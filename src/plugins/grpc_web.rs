@@ -63,6 +63,7 @@ const HEADER_GRPC_WEB_MODE: &str = "x-grpc-web-mode";
 const APPLICATION_GRPC_WEB: &str = "application/grpc-web";
 const APPLICATION_GRPC_WEB_TEXT: &str = "application/grpc-web-text";
 const BASE_EXPOSE_HEADERS: [&str; 3] = ["grpc-status", "grpc-message", "grpc-status-details-bin"];
+const BASE_EXPOSE_HEADERS_VALUE: &str = "grpc-status, grpc-message, grpc-status-details-bin";
 
 /// gRPC frame flag: data frame.
 pub(crate) const GRPC_FRAME_DATA: u8 = 0x00;
@@ -169,6 +170,37 @@ pub(crate) fn is_grpc_web_text(ct: &str) -> bool {
 /// response must NOT buffer (its trailers have to relay on the wire).
 pub fn request_is_grpc_web_translated(ctx: &RequestContext) -> bool {
     ctx.metadata.contains_key(META_GRPC_WEB_MODE)
+}
+
+pub struct GrpcWebErrorResponse {
+    pub headers: HashMap<String, String>,
+    pub body: Vec<u8>,
+}
+
+/// Build the client-visible gRPC-Web error shape for an early gateway refusal
+/// that happens before normal response hooks can run.
+pub fn translated_error_response(
+    ctx: &RequestContext,
+    status: u32,
+    message: &str,
+) -> Option<GrpcWebErrorResponse> {
+    let original_ct = ctx.metadata.get(META_GRPC_WEB_ORIGINAL_CT)?;
+    let response_ct = response_content_type(original_ct);
+    let mut headers = HashMap::with_capacity(5);
+    headers.insert("content-type".to_string(), response_ct.to_string());
+    headers.insert("x-grpc-web".to_string(), "1".to_string());
+    headers.insert(
+        "access-control-expose-headers".to_string(),
+        BASE_EXPOSE_HEADERS_VALUE.to_string(),
+    );
+    headers.insert("grpc-status".to_string(), status.to_string());
+    headers.insert("grpc-message".to_string(), message.to_string());
+
+    let mut body = build_trailer_frame(&headers);
+    if is_grpc_web_text(response_ct) {
+        body = BASE64.encode(&body).into_bytes();
+    }
+    Some(GrpcWebErrorResponse { headers, body })
 }
 
 fn is_valid_trailer_header(key: &str) -> Option<HeaderName> {

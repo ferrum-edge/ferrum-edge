@@ -17,6 +17,17 @@ fn create_plugin_default() -> std::sync::Arc<dyn Plugin> {
     create_plugin("grpc_web", &json!({})).unwrap().unwrap()
 }
 
+fn grpc_web_trailer_payload(body: &[u8]) -> String {
+    assert!(
+        body.len() >= 5,
+        "gRPC-Web trailer frame must include header"
+    );
+    assert_eq!(body[0], ferrum_edge::_test_support::GRPC_FRAME_TRAILER);
+    let len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+    assert_eq!(body.len(), 5 + len);
+    String::from_utf8(body[5..].to_vec()).unwrap()
+}
+
 // ── Plugin creation ──
 
 #[test]
@@ -108,6 +119,61 @@ async fn test_response_buffering_only_for_grpc_web_requests() {
     let result = plugin.on_request_received(&mut grpc_web_text).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(plugin.should_buffer_response_body(&grpc_web_text));
+}
+
+#[tokio::test]
+async fn test_translated_error_response_binary_uses_grpc_web_trailer_frame() {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web+proto");
+    plugin.on_request_received(&mut ctx).await;
+
+    let response =
+        ferrum_edge::plugins::grpc_web::translated_error_response(&ctx, 14, "blocked").unwrap();
+
+    assert_eq!(
+        response.headers.get("content-type").map(String::as_str),
+        Some("application/grpc-web+proto")
+    );
+    assert_eq!(
+        response.headers.get("x-grpc-web").map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("access-control-expose-headers")
+            .map(String::as_str),
+        Some("grpc-status, grpc-message, grpc-status-details-bin")
+    );
+    let payload = grpc_web_trailer_payload(&response.body);
+    assert!(payload.contains("grpc-status: 14\r\n"));
+    assert!(payload.contains("grpc-message: blocked\r\n"));
+}
+
+#[tokio::test]
+async fn test_translated_error_response_text_base64_encodes_trailer_frame() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web-text");
+    plugin.on_request_received(&mut ctx).await;
+
+    let response =
+        ferrum_edge::plugins::grpc_web::translated_error_response(&ctx, 14, "blocked").unwrap();
+
+    assert_eq!(
+        response.headers.get("content-type").map(String::as_str),
+        Some("application/grpc-web-text")
+    );
+    assert_eq!(
+        response.headers.get("x-grpc-web").map(String::as_str),
+        Some("1")
+    );
+    let decoded = BASE64.decode(&response.body).unwrap();
+    let payload = grpc_web_trailer_payload(&decoded);
+    assert!(payload.contains("grpc-status: 14\r\n"));
+    assert!(payload.contains("grpc-message: blocked\r\n"));
 }
 
 #[tokio::test]

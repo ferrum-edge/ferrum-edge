@@ -12486,6 +12486,22 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
     })
 }
 
+fn build_translated_grpc_web_error_response(
+    ctx: &RequestContext,
+    status: u32,
+    message: &str,
+) -> Option<Response<ProxyBody>> {
+    let translated = crate::plugins::grpc_web::translated_error_response(ctx, status, message)?;
+    let builder =
+        headers_mod::apply_response_headers(Response::builder().status(200), &translated.headers);
+
+    Some(
+        builder
+            .body(ProxyBody::full(Bytes::from(translated.body)))
+            .unwrap_or_else(|_| grpc_proxy::build_grpc_error_response(status, message)),
+    )
+}
+
 async fn finalize_reject_response_with_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -14175,14 +14191,13 @@ async fn handle_proxy_request_inner(
     //     gRPC — the exact no-trailer corruption the refusal prevents. It is
     //     detected via the plugin's spoof-proof context marker and FAILS
     //     CLOSED inside this branch like native gRPC (the Trailers-Only
-    //     refusal is also what the direct path returns a translated request
-    //     on a terminal gRPC-dispatch error — `build_grpc_error_response`
-    //     with `grpc-status` in the response HEADERS, which gRPC-Web clients
-    //     accept as a Trailers-Only response). `MeshMtls` still falls through
-    //     for native gRPC and binary translated gRPC-Web, but text-mode
-    //     translated gRPC-Web remains fail-closed here because it requires
-    //     request-body buffering and the generic mesh-mTLS path does not accept
-    //     pre-buffered request bodies.
+    //     refusal is encoded in the gRPC-Web wire format here because this
+    //     early fail-closed branch returns before the normal `grpc_web`
+    //     `after_proxy`/body hooks can translate a native gRPC error response).
+    //     `MeshMtls` still falls through for native gRPC and binary translated
+    //     gRPC-Web, but text-mode translated gRPC-Web remains fail-closed here
+    //     because it requires request-body buffering and the generic mesh-mTLS
+    //     path does not accept pre-buffered request bodies.
     let grpc_request_is_web_translated =
         crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx);
     let grpc_mesh_fall_through = is_grpc_request
@@ -14249,6 +14264,12 @@ async fn handle_proxy_request_inner(
                     cb_is_half_open_probe,
                 );
                 record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                if grpc_request_is_web_translated
+                    && let Some(response) =
+                        build_translated_grpc_web_error_response(&ctx, 14, message)
+                {
+                    return Ok(response);
+                }
                 return Ok(grpc_proxy::build_grpc_error_response(
                     14, // UNAVAILABLE
                     message,
@@ -16523,12 +16544,15 @@ async fn handle_proxy_request_inner(
         // plaintext direct dial.
         if is_grpc_request {
             record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-            return Ok(grpc_proxy::build_grpc_error_response(
-                14, // UNAVAILABLE
-                &format!(
-                    "sidecar mesh mTLS dispatch required for this backend target: {block_reason}"
-                ),
-            ));
+            let message = format!(
+                "sidecar mesh mTLS dispatch required for this backend target: {block_reason}"
+            );
+            if grpc_request_is_web_translated
+                && let Some(response) = build_translated_grpc_web_error_response(&ctx, 14, &message)
+            {
+                return Ok(response);
+            }
+            return Ok(grpc_proxy::build_grpc_error_response(14, &message));
         }
         record_request(&state, 502);
         return Ok(build_response(
@@ -16565,6 +16589,11 @@ async fn handle_proxy_request_inner(
     // overflow records neutral `RequestBodyTooLarge` instead of a backend
     // failure (codex r2-2 finding 5 extended it beyond HBONE).
     let mut mesh_request_body_exceeded = None;
+    // Mesh H2 dispatch resolves per-target proxy overrides inside
+    // `proxy_to_backend`; carry the effective read timeout back to the
+    // `StreamingH2` relay so native gRPC without a client deadline does not
+    // fall back to the outer proxy default.
+    let mut streaming_h2_read_timeout_ms = None;
     let (backend_resp, final_cb_target_key, final_upstream_target) = if let Some(retry_config) =
         retry_config
     {
@@ -16626,7 +16655,7 @@ async fn handle_proxy_request_inner(
                 ..
             } => {
                 backend_admission_permits = permits;
-                (response, retained_body)
+                (*response, retained_body)
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
                 release_circuit_breaker_probe_on_admission_reject(
@@ -16919,11 +16948,13 @@ async fn handle_proxy_request_inner(
                 response,
                 backend_admission_permits: permits,
                 request_body_exceeded,
+                streaming_h2_read_timeout_ms: effective_streaming_h2_read_timeout_ms,
                 ..
             } => {
                 backend_admission_permits = permits;
                 mesh_request_body_exceeded = request_body_exceeded;
-                response
+                streaming_h2_read_timeout_ms = effective_streaming_h2_read_timeout_ms;
+                *response
             }
             BackendDispatchResult::AdmissionRejected(rejection) => {
                 release_circuit_breaker_probe_on_admission_reject(
@@ -17760,16 +17791,18 @@ async fn handle_proxy_request_inner(
             // an ABSOLUTE deadline anchored at request receipt, per-frame
             // idle disabled — `grpc_streaming_response_deadline` is the same
             // helper the direct gRPC pool's streaming arm uses, falling back
-            // to the per-frame `backend_read_timeout_ms` when the client set
-            // no deadline.
+            // to the effective per-target `backend_read_timeout_ms` when the
+            // client set no deadline.
+            let effective_h2_read_timeout_ms =
+                streaming_h2_read_timeout_ms.unwrap_or(proxy.backend_read_timeout_ms);
             let (h2_read_timeout_ms, h2_total_deadline) = if streaming_h2_native_grpc {
                 grpc_proxy::grpc_streaming_response_deadline(
                     grpc_client_deadline_ms,
                     start_time.elapsed(),
-                    proxy.backend_read_timeout_ms,
+                    effective_h2_read_timeout_ms,
                 )
             } else {
-                (proxy.backend_read_timeout_ms, None)
+                (effective_h2_read_timeout_ms, None)
             };
             let body = if state.response_buffer_cutoff_bytes == 0
                 && state.max_response_body_size_bytes == 0
@@ -18962,10 +18995,11 @@ pub(crate) async fn proxy_to_backend_retry(
 /// own capability classification is the right answer.
 enum BackendDispatchResult {
     Response {
-        response: retry::BackendResponse,
+        response: Box<retry::BackendResponse>,
         retained_body: Option<Bytes>,
         backend_admission_permits: Option<BackendAdmissionPermitSet>,
         request_body_exceeded: Option<Arc<std::sync::atomic::AtomicBool>>,
+        streaming_h2_read_timeout_ms: Option<u64>,
     },
     AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
 }
@@ -18976,10 +19010,11 @@ fn backend_dispatch_response(
     backend_admission_permits: Option<BackendAdmissionPermitSet>,
 ) -> BackendDispatchResult {
     BackendDispatchResult::Response {
-        response,
+        response: Box::new(response),
         retained_body,
         backend_admission_permits,
         request_body_exceeded: None,
+        streaming_h2_read_timeout_ms: None,
     }
 }
 
@@ -19343,10 +19378,11 @@ async fn proxy_to_backend(
         )
         .await;
         return BackendDispatchResult::Response {
-            response: backend_resp,
+            response: Box::new(backend_resp),
             retained_body: body_bytes,
             backend_admission_permits,
             request_body_exceeded,
+            streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
         };
     }
 
@@ -19427,10 +19463,11 @@ async fn proxy_to_backend(
         )
         .await;
         return BackendDispatchResult::Response {
-            response: backend_resp,
+            response: Box::new(backend_resp),
             retained_body: body_bytes,
             backend_admission_permits,
             request_body_exceeded,
+            streaming_h2_read_timeout_ms: Some(proxy.backend_read_timeout_ms),
         };
     }
 
@@ -21325,9 +21362,11 @@ fn mesh_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::B
 }
 
 /// Gateway-side refusal when native gRPC over sidecar mesh-mTLS would require
-/// response buffering. The client sees a gRPC UNAVAILABLE, but backend-health
-/// accounting must stay neutral: no backend fault occurred.
+/// response buffering. Healthy backend statuses stay neutral because the
+/// refusal is a gateway-side policy conflict; an already-observed backend 5xx
+/// remains visible to backend-health accounting.
 fn mesh_grpc_response_buffering_refusal_response(
+    observed_status: u16,
     resolved_ip: Option<String>,
 ) -> retry::BackendResponse {
     let mut headers = HashMap::with_capacity(3);
@@ -21341,13 +21380,22 @@ fn mesh_grpc_response_buffering_refusal_response(
         "gRPC over sidecar mesh mTLS cannot buffer responses (trailers would be dropped)"
             .to_string(),
     );
+    let observed_backend_failure = (500..=599).contains(&observed_status);
     retry::BackendResponse {
-        status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
+        status_code: if observed_backend_failure {
+            observed_status
+        } else {
+            200 // gRPC errors ride HTTP 200 + grpc-status
+        },
         body: ResponseBody::Buffered(Vec::new()),
         headers,
         connection_error: false,
         backend_resolved_ip: resolved_ip,
-        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+        error_class: if observed_backend_failure {
+            None
+        } else {
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        },
     }
 }
 
@@ -22789,7 +22837,7 @@ async fn proxy_to_backend_mesh_mtls(
              exempt this route from response-body buffering to restore gRPC dispatch"
         );
         return (
-            mesh_grpc_response_buffering_refusal_response(resolved_ip),
+            mesh_grpc_response_buffering_refusal_response(status, resolved_ip),
             None,
             None,
         );
@@ -27094,7 +27142,8 @@ mod tests {
 
     #[test]
     fn mesh_grpc_response_buffering_refusal_is_gateway_side_neutral() {
-        let resp = mesh_grpc_response_buffering_refusal_response(Some("127.0.0.2".to_string()));
+        let resp =
+            mesh_grpc_response_buffering_refusal_response(200, Some("127.0.0.2".to_string()));
 
         assert_eq!(resp.status_code, 200);
         assert!(!resp.connection_error);
@@ -27102,6 +27151,29 @@ mod tests {
             resp.error_class,
             Some(retry::ErrorClass::DispatchPolicyRejected)
         );
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.2"));
+        assert_eq!(
+            resp.headers.get("content-type").map(String::as_str),
+            Some("application/grpc")
+        );
+        assert_eq!(
+            resp.headers.get("grpc-status").map(String::as_str),
+            Some("14")
+        );
+        let ResponseBody::Buffered(body) = resp.body else {
+            panic!("gRPC buffering refusal should be buffered");
+        };
+        assert!(body.is_empty(), "Trailers-Only refusal carries no body");
+    }
+
+    #[test]
+    fn mesh_grpc_response_buffering_refusal_preserves_backend_server_error() {
+        let resp =
+            mesh_grpc_response_buffering_refusal_response(503, Some("127.0.0.2".to_string()));
+
+        assert_eq!(resp.status_code, 503);
+        assert!(!resp.connection_error);
+        assert_eq!(resp.error_class, None);
         assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.2"));
         assert_eq!(
             resp.headers.get("content-type").map(String::as_str),
@@ -27223,7 +27295,7 @@ mod tests {
             )
             .await;
             let resp = match dispatch {
-                BackendDispatchResult::Response { response, .. } => response,
+                BackendDispatchResult::Response { response, .. } => *response,
                 BackendDispatchResult::AdmissionRejected(_) => {
                     panic!("test does not configure backend admission plugins")
                 }
