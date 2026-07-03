@@ -3567,8 +3567,9 @@ paths:
       summary: Replace all credentials of a type
       description: |
         Replaces the entire credential value for the given type. Accepts a single
-        JSON object or an array of objects. For `basicauth`, plaintext `password`
-        fields are automatically hashed and stored as `password_hash`.
+        JSON object or an array of objects; stored credentials are normalized to
+        a non-empty array. For `basicauth`, plaintext `password` fields are
+        automatically hashed and stored as `password_hash`.
       tags: [Consumers]
       requestBody:
         required: true
@@ -3610,8 +3611,8 @@ paths:
       summary: Append a credential entry for rotation
       description: |
         Appends a new credential entry to the given type, enabling zero-downtime
-        credential rotation. If the existing credential is a single object, it is
-        converted to an array. Max entries per type is controlled by
+        credential rotation. Credentials are stored as arrays. Max entries per
+        type is controlled by
         `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2). For `basicauth`, plaintext
         `password` fields are automatically hashed.
       tags: [Consumers]
@@ -3685,9 +3686,8 @@ paths:
       operationId: deleteConsumerCredentialByIndex
       summary: Remove a specific credential entry by index
       description: |
-        Removes a single credential entry at the given index. When the array has
-        one remaining element after removal, it is collapsed back to a single
-        object. When a single-object credential exists, only index 0 is valid.
+        Removes a single credential entry at the given index. When the array
+        becomes empty after removal, the credential type is removed.
       tags: [Consumers]
       responses:
         "200":
@@ -6222,65 +6222,48 @@ components:
           type: object
           default: {}
           description: |
-            Map of credential type to credential payload. Each type maps to either
-            a single JSON object or an array of objects (for zero-downtime rotation).
-            Array elements must be JSON objects — non-object elements are rejected.
+            Map of credential type to credential payload. Each type maps to an
+            array of credential objects for zero-downtime rotation. Credential
+            arrays must be non-empty and elements must be JSON objects.
             Credential values that serve as lookup keys must be unique across all
             consumers and across all entries within arrays. Max entries per type is
             controlled by `FERRUM_MAX_CREDENTIALS_PER_TYPE` (default: 2).
           properties:
             keyauth:
-              oneOf:
-                - $ref: "#/components/schemas/KeyAuthCredential"
-                - type: array
-                  items:
-                    $ref: "#/components/schemas/KeyAuthCredential"
-                  minItems: 1
-                  description: Multiple API key entries for zero-downtime rotation
-              description: "API key credential(s). Each `key` must be globally unique."
+              type: array
+              items:
+                $ref: "#/components/schemas/KeyAuthCredential"
+              minItems: 1
+              description: Multiple API key entries for zero-downtime rotation. Each `key` must be globally unique.
             basicauth:
-              oneOf:
-                - $ref: "#/components/schemas/BasicAuthCredential"
-                - type: array
-                  items:
-                    $ref: "#/components/schemas/BasicAuthCredential"
-                  minItems: 1
-                  description: Multiple basic auth entries for zero-downtime rotation
-              description: "Basic auth credential(s). Indexed by consumer `username`."
+              type: array
+              items:
+                $ref: "#/components/schemas/BasicAuthCredential"
+              minItems: 1
+              description: Multiple basic auth entries for zero-downtime rotation. Indexed by consumer `username`.
             jwt:
-              oneOf:
-                - $ref: "#/components/schemas/JwtCredential"
-                - type: array
-                  items:
-                    $ref: "#/components/schemas/JwtCredential"
-                  minItems: 1
-                  description: Multiple JWT secrets for zero-downtime rotation
-              description: "JWT credential(s). Secret must be at least 32 characters. Looked up by `username`, `id`, or `custom_id`; all secrets tried."
+              type: array
+              items:
+                $ref: "#/components/schemas/JwtCredential"
+              minItems: 1
+              description: Multiple JWT secrets for zero-downtime rotation. Secret must be at least 32 characters. Looked up by `username`, `id`, or `custom_id`; all secrets tried.
             hmac_auth:
-              oneOf:
-                - $ref: "#/components/schemas/HmacAuthCredential"
-                - type: array
-                  items:
-                    $ref: "#/components/schemas/HmacAuthCredential"
-                  minItems: 1
-                  description: Multiple HMAC secrets for zero-downtime rotation
-              description: "HMAC auth credential(s). Looked up by username in Authorization header; all secrets tried."
+              type: array
+              items:
+                $ref: "#/components/schemas/HmacAuthCredential"
+              minItems: 1
+              description: Multiple HMAC secrets for zero-downtime rotation. Looked up by username in Authorization header; all secrets tried.
             mtls_auth:
-              oneOf:
-                - $ref: "#/components/schemas/MtlsAuthCredential"
-                - type: array
-                  items:
-                    $ref: "#/components/schemas/MtlsAuthCredential"
-                  minItems: 1
-                  description: Multiple mTLS identities for zero-downtime rotation
-              description: "mTLS auth credential(s). Each `identity` must be globally unique."
+              type: array
+              items:
+                $ref: "#/components/schemas/MtlsAuthCredential"
+              minItems: 1
+              description: Multiple mTLS identities for zero-downtime rotation. Each `identity` must be globally unique.
           additionalProperties:
-            oneOf:
-              - type: object
-              - type: array
-                items:
-                  type: object
-                minItems: 1
+            type: array
+            items:
+              type: object
+            minItems: 1
         acl_groups:
           type: array
           items:

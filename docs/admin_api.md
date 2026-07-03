@@ -307,13 +307,13 @@ curl -H "Authorization: Bearer $TOKEN" http://localhost:9000/consumers
 # Create consumer
 curl -X POST -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"username": "alice", "credentials": {"keyauth": {"key": "my-key"}}}' \
+  -d '{"username": "alice", "credentials": {"keyauth": [{"key": "my-key"}]}}' \
   http://localhost:9000/consumers
 
-# Replace all credentials of a type (PUT replaces entirely)
+# Replace all credentials of a type (PUT replaces entirely and stores an array)
 curl -X PUT -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"key": "new-api-key"}' \
+  -d '[{"key": "new-api-key"}]' \
   http://localhost:9000/consumers/{consumer_id}/credentials/keyauth
 
 # Append a credential for zero-downtime rotation (POST adds to array)

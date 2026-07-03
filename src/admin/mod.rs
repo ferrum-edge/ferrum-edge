@@ -2738,7 +2738,7 @@ pub const ALLOWED_CREDENTIAL_TYPES: &[&str] =
 
 fn normalize_credential_set(cred_value: Value) -> Result<Value, Box<Response<Full<Bytes>>>> {
     match cred_value {
-        Value::Object(_) => Ok(cred_value),
+        Value::Object(_) => Ok(Value::Array(vec![cred_value])),
         Value::Array(entries) => {
             if entries.iter().all(Value::is_object) {
                 Ok(Value::Array(entries))
@@ -3040,33 +3040,12 @@ async fn handle_delete_credential_by_index(
                 consumer.credentials.remove(cred_type);
             }
         }
-        Value::Object(_) if index == 0 => {
-            consumer.credentials.remove(cred_type);
-        }
-        Value::Object(_) => {
-            return Ok(json_response(
-                StatusCode::NOT_FOUND,
-                &json!({"error": format!(
-                    "Credential index {} out of range (single credential object)",
-                    index
-                )}),
-            ));
-        }
         _ => {
             return Ok(json_response(
                 StatusCode::NOT_FOUND,
                 &json!({"error": format!("No '{}' credentials found", cred_type)}),
             ));
         }
-    }
-
-    if let Some(Value::Array(arr)) = consumer.credentials.get(cred_type)
-        && arr.len() == 1
-    {
-        let remaining = arr[0].clone();
-        consumer
-            .credentials
-            .insert(cred_type.to_string(), remaining);
     }
 
     let response = persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK).await;
@@ -4766,8 +4745,14 @@ mod tests {
 
     #[test]
     fn normalize_credential_set_accepts_object_or_object_array() {
-        assert!(normalize_credential_set(json!({"key": "one"})).is_ok());
-        assert!(normalize_credential_set(json!([{"key": "one"}, {"key": "two"}])).is_ok());
+        assert_eq!(
+            normalize_credential_set(json!({"key": "one"})).unwrap(),
+            json!([{"key": "one"}])
+        );
+        assert_eq!(
+            normalize_credential_set(json!([{"key": "one"}, {"key": "two"}])).unwrap(),
+            json!([{"key": "one"}, {"key": "two"}])
+        );
         assert!(normalize_credential_set(json!(["not-object"])).is_err());
         assert!(normalize_credential_set(json!("not-object")).is_err());
     }
