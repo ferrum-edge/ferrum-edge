@@ -124,11 +124,14 @@ REQUIRED_LIVE_ASSERTIONS=(
   sidecar.destination_rule.tcp_max_connections
   sidecar.virtual_service.cors_policy
 )
-# NOTE: every id except `sidecar.spire.workload_entries` (fixture
-# infrastructure, suite-local) backs a GA-contract capability row in
-# tests/conformance/ga_contract.yaml — keep the id strings in lock-step. No
-# contract row is live-deferred: VS CORS was the last (issue #1973, closed by
-# the mesh-slice CORS carriage this suite now exercises).
+# NOTE: every id backs a GA-contract capability row in
+# tests/conformance/ga_contract.yaml — keep the id strings in lock-step.
+# `sidecar.spire.workload_entries` (with the strict-mTLS positive) backs the
+# SPIFFE identity row `mesh.identity.spire_svid_issuance`;
+# `sidecar.peer_auth.strict_mtls_authenticated` is deliberately shared by the
+# PeerAuthentication and identity rows. No contract row is live-deferred: VS
+# CORS was the last (issue #1973, closed by the mesh-slice CORS carriage this
+# suite now exercises).
 
 mkdir -p "$ARTIFACT_DIR" "$RESULTS_DIR"
 

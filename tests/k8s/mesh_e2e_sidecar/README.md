@@ -45,13 +45,16 @@ shared schema from `tests/k8s/lib/live_assertions.sh` (suite
 | `sidecar.virtual_service.cors_policy` | VS-derived CORS on the client sidecar: allowed `Origin` → 200 with the origin reflected in `access-control-allow-origin`, `OPTIONS` preflight answered **204 by the sidecar** with `access-control-allow-methods`, disallowed `Origin` → **403** `CORS origin not allowed` (the plugin's own body, never the app marker) |
 | `sidecar.destination_rule.tcp_max_connections` | WebSocket flow (`wssvc`, maxConnections=1): one **held** WS session admitted (101), a concurrent second upgrade rejected **503** by the client sidecar's `BackendConnectionGuard` before dialing, and a fresh upgrade admitted after the held session closes — cap enforcement **and** release |
 
-Every assertion except `sidecar.spire.workload_entries` (fixture
-infrastructure) backs a GA-contract capability row in
+Every assertion backs a GA-contract capability row in
 `tests/conformance/ga_contract.yaml` — STRICT mTLS, AuthorizationPolicy
 allow/deny, RequestAuthentication JWT, DR connectTimeout, DR maxConnections,
-and VirtualService CORS; the artifact is validated against the contract by
-`tests/conformance/live_contract.rs` (the live workflow runs it right after
-the fixture). No contract row remains `live_deferred`: VS CORS (the last,
+VirtualService CORS, and SPIFFE identity plumbing
+(`mesh.identity.spire_svid_issuance`, backed by
+`sidecar.spire.workload_entries` plus the SVID-carried
+`sidecar.peer_auth.strict_mtls_authenticated` positive, which that row shares
+with the PeerAuthentication row); the artifact is validated against the
+contract by `tests/conformance/live_contract.rs` (the live workflow runs it
+right after the fixture). No contract row remains `live_deferred`: VS CORS (the last,
 issue #1973) is live-backed by the mesh slice's `virtual_service_cors_policies`
 carriage — the client sidecar synthesizes the `cors` plugin onto its
 materialized svc outbound route, and the probe proves allowed-Origin

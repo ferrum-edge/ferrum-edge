@@ -587,10 +587,10 @@ fn live_contract_rejects_stale_and_unparseable_created_at() {
 fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
     // Pin the real ga_contract.yaml against this validator: the Stable
     // sidecar surface is enrolled vertically (STRICT mTLS, authz ALLOW/DENY,
-    // RequestAuth JWT, DR connectTimeout + maxConnections, and VS CORS — all
-    // ENFORCED and emitted by tests/k8s/mesh_e2e_sidecar/run.sh; the last
-    // deferral, VS CORS, was closed by the mesh-slice CORS carriage of
-    // issue #1973).
+    // RequestAuth JWT, DR connectTimeout + maxConnections, VS CORS, and
+    // SPIFFE identity plumbing — all ENFORCED and emitted by
+    // tests/k8s/mesh_e2e_sidecar/run.sh; the last deferral, VS CORS, was
+    // closed by the mesh-slice CORS carriage of issue #1973).
     let contract = load_contract().expect("real contract loads");
     let sidecar_rows: Vec<_> = contract
         .ga_capabilities()
@@ -607,6 +607,7 @@ fn live_contract_real_contract_declares_the_sidecar_suite_rows() {
         .flat_map(|capability| capability.live_assertions.iter().map(String::as_str))
         .collect();
     for required in [
+        "sidecar.spire.workload_entries",
         "sidecar.peer_auth.strict_mtls_authenticated",
         "sidecar.peer_auth.strict_mtls_plaintext_rejected",
         "sidecar.authz.denied_principal_rejected",

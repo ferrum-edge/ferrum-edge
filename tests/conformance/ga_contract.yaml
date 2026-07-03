@@ -108,6 +108,42 @@ capabilities:
       - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
       - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
 
+  - id: mesh.identity.spire_svid_issuance
+    display_name: SPIFFE identity plumbing (SPIRE Agent CA)
+    maturity: ga
+    topology: sidecar
+    # Identity is delivered over the SPIRE Agent Workload API
+    # (FERRUM_MESH_CA_BACKEND=spire_agent), not a config protocol translation.
+    config_protocol: spiffe_workload_api
+    semantic_assertions:
+      - category: mesh_spiffe_identity
+        feature: SPIFFE ID parse + Istio ns/sa convention
+      - category: mesh_spiffe_identity
+        feature: X.509 URI-SAN SVID identity extraction
+      - category: mesh_spiffe_identity
+        feature: inbound peer SVID verification decision
+      - category: mesh_spiffe_identity
+        feature: gateway SVID slot fail-closed inbound identity
+      - category: mesh_spiffe_identity
+        feature: FERRUM_MESH_CA_BACKEND spire_agent selection
+    live_suite: mesh-e2e-sidecar
+    # Live backing: the suite registers SPIRE workload entries for every
+    # fixture identity (sidecar.spire.workload_entries) and the STRICT-mTLS
+    # positive rides SPIRE-issued SVIDs on both sides of the captured datapath
+    # (sidecar.peer_auth.strict_mtls_authenticated, shared with the
+    # PeerAuthentication row — sharing an emitted live assertion id across
+    # rows is deliberate and validated per-row).
+    live_assertions:
+      - sidecar.spire.workload_entries
+      - sidecar.peer_auth.strict_mtls_authenticated
+    platform_profile: kind-spire-sidecar
+    docs_anchor: docs/mesh.md#spire-agent-ca
+    owner: mesh
+    exclusions:
+      - NodeWaypoint topology remains Experimental and is excluded from this sidecar GA contract.
+      - Cross-cluster endpoint discovery remains Experimental and is excluded from this sidecar GA contract.
+      - Internal self-signed CA (FERRUM_MESH_CA_BACKEND=internal) remains Dev-only and is excluded.
+
   - id: mesh.request_authentication.jwt_validation
     display_name: RequestAuthentication JWT validation
     maturity: ga

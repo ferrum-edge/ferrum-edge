@@ -32,8 +32,18 @@ and VirtualService CORS, each backed by a `sidecar.*` live assertion the
 `mesh-e2e-sidecar` suite must emit and pass. No row is `live_deferred`: the
 last (VS CORS) closed with issue #1973 — the mesh slice now carries
 `virtual_service_cors_policies` and the client sidecar synthesizes the `cors`
-plugin onto its materialized outbound routes. Stable rows outside the sidecar *traffic* surface (native
-`MeshSubscribe` config transport, SPIFFE identity plumbing) enroll next;
+plugin onto its materialized outbound routes. **SPIFFE identity plumbing
+(SPIRE Agent CA) is now enrolled too** (`mesh.identity.spire_svid_issuance`):
+semantics pinned by the `mesh_spiffe_identity` conformance module (SPIFFE ID
+parse + Istio `ns/sa` convention, URI-SAN SVID extraction, the inbound
+peer-SVID verification decision, the fail-closed SVID slot, and `spire_agent`
+backend selection), live-gated by the required `sidecar.spire.workload_entries`
+and `sidecar.peer_auth.strict_mtls_authenticated` assertions. The remaining
+Stable row outside the sidecar traffic surface — native `MeshSubscribe` config
+transport — enrolls next, but it first needs a live signal: the
+`mesh-e2e-sidecar` fixture delivers mesh config via
+`FERRUM_MESH_CONFIG_PROTOCOL=file` ConfigMaps and deploys no Ferrum CP, so no
+suite today can honestly back a `MeshSubscribe` live assertion.
 `coverage.md` lists the currently enrolled rows and required live assertion
 IDs, which are the authoritative answer to "what regression fails CI today."
 
