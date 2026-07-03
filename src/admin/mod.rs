@@ -738,6 +738,72 @@ fn require_admin_role(actor: &AuditActor, required: AdminRole) -> Option<Respons
     ))
 }
 
+fn tls_route_required_role(method: &Method, segments: &[&str]) -> Option<AdminRole> {
+    match (method, segments) {
+        (
+            method,
+            ["admin", "tls", "inventory"]
+            | ["admin", "tls", "events"]
+            | ["admin", "tls", "acme", "certificates"]
+            | ["admin", "tls", "acme", "certificates", _]
+            | ["admin", "tls", "acme", "accounts"]
+            | ["admin", "tls", "acme", "orders"]
+            | ["admin", "tls", "acme", "orders", _]
+            | ["admin", "tls", "certificates"]
+            | ["admin", "tls", "certificates", _]
+            | ["admin", "tls", "ca-bundles"]
+            | ["admin", "tls", "ca-bundles", _]
+            | ["admin", "tls", "crls"]
+            | ["admin", "tls", "crls", _]
+            | ["admin", "tls", "ocsp-responses"]
+            | ["admin", "tls", "ocsp-responses", _]
+            | ["admin", "tls", "jwks"]
+            | ["admin", "tls", "jwks", _],
+        ) if method == Method::GET => Some(AdminRole::Operator),
+        (method, ["admin", "tls", "rotate", _] | ["admin", "tls", "validate"])
+            if method == Method::POST =>
+        {
+            Some(AdminRole::Operator)
+        }
+        (
+            method,
+            ["admin", "tls", "acme", "certificates"]
+            | ["admin", "tls", "acme", "orders"]
+            | ["admin", "tls", "certificates"]
+            | ["admin", "tls", "ca-bundles"]
+            | ["admin", "tls", "crls"]
+            | ["admin", "tls", "ocsp-responses"]
+            | ["admin", "tls", "jwks"],
+        ) if method == Method::POST => Some(AdminRole::Admin),
+        (
+            method,
+            ["admin", "tls", "acme", "certificates", _]
+            | ["admin", "tls", "certificates", _]
+            | ["admin", "tls", "ca-bundles", _]
+            | ["admin", "tls", "crls", _]
+            | ["admin", "tls", "ocsp-responses", _]
+            | ["admin", "tls", "jwks", _],
+        ) if method == Method::PUT => Some(AdminRole::Admin),
+        (
+            method,
+            ["admin", "tls", "acme", "certificates", _]
+            | ["admin", "tls", "acme", "orders", _]
+            | ["admin", "tls", "certificates", _]
+            | ["admin", "tls", "ca-bundles", _]
+            | ["admin", "tls", "crls", _]
+            | ["admin", "tls", "ocsp-responses", _]
+            | ["admin", "tls", "jwks", _],
+        ) if method == Method::DELETE => Some(AdminRole::Admin),
+        (method, ["admin", "tls", "acme", "renew", _]) if method == Method::POST => {
+            Some(AdminRole::Admin)
+        }
+        (method, ["admin", "tls", "acme", "orders", _, "finalize"]) if method == Method::POST => {
+            Some(AdminRole::Admin)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn log_audit_enqueue_failure(error: &anyhow::Error) {
     warn!(
         error = %error,
@@ -1264,6 +1330,11 @@ pub async fn handle_admin_request(
 
     // Route
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    if let Some(required) = tls_route_required_role(&method, segments.as_slice())
+        && let Some(resp) = require_admin_role(&auth, required)
+    {
+        return Ok(resp);
+    }
 
     match (method, segments.as_slice()) {
         // Proxies CRUD
@@ -2739,16 +2810,15 @@ pub const ALLOWED_CREDENTIAL_TYPES: &[&str] =
 fn normalize_credential_set(cred_value: Value) -> Result<Value, Box<Response<Full<Bytes>>>> {
     match cred_value {
         Value::Object(_) => Ok(Value::Array(vec![cred_value])),
-        Value::Array(entries) => {
-            if entries.iter().all(Value::is_object) {
-                Ok(Value::Array(entries))
-            } else {
-                Err(Box::new(json_response(
-                    StatusCode::BAD_REQUEST,
-                    &json!({"error": "Credential set entries must be JSON objects"}),
-                )))
-            }
-        }
+        Value::Array(entries) if entries.is_empty() => Err(Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Credential set must contain at least one entry"}),
+        ))),
+        Value::Array(entries) if entries.iter().all(Value::is_object) => Ok(Value::Array(entries)),
+        Value::Array(_) => Err(Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"error": "Credential set entries must be JSON objects"}),
+        ))),
         _ => Err(Box::new(json_response(
             StatusCode::BAD_REQUEST,
             &json!({"error": "Credential set must be a JSON object or array of JSON objects"}),
@@ -4753,8 +4823,94 @@ mod tests {
             normalize_credential_set(json!([{"key": "one"}, {"key": "two"}])).unwrap(),
             json!([{"key": "one"}, {"key": "two"}])
         );
+        assert!(normalize_credential_set(json!([])).is_err());
         assert!(normalize_credential_set(json!(["not-object"])).is_err());
         assert!(normalize_credential_set(json!("not-object")).is_err());
+    }
+
+    #[test]
+    fn tls_route_required_role_preserves_tls_security_boundary() {
+        let operator_allowed = [
+            (Method::GET, vec!["admin", "tls", "inventory"]),
+            (Method::GET, vec!["admin", "tls", "events"]),
+            (Method::GET, vec!["admin", "tls", "certificates"]),
+            (
+                Method::GET,
+                vec!["admin", "tls", "certificates", "edge-cert"],
+            ),
+            (Method::POST, vec!["admin", "tls", "validate"]),
+            (Method::POST, vec!["admin", "tls", "rotate", "backend_tls"]),
+        ];
+        for (method, route) in operator_allowed {
+            assert_eq!(
+                tls_route_required_role(&method, &route),
+                Some(AdminRole::Operator),
+                "{method} /{} should allow operator role",
+                route.join("/")
+            );
+        }
+
+        let admin_only = [
+            (Method::POST, vec!["admin", "tls", "certificates"]),
+            (
+                Method::PUT,
+                vec!["admin", "tls", "certificates", "edge-cert"],
+            ),
+            (
+                Method::DELETE,
+                vec!["admin", "tls", "certificates", "edge-cert"],
+            ),
+            (Method::POST, vec!["admin", "tls", "acme", "certificates"]),
+            (
+                Method::PUT,
+                vec!["admin", "tls", "acme", "certificates", "edge-cert"],
+            ),
+            (
+                Method::DELETE,
+                vec!["admin", "tls", "acme", "certificates", "edge-cert"],
+            ),
+            (Method::POST, vec!["admin", "tls", "acme", "orders"]),
+            (
+                Method::POST,
+                vec!["admin", "tls", "acme", "orders", "edge-order", "finalize"],
+            ),
+            (
+                Method::DELETE,
+                vec!["admin", "tls", "acme", "orders", "edge-order"],
+            ),
+            (
+                Method::POST,
+                vec!["admin", "tls", "acme", "renew", "edge-cert"],
+            ),
+        ];
+        let operator = AuditActor {
+            sub: "operator".to_string(),
+            role: AdminRole::Operator,
+        };
+        let admin = AuditActor {
+            sub: "admin".to_string(),
+            role: AdminRole::Admin,
+        };
+        for (method, route) in admin_only {
+            let required = tls_route_required_role(&method, &route);
+            assert_eq!(
+                required,
+                Some(AdminRole::Admin),
+                "{method} /{} should require admin role",
+                route.join("/")
+            );
+            assert_eq!(
+                require_admin_role(&operator, required.unwrap()).map(|response| response.status()),
+                Some(StatusCode::FORBIDDEN),
+                "operator must be forbidden for {method} /{}",
+                route.join("/")
+            );
+            assert!(
+                require_admin_role(&admin, required.unwrap()).is_none(),
+                "admin must pass the role gate for {method} /{}",
+                route.join("/")
+            );
+        }
     }
 
     #[test]

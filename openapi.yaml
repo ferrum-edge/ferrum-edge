@@ -3581,6 +3581,7 @@ paths:
                 - type: array
                   items:
                     type: object
+                  minItems: 1
               description: Credential payload (schema varies by credential type)
               examples:
                 - username: alice
@@ -4820,10 +4821,10 @@ components:
         type: integer
         minimum: 1
         maximum: 1000
-        default: 100
       description: |
-        Maximum number of items to return (max 1000). Invalid values and `0`
-        are coerced to the server default; values above the maximum are capped.
+        Maximum number of items to return. When omitted, the server returns all
+        matching items. Explicit invalid values or `0` are coerced to the server
+        default of 100. Values above 1000 are capped at 1000.
         List endpoints return a paginated envelope containing `data` and
         `pagination` fields even when this parameter is omitted.
 
