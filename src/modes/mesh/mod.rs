@@ -4748,7 +4748,7 @@ fn build_outbound_mesh_targets(
         match transport {
             MeshEgressTransport::SidecarMtls => append_cross_cluster_mesh_targets(
                 &mut targets,
-                runtime,
+                &runtime.cluster_domain,
                 service,
                 service_port,
                 protocol,
@@ -4819,9 +4819,19 @@ fn build_outbound_mesh_targets(
 /// fall-through to a different-network catch-all). A group with no matching
 /// gateway is SKIPPED with a warning — fail closed, never dial an unresolved
 /// address.
-fn append_cross_cluster_mesh_targets(
+///
+/// SHARED CORE: this is the single implementation of Sidecar cross-cluster
+/// grouping/reachability/gateway-selection, used by BOTH the mesh-mode
+/// outbound materializer ([`build_outbound_mesh_targets`], which passes
+/// `&runtime.cluster_domain`) and the gateway-to-mesh SD bridge
+/// ([`crate::service_discovery::mesh::MeshServiceDiscoverer`], which runs in
+/// database/file/dp modes with no `MeshRuntimeConfig` and passes its own
+/// resolved cluster domain). `cluster_domain` is the only runtime field the
+/// logic needs — do NOT re-widen the parameter to the mesh runtime, and do NOT
+/// fork this logic into the SD path.
+pub(crate) fn append_cross_cluster_mesh_targets(
     targets: &mut Vec<UpstreamTarget>,
-    runtime: &MeshRuntimeConfig,
+    cluster_domain: &str,
     service: &crate::modes::mesh::config::MeshService,
     service_port: &crate::modes::mesh::config::ServicePort,
     protocol: AppProtocol,
@@ -4877,7 +4887,7 @@ fn append_cross_cluster_mesh_targets(
     // The SNI the remote east-west gateway passthrough routes on — the
     // destination service FQDN. Matches `build_east_west_service_targets`'s
     // gateway-side hosts (`{name}.{namespace}.svc.{cluster_domain}`).
-    let cluster_domain = runtime.cluster_domain.trim_matches('.');
+    let cluster_domain = cluster_domain.trim_matches('.');
     let service_fqdn = format!(
         "{}.{}.svc.{cluster_domain}",
         service.name, service.namespace

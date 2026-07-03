@@ -36,9 +36,18 @@ pub struct MeshServiceDiscoverer {
     /// destination actually serves — a sidecar peer cannot accept an HBONE
     /// dial and would fail the request closed.
     topology: MeshSdTopology,
-    /// One-time guard for the "sidecar SD skips remote-cluster workloads"
-    /// warning, so a 30s poll loop does not repeat it forever.
-    warned_sidecar_remote_skipped: AtomicBool,
+    /// Kubernetes cluster DNS domain used to synthesize the destination
+    /// service FQDN (`{service}.{namespace}.svc.<domain>`) that east-west
+    /// gateway SNI routing keys on — the same `FERRUM_MESH_CLUSTER_DOMAIN`
+    /// mesh mode resolves into `MeshRuntimeConfig.cluster_domain` (default
+    /// `cluster.local`), resolved once at construction because this
+    /// discoverer runs in gateway modes that have no mesh runtime.
+    cluster_domain: String,
+    /// One-time guard for the "sidecar SD cannot bridge remote-cluster
+    /// workloads east-west for this upstream" warning (non-first / non-HTTP
+    /// selected port, or no `mesh.multi_cluster` in the snapshot), so a 30s
+    /// poll loop does not repeat it forever.
+    warned_sidecar_remote_unbridged: AtomicBool,
 }
 
 impl MeshServiceDiscoverer {
@@ -57,7 +66,12 @@ impl MeshServiceDiscoverer {
             port,
             default_weight,
             topology,
-            warned_sidecar_remote_skipped: AtomicBool::new(false),
+            cluster_domain: crate::config::conf_file::resolve_ferrum_var(
+                "FERRUM_MESH_CLUSTER_DOMAIN",
+            )
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string()),
+            warned_sidecar_remote_unbridged: AtomicBool::new(false),
         }
     }
 
@@ -243,6 +257,115 @@ impl MeshServiceDiscoverer {
             }
         }
     }
+
+    /// Bridge this service's Sidecar REMOTE workloads to east-west GATEWAY
+    /// failover targets, exactly like mesh-mode egress does — via the SHARED
+    /// core (`crate::modes::mesh::append_cross_cluster_mesh_targets`):
+    /// reachability-filter, group per `(network, trust_domain)`, ONE target per
+    /// group at the remote east-west gateway endpoint, tagged
+    /// `mesh.cross_cluster=true` + `mesh.eastwest_sni=<service FQDN>` +
+    /// `mesh.mtls_port=<gateway port>` + `mesh.remote=true` with NO pinned pod
+    /// SPIFFE (trust-domain-only verification). Do not fork that logic here.
+    ///
+    /// BRIDGEABILITY (fail closed otherwise, one-time warn): the east-west
+    /// model routes a service-FQDN SNI to only the service's FIRST DECLARED
+    /// port on the destination gateway (SNI carries no port — see the shared
+    /// core's first-port rule), and only over the HTTP-family cross-cluster
+    /// dial. So the bridge runs ONLY when the snapshot carries
+    /// `mesh.multi_cluster` AND this upstream's selected service port IS the
+    /// first declared port AND that port is effective-HTTP-family
+    /// (`protocol_overrides` applied, via the shared
+    /// `service_http_family_ports` predicate). A non-first selected port
+    /// cannot be honored — the destination gateway would forward its SNI to
+    /// the first port's backend, silently misrouting — so those upstreams keep
+    /// the fail-closed remote skip. A remote group with no matching gateway is
+    /// likewise skipped fail-closed inside the shared core (logged per poll).
+    ///
+    /// SD-BRIDGE DELTA vs the materializer's cross-cluster targets (the ONLY
+    /// intentional difference): each gateway target additionally carries
+    /// `mesh.mtls_authority_host` (`<name>.<namespace>.svc`). The destination
+    /// sidecar routes the inner mesh-mTLS-HTTP request by `Host`; mesh-mode
+    /// egress relies on the client `Host` already being the service host (its
+    /// outbound routes are host-routed + `preserve_host_header`), but a
+    /// north-south gateway's client `Host` is a public hostname the
+    /// destination's inbound routes would 404 — dispatch gives this tag
+    /// precedence over both the preserved client `Host` and the dial-authority
+    /// fallback (`proxy_to_backend_mesh_mtls`). No `mesh.mtls_authority_port`
+    /// is stamped, mirroring the materializer: cross-cluster traffic reaches
+    /// the destination via its app port + inbound capture, so the peer
+    /// disambiguates multi-port by orig-dst, not the authority port. Targets
+    /// keep the shared core's `weight: 1` (not `default_weight`) — they are
+    /// always-failover, never weighted against local targets.
+    fn append_sidecar_cross_cluster_targets(
+        &self,
+        service: &MeshService,
+        workloads: &[Workload],
+        multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+        selected_service_port: Option<&SelectedPort>,
+        targets: &mut Vec<UpstreamTarget>,
+    ) {
+        let first_port = service.ports.first();
+        let selected_is_first_declared = match (selected_service_port, first_port) {
+            (Some(selected), Some(first)) => selected.service_port == Some(first.port),
+            _ => false,
+        };
+        let first_is_http_family = first_port.is_some_and(|first| {
+            crate::modes::mesh::service_http_family_ports(service)
+                .iter()
+                .any(|sp| sp.port == first.port)
+        });
+        let (Some(first_port), Some(_), true, true) = (
+            first_port,
+            multi_cluster,
+            selected_is_first_declared,
+            first_is_http_family,
+        ) else {
+            if !self
+                .warned_sidecar_remote_unbridged
+                .swap(true, Ordering::Relaxed)
+            {
+                warn!(
+                    service = %self.service_name,
+                    namespace = %self.namespace,
+                    "sidecar-topology mesh service discovery skips remote-cluster workloads \
+                     (fail closed): east-west bridging requires mesh.multi_cluster in the \
+                     snapshot and the upstream's selected service port to be the service's \
+                     first declared HTTP-family port (the destination east-west gateway \
+                     routes a service-FQDN SNI to the first declared port only)"
+                );
+            }
+            return;
+        };
+
+        // Effective protocol of the first declared port (`protocol_overrides`
+        // applied), exactly as the mesh-mode materializer passes it.
+        let protocol = service
+            .protocol_overrides
+            .get(&first_port.port)
+            .copied()
+            .unwrap_or(first_port.protocol);
+        let mut gateway_targets = Vec::new();
+        crate::modes::mesh::append_cross_cluster_mesh_targets(
+            &mut gateway_targets,
+            &self.cluster_domain,
+            service,
+            first_port,
+            protocol,
+            workloads,
+            multi_cluster,
+        );
+        // SD-bridge-only additive tag (see the method doc): the destination
+        // sidecar routes the inner request by `Host`, and the gateway's client
+        // Host is not a mesh service host.
+        let authority_host = format!("{}.{}.svc", service.name, service.namespace);
+        for target in &mut gateway_targets {
+            target.tags.insert(
+                crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG.to_string(),
+                authority_host.clone(),
+            );
+        }
+        targets.extend(gateway_targets);
+    }
 }
 
 #[async_trait::async_trait]
@@ -298,42 +421,33 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             })
             .map(|workload| workload.spiffe_id.as_str())
             .collect();
+        let mut saw_remote_sidecar_workload = false;
         for workload in mesh.workloads.iter().filter(|workload| {
             Self::workload_matches_service(service, workload, &matching_service_spiffe_ids)
         }) {
+            let is_remote =
+                crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster);
+
+            // NEVER emit a direct per-pod dial for a Sidecar remote workload: a
+            // `remote-pod:15006` dial with a pinned pod SPIFFE fails in any
+            // multi-network mesh (the pod address is not reachable) while
+            // LOOKING like a routable failover target. The correct cross-cluster
+            // Sidecar shape is an east-west GATEWAY target (`mesh.cross_cluster`
+            // + `mesh.eastwest_sni`, trust-domain-only verification), which is
+            // appended after this loop via the SHARED mesh-mode core
+            // (`append_cross_cluster_mesh_targets`); when that bridge cannot
+            // honor the upstream's port selection it stays fail-closed (see
+            // `append_sidecar_cross_cluster_targets`).
+            if is_remote && self.topology == MeshSdTopology::Sidecar {
+                saw_remote_sidecar_workload = true;
+                continue;
+            }
+
             let Some(selected_port) =
                 Self::target_port_for_workload(selected_service_port.as_ref(), workload)
             else {
                 continue;
             };
-
-            let is_remote =
-                crate::modes::mesh::multicluster::workload_is_remote(workload, multi_cluster);
-
-            // FAIL CLOSED on Sidecar remote workloads: the correct cross-cluster
-            // Sidecar shape is an east-west GATEWAY target (`mesh.cross_cluster`
-            // + `mesh.eastwest_sni`, trust-domain-only verification — see
-            // `append_cross_cluster_mesh_targets`), which this SD path does not
-            // materialize yet. Emitting a direct `remote-pod:15006` dial with a
-            // pinned pod SPIFFE instead would fail in any multi-network mesh
-            // (the pod address is not reachable) while LOOKING like a routable
-            // failover target, so skip the workload rather than publish it.
-            // East-west-aware SD bridging is a documented follow-up.
-            if is_remote && self.topology == MeshSdTopology::Sidecar {
-                if !self
-                    .warned_sidecar_remote_skipped
-                    .swap(true, Ordering::Relaxed)
-                {
-                    warn!(
-                        service = %self.service_name,
-                        namespace = %self.namespace,
-                        "sidecar-topology mesh service discovery skips remote-cluster workloads \
-                         (fail closed): cross-cluster Sidecar dispatch requires east-west gateway \
-                         targets, which the gateway-to-mesh SD bridge does not materialize yet"
-                    );
-                }
-                continue;
-            }
 
             for address in &workload.addresses {
                 if address.is_empty() {
@@ -384,6 +498,20 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
                     path: None,
                 });
             }
+        }
+
+        // East-west bridge for Sidecar remote workloads: append gateway
+        // failover targets AFTER the local targets (mirroring the mesh-mode
+        // materializer's ordering — locals stay the first tier; the LB treats
+        // `mesh.cross_cluster` targets as always-failover local-first).
+        if saw_remote_sidecar_workload {
+            self.append_sidecar_cross_cluster_targets(
+                service,
+                &mesh.workloads,
+                multi_cluster,
+                selected_service_port.as_ref(),
+                &mut targets,
+            );
         }
 
         debug!(
