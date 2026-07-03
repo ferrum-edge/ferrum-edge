@@ -1510,6 +1510,66 @@ pub(crate) fn h3_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
     }
 }
 
+/// How a gRPC-flavored request may dispatch for an LB-selected target with
+/// respect to mesh transports (issue #2003).
+///
+/// The direct-dial gRPC pool (`GrpcConnectionPool`) speaks plaintext h2c /
+/// plain TLS straight to `target.host:target.port`. For a mesh-tagged target
+/// that dial BYPASSES the secured mesh transport: under STRICT
+/// PeerAuthentication it fails confusingly at the destination's capture
+/// listener, and under PERMISSIVE it succeeds **unauthenticated**, silently
+/// skipping SVID-mTLS/HBONE, identity pinning, and mesh authz identity. Every
+/// gRPC dispatch surface must therefore classify the selected target through
+/// this helper and never direct-dial a non-[`Direct`](GrpcMeshDispatch::Direct)
+/// target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcMeshDispatch {
+    /// No mesh transport tag: the direct `GrpcConnectionPool` dial is correct.
+    Direct,
+    /// Same-cluster Sidecar `mesh.mtls=true` target: dispatch through the
+    /// generic SVID-mTLS HTTP/2 path (`proxy_to_backend_mesh_mtls`), which is
+    /// hyper h2 end-to-end and preserves gRPC trailers. Only the H1/H2
+    /// frontend path can do this today; surfaces without a mesh-mTLS
+    /// dispatch (the H3 cross-protocol bridge, the gRPC retry loop after a
+    /// target rotation) must fail closed instead.
+    MeshMtls,
+    /// Cross-cluster east-west target (Ambient `mesh.hbone` or Sidecar
+    /// `mesh.mtls` with `mesh.cross_cluster=true`): fail closed. The gRPC
+    /// path has no east-west gateway dial-host override, destination-FQDN
+    /// SNI override, or trust-domain-scoped verification.
+    RefuseCrossCluster,
+    /// Same-cluster Ambient `mesh.hbone=true` target: fail closed. The HBONE
+    /// inner protocol is HTTP/1.1 over a byte tunnel (`hyper::client::conn::
+    /// http1` inside the CONNECT stream; the destination relays raw bytes to
+    /// the app), which cannot carry the HTTP/2 trailers gRPC requires for
+    /// `grpc-status`.
+    RefuseHbone,
+}
+
+/// Classify how a gRPC request may dispatch for `target`. See
+/// [`GrpcMeshDispatch`]. A target that carries BOTH transport tags (should not
+/// happen — topologies are mutually exclusive) is classified by the stricter
+/// refusal so it can never fall through to a direct dial. The cross-cluster
+/// check runs FIRST and keys on the `mesh.cross_cluster` tag alone — the
+/// pre-existing guard refused such targets even without a transport tag, and
+/// that fail-closed posture is preserved.
+pub fn classify_grpc_mesh_dispatch(
+    target: &crate::config::types::UpstreamTarget,
+) -> GrpcMeshDispatch {
+    if crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
+        || crate::proxy::mesh_mtls_pool::target_mesh_mtls_cross_cluster(target)
+    {
+        return GrpcMeshDispatch::RefuseCrossCluster;
+    }
+    if crate::proxy::hbone_pool::target_hbone_enabled(target) {
+        return GrpcMeshDispatch::RefuseHbone;
+    }
+    if crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target) {
+        return GrpcMeshDispatch::MeshMtls;
+    }
+    GrpcMeshDispatch::Direct
+}
+
 /// Build a gRPC error response with proper Trailers-Only encoding.
 ///
 /// gRPC errors use HTTP 200 with `grpc-status` and `grpc-message` as headers

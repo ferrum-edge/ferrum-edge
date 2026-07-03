@@ -14140,48 +14140,101 @@ async fn handle_proxy_request_inner(
     // flavor — any HTTP-family proxy can serve gRPC when the client sends
     // the right content-type. The gRPC pool uses h2c (plaintext HTTP/2) for
     // `BackendScheme::Http` and TLS+ALPN=h2 for `BackendScheme::Https`.
-    if is_grpc_request && proxy.dispatch_kind.is_http_family() {
-        // FAIL CLOSED on a gRPC request routed to a CROSS-CLUSTER east-west
-        // target (Ambient `mesh.hbone` or Sidecar `mesh.mtls`). The gRPC branch
-        // runs BEFORE the HBONE / mesh-mTLS dispatch gates and dials
-        // `target.host:target.port` directly via `GrpcConnectionPool` — for a
-        // cross-cluster target that host is a remote-pod / scoped synthetic
-        // identity that is NOT directly routable, and the dial has no east-west
-        // gateway dial-host override, no destination-FQDN SNI override, and no
-        // trust-domain-scoped verification. So a gRPC request here would either
-        // fail or — worse — bypass the SNI/trust-domain east-west path. Refuse
-        // it cleanly with a gRPC UNAVAILABLE (14, the gRPC analog of a 502
+    //
+    // MESH TRANSPORTS (issue #2003): the gRPC branch runs BEFORE the HBONE /
+    // mesh-mTLS dispatch gates below, and its pool dials the LB-selected
+    // `target.host:target.port` directly — which would silently bypass the
+    // secured mesh transport for a mesh-tagged target (unauthenticated under
+    // PERMISSIVE PeerAuthentication, confusing capture-listener failures under
+    // STRICT). Classify the selected target first:
+    //   * Same-cluster Sidecar `mesh.mtls` targets SKIP this branch and flow
+    //     down the generic HTTP dispatch path, whose mesh-mTLS gate + pool
+    //     (`proxy_to_backend_mesh_mtls`) carry gRPC natively: the pool is
+    //     hyper h2 end-to-end with pinned peer SVID, the request body streams
+    //     (`SizeLimitedIncoming`), and the `StreamingH2` response arm relays
+    //     backend trailers through `StripHopByHopTrailers` — the same trailer
+    //     semantics as `GrpcConnectionPool`. When that path cannot dispatch
+    //     (retry configured, body buffering required, no gateway SVID) the
+    //     mesh-mTLS gate below fails closed with a gRPC UNAVAILABLE.
+    //   * NATIVE-gRPC requests to Ambient `mesh.hbone` and cross-cluster
+    //     targets FAIL CLOSED inside this branch (see
+    //     `classify_grpc_mesh_dispatch`), never direct-dial.
+    //   * gRPC-Web (protocol-classified gRPC for plugin routing, but NOT the
+    //     native `application/grpc` content-type) frames its trailers inside
+    //     the response BODY, so it needs no HTTP/2 trailer relay: it falls
+    //     through for EVERY mesh-tagged target and rides the topology's
+    //     HTTP-family transport like plain HTTP (including HBONE and the
+    //     cross-cluster east-west paths). Non-mesh gRPC-Web keeps its
+    //     existing direct gRPC-pool dispatch unchanged.
+    let grpc_mesh_fall_through = is_grpc_request
+        && proxy.dispatch_kind.is_http_family()
+        && upstream_target.as_deref().is_some_and(|target| {
+            match grpc_proxy::classify_grpc_mesh_dispatch(target) {
+                grpc_proxy::GrpcMeshDispatch::Direct => false,
+                grpc_proxy::GrpcMeshDispatch::MeshMtls => true,
+                grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster
+                | grpc_proxy::GrpcMeshDispatch::RefuseHbone => !request_uses_grpc_content_type,
+            }
+        });
+    if is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through {
+        // FAIL CLOSED on a gRPC request routed to a mesh-tagged target this
+        // branch cannot dispatch over its secured transport (issue #2003):
+        //   * CROSS-CLUSTER east-west targets (Ambient `mesh.hbone` or Sidecar
+        //     `mesh.mtls`): the dial host is a remote-pod / scoped synthetic
+        //     identity that is NOT directly routable, and the dial has no
+        //     east-west gateway dial-host override, no destination-FQDN SNI
+        //     override, and no trust-domain-scoped verification. gRPC over
+        //     cross-cluster HBONE / mesh-mTLS is a documented follow-up
+        //     (HTTP-first), mirroring the WebSocket cross-cluster guards.
+        //   * Same-cluster Ambient `mesh.hbone` targets: the HBONE inner
+        //     protocol is HTTP/1.1 over a byte tunnel, which cannot carry the
+        //     HTTP/2 trailers gRPC requires — a documented residual
+        //     (docs/mesh.md), fail closed rather than silently corrupt.
+        //   * `MeshMtls` is normally unreachable here (the fall-through above
+        //     routes it down the generic mesh path) — refuse defensively.
+        // Refuse cleanly with a gRPC UNAVAILABLE (14, the gRPC analog of a 502
         // connection-level failure) before any backend dial / circuit-breaker
-        // charge. Full gRPC-over-HBONE / gRPC-over-mesh-mTLS cross-cluster is a
-        // documented follow-up (HTTP-first), mirroring the WebSocket
-        // cross-cluster fail-closed guards.
-        if let Some(target) = upstream_target.as_deref()
-            && (hbone_pool::target_hbone_cross_cluster(target)
-                || mesh_mtls_pool::target_mesh_mtls_cross_cluster(target))
-        {
-            warn!(
-                proxy_id = %proxy.id,
-                target_host = %target.host,
-                "Refusing gRPC dispatch to a cross-cluster east-west target: gRPC over \
-                 cross-cluster HBONE / mesh-mTLS is not yet supported (no gateway dial-host / \
-                 SNI override / trust-domain scope on the gRPC path). Failing closed with \
-                 gRPC UNAVAILABLE; tracked as a follow-up."
-            );
-            // Release a HALF_OPEN circuit-breaker probe slot that
-            // `check_circuit_breaker` may have admitted for this request — this
-            // reject precedes any backend dispatch, so a leaked probe slot would
-            // wedge the breaker (mirrors the WebSocket gateway-side rejects).
-            release_circuit_breaker_probe_on_admission_reject(
-                &state,
-                &proxy,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            );
-            record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-            return Ok(grpc_proxy::build_grpc_error_response(
-                14, // UNAVAILABLE
-                "gRPC over cross-cluster east-west routing is not supported",
-            ));
+        // charge — NEVER a direct plaintext dial that would bypass the mesh
+        // transport, identity pinning, and mesh authz identity.
+        if let Some(target) = upstream_target.as_deref() {
+            let refusal = match grpc_proxy::classify_grpc_mesh_dispatch(target) {
+                grpc_proxy::GrpcMeshDispatch::Direct => None,
+                grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => {
+                    Some("gRPC over cross-cluster east-west routing is not supported")
+                }
+                grpc_proxy::GrpcMeshDispatch::RefuseHbone => Some(
+                    "gRPC over the Ambient HBONE mesh transport is not supported \
+                     (HBONE inner protocol cannot carry gRPC trailers)",
+                ),
+                grpc_proxy::GrpcMeshDispatch::MeshMtls => {
+                    Some("gRPC to a sidecar mesh mTLS target cannot be dialed directly")
+                }
+            };
+            if let Some(message) = refusal {
+                warn!(
+                    proxy_id = %proxy.id,
+                    target_host = %target.host,
+                    message,
+                    "Refusing direct gRPC dispatch to a mesh-transport-tagged target: \
+                     failing closed with gRPC UNAVAILABLE instead of bypassing the \
+                     secured mesh transport"
+                );
+                // Release a HALF_OPEN circuit-breaker probe slot that
+                // `check_circuit_breaker` may have admitted for this request — this
+                // reject precedes any backend dispatch, so a leaked probe slot would
+                // wedge the breaker (mirrors the WebSocket gateway-side rejects).
+                release_circuit_breaker_probe_on_admission_reject(
+                    &state,
+                    &proxy,
+                    cb_target_key.as_deref(),
+                    cb_is_half_open_probe,
+                );
+                record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                return Ok(grpc_proxy::build_grpc_error_response(
+                    14, // UNAVAILABLE
+                    message,
+                ));
+            }
         }
 
         // Honor DestinationRule per-port `connect_timeout_ms` overrides on
@@ -14865,6 +14918,35 @@ async fn handle_proxy_request_inner(
                         Some(crate::circuit_breaker::target_key(&next.host, next.port));
                     grpc_final_cb_key = grpc_current_cb_key.clone();
                     grpc_current_target = Some(next);
+                }
+
+                // Re-screen the (possibly LB-rotated) retry target for mesh
+                // transport tags (issue #2003): the initial-attempt guard /
+                // fall-through above only classified the FIRST selected target,
+                // and this loop dials `GrpcConnectionPool` directly — a rotation
+                // onto a mesh-tagged target (mixed mesh/non-mesh upstream) must
+                // fail closed, never direct-dial past the secured transport.
+                // `MeshMtls` also refuses here: the generic mesh-mTLS path
+                // cannot dispatch retries (`!has_retry` gate), so there is no
+                // transport to switch to mid-loop. No circuit-breaker probe
+                // slot is held for the new target yet (the breaker is checked
+                // just below), so only the request is counted — mirrors the
+                // egress-policy re-screen below.
+                if let Some(ref rotated_target) = grpc_current_target
+                    && grpc_proxy::classify_grpc_mesh_dispatch(rotated_target)
+                        != grpc_proxy::GrpcMeshDispatch::Direct
+                {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        target_host = %rotated_target.host,
+                        "gRPC retry rotated onto a mesh-transport-tagged target; \
+                         refusing the direct dial and failing closed with gRPC UNAVAILABLE"
+                    );
+                    record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                    return Ok(grpc_proxy::build_grpc_error_response(
+                        14, // UNAVAILABLE
+                        "gRPC retry target requires a mesh transport that does not support retries",
+                    ));
                 }
 
                 // Re-screen the (possibly LB-rotated) retry target before
@@ -16353,6 +16435,15 @@ async fn handle_proxy_request_inner(
             block_reason,
             "mesh.hbone=true target requires HBONE dispatch; refusing direct-backend fallback"
         );
+        // A gRPC-flavored request gets a protocol-appropriate Trailers-Only
+        // refusal (gRPC errors ride HTTP 200 + grpc-status) instead of a JSON
+        // 502 the client cannot parse. Same fail-closed contract either way.
+        if is_grpc_request {
+            return Ok(grpc_proxy::build_grpc_error_response(
+                14, // UNAVAILABLE
+                &format!("HBONE dispatch required for this backend target: {block_reason}"),
+            ));
+        }
         return Ok(build_response(
             StatusCode::BAD_GATEWAY,
             r#"{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}"#,
@@ -16390,6 +16481,21 @@ async fn handle_proxy_request_inner(
             block_reason,
             "mesh.mtls=true target requires sidecar SVID-mTLS dispatch; refusing direct-backend fallback"
         );
+        // This gate is the fail-closed surface for gRPC-over-mesh-mTLS (issue
+        // #2003): gRPC requests to same-cluster `mesh.mtls` targets skip the
+        // direct-dial gRPC branch and dispatch through the mesh-mTLS pool, so
+        // when that transport is unavailable (retry configured, request-body
+        // buffering, missing gateway SVID) the request must die HERE with a
+        // protocol-appropriate Trailers-Only refusal — never fall back to a
+        // plaintext direct dial.
+        if is_grpc_request {
+            return Ok(grpc_proxy::build_grpc_error_response(
+                14, // UNAVAILABLE
+                &format!(
+                    "sidecar mesh mTLS dispatch required for this backend target: {block_reason}"
+                ),
+            ));
+        }
         return Ok(build_response(
             StatusCode::BAD_GATEWAY,
             r#"{"error":"Bad Gateway","message":"Sidecar mTLS dispatch required for this backend target"}"#,
@@ -21836,6 +21942,18 @@ async fn proxy_to_backend_mesh_mtls(
         );
     }
 
+    // Native-gRPC flavor (issue #2003): same-cluster `mesh.mtls` gRPC skips
+    // the direct-dial gRPC pool and dispatches here — the mesh-mTLS pool is
+    // hyper h2 end-to-end, so gRPC trailers ride it natively. Two gRPC-only
+    // adjustments below: the outbound request re-adds `te: trailers` (the
+    // hop-by-hop strip removes it, but the gRPC HTTP/2 mapping mandates it —
+    // the direct gRPC pool synthesizes it the same way), and the response is
+    // never buffered (a buffered `BackendResponse` has no trailer channel, so
+    // buffering would silently drop `grpc-status`).
+    let is_grpc = headers
+        .get("content-type")
+        .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
+
     let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
     let mut sender = match state
         .mesh_mtls_pool
@@ -22046,6 +22164,16 @@ async fn proxy_to_backend_mesh_mtls(
         }
     }
 
+    // gRPC HTTP/2 mapping: requests MUST carry `te: trailers` (the only `te`
+    // value HTTP/2 permits). The hop-by-hop strip above removes the client's
+    // copy, so re-synthesize it for native-gRPC requests — mirroring
+    // `strip_backend_request_headers_for_grpc` on the direct gRPC pool path.
+    if is_grpc {
+        parts
+            .headers
+            .insert(http::header::TE, http::HeaderValue::from_static("trailers"));
+    }
+
     let xff_val = build_xff_value(
         headers.get("x-forwarded-for").map(|s| s.as_str()),
         client_ip,
@@ -22209,6 +22337,50 @@ async fn proxy_to_backend_mesh_mtls(
         status,
         &resp_headers,
     );
+
+    // gRPC responses on this path MUST stream: the buffered arm below
+    // (`ResponseBody::Buffered`) collects only body bytes — it has no trailer
+    // channel — so buffering a gRPC response would silently drop `grpc-status`
+    // and corrupt the RPC. If buffering is still demanded after the
+    // content-type refinement (explicit `response_body_mode = Buffer`, or a
+    // plugin that needs the body for this content-type), FAIL CLOSED with a
+    // clear Trailers-Only refusal instead of forwarding a trailerless body
+    // (fail-closed beats silently-wrong) or streaming past a plugin that
+    // required the body (a silent policy bypass). This diverges from the
+    // direct gRPC pool, whose buffered path collects AND re-emits trailers;
+    // operators hitting this refusal should exempt the mesh gRPC route from
+    // response-body buffering. Status 200 keeps circuit-breaker / passive
+    // health accurate: the BACKEND responded fine — this is a gateway-side
+    // policy conflict, not a backend fault.
+    if is_grpc && !stream_response {
+        warn!(
+            proxy_id = %proxy.id,
+            target_host = %target.host,
+            response_status = status,
+            "Refusing to buffer a gRPC response over sidecar mesh mTLS: buffering would \
+             drop gRPC trailers (grpc-status). Failing closed with gRPC UNAVAILABLE; \
+             exempt this route from response-body buffering to restore gRPC dispatch"
+        );
+        let mut refusal_headers = HashMap::with_capacity(3);
+        refusal_headers.insert("content-type".to_string(), "application/grpc".to_string());
+        refusal_headers.insert("grpc-status".to_string(), "14".to_string()); // UNAVAILABLE
+        refusal_headers.insert(
+            "grpc-message".to_string(),
+            "gRPC over sidecar mesh mTLS cannot buffer responses (trailers would be dropped)"
+                .to_string(),
+        );
+        return (
+            retry::BackendResponse {
+                status_code: 200, // gRPC errors ride HTTP 200 + trailers
+                body: ResponseBody::Buffered(Vec::new()),
+                headers: refusal_headers,
+                connection_error: false,
+                backend_resolved_ip: resolved_ip,
+                error_class: None,
+            },
+            None,
+        );
+    }
 
     if stream_response {
         (

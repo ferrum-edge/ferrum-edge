@@ -19,15 +19,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use chrono::Utc;
 use futures_util::{Stream, StreamExt, stream};
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::Frame;
+use hyper::server::conn::http2::Builder as Http2ServerBuilder;
+use hyper::service::service_fn;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_stream::wrappers::{
-    IntervalStream, TcpListenerStream, UnboundedReceiverStream, UnixListenerStream,
+    IntervalStream, ReceiverStream, TcpListenerStream, UnboundedReceiverStream, UnixListenerStream,
 };
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
@@ -3027,6 +3033,443 @@ async fn functional_mesh_sidecar_egress_rejects_untrusted_client_gateway() {
     assert!(
         !body.contains("backend-ok"),
         "no backend body may leak through an unverified mTLS session: {body:?}\n{logs}"
+    );
+}
+
+// ── gRPC over the Sidecar mesh-mTLS egress transport (issue #2003) ──────────
+
+/// What the h2c gRPC client at point A observed: HTTP status, response
+/// HEADERS, collected DATA bytes, and response TRAILERS. `trailers` is empty
+/// when the stream ended without a trailers frame — e.g. a Trailers-Only
+/// gateway refusal, whose `grpc-status` rides the response headers instead.
+#[derive(Debug, Default)]
+struct GrpcEgressResponse {
+    status: u16,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+    trailers: HashMap<String, String>,
+}
+
+/// gRPC unary wire framing: `[compressed=0][len: u32 BE][payload]`.
+fn grpc_framed_payload(payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(5 + payload.len());
+    body.push(0);
+    body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    body.extend_from_slice(payload);
+    body
+}
+
+/// h2c gRPC echo backend that responds with REAL HTTP/2 trailers: one DATA
+/// frame echoing the request body, then a trailers frame carrying
+/// `grpc-status: 0` and a custom `x-mesh-trailer` marker. Unlike the
+/// header-encoded Trailers-Only shape, this exercises the full
+/// data-then-trailers relay the mesh-mTLS gRPC path must preserve end-to-end.
+async fn start_grpc_trailers_echo_backend() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gRPC trailers echo backend");
+    let port = listener.local_addr().expect("backend local addr").port();
+
+    tokio::spawn(async move {
+        loop {
+            let (stream, _addr) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let _ = stream.set_nodelay(true);
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let builder = Http2ServerBuilder::new(TokioExecutor::new());
+                let service = service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+                    let path = req.uri().path().to_string();
+                    let body_bytes = req
+                        .into_body()
+                        .collect()
+                        .await
+                        .map(|c| c.to_bytes())
+                        .unwrap_or_default();
+
+                    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
+                    let _ = tx.send(Ok(Frame::data(body_bytes))).await;
+                    let mut trailers = hyper::HeaderMap::new();
+                    trailers.insert("grpc-status", hyper::header::HeaderValue::from_static("0"));
+                    trailers.insert(
+                        "x-mesh-trailer",
+                        hyper::header::HeaderValue::from_static("echo-ok"),
+                    );
+                    let _ = tx.send(Ok(Frame::trailers(trailers))).await;
+                    drop(tx); // channel EOF ends the stream after the trailers
+
+                    let response = hyper::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .header("x-echo-path", &path)
+                        .body(StreamBody::new(ReceiverStream::new(rx)))
+                        .expect("build gRPC trailers echo response");
+                    Ok::<_, hyper::Error>(response)
+                });
+                if let Err(e) = builder.serve_connection(io, service).await
+                    && !format!("{e}").contains("connection closed")
+                {
+                    eprintln!("gRPC trailers echo backend error: {e}");
+                }
+            });
+        }
+    });
+
+    port
+}
+
+/// One captured gRPC request at point A's outbound listener: h2c
+/// (prior-knowledge HTTP/2) with `content-type: application/grpc` and the
+/// service FQDN as `:authority`, collecting the response DATA frames AND the
+/// trailers frame separately so trailer preservation is actually asserted.
+async fn grpc_egress_request(
+    port: u16,
+    authority: &str,
+    path: &str,
+    framed_body: &[u8],
+) -> Result<GrpcEgressResponse, Box<dyn std::error::Error + Send + Sync>> {
+    use hyper::client::conn::http2;
+
+    let stream = tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect(("127.0.0.1", port)),
+    )
+    .await
+    .map_err(|_| "connect timed out")??;
+    let _ = stream.set_nodelay(true);
+    let io = TokioIo::new(stream);
+    let (mut sender, conn) = http2::handshake(TokioExecutor::new(), io).await?;
+    let conn_task = tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    let req = hyper::Request::builder()
+        .method("POST")
+        .uri(format!("http://{authority}{path}"))
+        .header("content-type", "application/grpc")
+        .header("te", "trailers")
+        .body(Full::new(Bytes::copy_from_slice(framed_body)))?;
+    let response = tokio::time::timeout(Duration::from_secs(10), sender.send_request(req))
+        .await
+        .map_err(|_| "gRPC response headers timed out")??;
+
+    let status = response.status().as_u16();
+    let mut headers = HashMap::new();
+    for (k, v) in response.headers() {
+        if let Ok(vs) = v.to_str() {
+            headers.insert(k.as_str().to_string(), vs.to_string());
+        }
+    }
+
+    let mut body_bytes = Vec::new();
+    let mut trailers = HashMap::new();
+    let mut body = response.into_body();
+    loop {
+        let frame = match tokio::time::timeout(Duration::from_secs(10), body.frame()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(e))) => return Err(Box::new(e)),
+            Ok(None) => break,
+            Err(_) => return Err("gRPC response body timed out".into()),
+        };
+        if frame.is_data() {
+            if let Ok(data) = frame.into_data() {
+                body_bytes.extend_from_slice(&data);
+            }
+        } else if frame.is_trailers()
+            && let Ok(map) = frame.into_trailers()
+        {
+            for (k, v) in &map {
+                if let Ok(vs) = v.to_str() {
+                    trailers.insert(k.as_str().to_string(), vs.to_string());
+                }
+            }
+        }
+    }
+    conn_task.abort();
+
+    Ok(GrpcEgressResponse {
+        status,
+        headers,
+        body: body_bytes,
+        trailers,
+    })
+}
+
+/// Drive one captured gRPC request from gateway A to the trailers-echo gRPC
+/// backend behind gateway B over the given topology's egress transport,
+/// polling until `converged` accepts a response or the deadline lapses.
+/// Mirrors [`drive_egress_a_to_b`]; returns the FINAL observed response plus
+/// both gateways' captured logs so the caller can assert either convergence
+/// (positive/fail-closed cases) or the final state (negative cases).
+async fn drive_grpc_egress_a_to_b(
+    topology: &str,
+    client_trusted: bool,
+    converged: fn(&GrpcEgressResponse) -> bool,
+) -> Result<(GrpcEgressResponse, String), String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+    let b_spiffe = "spiffe://cluster.local/ns/ferrum/sa/svc-b";
+    let trust_label = if client_trusted {
+        "trusted"
+    } else {
+        "untrusted"
+    };
+    let payload = b"ferrum-mesh-grpc-payload";
+    let framed = grpc_framed_payload(payload);
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let node_a = format!("functional-mesh-grpc-{topology}-{trust_label}-a-{attempt}");
+        let node_b = format!("functional-mesh-grpc-{topology}-{trust_label}-b-{attempt}");
+        let temp_a = TempDir::new().map_err(|e| format!("temp dir a: {e}"))?;
+        let temp_b = TempDir::new().map_err(|e| format!("temp dir b: {e}"))?;
+        let svids = generate_two_gateway_svids(temp_b.path(), a_spiffe, b_spiffe);
+        // Untrusted A mints its OWN CA + SVID (same negative shape as
+        // `drive_egress_a_to_b`): neither side can verify the other.
+        let a_svid = if client_trusted {
+            svids.a
+        } else {
+            generate_gateway_svid(temp_a.path(), a_spiffe)
+        };
+        let backend_port = start_grpc_trailers_echo_backend().await;
+
+        let cp_b =
+            start_static_mesh_cp(egress_service_slice(&node_b, b_spiffe, backend_port)).await;
+        let cp_a =
+            start_static_mesh_cp(egress_service_slice(&node_a, b_spiffe, backend_port)).await;
+        let ports_a = reserve_mesh_ports().await;
+        let ports_b = reserve_mesh_ports().await;
+        let a_outbound_port = ports_a.outbound;
+        let b_transport_port = match topology {
+            "sidecar" => ports_b.inbound,
+            "ambient" => ports_b.hbone,
+            other => return Err(format!("unsupported egress topology {other}")),
+        };
+
+        let mut child_b = spawn_mesh_gateway(
+            &temp_b,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_b.addr,
+                ports: ports_b,
+                node_id: &node_b,
+                config_protocol: "native",
+                topology,
+                waypoint_name: None,
+                env_overrides: vec![
+                    ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                    ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                    ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+                    ("FERRUM_GATEWAY_SVID_CERT_PATH", svids.b.cert_path.clone()),
+                    ("FERRUM_GATEWAY_SVID_KEY_PATH", svids.b.key_path.clone()),
+                    (
+                        "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                        svids.b.trust_bundle_path.clone(),
+                    ),
+                ],
+            },
+        );
+        if !wait_for_tcp_port(b_transport_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway B transport listener never bound\n{}",
+                captured_output(&temp_b)
+            );
+            kill_child(&mut child_b);
+            cp_b.shutdown().await;
+            cp_a.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let mut a_env = vec![
+            ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+            ("FERRUM_LOG_LEVEL", "debug".to_string()),
+            ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", a_spiffe.to_string()),
+            ("FERRUM_GATEWAY_SVID_CERT_PATH", a_svid.cert_path.clone()),
+            ("FERRUM_GATEWAY_SVID_KEY_PATH", a_svid.key_path.clone()),
+            (
+                "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                a_svid.trust_bundle_path.clone(),
+            ),
+        ];
+        match topology {
+            "sidecar" => {
+                a_env.push(("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()));
+                a_env.push(("FERRUM_MESH_EGRESS_MTLS_PORT", b_transport_port.to_string()));
+            }
+            _ => {
+                a_env.push(("FERRUM_POOL_WARMUP_ENABLED", "true".to_string()));
+                a_env.push((
+                    "FERRUM_MESH_EGRESS_HBONE_PORT",
+                    b_transport_port.to_string(),
+                ));
+            }
+        }
+        let mut child_a = spawn_mesh_gateway(
+            &temp_a,
+            MeshGatewaySpawnOptions {
+                cp_addr: cp_a.addr,
+                ports: ports_a,
+                node_id: &node_a,
+                config_protocol: "native",
+                topology,
+                waypoint_name: None,
+                env_overrides: a_env,
+            },
+        );
+        if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+            last_failure = format!(
+                "attempt {attempt}: gateway A outbound listener never bound\n{}",
+                captured_output(&temp_a)
+            );
+            kill_child(&mut child_a);
+            kill_child(&mut child_b);
+            cp_a.shutdown().await;
+            cp_b.shutdown().await;
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        // Poll the captured gRPC request. The route materialization and (on
+        // Ambient) the capability probe race the first request, so early
+        // responses can be route-miss rejects; poll until the caller's
+        // convergence predicate accepts one or the deadline lapses. Negative
+        // cases pass a predicate that never accepts and assert the FINAL state.
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let last: Result<GrpcEgressResponse, String> = loop {
+            let observed = grpc_egress_request(
+                a_outbound_port,
+                "svc-b.ferrum.svc.cluster.local",
+                "/echo.Mesh/Call",
+                &framed,
+            )
+            .await
+            .map_err(|e| format!("gRPC egress request failed: {e}"));
+            match observed {
+                Ok(resp) if converged(&resp) => break Ok(resp),
+                other => {
+                    if Instant::now() >= deadline {
+                        break other;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        let output_a = captured_output(&temp_a);
+        let output_b = captured_output(&temp_b);
+        kill_child(&mut child_a);
+        kill_child(&mut child_b);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+
+        let logs = format!("--- gateway A ---\n{output_a}\n--- gateway B ---\n{output_b}");
+        return match last {
+            Ok(resp) => Ok((resp, logs)),
+            Err(e) => Err(format!("{e}\n{logs}")),
+        };
+    }
+
+    Err(format!(
+        "gRPC egress gateways never bound their listeners after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// gRPC keystone (Sidecar, issue #2003): a captured native-gRPC request at
+/// gateway A rides A's **SVID-mTLS HTTP/2 egress** (never the direct-dial gRPC
+/// pool) to the gRPC backend behind gateway B, and the backend's REAL HTTP/2
+/// trailers (`grpc-status`, custom trailer) survive the whole relay back to
+/// point A's client — the mesh-mTLS path's `StreamingH2` arm preserves
+/// trailers after hop-by-hop filtering.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_egress_grpc_routes_a_to_b_with_trailers() {
+    let (resp, logs) = drive_grpc_egress_a_to_b("sidecar", true, |resp| {
+        resp.status == 200
+            && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")
+            && resp
+                .body
+                .windows(b"ferrum-mesh-grpc-payload".len())
+                .any(|w| w == b"ferrum-mesh-grpc-payload")
+    })
+    .await
+    .expect("sidecar gRPC egress drive");
+    assert_eq!(
+        resp.status, 200,
+        "the captured gRPC request must traverse A's SVID-mTLS egress to B's gRPC backend: {resp:?}\n{logs}"
+    );
+    assert_eq!(
+        resp.trailers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "the backend's grpc-status TRAILER must survive the mesh-mTLS relay: {resp:?}\n{logs}"
+    );
+    assert_eq!(
+        resp.trailers.get("x-mesh-trailer").map(String::as_str),
+        Some("echo-ok"),
+        "custom (non-hop-by-hop) trailers must survive the mesh-mTLS relay: {resp:?}\n{logs}"
+    );
+    assert!(
+        resp.body
+            .windows(b"ferrum-mesh-grpc-payload".len())
+            .any(|w| w == b"ferrum-mesh-grpc-payload"),
+        "the echoed gRPC payload must ride the relayed DATA frames: {resp:?}\n{logs}"
+    );
+}
+
+/// gRPC mTLS negative (Sidecar, issue #2003): an untrusted gateway A (SVID not
+/// chaining to the mesh CA) must NEVER complete a gRPC call to B — the gRPC
+/// dispatch rides the same verified SVID-mTLS transport as HTTP, so an
+/// unverifiable peer fails closed instead of falling back to a direct dial.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_egress_grpc_rejects_untrusted_client_gateway() {
+    let (resp, logs) = drive_grpc_egress_a_to_b("sidecar", false, |resp| {
+        // Success shape must never be observed; poll to the deadline.
+        resp.status == 200 && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")
+    })
+    .await
+    .expect("untrusted gRPC egress drive");
+    assert!(
+        !(resp.status == 200 && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")),
+        "an untrusted gateway's gRPC request must fail closed, not complete: {resp:?}\n{logs}"
+    );
+    assert!(
+        !resp
+            .body
+            .windows(b"ferrum-mesh-grpc-payload".len())
+            .any(|w| w == b"ferrum-mesh-grpc-payload"),
+        "no backend payload may leak through an unverified mTLS session: {resp:?}\n{logs}"
+    );
+}
+
+/// gRPC fail-closed (Ambient, issue #2003): a captured native-gRPC request to
+/// an HBONE-tagged destination is refused BEFORE any dial with a Trailers-Only
+/// gRPC UNAVAILABLE (HTTP 200 + `grpc-status: 14` in the response HEADERS) —
+/// the HBONE inner protocol is HTTP/1.1 and cannot carry gRPC trailers, and a
+/// direct plaintext dial would silently bypass the mesh transport. The refusal
+/// must never converge to a completed call.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_egress_grpc_fails_closed_unavailable() {
+    let (resp, logs) = drive_grpc_egress_a_to_b("ambient", true, |resp| {
+        resp.status == 200 && resp.headers.get("grpc-status").map(String::as_str) == Some("14")
+    })
+    .await
+    .expect("ambient gRPC fail-closed drive");
+    assert_eq!(
+        resp.status, 200,
+        "the HBONE gRPC refusal rides HTTP 200 Trailers-Only encoding: {resp:?}\n{logs}"
+    );
+    assert_eq!(
+        resp.headers.get("grpc-status").map(String::as_str),
+        Some("14"),
+        "gRPC to an HBONE-tagged target must fail closed with UNAVAILABLE: {resp:?}\n{logs}"
+    );
+    assert!(
+        resp.body.is_empty(),
+        "the fail-closed refusal must not carry any backend bytes (no dial happened): {resp:?}\n{logs}"
     );
 }
 

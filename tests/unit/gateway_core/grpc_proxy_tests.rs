@@ -866,3 +866,147 @@ async fn grpc_channel_body_propagates_frontend_error_as_body_error() {
         "a transport-level abort is not a size violation"
     );
 }
+
+// ── gRPC mesh-transport dispatch classification (issue #2003) ───────────────
+//
+// The direct-dial gRPC pool must NEVER dispatch a mesh-transport-tagged target
+// (silent SVID-mTLS/HBONE bypass — unauthenticated under PERMISSIVE
+// PeerAuthentication). `classify_grpc_mesh_dispatch` is the single predicate
+// every gRPC dispatch surface (H1/H2 branch, its retry rotation, the H3
+// bridge) consults; these tests pin the classification matrix.
+
+fn target_with_tags(tags: &[(&str, &str)]) -> ferrum_edge::config::types::UpstreamTarget {
+    ferrum_edge::config::types::UpstreamTarget {
+        host: "orders.default.svc.cluster.local".to_string(),
+        port: 8080,
+        service_port_policy_key: None,
+        weight: 100,
+        tags: tags
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect(),
+        locality: None,
+        path: None,
+    }
+}
+
+#[test]
+fn grpc_mesh_dispatch_untagged_target_is_direct() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target_with_tags(&[])),
+        GrpcMeshDispatch::Direct,
+        "a target without mesh transport tags keeps the direct gRPC pool dial"
+    );
+    // Unrelated tags must not trip the mesh classification.
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target_with_tags(&[("subset", "v2")])),
+        GrpcMeshDispatch::Direct
+    );
+    // A boolish-false transport tag is NOT mesh-tagged.
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target_with_tags(&[(
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
+            "false"
+        )])),
+        GrpcMeshDispatch::Direct
+    );
+}
+
+#[test]
+fn grpc_mesh_dispatch_same_cluster_mtls_routes_over_mesh_mtls() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    let target = target_with_tags(&[
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
+            "true",
+        ),
+        (
+            ferrum_edge::proxy::hbone_pool::MESH_SPIFFE_ID_TAG,
+            "spiffe://cluster.local/ns/default/sa/orders",
+        ),
+    ]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target),
+        GrpcMeshDispatch::MeshMtls,
+        "same-cluster Sidecar mesh-mTLS targets dispatch over the SVID-mTLS H2 pool"
+    );
+}
+
+#[test]
+fn grpc_mesh_dispatch_same_cluster_hbone_fails_closed() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    let target = target_with_tags(&[(ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true")]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target),
+        GrpcMeshDispatch::RefuseHbone,
+        "the HBONE inner protocol is HTTP/1.1 and cannot carry gRPC trailers — refuse, never dial"
+    );
+}
+
+#[test]
+fn grpc_mesh_dispatch_cross_cluster_fails_closed_for_both_transports() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    let mtls_xc = target_with_tags(&[
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
+            "true",
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG,
+            "true",
+        ),
+    ]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&mtls_xc),
+        GrpcMeshDispatch::RefuseCrossCluster
+    );
+    let hbone_xc = target_with_tags(&[
+        (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG,
+            "true",
+        ),
+    ]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&hbone_xc),
+        GrpcMeshDispatch::RefuseCrossCluster,
+        "cross-cluster east-west targets refuse gRPC regardless of transport tag"
+    );
+}
+
+#[test]
+fn grpc_mesh_dispatch_conflicting_tags_take_the_stricter_refusal() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    // Both transport tags on one target should not happen (topologies are
+    // mutually exclusive), but if it does the target must NOT fall through to
+    // the mesh-mTLS dispatch — HBONE wins as a refusal.
+    let both = target_with_tags(&[
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
+            "true",
+        ),
+        (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
+    ]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&both),
+        GrpcMeshDispatch::RefuseHbone
+    );
+}
+
+#[test]
+fn grpc_mesh_dispatch_cross_cluster_tag_alone_still_refuses() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    // `mesh.cross_cluster` without a transport tag is not a shape the
+    // materializers produce, but the pre-existing gRPC guard refused it and
+    // the classifier preserves that fail-closed posture (never direct-dial a
+    // target that claims to be cross-cluster).
+    let xc_only = target_with_tags(&[(
+        ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG,
+        "true",
+    )]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&xc_only),
+        GrpcMeshDispatch::RefuseCrossCluster
+    );
+}
