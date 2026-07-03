@@ -1644,9 +1644,11 @@ pub fn classify_grpc_mesh_dispatch(
 /// target (issue #2003).
 ///
 /// * `Direct` never falls through — the direct `GrpcConnectionPool` serves it.
-/// * `MeshMtls` always falls through — the generic mesh-mTLS path carries
-///   every gRPC flavor (native streams with wire trailers; translated
-///   gRPC-Web buffers and re-encodes the captured trailers).
+/// * `MeshMtls` falls through only when the generic mesh-mTLS path can carry
+///   the request body without pre-buffering. Native streams and binary
+///   translated gRPC-Web are supported there; text-mode translated gRPC-Web
+///   still needs request-body buffering for base64 decode, which that path
+///   refuses today, so it fails closed before falling through.
 /// * `RefuseCrossCluster` / `RefuseHbone` fall through ONLY for PASS-THROUGH
 ///   gRPC-Web (body-framed trailers, rides the HTTP-family transport like
 ///   plain HTTP). Native gRPC must be refused inside the branch, and so must
@@ -1662,10 +1664,11 @@ pub fn grpc_mesh_dispatch_falls_through(
     dispatch: GrpcMeshDispatch,
     request_uses_grpc_content_type: bool,
     grpc_web_translated: bool,
+    mesh_mtls_supports_request_body: bool,
 ) -> bool {
     match dispatch {
         GrpcMeshDispatch::Direct => false,
-        GrpcMeshDispatch::MeshMtls => true,
+        GrpcMeshDispatch::MeshMtls => mesh_mtls_supports_request_body,
         GrpcMeshDispatch::RefuseCrossCluster | GrpcMeshDispatch::RefuseHbone => {
             !request_uses_grpc_content_type && !grpc_web_translated
         }

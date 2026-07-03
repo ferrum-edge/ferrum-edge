@@ -14178,8 +14178,11 @@ async fn handle_proxy_request_inner(
     //     refusal is also what the direct path returns a translated request
     //     on a terminal gRPC-dispatch error — `build_grpc_error_response`
     //     with `grpc-status` in the response HEADERS, which gRPC-Web clients
-    //     accept as a Trailers-Only response). `MeshMtls` still falls
-    //     through: the mesh-mTLS buffered arm re-encodes translated trailers.
+    //     accept as a Trailers-Only response). `MeshMtls` still falls through
+    //     for native gRPC and binary translated gRPC-Web, but text-mode
+    //     translated gRPC-Web remains fail-closed here because it requires
+    //     request-body buffering and the generic mesh-mTLS path does not accept
+    //     pre-buffered request bodies.
     let grpc_request_is_web_translated =
         crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx);
     let grpc_mesh_fall_through = is_grpc_request
@@ -14189,6 +14192,7 @@ async fn handle_proxy_request_inner(
                 grpc_proxy::classify_grpc_mesh_dispatch(target),
                 request_uses_grpc_content_type,
                 grpc_request_is_web_translated,
+                !requires_request_body_buffering,
             )
         });
     if is_grpc_request && proxy.dispatch_kind.is_http_family() && !grpc_mesh_fall_through {
@@ -21320,6 +21324,33 @@ fn mesh_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::B
     }
 }
 
+/// Gateway-side refusal when native gRPC over sidecar mesh-mTLS would require
+/// response buffering. The client sees a gRPC UNAVAILABLE, but backend-health
+/// accounting must stay neutral: no backend fault occurred.
+fn mesh_grpc_response_buffering_refusal_response(
+    resolved_ip: Option<String>,
+) -> retry::BackendResponse {
+    let mut headers = HashMap::with_capacity(3);
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "grpc-status".to_string(),
+        grpc_proxy::grpc_status::UNAVAILABLE.to_string(),
+    );
+    headers.insert(
+        "grpc-message".to_string(),
+        "gRPC over sidecar mesh mTLS cannot buffer responses (trailers would be dropped)"
+            .to_string(),
+    );
+    retry::BackendResponse {
+        status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
+        body: ResponseBody::Buffered(Vec::new()),
+        headers,
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_to_backend_hbone(
     state: &ProxyState,
@@ -22757,23 +22788,8 @@ async fn proxy_to_backend_mesh_mtls(
              drop gRPC trailers (grpc-status). Failing closed with gRPC UNAVAILABLE; \
              exempt this route from response-body buffering to restore gRPC dispatch"
         );
-        let mut refusal_headers = HashMap::with_capacity(3);
-        refusal_headers.insert("content-type".to_string(), "application/grpc".to_string());
-        refusal_headers.insert("grpc-status".to_string(), "14".to_string()); // UNAVAILABLE
-        refusal_headers.insert(
-            "grpc-message".to_string(),
-            "gRPC over sidecar mesh mTLS cannot buffer responses (trailers would be dropped)"
-                .to_string(),
-        );
         return (
-            retry::BackendResponse {
-                status_code: 200, // gRPC errors ride HTTP 200 + trailers
-                body: ResponseBody::Buffered(Vec::new()),
-                headers: refusal_headers,
-                connection_error: false,
-                backend_resolved_ip: resolved_ip,
-                error_class: None,
-            },
+            mesh_grpc_response_buffering_refusal_response(resolved_ip),
             None,
             None,
         );
@@ -22857,6 +22873,13 @@ async fn proxy_to_backend_mesh_mtls(
                     timeout_ms = timeout_ms,
                     "sidecar mTLS backend response body read timed out"
                 );
+                if is_grpc_flavored {
+                    return (
+                        mesh_grpc_deadline_exceeded_response(resolved_ip),
+                        None,
+                        None,
+                    );
+                }
                 return (
                     retry::BackendResponse {
                         status_code: 504,
@@ -27067,6 +27090,53 @@ mod tests {
             panic!("SNI direct-H2 rejection should be buffered");
         };
         assert_eq!(body.as_slice(), br#"{"error":"Bad Gateway"}"#);
+    }
+
+    #[test]
+    fn mesh_grpc_response_buffering_refusal_is_gateway_side_neutral() {
+        let resp = mesh_grpc_response_buffering_refusal_response(Some("127.0.0.2".to_string()));
+
+        assert_eq!(resp.status_code, 200);
+        assert!(!resp.connection_error);
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::DispatchPolicyRejected)
+        );
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.2"));
+        assert_eq!(
+            resp.headers.get("content-type").map(String::as_str),
+            Some("application/grpc")
+        );
+        assert_eq!(
+            resp.headers.get("grpc-status").map(String::as_str),
+            Some("14")
+        );
+        let ResponseBody::Buffered(body) = resp.body else {
+            panic!("gRPC buffering refusal should be buffered");
+        };
+        assert!(body.is_empty(), "Trailers-Only refusal carries no body");
+    }
+
+    #[test]
+    fn mesh_grpc_deadline_exceeded_response_is_trailers_only_timeout() {
+        let resp = mesh_grpc_deadline_exceeded_response(Some("127.0.0.3".to_string()));
+
+        assert_eq!(resp.status_code, 200);
+        assert!(!resp.connection_error);
+        assert_eq!(resp.error_class, Some(retry::ErrorClass::ReadWriteTimeout));
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.3"));
+        assert_eq!(
+            resp.headers.get("content-type").map(String::as_str),
+            Some("application/grpc")
+        );
+        assert_eq!(
+            resp.headers.get("grpc-status").map(String::as_str),
+            Some("4")
+        );
+        let ResponseBody::Buffered(body) = resp.body else {
+            panic!("gRPC deadline response should be buffered");
+        };
+        assert!(body.is_empty(), "Trailers-Only timeout carries no body");
     }
 
     #[tokio::test]
