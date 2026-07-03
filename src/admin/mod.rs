@@ -4860,6 +4860,30 @@ mod tests {
                 Method::DELETE,
                 vec!["admin", "tls", "certificates", "edge-cert"],
             ),
+            (Method::POST, vec!["admin", "tls", "ca-bundles"]),
+            (
+                Method::PUT,
+                vec!["admin", "tls", "ca-bundles", "internal-ca"],
+            ),
+            (
+                Method::DELETE,
+                vec!["admin", "tls", "ca-bundles", "internal-ca"],
+            ),
+            (Method::POST, vec!["admin", "tls", "crls"]),
+            (Method::PUT, vec!["admin", "tls", "crls", "edge-crl"]),
+            (Method::DELETE, vec!["admin", "tls", "crls", "edge-crl"]),
+            (Method::POST, vec!["admin", "tls", "ocsp-responses"]),
+            (
+                Method::PUT,
+                vec!["admin", "tls", "ocsp-responses", "edge-ocsp"],
+            ),
+            (
+                Method::DELETE,
+                vec!["admin", "tls", "ocsp-responses", "edge-ocsp"],
+            ),
+            (Method::POST, vec!["admin", "tls", "jwks"]),
+            (Method::PUT, vec!["admin", "tls", "jwks", "edge-jwks"]),
+            (Method::DELETE, vec!["admin", "tls", "jwks", "edge-jwks"]),
             (Method::POST, vec!["admin", "tls", "acme", "certificates"]),
             (
                 Method::PUT,
