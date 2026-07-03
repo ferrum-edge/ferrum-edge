@@ -2106,6 +2106,83 @@ async fn mesh_sd_sidecar_topology_bridges_remote_workloads_via_east_west_gateway
 }
 
 #[tokio::test]
+async fn mesh_sd_sidecar_bridges_service_name_matched_remote_workloads_without_refs() {
+    // A MeshService with NO `workloads` refs matches workloads by
+    // `workload.service_name` (the supported mesh-SD shape pinned by the
+    // inline `service_without_workload_refs_matches_service_name` test). The
+    // east-west bridge must honor those SAME matching semantics: a
+    // remote-provenance sidecar workload matched only by service_name still
+    // yields the gateway failover target. (Codex round 1: the bridge
+    // previously re-matched through the materializer's ref-only matcher,
+    // which sees an empty ref list and silently bridged nothing.)
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.clear(); // no refs — service_name fallback matching only
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![
+            mesh_workload(api_id, "api", "10.0.0.1", 8080),
+            mesh_remote_west_workload(remote_id, 8080),
+        ],
+        multi_cluster: Some(mesh_west_multi_cluster()),
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Sidecar)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(
+        targets.len(),
+        2,
+        "service_name-matched shape bridges like the ref'd shape: one local \
+         target plus ONE east-west gateway target"
+    );
+
+    // Local half of the no-refs shape is unchanged by the bridge.
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert_eq!(targets[0].port, 8080);
+    assert!(!targets[0].tags.contains_key("mesh.cross_cluster"));
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+
+    // Gateway failover target — same shape the ref-based bridge test pins.
+    let gateway = &targets[1];
+    assert_eq!(gateway.host, "west-gw.example.com");
+    assert_eq!(gateway.port, 15443);
+    assert_eq!(gateway.service_port_policy_key, Some(8080));
+    let tags = &gateway.tags;
+    assert_eq!(
+        tags.get("mesh.cross_cluster").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        tags.get("mesh.eastwest_sni").map(String::as_str),
+        Some("api.ferrum.svc.cluster.local")
+    );
+    assert_eq!(
+        tags.get("mesh.mtls_port").map(String::as_str),
+        Some("15443")
+    );
+    assert_eq!(tags.get("mesh.mtls").map(String::as_str), Some("true"));
+    assert_eq!(tags.get("mesh.remote").map(String::as_str), Some("true"));
+    assert!(
+        !tags.contains_key("mesh.spiffe_id"),
+        "no pod pinning across the SNI-passthrough gateway"
+    );
+    assert_eq!(
+        tags.get("mesh.trust_domain").map(String::as_str),
+        Some("west.local")
+    );
+    assert_eq!(
+        tags.get(ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG)
+            .map(String::as_str),
+        Some("api.ferrum.svc")
+    );
+}
+
+#[tokio::test]
 async fn mesh_sd_sidecar_remote_workloads_without_matching_gateway_skip_fail_closed() {
     // A remote group whose network has no east-west gateway (and no catch-all)
     // must be skipped fail-closed by the shared core: never a direct

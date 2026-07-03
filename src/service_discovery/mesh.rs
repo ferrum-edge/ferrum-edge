@@ -260,12 +260,26 @@ impl MeshServiceDiscoverer {
 
     /// Bridge this service's Sidecar REMOTE workloads to east-west GATEWAY
     /// failover targets, exactly like mesh-mode egress does — via the SHARED
-    /// core (`crate::modes::mesh::append_cross_cluster_mesh_targets`):
+    /// core's PRE-MATCHED entry point
+    /// (`crate::modes::mesh::append_cross_cluster_mesh_targets_prematched`):
     /// reachability-filter, group per `(network, trust_domain)`, ONE target per
     /// group at the remote east-west gateway endpoint, tagged
     /// `mesh.cross_cluster=true` + `mesh.eastwest_sni=<service FQDN>` +
     /// `mesh.mtls_port=<gateway port>` + `mesh.remote=true` with NO pinned pod
     /// SPIFFE (trust-domain-only verification). Do not fork that logic here.
+    ///
+    /// MATCHING SEMANTICS (codex round 1): `remote_workloads` is the set the
+    /// `discover()` loop ALREADY matched via `workload_matches_service` — the
+    /// SD matcher, whose semantics include the service-name fallback for a
+    /// `MeshService` with NO `workloads` refs (pinned by
+    /// `service_without_workload_refs_matches_service_name`), namespace
+    /// scoping, and the legacy mismatched-metadata rule. The bridge must honor
+    /// THOSE semantics, not the mesh-mode materializer's ref-only matcher
+    /// (`matched_remote_service_workloads`, which iterates `service.workloads`
+    /// and would silently bridge NOTHING for a remote-only service without
+    /// refs) — so this hands the pre-matched slice to the shared core instead
+    /// of letting it re-match. The two matchers legitimately differ; do NOT
+    /// unify them — only the SD path routes around the ref-only one.
     ///
     /// BRIDGEABILITY (fail closed otherwise, one-time warn): the east-west
     /// model routes a service-FQDN SNI to only the service's FIRST DECLARED
@@ -299,7 +313,7 @@ impl MeshServiceDiscoverer {
     fn append_sidecar_cross_cluster_targets(
         &self,
         service: &MeshService,
-        workloads: &[Workload],
+        remote_workloads: &[&Workload],
         multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
         selected_service_port: Option<&SelectedPort>,
         targets: &mut Vec<UpstreamTarget>,
@@ -314,7 +328,7 @@ impl MeshServiceDiscoverer {
                 .iter()
                 .any(|sp| sp.port == first.port)
         });
-        let (Some(first_port), Some(_), true, true) = (
+        let (Some(first_port), Some(multi_cluster), true, true) = (
             first_port,
             multi_cluster,
             selected_is_first_declared,
@@ -345,13 +359,13 @@ impl MeshServiceDiscoverer {
             .copied()
             .unwrap_or(first_port.protocol);
         let mut gateway_targets = Vec::new();
-        crate::modes::mesh::append_cross_cluster_mesh_targets(
+        crate::modes::mesh::append_cross_cluster_mesh_targets_prematched(
             &mut gateway_targets,
             &self.cluster_domain,
             service,
             first_port,
             protocol,
-            workloads,
+            remote_workloads,
             multi_cluster,
         );
         // SD-bridge-only additive tag (see the method doc): the destination
@@ -421,7 +435,12 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             })
             .map(|workload| workload.spiffe_id.as_str())
             .collect();
-        let mut saw_remote_sidecar_workload = false;
+        // Sidecar remote workloads the loop matched (via `workload_matches_service`,
+        // the SD matching semantics) but skipped as direct dials — collected so
+        // the east-west bridge below honors the SAME matching the loop used
+        // (including the no-refs service-name fallback) instead of re-matching
+        // through the materializer's ref-only matcher.
+        let mut remote_sidecar_workloads: Vec<&Workload> = Vec::new();
         for workload in mesh.workloads.iter().filter(|workload| {
             Self::workload_matches_service(service, workload, &matching_service_spiffe_ids)
         }) {
@@ -434,12 +453,13 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             // LOOKING like a routable failover target. The correct cross-cluster
             // Sidecar shape is an east-west GATEWAY target (`mesh.cross_cluster`
             // + `mesh.eastwest_sni`, trust-domain-only verification), which is
-            // appended after this loop via the SHARED mesh-mode core
-            // (`append_cross_cluster_mesh_targets`); when that bridge cannot
-            // honor the upstream's port selection it stays fail-closed (see
-            // `append_sidecar_cross_cluster_targets`).
+            // appended after this loop via the SHARED mesh-mode core's
+            // pre-matched entry point
+            // (`append_cross_cluster_mesh_targets_prematched`); when that
+            // bridge cannot honor the upstream's port selection it stays
+            // fail-closed (see `append_sidecar_cross_cluster_targets`).
             if is_remote && self.topology == MeshSdTopology::Sidecar {
-                saw_remote_sidecar_workload = true;
+                remote_sidecar_workloads.push(workload);
                 continue;
             }
 
@@ -504,10 +524,10 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
         // failover targets AFTER the local targets (mirroring the mesh-mode
         // materializer's ordering — locals stay the first tier; the LB treats
         // `mesh.cross_cluster` targets as always-failover local-first).
-        if saw_remote_sidecar_workload {
+        if !remote_sidecar_workloads.is_empty() {
             self.append_sidecar_cross_cluster_targets(
                 service,
-                &mesh.workloads,
+                &remote_sidecar_workloads,
                 multi_cluster,
                 selected_service_port.as_ref(),
                 &mut targets,

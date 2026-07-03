@@ -4829,6 +4829,18 @@ fn build_outbound_mesh_targets(
 /// resolved cluster domain). `cluster_domain` is the only runtime field the
 /// logic needs — do NOT re-widen the parameter to the mesh runtime, and do NOT
 /// fork this logic into the SD path.
+///
+/// TWO ENTRY POINTS, ONE CORE: workload→service MATCHING is the one step the
+/// two callers legitimately do differently. This function is the mesh-mode
+/// materializer entry point — it matches via the ref-based
+/// [`matched_remote_service_workloads`] (mirroring the local materializer's
+/// matcher) and delegates everything else to
+/// [`append_cross_cluster_mesh_targets_prematched`]. The SD bridge calls the
+/// prematched entry point DIRECTLY with the remote workloads its `discover()`
+/// loop already matched (`workload_matches_service` semantics, which include
+/// the service-name fallback for a `MeshService` with no `workloads` refs) —
+/// so the two matchers never fork the grouping/reachability/gateway-selection
+/// logic, and neither caller's matching semantics leak into the other's.
 pub(crate) fn append_cross_cluster_mesh_targets(
     targets: &mut Vec<UpstreamTarget>,
     cluster_domain: &str,
@@ -4842,6 +4854,39 @@ pub(crate) fn append_cross_cluster_mesh_targets(
         return;
     };
 
+    let all_remote_workloads =
+        matched_remote_service_workloads(service, workloads, Some(multi_cluster));
+    append_cross_cluster_mesh_targets_prematched(
+        targets,
+        cluster_domain,
+        service,
+        service_port,
+        protocol,
+        &all_remote_workloads,
+        multi_cluster,
+    );
+}
+
+/// The pre-matched entry point of the Sidecar cross-cluster SHARED CORE (see
+/// [`append_cross_cluster_mesh_targets`], which documents the emitted target
+/// shape and the two-entry-point contract). `remote_workloads` MUST already be
+/// (a) matched to `service` under the CALLER's workload-matching semantics and
+/// (b) classified remote via
+/// [`crate::modes::mesh::multicluster::workload_is_remote`] against the SAME
+/// `multi_cluster`. Everything downstream of matching lives here — the
+/// first-port rule, the [R2-2] reachability filter, `(network, trust_domain)`
+/// grouping, fail-closed gateway selection, and the [R3-3]/[R5-3] duplicate
+/// dial-endpoint resolution — so it can never diverge between the mesh-mode
+/// materializer and the SD bridge.
+pub(crate) fn append_cross_cluster_mesh_targets_prematched(
+    targets: &mut Vec<UpstreamTarget>,
+    cluster_domain: &str,
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    protocol: AppProtocol,
+    remote_workloads: &[&crate::modes::mesh::config::Workload],
+    multi_cluster: &crate::modes::mesh::config::MultiClusterConfig,
+) {
     // FIRST-PORT ONLY: the east-west gateway routes a service-FQDN SNI to only
     // the service's FIRST DECLARED port (single-port-per-SNI — SNI carries no
     // port; see `build_east_west_service_targets`, which picks
@@ -4854,9 +4899,7 @@ pub(crate) fn append_cross_cluster_mesh_targets(
         return;
     }
 
-    let all_remote_workloads =
-        matched_remote_service_workloads(service, workloads, Some(multi_cluster));
-    if all_remote_workloads.is_empty() {
+    if remote_workloads.is_empty() {
         return;
     }
 
@@ -4869,8 +4912,9 @@ pub(crate) fn append_cross_cluster_mesh_targets(
     // have no backend to forward to), so it must not produce a cross-cluster
     // target here either. The check uses the SERVICE's FIRST port (the only port
     // the single-SNI east-west model routes), exactly as the gateway side does.
-    let remote_workloads: Vec<_> = all_remote_workloads
-        .into_iter()
+    let remote_workloads: Vec<_> = remote_workloads
+        .iter()
+        .copied()
         .filter(|workload| east_west_workload_is_reachable(service, workload))
         .collect();
     if remote_workloads.is_empty() {
