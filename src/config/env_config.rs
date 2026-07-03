@@ -4253,6 +4253,29 @@ impl EnvConfig {
                             .into());
                     }
                 }
+                // Advisory (any mode, never an error): with cross-cluster
+                // remote endpoint discovery enabled and non-strict locality
+                // LB, an ABSENT source locality makes the locality-aware LB
+                // return mixed local + remote candidates even while local
+                // endpoints are healthy (see the strict-mode doc on
+                // `LoadBalancer` in src/load_balancer.rs). Cross-cluster
+                // east-west GATEWAY failover targets are unaffected (always
+                // local-first regardless of the flag); this only affects
+                // plain remote workload endpoints from the Experimental
+                // remote-discovery path.
+                if self.mesh_remote_discovery_poll_interval_seconds > 0
+                    && !self.mesh_locality_lb_strict
+                {
+                    tracing::warn!(
+                        "FERRUM_MESH_REMOTE_DISCOVERY_POLL_INTERVAL_SECONDS > 0 with \
+                         FERRUM_MESH_LOCALITY_LB_STRICT=false: if the local workload's source \
+                         locality cannot be resolved, the locality-aware load balancer will mix \
+                         remote-cluster endpoints into selection even while local endpoints are \
+                         healthy. Recommend FERRUM_MESH_LOCALITY_LB_STRICT=true so an absent \
+                         source locality fails closed to local endpoints (east-west gateway \
+                         failover targets are already local-first and unaffected)."
+                    );
+                }
                 // The running mesh's workload identity comes either from
                 // file-based gateway SVID material (all three
                 // FERRUM_GATEWAY_SVID_* paths, loaded together by

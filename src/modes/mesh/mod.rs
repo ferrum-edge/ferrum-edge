@@ -8466,6 +8466,22 @@ pub async fn run(
         "Mesh mode starting"
     );
 
+    // Deliberately a warning, not a refusal: the NodeWaypoint eBPF live gate
+    // runs the production identity profile on this topology, and the
+    // production identity guardrails (dev CA/attestor/no-identity refusals,
+    // inbound mTLS fail-closed) all still apply. The warning exists so an
+    // operator running an Experimental topology under the production flag has
+    // an explicit, greppable signal of the maturity mismatch.
+    if runtime.topology == MeshTopology::NodeWaypoint && crate::identity::production_mode() {
+        warn!(
+            topology = runtime.topology.as_str(),
+            "FERRUM_MESH_TOPOLOGY=node_waypoint is an Experimental topology running under \
+             FERRUM_MESH_PRODUCTION_MODE=true. Experimental surfaces are excluded from the GA \
+             contract (docs/mesh_supported_matrix.md); production identity guardrails still \
+             apply."
+        );
+    }
+
     // Configure the process-singleton policy-deny recorder before anything can
     // record into it. This is idempotent and a no-op on subsequent calls
     // (e.g., a restart-without-fork test harness) so we never wipe history
@@ -11132,8 +11148,14 @@ fn enforce_mesh_inbound_fail_closed(
          FERRUM_FRONTEND_TLS_CERT_PATH / KEY_PATH), so it would accept unauthenticated plaintext"
     };
     match decide_mesh_inbound_fail_closed(frontend_tls.is_none(), production) {
-        MeshInboundFailClosed::Ok => Ok(()),
+        MeshInboundFailClosed::Ok => {
+            crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(false);
+            Ok(())
+        }
         MeshInboundFailClosed::AllowWithWarning => {
+            // Coarse posture gauge only — the reason detail stays in the
+            // `warn!` below (security detail goes to logs, not /metrics).
+            crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(true);
             warn!(
                 topology = runtime.topology.as_str(),
                 ?mtls_mode,
@@ -11407,6 +11429,9 @@ fn plan_mesh_inbound_tls_reload_with_federation(
                         return None;
                     }
                     MeshInboundFailClosed::AllowWithWarning => {
+                        // Degrade the coarse posture gauge alongside the warn
+                        // (same site: this plan is what the apply task swaps in).
+                        crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(true);
                         warn!(
                             mesh_slice_version = %slice.version,
                             ?mtls_mode,
@@ -11418,6 +11443,11 @@ fn plan_mesh_inbound_tls_reload_with_federation(
                     }
                     MeshInboundFailClosed::Ok => {}
                 }
+            } else if has_termination_listener {
+                // A reload that resolves the termination listener back to an
+                // mTLS-capable ServerConfig heals the dev plaintext posture;
+                // reflect that so operators can alert on the gauge clearing.
+                crate::plugins::mesh::prometheus_helpers::set_mesh_inbound_plaintext_allowed(false);
             }
             Some(MeshInboundTlsReloadPlan::Swap {
                 snapshot: next_snapshot,

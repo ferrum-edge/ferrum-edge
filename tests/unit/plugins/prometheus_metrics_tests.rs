@@ -255,6 +255,29 @@ async fn test_registry_renders_mesh_cert_telemetry_metrics() {
 }
 
 #[tokio::test]
+async fn test_registry_renders_mesh_inbound_plaintext_allowed_gauge() {
+    let registry = MetricsRegistry::new();
+
+    // Dev opt-out posture: the inbound listener was allowed up without
+    // enforced mTLS. The gauge is a process-global static shared with other
+    // parallel tests, so assert only on this gauge's line immediately after
+    // setting it in the same test (no other test writes this static).
+    prometheus_helpers::set_mesh_inbound_plaintext_allowed(true);
+    let output = registry.render_uncached();
+    assert!(output.contains("# TYPE ferrum_mesh_inbound_plaintext_allowed gauge"));
+    assert!(output.contains("ferrum_mesh_inbound_plaintext_allowed 1"));
+    // Coarse by design: no labels on the series (the downgrade reason stays
+    // in the enforcement-site logs).
+    assert!(!output.contains("ferrum_mesh_inbound_plaintext_allowed{"));
+
+    // A startup or PeerAuthentication live reload that resolves an
+    // mTLS-capable inbound config heals the posture back to 0.
+    prometheus_helpers::set_mesh_inbound_plaintext_allowed(false);
+    let output = registry.render_uncached();
+    assert!(output.contains("ferrum_mesh_inbound_plaintext_allowed 0"));
+}
+
+#[tokio::test]
 async fn test_registry_renders_node_agent_metrics_when_registered() {
     let registry = MetricsRegistry::new();
     let metrics = Arc::new(NodeAgentMetrics::default());

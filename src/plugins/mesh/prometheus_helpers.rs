@@ -45,6 +45,7 @@ static MESH_REMOTE_DISCOVERY_LAST_SUCCESS: LazyLock<
     DashMap<MeshRemoteDiscoveryPollSuccessKey, AtomicU64>,
 > = LazyLock::new(DashMap::new);
 static XDS_STREAMS_REJECTED: AtomicU64 = AtomicU64::new(0);
+static MESH_INBOUND_PLAINTEXT_ALLOWED: AtomicU64 = AtomicU64::new(0);
 static XDS_WARMING_PARTIAL_APPLIES: LazyLock<DashMap<Arc<str>, AtomicU64>> =
     LazyLock::new(DashMap::new);
 static XDS_FIRST_SLICE_NACKS: LazyLock<DashMap<XdsFirstSliceNackKey, AtomicU64>> =
@@ -421,6 +422,19 @@ pub fn increment_xds_stream_rejected() {
     XDS_STREAMS_REJECTED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Set the coarse posture gauge for the mesh inbound listener's mTLS
+/// enforcement: `true` when the listener was allowed to come up without
+/// enforced mTLS (the dev opt-out posture of `decide_mesh_inbound_fail_closed`
+/// — production mode refuses it instead), `false` when the resolved inbound
+/// listener enforces mTLS. Deliberately label-free: the downgrade reason
+/// (PeerAuthentication DISABLE vs no usable server identity) stays in the
+/// `warn!` logs at the enforcement sites — security detail goes to logs, not
+/// `/metrics`. Updated at startup enforcement and on PeerAuthentication live
+/// reload so a reload that heals or degrades the posture moves the gauge.
+pub fn set_mesh_inbound_plaintext_allowed(allowed: bool) {
+    MESH_INBOUND_PLAINTEXT_ALLOWED.store(u64::from(allowed), Ordering::Relaxed);
+}
+
 /// Count a NACK of a required mesh-slice type that occurred while the DP is
 /// still waiting for its first slice. A persistently NACKing required type
 /// wedges `wait_for_first_slice()` until the NACK circuit breaker trips, so a
@@ -544,6 +558,15 @@ pub fn render_mesh_observability_metrics(output: &mut String) {
             ));
         }
     }
+
+    output.push_str(
+        "# HELP ferrum_mesh_inbound_plaintext_allowed 1 when the mesh inbound listener was allowed to come up without enforced mTLS (dev opt-out posture; production mode refuses this). 0 otherwise.\n",
+    );
+    output.push_str("# TYPE ferrum_mesh_inbound_plaintext_allowed gauge\n");
+    output.push_str(&format!(
+        "ferrum_mesh_inbound_plaintext_allowed {}\n",
+        MESH_INBOUND_PLAINTEXT_ALLOWED.load(Ordering::Relaxed)
+    ));
 
     if !MESH_FEDERATION_POLL_FAILURES.is_empty() {
         output.push_str(
