@@ -1010,3 +1010,74 @@ fn grpc_mesh_dispatch_cross_cluster_tag_alone_still_refuses() {
         GrpcMeshDispatch::RefuseCrossCluster
     );
 }
+
+// ── Mesh-mTLS gRPC receive limit (issue #2003 codex r1-3) ──
+
+#[test]
+fn mesh_request_body_limit_selects_grpc_recv_limit_for_grpc_flavored_requests() {
+    // gRPC-flavored uploads (native application/grpc or grpc_web-translated)
+    // mirror the direct gRPC pool's receive limit; plain HTTP keeps the
+    // general request-body limit. Defaults: 10 MiB HTTP vs 4 MiB gRPC — a
+    // 6 MiB gRPC upload must trip the gRPC limit, not slip under the HTTP one.
+    let http_limit = 10 * 1024 * 1024;
+    let grpc_limit = 4 * 1024 * 1024;
+    assert_eq!(
+        grpc_proxy::mesh_request_body_limit(true, http_limit, grpc_limit),
+        grpc_limit
+    );
+    assert_eq!(
+        grpc_proxy::mesh_request_body_limit(false, http_limit, grpc_limit),
+        http_limit
+    );
+}
+
+#[test]
+fn mesh_request_body_limit_zero_means_unlimited_per_knob_not_cross_inherited() {
+    // `0` = unlimited for whichever knob is selected; the other knob's value
+    // must never leak across flavors.
+    assert_eq!(grpc_proxy::mesh_request_body_limit(true, 10, 0), 0);
+    assert_eq!(grpc_proxy::mesh_request_body_limit(false, 0, 10), 0);
+}
+
+#[test]
+fn grpc_request_body_too_large_backend_response_is_trailers_only_resource_exhausted() {
+    use ferrum_edge::retry::{ErrorClass, ResponseBody};
+
+    let max = 4 * 1024 * 1024;
+    let resp = grpc_proxy::grpc_request_body_too_large_backend_response(
+        "grpc-test",
+        Some("10.0.0.9".to_string()),
+        Some(6 * 1024 * 1024),
+        max,
+    );
+    // Mirrors the direct gRPC pool's oversize rejection: gRPC errors ride
+    // HTTP 200 with the outcome in grpc-status (8 = RESOURCE_EXHAUSTED).
+    assert_eq!(resp.status_code, 200);
+    assert_eq!(
+        resp.headers.get("grpc-status").map(String::as_str),
+        Some("8")
+    );
+    assert_eq!(
+        resp.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    let message = resp
+        .headers
+        .get("grpc-message")
+        .expect("refusal must carry grpc-message");
+    assert!(
+        message.contains(&max.to_string()),
+        "grpc-message should name the limit: {message}"
+    );
+    // RequestBodyTooLarge keeps backend-health accounting NEUTRAL (the
+    // backend was never at fault) instead of banking the 200 as a success.
+    assert_eq!(resp.error_class, Some(ErrorClass::RequestBodyTooLarge));
+    assert!(!resp.connection_error);
+    assert_eq!(resp.backend_resolved_ip.as_deref(), Some("10.0.0.9"));
+    match resp.body {
+        ResponseBody::Buffered(body) => {
+            assert!(body.is_empty(), "Trailers-Only refusal carries no body")
+        }
+        _ => panic!("expected a buffered (empty, trailers-only) refusal body"),
+    }
+}

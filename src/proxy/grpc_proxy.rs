@@ -1369,6 +1369,75 @@ pub(crate) fn grpc_admission_status_from_maps(
         .unwrap_or(http_status)
 }
 
+/// Effective request-body cap for the sidecar mesh-mTLS dispatch path (issue
+/// #2003 codex r1-3): gRPC-flavored uploads — native `application/grpc` or
+/// gRPC-Web translated to it by the `grpc_web` plugin; both are wire-native
+/// gRPC framing by dispatch time — are bounded by `max_grpc_recv_size_bytes`,
+/// mirroring the direct gRPC pool's receive limit. Everything else keeps the
+/// general `max_request_body_size_bytes`. `0` means unlimited for whichever
+/// knob is selected (never cross-inherited).
+pub fn mesh_request_body_limit(
+    is_grpc: bool,
+    max_request_body_size_bytes: usize,
+    max_grpc_recv_size_bytes: usize,
+) -> usize {
+    if is_grpc {
+        max_grpc_recv_size_bytes
+    } else {
+        max_request_body_size_bytes
+    }
+}
+
+/// Trailers-Only `RESOURCE_EXHAUSTED` refusal for a gRPC request body that
+/// exceeds `max_grpc_recv_size_bytes` on a mesh dispatch path, mirroring the
+/// direct gRPC pool's oversize rejection (same gRPC status and message shape;
+/// gRPC errors ride HTTP 200 with the outcome in `grpc-status`).
+///
+/// `ErrorClass::RequestBodyTooLarge` keeps backend-health accounting NEUTRAL:
+/// a client-side upload overflow carries no signal about the backend, so the
+/// circuit breaker and passive health skip it via
+/// `client_side_no_backend_signal` and the adaptive-concurrency limiter
+/// ignores it the same way — instead of banking the HTTP 200 as a phantom
+/// success for a backend that was never dialed (or never finished the RPC).
+pub fn grpc_request_body_too_large_backend_response(
+    proxy_id: &str,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> crate::retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy_id,
+            request_body_bytes = size,
+            max_grpc_recv_size_bytes = max_size,
+            "gRPC request body exceeds configured receive limit on mesh dispatch"
+        ),
+        None => warn!(
+            proxy_id = %proxy_id,
+            max_grpc_recv_size_bytes = max_size,
+            "gRPC streaming request body exceeded configured receive limit on mesh dispatch"
+        ),
+    }
+    let mut headers = HashMap::with_capacity(3);
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "grpc-status".to_string(),
+        grpc_status::RESOURCE_EXHAUSTED.to_string(),
+    );
+    headers.insert(
+        "grpc-message".to_string(),
+        format!("gRPC request payload size exceeds maximum of {max_size} bytes"),
+    );
+    crate::retry::BackendResponse {
+        status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
+        body: crate::retry::ResponseBody::Buffered(Vec::new()),
+        headers,
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(crate::retry::ErrorClass::RequestBodyTooLarge),
+    }
+}
+
 /// Reserved gRPC terminal-status metadata keys (`grpc-status`,
 /// `grpc-message`, `grpc-status-details-bin`). Per the gRPC HTTP/2 mapping,
 /// a non-Trailers-Only response must carry these ONLY in the terminal

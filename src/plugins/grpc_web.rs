@@ -155,6 +155,22 @@ pub(crate) fn is_grpc_web_text(ct: &str) -> bool {
     has_ascii_case_insensitive_prefix(ct.trim(), APPLICATION_GRPC_WEB_TEXT)
 }
 
+/// True when the `grpc_web` plugin translated this request from gRPC-Web to
+/// native gRPC framing. The marker is stamped only by `on_request_received`
+/// after verifying the ORIGINAL client content-type is `application/grpc-web*`
+/// (the spoofable inbound `x-grpc-web-mode` header is stripped there first),
+/// so a client cannot inject it.
+///
+/// Dispatch paths use this to tell a translated gRPC-Web request apart from
+/// native gRPC: by dispatch time both carry `content-type: application/grpc`
+/// (rewritten in `before_proxy`), but a translated response MUST buffer — the
+/// plugin re-encodes the backend's terminal trailers (`grpc-status` /
+/// `grpc-message`) INTO the gRPC-Web response body — while a native gRPC
+/// response must NOT buffer (its trailers have to relay on the wire).
+pub fn request_is_grpc_web_translated(ctx: &RequestContext) -> bool {
+    ctx.metadata.contains_key(META_GRPC_WEB_MODE)
+}
+
 fn is_valid_trailer_header(key: &str) -> Option<HeaderName> {
     let header = HeaderName::from_bytes(key.trim().as_bytes()).ok()?;
     let normalized = header.as_str();

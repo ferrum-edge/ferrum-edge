@@ -16435,15 +16435,29 @@ async fn handle_proxy_request_inner(
             block_reason,
             "mesh.hbone=true target requires HBONE dispatch; refusing direct-backend fallback"
         );
+        // codex r1-2: `check_circuit_breaker` may have admitted this request
+        // as a HALF_OPEN probe. This refusal precedes any backend dispatch,
+        // so release the claimed probe slot before returning — repeated
+        // fail-closed refusals would otherwise leak `half_open_in_flight`
+        // slots and wedge the breaker (mirrors the WebSocket origin reject
+        // and the gRPC-branch mesh refusals).
+        release_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
         // A gRPC-flavored request gets a protocol-appropriate Trailers-Only
         // refusal (gRPC errors ride HTTP 200 + grpc-status) instead of a JSON
         // 502 the client cannot parse. Same fail-closed contract either way.
         if is_grpc_request {
+            record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
             return Ok(grpc_proxy::build_grpc_error_response(
                 14, // UNAVAILABLE
                 &format!("HBONE dispatch required for this backend target: {block_reason}"),
             ));
         }
+        record_request(&state, 502);
         return Ok(build_response(
             StatusCode::BAD_GATEWAY,
             r#"{"error":"Bad Gateway","message":"HBONE dispatch required for this backend target"}"#,
@@ -16481,6 +16495,18 @@ async fn handle_proxy_request_inner(
             block_reason,
             "mesh.mtls=true target requires sidecar SVID-mTLS dispatch; refusing direct-backend fallback"
         );
+        // codex r1-2: release a HALF_OPEN probe slot `check_circuit_breaker`
+        // may have claimed for this request — this refusal precedes any
+        // backend dispatch, and without the release repeated fail-closed
+        // refusals leak `half_open_in_flight` slots and wedge the breaker
+        // (mirrors the WebSocket origin reject and the gRPC-branch mesh
+        // refusals).
+        release_circuit_breaker_probe_on_admission_reject(
+            &state,
+            &proxy,
+            cb_target_key.as_deref(),
+            cb_is_half_open_probe,
+        );
         // This gate is the fail-closed surface for gRPC-over-mesh-mTLS (issue
         // #2003): gRPC requests to same-cluster `mesh.mtls` targets skip the
         // direct-dial gRPC branch and dispatch through the mesh-mTLS pool, so
@@ -16489,6 +16515,7 @@ async fn handle_proxy_request_inner(
         // protocol-appropriate Trailers-Only refusal — never fall back to a
         // plaintext direct dial.
         if is_grpc_request {
+            record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
             return Ok(grpc_proxy::build_grpc_error_response(
                 14, // UNAVAILABLE
                 &format!(
@@ -16496,6 +16523,7 @@ async fn handle_proxy_request_inner(
                 ),
             ));
         }
+        record_request(&state, 502);
         return Ok(build_response(
             StatusCode::BAD_GATEWAY,
             r#"{"error":"Bad Gateway","message":"Sidecar mTLS dispatch required for this backend target"}"#,
@@ -16987,6 +17015,32 @@ async fn handle_proxy_request_inner(
             ),
         );
     let defer_streaming_dispatch = defer_streaming_h2_dispatch || defer_streaming_h3_dispatch;
+    // Issue #2003 codex r1-1: native gRPC over the generic path (the
+    // mesh-mTLS `StreamingH2` relay — the only way a native-gRPC request
+    // reaches this point) rides HTTP 200 with the RPC outcome in
+    // `grpc-status`. Seed backend-health accounting (CB / passive health /
+    // least-latency / adaptive concurrency) with the header-mapped status so
+    // a Trailers-Only error — grpc-status in the response HEADERS with
+    // END_STREAM set, which lands on the eager-record path via
+    // `streaming_h2_body_ended` — is not banked as a healthy 200. A
+    // trailer-borne grpc-status on a streaming response is classified at body
+    // EOF by the gRPC trailer classifiers attached in the `StreamingH2` body
+    // arm below. Together these mirror the direct gRPC path exactly:
+    // `grpc_admission_status_from_maps` at header time +
+    // `with_grpc_trailer_{admission,backend_dispatch}_classification` at EOF,
+    // sharing the same `grpc_status_to_http_status` mapping. The client-visible
+    // response status is deliberately NOT rewritten.
+    let streaming_h2_native_grpc =
+        request_uses_grpc_content_type && matches!(&response_body, ResponseBody::StreamingH2(_));
+    let recorded_backend_status = if streaming_h2_native_grpc {
+        grpc_proxy::grpc_admission_status_from_maps(
+            &HashMap::new(),
+            &response_headers,
+            response_status,
+        )
+    } else {
+        response_status
+    };
     // Final-attempt dispatch elapsed for CB/passive-health/least-latency and
     // adaptive-concurrency samples. `backend_start` intentionally spans every
     // retry attempt and backoff for transaction logs below; using it here would
@@ -17015,7 +17069,7 @@ async fn handle_proxy_request_inner(
             upstream_balancer.as_ref(),
             final_upstream_target.as_deref(),
             final_cb_target_key.as_deref(),
-            response_status,
+            recorded_backend_status,
             backend_resp.connection_error,
             backend_error_class,
             cb_retry_probe_slot_available,
@@ -17023,7 +17077,7 @@ async fn handle_proxy_request_inner(
             final_backend_dispatch_elapsed,
         );
     }
-    let backend_admission_response_status = response_status;
+    let backend_admission_response_status = recorded_backend_status;
     let backend_admission_connection_error = backend_resp.connection_error;
     let backend_admission_error_class = backend_error_class;
     let backend_admission_elapsed = final_backend_dispatch_elapsed;
@@ -17702,6 +17756,21 @@ async fn handle_proxy_request_inner(
                     backend_admission_response_status,
                     backend_admission_elapsed,
                 );
+                // Issue #2003 codex r1-1: native gRPC over mesh-mTLS finishes
+                // HTTP 200 with the RPC outcome in a grpc-status trailer —
+                // classify it at EOF so a backend gRPC failure (e.g. 14 -> 503)
+                // shrinks the adaptive-concurrency limit instead of recording a
+                // healthy success. A late client-upload overflow (which RSTs the
+                // response stream) is tagged so the limiter ignores it as
+                // client-side RequestBodyTooLarge. Both mirror the direct gRPC
+                // streaming path's admission wiring exactly.
+                if streaming_h2_native_grpc {
+                    body = body
+                        .with_grpc_trailer_admission_classification()
+                        .with_deferred_admission_request_body_exceeded_flag(
+                            hbone_request_body_exceeded.clone(),
+                        );
+                }
             }
             // #1649 item 2: defer the dispatch outcome (CB / passive health /
             // least-latency) to body completion so a 2xx-then-stall H2/HBONE body
@@ -17734,6 +17803,16 @@ async fn handle_proxy_request_inner(
                     .with_deferred_dispatch_request_body_exceeded_flag(
                         hbone_request_body_exceeded.clone(),
                     );
+                // Issue #2003 codex r1-1: map a native-gRPC grpc-status trailer
+                // into the deferred dispatch outcome (circuit breaker / passive
+                // health / least-latency) at body EOF — same semantics as the
+                // direct gRPC streaming path
+                // (`with_grpc_trailer_backend_dispatch_classification`): the
+                // trailer status maps through `grpc_status_to_http_status` and
+                // counts as a failure exactly when the mapped HTTP status does.
+                if streaming_h2_native_grpc {
+                    body = body.with_grpc_trailer_backend_dispatch_classification();
+                }
             }
             body
         }
@@ -20961,11 +21040,28 @@ enum HyperBodyCollectError {
 }
 
 async fn collect_hyper_body_with_limit(
-    mut body: Incoming,
+    body: Incoming,
     max_size: usize,
     backend_read_timeout_ms: u64,
 ) -> Result<Vec<u8>, HyperBodyCollectError> {
+    collect_hyper_body_and_trailers_with_limit(body, max_size, backend_read_timeout_ms)
+        .await
+        .map(|(body_bytes, _trailers)| body_bytes)
+}
+
+/// Collect a hyper H2 response body up to `max_size`, also capturing the
+/// terminal TRAILERS frame when present. Data-frame limits and read-timeout
+/// behavior are identical to [`collect_hyper_body_with_limit`] (which
+/// delegates here). The mesh-mTLS buffered arm needs the trailers to preserve
+/// gRPC terminal metadata for gRPC-Web translation (codex r1-4); callers that
+/// don't can use the body-only wrapper.
+async fn collect_hyper_body_and_trailers_with_limit(
+    mut body: Incoming,
+    max_size: usize,
+    backend_read_timeout_ms: u64,
+) -> Result<(Vec<u8>, Option<hyper::HeaderMap>), HyperBodyCollectError> {
     let mut body_bytes = Vec::new();
+    let mut trailers: Option<hyper::HeaderMap> = None;
     loop {
         let next_frame = if backend_read_timeout_ms > 0 {
             match tokio::time::timeout(Duration::from_millis(backend_read_timeout_ms), body.frame())
@@ -20990,9 +21086,16 @@ async fn collect_hyper_body_with_limit(
                 return Err(HyperBodyCollectError::TooLarge);
             }
             body_bytes.extend_from_slice(data);
+        } else if let Ok(trailer_map) = frame.into_trailers() {
+            // A second TRAILERS frame is not legal HTTP/2, but merge whatever
+            // hyper surfaces rather than silently dropping trailing metadata.
+            match trailers.as_mut() {
+                Some(existing) => existing.extend(trailer_map),
+                None => trailers = Some(trailer_map),
+            }
         }
     }
-    Ok(body_bytes)
+    Ok((body_bytes, trailers))
 }
 
 fn hbone_response_body_too_large_response(
@@ -21056,6 +21159,29 @@ fn hbone_request_body_too_large_response(
         connection_error: false,
         backend_resolved_ip: resolved_ip,
         error_class: Some(retry::ErrorClass::RequestBodyTooLarge),
+    }
+}
+
+/// Mid-upload overflow refusal for the sidecar mesh-mTLS path (codex r1-3):
+/// gRPC-flavored requests — which are capped at the gRPC receive limit — get
+/// the direct gRPC pool's Trailers-Only RESOURCE_EXHAUSTED shape; plain HTTP
+/// keeps the JSON 413. Both are `ErrorClass::RequestBodyTooLarge`, so
+/// backend-health accounting stays NEUTRAL either way.
+fn mesh_mtls_request_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    grpc_flavored: bool,
+    max_size: usize,
+) -> retry::BackendResponse {
+    if grpc_flavored {
+        grpc_proxy::grpc_request_body_too_large_backend_response(
+            &proxy.id,
+            resolved_ip,
+            None,
+            max_size,
+        )
+    } else {
+        hbone_request_body_too_large_response(proxy, resolved_ip, None, max_size)
     }
 }
 
@@ -21925,34 +22051,68 @@ async fn proxy_to_backend_mesh_mtls(
         }
     };
 
+    // gRPC flavor (issue #2003): same-cluster `mesh.mtls` gRPC skips the
+    // direct-dial gRPC pool and dispatches here — the mesh-mTLS pool is hyper
+    // h2 end-to-end, so gRPC trailers ride it natively. gRPC-only adjustments
+    // below: the request-body cap is the gRPC receive limit
+    // (`max_grpc_recv_size_bytes`, mirroring the direct gRPC pool — codex
+    // r1-3), the outbound request re-adds `te: trailers` (the hop-by-hop
+    // strip removes it, but the gRPC HTTP/2 mapping mandates it — the direct
+    // gRPC pool synthesizes it the same way), and a NATIVE gRPC response is
+    // never buffered (a buffered `BackendResponse` has no trailer channel, so
+    // buffering would silently drop `grpc-status`).
+    //
+    // gRPC-Web translated by the `grpc_web` plugin (codex r1-4) is
+    // distinguished via the plugin's request-context marker — stamped only
+    // after the plugin verified the ORIGINAL `application/grpc-web*`
+    // content-type; the spoofable inbound header is stripped there. By
+    // dispatch time its outbound content-type and body are wire-native gRPC,
+    // so it shares the gRPC receive limit and `te: trailers`, but its
+    // response MUST buffer: the plugin re-encodes the backend's terminal
+    // trailers INTO the gRPC-Web response body (see the buffered arm below).
+    let is_grpc_flavored = headers
+        .get("content-type")
+        .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
+    let is_grpc_web_translated = is_grpc_flavored
+        && ctx.is_some_and(crate::plugins::grpc_web::request_is_grpc_web_translated);
+    let is_native_grpc = is_grpc_flavored && !is_grpc_web_translated;
+
+    let request_body_limit = grpc_proxy::mesh_request_body_limit(
+        is_grpc_flavored,
+        state.max_request_body_size_bytes,
+        state.max_grpc_recv_size_bytes,
+    );
     if request_may_have_body(method, headers)
-        && state.max_request_body_size_bytes > 0
+        && request_body_limit > 0
         && let Some(content_length) = headers.get("content-length")
         && let Ok(len) = content_length.parse::<usize>()
-        && len > state.max_request_body_size_bytes
+        && len > request_body_limit
     {
+        // Mirror the direct gRPC path's oversize rejection shape (Trailers-Only
+        // RESOURCE_EXHAUSTED) for gRPC-flavored requests; plain HTTP keeps the
+        // 413. Both carry `ErrorClass::RequestBodyTooLarge` so backend-health
+        // accounting stays NEUTRAL (the backend was never dialed).
+        if is_grpc_flavored {
+            return (
+                grpc_proxy::grpc_request_body_too_large_backend_response(
+                    &proxy.id,
+                    resolved_ip,
+                    Some(len),
+                    request_body_limit,
+                ),
+                None,
+            );
+        }
         return (
             hbone_request_body_too_large_response(
                 proxy,
                 resolved_ip,
                 Some(len),
-                state.max_request_body_size_bytes,
+                request_body_limit,
             ),
             None,
         );
     }
-
-    // Native-gRPC flavor (issue #2003): same-cluster `mesh.mtls` gRPC skips
-    // the direct-dial gRPC pool and dispatches here — the mesh-mTLS pool is
-    // hyper h2 end-to-end, so gRPC trailers ride it natively. Two gRPC-only
-    // adjustments below: the outbound request re-adds `te: trailers` (the
-    // hop-by-hop strip removes it, but the gRPC HTTP/2 mapping mandates it —
-    // the direct gRPC pool synthesizes it the same way), and the response is
-    // never buffered (a buffered `BackendResponse` has no trailer channel, so
-    // buffering would silently drop `grpc-status`).
-    let is_grpc = headers
-        .get("content-type")
-        .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
 
     let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
     let mut sender = match state
@@ -22104,8 +22264,12 @@ async fn proxy_to_backend_mesh_mtls(
 
     let (mut parts, body) = original_req.into_parts();
     let body_size_exceeded = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let max_request_body_size = if state.max_request_body_size_bytes > 0 {
-        state.max_request_body_size_bytes
+    // `request_body_limit` is flavor-aware (codex r1-3): the gRPC receive
+    // limit for gRPC-flavored requests, the general request-body limit
+    // otherwise — so a streamed gRPC upload trips at the same byte count as
+    // the direct gRPC pool's size limiter.
+    let max_request_body_size = if request_body_limit > 0 {
+        request_body_limit
     } else {
         usize::MAX
     };
@@ -22166,9 +22330,11 @@ async fn proxy_to_backend_mesh_mtls(
 
     // gRPC HTTP/2 mapping: requests MUST carry `te: trailers` (the only `te`
     // value HTTP/2 permits). The hop-by-hop strip above removes the client's
-    // copy, so re-synthesize it for native-gRPC requests — mirroring
-    // `strip_backend_request_headers_for_grpc` on the direct gRPC pool path.
-    if is_grpc {
+    // copy, so re-synthesize it for gRPC-flavored requests (native AND
+    // gRPC-Web-translated — both are wire-native gRPC to the peer) —
+    // mirroring `strip_backend_request_headers_for_grpc` on the direct gRPC
+    // pool path, which serves both flavors the same way.
+    if is_grpc_flavored {
         parts
             .headers
             .insert(http::header::TE, http::HeaderValue::from_static("trailers"));
@@ -22242,11 +22408,11 @@ async fn proxy_to_backend_mesh_mtls(
             Ok(Err(err)) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
-                        hbone_request_body_too_large_response(
+                        mesh_mtls_request_body_too_large_response(
                             proxy,
                             resolved_ip,
-                            None,
-                            state.max_request_body_size_bytes,
+                            is_grpc_flavored,
+                            request_body_limit,
                         ),
                         None,
                     );
@@ -22256,11 +22422,11 @@ async fn proxy_to_backend_mesh_mtls(
             Err(_) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
-                        hbone_request_body_too_large_response(
+                        mesh_mtls_request_body_too_large_response(
                             proxy,
                             resolved_ip,
-                            None,
-                            state.max_request_body_size_bytes,
+                            is_grpc_flavored,
+                            request_body_limit,
                         ),
                         None,
                     );
@@ -22291,11 +22457,11 @@ async fn proxy_to_backend_mesh_mtls(
             Err(err) => {
                 if body_size_exceeded.load(Ordering::Acquire) {
                     return (
-                        hbone_request_body_too_large_response(
+                        mesh_mtls_request_body_too_large_response(
                             proxy,
                             resolved_ip,
-                            None,
-                            state.max_request_body_size_bytes,
+                            is_grpc_flavored,
+                            request_body_limit,
                         ),
                         None,
                     );
@@ -22338,9 +22504,9 @@ async fn proxy_to_backend_mesh_mtls(
         &resp_headers,
     );
 
-    // gRPC responses on this path MUST stream: the buffered arm below
-    // (`ResponseBody::Buffered`) collects only body bytes — it has no trailer
-    // channel — so buffering a gRPC response would silently drop `grpc-status`
+    // NATIVE gRPC responses on this path MUST stream: a buffered
+    // `BackendResponse` cannot re-emit wire trailers to the client, so
+    // buffering a native gRPC response would silently drop `grpc-status`
     // and corrupt the RPC. If buffering is still demanded after the
     // content-type refinement (explicit `response_body_mode = Buffer`, or a
     // plugin that needs the body for this content-type), FAIL CLOSED with a
@@ -22352,7 +22518,13 @@ async fn proxy_to_backend_mesh_mtls(
     // response-body buffering. Status 200 keeps circuit-breaker / passive
     // health accurate: the BACKEND responded fine — this is a gateway-side
     // policy conflict, not a backend fault.
-    if is_grpc && !stream_response {
+    //
+    // gRPC-Web translated by the `grpc_web` plugin is deliberately EXEMPT
+    // (codex r1-4): its trailers are body-encoded, not wire-relayed — the
+    // plugin embeds them into the gRPC-Web response body — so buffering is
+    // required and correct. The buffered arm below captures the backend's
+    // terminal H2 trailers into the response-header view for that encoding.
+    if is_native_grpc && !stream_response {
         warn!(
             proxy_id = %proxy.id,
             target_host = %target.host,
@@ -22395,14 +22567,14 @@ async fn proxy_to_backend_mesh_mtls(
             None,
         )
     } else {
-        let body_bytes = match collect_hyper_body_with_limit(
+        let (body_bytes, backend_trailers) = match collect_hyper_body_and_trailers_with_limit(
             response.into_body(),
             state.max_response_body_size_bytes,
             proxy.backend_read_timeout_ms,
         )
         .await
         {
-            Ok(body_bytes) => body_bytes,
+            Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
                 return (
                     hbone_response_body_too_large_response(
@@ -22438,6 +22610,30 @@ async fn proxy_to_backend_mesh_mtls(
                 );
             }
         };
+        // codex r1-4: a gRPC-Web-translated response buffers here BY DESIGN —
+        // the `grpc_web` plugin re-encodes the backend's terminal trailers
+        // (`grpc-status` / `grpc-message` / custom trailing metadata) into
+        // the gRPC-Web response body, reading them from the response-header
+        // map. Fold the captured H2 trailers into the same merged
+        // header+trailer view the direct gRPC pool's buffered path presents
+        // to response hooks (hop-by-hop trailer names filtered; reserved gRPC
+        // terminal keys trailer-authoritative, header-wins otherwise).
+        // Without this merge the plugin would synthesize `grpc-status: 2`
+        // (UNKNOWN) for every RPC, since a trailer-borne grpc-status would
+        // never reach it. Scoped to the translated flavor: plain-HTTP
+        // buffered responses keep their headers untouched.
+        if is_grpc_web_translated && let Some(trailer_map) = backend_trailers {
+            let mut backend_trailer_headers = HashMap::new();
+            grpc_proxy::collect_buffered_grpc_trailers(&trailer_map, &mut backend_trailer_headers);
+            if !backend_trailer_headers.is_empty() {
+                let (merged_view, _header_shadowed_trailer_keys) =
+                    grpc_proxy::build_grpc_plugin_header_view(
+                        &resp_headers,
+                        &backend_trailer_headers,
+                    );
+                resp_headers = merged_view;
+            }
+        }
         (
             retry::BackendResponse {
                 status_code: status,

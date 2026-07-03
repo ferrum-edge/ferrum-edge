@@ -1104,3 +1104,61 @@ fn test_parse_grpc_frames_truncated() {
     let data = vec![0x00, 0x00, 0x00, 0x00, 0x05, b'h', b'e'];
     assert!(parse_grpc_frames(&data).is_empty());
 }
+
+// ── request_is_grpc_web_translated — mesh dispatch distinction (codex r1-4) ──
+//
+// The mesh-mTLS dispatch path uses this marker to tell a gRPC-Web request the
+// plugin translated to native gRPC (response MUST buffer: trailers are
+// re-encoded into the gRPC-Web body) apart from native gRPC (response must
+// NOT buffer: trailers must relay on the wire).
+
+#[tokio::test]
+async fn test_translated_marker_set_only_after_grpc_web_translation() {
+    use ferrum_edge::plugins::grpc_web::request_is_grpc_web_translated;
+
+    let plugin = create_plugin_default();
+
+    // A fresh, untranslated context is not marked.
+    let ctx = create_grpc_web_context("application/grpc-web");
+    assert!(!request_is_grpc_web_translated(&ctx));
+
+    // on_request_received verifies the gRPC-Web content-type, rewrites it to
+    // native gRPC, and stamps the marker.
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(request_is_grpc_web_translated(&ctx));
+    assert_eq!(
+        ctx.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+}
+
+#[tokio::test]
+async fn test_native_grpc_request_is_never_marked_translated() {
+    use ferrum_edge::plugins::grpc_web::request_is_grpc_web_translated;
+
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc");
+    let _ = plugin.on_request_received(&mut ctx).await;
+    assert!(
+        !request_is_grpc_web_translated(&ctx),
+        "native gRPC must keep the wire-trailer (no-buffer) dispatch contract"
+    );
+}
+
+#[tokio::test]
+async fn test_spoofed_mode_header_cannot_mark_request_translated() {
+    use ferrum_edge::plugins::grpc_web::request_is_grpc_web_translated;
+
+    let plugin = create_plugin_default();
+    // A client injecting the internal mode header on a non-gRPC-Web request
+    // must not flip the dispatch distinction: the plugin strips the header
+    // and only stamps the marker after verifying the real content-type.
+    let mut ctx = create_grpc_web_context("application/json");
+    ctx.headers
+        .insert("x-grpc-web-mode".to_string(), "binary".to_string());
+    let _ = plugin.on_request_received(&mut ctx).await;
+    assert!(!request_is_grpc_web_translated(&ctx));
+    assert!(!ctx.headers.contains_key("x-grpc-web-mode"));
+}
