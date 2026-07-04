@@ -2292,6 +2292,9 @@ async fn start_dtls_frontend_listener(
                 // Run on_stream_connect plugins (with DTLS client cert if available)
                 let mut stream_ctx = StreamConnectionContext {
                     client_ip: client_addr.ip().to_string(),
+                    // PROXY protocol is not supported on UDP/DTLS (TCP-borne only);
+                    // direct_client_ip always equals client_ip for UDP sessions.
+                    direct_client_ip: client_addr.ip().to_string(),
                     proxy_id: proxy.id.clone(),
                     proxy_name: proxy_name.clone(),
                     listen_port: port,
@@ -3191,6 +3194,9 @@ async fn create_session(
     // Run on_stream_connect plugins before creating backend connection
     let mut stream_ctx = StreamConnectionContext {
         client_ip: client_addr.ip().to_string(),
+        // PROXY protocol is not supported on plain UDP (TCP-borne only);
+        // direct_client_ip always equals client_ip for UDP sessions.
+        direct_client_ip: client_addr.ip().to_string(),
         proxy_id: proxy_id.to_string(),
         proxy_name: proxy_name.clone(),
         listen_port,

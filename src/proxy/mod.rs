@@ -46,6 +46,7 @@ mod mesh_tcp_inbound;
 pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;
 pub mod netns_capture;
+pub mod proxy_protocol;
 pub mod sni;
 pub mod stream_error;
 pub mod stream_listener;
@@ -4765,6 +4766,7 @@ impl ProxyState {
                 },
                 env_config_arc.pool_shard_amount,
                 mesh_outbound_enforcement.clone(),
+                trusted_proxies.clone(),
             ),
         );
 

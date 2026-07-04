@@ -23,6 +23,7 @@ fn make_consumer(username: &str) -> Consumer {
 fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: ip.to_string(),
+        direct_client_ip: ip.to_string(),
         proxy_id: proxy_id.to_string(),
         proxy_name: Some(format!("TCP Proxy {proxy_id}")),
         listen_port: 5432,

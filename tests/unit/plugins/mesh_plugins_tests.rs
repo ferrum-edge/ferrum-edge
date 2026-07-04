@@ -101,6 +101,7 @@ fn request_context(source: Option<&str>) -> RequestContext {
 fn stream_context() -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
+        direct_client_ip: "127.0.0.1".to_string(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: None,
         listen_port: 15443,
@@ -1589,6 +1590,7 @@ async fn workload_metrics_on_stream_connect_adds_source_identity_metadata() {
     .expect("plugin config");
     let mut ctx = StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
+        direct_client_ip: "127.0.0.1".to_string(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("payments-tcp".to_string()),
         listen_port: 15432,
@@ -4389,6 +4391,7 @@ async fn workload_metrics_stream_inbound_listener_stamps_mesh_direction() {
     let plugin = WorkloadMetrics::new(&json!({})).expect("plugin config");
     let mut ctx = StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
+        direct_client_ip: "127.0.0.1".to_string(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: None,
         listen_port: 15432,

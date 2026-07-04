@@ -1934,7 +1934,21 @@ pub async fn log_with_mirror(
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct StreamConnectionContext {
+    /// Gateway-resolved client IP. For TCP stream proxies with inbound PROXY
+    /// protocol enabled and a trusted upstream peer, this is the forwarded
+    /// source address reported in the PROXY header — the real originating
+    /// client IP, analogous to XFF-resolved `client_ip` on the HTTP path.
+    /// When PROXY protocol is disabled or the peer is not trusted, this equals
+    /// `direct_client_ip` (the raw socket peer).
     pub client_ip: String,
+    /// Immediate socket-peer IP captured at accept(), before any PROXY-protocol
+    /// header is applied. For stream proxies without inbound PROXY protocol
+    /// this is always equal to `client_ip`. For proxies behind a trusted L4
+    /// load balancer using PROXY protocol, this is the LB's own IP.
+    /// Mirrors `RequestContext::direct_client_ip` on the HTTP path. Used by
+    /// `mesh_authz` to populate Istio's `source.ip` principal (socket peer)
+    /// separately from `remote.ip` (forwarded/resolved address).
+    pub direct_client_ip: String,
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub listen_port: u16,

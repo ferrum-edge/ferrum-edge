@@ -2389,6 +2389,7 @@ use std::sync::Arc;
 fn stream_ctx(first_bytes: &[u8], kind: StreamBytesKind) -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: "203.0.113.10".to_string(),
+        direct_client_ip: "203.0.113.10".to_string(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("TCP Proxy".to_string()),
         listen_port: 9000,

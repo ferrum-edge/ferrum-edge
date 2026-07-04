@@ -6011,6 +6011,28 @@ components:
             in either direction, the connection is closed. When omitted, uses the global
             FERRUM_TCP_IDLE_TIMEOUT_SECONDS (default: 300s / 5 min). Set to 0 to disable.
             Only applicable for tcp/tcp_tls protocols.
+        stream_proxy_protocol:
+          type: boolean
+          nullable: true
+          description: |
+            Enable inbound PROXY protocol (v1 text or v2 binary, auto-detected) on this
+            stream proxy listener. When true, every inbound TCP connection must begin with a
+            valid PROXY header; connections that do not are closed immediately (fail closed).
+
+            Trust requirement: the forwarded address is honoured only when the socket peer
+            (the load balancer's own IP) belongs to the FERRUM_TRUSTED_PROXIES CIDR set. A
+            connection from an untrusted peer on a PROXY-protocol-enabled listener is also
+            closed to prevent direct-connect clients from spoofing their source IP.
+
+            After a trusted parse, client_ip in the stream context (and in stream logs and
+            authz plugins) is the forwarded source IP from the PROXY header; direct_client_ip
+            retains the raw socket peer (the LB's own IP). This mirrors XFF + FERRUM_TRUSTED_PROXIES
+            on the HTTP path.
+
+            Only valid for tcp / tcp_tls stream proxies. Setting it on UDP, DTLS, or HTTP
+            proxies produces a validation error (PROXY protocol is TCP-borne).
+
+            Default: null / false (disabled; socket peer is always used as client_ip).
         websocket_idle_timeout_seconds:
           type: integer
           format: uint64

@@ -14,6 +14,7 @@ fn create_context_with_ip(ip: &str) -> RequestContext {
 fn create_stream_context_with_ip(ip: &str) -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: ip.to_string(),
+        direct_client_ip: ip.to_string(),
         proxy_id: "test-proxy".to_string(),
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 8080,

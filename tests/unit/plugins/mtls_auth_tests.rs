@@ -138,6 +138,7 @@ fn create_stream_ctx_with_cert(
 ) -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
+        direct_client_ip: "127.0.0.1".to_string(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("TCP Proxy".to_string()),
         listen_port: 5432,
@@ -1025,6 +1026,7 @@ fn create_udp_stream_ctx_with_cert(
 ) -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
+        direct_client_ip: "127.0.0.1".to_string(),
         proxy_id: "udp-proxy".to_string(),
         proxy_name: Some("UDP Proxy".to_string()),
         listen_port: 5353,
@@ -1047,6 +1049,7 @@ fn create_udp_stream_ctx_with_cert(
 fn create_udp_stream_ctx_no_cert(consumers: Vec<Consumer>) -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
+        direct_client_ip: "127.0.0.1".to_string(),
         proxy_id: "udp-proxy".to_string(),
         proxy_name: Some("UDP Proxy".to_string()),
         listen_port: 5353,
@@ -1112,6 +1115,7 @@ async fn test_mtls_auth_dtls_with_allowed_issuer() {
     .unwrap();
     let mut ctx = StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
+        direct_client_ip: "127.0.0.1".to_string(),
         proxy_id: "udp-proxy".to_string(),
         proxy_name: Some("UDP Proxy".to_string()),
         listen_port: 5353,
@@ -1147,6 +1151,7 @@ async fn test_mtls_auth_dtls_allowed_issuer_rejects_mismatch() {
     .unwrap();
     let mut ctx = StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
+        direct_client_ip: "127.0.0.1".to_string(),
         proxy_id: "udp-proxy".to_string(),
         proxy_name: Some("UDP Proxy".to_string()),
         listen_port: 5353,

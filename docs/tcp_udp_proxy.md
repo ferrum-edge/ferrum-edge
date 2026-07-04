@@ -74,6 +74,7 @@ proxies:
 | `backend_scheme` | `string` | (required) | One of: `tcp`, `tcps`, `udp`, `dtls` |
 | `frontend_tls` | `bool` | `false` | Terminate TLS (TCP) or DTLS (UDP) on incoming connections |
 | `tcp_idle_timeout_seconds` | `u64` | (global) | TCP idle timeout override. When omitted, uses `FERRUM_TCP_IDLE_TIMEOUT_SECONDS` (default 300s). 0 = disabled |
+| `stream_proxy_protocol` | `bool` | `false` | Enable inbound PROXY protocol (v1 or v2) on this `tcp`/`tcp_tls` listener. See [Inbound PROXY Protocol](#inbound-proxy-protocol) below. |
 | `udp_idle_timeout_seconds` | `u64` | `60` | UDP session idle timeout before cleanup |
 
 ### Synthetic `listen_path`
@@ -450,12 +451,74 @@ These Linux-specific options auto-detect kernel support at startup when set to `
 | `FERRUM_TCP_FASTOPEN_ENABLED` | `auto` | TCP Fast Open on listener and outbound sockets. Saves 1 RTT for repeat connections. Checks `/proc/sys/net/ipv4/tcp_fastopen` sysctl |
 | `FERRUM_UDP_RECVMMSG_BATCH_SIZE` | `64` | Datagrams per `recvmmsg` syscall (1-1024). Each slot allocates 65535 bytes |
 
+## Inbound PROXY Protocol
+
+Ferrum supports inbound [PROXY protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) (v1 text and v2 binary, auto-detected by prefix) on TCP and TCP+TLS stream listeners. This lets a front-end load balancer (AWS NLB, HAProxy, etc.) prepend the real client address to each accepted connection so the gateway sees the originating source IP instead of the LB's own IP.
+
+### Enabling PROXY Protocol
+
+Add `stream_proxy_protocol: true` to any `tcp` or `tcp_tls` proxy:
+
+```yaml
+proxies:
+  - id: db-proxy
+    name: Postgres
+    backend_scheme: tcp
+    listen_port: 5432
+    targets:
+      - host: db.internal
+        port: 5432
+    stream_proxy_protocol: true   # expect PROXY header on every accepted connection
+```
+
+### Trust Gating
+
+The forwarded address from the PROXY header is honored **only when** the socket peer (the load balancer's own IP) belongs to `FERRUM_TRUSTED_PROXIES`. This prevents a direct-connect client from spoofing their source IP by sending a hand-crafted PROXY header.
+
+- Set `FERRUM_TRUSTED_PROXIES` to the CIDR(s) of your load balancer's egress IPs:
+  ```
+  FERRUM_TRUSTED_PROXIES=10.0.0.0/8,172.16.0.0/12
+  ```
+- Connections from a peer **not** in `FERRUM_TRUSTED_PROXIES` are **closed immediately** with a structured warning log. An untrusted peer on a PROXY-protocol-enabled listener indicates a misconfiguration or an attack; silently ignoring the header would mislead downstream authz plugins.
+
+### Fail-Closed Behavior
+
+When `stream_proxy_protocol: true` is set:
+
+| Scenario | Result |
+|----------|--------|
+| Trusted peer + valid PROXY header | `client_ip` = forwarded address; `direct_client_ip` = LB socket peer |
+| Trusted peer + missing/invalid header | Connection **closed** immediately (structured warn) |
+| Untrusted peer | Connection **closed** immediately (structured warn) |
+| Trusted peer + PROXY v2 LOCAL command | `client_ip` = `direct_client_ip` = LB socket peer (LB health check) |
+| v1 `UNKNOWN` or v2 `AF_UNSPEC` | `client_ip` = `direct_client_ip` = LB socket peer |
+
+If the client does not send a PROXY header within 5 seconds, the connection is also closed.
+
+### Client IP Resolution
+
+After a trusted PROXY header parse, the resolved client IP flows through the full stream plugin chain:
+
+- **`client_ip`** in `StreamConnectionContext` = forwarded source address (real originating client)
+- **`direct_client_ip`** in `StreamConnectionContext` = raw socket peer (load balancer's IP)
+- Stream logs and rate-limit plugins see `client_ip` (the forwarded address)
+- Mesh authz `remote.ip` / `remoteIpBlocks` uses `client_ip`; `source.ip` / `ipBlocks` uses `direct_client_ip`
+
+This mirrors the HTTP-path semantics of `X-Forwarded-For` + `FERRUM_TRUSTED_PROXIES`.
+
+### Limitations
+
+- **TCP and TCP+TLS only.** PROXY protocol is a TCP-borne framing; it cannot be used on `udp` or `dtls` proxies. Setting `stream_proxy_protocol: true` on a non-TCP proxy produces a validation error.
+- **Not supported on mesh inbound relay paths.** Mesh tunnel peers (Sidecar mTLS, Ambient HBONE) carry cryptographic peer identity rather than PROXY headers; mesh inbound TCP relay never reads PROXY protocol headers.
+- **No outbound PROXY protocol.** Ferrum currently does not prepend PROXY headers to backend connections (outbound PROXY protocol support is a future enhancement).
+
 ## Validation Rules
 
 - `listen_port` is required for stream proxies (1024-65535)
 - `listen_port` must be unique across all stream proxies (checked via database in DB/CP mode, in-memory in file mode)
 - `listen_port` must not conflict with gateway reserved ports — the proxy HTTP/HTTPS ports (`FERRUM_PROXY_HTTP_PORT`, `FERRUM_PROXY_HTTPS_PORT`), admin HTTP/HTTPS ports (`FERRUM_ADMIN_HTTP_PORT`, `FERRUM_ADMIN_HTTPS_PORT`), or CP gRPC port (`FERRUM_CP_GRPC_LISTEN_ADDR`)
 - HTTP proxies must not set `listen_port`
+- `stream_proxy_protocol` may only be set on `tcp` / `tcp_tls` proxies; setting it on `udp`, `dtls`, or HTTP proxies is a validation error
 - Stream proxies are excluded from the HTTP router (routed by port, not path)
 
 ### Port Availability Enforcement

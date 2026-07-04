@@ -31,8 +31,8 @@ use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
 use ferrum_edge::modes::mesh::MeshTrafficDirection;
 use ferrum_edge::modes::mesh::config::{
-    ConditionMatch, MeshPolicy, MeshRule, PolicyAction, PolicyScope, PrincipalMatch, RequestMatch,
-    WorkloadSelector,
+    ConditionMatch, MeshPolicy, MeshRule, ParsedCidr, PolicyAction, PolicyScope, PrincipalMatch,
+    RequestMatch, SourceNegationMatch, WorkloadSelector,
 };
 use ferrum_edge::plugins::mesh::authz::MeshAuthz;
 use ferrum_edge::plugins::{
@@ -1451,6 +1451,7 @@ async fn condition_not_values_on_jwt_claim_allows_absent_attribute() {
 fn inbound_stream_ctx(listen_port: u16, peer_spiffe: &str) -> StreamConnectionContext {
     let mut ctx = StreamConnectionContext {
         client_ip: "10.0.0.7".to_string(),
+        direct_client_ip: "10.0.0.7".to_string(),
         proxy_id: "__mesh-in-tcp-relay-default-redis-6379".to_string(),
         proxy_name: Some("mesh raw-tcp inbound".to_string()),
         listen_port,
@@ -1588,6 +1589,173 @@ async fn stream_port_scoped_deny_ignores_non_matching_port_and_admits_relay() {
         ),
         "a DENY scoped to an unrelated port must not block the captured raw-TCP \
          inbound relay on the app port"
+    );
+}
+
+/// Build a `MeshAuthz` plugin that enforces a single `MeshPolicy` (no workload
+/// selector — mesh-wide). Used by stream-path IP-split tests below.
+fn build_stream_authz(policy: MeshPolicy) -> MeshAuthz {
+    MeshAuthz::new(&json!({ "mesh_policies": [policy] })).expect("plugin config")
+}
+
+#[tokio::test]
+async fn stream_source_ip_uses_direct_client_ip_not_client_ip() {
+    // When `direct_client_ip` (socket peer / LB IP) and `client_ip` (PROXY-
+    // protocol-forwarded / resolved address) differ, Istio `source.ip` /
+    // `ipBlocks` must match against `direct_client_ip` (the socket peer),
+    // NOT the forwarded `client_ip`. This mirrors the HTTP-path split where
+    // `source.ip` uses `RequestContext::direct_client_ip`.
+    //
+    // Policy: ALLOW only when source.ip is in 10.0.0.0/8 (the LB CIDR).
+    let allow_lb_peer = MeshPolicy {
+        name: "allow-lb-peer".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            source_negation: SourceNegationMatch {
+                ip_blocks: vec![ParsedCidr::parse("10.0.0.0/8").unwrap()],
+                ..SourceNegationMatch::default()
+            },
+            action: PolicyAction::Allow,
+            ..MeshRule::default()
+        }],
+    };
+    let plugin = build_stream_authz(allow_lb_peer);
+
+    // Scenario: LB peer = 10.0.0.1 (in 10.0.0.0/8), forwarded client = 203.0.113.5 (not in range).
+    // source.ip must use direct_client_ip (10.0.0.1) → should be allowed.
+    let mut ctx = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    ctx.client_ip = "203.0.113.5".to_string(); // forwarded (PROXY protocol)
+    ctx.direct_client_ip = "10.0.0.1".to_string(); // socket peer (LB)
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut ctx).await,
+            PluginResult::Continue
+        ),
+        "source.ip ipBlocks must match direct_client_ip (socket peer), not client_ip (forwarded)"
+    );
+}
+
+#[tokio::test]
+async fn stream_remote_ip_uses_client_ip_not_direct_client_ip() {
+    // Istio `remote.ip` / `remoteIpBlocks` must match the RESOLVED client IP
+    // (`client_ip`, i.e. the PROXY-protocol-forwarded address). It must NOT
+    // match the raw socket peer (`direct_client_ip`).
+    //
+    // Policy: ALLOW only when remote.ip is in 203.0.113.0/24 (real client CIDR).
+    let allow_real_client = MeshPolicy {
+        name: "allow-real-client".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            source_negation: SourceNegationMatch {
+                remote_ip_blocks: vec![ParsedCidr::parse("203.0.113.0/24").unwrap()],
+                ..SourceNegationMatch::default()
+            },
+            action: PolicyAction::Allow,
+            ..MeshRule::default()
+        }],
+    };
+    let plugin = build_stream_authz(allow_real_client);
+
+    // LB peer = 10.0.0.1 (not in 203.0.113.0/24), forwarded client = 203.0.113.5 (in range).
+    // remote.ip must use client_ip (203.0.113.5) → allowed.
+    let mut ctx = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    ctx.client_ip = "203.0.113.5".to_string(); // forwarded (PROXY protocol)
+    ctx.direct_client_ip = "10.0.0.1".to_string(); // socket peer (LB)
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut ctx).await,
+            PluginResult::Continue
+        ),
+        "remote.ip remoteIpBlocks must match client_ip (forwarded), not direct_client_ip (socket peer)"
+    );
+
+    // Inverse: policy targets the LB peer range. Should NOT be admitted via remote.ip.
+    let allow_lb_as_remote = MeshPolicy {
+        name: "allow-lb-as-remote".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            source_negation: SourceNegationMatch {
+                remote_ip_blocks: vec![ParsedCidr::parse("10.0.0.0/8").unwrap()],
+                ..SourceNegationMatch::default()
+            },
+            action: PolicyAction::Allow,
+            ..MeshRule::default()
+        }],
+    };
+    let plugin2 = build_stream_authz(allow_lb_as_remote);
+    let mut ctx2 = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    ctx2.client_ip = "203.0.113.5".to_string(); // forwarded
+    ctx2.direct_client_ip = "10.0.0.1".to_string(); // socket peer (in 10.0.0.0/8)
+    assert!(
+        matches!(
+            plugin2.on_stream_connect(&mut ctx2).await,
+            PluginResult::Reject { .. }
+        ),
+        "LB socket peer must NOT satisfy remote.ip remoteIpBlocks when forwarded client_ip is out of range"
+    );
+}
+
+#[tokio::test]
+async fn stream_ip_split_collapses_when_no_proxy_protocol() {
+    // When PROXY protocol is not enabled, direct_client_ip == client_ip (both
+    // equal the socket peer). An ipBlocks policy on the socket IP must ALLOW
+    // and a remoteIpBlocks policy on the same IP must also ALLOW — no split.
+    let socket_peer = "10.0.0.50";
+    let allow_source = MeshPolicy {
+        name: "allow-socket-as-source".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            source_negation: SourceNegationMatch {
+                ip_blocks: vec![ParsedCidr::parse("10.0.0.0/8").unwrap()],
+                ..SourceNegationMatch::default()
+            },
+            action: PolicyAction::Allow,
+            ..MeshRule::default()
+        }],
+    };
+    let allow_remote = MeshPolicy {
+        name: "allow-socket-as-remote".to_string(),
+        namespace: DEFAULT_NAMESPACE.to_string(),
+        scope: PolicyScope::MeshWide,
+        rules: vec![MeshRule {
+            source_negation: SourceNegationMatch {
+                remote_ip_blocks: vec![ParsedCidr::parse("10.0.0.0/8").unwrap()],
+                ..SourceNegationMatch::default()
+            },
+            action: PolicyAction::Allow,
+            ..MeshRule::default()
+        }],
+    };
+
+    // Without PROXY protocol, both IPs equal the socket peer.
+    let mut ctx1 = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    ctx1.client_ip = socket_peer.to_string();
+    ctx1.direct_client_ip = socket_peer.to_string();
+    assert!(
+        matches!(
+            build_stream_authz(allow_source)
+                .on_stream_connect(&mut ctx1)
+                .await,
+            PluginResult::Continue
+        ),
+        "source.ip ipBlocks must match socket peer when no PROXY protocol"
+    );
+
+    let mut ctx2 = inbound_stream_ctx(6379, CLIENT_SPIFFE);
+    ctx2.client_ip = socket_peer.to_string();
+    ctx2.direct_client_ip = socket_peer.to_string();
+    assert!(
+        matches!(
+            build_stream_authz(allow_remote)
+                .on_stream_connect(&mut ctx2)
+                .await,
+            PluginResult::Continue
+        ),
+        "remote.ip remoteIpBlocks must match socket peer when no PROXY protocol"
     );
 }
 

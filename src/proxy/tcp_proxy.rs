@@ -983,6 +983,12 @@ pub struct TcpListenerConfig {
     /// policy set for the proxy's own workload identity rather than per-pod.
     pub node_waypoint_identity_resolver:
         Option<Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>>,
+    /// Pre-parsed trusted proxy CIDR set (from `FERRUM_TRUSTED_PROXIES`).
+    /// When a proxy has `stream_proxy_protocol: true`, the accept loop reads
+    /// the inbound PROXY protocol header and honors the forwarded address only
+    /// when the socket peer belongs to this set. Connections from untrusted
+    /// peers are closed immediately to prevent IP spoofing.
+    pub trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
 }
 
 #[derive(Clone)]
@@ -1013,6 +1019,7 @@ struct TcpAcceptLoopState {
     node_waypoint_identity_resolver:
         Option<Arc<crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver>>,
     node_waypoint_identity_warn_limiter: Arc<NodeWaypointIdentityWarnLimiter>,
+    trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
 }
 
 /// Start a TCP proxy listener on the given port.
@@ -1055,6 +1062,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         record_mesh_mtls_metric,
         mesh_outbound_enforcement,
         node_waypoint_identity_resolver,
+        trusted_proxies,
     } = cfg;
     let addr = SocketAddr::new(bind_addr, port);
     let backlog = tcp_listen_backlog as i32;
@@ -1135,6 +1143,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         mesh_outbound_enforcement,
         node_waypoint_identity_resolver,
         node_waypoint_identity_warn_limiter: Arc::new(NodeWaypointIdentityWarnLimiter::new()),
+        trusted_proxies,
     };
 
     // Bind all extra sockets before spawning any accept loops. If one bind
@@ -1270,6 +1279,7 @@ async fn run_tcp_accept_loop(
                     state.node_waypoint_identity_resolver.clone();
                 let node_waypoint_identity_warn_limiter =
                     state.node_waypoint_identity_warn_limiter.clone();
+                let trusted_proxies = state.trusted_proxies.clone();
 
                 tokio::spawn(async move {
                     let _active_metric_guard = TcpActiveConnectionGuard::new(metrics.clone());
@@ -1279,7 +1289,65 @@ async fn run_tcp_accept_loop(
 
                     let connected_at = Instant::now();
                     let connected_wall_at = chrono::Utc::now();
-                    let client_ip = remote_addr.ip().to_string();
+                    let direct_client_ip = remote_addr.ip().to_string();
+
+                    // Inbound PROXY protocol (v1 text / v2 binary) — opt-in per proxy.
+                    // When `stream_proxy_protocol: true` is set on the Proxy config, every
+                    // connection must begin with a PROXY header. The forwarded source address
+                    // is honoured only when the socket peer belongs to FERRUM_TRUSTED_PROXIES.
+                    // Connections from untrusted peers, or with an invalid/absent header, are
+                    // closed immediately (fail closed). This mirrors the HTTP-path semantics
+                    // of `direct_client_ip` (socket peer) vs `client_ip` (XFF-resolved).
+                    // We check `stream_proxy_protocol` from the current epoch config for this
+                    // proxy_id. This is a cold check per connection (one epoch load), not
+                    // per-request overhead.
+                    let proxy_protocol_enabled = {
+                        let epoch = request_epoch.load();
+                        epoch
+                            .proxy_by_id(proxy_id.as_ref())
+                            .and_then(|p| p.stream_proxy_protocol)
+                            .unwrap_or(false)
+                    };
+
+                    // `client_ip` will be overwritten if PROXY protocol supplies a forwarded addr.
+                    let client_ip = if proxy_protocol_enabled {
+                        let peer_addr = remote_addr;
+                        let peer_ip = peer_addr.ip();
+                        // Only honor the PROXY header when the LB's IP is in FERRUM_TRUSTED_PROXIES.
+                        if !trusted_proxies.contains(&peer_ip) {
+                            crate::proxy::proxy_protocol::warn_untrusted_proxy_peer(
+                                &peer_addr,
+                                &proxy_id,
+                            );
+                            return; // close connection immediately
+                        }
+                        // Parse the PROXY header from the raw TcpStream. The header precedes
+                        // the TLS ClientHello so we read it before any TLS handshake.
+                        match crate::proxy::proxy_protocol::read_proxy_header(
+                            &mut stream,
+                            None, // use default 5s safety timeout
+                        )
+                        .await
+                        {
+                            Ok(result) => {
+                                let (resolved, _direct) =
+                                    crate::proxy::proxy_protocol::apply_proxy_result(
+                                        result, &peer_addr,
+                                    );
+                                resolved
+                            }
+                            Err(e) => {
+                                crate::proxy::proxy_protocol::warn_invalid_proxy_header(
+                                    &peer_addr,
+                                    &proxy_id,
+                                    &e,
+                                );
+                                return; // close connection immediately
+                            }
+                        }
+                    } else {
+                        direct_client_ip.clone()
+                    };
 
                     // Node-waypoint per-pod policy scoping (parity with the
                     // HTTP/HBONE admit path in `src/proxy/mod.rs`). When this
@@ -1310,6 +1378,9 @@ async fn run_tcp_accept_loop(
                     // (after TLS handshake for TLS proxies, so client cert is available).
                     let mut stream_ctx = StreamConnectionContext {
                         client_ip: client_ip.clone(),
+                        // `direct_client_ip` is always the raw socket peer. When PROXY
+                        // protocol is active `client_ip` may differ (forwarded source IP).
+                        direct_client_ip: direct_client_ip.clone(),
                         proxy_id: proxy_id.to_string(),
                         proxy_name: base_proxy.and_then(|p| p.name.clone()),
                         listen_port: port,

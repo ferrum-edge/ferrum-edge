@@ -44,6 +44,7 @@ fn build_cert_with_uri_sans(uris: &[&str]) -> Vec<u8> {
 fn empty_stream_ctx(cert_der: Option<Vec<u8>>) -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
+        direct_client_ip: "127.0.0.1".to_string(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("tcp".to_string()),
         listen_port: 5432,

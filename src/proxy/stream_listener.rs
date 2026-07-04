@@ -433,6 +433,13 @@ pub struct StreamListenerManager {
     /// (`connect4`/`connect6` cgroup hooks), and a shared UDP frontend socket
     /// has no per-source-pod cookie. See [`Self::set_node_waypoint_identity_resolver`].
     node_waypoint_identity_resolver: arc_swap::ArcSwap<Option<Arc<NodeWaypointIdentityResolver>>>,
+    /// Pre-parsed trusted proxy CIDR set (from `FERRUM_TRUSTED_PROXIES`).
+    /// Shared with each spawned TCP stream accept loop that has
+    /// `stream_proxy_protocol: true`. The accept loop honors the forwarded
+    /// address from the PROXY header only when the socket peer belongs to
+    /// this set; untrusted peers are rejected outright to prevent IP spoofing.
+    /// Empty when `FERRUM_TRUSTED_PROXIES` is not set.
+    trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
 }
 
 impl StreamListenerManager {
@@ -467,6 +474,7 @@ impl StreamListenerManager {
         udp_gro_enabled: bool,
         udp_gso_enabled: bool,
         udp_pktinfo_enabled: bool,
+        trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
     ) -> Self {
         Self::new_with_epoch(
             bind_addr,
@@ -498,6 +506,7 @@ impl StreamListenerManager {
             udp_gro_enabled,
             udp_gso_enabled,
             udp_pktinfo_enabled,
+            trusted_proxies,
         )
     }
 
@@ -532,6 +541,7 @@ impl StreamListenerManager {
         udp_gro_enabled: bool,
         udp_gso_enabled: bool,
         udp_pktinfo_enabled: bool,
+        trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
     ) -> Self {
         Self::new_with_epoch_and_mesh_enforcement(
             bind_addr,
@@ -565,6 +575,7 @@ impl StreamListenerManager {
             udp_pktinfo_enabled,
             0,
             crate::modes::mesh::outbound_enforcement::empty_slot(),
+            trusted_proxies,
         )
     }
 
@@ -602,6 +613,7 @@ impl StreamListenerManager {
         pool_shard_amount: usize,
         mesh_outbound_enforcement:
             crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
+        trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
     ) -> Self {
         Self {
             listeners: tokio::sync::Mutex::new(std::collections::HashMap::new()),
@@ -642,6 +654,7 @@ impl StreamListenerManager {
             backend_tls_reload_epoch: Arc::new(AtomicU64::new(0)),
             mesh_outbound_enforcement,
             node_waypoint_identity_resolver: arc_swap::ArcSwap::new(Arc::new(None)),
+            trusted_proxies,
         }
     }
 
@@ -1391,6 +1404,7 @@ impl StreamListenerManager {
                     .load_full()
                     .as_ref()
                     .clone();
+                let trusted_proxies = self.trusted_proxies.clone();
                 let join_handle = tokio::spawn(async move {
                     if let Err(e) = super::tcp_proxy::start_tcp_listener(TcpListenerConfig {
                         port: port_val,
@@ -1424,6 +1438,7 @@ impl StreamListenerManager {
                         record_mesh_mtls_metric,
                         mesh_outbound_enforcement,
                         node_waypoint_identity_resolver,
+                        trusted_proxies,
                     })
                     .await
                     {

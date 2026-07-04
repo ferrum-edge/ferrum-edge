@@ -1924,15 +1924,25 @@ impl Plugin for MeshAuthz {
         // Istio `when:` attributes for stream (TCP/UDP) connections. No HTTP
         // headers or JWT here, but source identity, destination port,
         // connection SNI, and source/remote IP are all available.
-        let resolved_ip = parse_client_ip(&ctx.client_ip);
+        //
+        // Istio source IP matchers. `source.ip` is the immediate downstream
+        // socket peer captured at accept() before any PROXY-protocol rewriting
+        // (`direct_client_ip`); `remote.ip` is the resolved client IP after
+        // inbound PROXY protocol is applied (`client_ip`). When PROXY protocol
+        // is not enabled these two are the same socket-peer value, matching
+        // Envoy's un-fronted raw-TCP behavior. This mirrors the HTTP-path split
+        // at `on_request_received` where `direct_client_ip` and `client_ip` are
+        // similarly separated via XFF / real-IP resolution.
+        let source_ip = parse_client_ip(&ctx.direct_client_ip);
+        let remote_ip = parse_client_ip(&ctx.client_ip);
         let attributes =
-            self.build_stream_condition_attributes(ctx, source_principal.as_ref(), resolved_ip);
+            self.build_stream_condition_attributes(ctx, source_principal.as_ref(), remote_ip);
         let request = MeshAuthzRequest {
             source_principal,
             port: Some(ctx.listen_port),
             attributes,
-            source_ip: resolved_ip,
-            remote_ip: resolved_ip,
+            source_ip,
+            remote_ip,
             ..MeshAuthzRequest::default()
         };
         let decision = if self.per_pod_policy_scoping {

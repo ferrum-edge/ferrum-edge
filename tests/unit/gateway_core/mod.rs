@@ -24,6 +24,7 @@ mod per_port_load_balancer_tests;
 mod pool_key_tests;
 mod protocol_validation_tests;
 mod proxy_body_tests;
+mod proxy_protocol_tests;
 mod proxy_tests;
 mod request_context_tests;
 mod response_body_mode_tests;

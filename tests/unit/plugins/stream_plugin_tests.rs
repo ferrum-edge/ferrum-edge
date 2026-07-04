@@ -261,6 +261,7 @@ async fn test_ip_restriction_stream_connect_allowed() {
 
     let mut ctx = StreamConnectionContext {
         client_ip: "10.1.2.3".to_string(),
+        direct_client_ip: "10.1.2.3".to_string(),
         proxy_id: "test-proxy".to_string(),
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 5432,
@@ -293,6 +294,7 @@ async fn test_ip_restriction_stream_connect_denied() {
 
     let mut ctx = StreamConnectionContext {
         client_ip: "192.168.1.1".to_string(),
+        direct_client_ip: "192.168.1.1".to_string(),
         proxy_id: "test-proxy".to_string(),
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 5432,
@@ -326,6 +328,7 @@ async fn test_ip_restriction_stream_connect_denied() {
 fn make_stream_ctx() -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: "10.1.2.3".to_string(),
+        direct_client_ip: "10.1.2.3".to_string(),
         proxy_id: "test-proxy".to_string(),
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 5432,
