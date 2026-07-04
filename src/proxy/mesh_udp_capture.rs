@@ -848,7 +848,8 @@ async fn run_udp_egress_session(
                 lb,
                 &entry.upstream_id,
                 override_port,
-            ))
+            )
+            && stream_port_override_affects_selection(proxy, override_port))
         .then_some(override_port);
         if let Some(port) = port_lane {
             let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
@@ -1312,6 +1313,20 @@ fn spawn_capture_session_cleanup(
     });
 }
 
+#[cfg(target_os = "linux")]
+fn stream_port_override_affects_selection(proxy: &crate::config::types::Proxy, port: u16) -> bool {
+    let Some(override_config) = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&port))
+    else {
+        return false;
+    };
+    override_config.algorithm.is_some()
+        || override_config.hash_on.is_some()
+        || override_config.locality_lb_setting.is_some()
+}
+
 /// Non-Linux stub. `IP_TRANSPARENT` and recvmsg cmsg orig-dst recovery are
 /// Linux-only; mesh UDP capture is unsupported elsewhere, so the listener logs
 /// and returns immediately (the flag is default-off, so this is never reached
@@ -1393,6 +1408,51 @@ mod tests {
             client: client.parse().unwrap(),
             orig_dst: dst.parse().unwrap(),
         }
+    }
+
+    fn proxy_with_override(
+        override_config: crate::config::types::ResolvedPortOverride,
+    ) -> crate::config::types::Proxy {
+        let mut proxy: crate::config::types::Proxy = serde_yaml::from_str(
+            r#"
+id: mesh-udp-relay
+backend_scheme: udp
+backend_host: placeholder.local
+backend_port: 0
+listen_port: 15011
+"#,
+        )
+        .expect("proxy fixture should deserialize");
+        proxy.dispatch_port_overrides =
+            Some(std::collections::HashMap::from([(53, override_config)]));
+        proxy
+    }
+
+    #[test]
+    fn mesh_udp_stream_port_override_affects_selection_only_for_lb_fields() {
+        let timeout_only = proxy_with_override(crate::config::types::ResolvedPortOverride {
+            connect_timeout_ms: Some(250),
+            ..Default::default()
+        });
+        assert!(!stream_port_override_affects_selection(&timeout_only, 53));
+
+        let passive_only = proxy_with_override(crate::config::types::ResolvedPortOverride {
+            passive_health_check: Some(crate::config::types::PassiveHealthCheck::default()),
+            ..Default::default()
+        });
+        assert!(!stream_port_override_affects_selection(&passive_only, 53));
+
+        let locality = proxy_with_override(crate::config::types::ResolvedPortOverride {
+            locality_lb_setting: Some(crate::config::types::UpstreamLocalityLbSetting::default()),
+            ..Default::default()
+        });
+        assert!(stream_port_override_affects_selection(&locality, 53));
+
+        let algorithm = proxy_with_override(crate::config::types::ResolvedPortOverride {
+            algorithm: Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing),
+            ..Default::default()
+        });
+        assert!(stream_port_override_affects_selection(&algorithm, 53));
     }
 
     #[test]
