@@ -3930,6 +3930,25 @@ impl GatewayConfig {
                 continue;
             }
 
+            // All proxies sharing a port must agree on stream_proxy_protocol:
+            // the PROXY header is read from the raw stream BEFORE the TLS
+            // ClientHello, so SNI-based proxy resolution has not happened yet
+            // and the accept loop can only apply one per-listener decision.
+            let pp_enabled: Vec<&str> = proxies_on_port
+                .iter()
+                .filter(|p| p.stream_proxy_protocol == Some(true))
+                .map(|p| p.id.as_str())
+                .collect();
+            if !pp_enabled.is_empty() && pp_enabled.len() != proxies_on_port.len() {
+                errors.push(format!(
+                    "Shared listen_port {} mixes stream_proxy_protocol settings ({} enable it) — \
+                     the PROXY header is parsed before SNI resolution, so every proxy sharing a \
+                     port must agree on stream_proxy_protocol",
+                    port,
+                    pp_enabled.join(", ")
+                ));
+            }
+
             // At most one proxy per port may have empty hosts (catch-all)
             let catch_all_count = proxies_on_port
                 .iter()

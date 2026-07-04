@@ -679,6 +679,46 @@ fn test_passthrough_port_sharing_overlapping_hosts_rejected() {
 }
 
 #[test]
+fn test_passthrough_port_sharing_mixed_stream_proxy_protocol_rejected() {
+    // The PROXY header is parsed before the TLS ClientHello, so SNI-based
+    // proxy resolution cannot vary the decision per proxy: every proxy
+    // sharing a listener port must agree on stream_proxy_protocol.
+    let mut p1 = make_stream_proxy("pt-pp", BackendScheme::Tcp, 8444);
+    p1.passthrough = true;
+    p1.hosts = vec!["a.example.com".to_string()];
+    p1.stream_proxy_protocol = Some(true);
+
+    let mut p2 = make_stream_proxy("pt-no-pp", BackendScheme::Tcp, 8444);
+    p2.passthrough = true;
+    p2.hosts = vec!["b.example.com".to_string()];
+
+    let config = test_config(vec![p1, p2]);
+    let errors = config.validate_stream_proxies().unwrap_err();
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.contains("mixes stream_proxy_protocol")),
+        "expected mixed stream_proxy_protocol rejection, got: {errors:?}"
+    );
+}
+
+#[test]
+fn test_passthrough_port_sharing_uniform_stream_proxy_protocol_accepted() {
+    let mut p1 = make_stream_proxy("pt-pp-a", BackendScheme::Tcp, 8444);
+    p1.passthrough = true;
+    p1.hosts = vec!["a.example.com".to_string()];
+    p1.stream_proxy_protocol = Some(true);
+
+    let mut p2 = make_stream_proxy("pt-pp-b", BackendScheme::Tcp, 8444);
+    p2.passthrough = true;
+    p2.hosts = vec!["b.example.com".to_string()];
+    p2.stream_proxy_protocol = Some(true);
+
+    let config = test_config(vec![p1, p2]);
+    assert!(config.validate_stream_proxies().is_ok());
+}
+
+#[test]
 fn test_passthrough_port_sharing_wildcard_hosts() {
     let mut p1 = make_stream_proxy("pt-wild", BackendScheme::Tcp, 8444);
     p1.passthrough = true;

@@ -509,6 +509,7 @@ This mirrors the HTTP-path semantics of `X-Forwarded-For` + `FERRUM_TRUSTED_PROX
 ### Limitations
 
 - **TCP and TCP+TLS only.** PROXY protocol is a TCP-borne framing; it cannot be used on `udp` or `dtls` proxies. Setting `stream_proxy_protocol: true` on a non-TCP proxy produces a validation error.
+- **Shared (SNI-passthrough) ports must agree.** The PROXY header is read from the raw stream before the TLS ClientHello, so SNI-based proxy resolution has not happened yet — the accept loop applies one per-listener decision. Every passthrough proxy sharing a `listen_port` must set the same `stream_proxy_protocol` value; mixing is a validation error.
 - **Not supported on mesh inbound relay paths.** Mesh tunnel peers (Sidecar mTLS, Ambient HBONE) carry cryptographic peer identity rather than PROXY headers; mesh inbound TCP relay never reads PROXY protocol headers.
 - **No outbound PROXY protocol.** Ferrum currently does not prepend PROXY headers to backend connections (outbound PROXY protocol support is a future enhancement).
 
