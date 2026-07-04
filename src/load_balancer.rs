@@ -3189,10 +3189,9 @@ impl LoadBalancer {
     ) -> HashOnStrategy {
         if let Some(port) = port
             && let Some(state) = self.port_overrides.get(&port)
+            && (state.algorithm_overridden || subset_name.is_none())
         {
-            if state.algorithm_overridden || subset_name.is_none() {
-                return state.hash_on_strategy.clone();
-            }
+            return state.hash_on_strategy.clone();
         }
         if let Some(subset_name) = subset_name {
             return self.hash_on_strategy_for_subset(subset_name);
@@ -3215,10 +3214,9 @@ impl LoadBalancer {
     ) -> LoadBalancerAlgorithm {
         if let Some(p) = port
             && let Some(port_state) = self.port_overrides.get(&p)
+            && (port_state.algorithm_overridden || subset_name.is_none())
         {
-            if port_state.algorithm_overridden || subset_name.is_none() {
-                return port_state.algorithm;
-            }
+            return port_state.algorithm;
         }
         match subset_name {
             Some(name) => self.subset_algorithm(name),
