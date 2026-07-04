@@ -45,7 +45,10 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
-use super::{LoadBalancerConnectionGuard, ProxyState, hbone_pool, mesh_mtls_pool, tcp_proxy};
+use super::{
+    LoadBalancerConnectionGuard, ProxyState, backend_dispatch, hbone_pool, mesh_mtls_pool,
+    tcp_proxy,
+};
 use crate::identity::SpiffeId;
 use crate::load_balancer::LoadBalancerCache;
 use crate::request_epoch::RequestEpoch;
@@ -66,12 +69,28 @@ pub(crate) async fn handle_mesh_tcp_egress(
     asserted_source_identity: Option<&SpiffeId>,
 ) {
     let proxy = entry.relay_proxy.as_ref();
-    let Some(selection) = LoadBalancerCache::select_target_from(
-        &epoch.load_balancer,
-        &entry.upstream_id,
-        &proxy.id,
-        None,
-    ) else {
+    let lb = &epoch.load_balancer;
+    // Engage the per-port LB lane (algorithm / locality / ejection-cap) when
+    // all upstream targets share a single port — same pre-selection semantics
+    // as the HTTP dispatch path.  Stream paths record no passive health, so the
+    // health parameter stays None.
+    let dispatch_port = backend_dispatch::initial_dispatch_port(
+        proxy,
+        LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id),
+    );
+    let has_port_override =
+        backend_dispatch::has_effective_port_override(proxy, lb, &entry.upstream_id, dispatch_port);
+    let Some(selection) = (if has_port_override {
+        LoadBalancerCache::select_target_for_port_from(
+            lb,
+            &entry.upstream_id,
+            &proxy.id,
+            dispatch_port,
+            None,
+        )
+    } else {
+        LoadBalancerCache::select_target_from(lb, &entry.upstream_id, &proxy.id, None)
+    }) else {
         warn!(
             service = %entry.service_fqdn,
             orig_dst = %orig_dst,

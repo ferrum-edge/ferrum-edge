@@ -40,6 +40,7 @@ use crate::plugins::{
     Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
     StreamTransactionSummary,
 };
+use crate::proxy::backend_dispatch::{has_effective_port_override, initial_dispatch_port};
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 use crate::retry::ErrorClass;
@@ -3180,17 +3181,53 @@ fn enforce_mesh_tcp_outbound_target(
 }
 
 /// Resolve the backend target — either direct from proxy config or via load balancer.
+///
+/// Per-port DestinationRule policy (LB algorithm, locality-LB, ejection-cap) is engaged
+/// whenever all upstream targets share a single port (i.e. `initial_dispatch_port_override`
+/// is non-zero) — the same pre-selection semantics the HTTP dispatch path uses.  Stream
+/// paths record no passive health so the `health` parameter stays `None`; ejection state
+/// recorded by HTTP traffic for the same upstream is still respected via the port-scoped
+/// candidate pool inside the LB cache.
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
 ) -> Result<(String, u16, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
+        // Mirror the HTTP dispatch pre-selection: compute the initial dispatch port and
+        // engage the per-port LB lane when it covers all targets (same semantics as
+        // `backend_dispatch::initial_dispatch_port` + `has_effective_port_override`).
+        let dispatch_port = initial_dispatch_port(
+            proxy,
+            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id),
+        );
+        let has_port_override =
+            has_effective_port_override(proxy, lb_snapshot, upstream_id, dispatch_port);
+
         let selection = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-            LoadBalancerCache::select_target_subset_from(
+            if has_port_override {
+                LoadBalancerCache::select_target_for_port_subset_from(
+                    lb_snapshot,
+                    upstream_id,
+                    &proxy.id,
+                    dispatch_port,
+                    subset_name,
+                    None,
+                )
+            } else {
+                LoadBalancerCache::select_target_subset_from(
+                    lb_snapshot,
+                    upstream_id,
+                    &proxy.id,
+                    subset_name,
+                    None,
+                )
+            }
+        } else if has_port_override {
+            LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
                 upstream_id,
                 &proxy.id,
-                subset_name,
+                dispatch_port,
                 None,
             )
         } else {

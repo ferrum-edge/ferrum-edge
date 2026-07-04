@@ -815,8 +815,8 @@ async fn run_udp_egress_session(
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
 ) {
-    use super::LoadBalancerConnectionGuard;
-    use crate::load_balancer::LoadBalancerCache;
+    use super::{LoadBalancerConnectionGuard, backend_dispatch};
+    use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
     use tracing::{debug, warn};
 
     // The admission epoch is reused here (codex r7 P2) so route resolution (done
@@ -828,20 +828,48 @@ async fn run_udp_egress_session(
     let proxy = entry.relay_proxy.as_ref();
 
     // ── Fail-closed egress gates (mirrors handle_mesh_tcp_egress) ──────────
-    let Some(selection) = LoadBalancerCache::select_target_from(
-        &epoch.load_balancer,
-        &entry.upstream_id,
-        &proxy.id,
-        None,
-    ) else {
-        warn!(
-            service = %entry.service_fqdn,
-            orig_dst = %key.orig_dst,
-            "Mesh UDP egress has no selectable workload target; ending session"
+    // Engage the per-port LB lane (algorithm / locality / ejection-cap) when
+    // all upstream targets share a single port — same pre-selection semantics
+    // as the HTTP dispatch path.  Stream paths record no passive health, so the
+    // health parameter stays None.
+    //
+    // All lb operations are done in a scoped block so the reference to
+    // `epoch.load_balancer` (the Arc inner snapshot) is released before
+    // `drop(epoch)` below (codex r7 P2: epoch is setup-only; drop early).
+    let (target, balancer) = {
+        let lb: &LoadBalancerCacheInner = &epoch.load_balancer;
+        let dispatch_port = backend_dispatch::initial_dispatch_port(
+            proxy,
+            LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id),
         );
-        return;
+        let has_port_override = backend_dispatch::has_effective_port_override(
+            proxy,
+            lb,
+            &entry.upstream_id,
+            dispatch_port,
+        );
+        let selection = if has_port_override {
+            LoadBalancerCache::select_target_for_port_from(
+                lb,
+                &entry.upstream_id,
+                &proxy.id,
+                dispatch_port,
+                None,
+            )
+        } else {
+            LoadBalancerCache::select_target_from(lb, &entry.upstream_id, &proxy.id, None)
+        };
+        let Some(selection) = selection else {
+            warn!(
+                service = %entry.service_fqdn,
+                orig_dst = %key.orig_dst,
+                "Mesh UDP egress has no selectable workload target; ending session"
+            );
+            return;
+        };
+        let balancer = lb.balancers().get(&entry.upstream_id).cloned();
+        (selection.target, balancer)
     };
-    let target = selection.target;
 
     // Least-connection accounting parity with the raw-TCP / HTTP relay paths
     // (mirrors handle_mesh_tcp_egress): acquire the guard immediately after
@@ -849,11 +877,7 @@ async fn run_udp_egress_session(
     // active-connection counts include long-lived UDP sessions. Dropped on any
     // early return below and at session teardown, so least-connections LB sees a
     // UDP session start/stop exactly once.
-    let balancer = epoch
-        .load_balancer
-        .balancers()
-        .get(&entry.upstream_id)
-        .cloned();
+
     // Setup-only snapshot: release the epoch now so a long-lived UDP session does
     // not pin an old config generation in memory (codex r7 P2).
     drop(epoch);

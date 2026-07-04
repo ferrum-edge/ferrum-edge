@@ -33,6 +33,7 @@ use crate::plugins::{
     StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
     UdpMetadataSink,
 };
+use crate::proxy::backend_dispatch::{has_effective_port_override, initial_dispatch_port};
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
@@ -4081,20 +4082,40 @@ async fn create_session(
 /// the client-side `RecvError` instead of the correct backend-side
 /// `BackendError`). Mirrors the TCP resolver in
 /// [`crate::proxy::tcp_proxy::resolve_backend_target`].
+///
+/// Per-port DestinationRule LB/locality/ejection-cap policy engages when
+/// `initial_dispatch_port_override` is non-zero (all targets on one port),
+/// matching the pre-selection semantics used by the HTTP dispatch path.
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
 ) -> Result<(String, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
-        let selection =
+        let dispatch_port = initial_dispatch_port(
+            proxy,
+            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id),
+        );
+        let has_port_override =
+            has_effective_port_override(proxy, lb_snapshot, upstream_id, dispatch_port);
+
+        let selection = if has_port_override {
+            LoadBalancerCache::select_target_for_port_from(
+                lb_snapshot,
+                upstream_id,
+                &proxy.id,
+                dispatch_port,
+                None,
+            )
+        } else {
             LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, &proxy.id, None)
-                .ok_or_else(|| -> anyhow::Error {
-                    StreamSetupError::new(
-                        StreamSetupKind::NoHealthyTargets,
-                        format!("for upstream {upstream_id}"),
-                    )
-                    .into()
-                })?;
+        }
+        .ok_or_else(|| -> anyhow::Error {
+            StreamSetupError::new(
+                StreamSetupKind::NoHealthyTargets,
+                format!("for upstream {upstream_id}"),
+            )
+            .into()
+        })?;
         Ok((selection.target.host.clone(), selection.target.port))
     } else {
         Ok((proxy.backend_host.clone(), proxy.backend_port))
