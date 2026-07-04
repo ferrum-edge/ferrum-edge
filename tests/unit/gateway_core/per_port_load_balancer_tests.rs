@@ -1509,9 +1509,11 @@ fn stream_path_hint_is_zero_for_mixed_port_upstream() {
     );
 }
 
-/// When a stream upstream has a per-port locality_lb_setting the per-port
-/// lane is still the code path; the selection should be confined to the
-/// port-scoped candidate pool (non-matching-port targets are excluded).
+/// Pinning the port-pool confinement invariant: when a stream upstream has a
+/// per-port override, explicit `select_target_for_port_from` returns only
+/// targets whose port matches the requested port.  This is a PRIMITIVE-level
+/// invariant that applies to both HTTP and stream selection; the stream paths
+/// engage it when `initial_dispatch_port_override` is non-zero.
 #[test]
 fn stream_path_per_port_selection_excludes_off_port_targets() {
     let mut port_overrides = HashMap::new();
@@ -1555,10 +1557,13 @@ fn stream_path_per_port_selection_excludes_off_port_targets() {
     assert_eq!(selected.target.port, 9000);
 }
 
-/// Ejection state recorded by HTTP traffic for a shared upstream is respected
-/// by the stream-path per-port lane: a 100%-ejected target is not selected.
+/// Pin the per-port LB primitive's health-context behavior: when a
+/// `HealthContext` IS provided, ejected targets are excluded by the
+/// `maxEjectionPercent` cap.  This is the path HTTP dispatch takes and the
+/// path that issue #2018 will wire for stream selection; it is NOT current
+/// stream behavior (see the companion test below).
 #[test]
-fn stream_path_per_port_respects_ejection_from_http_traffic() {
+fn per_port_lane_filters_ejected_targets_when_health_context_provided() {
     let mut port_overrides = HashMap::new();
     port_overrides.insert(
         9000,
@@ -1586,8 +1591,9 @@ fn stream_path_per_port_respects_ejection_from_http_traffic() {
     let snapshot = cache.load();
 
     let active_unhealthy: DashMap<String, u64> = DashMap::new();
-    // Eject "a" (as if recorded by HTTP traffic).
-    active_unhealthy.insert(target_host_port_key(&targets_list[0]), 0);
+    // Active-unhealthy keys use the upstream-scoped format "upstream_id::host:port".
+    // This is how HTTP dispatch records active ejection state (via `target_key`).
+    active_unhealthy.insert("u1::a:9000".to_string(), 0);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -1600,21 +1606,93 @@ fn stream_path_per_port_respects_ejection_from_http_traffic() {
         "single-port upstream resolves dispatch port"
     );
 
-    // The stream path would call select_target_for_port_from with health context.
+    // Calling select_target_for_port_from WITH a health context (as HTTP
+    // dispatch does, and as issue #2018 will wire for stream paths) must
+    // exclude the ejected target.
     for _ in 0..4 {
         let selected = LoadBalancerCache::select_target_for_port_from(
             &snapshot,
             "u1",
-            "stream-key",
+            "http-key",
             dispatch_port,
             Some(&health),
         )
         .expect("healthy target 'b' must always be available");
         assert_eq!(
             selected.target.host, "b",
-            "ejected target 'a' must not be selected"
+            "ejected target 'a' must not be selected when health context is provided"
         );
     }
+}
+
+/// Pin CURRENT stream behavior: stream paths call `select_target_for_port_from`
+/// with `health: None`, so ejection state and `maxEjectionPercent` have NO
+/// effect on stream target selection.  This is pre-existing, unchanged by PR
+/// #2016, and tracked in issue #2018.
+#[test]
+fn stream_path_per_port_selection_ignores_ejection_without_health_context() {
+    // Same upstream setup as the companion test above.
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        9000,
+        UpstreamPortOverride {
+            passive_health_check: Some(PassiveHealthCheck {
+                unhealthy_threshold: 1,
+                max_ejection_percent: Some(50),
+                ..PassiveHealthCheck::default()
+            }),
+            algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+            ..Default::default()
+        },
+    );
+    let targets_list = vec![target("a", 9000), target("b", 9000)];
+    let upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        targets_list.clone(),
+        port_overrides,
+    );
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    // Record ejection for "a" using the upstream-scoped key format — but the
+    // stream call site passes `None`, so this map is never consulted.
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    active_unhealthy.insert("u1::a:9000".to_string(), 0);
+
+    let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
+    assert_eq!(dispatch_port, 9000);
+
+    // Stream call sites pass `health: None` — ejection state is NOT consulted.
+    // Both "a" and "b" must remain selectable, even though "a" is ejected in
+    // the active_unhealthy map above (issue #2018: stream ejection wiring is a
+    // follow-up).
+    let mut saw_a = false;
+    let mut saw_b = false;
+    for i in 0..8 {
+        let selected = LoadBalancerCache::select_target_for_port_from(
+            &snapshot,
+            "u1",
+            &format!("stream-key-{i}"),
+            dispatch_port,
+            None, // no health context — current stream behavior
+        )
+        .expect("all targets selectable when no health context is provided");
+        match selected.target.host.as_str() {
+            "a" => saw_a = true,
+            "b" => saw_b = true,
+            other => panic!("unexpected host: {other}"),
+        }
+    }
+    assert!(
+        saw_a,
+        "ejected target 'a' IS still selectable: stream paths carry no health context \
+         (issue #2018)"
+    );
+    assert!(saw_b, "target 'b' must also be selectable");
 }
 
 /// A stream upstream with a subset and a single port engages the
@@ -1678,6 +1756,89 @@ fn stream_path_per_port_subset_engages_when_single_port() {
             "per-port subset selection must not escape to non-subset target 'c', got '{host}'"
         );
     }
+}
+
+/// The per-port lane engages the port's LB algorithm independently of the
+/// upstream-level algorithm.  Specifically: an upstream-level `RoundRobin`
+/// upstream with a per-port `ConsistentHashing` override (inheriting the
+/// upstream's `hash_on` key) must route the SAME ctx_key to the SAME target
+/// on every call via the port lane, while the upstream-level lane rotates.
+/// This exercises a real per-port policy knob beyond mere port-pool confinement
+/// and applies to both HTTP dispatch and the stream paths (which call
+/// `select_target_for_port_from` when `initial_dispatch_port_override` is
+/// non-zero).
+#[test]
+fn per_port_consistent_hash_overrides_upstream_round_robin() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        9000,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+            // No per-port hash_on: inherits the upstream's `hash_on` key
+            // (cookie:srv) via `get_hash_on_strategy_for_port_from` semantics.
+            ..Default::default()
+        },
+    );
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![target("a", 9000), target("b", 9000), target("c", 9000)],
+        port_overrides,
+    );
+    // Set a hash_on key at the upstream level; the per-port ConsistentHashing
+    // override without its own hash_on inherits it.
+    upstream.hash_on = Some("header:x-session-id".to_string());
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    // The per-port lane must engage ConsistentHashing (inherited hash key),
+    // so the same ctx_key always selects the same target.
+    let first = LoadBalancerCache::select_target_for_port_from(
+        &snapshot,
+        "u1",
+        "sticky-session-abc",
+        9000,
+        None,
+    )
+    .expect("port selection must succeed")
+    .target
+    .host
+    .clone();
+
+    for _ in 0..4 {
+        let again = LoadBalancerCache::select_target_for_port_from(
+            &snapshot,
+            "u1",
+            "sticky-session-abc",
+            9000,
+            None,
+        )
+        .expect("port selection must succeed")
+        .target
+        .host
+        .clone();
+        assert_eq!(
+            again, first,
+            "per-port ConsistentHashing must return the same target for the same ctx_key"
+        );
+    }
+
+    // The upstream-level lane uses RoundRobin and MUST rotate across targets,
+    // proving the two lanes are independent.
+    let rr: Vec<String> = (0..3)
+        .map(|_| {
+            LoadBalancerCache::select_target_from(&snapshot, "u1", "rr-key", None)
+                .expect("upstream-level selection must succeed")
+                .target
+                .host
+                .clone()
+        })
+        .collect();
+    // RoundRobin rotates a, b, c in order.
+    assert_eq!(rr, vec!["a", "b", "c"]);
 }
 
 #[test]
