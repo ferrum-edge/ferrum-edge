@@ -866,3 +866,418 @@ async fn grpc_channel_body_propagates_frontend_error_as_body_error() {
         "a transport-level abort is not a size violation"
     );
 }
+
+// ── gRPC mesh-transport dispatch classification (issue #2003) ───────────────
+//
+// The direct-dial gRPC pool must NEVER dispatch a mesh-transport-tagged target
+// (silent SVID-mTLS/HBONE bypass — unauthenticated under PERMISSIVE
+// PeerAuthentication). `classify_grpc_mesh_dispatch` is the single predicate
+// every gRPC dispatch surface (H1/H2 branch, its retry rotation, the H3
+// bridge) consults; these tests pin the classification matrix.
+
+fn target_with_tags(tags: &[(&str, &str)]) -> ferrum_edge::config::types::UpstreamTarget {
+    ferrum_edge::config::types::UpstreamTarget {
+        host: "orders.default.svc.cluster.local".to_string(),
+        port: 8080,
+        service_port_policy_key: None,
+        weight: 100,
+        tags: tags
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect(),
+        locality: None,
+        path: None,
+    }
+}
+
+#[test]
+fn grpc_mesh_dispatch_untagged_target_is_direct() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target_with_tags(&[])),
+        GrpcMeshDispatch::Direct,
+        "a target without mesh transport tags keeps the direct gRPC pool dial"
+    );
+    // Unrelated tags must not trip the mesh classification.
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target_with_tags(&[("subset", "v2")])),
+        GrpcMeshDispatch::Direct
+    );
+    // A boolish-false transport tag is NOT mesh-tagged.
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target_with_tags(&[(
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
+            "false"
+        )])),
+        GrpcMeshDispatch::Direct
+    );
+}
+
+#[test]
+fn grpc_mesh_dispatch_same_cluster_mtls_routes_over_mesh_mtls() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    let target = target_with_tags(&[
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
+            "true",
+        ),
+        (
+            ferrum_edge::proxy::hbone_pool::MESH_SPIFFE_ID_TAG,
+            "spiffe://cluster.local/ns/default/sa/orders",
+        ),
+    ]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target),
+        GrpcMeshDispatch::MeshMtls,
+        "same-cluster Sidecar mesh-mTLS targets dispatch over the SVID-mTLS H2 pool"
+    );
+}
+
+#[test]
+fn grpc_mesh_dispatch_same_cluster_hbone_fails_closed() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    let target = target_with_tags(&[(ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true")]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target),
+        GrpcMeshDispatch::RefuseHbone,
+        "the HBONE inner protocol is HTTP/1.1 and cannot carry gRPC trailers — refuse, never dial"
+    );
+}
+
+#[test]
+fn grpc_mesh_dispatch_cross_cluster_fails_closed_for_both_transports() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    let mtls_xc = target_with_tags(&[
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
+            "true",
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG,
+            "true",
+        ),
+    ]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&mtls_xc),
+        GrpcMeshDispatch::RefuseCrossCluster
+    );
+    let hbone_xc = target_with_tags(&[
+        (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG,
+            "true",
+        ),
+    ]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&hbone_xc),
+        GrpcMeshDispatch::RefuseCrossCluster,
+        "cross-cluster east-west targets refuse gRPC regardless of transport tag"
+    );
+}
+
+#[test]
+fn grpc_mesh_dispatch_conflicting_tags_take_the_stricter_refusal() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    // Both transport tags on one target should not happen (topologies are
+    // mutually exclusive), but if it does the target must NOT fall through to
+    // the mesh-mTLS dispatch — HBONE wins as a refusal.
+    let both = target_with_tags(&[
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
+            "true",
+        ),
+        (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
+    ]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&both),
+        GrpcMeshDispatch::RefuseHbone
+    );
+}
+
+#[test]
+fn grpc_mesh_dispatch_cross_cluster_tag_alone_still_refuses() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    // `mesh.cross_cluster` without a transport tag is not a shape the
+    // materializers produce, but the pre-existing gRPC guard refused it and
+    // the classifier preserves that fail-closed posture (never direct-dial a
+    // target that claims to be cross-cluster).
+    let xc_only = target_with_tags(&[(
+        ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG,
+        "true",
+    )]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&xc_only),
+        GrpcMeshDispatch::RefuseCrossClusterNoTransport
+    );
+}
+
+// ── Mesh-mTLS gRPC receive limit (issue #2003 codex r1-3) ──
+
+#[test]
+fn mesh_request_body_limit_selects_grpc_recv_limit_for_grpc_flavored_requests() {
+    // gRPC-flavored uploads (native application/grpc or grpc_web-translated)
+    // mirror the direct gRPC pool's receive limit; plain HTTP keeps the
+    // general request-body limit. Defaults: 10 MiB HTTP vs 4 MiB gRPC — a
+    // 6 MiB gRPC upload must trip the gRPC limit, not slip under the HTTP one.
+    let http_limit = 10 * 1024 * 1024;
+    let grpc_limit = 4 * 1024 * 1024;
+    assert_eq!(
+        grpc_proxy::mesh_request_body_limit(true, http_limit, grpc_limit),
+        grpc_limit
+    );
+    assert_eq!(
+        grpc_proxy::mesh_request_body_limit(false, http_limit, grpc_limit),
+        http_limit
+    );
+}
+
+#[test]
+fn mesh_request_body_limit_zero_means_unlimited_per_knob_not_cross_inherited() {
+    // `0` = unlimited for whichever knob is selected; the other knob's value
+    // must never leak across flavors.
+    assert_eq!(grpc_proxy::mesh_request_body_limit(true, 10, 0), 0);
+    assert_eq!(grpc_proxy::mesh_request_body_limit(false, 0, 10), 0);
+}
+
+#[test]
+fn grpc_request_body_too_large_backend_response_is_trailers_only_resource_exhausted() {
+    use ferrum_edge::retry::{ErrorClass, ResponseBody};
+
+    let max = 4 * 1024 * 1024;
+    let resp = grpc_proxy::grpc_request_body_too_large_backend_response(
+        "grpc-test",
+        Some("10.0.0.9".to_string()),
+        Some(6 * 1024 * 1024),
+        max,
+    );
+    // Mirrors the direct gRPC pool's oversize rejection: gRPC errors ride
+    // HTTP 200 with the outcome in grpc-status (8 = RESOURCE_EXHAUSTED).
+    assert_eq!(resp.status_code, 200);
+    assert_eq!(
+        resp.headers.get("grpc-status").map(String::as_str),
+        Some("8")
+    );
+    assert_eq!(
+        resp.headers.get("content-type").map(String::as_str),
+        Some("application/grpc")
+    );
+    let message = resp
+        .headers
+        .get("grpc-message")
+        .expect("refusal must carry grpc-message");
+    assert!(
+        message.contains(&max.to_string()),
+        "grpc-message should name the limit: {message}"
+    );
+    // RequestBodyTooLarge keeps backend-health accounting NEUTRAL (the
+    // backend was never at fault) instead of banking the 200 as a success.
+    assert_eq!(resp.error_class, Some(ErrorClass::RequestBodyTooLarge));
+    assert!(!resp.connection_error);
+    assert_eq!(resp.backend_resolved_ip.as_deref(), Some("10.0.0.9"));
+    match resp.body {
+        ResponseBody::Buffered(body) => {
+            assert!(body.is_empty(), "Trailers-Only refusal carries no body")
+        }
+        _ => panic!("expected a buffered (empty, trailers-only) refusal body"),
+    }
+}
+
+// ── gRPC mesh fall-through classifier (issue #2003 codex r2 finding 1) ──────
+//
+// Only PASS-THROUGH gRPC-Web may fall through the gRPC branch onto a
+// refuse-classified mesh transport: gRPC-Web the `grpc_web` plugin TRANSLATED
+// is wire-native gRPC by dispatch time, so riding the HBONE HTTP/1.1 inner
+// tunnel (or the cross-cluster paths) would silently drop its trailers — it
+// must fail closed inside the branch exactly like native gRPC.
+
+#[test]
+fn grpc_mesh_fall_through_allows_only_pass_through_grpc_web_on_refused_transports() {
+    use grpc_proxy::{GrpcMeshDispatch, grpc_mesh_dispatch_falls_through};
+    for refused in [
+        GrpcMeshDispatch::RefuseHbone,
+        GrpcMeshDispatch::RefuseCrossCluster,
+    ] {
+        // Pass-through gRPC-Web (no native content-type, no translation
+        // marker): body-framed trailers ride the HTTP-family transport.
+        assert!(
+            grpc_mesh_dispatch_falls_through(refused, false, false, true),
+            "pass-through gRPC-Web must keep riding {refused:?} like plain HTTP"
+        );
+        // Native gRPC: refuse in-branch (Trailers-Only UNAVAILABLE).
+        assert!(
+            !grpc_mesh_dispatch_falls_through(refused, true, false, true),
+            "native gRPC must fail closed for {refused:?}"
+        );
+        // Translated gRPC-Web: outbound is wire-native gRPC — refuse
+        // in-branch, never tunnel it as trailerless native gRPC.
+        assert!(
+            !grpc_mesh_dispatch_falls_through(refused, false, true, true),
+            "grpc_web-translated requests must fail closed for {refused:?}"
+        );
+    }
+    assert!(
+        !grpc_mesh_dispatch_falls_through(
+            GrpcMeshDispatch::RefuseCrossClusterNoTransport,
+            false,
+            false,
+            true
+        ),
+        "a cross-cluster-only target has no mesh transport for pass-through gRPC-Web to use"
+    );
+}
+
+#[test]
+fn grpc_mesh_fall_through_mesh_mtls_requires_streamable_request_body() {
+    use grpc_proxy::{GrpcMeshDispatch, grpc_mesh_dispatch_falls_through};
+    // Same-cluster Sidecar mesh-mTLS carries native gRPC (streaming trailer
+    // relay) AND binary translated gRPC-Web (buffered trailer re-encode) down
+    // the generic mesh path when the request body can stream.
+    for (native_ct, translated) in [(true, false), (false, true), (false, false)] {
+        assert!(
+            grpc_mesh_dispatch_falls_through(
+                GrpcMeshDispatch::MeshMtls,
+                native_ct,
+                translated,
+                true
+            ),
+            "MeshMtls must fall through for native_ct={native_ct} translated={translated}"
+        );
+        assert!(
+            !grpc_mesh_dispatch_falls_through(
+                GrpcMeshDispatch::Direct,
+                native_ct,
+                translated,
+                true
+            ),
+            "Direct targets stay on the direct gRPC pool"
+        );
+    }
+    assert!(
+        !grpc_mesh_dispatch_falls_through(GrpcMeshDispatch::MeshMtls, false, true, false),
+        "text-mode translated gRPC-Web still needs request-body buffering, which mesh-mTLS dispatch refuses"
+    );
+}
+
+// ── Streaming gRPC response timeout regime (codex r2 finding 6) ─────────────
+//
+// `grpc_streaming_response_deadline` is shared by the direct gRPC pool's
+// streaming arm and the mesh-mTLS StreamingH2 relay: a client `grpc-timeout`
+// becomes an ABSOLUTE deadline anchored at request receipt with the per-frame
+// idle guard disabled; without one the operator read timeout applies per
+// frame.
+
+#[test]
+fn grpc_streaming_response_deadline_client_budget_is_absolute_and_disables_per_frame() {
+    use std::time::Duration;
+    let before = tokio::time::Instant::now();
+    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(
+        Some(5_000),
+        Duration::from_millis(1_000),
+        30_000,
+    );
+    assert_eq!(
+        per_frame_ms, 0,
+        "a client deadline replaces the per-frame idle regime"
+    );
+    let deadline = deadline.expect("a sane client budget must arm a deadline");
+    let remaining = deadline.saturating_duration_since(before);
+    // 5s budget minus 1s already elapsed => ~4s remaining. Small slack for
+    // the helper's own `Instant::now()` anchor being taken after `before`.
+    assert!(
+        remaining <= Duration::from_millis(4_100),
+        "deadline must subtract the elapsed request time: {remaining:?}"
+    );
+    assert!(
+        remaining >= Duration::from_millis(3_500),
+        "deadline must preserve the remaining client budget: {remaining:?}"
+    );
+}
+
+#[test]
+fn grpc_streaming_response_deadline_exhausted_budget_is_immediate_not_negative() {
+    use std::time::Duration;
+    // Elapsed time exceeding the budget saturates to zero remaining — the
+    // deadline is "now" (fires on first poll), never a panic or underflow.
+    let before = tokio::time::Instant::now();
+    let (per_frame_ms, deadline) =
+        grpc_proxy::grpc_streaming_response_deadline(Some(100), Duration::from_secs(60), 30_000);
+    assert_eq!(per_frame_ms, 0);
+    let deadline = deadline.expect("an exhausted budget still arms a deadline");
+    assert!(
+        deadline.saturating_duration_since(before) <= Duration::from_millis(50),
+        "an exhausted budget must produce an already-due deadline"
+    );
+}
+
+#[test]
+fn grpc_streaming_response_deadline_no_client_budget_falls_back_per_frame() {
+    let (per_frame_ms, deadline) =
+        grpc_proxy::grpc_streaming_response_deadline(None, std::time::Duration::ZERO, 30_000);
+    assert_eq!(
+        per_frame_ms, 30_000,
+        "without a client deadline the operator read timeout applies per frame"
+    );
+    assert!(deadline.is_none());
+    // 0 + None (no client deadline, no operator fallback) = unbounded, for
+    // long-lived server/bidi streams that legitimately idle.
+    let (per_frame_ms, deadline) =
+        grpc_proxy::grpc_streaming_response_deadline(None, std::time::Duration::ZERO, 0);
+    assert_eq!(per_frame_ms, 0);
+    assert!(deadline.is_none());
+}
+
+#[test]
+fn grpc_streaming_response_deadline_pathological_budget_is_unbounded_not_panic() {
+    // A multi-year client grpc-timeout must NEVER panic the proxy path
+    // (`checked_add`, not `+`). Whether the platform's `Instant` range
+    // absorbs ~584M years is platform-dependent: `None` = degraded to
+    // unbounded; `Some` must be so far in the future it is functionally
+    // unbounded.
+    let (per_frame_ms, deadline) = grpc_proxy::grpc_streaming_response_deadline(
+        Some(u64::MAX),
+        std::time::Duration::ZERO,
+        30_000,
+    );
+    assert_eq!(per_frame_ms, 0);
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            remaining > std::time::Duration::from_secs(365 * 24 * 60 * 60),
+            "a non-overflowing pathological budget must still be functionally unbounded: {remaining:?}"
+        );
+    }
+}
+
+// ── Mesh gRPC limit ordering (codex r2 finding 4) ───────────────────────────
+//
+// The dispatch-branch declared-Content-Length check must select the gRPC
+// receive limit for gRPC-flavored requests BEFORE the generic HTTP check can
+// fire, in BOTH orderings of the two knobs — the direct gRPC pool never
+// applies `max_request_body_size_bytes` to a gRPC body.
+
+#[test]
+fn mesh_request_body_limit_grpc_flavor_wins_in_both_knob_orderings() {
+    let two_mib = 2 * 1024 * 1024;
+    let six_mib = 6 * 1024 * 1024;
+
+    // HTTP limit (1 MiB) < gRPC limit (4 MiB): a 2 MiB gRPC body is IN
+    // budget — the generic 413 must not fire early with the smaller limit.
+    let http_limit = 1024 * 1024;
+    let grpc_limit = 4 * 1024 * 1024;
+    let selected = grpc_proxy::mesh_request_body_limit(true, http_limit, grpc_limit);
+    assert_eq!(selected, grpc_limit);
+    assert!(two_mib <= selected, "in-budget gRPC body must be admitted");
+    assert!(six_mib > selected, "over-budget gRPC body must be rejected");
+
+    // gRPC limit (4 MiB) < HTTP limit (10 MiB): a 6 MiB gRPC body must trip
+    // the gRPC limit even though the HTTP limit would admit it.
+    let http_limit = 10 * 1024 * 1024;
+    let selected = grpc_proxy::mesh_request_body_limit(true, http_limit, grpc_limit);
+    assert_eq!(selected, grpc_limit);
+    assert!(six_mib > selected);
+    // Plain HTTP keeps the general limit in both orderings.
+    assert_eq!(
+        grpc_proxy::mesh_request_body_limit(false, http_limit, grpc_limit),
+        http_limit
+    );
+}

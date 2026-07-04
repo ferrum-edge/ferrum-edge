@@ -1369,6 +1369,75 @@ pub(crate) fn grpc_admission_status_from_maps(
         .unwrap_or(http_status)
 }
 
+/// Effective request-body cap for the sidecar mesh-mTLS dispatch path (issue
+/// #2003 codex r1-3): gRPC-flavored uploads — native `application/grpc` or
+/// gRPC-Web translated to it by the `grpc_web` plugin; both are wire-native
+/// gRPC framing by dispatch time — are bounded by `max_grpc_recv_size_bytes`,
+/// mirroring the direct gRPC pool's receive limit. Everything else keeps the
+/// general `max_request_body_size_bytes`. `0` means unlimited for whichever
+/// knob is selected (never cross-inherited).
+pub fn mesh_request_body_limit(
+    is_grpc: bool,
+    max_request_body_size_bytes: usize,
+    max_grpc_recv_size_bytes: usize,
+) -> usize {
+    if is_grpc {
+        max_grpc_recv_size_bytes
+    } else {
+        max_request_body_size_bytes
+    }
+}
+
+/// Trailers-Only `RESOURCE_EXHAUSTED` refusal for a gRPC request body that
+/// exceeds `max_grpc_recv_size_bytes` on a mesh dispatch path, mirroring the
+/// direct gRPC pool's oversize rejection (same gRPC status and message shape;
+/// gRPC errors ride HTTP 200 with the outcome in `grpc-status`).
+///
+/// `ErrorClass::RequestBodyTooLarge` keeps backend-health accounting NEUTRAL:
+/// a client-side upload overflow carries no signal about the backend, so the
+/// circuit breaker and passive health skip it via
+/// `client_side_no_backend_signal` and the adaptive-concurrency limiter
+/// ignores it the same way — instead of banking the HTTP 200 as a phantom
+/// success for a backend that was never dialed (or never finished the RPC).
+pub fn grpc_request_body_too_large_backend_response(
+    proxy_id: &str,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> crate::retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy_id,
+            request_body_bytes = size,
+            max_grpc_recv_size_bytes = max_size,
+            "gRPC request body exceeds configured receive limit on mesh dispatch"
+        ),
+        None => warn!(
+            proxy_id = %proxy_id,
+            max_grpc_recv_size_bytes = max_size,
+            "gRPC streaming request body exceeded configured receive limit on mesh dispatch"
+        ),
+    }
+    let mut headers = HashMap::with_capacity(3);
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "grpc-status".to_string(),
+        grpc_status::RESOURCE_EXHAUSTED.to_string(),
+    );
+    headers.insert(
+        "grpc-message".to_string(),
+        format!("gRPC request payload size exceeds maximum of {max_size} bytes"),
+    );
+    crate::retry::BackendResponse {
+        status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
+        body: crate::retry::ResponseBody::Buffered(Vec::new()),
+        headers,
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(crate::retry::ErrorClass::RequestBodyTooLarge),
+    }
+}
+
 /// Reserved gRPC terminal-status metadata keys (`grpc-status`,
 /// `grpc-message`, `grpc-status-details-bin`). Per the gRPC HTTP/2 mapping,
 /// a non-Trailers-Only response must carry these ONLY in the terminal
@@ -1507,6 +1576,145 @@ pub(crate) fn h3_http_reject_status_to_grpc_status(status: StatusCode) -> u32 {
         grpc_status::UNAVAILABLE
     } else {
         http_reject_status_to_grpc_status(status)
+    }
+}
+
+/// How a gRPC-flavored request may dispatch for an LB-selected target with
+/// respect to mesh transports (issue #2003).
+///
+/// The direct-dial gRPC pool (`GrpcConnectionPool`) speaks plaintext h2c /
+/// plain TLS straight to `target.host:target.port`. For a mesh-tagged target
+/// that dial BYPASSES the secured mesh transport: under STRICT
+/// PeerAuthentication it fails confusingly at the destination's capture
+/// listener, and under PERMISSIVE it succeeds **unauthenticated**, silently
+/// skipping SVID-mTLS/HBONE, identity pinning, and mesh authz identity. Every
+/// gRPC dispatch surface must therefore classify the selected target through
+/// this helper and never direct-dial a non-[`Direct`](GrpcMeshDispatch::Direct)
+/// target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrpcMeshDispatch {
+    /// No mesh transport tag: the direct `GrpcConnectionPool` dial is correct.
+    Direct,
+    /// Same-cluster Sidecar `mesh.mtls=true` target: dispatch through the
+    /// generic SVID-mTLS HTTP/2 path (`proxy_to_backend_mesh_mtls`), which is
+    /// hyper h2 end-to-end and preserves gRPC trailers. Only the H1/H2
+    /// frontend path can do this today; surfaces without a mesh-mTLS
+    /// dispatch (the H3 cross-protocol bridge, the gRPC retry loop after a
+    /// target rotation) must fail closed instead.
+    MeshMtls,
+    /// Cross-cluster east-west target (Ambient `mesh.hbone` or Sidecar
+    /// `mesh.mtls` with `mesh.cross_cluster=true`): fail closed. The gRPC
+    /// path has no east-west gateway dial-host override, destination-FQDN
+    /// SNI override, or trust-domain-scoped verification.
+    RefuseCrossCluster,
+    /// Malformed cross-cluster target with no mesh transport tag: fail
+    /// closed. It is not a valid pass-through gRPC-Web mesh transport either,
+    /// so it must not use the plain HTTP-family fallback.
+    RefuseCrossClusterNoTransport,
+    /// Same-cluster Ambient `mesh.hbone=true` target: fail closed. The HBONE
+    /// inner protocol is HTTP/1.1 over a byte tunnel (`hyper::client::conn::
+    /// http1` inside the CONNECT stream; the destination relays raw bytes to
+    /// the app), which cannot carry the HTTP/2 trailers gRPC requires for
+    /// `grpc-status`.
+    RefuseHbone,
+}
+
+/// Classify how a gRPC request may dispatch for `target`. See
+/// [`GrpcMeshDispatch`]. A target that carries BOTH transport tags (should not
+/// happen — topologies are mutually exclusive) is classified by the stricter
+/// refusal so it can never fall through to a direct dial. The cross-cluster
+/// check runs FIRST and keys on the `mesh.cross_cluster` tag alone — the
+/// pre-existing guard refused such targets even without a transport tag, and
+/// that fail-closed posture is preserved.
+pub fn classify_grpc_mesh_dispatch(
+    target: &crate::config::types::UpstreamTarget,
+) -> GrpcMeshDispatch {
+    let hbone = crate::proxy::hbone_pool::target_hbone_enabled(target);
+    let mesh_mtls = crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target);
+    let cross_cluster = crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
+        || crate::proxy::mesh_mtls_pool::target_mesh_mtls_cross_cluster(target);
+    if cross_cluster {
+        if hbone || mesh_mtls {
+            return GrpcMeshDispatch::RefuseCrossCluster;
+        }
+        return GrpcMeshDispatch::RefuseCrossClusterNoTransport;
+    }
+    if hbone {
+        return GrpcMeshDispatch::RefuseHbone;
+    }
+    if mesh_mtls {
+        return GrpcMeshDispatch::MeshMtls;
+    }
+    GrpcMeshDispatch::Direct
+}
+
+/// Whether a protocol-classified gRPC request may fall through the direct-dial
+/// gRPC branch onto the generic HTTP-family dispatch path for a mesh-tagged
+/// target (issue #2003).
+///
+/// * `Direct` never falls through — the direct `GrpcConnectionPool` serves it.
+/// * `MeshMtls` falls through only when the generic mesh-mTLS path can carry
+///   the request body without pre-buffering. Native streams and binary
+///   translated gRPC-Web are supported there; text-mode translated gRPC-Web
+///   still needs request-body buffering for base64 decode, which that path
+///   refuses today, so it fails closed before falling through.
+/// * `RefuseCrossCluster` / `RefuseHbone` fall through ONLY for PASS-THROUGH
+///   gRPC-Web (body-framed trailers, rides the HTTP-family transport like
+///   plain HTTP). Native gRPC must be refused inside the branch, and so must
+///   gRPC-Web the `grpc_web` plugin TRANSLATED (codex r2-1): by dispatch time
+///   the outbound request is wire-native gRPC (`content-type:
+///   application/grpc`), so letting it ride the HBONE HTTP/1.1 inner tunnel
+///   or the cross-cluster paths would hit the exact no-trailer corruption the
+///   refusal exists to prevent. The original request content-type
+///   (`request_uses_grpc_content_type`) alone cannot see the translation —
+///   pair it with the plugin's spoof-proof context marker
+///   (`grpc_web::request_is_grpc_web_translated`).
+/// * `RefuseCrossClusterNoTransport` never falls through because the target
+///   is malformed: there is no HBONE or mesh-mTLS transport for the HTTP path
+///   to use.
+pub fn grpc_mesh_dispatch_falls_through(
+    dispatch: GrpcMeshDispatch,
+    request_uses_grpc_content_type: bool,
+    grpc_web_translated: bool,
+    mesh_mtls_supports_request_body: bool,
+) -> bool {
+    match dispatch {
+        GrpcMeshDispatch::Direct => false,
+        GrpcMeshDispatch::MeshMtls => mesh_mtls_supports_request_body,
+        GrpcMeshDispatch::RefuseCrossClusterNoTransport => false,
+        GrpcMeshDispatch::RefuseCrossCluster | GrpcMeshDispatch::RefuseHbone => {
+            !request_uses_grpc_content_type && !grpc_web_translated
+        }
+    }
+}
+
+/// Timeout regime for a STREAMING gRPC response body:
+/// `(per_frame_read_timeout_ms, absolute_total_deadline)`.
+///
+/// A client `grpc-timeout` is an end-to-end RPC deadline (issue #1649), so it
+/// is honored as an ABSOLUTE deadline anchored at request receipt — the
+/// remaining budget is `client_deadline_ms` minus `elapsed_since_receipt` — and
+/// the per-frame idle timeout is disabled (`0`): a backend that sends headers
+/// just before the deadline then trickles body frames is cut at the client's
+/// deadline instead of resetting a per-frame window forever. Without a client
+/// deadline, the operator `fallback_read_timeout_ms` applies PER FRAME (`0` =
+/// unbounded, for long-lived server/bidi streams that legitimately idle). A
+/// pathologically large client deadline that overflows Tokio's `Instant` range
+/// yields `None` and is treated as unbounded rather than panicking the proxy
+/// path. Shared by the direct gRPC pool's streaming arm and the mesh-mTLS
+/// `StreamingH2` relay so the two regimes cannot drift.
+pub fn grpc_streaming_response_deadline(
+    client_deadline_ms: Option<u64>,
+    elapsed_since_receipt: std::time::Duration,
+    fallback_read_timeout_ms: u64,
+) -> (u64, Option<tokio::time::Instant>) {
+    match client_deadline_ms {
+        Some(budget_ms) => {
+            let remaining =
+                std::time::Duration::from_millis(budget_ms).saturating_sub(elapsed_since_receipt);
+            (0u64, tokio::time::Instant::now().checked_add(remaining))
+        }
+        None => (fallback_read_timeout_ms, None),
     }
 }
 
