@@ -350,6 +350,7 @@ pub(crate) const STREAM_ERR_REJECTED_BY_PLUGIN: &str = "rejected by plugin";
 pub(crate) const STREAM_ERR_NO_HEALTHY_TARGETS: &str = "No healthy targets";
 pub(crate) const STREAM_ERR_CIRCUIT_BREAKER_OPEN: &str = "circuit breaker open";
 pub(crate) const STREAM_ERR_BACKEND_MAX_CONNECTIONS: &str = "Backend maxConnections reached";
+pub(crate) const STREAM_ERR_UNSUPPORTED_STREAM_POLICY: &str = "Unsupported stream policy";
 
 /// Sentinel prefix used by the Linux splice paths
 /// (`io_uring_splice_direction`, `libc_splice_loop`) to signal that the
@@ -3215,10 +3216,14 @@ fn resolve_backend_target(
     if let Some(upstream_id) = &proxy.upstream_id {
         let override_port =
             LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
-        let port_lane = (override_port != 0
+        let port_lane = if override_port != 0
             && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port)
-            && tcp_port_lane_selection_supported(proxy, override_port))
-        .then_some(override_port);
+            && tcp_port_lane_selection_supported(proxy, override_port)?
+        {
+            Some(override_port)
+        } else {
+            None
+        };
 
         let selection = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
             if let Some(port) = port_lane {
@@ -3274,15 +3279,33 @@ fn resolve_backend_target(
     }
 }
 
-fn tcp_port_lane_selection_supported(proxy: &Proxy, port: u16) -> bool {
-    !matches!(
-        proxy
-            .dispatch_port_overrides
-            .as_ref()
-            .and_then(|overrides| overrides.get(&port))
-            .and_then(|override_config| override_config.algorithm),
-        Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections)
-    )
+fn tcp_port_lane_selection_supported(proxy: &Proxy, port: u16) -> Result<bool, anyhow::Error> {
+    let Some(override_config) = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&port))
+    else {
+        return Ok(false);
+    };
+    if override_config.algorithm
+        == Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections)
+    {
+        return Err(StreamSetupError::new(
+            StreamSetupKind::UnsupportedStreamPolicy,
+            format!("for TCP port {port}: per-port LEAST_CONN requires stream load-balancer connection accounting"),
+        )
+        .into());
+    }
+    Ok(stream_port_override_affects_selection(override_config))
+}
+
+fn stream_port_override_affects_selection(
+    override_config: &crate::config::types::ResolvedPortOverride,
+) -> bool {
+    override_config.algorithm.is_some()
+        || override_config.hash_on.is_some()
+        || override_config.locality_lb_setting.is_some()
+        || override_config.passive_health_check.is_some()
 }
 
 #[cfg(test)]
@@ -3702,7 +3725,7 @@ mod backend_target_selection_tests {
     }
 
     #[test]
-    fn resolve_backend_target_skips_tcp_port_lane_for_least_connections() {
+    fn resolve_backend_target_rejects_tcp_port_lane_for_least_connections() {
         let mut config = config_with_two_targets();
         config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
         config.upstreams[0].port_overrides.insert(
@@ -3720,13 +3743,70 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
+        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("per-port LEAST_CONN must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("per-port LEAST_CONN"),
+            "error should make the unsupported policy explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_preserves_subset_lb_for_non_lb_port_override() {
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [{
+                "id": "orders-proxy",
+                "backend_scheme": "tcp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 15432,
+                "upstream_id": "orders",
+                "upstream_subset": "canary"
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "orders",
+                "algorithm": "round_robin",
+                "targets": [
+                    {
+                        "host": "canary-a.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    },
+                    {
+                        "host": "canary-b.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    }
+                ],
+                "subsets": [{
+                    "name": "canary",
+                    "labels": { "version": "canary" },
+                    "traffic_policy": { "load_balancer_algorithm": "consistent_hashing" }
+                }],
+                "port_overrides": {
+                    "5432": { "connect_timeout_ms": 250 }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
         let (_, _, _, port_lane) =
             resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
 
         assert_eq!(
             port_lane, None,
-            "TCP streams do not maintain per-target active connection accounting, so a per-port \
-             LEAST_CONN override must not engage the per-port selector"
+            "a connect-timeout-only port override must not bypass the subset LB lane"
         );
     }
 }

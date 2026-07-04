@@ -87,6 +87,10 @@ pub enum StreamSetupKind {
     /// (which is a failure-rate gate) and from runtime port exhaustion
     /// (which is a host-level resource exhaustion).
     BackendMaxConnectionsExceeded,
+    /// The configured stream-family policy is recognized, but this path cannot
+    /// apply it correctly yet. Backend-side: the gateway is refusing to route
+    /// with different semantics than the operator configured.
+    UnsupportedStreamPolicy,
 }
 
 impl StreamSetupKind {
@@ -103,7 +107,8 @@ impl StreamSetupKind {
             Self::RejectedByPlugin
             | Self::NoHealthyTargets
             | Self::CircuitBreakerOpen
-            | Self::BackendMaxConnectionsExceeded => None,
+            | Self::BackendMaxConnectionsExceeded
+            | Self::UnsupportedStreamPolicy => None,
         }
     }
 
@@ -163,6 +168,9 @@ impl StreamSetupKind {
             Self::CircuitBreakerOpen => crate::proxy::tcp_proxy::STREAM_ERR_CIRCUIT_BREAKER_OPEN,
             Self::BackendMaxConnectionsExceeded => {
                 crate::proxy::tcp_proxy::STREAM_ERR_BACKEND_MAX_CONNECTIONS
+            }
+            Self::UnsupportedStreamPolicy => {
+                crate::proxy::tcp_proxy::STREAM_ERR_UNSUPPORTED_STREAM_POLICY
             }
         }
     }
@@ -293,6 +301,7 @@ mod tests {
             StreamSetupKind::BackendMaxConnectionsExceeded.tls_side(),
             None
         );
+        assert_eq!(StreamSetupKind::UnsupportedStreamPolicy.tls_side(), None);
     }
 
     #[test]
@@ -317,6 +326,7 @@ mod tests {
             StreamSetupKind::NoHealthyTargets,
             StreamSetupKind::CircuitBreakerOpen,
             StreamSetupKind::BackendMaxConnectionsExceeded,
+            StreamSetupKind::UnsupportedStreamPolicy,
         ] {
             assert!(
                 !kind.is_client_side(),
@@ -357,6 +367,10 @@ mod tests {
         assert_eq!(
             StreamSetupKind::BackendMaxConnectionsExceeded.prefix(),
             "Backend maxConnections reached"
+        );
+        assert_eq!(
+            StreamSetupKind::UnsupportedStreamPolicy.prefix(),
+            "Unsupported stream policy"
         );
     }
 

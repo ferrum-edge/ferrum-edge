@@ -239,7 +239,8 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
         StreamSetupKind::RejectedByPlugin
         | StreamSetupKind::NoHealthyTargets
         | StreamSetupKind::CircuitBreakerOpen
-        | StreamSetupKind::BackendMaxConnectionsExceeded => ErrorClass::RequestError,
+        | StreamSetupKind::BackendMaxConnectionsExceeded
+        | StreamSetupKind::UnsupportedStreamPolicy => ErrorClass::RequestError,
     }
 }
 

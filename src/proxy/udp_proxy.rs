@@ -4110,10 +4110,14 @@ fn resolve_backend_target(
         // upstream would silently pin selection to that port's targets.
         let override_port =
             LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
-        let port_lane = (override_port != 0
+        let port_lane = if override_port != 0
             && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port)
-            && udp_port_lane_selection_supported(proxy, override_port))
-        .then_some(override_port);
+            && udp_port_lane_selection_supported(proxy, override_port)?
+        {
+            Some(override_port)
+        } else {
+            None
+        };
 
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
@@ -4139,15 +4143,33 @@ fn resolve_backend_target(
     }
 }
 
-fn udp_port_lane_selection_supported(proxy: &Proxy, port: u16) -> bool {
-    !matches!(
-        proxy
-            .dispatch_port_overrides
-            .as_ref()
-            .and_then(|overrides| overrides.get(&port))
-            .and_then(|override_config| override_config.algorithm),
-        Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections)
-    )
+fn udp_port_lane_selection_supported(proxy: &Proxy, port: u16) -> Result<bool, anyhow::Error> {
+    let Some(override_config) = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&port))
+    else {
+        return Ok(false);
+    };
+    if override_config.algorithm
+        == Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections)
+    {
+        return Err(StreamSetupError::new(
+            StreamSetupKind::UnsupportedStreamPolicy,
+            format!("for UDP port {port}: per-port LEAST_CONN requires stream load-balancer connection accounting"),
+        )
+        .into());
+    }
+    Ok(stream_port_override_affects_selection(override_config))
+}
+
+fn stream_port_override_affects_selection(
+    override_config: &crate::config::types::ResolvedPortOverride,
+) -> bool {
+    override_config.algorithm.is_some()
+        || override_config.hash_on.is_some()
+        || override_config.locality_lb_setting.is_some()
+        || override_config.passive_health_check.is_some()
 }
 
 fn resolve_or_reuse_backend_target(
@@ -4205,11 +4227,11 @@ fn epoch_millis_precise() -> u64 {
 mod tests {
     use super::{
         BackendDtlsConfigCache, BackendDtlsConfigCacheState, DtlsDisconnectContext,
-        STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, UdpDisconnectContext, UdpSession,
-        build_dtls_stream_summary, build_udp_stream_summary, cached_backend_dtls_config,
-        dtls_disconnect_cause, dtls_disconnect_direction, emit_udp_stream_disconnect,
-        forward_client_datagram_to_backend, reserve_udp_session_slot,
-        resolve_or_reuse_backend_target, udp_session_shard_amount,
+        STREAM_ERR_BACKEND_DTLS_HANDSHAKE_FAILED, StreamSetupKind, UdpDisconnectContext,
+        UdpSession, build_dtls_stream_summary, build_udp_stream_summary,
+        cached_backend_dtls_config, dtls_disconnect_cause, dtls_disconnect_direction,
+        emit_udp_stream_disconnect, find_stream_setup_error, forward_client_datagram_to_backend,
+        reserve_udp_session_slot, resolve_or_reuse_backend_target, udp_session_shard_amount,
     };
     use crate::config::types::{BackendScheme, BackendTlsConfig, Proxy};
     use crate::load_balancer::LoadBalancerCache;
@@ -5017,7 +5039,7 @@ listen_port: 5300
     }
 
     #[test]
-    fn resolve_udp_backend_target_skips_port_lane_for_least_connections() {
+    fn resolve_udp_backend_target_rejects_port_lane_for_least_connections() {
         let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
             "version": "1",
             "proxies": [{
@@ -5048,19 +5070,15 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let mut hosts = std::collections::HashSet::new();
-        for i in 1..=16 {
-            let key = format!("192.0.2.{i}");
-            let (host, port) =
-                super::resolve_backend_target(&proxy, &snapshot, &key).expect("target selected");
-            assert_eq!(port, 5353);
-            hosts.insert(host);
-        }
+        let err = super::resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("per-port LEAST_CONN must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
         assert!(
-            hosts.contains("a.local") && hosts.contains("b.local"),
-            "UDP sessions do not record per-target LB connection accounting, so a per-port \
-             LEAST_CONN override must not engage the per-port selector"
+            setup.message.contains("per-port LEAST_CONN"),
+            "error should make the unsupported policy explicit: {}",
+            setup.message
         );
     }
 
