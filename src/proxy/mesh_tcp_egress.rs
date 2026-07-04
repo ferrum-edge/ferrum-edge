@@ -84,16 +84,17 @@ pub(crate) async fn handle_mesh_tcp_egress(
             override_port,
         ))
     .then_some(override_port);
+    let lb_hash_key = remote_addr.ip().to_string();
     let Some(selection) = (if let Some(port) = port_lane {
         LoadBalancerCache::select_target_for_port_from(
             lb,
             &entry.upstream_id,
-            &proxy.id,
+            &lb_hash_key,
             port,
             None,
         )
     } else {
-        LoadBalancerCache::select_target_from(lb, &entry.upstream_id, &proxy.id, None)
+        LoadBalancerCache::select_target_from(lb, &entry.upstream_id, &lb_hash_key, None)
     }) else {
         warn!(
             service = %entry.service_fqdn,

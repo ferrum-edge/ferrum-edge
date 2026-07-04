@@ -2009,8 +2009,9 @@ async fn handle_tcp_connection_inner(
         stream_ctx.proxy_name = proxy.name.clone();
         stream_ctx.backend_scheme = proxy.effective_scheme();
 
+        let lb_hash_key = remote_addr.ip().to_string();
         let (backend_host, backend_port, backend_policy_port, lb_port_lane) =
-            resolve_backend_target(proxy, &epoch.load_balancer)?;
+            resolve_backend_target(proxy, &epoch.load_balancer, &lb_hash_key)?;
 
         // Populate backend target as soon as it's known — even if DNS or connect fails,
         // the log will show which target was attempted.
@@ -3204,6 +3205,7 @@ fn enforce_mesh_tcp_outbound_target(
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
+    lb_hash_key: &str,
 ) -> Result<(String, u16, u16, Option<u16>), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
         let override_port =
@@ -3217,7 +3219,7 @@ fn resolve_backend_target(
                 LoadBalancerCache::select_target_for_port_subset_from(
                     lb_snapshot,
                     upstream_id,
-                    &proxy.id,
+                    lb_hash_key,
                     port,
                     subset_name,
                     None,
@@ -3226,7 +3228,7 @@ fn resolve_backend_target(
                 LoadBalancerCache::select_target_subset_from(
                     lb_snapshot,
                     upstream_id,
-                    &proxy.id,
+                    lb_hash_key,
                     subset_name,
                     None,
                 )
@@ -3235,12 +3237,12 @@ fn resolve_backend_target(
             LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
                 upstream_id,
-                &proxy.id,
+                lb_hash_key,
                 port,
                 None,
             )
         } else {
-            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, &proxy.id, None)
+            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, lb_hash_key, None)
         }
         .ok_or_else(|| -> anyhow::Error {
             let scope = proxy
@@ -3375,7 +3377,7 @@ mod backend_target_selection_tests {
         let proxy = proxy_with_subset(Some("canary"));
 
         let (host, port, policy_port, port_lane) =
-            resolve_backend_target(&proxy, &snapshot).expect("target selected");
+            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
 
         assert_eq!(host, "canary.local");
         assert_eq!(port, 1002);
@@ -3390,7 +3392,8 @@ mod backend_target_selection_tests {
         let snapshot = cache.load();
         let proxy = proxy_with_subset(Some("missing"));
 
-        let err = resolve_backend_target(&proxy, &snapshot).expect_err("missing subset rejected");
+        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("missing subset rejected");
 
         assert!(err.to_string().contains("subset missing"));
     }
@@ -3526,7 +3529,7 @@ mod backend_target_selection_tests {
         let mut hosts = std::collections::HashSet::new();
         for _ in 0..8 {
             let (host, _, _, port_lane) =
-                resolve_backend_target(&proxy, &snapshot).expect("target selected");
+                resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
             assert_eq!(
                 port_lane, None,
                 "mixed-port upstream must not resolve a per-port lane from the placeholder"
@@ -3564,6 +3567,40 @@ mod backend_target_selection_tests {
         assert_eq!(host, "blocked.local");
         assert_eq!(port, 5432);
         assert_eq!(policy_port, 5432);
+    }
+
+    #[test]
+    fn resolve_backend_target_hashes_port_lane_by_client_key() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing),
+                ..Default::default()
+            },
+        );
+        let mut proxy = proxy_with_subset(None);
+        proxy.upstream_id = Some("orders".to_string());
+        config.proxies.push(proxy);
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies.pop().expect("proxy pushed above");
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let mut hosts = std::collections::HashSet::new();
+        for i in 1..=64 {
+            let key = format!("192.0.2.{i}");
+            let (host, _, _, port_lane) =
+                resolve_backend_target(&proxy, &snapshot, &key).expect("target selected");
+            assert_eq!(port_lane, Some(5432));
+            hosts.insert(host);
+        }
+
+        assert!(
+            hosts.contains("allowed.local") && hosts.contains("blocked.local"),
+            "per-port consistent hashing must use the per-flow key, not a constant proxy id: {hosts:?}"
+        );
     }
 }
 

@@ -850,16 +850,17 @@ async fn run_udp_egress_session(
                 override_port,
             ))
         .then_some(override_port);
+        let lb_hash_key = key.client.ip().to_string();
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb,
                 &entry.upstream_id,
-                &proxy.id,
+                &lb_hash_key,
                 port,
                 None,
             )
         } else {
-            LoadBalancerCache::select_target_from(lb, &entry.upstream_id, &proxy.id, None)
+            LoadBalancerCache::select_target_from(lb, &entry.upstream_id, &lb_hash_key, None)
         };
         let Some(selection) = selection else {
             warn!(
