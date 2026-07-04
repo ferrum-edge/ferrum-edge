@@ -1007,7 +1007,7 @@ fn grpc_mesh_dispatch_cross_cluster_tag_alone_still_refuses() {
     )]);
     assert_eq!(
         classify_grpc_mesh_dispatch(&xc_only),
-        GrpcMeshDispatch::RefuseCrossCluster
+        GrpcMeshDispatch::RefuseCrossClusterNoTransport
     );
 }
 
@@ -1115,6 +1115,15 @@ fn grpc_mesh_fall_through_allows_only_pass_through_grpc_web_on_refused_transport
             "grpc_web-translated requests must fail closed for {refused:?}"
         );
     }
+    assert!(
+        !grpc_mesh_dispatch_falls_through(
+            GrpcMeshDispatch::RefuseCrossClusterNoTransport,
+            false,
+            false,
+            true
+        ),
+        "a cross-cluster-only target has no mesh transport for pass-through gRPC-Web to use"
+    );
 }
 
 #[test]

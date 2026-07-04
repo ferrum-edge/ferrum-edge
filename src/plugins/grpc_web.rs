@@ -179,13 +179,11 @@ pub struct GrpcWebErrorResponse {
 
 /// Build the client-visible gRPC-Web error shape for an early gateway refusal
 /// that happens before normal response hooks can run.
-pub fn translated_error_response(
-    ctx: &RequestContext,
+pub fn error_response_for_content_type(
+    response_ct: &str,
     status: u32,
     message: &str,
-) -> Option<GrpcWebErrorResponse> {
-    let original_ct = ctx.metadata.get(META_GRPC_WEB_ORIGINAL_CT)?;
-    let response_ct = response_content_type(original_ct);
+) -> GrpcWebErrorResponse {
     let mut headers = HashMap::with_capacity(5);
     headers.insert("content-type".to_string(), response_ct.to_string());
     headers.insert("x-grpc-web".to_string(), "1".to_string());
@@ -200,7 +198,23 @@ pub fn translated_error_response(
     if is_grpc_web_text(response_ct) {
         body = BASE64.encode(&body).into_bytes();
     }
-    Some(GrpcWebErrorResponse { headers, body })
+    GrpcWebErrorResponse { headers, body }
+}
+
+/// Build the client-visible gRPC-Web error shape for a translated request that
+/// happens before normal response hooks can run.
+pub fn translated_error_response(
+    ctx: &RequestContext,
+    status: u32,
+    message: &str,
+) -> Option<GrpcWebErrorResponse> {
+    let original_ct = ctx.metadata.get(META_GRPC_WEB_ORIGINAL_CT)?;
+    let response_ct = response_content_type(original_ct);
+    Some(error_response_for_content_type(
+        response_ct,
+        status,
+        message,
+    ))
 }
 
 fn is_valid_trailer_header(key: &str) -> Option<HeaderName> {

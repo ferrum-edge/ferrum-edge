@@ -7951,6 +7951,7 @@ async fn handle_websocket_request_authenticated(
                     plugin_execution_ns,
                     Some(&original_request_path),
                     false,
+                    None,
                 )
                 .await);
             }
@@ -12502,6 +12503,24 @@ fn build_translated_grpc_web_error_response(
     )
 }
 
+fn build_grpc_web_error_response(
+    response_content_type: &str,
+    status: u32,
+    message: &str,
+) -> Response<ProxyBody> {
+    let response = crate::plugins::grpc_web::error_response_for_content_type(
+        response_content_type,
+        status,
+        message,
+    );
+    let builder =
+        headers_mod::apply_response_headers(Response::builder().status(200), &response.headers);
+
+    builder
+        .body(ProxyBody::full(Bytes::from(response.body)))
+        .unwrap_or_else(|_| grpc_proxy::build_grpc_error_response(status, message))
+}
+
 async fn finalize_reject_response_with_after_proxy_hooks(
     plugins: &[Arc<dyn Plugin>],
     ctx: &mut RequestContext,
@@ -12548,6 +12567,7 @@ async fn handle_backend_admission_rejection(
     plugin_execution_ns: u64,
     original_request_path: Option<&str>,
     is_grpc_request: bool,
+    grpc_web_error_content_type: Option<&str>,
 ) -> Response<ProxyBody> {
     let reject = finalize_reject_response_with_after_proxy_hooks(
         plugins,
@@ -12559,6 +12579,15 @@ async fn handle_backend_admission_rejection(
     )
     .await;
     apply_grpc_reject_metadata(ctx, &reject);
+    let grpc_web_response = grpc_web_error_content_type.and_then(|content_type| {
+        reject.grpc_status.map(|grpc_status| {
+            let message = reject
+                .grpc_message
+                .as_deref()
+                .unwrap_or_else(|| grpc_status_reason(grpc_status));
+            build_grpc_web_error_response(content_type, grpc_status, message)
+        })
+    });
     log_rejected_request_with_path(
         plugins,
         ctx,
@@ -12570,6 +12599,9 @@ async fn handle_backend_admission_rejection(
     )
     .await;
     record_request(state, reject.http_status.as_u16());
+    if let Some(response) = grpc_web_response {
+        return response;
+    }
     build_response_from_normalized_reject(reject)
 }
 
@@ -14236,6 +14268,9 @@ async fn handle_proxy_request_inner(
                 grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => {
                     Some("gRPC over cross-cluster east-west routing is not supported")
                 }
+                grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterNoTransport => {
+                    Some("gRPC over cross-cluster east-west routing requires a mesh transport tag")
+                }
                 grpc_proxy::GrpcMeshDispatch::RefuseHbone => Some(
                     "gRPC over the Ambient HBONE mesh transport is not supported \
                      (HBONE inner protocol cannot carry gRPC trailers)",
@@ -14264,11 +14299,8 @@ async fn handle_proxy_request_inner(
                     cb_is_half_open_probe,
                 );
                 record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
-                if grpc_request_is_web_translated
-                    && let Some(response) =
-                        build_translated_grpc_web_error_response(&ctx, 14, message)
-                {
-                    return Ok(response);
+                if let Some(content_type) = grpc_web_response_content_type {
+                    return Ok(build_grpc_web_error_response(content_type, 14, message));
                 }
                 return Ok(grpc_proxy::build_grpc_error_response(
                     14, // UNAVAILABLE
@@ -14573,6 +14605,7 @@ async fn handle_proxy_request_inner(
                         plugin_execution_ns,
                         Some(&original_request_path),
                         true,
+                        grpc_web_response_content_type,
                     )
                     .await);
                 }
@@ -14724,6 +14757,7 @@ async fn handle_proxy_request_inner(
                             plugin_execution_ns,
                             Some(&original_request_path),
                             true,
+                            grpc_web_response_content_type,
                         )
                         .await);
                     }
@@ -14789,6 +14823,7 @@ async fn handle_proxy_request_inner(
                                         plugin_execution_ns,
                                         Some(&original_request_path),
                                         true,
+                                        grpc_web_response_content_type,
                                     )
                                     .await);
                                 }
@@ -14983,6 +15018,13 @@ async fn handle_proxy_request_inner(
                          refusing the direct dial and failing closed with gRPC UNAVAILABLE"
                     );
                     record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                    if let Some(content_type) = grpc_web_response_content_type {
+                        return Ok(build_grpc_web_error_response(
+                            content_type,
+                            14,
+                            "gRPC retry target requires a mesh transport that does not support retries",
+                        ));
+                    }
                     if grpc_request_is_web_translated
                         && let Some(response) = build_translated_grpc_web_error_response(
                             &ctx,
@@ -15104,6 +15146,7 @@ async fn handle_proxy_request_inner(
                             plugin_execution_ns,
                             Some(&original_request_path),
                             true,
+                            grpc_web_response_content_type,
                         )
                         .await);
                     }
@@ -16489,9 +16532,14 @@ async fn handle_proxy_request_inner(
         // 502 the client cannot parse. Same fail-closed contract either way.
         if is_grpc_request {
             record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+            let message =
+                format!("HBONE dispatch required for this backend target: {block_reason}");
+            if let Some(content_type) = grpc_web_response_content_type {
+                return Ok(build_grpc_web_error_response(content_type, 14, &message));
+            }
             return Ok(grpc_proxy::build_grpc_error_response(
                 14, // UNAVAILABLE
-                &format!("HBONE dispatch required for this backend target: {block_reason}"),
+                &message,
             ));
         }
         record_request(&state, 502);
@@ -16556,6 +16604,9 @@ async fn handle_proxy_request_inner(
             let message = format!(
                 "sidecar mesh mTLS dispatch required for this backend target: {block_reason}"
             );
+            if let Some(content_type) = grpc_web_response_content_type {
+                return Ok(build_grpc_web_error_response(content_type, 14, &message));
+            }
             if grpc_request_is_web_translated
                 && let Some(response) = build_translated_grpc_web_error_response(&ctx, 14, &message)
             {
@@ -16687,6 +16738,7 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns,
                     Some(&original_request_path),
                     is_grpc_request,
+                    grpc_web_response_content_type,
                 )
                 .await);
             }
@@ -16830,6 +16882,7 @@ async fn handle_proxy_request_inner(
                         plugin_execution_ns,
                         Some(&original_request_path),
                         is_grpc_request,
+                        grpc_web_response_content_type,
                     )
                     .await);
                 }
@@ -16983,6 +17036,7 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns,
                     Some(&original_request_path),
                     is_grpc_request,
+                    grpc_web_response_content_type,
                 )
                 .await);
             }
@@ -21392,6 +21446,45 @@ fn mesh_grpc_deadline_exceeded_response(resolved_ip: Option<String>) -> retry::B
     }
 }
 
+fn mesh_grpc_response_body_too_large_response(
+    proxy: &Proxy,
+    resolved_ip: Option<String>,
+    observed_size: Option<usize>,
+    max_size: usize,
+) -> retry::BackendResponse {
+    match observed_size {
+        Some(size) => warn!(
+            proxy_id = %proxy.id,
+            response_body_bytes = size,
+            max_response_body_size_bytes = max_size,
+            "sidecar mTLS gRPC backend response body exceeds configured size limit"
+        ),
+        None => warn!(
+            proxy_id = %proxy.id,
+            max_response_body_size_bytes = max_size,
+            "sidecar mTLS gRPC backend response body exceeded configured size limit while buffering"
+        ),
+    }
+    let mut headers = HashMap::with_capacity(3);
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "grpc-status".to_string(),
+        grpc_proxy::grpc_status::RESOURCE_EXHAUSTED.to_string(),
+    );
+    headers.insert(
+        "grpc-message".to_string(),
+        format!("gRPC response payload size exceeds maximum of {max_size} bytes"),
+    );
+    retry::BackendResponse {
+        status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
+        body: ResponseBody::Buffered(Vec::new()),
+        headers,
+        connection_error: false,
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(retry::ErrorClass::ResponseBodyTooLarge),
+    }
+}
+
 /// Gateway-side refusal when native gRPC over sidecar mesh-mTLS would require
 /// response buffering. Healthy backend statuses stay neutral because the
 /// refusal is a gateway-side policy conflict; an already-observed backend 5xx
@@ -22916,12 +23009,21 @@ async fn proxy_to_backend_mesh_mtls(
         && len > state.max_response_body_size_bytes
     {
         return (
-            hbone_response_body_too_large_response(
-                proxy,
-                resolved_ip,
-                Some(len),
-                state.max_response_body_size_bytes,
-            ),
+            if is_grpc_flavored {
+                mesh_grpc_response_body_too_large_response(
+                    proxy,
+                    resolved_ip,
+                    Some(len),
+                    state.max_response_body_size_bytes,
+                )
+            } else {
+                hbone_response_body_too_large_response(
+                    proxy,
+                    resolved_ip,
+                    Some(len),
+                    state.max_response_body_size_bytes,
+                )
+            },
             None,
             None,
         );
@@ -23030,12 +23132,21 @@ async fn proxy_to_backend_mesh_mtls(
             Ok(collected) => collected,
             Err(HyperBodyCollectError::TooLarge) => {
                 return (
-                    hbone_response_body_too_large_response(
-                        proxy,
-                        resolved_ip,
-                        None,
-                        state.max_response_body_size_bytes,
-                    ),
+                    if is_grpc_flavored {
+                        mesh_grpc_response_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_response_body_size_bytes,
+                        )
+                    } else {
+                        hbone_response_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            None,
+                            state.max_response_body_size_bytes,
+                        )
+                    },
                     None,
                     None,
                 );
@@ -27361,6 +27472,44 @@ mod tests {
             panic!("gRPC deadline response should be buffered");
         };
         assert!(body.is_empty(), "Trailers-Only timeout carries no body");
+    }
+
+    #[test]
+    fn mesh_grpc_response_body_too_large_response_is_resource_exhausted_backend_failure() {
+        let proxy = test_proxy(ResponseBodyMode::Stream);
+        let resp = mesh_grpc_response_body_too_large_response(
+            &proxy,
+            Some("127.0.0.5".to_string()),
+            Some(11),
+            10,
+        );
+
+        assert_eq!(resp.status_code, 200);
+        assert!(!resp.connection_error);
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::ResponseBodyTooLarge)
+        );
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.5"));
+        assert_eq!(
+            resp.headers.get("content-type").map(String::as_str),
+            Some("application/grpc")
+        );
+        assert_eq!(
+            resp.headers.get("grpc-status").map(String::as_str),
+            Some("8")
+        );
+        assert_eq!(
+            resp.headers.get("grpc-message").map(String::as_str),
+            Some("gRPC response payload size exceeds maximum of 10 bytes")
+        );
+        let ResponseBody::Buffered(body) = resp.body else {
+            panic!("gRPC response-size refusal should be buffered");
+        };
+        assert!(
+            body.is_empty(),
+            "Trailers-Only resource-exhausted response carries no body"
+        );
     }
 
     #[test]

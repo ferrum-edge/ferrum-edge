@@ -1607,6 +1607,10 @@ pub enum GrpcMeshDispatch {
     /// path has no east-west gateway dial-host override, destination-FQDN
     /// SNI override, or trust-domain-scoped verification.
     RefuseCrossCluster,
+    /// Malformed cross-cluster target with no mesh transport tag: fail
+    /// closed. It is not a valid pass-through gRPC-Web mesh transport either,
+    /// so it must not use the plain HTTP-family fallback.
+    RefuseCrossClusterNoTransport,
     /// Same-cluster Ambient `mesh.hbone=true` target: fail closed. The HBONE
     /// inner protocol is HTTP/1.1 over a byte tunnel (`hyper::client::conn::
     /// http1` inside the CONNECT stream; the destination relays raw bytes to
@@ -1625,15 +1629,20 @@ pub enum GrpcMeshDispatch {
 pub fn classify_grpc_mesh_dispatch(
     target: &crate::config::types::UpstreamTarget,
 ) -> GrpcMeshDispatch {
-    if crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
-        || crate::proxy::mesh_mtls_pool::target_mesh_mtls_cross_cluster(target)
-    {
-        return GrpcMeshDispatch::RefuseCrossCluster;
+    let hbone = crate::proxy::hbone_pool::target_hbone_enabled(target);
+    let mesh_mtls = crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target);
+    let cross_cluster = crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
+        || crate::proxy::mesh_mtls_pool::target_mesh_mtls_cross_cluster(target);
+    if cross_cluster {
+        if hbone || mesh_mtls {
+            return GrpcMeshDispatch::RefuseCrossCluster;
+        }
+        return GrpcMeshDispatch::RefuseCrossClusterNoTransport;
     }
-    if crate::proxy::hbone_pool::target_hbone_enabled(target) {
+    if hbone {
         return GrpcMeshDispatch::RefuseHbone;
     }
-    if crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target) {
+    if mesh_mtls {
         return GrpcMeshDispatch::MeshMtls;
     }
     GrpcMeshDispatch::Direct
@@ -1660,6 +1669,9 @@ pub fn classify_grpc_mesh_dispatch(
 ///   (`request_uses_grpc_content_type`) alone cannot see the translation —
 ///   pair it with the plugin's spoof-proof context marker
 ///   (`grpc_web::request_is_grpc_web_translated`).
+/// * `RefuseCrossClusterNoTransport` never falls through because the target
+///   is malformed: there is no HBONE or mesh-mTLS transport for the HTTP path
+///   to use.
 pub fn grpc_mesh_dispatch_falls_through(
     dispatch: GrpcMeshDispatch,
     request_uses_grpc_content_type: bool,
@@ -1669,6 +1681,7 @@ pub fn grpc_mesh_dispatch_falls_through(
     match dispatch {
         GrpcMeshDispatch::Direct => false,
         GrpcMeshDispatch::MeshMtls => mesh_mtls_supports_request_body,
+        GrpcMeshDispatch::RefuseCrossClusterNoTransport => false,
         GrpcMeshDispatch::RefuseCrossCluster | GrpcMeshDispatch::RefuseHbone => {
             !request_uses_grpc_content_type && !grpc_web_translated
         }

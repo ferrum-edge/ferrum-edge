@@ -176,6 +176,31 @@ async fn test_translated_error_response_text_base64_encodes_trailer_frame() {
     assert!(payload.contains("grpc-message: blocked\r\n"));
 }
 
+#[test]
+fn test_error_response_for_content_type_text_base64_encodes_trailer_frame() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let response = ferrum_edge::plugins::grpc_web::error_response_for_content_type(
+        "application/grpc-web-text",
+        14,
+        "blocked",
+    );
+
+    assert_eq!(
+        response.headers.get("content-type").map(String::as_str),
+        Some("application/grpc-web-text")
+    );
+    assert_eq!(
+        response.headers.get("x-grpc-web").map(String::as_str),
+        Some("1")
+    );
+    let decoded = BASE64.decode(&response.body).unwrap();
+    let payload = grpc_web_trailer_payload(&decoded);
+    assert!(payload.contains("grpc-status: 14\r\n"));
+    assert!(payload.contains("grpc-message: blocked\r\n"));
+}
+
 #[tokio::test]
 async fn test_detects_grpc_web_binary_proto() {
     let plugin = create_plugin_default();

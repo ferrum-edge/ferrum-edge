@@ -2827,6 +2827,9 @@ fn grpc_mesh_transport_refusal(target: Option<&UpstreamTarget>) -> Option<&'stat
         grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => {
             Some("gRPC over cross-cluster east-west routing is not supported")
         }
+        grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterNoTransport => {
+            Some("gRPC over cross-cluster east-west routing requires a mesh transport tag")
+        }
         grpc_proxy::GrpcMeshDispatch::RefuseHbone => Some(
             "gRPC over the Ambient HBONE mesh transport is not supported \
              (HBONE inner protocol cannot carry gRPC trailers)",
