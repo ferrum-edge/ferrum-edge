@@ -7121,9 +7121,13 @@ fn row_to_proxy(
             .try_get::<f64, _>("udp_max_response_amplification_factor")
             .ok()
             .map(|v| v as f32),
+        // Written as an i32 0/1 (like the other proxy booleans); decode with
+        // the same width. `Option<i32>` represents SQL NULL, so `?` fails only
+        // on real decode errors — silently mapping those to `None` would
+        // disable PROXY-header consumption on an enabled listener and corrupt
+        // the first bytes of the application/TLS stream.
         stream_proxy_protocol: row
-            .try_get::<i64, _>("stream_proxy_protocol")
-            .ok()
+            .try_get::<Option<i32>, _>("stream_proxy_protocol")?
             .map(|v| v != 0),
         // api_spec_id: PRESERVE here. This row mapper is shared between
         // admin GET/list paths (which need the real owning spec id to

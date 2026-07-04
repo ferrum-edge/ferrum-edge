@@ -4589,6 +4589,20 @@ impl Proxy {
         let effective_scheme = self.effective_scheme();
         let is_stream_proxy = effective_scheme.is_stream();
 
+        // Inbound PROXY protocol is TCP-borne: valid only on tcp/tcps stream
+        // proxies. Enforced here (single-proxy admin writes: POST/PUT
+        // /proxies and the API-spec proxy path) in addition to
+        // `GatewayConfig::validate_stream_proxies`, so a bad row can never
+        // persist and then wedge the next full-config load/reconcile.
+        if self.stream_proxy_protocol == Some(true)
+            && !matches!(effective_scheme, BackendScheme::Tcp | BackendScheme::Tcps)
+        {
+            errors.push(
+                "stream_proxy_protocol is only valid for tcp/tcps stream proxies                  (PROXY protocol is TCP-borne)"
+                    .to_string(),
+            );
+        }
+
         // Passthrough mode validation
         if self.passthrough {
             if !is_stream_proxy {
