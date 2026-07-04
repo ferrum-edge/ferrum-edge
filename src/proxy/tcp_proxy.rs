@@ -1592,6 +1592,10 @@ struct TcpConnParams {
     upstream_id: Option<String>,
     /// Optional upstream subset for DestinationRule-style retry target selection.
     upstream_subset: Option<String>,
+    /// Stable per-flow key used for initial LB selection. Retries reuse this
+    /// key while excluding the failed target so consistent-hash failover stays
+    /// distributed by client flow instead of by failed backend hostname.
+    lb_hash_key: String,
     /// When true, forward encrypted client bytes directly without TLS termination.
     passthrough: bool,
     /// Whether TCP Fast Open is enabled (gated on `FERRUM_TCP_FASTOPEN_ENABLED`).
@@ -2058,6 +2062,7 @@ async fn handle_tcp_connection_inner(
             retry: proxy.retry.clone(),
             upstream_id: proxy.upstream_id.clone(),
             upstream_subset: proxy.upstream_subset.clone(),
+            lb_hash_key,
             passthrough: proxy.passthrough,
             tcp_fastopen_enabled: tcp_fastopen,
             dispatch_port_overrides: proxy.dispatch_port_overrides.clone(),
@@ -3362,6 +3367,7 @@ mod backend_target_selection_tests {
             retry: None,
             upstream_id: Some("orders".to_string()),
             upstream_subset: None,
+            lb_hash_key: "192.0.2.10".to_string(),
             passthrough: false,
             tcp_fastopen_enabled: false,
             dispatch_port_overrides: None,
@@ -3582,6 +3588,86 @@ mod backend_target_selection_tests {
     }
 
     #[test]
+    fn tcp_port_lane_retry_reuses_original_hash_key() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].targets.push(UpstreamTarget {
+            host: "backup.local".into(),
+            port: 5432,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: HashMap::new(),
+            locality: None,
+            path: None,
+        });
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing),
+                ..Default::default()
+            },
+        );
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let (flow_key, failed) = (1..=256)
+            .find_map(|i| {
+                let key = format!("198.51.100.{i}");
+                let initial = LoadBalancerCache::select_target_for_port_from(
+                    &snapshot, "orders", &key, 5432, None,
+                )?;
+                let exclude = UpstreamTarget {
+                    host: initial.target.host.clone(),
+                    port: initial.target.port,
+                    service_port_policy_key: Some(initial.target.dispatch_policy_port()),
+                    weight: 1,
+                    path: None,
+                    tags: HashMap::new(),
+                    locality: None,
+                };
+                let expected = LoadBalancerCache::select_next_target_for_port_from(
+                    &snapshot, "orders", &key, 5432, &exclude, None,
+                )?;
+                let failed_host_key = LoadBalancerCache::select_next_target_for_port_from(
+                    &snapshot,
+                    "orders",
+                    &initial.target.host,
+                    5432,
+                    &exclude,
+                    None,
+                )?;
+                (expected.host != failed_host_key.host)
+                    .then(|| (key, (initial.target.host.clone(), initial.target.port)))
+            })
+            .expect("test fixture should expose distinct retry hash outcomes");
+
+        let mut params = retry_params();
+        params.lb_port_lane = Some(5432);
+        params.lb_hash_key = flow_key.clone();
+
+        let (host, port, policy_port) =
+            try_next_target(&params, &failed.0, failed.1, 5432, &snapshot)
+                .expect("alternate target inside the port lane");
+
+        let exclude = UpstreamTarget {
+            host: failed.0,
+            port: failed.1,
+            service_port_policy_key: Some(5432),
+            weight: 1,
+            path: None,
+            tags: HashMap::new(),
+            locality: None,
+        };
+        let expected = LoadBalancerCache::select_next_target_for_port_from(
+            &snapshot, "orders", &flow_key, 5432, &exclude, None,
+        )
+        .expect("expected retry target");
+        assert_eq!(host, expected.host);
+        assert_eq!(port, expected.port);
+        assert_eq!(policy_port, expected.dispatch_policy_port());
+    }
+
+    #[test]
     fn resolve_backend_target_hashes_port_lane_by_client_key() {
         let mut config = config_with_two_targets();
         config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
@@ -3680,12 +3766,13 @@ fn try_next_target(
     };
     // Rotate inside the per-port lane the initial selection used (if any), so
     // a per-port algorithm/locality override is not escaped on connect retry.
+    let lb_hash_key = params.lb_hash_key.as_str();
     let next = match (params.upstream_subset.as_deref(), params.lb_port_lane) {
         (Some(subset_name), Some(port)) => {
             LoadBalancerCache::select_next_target_for_port_subset_from(
                 lb_snapshot,
                 upstream_id,
-                current_host,
+                lb_hash_key,
                 port,
                 subset_name,
                 &exclude,
@@ -3695,7 +3782,7 @@ fn try_next_target(
         (Some(subset_name), None) => LoadBalancerCache::select_next_target_subset_from(
             lb_snapshot,
             upstream_id,
-            current_host,
+            lb_hash_key,
             subset_name,
             &exclude,
             None,
@@ -3703,7 +3790,7 @@ fn try_next_target(
         (None, Some(port)) => LoadBalancerCache::select_next_target_for_port_from(
             lb_snapshot,
             upstream_id,
-            current_host,
+            lb_hash_key,
             port,
             &exclude,
             None,
@@ -3711,7 +3798,7 @@ fn try_next_target(
         (None, None) => LoadBalancerCache::select_next_target_from(
             lb_snapshot,
             upstream_id,
-            current_host,
+            lb_hash_key,
             &exclude,
             None,
         ),

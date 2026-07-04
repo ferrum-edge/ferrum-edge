@@ -4111,7 +4111,8 @@ fn resolve_backend_target(
         let override_port =
             LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
         let port_lane = (override_port != 0
-            && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port))
+            && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port)
+            && udp_port_lane_selection_supported(proxy, override_port))
         .then_some(override_port);
 
         let selection = if let Some(port) = port_lane {
@@ -4136,6 +4137,17 @@ fn resolve_backend_target(
     } else {
         Ok((proxy.backend_host.clone(), proxy.backend_port))
     }
+}
+
+fn udp_port_lane_selection_supported(proxy: &Proxy, port: u16) -> bool {
+    !matches!(
+        proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&port))
+            .and_then(|override_config| override_config.algorithm),
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections)
+    )
 }
 
 fn resolve_or_reuse_backend_target(
@@ -5001,6 +5013,54 @@ listen_port: 5300
         assert!(
             hosts.contains("a.local") && hosts.contains("b.local"),
             "per-port UDP consistent hashing must use the session key, not a constant proxy id: {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_udp_backend_target_skips_port_lane_for_least_connections() {
+        let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "udp-proxy",
+                "backend_scheme": "udp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 5300,
+                "upstream_id": "dns",
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "dns",
+                "algorithm": "round_robin",
+                "targets": [
+                    { "host": "a.local", "port": 5353 },
+                    { "host": "b.local", "port": 5353 }
+                ],
+                "port_overrides": {
+                    "5353": { "algorithm": "least_connections" }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let mut hosts = std::collections::HashSet::new();
+        for i in 1..=16 {
+            let key = format!("192.0.2.{i}");
+            let (host, port) =
+                super::resolve_backend_target(&proxy, &snapshot, &key).expect("target selected");
+            assert_eq!(port, 5353);
+            hosts.insert(host);
+        }
+
+        assert!(
+            hosts.contains("a.local") && hosts.contains("b.local"),
+            "UDP sessions do not record per-target LB connection accounting, so a per-port \
+             LEAST_CONN override must not engage the per-port selector"
         );
     }
 
