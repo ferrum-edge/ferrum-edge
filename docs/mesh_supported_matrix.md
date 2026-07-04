@@ -166,6 +166,7 @@ new documented deferral gets an issue and a row here).
 | Ambient SD east-west parity (gateway-routed remote targets on the SD bridge without regressing flat-network direct dials) | [#2011](https://github.com/ferrum-edge/ferrum-edge/issues/2011) | `docs/mesh.md` protocol matrix note [4] |
 | Port-level `connectionPool` merge semantics vs Istio complete-replacement (uniform follow-up across all applied knobs) | [#2012](https://github.com/ferrum-edge/ferrum-edge/issues/2012) | `docs/mesh.md` "Port-level `connectionPool` merge semantics" |
 | Ambient UDP capture producer (matrix rows are "transport half only") + the live UDP/raw-TCP source-capture e2e (`netns-capture-live`) | [#2013](https://github.com/ferrum-edge/ferrum-edge/issues/2013) | `docs/mesh.md` matrix UDP/DTLS rows + note [10], UDP TPROXY capture section |
+| DR `connectionPool` knob-coverage residuals on the H3 frontend / SD paths (post-#1806/#1816: H3 `maxRetries` cap, native-H3 / gRPC-bridge override threading, stale SD/H3 coverage-limitation wording) — moot for mesh, gateway-surface only | [#2020](https://github.com/ferrum-edge/ferrum-edge/issues/2020) | `docs/mesh.md` `http1MaxPendingRequests` coverage-limitations bullet + "Dispatch-path coverage" |
 
 ## How a feature graduates
 
