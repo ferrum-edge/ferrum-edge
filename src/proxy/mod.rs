@@ -14983,6 +14983,15 @@ async fn handle_proxy_request_inner(
                          refusing the direct dial and failing closed with gRPC UNAVAILABLE"
                     );
                     record_request(&state, 200); // gRPC errors ride HTTP 200 + trailers
+                    if grpc_request_is_web_translated
+                        && let Some(response) = build_translated_grpc_web_error_response(
+                            &ctx,
+                            14,
+                            "gRPC retry target requires a mesh transport that does not support retries",
+                        )
+                    {
+                        return Ok(response);
+                    }
                     return Ok(grpc_proxy::build_grpc_error_response(
                         14, // UNAVAILABLE
                         "gRPC retry target requires a mesh transport that does not support retries",
@@ -21331,6 +21340,28 @@ fn mesh_mtls_request_body_too_large_response(
     }
 }
 
+fn mesh_grpc_unavailable_response(
+    resolved_ip: Option<String>,
+    message: &str,
+    error_class: retry::ErrorClass,
+) -> retry::BackendResponse {
+    let mut headers = HashMap::with_capacity(3);
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "grpc-status".to_string(),
+        grpc_proxy::grpc_status::UNAVAILABLE.to_string(),
+    );
+    headers.insert("grpc-message".to_string(), message.to_string());
+    retry::BackendResponse {
+        status_code: 200, // gRPC errors ride HTTP 200 + grpc-status
+        body: ResponseBody::Buffered(Vec::new()),
+        headers,
+        connection_error: !retry::request_reached_wire(error_class),
+        backend_resolved_ip: resolved_ip,
+        error_class: Some(error_class),
+    }
+}
+
 /// Timeout refusal for a gRPC-flavored request on the sidecar mesh-mTLS path
 /// (codex r2-2 finding 6): the direct gRPC pool maps a dispatch timeout
 /// (`GrpcProxyError::BackendTimeout`) to a Trailers-Only DEADLINE_EXCEEDED
@@ -21397,6 +21428,27 @@ fn mesh_grpc_response_buffering_refusal_response(
             Some(retry::ErrorClass::DispatchPolicyRejected)
         },
     }
+}
+
+fn native_grpc_mesh_mtls_buffering_conflict_known(
+    stream_response: bool,
+    proxy: &Proxy,
+    plugins: &[Arc<dyn Plugin>],
+    ctx: Option<&RequestContext>,
+) -> bool {
+    if stream_response {
+        return false;
+    }
+    let grpc_response_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    !refine_stream_response_for_content_type(
+        stream_response,
+        proxy,
+        plugins,
+        ctx,
+        200,
+        &grpc_response_headers,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22389,6 +22441,30 @@ async fn proxy_to_backend_mesh_mtls(
         );
     }
 
+    // Native gRPC over sidecar mesh-mTLS can only be forwarded safely as a
+    // streaming H2 response because `BackendResponse::Buffered` has no trailer
+    // channel. If buffering is already known to be required for an
+    // `application/grpc` response (explicit buffer mode or an active response
+    // body plugin that would still need the body for that content-type), fail
+    // before sending the RPC so an UNAVAILABLE response cannot duplicate
+    // side effects through client retries. The post-header check below remains
+    // as a defensive fallback for response-specific decisions.
+    if is_native_grpc
+        && native_grpc_mesh_mtls_buffering_conflict_known(stream_response, proxy, plugins, ctx)
+    {
+        warn!(
+            proxy_id = %proxy.id,
+            target_host = %target.host,
+            "Refusing native gRPC over sidecar mesh mTLS before dispatch: response buffering \
+             is required and would drop gRPC trailers"
+        );
+        return (
+            mesh_grpc_response_buffering_refusal_response(200, resolved_ip),
+            None,
+            None,
+        );
+    }
+
     let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
     let mut sender = match state
         .mesh_mtls_pool
@@ -22406,6 +22482,27 @@ async fn proxy_to_backend_mesh_mtls(
     {
         Ok(sender) => sender,
         Err(err) => {
+            if is_grpc_flavored {
+                let error_class = err.error_class();
+                if error_class == retry::ErrorClass::PortExhaustion {
+                    state.overload.record_port_exhaustion();
+                }
+                error!(
+                    proxy_id = %proxy.id,
+                    error_kind = retry::error_class_log_kind(error_class),
+                    error = %err,
+                    "sidecar mTLS gRPC pool request failed before dispatch"
+                );
+                return (
+                    mesh_grpc_unavailable_response(
+                        resolved_ip,
+                        "sidecar mTLS backend unavailable",
+                        error_class,
+                    ),
+                    None,
+                    None,
+                );
+            }
             return (
                 hbone_pool_error_response(state, proxy, &err, resolved_ip),
                 None,
@@ -22423,6 +22520,22 @@ async fn proxy_to_backend_mesh_mtls(
     {
         Ok(Ok(())) => {}
         Ok(Err(err)) => {
+            if is_grpc_flavored {
+                error!(
+                    proxy_id = %proxy.id,
+                    error = %err,
+                    "sidecar mTLS gRPC sender readiness failed before dispatch"
+                );
+                return (
+                    mesh_grpc_unavailable_response(
+                        resolved_ip,
+                        "sidecar mTLS backend unavailable",
+                        retry::ErrorClass::ConnectionPoolError,
+                    ),
+                    None,
+                    None,
+                );
+            }
             return (
                 hbone_hyper_error_response(proxy, err, resolved_ip),
                 None,
@@ -22435,6 +22548,17 @@ async fn proxy_to_backend_mesh_mtls(
                 "sidecar mTLS HTTP/2 sender readiness timed out ({}ms)",
                 proxy.backend_connect_timeout_ms
             );
+            if is_grpc_flavored {
+                return (
+                    mesh_grpc_unavailable_response(
+                        resolved_ip,
+                        "sidecar mTLS backend unavailable",
+                        retry::ErrorClass::ConnectionTimeout,
+                    ),
+                    None,
+                    None,
+                );
+            }
             return (
                 retry::BackendResponse {
                     status_code: 504,
@@ -22766,7 +22890,15 @@ async fn proxy_to_backend_mesh_mtls(
                 );
             }
             return (
-                hbone_hyper_error_response(proxy, err, resolved_ip),
+                if is_grpc_flavored {
+                    mesh_grpc_unavailable_response(
+                        resolved_ip,
+                        "sidecar mTLS backend unavailable",
+                        retry::ErrorClass::ProtocolError,
+                    )
+                } else {
+                    hbone_hyper_error_response(proxy, err, resolved_ip)
+                },
                 None,
                 None,
             );
@@ -22909,8 +23041,28 @@ async fn proxy_to_backend_mesh_mtls(
                 );
             }
             Err(HyperBodyCollectError::Read(err)) => {
+                if body_size_exceeded.load(Ordering::Acquire) {
+                    return (
+                        mesh_mtls_request_body_too_large_response(
+                            proxy,
+                            resolved_ip,
+                            is_grpc_flavored,
+                            request_body_limit,
+                        ),
+                        None,
+                        None,
+                    );
+                }
                 return (
-                    hbone_hyper_error_response(proxy, err, resolved_ip),
+                    if is_grpc_flavored {
+                        mesh_grpc_unavailable_response(
+                            resolved_ip,
+                            "sidecar mTLS backend unavailable",
+                            retry::ErrorClass::ProtocolError,
+                        )
+                    } else {
+                        hbone_hyper_error_response(proxy, err, resolved_ip)
+                    },
                     None,
                     None,
                 );
@@ -27209,6 +27361,80 @@ mod tests {
             panic!("gRPC deadline response should be buffered");
         };
         assert!(body.is_empty(), "Trailers-Only timeout carries no body");
+    }
+
+    #[test]
+    fn mesh_grpc_unavailable_response_is_trailers_only_backend_failure() {
+        let resp = mesh_grpc_unavailable_response(
+            Some("127.0.0.4".to_string()),
+            "sidecar mTLS backend unavailable",
+            retry::ErrorClass::ConnectionPoolError,
+        );
+
+        assert_eq!(resp.status_code, 200);
+        assert!(resp.connection_error);
+        assert_eq!(
+            resp.error_class,
+            Some(retry::ErrorClass::ConnectionPoolError)
+        );
+        assert_eq!(resp.backend_resolved_ip.as_deref(), Some("127.0.0.4"));
+        assert_eq!(
+            resp.headers.get("content-type").map(String::as_str),
+            Some("application/grpc")
+        );
+        assert_eq!(
+            resp.headers.get("grpc-status").map(String::as_str),
+            Some("14")
+        );
+        assert_eq!(
+            resp.headers.get("grpc-message").map(String::as_str),
+            Some("sidecar mTLS backend unavailable")
+        );
+        let ResponseBody::Buffered(body) = resp.body else {
+            panic!("gRPC unavailable response should be buffered");
+        };
+        assert!(body.is_empty(), "Trailers-Only response carries no body");
+    }
+
+    #[test]
+    fn native_grpc_mesh_mtls_buffering_conflict_is_detected_before_dispatch() {
+        let ctx = RequestContext::new("127.0.0.1".to_string(), "POST".to_string(), "/".to_string());
+
+        let buffered_proxy = test_proxy(ResponseBodyMode::Buffer);
+        assert!(native_grpc_mesh_mtls_buffering_conflict_known(
+            false,
+            &buffered_proxy,
+            &[],
+            Some(&ctx),
+        ));
+
+        let streaming_proxy = test_proxy(ResponseBodyMode::Stream);
+        let grpc_buffering_plugins: Vec<Arc<dyn Plugin>> =
+            vec![Arc::new(ContentTypeBufferPlugin {
+                buffer_content_type: "application/grpc",
+            })];
+        assert!(native_grpc_mesh_mtls_buffering_conflict_known(
+            false,
+            &streaming_proxy,
+            &grpc_buffering_plugins,
+            Some(&ctx),
+        ));
+
+        let json_only_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(ContentTypeBufferPlugin {
+            buffer_content_type: "application/json",
+        })];
+        assert!(!native_grpc_mesh_mtls_buffering_conflict_known(
+            false,
+            &streaming_proxy,
+            &json_only_plugins,
+            Some(&ctx),
+        ));
+        assert!(!native_grpc_mesh_mtls_buffering_conflict_known(
+            true,
+            &buffered_proxy,
+            &grpc_buffering_plugins,
+            Some(&ctx),
+        ));
     }
 
     #[tokio::test]
