@@ -1298,16 +1298,15 @@ async fn run_tcp_accept_loop(
                     // Connections from untrusted peers, or with an invalid/absent header, are
                     // closed immediately (fail closed). This mirrors the HTTP-path semantics
                     // of `direct_client_ip` (socket peer) vs `client_ip` (XFF-resolved).
-                    // We check `stream_proxy_protocol` from the current epoch config for this
-                    // proxy_id. This is a cold check per connection (one epoch load), not
-                    // per-request overhead.
-                    let proxy_protocol_enabled = {
-                        let epoch = request_epoch.load();
-                        epoch
-                            .proxy_by_id(proxy_id.as_ref())
-                            .and_then(|p| p.stream_proxy_protocol)
-                            .unwrap_or(false)
-                    };
+                    // Load one request epoch for this accepted connection and reuse it for
+                    // PROXY parsing, SNI/routing, and stream setup. A live reload that toggles
+                    // `stream_proxy_protocol` must not let one connection decide header
+                    // consumption from one snapshot and route with another.
+                    let epoch = request_epoch.load();
+                    let proxy_protocol_enabled = epoch
+                        .proxy_by_id(proxy_id.as_ref())
+                        .and_then(|p| p.stream_proxy_protocol)
+                        .unwrap_or(false);
 
                     // `client_ip` will be overwritten if PROXY protocol supplies a forwarded addr.
                     let client_ip = if proxy_protocol_enabled {
@@ -1369,7 +1368,6 @@ async fn run_tcp_accept_loop(
                             &client_ip,
                             &node_waypoint_identity_warn_limiter,
                         );
-                    let epoch = request_epoch.load();
                     let base_proxy = epoch.proxy_by_id(proxy_id.as_ref());
                     let consumer_index =
                         Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
