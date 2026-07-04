@@ -6322,10 +6322,9 @@ impl ProxyState {
     ///
     /// Serialized proxy content catches ordinary route/backend/policy edits while
     /// ignoring volatile timestamps. The two DR-derived dispatch projection
-    /// fields are skipped by serde and therefore compared explicitly, but only
-    /// for keys and values read from the route-carried `Proxy` at dispatch time.
-    /// Load-balancer-only values are consumed by the LB cache and must not force
-    /// a route-table rebuild when the effective override key set is unchanged.
+    /// fields are skipped by serde and therefore compared explicitly for every
+    /// value that can alter dispatch, including LB fields used to decide whether
+    /// stream-family mesh relays enter a per-port selection lane.
     fn proxy_content_eq(a: &Proxy, b: &Proxy) -> bool {
         if a.resolved_tls != b.resolved_tls {
             return false;
@@ -6488,7 +6487,10 @@ impl ProxyState {
         b: &crate::config::types::ResolvedPortOverride,
     ) -> bool {
         a.connect_timeout_ms == b.connect_timeout_ms
+            && a.algorithm == b.algorithm
+            && a.hash_on == b.hash_on
             && a.passive_health_check == b.passive_health_check
+            && a.locality_lb_setting == b.locality_lb_setting
             && a.max_connections == b.max_connections
             && a.tcp_keepalive == b.tcp_keepalive
             && a.http_max_requests_per_connection == b.http_max_requests_per_connection
@@ -29009,7 +29011,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_routes_changed_ignores_lb_only_override_value_change() {
+    fn delta_routes_changed_detects_projected_lb_override_change_without_proxy_delta() {
         let (delta, old_config, new_config) = route_delta_projected_upstream_change_delta(
             |upstream| {
                 upstream.port_overrides.insert(
@@ -29031,7 +29033,39 @@ mod tests {
             },
         );
 
-        assert!(!ProxyState::delta_routes_changed(
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_projected_hash_override_change_without_proxy_delta() {
+        let (delta, old_config, new_config) = route_delta_projected_tcp_relay_change_delta(
+            |upstream| {
+                upstream.port_overrides.insert(
+                    3306,
+                    crate::config::types::UpstreamPortOverride {
+                        algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+                        hash_on: Some("header:x-tenant".to_string()),
+                        ..Default::default()
+                    },
+                );
+            },
+            |upstream| {
+                upstream.port_overrides.insert(
+                    3306,
+                    crate::config::types::UpstreamPortOverride {
+                        algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+                        hash_on: Some("header:x-user".to_string()),
+                        ..Default::default()
+                    },
+                );
+            },
+        );
+
+        assert!(ProxyState::delta_routes_changed(
             &delta,
             &old_config,
             &new_config

@@ -1004,10 +1004,11 @@ pub(crate) fn resolve_hash_key(
 /// previously open-coded the same five-step sequence:
 ///
 /// 1. Compute the per-port override port that covers `prev_target` (if any).
-/// 2. If the failed target sits in an override lane whose `hash_on` differs
-///    from the upstream-level strategy, recompute the retry hash key against
-///    the per-port `hash_on` so consistent-hash buckets stay consistent on
-///    the retry attempt; otherwise reuse the steady-state `base_hash_key`.
+/// 2. If the failed target sits in an override lane, recompute the retry hash
+///    key from the same effective selection strategy used by initial dispatch
+///    (per-port, subset, then upstream) so consistent-hash buckets stay
+///    consistent on the retry attempt; otherwise reuse the steady-state
+///    `base_hash_key`.
 /// 3. Build a `HealthContext` whose `max_ejection_percent` honours the
 ///    per-port `passive_health_check` override when one is configured.
 /// 4. Dispatch to the appropriate `select_next_target_*_from` variant —
@@ -1025,8 +1026,8 @@ pub(crate) fn resolve_hash_key(
 /// Hot-path safe: `epoch.load_balancer` is an already-cloned `Arc` snapshot,
 /// `HealthContext` is borrowed, and the only allocation is the optional
 /// `String` produced by `resolve_hash_key()` when the override-lane branch
-/// fires. Steady-state retries (no port override OR matching `hash_on`)
-/// reuse the borrowed `base_hash_key` with zero allocations.
+/// fires. Steady-state retries with no port override reuse the borrowed
+/// `base_hash_key` with zero allocations.
 pub(crate) fn select_next_retry_target(
     state: &ProxyState,
     epoch: &RequestEpoch,
@@ -1047,15 +1048,16 @@ pub(crate) fn select_next_retry_target(
             )
         });
 
-    // Recompute the retry hash key when the per-port `hash_on` strategy
-    // differs from the upstream-level one. Steady-state retries reuse the
-    // borrowed `base_hash_key`, keeping zero-allocation behavior.
+    // Recompute the retry hash key from the same effective strategy used by
+    // initial port/subset dispatch. Steady-state retries without a live port
+    // lane reuse the borrowed `base_hash_key`, keeping zero-allocation behavior.
     let rehashed;
     let retry_key: &str = if let Some(port) = retry_override_port {
-        let strategy = LoadBalancerCache::get_hash_on_strategy_for_port_from(
+        let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
             &epoch.load_balancer,
             upstream_id,
-            port,
+            Some(port),
+            proxy.upstream_subset.as_deref(),
         );
         rehashed = resolve_hash_key(&strategy, client_ip, proxy_headers).0;
         &rehashed
@@ -1356,6 +1358,131 @@ mod tests {
             first.target.as_ref().map(|t| t.port),
             second.target.as_ref().map(|t| t.port),
             "mixed-port upstreams must keep using the upstream-level balancer until a target is selected"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_selection_uses_subset_hash_strategy_for_port_subset_without_port_hash_on() {
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "consumers": [],
+                "plugin_configs": [],
+                "proxies": [{
+                    "id": "mesh-egress",
+                    "listen_path": "/",
+                    "backend_scheme": "http",
+                    "backend_host": "unused.local",
+                    "backend_port": 8080,
+                    "upstream_id": "mesh-upstream",
+                    "upstream_subset": "v1"
+                }],
+                "upstreams": [{
+                    "id": "mesh-upstream",
+                    "targets": [
+                        {
+                            "host": "10.0.0.1",
+                            "port": 8080,
+                            "tags": {"version": "v1"}
+                        },
+                        {
+                            "host": "10.0.0.2",
+                            "port": 8080,
+                            "tags": {"version": "v1"}
+                        },
+                        {
+                            "host": "10.0.0.3",
+                            "port": 8080,
+                            "tags": {"version": "v1"}
+                        },
+                        {
+                            "host": "10.0.0.4",
+                            "port": 8080,
+                            "tags": {"version": "v2"}
+                        }
+                    ],
+                    "algorithm": "round_robin",
+                    "hash_on": "ip",
+                    "subsets": [{
+                        "name": "v1",
+                        "labels": {"version": "v1"},
+                        "traffic_policy": {
+                            "load_balancer_algorithm": "consistent_hashing",
+                            "hash_on": "header:x-user-id"
+                        }
+                    }],
+                    "port_overrides": {
+                        "8080": {
+                            "connect_timeout_ms": 250
+                        }
+                    }
+                }]
+            }))
+            .expect("test config should deserialize");
+        config.normalize_fields();
+        let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig::default());
+        let env_config = crate::config::env_config::EnvConfig::default();
+        let (state, _) = crate::proxy::ProxyState::new(config, dns_cache, env_config, None, None)
+            .expect("test proxy state should build");
+        let epoch = state.request_epoch.load();
+        let proxy = &epoch.config.proxies[0];
+        let prev_target = &epoch.config.upstreams[0].targets[0];
+        let mut headers = HashMap::new();
+        headers.insert("x-user-id".to_string(), "alice".to_string());
+
+        let expected = LoadBalancerCache::select_next_target_for_port_subset_from(
+            &epoch.load_balancer,
+            "mesh-upstream",
+            "alice",
+            8080,
+            "v1",
+            prev_target,
+            None,
+        )
+        .expect("expected subset retry target");
+        let (client_ip, port_only_key) = [
+            "192.0.2.10",
+            "198.51.100.20",
+            "203.0.113.30",
+            "10.10.10.10",
+            "172.16.4.8",
+        ]
+        .into_iter()
+        .filter_map(|candidate| {
+            let target = LoadBalancerCache::select_next_target_for_port_subset_from(
+                &epoch.load_balancer,
+                "mesh-upstream",
+                candidate,
+                8080,
+                "v1",
+                prev_target,
+                None,
+            )?;
+            ((target.host.as_str(), target.port) != (expected.host.as_str(), expected.port))
+                .then_some((candidate, target))
+        })
+        .next()
+        .expect("test keys must distinguish subset header hashing from upstream/IP hashing");
+        let retry = select_next_retry_target(
+            &state,
+            &epoch,
+            proxy,
+            prev_target,
+            client_ip,
+            client_ip,
+            &headers,
+        )
+        .expect("retry target should be selected");
+
+        assert_eq!(
+            (retry.host.as_str(), retry.port),
+            (expected.host.as_str(), expected.port),
+            "retry must preserve the subset-scoped hash_on key when the port override has no hash_on"
+        );
+        assert_ne!(
+            (expected.host.as_str(), expected.port),
+            (port_only_key.host.as_str(), port_only_key.port),
+            "sanity check: selected client IP must exercise the old upstream/IP hash-key bug"
         );
     }
 
