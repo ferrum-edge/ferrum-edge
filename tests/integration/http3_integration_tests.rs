@@ -111,6 +111,7 @@ fn create_http3_test_proxy() -> Proxy {
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -334,6 +335,7 @@ async fn test_http3_proxy_state_creation() {
             false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
             false, // udp_gso_enabled
             false, // udp_pktinfo_enabled
+            Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -619,6 +621,7 @@ async fn test_http3_full_integration() {
             false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
             false, // udp_gso_enabled
             false, // udp_pktinfo_enabled
+            Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::none()),
         ),
     );
     let dns_cache_for_sd = dns_cache.clone();
@@ -832,6 +835,7 @@ async fn test_http3_streaming_decision_logic() {
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };

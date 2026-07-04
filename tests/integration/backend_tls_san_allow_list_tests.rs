@@ -134,6 +134,7 @@ fn create_test_proxy(port: u16, ca_path: &str, san_allow_list: Vec<String>) -> P
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

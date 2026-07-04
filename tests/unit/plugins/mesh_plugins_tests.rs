@@ -4455,3 +4455,116 @@ async fn workload_metrics_direction_emit_rejects_garbage_value() {
         "config error must mention the field: {err}"
     );
 }
+
+// ── PROXY protocol stream IP split (source.ip vs remote.ip) ──────────────────
+
+/// When inbound PROXY protocol is enabled the stream path produces two
+/// distinct IP values: `direct_client_ip` (socket peer, the load balancer)
+/// and `client_ip` (forwarded origin from the PROXY header).
+///
+/// `build_stream_condition_attributes` must map them to different `when:`
+/// keys so policies can distinguish between them — mirroring the HTTP-path
+/// split where `source.ip` = socket peer and `remote.ip` = XFF-resolved.
+///
+/// This test exercises the full `on_stream_connect` codepath with a
+/// policy that gates on `source.ip` (should see the direct socket peer)
+/// and a second policy that gates on `remote.ip` (should see the
+/// forwarded/resolved address).
+#[tokio::test]
+async fn mesh_authz_stream_source_ip_uses_direct_socket_peer_not_forwarded() {
+    // Policy: DENY if source.ip (socket peer) == "10.0.0.1"
+    // This should trigger when direct_client_ip = "10.0.0.1", regardless of
+    // the forwarded client_ip.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [{
+            "name": "deny-lb-peer",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": [{
+                "when": [{"key": "source.ip", "values": ["10.0.0.1/32"]}],
+                "action": "deny"
+            }]
+        }]
+    }))
+    .expect("plugin config");
+
+    // direct_client_ip = LB socket peer; client_ip = forwarded origin from PROXY header.
+    let mut ctx_peer_matches = stream_context();
+    ctx_peer_matches.direct_client_ip = "10.0.0.1".to_string(); // socket peer = LB
+    ctx_peer_matches.client_ip = "192.168.100.5".to_string(); // forwarded = real client
+
+    // The DENY should fire because source.ip (direct socket peer) matches.
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut ctx_peer_matches).await,
+            PluginResult::Reject { .. }
+        ),
+        "source.ip when-condition must match the direct socket peer (direct_client_ip)"
+    );
+
+    // When the socket peer is different (10.0.0.2) and the forwarded origin
+    // happens to be 10.0.0.1, source.ip should NOT match — source.ip is the
+    // socket peer, not the forwarded address.
+    let mut ctx_forwarded_matches = stream_context();
+    ctx_forwarded_matches.direct_client_ip = "10.0.0.2".to_string(); // different peer
+    ctx_forwarded_matches.client_ip = "10.0.0.1".to_string(); // forwarded = PROXY header value
+
+    // The DENY must NOT fire because source.ip sees the socket peer (10.0.0.2),
+    // not the forwarded address.
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut ctx_forwarded_matches).await,
+            PluginResult::Continue
+        ),
+        "source.ip when-condition must NOT match the forwarded client_ip"
+    );
+}
+
+#[tokio::test]
+async fn mesh_authz_stream_remote_ip_uses_forwarded_address_not_socket_peer() {
+    // Policy: DENY if remote.ip (forwarded/resolved) == "192.168.100.5"
+    // This should trigger when client_ip = "192.168.100.5", regardless of
+    // the socket peer in direct_client_ip.
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [{
+            "name": "deny-forwarded-origin",
+            "namespace": "default",
+            "scope": {"kind": "mesh_wide"},
+            "rules": [{
+                "when": [{"key": "remote.ip", "values": ["192.168.100.5/32"]}],
+                "action": "deny"
+            }]
+        }]
+    }))
+    .expect("plugin config");
+
+    // client_ip = resolved forwarded address (PROXY header); direct = LB peer.
+    let mut ctx_forwarded_matches = stream_context();
+    ctx_forwarded_matches.direct_client_ip = "10.0.0.1".to_string(); // socket peer = LB
+    ctx_forwarded_matches.client_ip = "192.168.100.5".to_string(); // forwarded origin
+
+    // The DENY fires because remote.ip (forwarded address) matches.
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut ctx_forwarded_matches).await,
+            PluginResult::Reject { .. }
+        ),
+        "remote.ip when-condition must match the forwarded/resolved client_ip"
+    );
+
+    // When the socket peer is 192.168.100.5 but the forwarded address is
+    // different, remote.ip should NOT match.
+    let mut ctx_peer_matches = stream_context();
+    ctx_peer_matches.direct_client_ip = "192.168.100.5".to_string(); // socket peer matches
+    ctx_peer_matches.client_ip = "172.16.0.99".to_string(); // forwarded = different
+
+    // The DENY must NOT fire because remote.ip sees the forwarded address
+    // (172.16.0.99), not the socket peer.
+    assert!(
+        matches!(
+            plugin.on_stream_connect(&mut ctx_peer_matches).await,
+            PluginResult::Continue
+        ),
+        "remote.ip when-condition must NOT match the direct socket peer (direct_client_ip)"
+    );
+}

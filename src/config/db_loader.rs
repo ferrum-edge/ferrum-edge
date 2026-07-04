@@ -1521,14 +1521,14 @@ impl DatabaseStore {
     /// kept available outside `#[cfg(test)]` so it remains a visible
     /// drift-prevention anchor when reading the SQL definition.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 50;
+    pub(crate) const PROXY_INSERT_PLACEHOLDER_COUNT: usize = 51;
 
     /// Number of `?` placeholders in the `submit_api_spec_bundle` proxy
     /// INSERT statement (which adds `api_spec_id` between
-    /// `udp_max_response_amplification_factor` and `created_at`).
-    /// 50 base + 1 (api_spec_id) = 51.
+    /// `stream_proxy_protocol` and `created_at`).
+    /// 51 base + 1 (api_spec_id) = 52.
     #[allow(dead_code)]
-    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 51;
+    pub(crate) const PROXY_INSERT_WITH_API_SPEC_ID_PLACEHOLDER_COUNT: usize = 52;
 
     /// Proxy INSERT SQL without `api_spec_id` (direct admin path and bulk import).
     ///
@@ -1553,11 +1553,12 @@ impl DatabaseStore {
          listen_port, frontend_tls, passthrough, \
          udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
          allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
+         stream_proxy_protocol, \
          upstream_subset, \
          created_at, updated_at) \
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                ?, ?, ?, ?, ?)";
+                ?, ?, ?, ?, ?, ?)";
 
     // ---- CRUD for Admin API ----
 
@@ -1677,6 +1678,11 @@ impl DatabaseStore {
                     .udp_max_response_amplification_factor
                     .map(|v| v as f64),
             )
+            .bind(
+                proxy
+                    .stream_proxy_protocol
+                    .map(|v| if v { 1i32 } else { 0 }),
+            )
             .bind(&proxy.upstream_subset)
             .bind(proxy.created_at.to_rfc3339())
             .bind(proxy.updated_at.to_rfc3339())
@@ -1735,7 +1741,7 @@ impl DatabaseStore {
         let hosts_json = serde_json::to_string(&proxy.hosts)?;
 
         sqlx::query(
-            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, updated_at=? WHERE id=? AND namespace=?")
+            &self.q("UPDATE proxies SET name=?, hosts=?, listen_path=?, backend_scheme=?, backend_host=?, backend_port=?, backend_path=?, strip_listen_path=?, preserve_host_header=?, backend_connect_timeout_ms=?, backend_read_timeout_ms=?, backend_write_timeout_ms=?, backend_tls_client_cert_path=?, backend_tls_client_key_path=?, backend_tls_verify_server_cert=?, backend_tls_server_ca_cert_path=?, dns_override=?, dns_cache_ttl_seconds=?, auth_mode=?, upstream_id=?, upstream_subset=?, circuit_breaker=?, retry=?, response_body_mode=?, pool_idle_timeout_seconds=?, pool_enable_http_keep_alive=?, pool_enable_http2=?, pool_tcp_keepalive_seconds=?, pool_http2_keep_alive_interval_seconds=?, pool_http2_keep_alive_timeout_seconds=?, pool_http2_initial_stream_window_size=?, pool_http2_initial_connection_window_size=?, pool_http2_adaptive_window=?, pool_http2_max_frame_size=?, pool_http2_max_concurrent_streams=?, pool_http3_connections_per_backend=?, pool_max_requests_per_connection=?, listen_port=?, frontend_tls=?, passthrough=?, udp_idle_timeout_seconds=?, tcp_idle_timeout_seconds=?, websocket_idle_timeout_seconds=?, allowed_methods=?, allowed_ws_origins=?, udp_max_response_amplification_factor=?, stream_proxy_protocol=?, updated_at=? WHERE id=? AND namespace=?")
         )
         .bind(&proxy.name)
         .bind(&hosts_json)
@@ -1783,6 +1789,7 @@ impl DatabaseStore {
         .bind(proxy.allowed_methods.as_ref().map(serde_json::to_string).transpose()?)
         .bind(if proxy.allowed_ws_origins.is_empty() { None } else { Some(serde_json::to_string(&proxy.allowed_ws_origins)?) })
         .bind(proxy.udp_max_response_amplification_factor.map(|v| v as f64))
+        .bind(proxy.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
         .bind(Utc::now().to_rfc3339())
         .bind(&proxy.id)
         .bind(&proxy.namespace)
@@ -4152,6 +4159,11 @@ impl DatabaseStore {
                         .udp_max_response_amplification_factor
                         .map(|v| v as f64),
                 )
+                .bind(
+                    proxy
+                        .stream_proxy_protocol
+                        .map(|v| if v { 1i32 } else { 0 }),
+                )
                 .bind(&proxy.upstream_subset)
                 .bind(proxy.created_at.to_rfc3339())
                 .bind(proxy.updated_at.to_rfc3339())
@@ -5012,10 +5024,11 @@ impl DatabaseStore {
                   listen_port, frontend_tls, passthrough, \
                   udp_idle_timeout_seconds, tcp_idle_timeout_seconds, websocket_idle_timeout_seconds, \
                   allowed_methods, allowed_ws_origins, udp_max_response_amplification_factor, \
+                  stream_proxy_protocol, \
                   api_spec_id, created_at, updated_at) \
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                         ?, ?, ?, ?, ?, ?)"))
+                         ?, ?, ?, ?, ?, ?, ?)"))
             .bind(&p.id)
             .bind(&p.namespace)
             .bind(&p.name)
@@ -5089,6 +5102,7 @@ impl DatabaseStore {
                 Some(serde_json::to_string(&p.allowed_ws_origins)?)
             })
             .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
+            .bind(p.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
             .bind(&spec.id)
             .bind(p.created_at.to_rfc3339())
             .bind(p.updated_at.to_rfc3339())
@@ -5419,6 +5433,7 @@ impl DatabaseStore {
                  websocket_idle_timeout_seconds = ?, \
                  allowed_methods = ?, allowed_ws_origins = ?, \
                  udp_max_response_amplification_factor = ?, \
+                 stream_proxy_protocol = ?, \
                  api_spec_id = ?, updated_at = ? \
                  WHERE id = ? AND namespace = ?"))
             .bind(&p.namespace)
@@ -5493,6 +5508,7 @@ impl DatabaseStore {
                 Some(serde_json::to_string(&p.allowed_ws_origins)?)
             })
             .bind(p.udp_max_response_amplification_factor.map(|v| v as f64))
+            .bind(p.stream_proxy_protocol.map(|v| if v { 1i32 } else { 0 }))
             .bind(&spec.id)
             .bind(p.updated_at.to_rfc3339())
             // WHERE clause — match by primary key
@@ -7105,6 +7121,10 @@ fn row_to_proxy(
             .try_get::<f64, _>("udp_max_response_amplification_factor")
             .ok()
             .map(|v| v as f32),
+        stream_proxy_protocol: row
+            .try_get::<i64, _>("stream_proxy_protocol")
+            .ok()
+            .map(|v| v != 0),
         // api_spec_id: PRESERVE here. This row mapper is shared between
         // admin GET/list paths (which need the real owning spec id to
         // serialise per the OpenAPI schema) and the runtime config loader
@@ -7611,7 +7631,7 @@ mod proxy_insert_sql_drift_tests {
         // change there.
         let values_clause = "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
                                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, \
-                                     ?, ?, ?, ?, ?, ?)";
+                                     ?, ?, ?, ?, ?, ?, ?)";
         let placeholders = values_clause.matches('?').count();
         assert_eq!(
             placeholders,

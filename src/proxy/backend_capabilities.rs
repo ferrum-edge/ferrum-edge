@@ -619,6 +619,7 @@ mod tests {
             allowed_methods: None,
             allowed_ws_origins: vec![],
             udp_max_response_amplification_factor: None,
+            stream_proxy_protocol: None,
             created_at: now,
             updated_at: now,
         }

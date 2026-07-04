@@ -1213,7 +1213,7 @@ async fn run_tcp_accept_loop(
     loop {
         tokio::select! {
             result = listener.accept() => {
-                let (stream, remote_addr) = match result {
+                let (mut stream, remote_addr) = match result {
                     Ok(conn) => conn,
                     Err(e) => {
                         // Bound the log rate independently of the backoff (an

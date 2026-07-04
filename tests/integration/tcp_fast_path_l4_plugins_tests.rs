@@ -45,6 +45,7 @@ use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::overload::OverloadState;
 use ferrum_edge::plugin_cache::PluginCache;
 use ferrum_edge::plugins::ProxyProtocol;
+use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics, start_tcp_listener};
 use ferrum_edge::request_epoch::RequestEpochStore;
 
@@ -142,6 +143,7 @@ fn fast_path_tcp_proxy(listen_port: u16, backend_port: u16, plugin_config_ids: &
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
@@ -367,6 +369,7 @@ async fn try_spawn_fast_path_gateway(
             record_mesh_mtls_metric: false,
             mesh_outbound_enforcement: ferrum_edge::modes::mesh::outbound_enforcement::empty_slot(),
             node_waypoint_identity_resolver: None,
+            trusted_proxies: Arc::new(TrustedProxies::none()),
         };
         tokio::spawn(async move {
             // Errors here would abort the test by leaving `started`

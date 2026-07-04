@@ -1218,7 +1218,8 @@ impl MeshAuthz {
         &self,
         ctx: &StreamConnectionContext,
         source_principal: Option<&SpiffeId>,
-        resolved_ip: Option<std::net::IpAddr>,
+        source_ip: Option<std::net::IpAddr>,
+        remote_ip: Option<std::net::IpAddr>,
     ) -> BTreeMap<String, MeshAuthzAttribute> {
         let mut attributes = BTreeMap::new();
         let keys = &self.condition_keys;
@@ -1252,13 +1253,17 @@ impl MeshAuthz {
         {
             attributes.insert(ATTR_CONNECTION_SNI.to_string(), sni.clone().into());
         }
+        // `source.ip` is the immediate downstream socket peer before any
+        // PROXY-protocol rewriting; `remote.ip` is the resolved/forwarded
+        // client IP after inbound PROXY protocol is applied.  These mirror
+        // the HTTP-path split in `build_condition_attributes`.
         if keys.source_ip
-            && let Some(ip) = resolved_ip
+            && let Some(ip) = source_ip
         {
             attributes.insert(ATTR_SOURCE_IP.to_string(), ip.to_string().into());
         }
         if keys.remote_ip
-            && let Some(ip) = resolved_ip
+            && let Some(ip) = remote_ip
         {
             attributes.insert(ATTR_REMOTE_IP.to_string(), ip.to_string().into());
         }
@@ -1935,8 +1940,12 @@ impl Plugin for MeshAuthz {
         // similarly separated via XFF / real-IP resolution.
         let source_ip = parse_client_ip(&ctx.direct_client_ip);
         let remote_ip = parse_client_ip(&ctx.client_ip);
-        let attributes =
-            self.build_stream_condition_attributes(ctx, source_principal.as_ref(), remote_ip);
+        let attributes = self.build_stream_condition_attributes(
+            ctx,
+            source_principal.as_ref(),
+            source_ip,
+            remote_ip,
+        );
         let request = MeshAuthzRequest {
             source_principal,
             port: Some(ctx.listen_port),

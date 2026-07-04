@@ -189,6 +189,7 @@ fn make_proxy(id: &str, hosts: Vec<&str>) -> ferrum_edge::config::types::Proxy {
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

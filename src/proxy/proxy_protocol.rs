@@ -33,7 +33,11 @@ use tracing::warn;
 pub enum ProxyProtocolResult {
     /// A forwarded source address was parsed and should be used as the
     /// resolved `client_ip`. The socket peer remains the `direct_client_ip`.
-    Forwarded { src: SocketAddr, dst: SocketAddr },
+    Forwarded {
+        src: SocketAddr,
+        #[allow(dead_code)]
+        dst: SocketAddr,
+    },
     /// The header was a v2 LOCAL command or a v1/v2 UNKNOWN/unrecognised
     /// family — treat the socket peer as the client (health checks from the LB
     /// itself; pass-through for connection-level checks).
@@ -67,13 +71,17 @@ pub enum ProxyProtocolError {
 const V2_SIG: &[u8; 12] = b"\r\n\r\n\x00\r\nQUIT\n";
 // PROXY v1 prefix
 const V1_PREFIX: &[u8; 6] = b"PROXY ";
-// Maximum v2 address-block length we will read: 216 bytes covers
-// IPv6+IPv6 (32 bytes) + TLVs. Anything longer is rejected to bound
-// memory. Per spec the address block can have arbitrary TLVs; we only
-// consume the AF_INET / AF_INET6 address portion and stop there.
+// Maximum v2 address-block length we will read. The fixed address
+// blocks are at most 36 bytes (AF_INET6: 16+16+2+2). We set the cap
+// to 512 to allow for implementation-defined TLV extensions (e.g. AWS
+// VPC Lattice, HAProxy custom TLVs) that appear after the address pair.
+// Anything longer is rejected to bound memory; per spec the address
+// block can carry arbitrary TLVs after the AF_INET / AF_INET6 portion.
 const V2_MAX_ADDR_LEN: u16 = 512;
-// PROXY v1: maximum total line length is 107 bytes + CRLF = 108 bytes including CRLF.
-const V1_MAX_LEN: usize = 108;
+// PROXY v1: maximum total line length is 107 bytes + CRLF = 109 bytes.
+// `rest` holds the full line including the 6-byte "PROXY " prefix and the
+// CRLF terminator, so the cap must cover all 109 bytes.
+const V1_MAX_LEN: usize = 109;
 
 /// Parse the PROXY protocol header from `stream`.
 ///
@@ -199,22 +207,15 @@ fn parse_v1_line(line: &str) -> Result<ProxyProtocolResult, ProxyProtocolError> 
         .map_err(|_| ProxyProtocolError::Malformed(format!("invalid dst IP {:?}", dst_addr)))?;
 
     // Validate family consistency (spec-required).
-    match proto {
-        "TCP4" => {
-            if !matches!(src_ip, IpAddr::V4(_)) || !matches!(dst_ip, IpAddr::V4(_)) {
-                return Err(ProxyProtocolError::Malformed(
-                    "TCP4 addresses must be IPv4".into(),
-                ));
-            }
-        }
-        "TCP6" => {
-            if !matches!(src_ip, IpAddr::V6(_)) || !matches!(dst_ip, IpAddr::V6(_)) {
-                return Err(ProxyProtocolError::Malformed(
-                    "TCP6 addresses must be IPv6".into(),
-                ));
-            }
-        }
-        _ => {}
+    if proto == "TCP4" && (!matches!(src_ip, IpAddr::V4(_)) || !matches!(dst_ip, IpAddr::V4(_))) {
+        return Err(ProxyProtocolError::Malformed(
+            "TCP4 addresses must be IPv4".into(),
+        ));
+    }
+    if proto == "TCP6" && (!matches!(src_ip, IpAddr::V6(_)) || !matches!(dst_ip, IpAddr::V6(_))) {
+        return Err(ProxyProtocolError::Malformed(
+            "TCP6 addresses must be IPv6".into(),
+        ));
     }
 
     Ok(ProxyProtocolResult::Forwarded {

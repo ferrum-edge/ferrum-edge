@@ -189,6 +189,7 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
     use ferrum_edge::consumer_index::ConsumerIndex;
     use ferrum_edge::load_balancer::LoadBalancerCache;
     use ferrum_edge::plugin_cache::PluginCache;
+    use ferrum_edge::proxy::client_ip::TrustedProxies;
     use ferrum_edge::proxy::stream_listener::StreamListenerManager;
     use ferrum_edge::request_epoch::RequestEpochStore;
     use std::net::IpAddr;
@@ -263,6 +264,7 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -341,6 +343,7 @@ async fn mesh_peer_auth_live_reload_tcp_tls_swap_takes_effect_on_next_accept() {
         false,
         false,
         false,
+        Arc::new(TrustedProxies::none()),
     );
 
     let failures = manager.reconcile().await;
@@ -396,6 +399,7 @@ async fn mesh_peer_auth_live_reload_dtls_swap_noop_without_dtls_listeners() {
     use ferrum_edge::consumer_index::ConsumerIndex;
     use ferrum_edge::load_balancer::LoadBalancerCache;
     use ferrum_edge::plugin_cache::PluginCache;
+    use ferrum_edge::proxy::client_ip::TrustedProxies;
     use ferrum_edge::proxy::stream_listener::StreamListenerManager;
     use ferrum_edge::request_epoch::RequestEpochStore;
     use std::net::IpAddr;
@@ -444,6 +448,7 @@ async fn mesh_peer_auth_live_reload_dtls_swap_noop_without_dtls_listeners() {
         false,
         false,
         false,
+        Arc::new(TrustedProxies::none()),
     );
 
     let build_invocations = std::sync::atomic::AtomicUsize::new(0);

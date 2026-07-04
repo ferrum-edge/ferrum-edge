@@ -73,6 +73,7 @@ fn make_proxy(id: &str, listen_path: &str) -> Proxy {
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }

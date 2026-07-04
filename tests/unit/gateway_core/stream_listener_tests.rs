@@ -12,6 +12,7 @@ use ferrum_edge::consumer_index::ConsumerIndex;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::load_balancer::LoadBalancerCache;
 use ferrum_edge::plugin_cache::PluginCache;
+use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::stream_listener::StreamListenerManager;
 use ferrum_edge::request_epoch::RequestEpochStore;
 use std::net::IpAddr;
@@ -81,6 +82,7 @@ fn create_stream_proxy(id: &str, scheme: BackendScheme, port: u16) -> Proxy {
         allowed_methods: None,
         allowed_ws_origins: vec![],
         udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -149,6 +151,7 @@ fn create_manager_with_config_arc(
         false, // udp_gro_enabled (use false in tests to avoid Linux-specific failures)
         false, // udp_gso_enabled
         false, // udp_pktinfo_enabled
+        Arc::new(TrustedProxies::none()),
     )
 }
 
@@ -966,6 +969,7 @@ async fn test_global_shutdown_stops_tcp_accept_loop() {
         false,
         false,
         false,
+        Arc::new(TrustedProxies::none()),
     );
 
     // Inject the global shutdown receiver BEFORE reconcile so the spawned
@@ -1074,6 +1078,7 @@ async fn test_global_shutdown_stops_udp_recv_loop() {
         false,
         false,
         false,
+        Arc::new(TrustedProxies::none()),
     );
 
     let (global_tx, global_rx) = tokio::sync::watch::channel(false);

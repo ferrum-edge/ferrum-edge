@@ -40,6 +40,7 @@ use ferrum_edge::modes::mesh::outbound_enforcement::{
 };
 use ferrum_edge::overload::OverloadState;
 use ferrum_edge::plugins::mesh::outbound_registry::OutboundRegistry;
+use ferrum_edge::proxy::client_ip::TrustedProxies;
 use ferrum_edge::proxy::tcp_proxy::{TcpListenerConfig, TcpProxyMetrics, start_tcp_listener};
 use ferrum_edge::proxy::udp_proxy::{UdpListenerConfig, UdpProxyMetrics, start_udp_listener};
 use ferrum_edge::request_epoch::RequestEpochStore;
@@ -116,6 +117,7 @@ fn tcp_proxy(listen_port: u16, backend_port: u16) -> Proxy {
         passthrough: false,
         udp_idle_timeout_seconds: 60,
         udp_max_response_amplification_factor: None,
+        stream_proxy_protocol: None,
         tcp_idle_timeout_seconds: Some(0),
         websocket_idle_timeout_seconds: None,
         allowed_methods: None,
@@ -289,6 +291,7 @@ async fn try_spawn_tcp_listener(
         record_mesh_mtls_metric: false,
         mesh_outbound_enforcement: enforcement,
         node_waypoint_identity_resolver: None,
+        trusted_proxies: Arc::new(TrustedProxies::none()),
     };
     let join = tokio::spawn(async move {
         let _ = start_tcp_listener(cfg).await;
