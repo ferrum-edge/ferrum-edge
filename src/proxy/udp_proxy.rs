@@ -4151,15 +4151,21 @@ fn udp_port_lane_selection_supported(proxy: &Proxy, port: u16) -> Result<bool, a
     else {
         return Ok(false);
     };
-    if override_config.algorithm
-        == Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections)
-    {
+    let unsupported_algorithm = match override_config.algorithm {
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections) => Some("LEAST_CONN"),
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency) => Some("LEAST_LATENCY"),
+        _ => None,
+    };
+    if let Some(algorithm) = unsupported_algorithm {
         return Err(StreamSetupError::new(
             StreamSetupKind::UnsupportedStreamPolicy,
-            format!("for UDP port {port}: per-port LEAST_CONN requires stream load-balancer connection accounting"),
+            format!(
+                "for UDP port {port}: per-port {algorithm} requires stream load-balancer accounting"
+            ),
         )
         .into());
     }
+    validate_stream_hash_on(port, override_config)?;
     Ok(stream_port_override_affects_selection(override_config))
 }
 
@@ -4169,6 +4175,24 @@ fn stream_port_override_affects_selection(
     override_config.algorithm.is_some()
         || override_config.hash_on.is_some()
         || override_config.locality_lb_setting.is_some()
+}
+
+fn validate_stream_hash_on(
+    port: u16,
+    override_config: &crate::config::types::ResolvedPortOverride,
+) -> Result<(), anyhow::Error> {
+    let Some(hash_on) = override_config.hash_on.as_deref() else {
+        return Ok(());
+    };
+    let trimmed = hash_on.trim();
+    if trimmed.is_empty() || trimmed == "ip" {
+        return Ok(());
+    }
+    Err(StreamSetupError::new(
+        StreamSetupKind::UnsupportedStreamPolicy,
+        format!("for UDP port {port}: stream per-port consistent hashing supports only source-IP hash keys"),
+    )
+    .into())
 }
 
 fn resolve_or_reuse_backend_target(
@@ -5077,6 +5101,97 @@ listen_port: 5300
         assert!(
             setup.message.contains("per-port LEAST_CONN"),
             "error should make the unsupported policy explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_udp_backend_target_rejects_port_lane_for_least_latency() {
+        let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "udp-proxy",
+                "backend_scheme": "udp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 5300,
+                "upstream_id": "dns",
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "dns",
+                "algorithm": "round_robin",
+                "targets": [
+                    { "host": "a.local", "port": 5353 },
+                    { "host": "b.local", "port": 5353 }
+                ],
+                "port_overrides": {
+                    "5353": { "algorithm": "least_latency" }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = super::resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("per-port LEAST_LATENCY must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("per-port LEAST_LATENCY"),
+            "error should make the unsupported policy explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_udp_backend_target_rejects_port_lane_for_non_ip_hash_on() {
+        let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "udp-proxy",
+                "backend_scheme": "udp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 5300,
+                "upstream_id": "dns",
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "dns",
+                "algorithm": "round_robin",
+                "targets": [
+                    { "host": "a.local", "port": 5353 },
+                    { "host": "b.local", "port": 5353 }
+                ],
+                "port_overrides": {
+                    "5353": {
+                        "algorithm": "consistent_hashing",
+                        "hash_on": "cookie:ferrum-affinity"
+                    }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = super::resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("stream hash_on cookie must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("source-IP hash keys"),
+            "error should make the unsupported hash key explicit: {}",
             setup.message
         );
     }

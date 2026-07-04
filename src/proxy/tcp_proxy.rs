@@ -3287,24 +3287,57 @@ fn tcp_port_lane_selection_supported(proxy: &Proxy, port: u16) -> Result<bool, a
     else {
         return Ok(false);
     };
-    if override_config.algorithm
-        == Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections)
-    {
+    let unsupported_algorithm = match override_config.algorithm {
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections) => Some("LEAST_CONN"),
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency) => Some("LEAST_LATENCY"),
+        _ => None,
+    };
+    if let Some(algorithm) = unsupported_algorithm {
         return Err(StreamSetupError::new(
             StreamSetupKind::UnsupportedStreamPolicy,
-            format!("for TCP port {port}: per-port LEAST_CONN requires stream load-balancer connection accounting"),
+            format!(
+                "for TCP port {port}: per-port {algorithm} requires stream load-balancer accounting"
+            ),
         )
         .into());
     }
-    Ok(stream_port_override_affects_selection(override_config))
+    validate_stream_hash_on(proxy, port, override_config)?;
+    Ok(stream_port_override_affects_selection(
+        proxy,
+        override_config,
+    ))
 }
 
 fn stream_port_override_affects_selection(
+    proxy: &Proxy,
     override_config: &crate::config::types::ResolvedPortOverride,
 ) -> bool {
+    if proxy.upstream_subset.is_some() && override_config.algorithm.is_none() {
+        return false;
+    }
     override_config.algorithm.is_some()
         || override_config.hash_on.is_some()
         || override_config.locality_lb_setting.is_some()
+}
+
+fn validate_stream_hash_on(
+    proxy: &Proxy,
+    port: u16,
+    override_config: &crate::config::types::ResolvedPortOverride,
+) -> Result<(), anyhow::Error> {
+    let Some(hash_on) = override_config.hash_on.as_deref() else {
+        return Ok(());
+    };
+    let trimmed = hash_on.trim();
+    if trimmed.is_empty() || trimmed == "ip" {
+        return Ok(());
+    }
+    let protocol = proxy.effective_scheme();
+    Err(StreamSetupError::new(
+        StreamSetupKind::UnsupportedStreamPolicy,
+        format!("for {protocol} port {port}: stream per-port consistent hashing supports only source-IP hash keys"),
+    )
+    .into())
 }
 
 #[cfg(test)]
@@ -3755,6 +3788,69 @@ mod backend_target_selection_tests {
     }
 
     #[test]
+    fn resolve_backend_target_rejects_tcp_port_lane_for_least_latency() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency),
+                ..Default::default()
+            },
+        );
+        let mut proxy = proxy_with_subset(None);
+        proxy.upstream_id = Some("orders".to_string());
+        config.proxies.push(proxy);
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies.pop().expect("proxy pushed above");
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("per-port LEAST_LATENCY must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("per-port LEAST_LATENCY"),
+            "error should make the unsupported policy explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_rejects_tcp_port_lane_for_non_ip_hash_on() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::ConsistentHashing),
+                hash_on: Some("header:x-user-id".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut proxy = proxy_with_subset(None);
+        proxy.upstream_id = Some("orders".to_string());
+        config.proxies.push(proxy);
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies.pop().expect("proxy pushed above");
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("stream hash_on header must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("source-IP hash keys"),
+            "error should make the unsupported hash key explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
     fn resolve_backend_target_preserves_subset_lb_for_non_lb_port_override() {
         let mut config: GatewayConfig = serde_json::from_value(json!({
             "version": "1",
@@ -3806,6 +3902,61 @@ mod backend_target_selection_tests {
         assert_eq!(
             port_lane, None,
             "a connect-timeout-only port override must not bypass the subset LB lane"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_preserves_subset_lb_for_hash_only_port_override() {
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [{
+                "id": "orders-proxy",
+                "backend_scheme": "tcp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 15432,
+                "upstream_id": "orders",
+                "upstream_subset": "canary"
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "orders",
+                "algorithm": "round_robin",
+                "targets": [
+                    {
+                        "host": "canary-a.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    },
+                    {
+                        "host": "canary-b.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    }
+                ],
+                "subsets": [{
+                    "name": "canary",
+                    "labels": { "version": "canary" },
+                    "traffic_policy": { "load_balancer_algorithm": "consistent_hashing" }
+                }],
+                "port_overrides": {
+                    "5432": { "hash_on": "ip" }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let (_, _, _, port_lane) =
+            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+
+        assert_eq!(
+            port_lane, None,
+            "a hash-only port override must not bypass the subset LB algorithm"
         );
     }
 
