@@ -4112,7 +4112,7 @@ fn resolve_backend_target(
             LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
         let port_lane = if override_port != 0
             && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port)
-            && udp_port_lane_selection_supported(proxy, override_port)?
+            && udp_port_lane_selection_supported(proxy, lb_snapshot, upstream_id, override_port)?
         {
             Some(override_port)
         } else {
@@ -4143,7 +4143,12 @@ fn resolve_backend_target(
     }
 }
 
-fn udp_port_lane_selection_supported(proxy: &Proxy, port: u16) -> Result<bool, anyhow::Error> {
+fn udp_port_lane_selection_supported(
+    proxy: &Proxy,
+    lb_snapshot: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    port: u16,
+) -> Result<bool, anyhow::Error> {
     let Some(override_config) = proxy
         .dispatch_port_overrides
         .as_ref()
@@ -4165,8 +4170,11 @@ fn udp_port_lane_selection_supported(proxy: &Proxy, port: u16) -> Result<bool, a
         )
         .into());
     }
-    validate_stream_hash_on(port, override_config)?;
-    Ok(stream_port_override_affects_selection(override_config))
+    let selection_affecting = stream_port_override_affects_selection(override_config);
+    if selection_affecting {
+        validate_stream_hash_on(lb_snapshot, upstream_id, port)?;
+    }
+    Ok(selection_affecting)
 }
 
 fn stream_port_override_affects_selection(
@@ -4178,14 +4186,17 @@ fn stream_port_override_affects_selection(
 }
 
 fn validate_stream_hash_on(
+    lb_snapshot: &LoadBalancerCacheInner,
+    upstream_id: &str,
     port: u16,
-    override_config: &crate::config::types::ResolvedPortOverride,
 ) -> Result<(), anyhow::Error> {
-    let Some(hash_on) = override_config.hash_on.as_deref() else {
-        return Ok(());
-    };
-    let trimmed = hash_on.trim();
-    if trimmed.is_empty() || trimmed == "ip" {
+    let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+        lb_snapshot,
+        upstream_id,
+        Some(port),
+        None,
+    );
+    if matches!(strategy, crate::load_balancer::HashOnStrategy::Ip) {
         return Ok(());
     }
     Err(StreamSetupError::new(
@@ -5192,6 +5203,51 @@ listen_port: 5300
         assert!(
             setup.message.contains("source-IP hash keys"),
             "error should make the unsupported hash key explicit: {}",
+            setup.message
+        );
+    }
+
+    #[test]
+    fn resolve_udp_backend_target_rejects_port_lane_for_inherited_non_ip_hash_on() {
+        let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "udp-proxy",
+                "backend_scheme": "udp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 5300,
+                "upstream_id": "dns",
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "dns",
+                "algorithm": "round_robin",
+                "hash_on": "header:x-user-id",
+                "targets": [
+                    { "host": "a.local", "port": 5353 },
+                    { "host": "b.local", "port": 5353 }
+                ],
+                "port_overrides": {
+                    "5353": { "algorithm": "consistent_hashing" }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let err = super::resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+            .expect_err("inherited stream hash_on header must be rejected explicitly");
+        let setup = find_stream_setup_error(&err).expect("typed stream setup error");
+
+        assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
+        assert!(
+            setup.message.contains("source-IP hash keys"),
+            "error should make the inherited unsupported hash key explicit: {}",
             setup.message
         );
     }

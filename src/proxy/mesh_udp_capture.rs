@@ -850,6 +850,23 @@ async fn run_udp_egress_session(
                 override_port,
             ))
         .then_some(override_port);
+        if let Some(port) = port_lane {
+            let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+                lb,
+                &entry.upstream_id,
+                Some(port),
+                None,
+            );
+            if !matches!(strategy, crate::load_balancer::HashOnStrategy::Ip) {
+                warn!(
+                    service = %entry.service_fqdn,
+                    port,
+                    orig_dst = %key.orig_dst,
+                    "Mesh UDP egress per-port consistent hashing supports only source-IP hash keys; ending session"
+                );
+                return;
+            }
+        }
         let lb_hash_key = key.client.ip().to_string();
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
