@@ -4169,7 +4169,6 @@ fn stream_port_override_affects_selection(
     override_config.algorithm.is_some()
         || override_config.hash_on.is_some()
         || override_config.locality_lb_setting.is_some()
-        || override_config.passive_health_check.is_some()
 }
 
 fn resolve_or_reuse_backend_target(

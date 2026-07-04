@@ -3305,7 +3305,6 @@ fn stream_port_override_affects_selection(
     override_config.algorithm.is_some()
         || override_config.hash_on.is_some()
         || override_config.locality_lb_setting.is_some()
-        || override_config.passive_health_check.is_some()
 }
 
 #[cfg(test)]
@@ -3807,6 +3806,67 @@ mod backend_target_selection_tests {
         assert_eq!(
             port_lane, None,
             "a connect-timeout-only port override must not bypass the subset LB lane"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_preserves_subset_lb_for_passive_health_only_port_override() {
+        let mut config: GatewayConfig = serde_json::from_value(json!({
+            "version": "1",
+            "proxies": [{
+                "id": "orders-proxy",
+                "backend_scheme": "tcp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 15432,
+                "upstream_id": "orders",
+                "upstream_subset": "canary"
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "orders",
+                "algorithm": "round_robin",
+                "targets": [
+                    {
+                        "host": "canary-a.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    },
+                    {
+                        "host": "canary-b.local",
+                        "port": 5432,
+                        "tags": { "version": "canary" }
+                    }
+                ],
+                "subsets": [{
+                    "name": "canary",
+                    "labels": { "version": "canary" },
+                    "traffic_policy": { "load_balancer_algorithm": "consistent_hashing" }
+                }],
+                "port_overrides": {
+                    "5432": {
+                        "passive_health_check": {
+                            "unhealthy_threshold": 3,
+                            "max_ejection_percent": 50
+                        }
+                    }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let (_, _, _, port_lane) =
+            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+
+        assert_eq!(
+            port_lane, None,
+            "a passive-health-only port override cannot apply without HealthContext and must not \
+             bypass the subset LB lane"
         );
     }
 }
