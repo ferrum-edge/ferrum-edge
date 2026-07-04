@@ -40,7 +40,7 @@ use crate::plugins::{
     Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
     StreamTransactionSummary,
 };
-use crate::proxy::backend_dispatch::{has_effective_port_override, initial_dispatch_port};
+use crate::proxy::backend_dispatch::has_effective_port_override;
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 use crate::retry::ErrorClass;
@@ -1599,6 +1599,11 @@ struct TcpConnParams {
     /// Flattened per-port dispatch overrides used by retry attempts.
     dispatch_port_overrides:
         Option<std::collections::HashMap<u16, crate::config::types::ResolvedPortOverride>>,
+    /// Per-port LB selection lane engaged for the initial target selection
+    /// (single-port upstream with an effective override). Connection-phase
+    /// retries must rotate inside the same lane so a per-port algorithm /
+    /// locality policy is not escaped by `retry_on_connect_failure`.
+    lb_port_lane: Option<u16>,
 }
 
 /// Lightweight snapshot of the proxy fields needed per TCP connection.
@@ -2004,7 +2009,7 @@ async fn handle_tcp_connection_inner(
         stream_ctx.proxy_name = proxy.name.clone();
         stream_ctx.backend_scheme = proxy.effective_scheme();
 
-        let (backend_host, backend_port, backend_policy_port) =
+        let (backend_host, backend_port, backend_policy_port, lb_port_lane) =
             resolve_backend_target(proxy, &epoch.load_balancer)?;
 
         // Populate backend target as soon as it's known — even if DNS or connect fails,
@@ -2055,6 +2060,7 @@ async fn handle_tcp_connection_inner(
             passthrough: proxy.passthrough,
             tcp_fastopen_enabled: tcp_fastopen,
             dispatch_port_overrides: proxy.dispatch_port_overrides.clone(),
+            lb_port_lane,
         };
 
         (params, cb_info)
@@ -3182,34 +3188,37 @@ fn enforce_mesh_tcp_outbound_target(
 
 /// Resolve the backend target — either direct from proxy config or via load balancer.
 ///
-/// Per-port DestinationRule policy (LB algorithm, locality-LB, ejection-cap) is engaged
-/// whenever all upstream targets share a single port (i.e. `initial_dispatch_port_override`
-/// is non-zero) — the same pre-selection semantics the HTTP dispatch path uses.  Stream
-/// paths record no passive health so the `health` parameter stays `None`; ejection state
-/// recorded by HTTP traffic for the same upstream is still respected via the port-scoped
-/// candidate pool inside the LB cache.
+/// Per-port DestinationRule policy (LB algorithm, locality-LB) is engaged only when
+/// every upstream target shares a single dispatch port (a non-zero
+/// `initial_dispatch_port_override`) — the same pre-selection semantics the HTTP
+/// dispatch path uses for single-port upstreams. The HTTP path's `backend_port`
+/// fallback (`backend_dispatch::initial_dispatch_port`) is deliberately NOT used
+/// here: for a stream proxy referencing an upstream, `backend_port` is a
+/// placeholder, and a coincidental match with one overridden port of a mixed-port
+/// upstream would silently pin selection to that port's targets.
+///
+/// Returns `(host, port, policy_port, port_lane)` where `port_lane` is the engaged
+/// per-port selection lane (if any) — connection-phase retries must rotate inside
+/// the same lane (`try_next_target`). Stream paths carry no `HealthContext`, so the
+/// `health` parameter stays `None` (see issue #2018).
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
-) -> Result<(String, u16, u16), anyhow::Error> {
+) -> Result<(String, u16, u16, Option<u16>), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
-        // Mirror the HTTP dispatch pre-selection: compute the initial dispatch port and
-        // engage the per-port LB lane when it covers all targets (same semantics as
-        // `backend_dispatch::initial_dispatch_port` + `has_effective_port_override`).
-        let dispatch_port = initial_dispatch_port(
-            proxy,
-            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id),
-        );
-        let has_port_override =
-            has_effective_port_override(proxy, lb_snapshot, upstream_id, dispatch_port);
+        let override_port =
+            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
+        let port_lane = (override_port != 0
+            && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port))
+        .then_some(override_port);
 
         let selection = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
-            if has_port_override {
+            if let Some(port) = port_lane {
                 LoadBalancerCache::select_target_for_port_subset_from(
                     lb_snapshot,
                     upstream_id,
                     &proxy.id,
-                    dispatch_port,
+                    port,
                     subset_name,
                     None,
                 )
@@ -3222,12 +3231,12 @@ fn resolve_backend_target(
                     None,
                 )
             }
-        } else if has_port_override {
+        } else if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
                 upstream_id,
                 &proxy.id,
-                dispatch_port,
+                port,
                 None,
             )
         } else {
@@ -3245,12 +3254,14 @@ fn resolve_backend_target(
             selection.target.host.clone(),
             selection.target.port,
             selection.target.dispatch_policy_port(),
+            port_lane,
         ))
     } else {
         Ok((
             proxy.backend_host.clone(),
             proxy.backend_port,
             proxy.backend_port,
+            None,
         ))
     }
 }
@@ -3340,6 +3351,7 @@ mod backend_target_selection_tests {
             passthrough: false,
             tcp_fastopen_enabled: false,
             dispatch_port_overrides: None,
+            lb_port_lane: None,
         }
     }
 
@@ -3362,12 +3374,13 @@ mod backend_target_selection_tests {
         let snapshot = cache.load();
         let proxy = proxy_with_subset(Some("canary"));
 
-        let (host, port, policy_port) =
+        let (host, port, policy_port, port_lane) =
             resolve_backend_target(&proxy, &snapshot).expect("target selected");
 
         assert_eq!(host, "canary.local");
         assert_eq!(port, 1002);
         assert_eq!(policy_port, 1002);
+        assert_eq!(port_lane, None, "no port override configured");
     }
 
     #[test]
@@ -3476,6 +3489,82 @@ mod backend_target_selection_tests {
             "lane 6379 remains selectable when excluding lane 6381"
         );
     }
+
+    /// A stream proxy's `backend_port` is a placeholder when an upstream is
+    /// configured. On a mixed-port upstream it must NOT engage the per-port
+    /// lane even when it coincides with an overridden target port (codex
+    /// round-1 P2 on PR #2016).
+    #[test]
+    fn resolve_backend_target_ignores_backend_port_placeholder_on_mixed_port_upstream() {
+        let mut config = config_with_subset();
+        // Targets sit on 1001 and 1002; add a per-port override on 1001 and
+        // make the proxy's placeholder backend_port coincide with it.
+        config.upstreams[0].port_overrides.insert(
+            1001,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::RoundRobin),
+                ..Default::default()
+            },
+        );
+        // `resolve_dispatch_port_overrides` projects upstream overrides onto
+        // every referencing proxy — mirror the load path.
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let mut proxy = proxy_with_subset(None);
+        proxy.backend_port = 1001;
+        config.proxies.push(proxy);
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies.pop().expect("proxy pushed above");
+        assert!(
+            proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .is_some_and(|o| o.contains_key(&1001)),
+            "projection must land the 1001 override on the proxy"
+        );
+
+        let mut hosts = std::collections::HashSet::new();
+        for _ in 0..8 {
+            let (host, _, _, port_lane) =
+                resolve_backend_target(&proxy, &snapshot).expect("target selected");
+            assert_eq!(
+                port_lane, None,
+                "mixed-port upstream must not resolve a per-port lane from the placeholder"
+            );
+            hosts.insert(host);
+        }
+        assert!(
+            hosts.contains("stable.local") && hosts.contains("canary.local"),
+            "selection must rotate across ALL targets, not pin to the placeholder port: {hosts:?}"
+        );
+    }
+
+    /// Connection-phase retry rotation must stay inside the engaged per-port
+    /// lane (codex round-1 P2 on PR #2016): with `lb_port_lane` set, the
+    /// port-scoped next-target variant is used and still rotates to the
+    /// sibling target on that port.
+    #[test]
+    fn tcp_retry_rotation_stays_in_port_lane() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::RoundRobin),
+                ..Default::default()
+            },
+        );
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let mut params = retry_params();
+        params.lb_port_lane = Some(5432);
+
+        let (host, port, policy_port) =
+            try_next_target(&params, "allowed.local", 5432, 5432, &snapshot)
+                .expect("alternate target inside the port lane");
+        assert_eq!(host, "blocked.local");
+        assert_eq!(port, 5432);
+        assert_eq!(policy_port, 5432);
+    }
 }
 
 /// Backend stream type for the connection-phase retry loop.
@@ -3511,23 +3600,43 @@ fn try_next_target(
         tags: std::collections::HashMap::new(),
         locality: None,
     };
-    let next = if let Some(subset_name) = params.upstream_subset.as_deref() {
-        LoadBalancerCache::select_next_target_subset_from(
+    // Rotate inside the per-port lane the initial selection used (if any), so
+    // a per-port algorithm/locality override is not escaped on connect retry.
+    let next = match (params.upstream_subset.as_deref(), params.lb_port_lane) {
+        (Some(subset_name), Some(port)) => {
+            LoadBalancerCache::select_next_target_for_port_subset_from(
+                lb_snapshot,
+                upstream_id,
+                current_host,
+                port,
+                subset_name,
+                &exclude,
+                None,
+            )
+        }
+        (Some(subset_name), None) => LoadBalancerCache::select_next_target_subset_from(
             lb_snapshot,
             upstream_id,
             current_host,
             subset_name,
             &exclude,
             None,
-        )
-    } else {
-        LoadBalancerCache::select_next_target_from(
+        ),
+        (None, Some(port)) => LoadBalancerCache::select_next_target_for_port_from(
+            lb_snapshot,
+            upstream_id,
+            current_host,
+            port,
+            &exclude,
+            None,
+        ),
+        (None, None) => LoadBalancerCache::select_next_target_from(
             lb_snapshot,
             upstream_id,
             current_host,
             &exclude,
             None,
-        )
+        ),
     }?;
     Some((next.host.clone(), next.port, next.dispatch_policy_port()))
 }

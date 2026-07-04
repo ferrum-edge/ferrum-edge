@@ -33,7 +33,7 @@ use crate::plugins::{
     StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
     UdpMetadataSink,
 };
-use crate::proxy::backend_dispatch::{has_effective_port_override, initial_dispatch_port};
+use crate::proxy::backend_dispatch::has_effective_port_override;
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
@@ -4083,27 +4083,34 @@ async fn create_session(
 /// `BackendError`). Mirrors the TCP resolver in
 /// [`crate::proxy::tcp_proxy::resolve_backend_target`].
 ///
-/// Per-port DestinationRule LB/locality/ejection-cap policy engages when
-/// `initial_dispatch_port_override` is non-zero (all targets on one port),
-/// matching the pre-selection semantics used by the HTTP dispatch path.
+/// Per-port DestinationRule LB/locality policy engages only when
+/// `initial_dispatch_port_override` is non-zero (all targets on one port);
+/// the HTTP path's `backend_port` fallback is deliberately not used (a
+/// placeholder port must never pin a mixed-port upstream). Stream paths
+/// carry no `HealthContext` (issue #2018).
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
 ) -> Result<(String, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
-        let dispatch_port = initial_dispatch_port(
-            proxy,
-            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id),
-        );
-        let has_port_override =
-            has_effective_port_override(proxy, lb_snapshot, upstream_id, dispatch_port);
+        // Engage the per-port LB lane only when every upstream target shares a
+        // single dispatch port (non-zero `initial_dispatch_port_override`). The
+        // HTTP path's `backend_port` fallback is deliberately not used: for a
+        // stream proxy referencing an upstream, `backend_port` is a placeholder,
+        // and a coincidental match with one overridden port of a mixed-port
+        // upstream would silently pin selection to that port's targets.
+        let override_port =
+            LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
+        let port_lane = (override_port != 0
+            && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port))
+        .then_some(override_port);
 
-        let selection = if has_port_override {
+        let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
                 upstream_id,
                 &proxy.id,
-                dispatch_port,
+                port,
                 None,
             )
         } else {

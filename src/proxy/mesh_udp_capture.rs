@@ -828,32 +828,34 @@ async fn run_udp_egress_session(
     let proxy = entry.relay_proxy.as_ref();
 
     // ── Fail-closed egress gates (mirrors handle_mesh_tcp_egress) ──────────
-    // Engage the per-port LB lane (algorithm / locality / ejection-cap) when
-    // all upstream targets share a single port — same pre-selection semantics
-    // as the HTTP dispatch path.  Stream paths record no passive health, so the
-    // health parameter stays None.
+    // Engage the per-port LB lane (algorithm / locality) when all upstream
+    // targets share a single port — same pre-selection semantics as the HTTP
+    // dispatch path. Stream paths carry no HealthContext (issue #2018).
     //
     // All lb operations are done in a scoped block so the reference to
     // `epoch.load_balancer` (the Arc inner snapshot) is released before
     // `drop(epoch)` below (codex r7 P2: epoch is setup-only; drop early).
     let (target, balancer) = {
         let lb: &LoadBalancerCacheInner = &epoch.load_balancer;
-        let dispatch_port = backend_dispatch::initial_dispatch_port(
-            proxy,
-            LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id),
-        );
-        let has_port_override = backend_dispatch::has_effective_port_override(
-            proxy,
-            lb,
-            &entry.upstream_id,
-            dispatch_port,
-        );
-        let selection = if has_port_override {
+        // Engage the per-port lane only on a non-zero override port: the relay
+        // proxy's `backend_port` is a placeholder, so the HTTP path's fallback
+        // must not pin a mixed-port upstream (see tcp_proxy::resolve_backend_target).
+        let override_port =
+            LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id);
+        let port_lane = (override_port != 0
+            && backend_dispatch::has_effective_port_override(
+                proxy,
+                lb,
+                &entry.upstream_id,
+                override_port,
+            ))
+        .then_some(override_port);
+        let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb,
                 &entry.upstream_id,
                 &proxy.id,
-                dispatch_port,
+                port,
                 None,
             )
         } else {

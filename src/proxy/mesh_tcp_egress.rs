@@ -70,22 +70,26 @@ pub(crate) async fn handle_mesh_tcp_egress(
 ) {
     let proxy = entry.relay_proxy.as_ref();
     let lb = &epoch.load_balancer;
-    // Engage the per-port LB lane (algorithm / locality / ejection-cap) when
-    // all upstream targets share a single port — same pre-selection semantics
-    // as the HTTP dispatch path.  Stream paths record no passive health, so the
-    // health parameter stays None.
-    let dispatch_port = backend_dispatch::initial_dispatch_port(
-        proxy,
-        LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id),
-    );
-    let has_port_override =
-        backend_dispatch::has_effective_port_override(proxy, lb, &entry.upstream_id, dispatch_port);
-    let Some(selection) = (if has_port_override {
+    // Engage the per-port LB lane (algorithm / locality) only when all upstream
+    // targets share a single dispatch port (non-zero override) — the relay
+    // proxy's `backend_port` is a placeholder, so the HTTP path's fallback must
+    // not be used. Stream paths carry no HealthContext (issue #2018).
+    let override_port =
+        LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id);
+    let port_lane = (override_port != 0
+        && backend_dispatch::has_effective_port_override(
+            proxy,
+            lb,
+            &entry.upstream_id,
+            override_port,
+        ))
+    .then_some(override_port);
+    let Some(selection) = (if let Some(port) = port_lane {
         LoadBalancerCache::select_target_for_port_from(
             lb,
             &entry.upstream_id,
             &proxy.id,
-            dispatch_port,
+            port,
             None,
         )
     } else {

@@ -1733,13 +1733,20 @@ impl RouterCache {
                         sp.port,
                     );
                     let decision = if upstream_ids.contains(upstream_id.as_str()) {
-                        let relay_proxy =
-                            Arc::new(crate::modes::mesh::mesh_outbound_tcp_relay_proxy(
-                                &service.namespace,
-                                &service.name,
-                                sp.port,
-                                &upstream_id,
-                            ));
+                        let mut relay_proxy = crate::modes::mesh::mesh_outbound_tcp_relay_proxy(
+                            &service.namespace,
+                            &service.name,
+                            sp.port,
+                            &upstream_id,
+                        );
+                        // Project per-port DestinationRule overrides onto the
+                        // synthesized relay proxy (mirrors the UDP table): the
+                        // stream selection path gates the per-port LB lane on
+                        // `Proxy.dispatch_port_overrides`, which the relay
+                        // builders leave unset.
+                        relay_proxy.dispatch_port_overrides =
+                            dispatch_port_overrides_for_upstream(config, &upstream_id);
+                        let relay_proxy = Arc::new(relay_proxy);
                         let service_fqdn = config
                             .upstreams
                             .iter()
@@ -1789,14 +1796,17 @@ impl RouterCache {
                 mesh.multi_cluster.as_ref(),
             ) {
                 let decision = if upstream_ids.contains(spec.upstream_id.as_str()) {
-                    let relay_proxy =
-                        Arc::new(crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
-                            &spec.service.namespace,
-                            &spec.service.name,
-                            spec.service_port.port,
-                            spec.canonical_ip,
-                            &spec.upstream_id,
-                        ));
+                    let mut relay_proxy = crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
+                        &spec.service.namespace,
+                        &spec.service.name,
+                        spec.service_port.port,
+                        spec.canonical_ip,
+                        &spec.upstream_id,
+                    );
+                    // Same per-port DR override projection as the VIP table.
+                    relay_proxy.dispatch_port_overrides =
+                        dispatch_port_overrides_for_upstream(config, &spec.upstream_id);
+                    let relay_proxy = Arc::new(relay_proxy);
                     let service_fqdn = config
                         .upstreams
                         .iter()
@@ -4739,6 +4749,9 @@ mod tests {
             "id": "__mesh-out-tcp-upstream-default-redis-6379",
             "name": "redis.default.svc.cluster.local",
             "targets": [{"host": "10.0.0.5", "port": 6379}],
+            "port_overrides": {
+                "6379": { "algorithm": "round_robin" }
+            },
         }))
         .expect("upstream deserializes");
         let config = GatewayConfig {
@@ -4766,6 +4779,17 @@ mod tests {
                 assert_eq!(
                     entry.relay_proxy.upstream_id.as_deref(),
                     Some("__mesh-out-tcp-upstream-default-redis-6379")
+                );
+                // Per-port DR overrides project onto the synthesized relay
+                // proxy (mirrors the UDP table); the stream selection path
+                // gates the per-port LB lane on `dispatch_port_overrides`.
+                assert!(
+                    entry
+                        .relay_proxy
+                        .dispatch_port_overrides
+                        .as_ref()
+                        .is_some_and(|o| o.contains_key(&6379)),
+                    "TCP relay proxy must carry the upstream's per-port overrides"
                 );
             }
             _ => panic!("expected Relay decision for an exact (VIP, port) match"),
