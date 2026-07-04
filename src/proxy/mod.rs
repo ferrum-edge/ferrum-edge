@@ -5080,12 +5080,14 @@ impl ProxyState {
                 let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
                     continue;
                 };
-                let relay_proxy = crate::modes::mesh::mesh_outbound_tcp_relay_proxy(
+                let mut relay_proxy = crate::modes::mesh::mesh_outbound_tcp_relay_proxy(
                     &service.namespace,
                     &service.name,
                     sp.port,
                     &upstream_id,
                 );
+                relay_proxy.dispatch_port_overrides =
+                    Self::projected_dispatch_overrides_for_upstream(config, &upstream_id);
                 for target in &upstream.targets {
                     // Only Ambient `mesh.hbone` targets use the HBONE capability
                     // registry. Sidecar `mesh.mtls` raw-TCP targets dispatch over
@@ -5127,13 +5129,15 @@ impl ProxyState {
             let Some(upstream) = upstream_map.get(spec.upstream_id.as_str()) else {
                 continue;
             };
-            let relay_proxy = crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
+            let mut relay_proxy = crate::modes::mesh::mesh_outbound_tcp_bywl_relay_proxy(
                 &spec.service.namespace,
                 &spec.service.name,
                 spec.service_port.port,
                 spec.canonical_ip,
                 &spec.upstream_id,
             );
+            relay_proxy.dispatch_port_overrides =
+                Self::projected_dispatch_overrides_for_upstream(config, &spec.upstream_id);
             for target in &upstream.targets {
                 // Ambient `mesh.hbone` per-workload targets only; Sidecar
                 // `mesh.mtls` (no probe) and cross-cluster east-west targets
@@ -5174,12 +5178,14 @@ impl ProxyState {
                 let Some(upstream) = upstream_map.get(upstream_id.as_str()) else {
                     continue;
                 };
-                let relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
+                let mut relay_proxy = crate::modes::mesh::mesh_outbound_udp_relay_proxy(
                     &service.namespace,
                     &service.name,
                     sp.port,
                     &upstream_id,
                 );
+                relay_proxy.dispatch_port_overrides =
+                    Self::projected_dispatch_overrides_for_upstream(config, &upstream_id);
                 for target in &upstream.targets {
                     // Ambient `mesh.hbone` UDP targets only; Sidecar `mesh.mtls`
                     // (no probe) and cross-cluster east-west targets
@@ -6398,6 +6404,19 @@ impl ProxyState {
                         Self::projected_dispatch_overrides_for_upstream(config, &upstream_id),
                     );
                 }
+            }
+        }
+
+        for spec in crate::modes::mesh::mesh_outbound_tcp_bywl_upstreams(
+            &mesh.services,
+            &mesh.workloads,
+            mesh.multi_cluster.as_ref(),
+        ) {
+            if upstream_ids.contains(spec.upstream_id.as_str()) {
+                projection.insert(
+                    spec.upstream_id.clone(),
+                    Self::projected_dispatch_overrides_for_upstream(config, &spec.upstream_id),
+                );
             }
         }
 
@@ -25429,7 +25448,7 @@ mod tests {
         );
         // The single-target HBONE-tagged, identity-pinned upstream the Ambient
         // materializer would emit.
-        let upstream: Upstream = serde_json::from_value(json!({
+        let mut upstream: Upstream = serde_json::from_value(json!({
             "id": bywl_id,
             "name": "redis.default.svc.cluster.local",
             "targets": [{
@@ -25439,6 +25458,17 @@ mod tests {
             }],
         }))
         .expect("upstream deserializes");
+        upstream.port_overrides.insert(
+            6379,
+            crate::config::types::UpstreamPortOverride {
+                tcp_keepalive: Some(crate::config::types::TcpKeepaliveCfg {
+                    time_seconds: Some(10),
+                    interval_seconds: Some(2),
+                    probes: Some(3),
+                }),
+                ..Default::default()
+            },
+        );
         let config = GatewayConfig {
             upstreams: vec![upstream],
             mesh: Some(Box::new(MeshConfig {
@@ -25486,6 +25516,16 @@ mod tests {
             enrolled.hbone_expected_peer.as_ref().map(|p| p.as_str()),
             Some(spiffe),
             "the HBONE probe pins the same destination identity dispatch uses"
+        );
+        assert!(
+            enrolled
+                .proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get(&6379))
+                .and_then(|override_config| override_config.tcp_keepalive.as_ref())
+                .is_some(),
+            "the HBONE probe relay must carry the same per-port TCP policy as dispatch"
         );
     }
 
@@ -28599,6 +28639,106 @@ mod tests {
         (delta, old_config, new_config)
     }
 
+    fn route_delta_projected_tcp_bywl_relay_change_delta(
+        mutate_old_upstream: impl FnOnce(&mut Upstream),
+        mutate_new_upstream: impl FnOnce(&mut Upstream),
+    ) -> (
+        crate::config_delta::ConfigDelta,
+        GatewayConfig,
+        GatewayConfig,
+        String,
+    ) {
+        use crate::identity::spiffe::{SpiffeId, TrustDomain};
+        use crate::modes::mesh::config::{
+            AppProtocol, MeshConfig, MeshService, ServicePort, ServiceTargetPort, Workload,
+            WorkloadPort, WorkloadRef, WorkloadSelector,
+        };
+
+        let t0 = chrono::Utc::now();
+        let t1 = t0 + chrono::Duration::seconds(1);
+        let spiffe = "spiffe://cluster.local/ns/default/sa/redis";
+        let workload_ip: std::net::IpAddr = "10.0.0.7".parse().expect("workload ip");
+        let upstream_id = crate::modes::mesh::mesh_outbound_tcp_bywl_upstream_id(
+            "default",
+            "redis",
+            6379,
+            workload_ip,
+        );
+        let mut old_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.7", 6380)]);
+        old_upstream.name = Some("redis.default.svc.cluster.local".to_string());
+        old_upstream.created_at = t0;
+        old_upstream.updated_at = t0;
+        mutate_old_upstream(&mut old_upstream);
+        let mut new_upstream = upstream_with_targets(&upstream_id, &[("10.0.0.7", 6380)]);
+        new_upstream.name = Some("redis.default.svc.cluster.local".to_string());
+        new_upstream.created_at = t1;
+        new_upstream.updated_at = t1;
+        mutate_new_upstream(&mut new_upstream);
+
+        let service = MeshService {
+            name: "redis".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![ServicePort {
+                port: 6379,
+                protocol: AppProtocol::Redis,
+                name: Some("redis".to_string()),
+                target_port: Some(ServiceTargetPort::Number(6380)),
+            }],
+            workloads: vec![WorkloadRef {
+                spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            }],
+            protocol_overrides: HashMap::new(),
+            cluster_ips: Vec::new(),
+        };
+        let workload = Workload {
+            spiffe_id: SpiffeId::new(spiffe).unwrap(),
+            selector: WorkloadSelector::default(),
+            service_name: "redis".to_string(),
+            addresses: vec!["10.0.0.7".to_string()],
+            ports: vec![WorkloadPort {
+                port: 6380,
+                protocol: AppProtocol::Redis,
+                name: Some("redis".to_string()),
+            }],
+            trust_domain: TrustDomain::new("cluster.local").unwrap(),
+            namespace: "default".to_string(),
+            network: None,
+            cluster: None,
+            weight: None,
+            locality: None,
+            service_account: None,
+            pod_uid: None,
+            node_waypoint: None,
+            remote_provenance: false,
+        };
+        let mesh = MeshConfig {
+            services: vec![service],
+            workloads: vec![workload],
+            ..MeshConfig::default()
+        };
+        let old_config = GatewayConfig {
+            upstreams: vec![old_upstream],
+            mesh: Some(Box::new(mesh.clone())),
+            ..GatewayConfig::default()
+        };
+        let new_config = GatewayConfig {
+            upstreams: vec![new_upstream],
+            mesh: Some(Box::new(mesh)),
+            ..GatewayConfig::default()
+        };
+
+        let delta = crate::config_delta::ConfigDelta::compute(&old_config, &new_config);
+        assert!(
+            delta.modified_proxies.is_empty(),
+            "by-workload TCP relay projection changes must not rely on a Proxy resource modification"
+        );
+        assert!(
+            !delta.modified_upstreams.is_empty(),
+            "test setup must simulate the upstream timestamp delta from the DR edit"
+        );
+        (delta, old_config, new_config, upstream_id)
+    }
+
     fn http_route_proxy_with_upstream() -> Proxy {
         let t0 = chrono::Utc::now();
         let mut proxy = route_delta_proxy("http", DispatchKind::HttpPool, t0);
@@ -28999,6 +29139,59 @@ mod tests {
             relay_timeout(&new_snapshot),
             Some(60),
             "rebuilding the route table swaps in the synthesized TCP relay policy"
+        );
+    }
+
+    #[test]
+    fn delta_routes_changed_detects_projected_tcp_bywl_relay_override_change_without_proxy_delta() {
+        let (delta, old_config, new_config, _upstream_id) =
+            route_delta_projected_tcp_bywl_relay_change_delta(
+                |upstream| {
+                    upstream.port_overrides.insert(
+                        6379,
+                        crate::config::types::UpstreamPortOverride {
+                            connect_timeout_ms: Some(40),
+                            ..Default::default()
+                        },
+                    );
+                },
+                |upstream| {
+                    upstream.port_overrides.insert(
+                        6379,
+                        crate::config::types::UpstreamPortOverride {
+                            connect_timeout_ms: Some(80),
+                            ..Default::default()
+                        },
+                    );
+                },
+            );
+
+        assert!(ProxyState::delta_routes_changed(
+            &delta,
+            &old_config,
+            &new_config
+        ));
+
+        let old_snapshot =
+            crate::router_cache::RouterCache::build_route_table_snapshot(&old_config);
+        let new_snapshot =
+            crate::router_cache::RouterCache::build_route_table_snapshot(&new_config);
+        let relay_timeout = |table: &crate::router_cache::HostRouteTable| match table
+            .mesh_tcp_egress_by_workload_decision("10.0.0.7:6380".parse().expect("addr"))
+        {
+            Some(crate::router_cache::MeshTcpEgressDecision::Relay(entry)) => entry
+                .relay_proxy
+                .dispatch_port_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get(&6379))
+                .and_then(|override_config| override_config.connect_timeout_ms),
+            _ => None,
+        };
+        assert_eq!(relay_timeout(&old_snapshot), Some(40));
+        assert_eq!(
+            relay_timeout(&new_snapshot),
+            Some(80),
+            "rebuilding the route table swaps in the synthesized by-workload TCP relay policy"
         );
     }
 

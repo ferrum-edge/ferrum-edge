@@ -3211,7 +3211,8 @@ fn resolve_backend_target(
         let override_port =
             LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
         let port_lane = (override_port != 0
-            && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port))
+            && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port)
+            && tcp_port_lane_selection_supported(proxy, override_port))
         .then_some(override_port);
 
         let selection = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
@@ -3266,6 +3267,17 @@ fn resolve_backend_target(
             None,
         ))
     }
+}
+
+fn tcp_port_lane_selection_supported(proxy: &Proxy, port: u16) -> bool {
+    !matches!(
+        proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.get(&port))
+            .and_then(|override_config| override_config.algorithm),
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections)
+    )
 }
 
 #[cfg(test)]
@@ -3600,6 +3612,35 @@ mod backend_target_selection_tests {
         assert!(
             hosts.contains("allowed.local") && hosts.contains("blocked.local"),
             "per-port consistent hashing must use the per-flow key, not a constant proxy id: {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_backend_target_skips_tcp_port_lane_for_least_connections() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        config.upstreams[0].port_overrides.insert(
+            5432,
+            crate::config::types::UpstreamPortOverride {
+                algorithm: Some(crate::config::types::LoadBalancerAlgorithm::LeastConnections),
+                ..Default::default()
+            },
+        );
+        let mut proxy = proxy_with_subset(None);
+        proxy.upstream_id = Some("orders".to_string());
+        config.proxies.push(proxy);
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies.pop().expect("proxy pushed above");
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let (_, _, _, port_lane) =
+            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+
+        assert_eq!(
+            port_lane, None,
+            "TCP streams do not maintain per-target active connection accounting, so a per-port \
+             LEAST_CONN override must not engage the per-port selector"
         );
     }
 }

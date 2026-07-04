@@ -1920,8 +1920,9 @@ async fn process_new_session_datagram(
     let mut preselected_backend_target = None;
     if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
         use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS};
+        let lb_hash_key = client_addr.ip().to_string();
         let (backend_host, backend_port) =
-            resolve_backend_target(&view.proxy, &epoch.load_balancer)?;
+            resolve_backend_target(&view.proxy, &epoch.load_balancer, &lb_hash_key)?;
         preselected_backend_target = Some((backend_host.clone(), backend_port));
         let protocol_label = if matches!(view.proxy.effective_scheme(), BackendScheme::Dtls) {
             PROTOCOL_UDP_DTLS
@@ -2743,7 +2744,9 @@ async fn handle_dtls_client_inner(
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
 
     // Resolve backend target
-    let (backend_host, backend_port) = resolve_backend_target(&proxy, &epoch.load_balancer)?;
+    let lb_hash_key = client_addr.ip().to_string();
+    let (backend_host, backend_port) =
+        resolve_backend_target(&proxy, &epoch.load_balancer, &lb_hash_key)?;
     // Populate backend target as soon as it's known — even if DNS or connect fails.
     backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
 
@@ -3232,8 +3235,13 @@ async fn create_session(
         }
     }
 
-    let (backend_host, backend_port) =
-        resolve_or_reuse_backend_target(preselected_backend_target, &proxy, &epoch.load_balancer)?;
+    let lb_hash_key = client_addr.ip().to_string();
+    let (backend_host, backend_port) = resolve_or_reuse_backend_target(
+        preselected_backend_target,
+        &proxy,
+        &epoch.load_balancer,
+        &lb_hash_key,
+    )?;
 
     // Circuit breaker check — reject before creating backend socket if open.
     // When admitted, capture whether this is a half-open probe so downstream
@@ -4091,6 +4099,7 @@ async fn create_session(
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
+    lb_hash_key: &str,
 ) -> Result<(String, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
         // Engage the per-port LB lane only when every upstream target shares a
@@ -4109,12 +4118,12 @@ fn resolve_backend_target(
             LoadBalancerCache::select_target_for_port_from(
                 lb_snapshot,
                 upstream_id,
-                &proxy.id,
+                lb_hash_key,
                 port,
                 None,
             )
         } else {
-            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, &proxy.id, None)
+            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, lb_hash_key, None)
         }
         .ok_or_else(|| -> anyhow::Error {
             StreamSetupError::new(
@@ -4133,10 +4142,11 @@ fn resolve_or_reuse_backend_target(
     preselected: Option<(String, u16)>,
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
+    lb_hash_key: &str,
 ) -> Result<(String, u16), anyhow::Error> {
     match preselected {
         Some(target) => Ok(target),
-        None => resolve_backend_target(proxy, lb_snapshot),
+        None => resolve_backend_target(proxy, lb_snapshot, lb_hash_key),
     }
 }
 
@@ -4939,11 +4949,59 @@ listen_port: 5300
             Some(("admitted.local".to_string(), 5354)),
             &proxy,
             &snapshot,
+            "127.0.0.1",
         )
         .unwrap();
 
         assert_eq!(host, "admitted.local");
         assert_eq!(port, 5354);
+    }
+
+    #[test]
+    fn resolve_udp_backend_target_hashes_port_lane_by_client_key() {
+        let mut config: GatewayConfig = serde_json::from_value(serde_json::json!({
+            "version": "1",
+            "proxies": [{
+                "id": "udp-proxy",
+                "backend_scheme": "udp",
+                "backend_host": "unused.local",
+                "backend_port": 0,
+                "listen_port": 5300,
+                "upstream_id": "dns",
+            }],
+            "consumers": [],
+            "plugin_configs": [],
+            "upstreams": [{
+                "id": "dns",
+                "algorithm": "round_robin",
+                "targets": [
+                    { "host": "a.local", "port": 5353 },
+                    { "host": "b.local", "port": 5353 }
+                ],
+                "port_overrides": {
+                    "5353": { "algorithm": "consistent_hashing" }
+                }
+            }]
+        }))
+        .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+
+        let mut hosts = std::collections::HashSet::new();
+        for i in 1..=64 {
+            let key = format!("192.0.2.{i}");
+            let (host, port) =
+                super::resolve_backend_target(&proxy, &snapshot, &key).expect("target selected");
+            assert_eq!(port, 5353);
+            hosts.insert(host);
+        }
+
+        assert!(
+            hosts.contains("a.local") && hosts.contains("b.local"),
+            "per-port UDP consistent hashing must use the session key, not a constant proxy id: {hosts:?}"
+        );
     }
 
     #[test]
