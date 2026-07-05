@@ -330,6 +330,7 @@ async fn try_spawn_tcp_tls_gateway(
             config: config_swap,
             dns_cache: DnsCache::new(DnsConfig::default()),
             request_epoch,
+            health_checker: Arc::new(ferrum_edge::health_check::HealthChecker::new()),
             frontend_tls_slot: Arc::new(arc_swap::ArcSwap::new(Arc::new(Some(
                 build_frontend_tls_config(),
             )))),

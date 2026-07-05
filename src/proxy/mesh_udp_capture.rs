@@ -835,7 +835,8 @@ async fn run_udp_egress_session(
     // ── Fail-closed egress gates (mirrors handle_mesh_tcp_egress) ──────────
     // Engage the per-port LB lane (algorithm / locality) when all upstream
     // targets share a single port — same pre-selection semantics as the HTTP
-    // dispatch path. Stream paths carry no HealthContext (issue #2018).
+    // dispatch path. Selection respects active/passive health state already
+    // recorded for the relay proxy/upstream.
     //
     // All lb operations are done in a scoped block so the reference to
     // `epoch.load_balancer` (the Arc inner snapshot) is released before
@@ -886,16 +887,28 @@ async fn run_udp_egress_session(
             }
         }
         let lb_hash_key = mesh_udp_lb_hash_key_for_client_ip(key.client.ip());
+        let health_ctx = backend_dispatch::health_context_for_selection(
+            proxy,
+            &state.health_checker,
+            lb,
+            &entry.upstream_id,
+            port_lane,
+        );
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb,
                 &entry.upstream_id,
                 &lb_hash_key,
                 port,
-                None,
+                Some(&health_ctx),
             )
         } else {
-            LoadBalancerCache::select_target_from(lb, &entry.upstream_id, &lb_hash_key, None)
+            LoadBalancerCache::select_target_from(
+                lb,
+                &entry.upstream_id,
+                &lb_hash_key,
+                Some(&health_ctx),
+            )
         };
         let Some(selection) = selection else {
             warn!(

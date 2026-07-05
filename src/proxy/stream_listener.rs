@@ -15,6 +15,7 @@ use tracing::{error, info, warn};
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::dns::DnsCache;
+use crate::health_check::HealthChecker;
 use crate::modes::mesh::node_waypoint::NodeWaypointIdentityResolver;
 use crate::request_epoch::RequestEpochStore;
 use crate::tls::TlsPolicy;
@@ -326,6 +327,7 @@ pub struct StreamListenerManager {
     dns_cache: DnsCache,
     request_epoch: Arc<RequestEpochStore>,
     circuit_breaker_cache: Arc<CircuitBreakerCache>,
+    health_checker: Arc<HealthChecker>,
     /// Frontend TLS config for TCP stream proxies with `frontend_tls: true`.
     /// Uses `Arc<ArcSwap<...>>` so the **same** slot can be cloned into every
     /// TCP accept loop and snapshotted per accept. This lets mesh
@@ -574,6 +576,7 @@ impl StreamListenerManager {
             udp_gso_enabled,
             udp_pktinfo_enabled,
             0,
+            Arc::new(HealthChecker::new()),
             crate::modes::mesh::outbound_enforcement::empty_slot(),
             trusted_proxies,
         )
@@ -611,6 +614,7 @@ impl StreamListenerManager {
         udp_gso_enabled: bool,
         udp_pktinfo_enabled: bool,
         pool_shard_amount: usize,
+        health_checker: Arc<HealthChecker>,
         mesh_outbound_enforcement:
             crate::modes::mesh::outbound_enforcement::SharedMeshOutboundEnforcement,
         trusted_proxies: Arc<crate::proxy::client_ip::TrustedProxies>,
@@ -624,6 +628,7 @@ impl StreamListenerManager {
             dns_cache,
             request_epoch,
             circuit_breaker_cache,
+            health_checker,
             frontend_tls_config: Arc::new(arc_swap::ArcSwap::new(Arc::new(frontend_tls_config))),
             frontend_dtls_material: arc_swap::ArcSwap::new(Arc::new(None)),
             tls_no_verify,
@@ -1227,6 +1232,7 @@ impl StreamListenerManager {
             let config = self.config.clone();
             let dns_cache = self.dns_cache.clone();
             let request_epoch = self.request_epoch.clone();
+            let health_checker = self.health_checker.clone();
             let tls_no_verify = self.tls_no_verify;
             let cb_cache = self.circuit_breaker_cache.clone();
             let started = Arc::new(AtomicBool::new(false));
@@ -1302,6 +1308,7 @@ impl StreamListenerManager {
                         proxy_id: proxy_id_owned.clone(),
                         dns_cache,
                         request_epoch,
+                        health_checker,
                         shutdown: shutdown_rx,
                         global_shutdown: global_shutdown_for_listener,
                         metrics,
@@ -1413,6 +1420,7 @@ impl StreamListenerManager {
                         config,
                         dns_cache,
                         request_epoch,
+                        health_checker,
                         frontend_tls_slot: tls_slot,
                         shutdown: shutdown_rx,
                         global_shutdown: global_shutdown_for_listener,

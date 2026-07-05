@@ -32,6 +32,7 @@ use crate::tls::backend::BackendTlsConfigBuilder;
 use crate::config::types::{BackendScheme, GatewayConfig, Proxy};
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
+use crate::health_check::HealthChecker;
 use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::modes::mesh::outbound_enforcement::{
     Decision, MeshOutboundEnforcement, PROTOCOL_TCP, PROTOCOL_TCP_TLS,
@@ -912,6 +913,7 @@ pub struct TcpListenerConfig {
     pub config: Arc<arc_swap::ArcSwap<GatewayConfig>>,
     pub dns_cache: DnsCache,
     pub request_epoch: Arc<RequestEpochStore>,
+    pub health_checker: Arc<HealthChecker>,
     /// Shared frontend TLS slot. The accept loop snapshots this per accept so
     /// a mesh PeerAuthentication live reload that swaps the slot is picked up
     /// on the next inbound TCP+TLS handshake without rebinding the listener.
@@ -999,6 +1001,7 @@ struct TcpAcceptLoopState {
     proxy_id: Arc<str>,
     dns_cache: DnsCache,
     request_epoch: Arc<RequestEpochStore>,
+    health_checker: Arc<HealthChecker>,
     /// Shared frontend TLS slot. Snapshotted per accept so the latest
     /// `ServerConfig` (e.g. after a mesh PeerAuthentication live reload swap)
     /// is used for the next handshake without rebinding the listener.
@@ -1039,6 +1042,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         config,
         dns_cache,
         request_epoch,
+        health_checker,
         frontend_tls_slot,
         shutdown,
         global_shutdown,
@@ -1128,6 +1132,7 @@ pub async fn start_tcp_listener(cfg: TcpListenerConfig) -> Result<(), anyhow::Er
         proxy_id: proxy_id.clone(),
         dns_cache,
         request_epoch,
+        health_checker,
         frontend_tls_slot,
         metrics,
         backend_tls_cache,
@@ -1252,6 +1257,7 @@ async fn run_tcp_accept_loop(
                 let proxy_id = state.proxy_id.clone();
                 let dns_cache = state.dns_cache.clone();
                 let request_epoch = state.request_epoch.clone();
+                let health_checker = state.health_checker.clone();
                 // Snapshot the live frontend TLS slot once per accept so the
                 // handshake uses whatever rustls::ServerConfig is current at
                 // this instant. Mesh PeerAuthentication live reload swaps this
@@ -1432,6 +1438,7 @@ async fn run_tcp_accept_loop(
                         remote_addr,
                         &proxy_id,
                         &epoch,
+                        &health_checker,
                         &dns_cache,
                         frontend_tls.as_ref(),
                         backend_tls.as_deref(),
@@ -1801,6 +1808,7 @@ async fn handle_tcp_connection(
     remote_addr: SocketAddr,
     proxy_id: &str,
     epoch: &RequestEpoch,
+    health_checker: &HealthChecker,
     dns_cache: &DnsCache,
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
@@ -1842,6 +1850,7 @@ async fn handle_tcp_connection(
         remote_addr,
         proxy_id,
         epoch,
+        health_checker,
         dns_cache,
         frontend_tls_config,
         cached_backend_tls,
@@ -2014,6 +2023,7 @@ async fn handle_tcp_connection_inner(
     remote_addr: SocketAddr,
     proxy_id: &str,
     epoch: &RequestEpoch,
+    health_checker: &HealthChecker,
     dns_cache: &DnsCache,
     frontend_tls_config: Option<&Arc<rustls::ServerConfig>>,
     cached_backend_tls: Option<&CachedBackendTlsConfig>,
@@ -2085,7 +2095,7 @@ async fn handle_tcp_connection_inner(
 
         let lb_hash_key = stream_lb_hash_key_for_client_ip(remote_addr.ip());
         let (backend_host, backend_port, backend_policy_port, lb_port_lane) =
-            resolve_backend_target(proxy, &epoch.load_balancer, &lb_hash_key)?;
+            resolve_backend_target(proxy, &epoch.load_balancer, health_checker, &lb_hash_key)?;
 
         // Populate backend target as soon as it's known — even if DNS or connect fails,
         // the log will show which target was attempted.
@@ -3275,11 +3285,12 @@ fn enforce_mesh_tcp_outbound_target(
 ///
 /// Returns `(host, port, policy_port, port_lane)` where `port_lane` is the engaged
 /// per-port selection lane (if any) — connection-phase retries must rotate inside
-/// the same lane (`try_next_target`). Stream paths carry no `HealthContext`, so the
-/// `health` parameter stays `None` (see issue #2018).
+/// the same lane (`try_next_target`). Stream target selection respects active
+/// health checks and passive ejection state recorded by HTTP-family traffic.
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
+    health_checker: &HealthChecker,
     lb_hash_key: &str,
 ) -> Result<(String, u16, u16, Option<u16>), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
@@ -3293,6 +3304,13 @@ fn resolve_backend_target(
         } else {
             None
         };
+        let health_ctx = crate::proxy::backend_dispatch::health_context_for_selection(
+            proxy,
+            health_checker,
+            lb_snapshot,
+            upstream_id,
+            port_lane,
+        );
 
         let selection = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
             if let Some(port) = port_lane {
@@ -3302,7 +3320,7 @@ fn resolve_backend_target(
                     lb_hash_key,
                     port,
                     subset_name,
-                    None,
+                    Some(&health_ctx),
                 )
             } else {
                 LoadBalancerCache::select_target_subset_from(
@@ -3310,7 +3328,7 @@ fn resolve_backend_target(
                     upstream_id,
                     lb_hash_key,
                     subset_name,
-                    None,
+                    Some(&health_ctx),
                 )
             }
         } else if let Some(port) = port_lane {
@@ -3319,10 +3337,15 @@ fn resolve_backend_target(
                 upstream_id,
                 lb_hash_key,
                 port,
-                None,
+                Some(&health_ctx),
             )
         } else {
-            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, lb_hash_key, None)
+            LoadBalancerCache::select_target_from(
+                lb_snapshot,
+                upstream_id,
+                lb_hash_key,
+                Some(&health_ctx),
+            )
         }
         .ok_or_else(|| -> anyhow::Error {
             let scope = proxy
@@ -3561,7 +3584,8 @@ mod backend_target_selection_tests {
         let proxy = proxy_with_subset(Some("canary"));
 
         let (host, port, policy_port, port_lane) =
-            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+            resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                .expect("target selected");
 
         assert_eq!(host, "canary.local");
         assert_eq!(port, 1002);
@@ -3576,10 +3600,58 @@ mod backend_target_selection_tests {
         let snapshot = cache.load();
         let proxy = proxy_with_subset(Some("missing"));
 
-        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+        let err = resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
             .expect_err("missing subset rejected");
 
         assert!(err.to_string().contains("subset missing"));
+    }
+
+    #[test]
+    fn resolve_backend_target_skips_active_unhealthy_targets() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        let unhealthy_target = config.upstreams[0].targets[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let mut proxy = proxy_with_subset(None);
+        proxy.upstream_id = Some("orders".to_string());
+        let health_checker = HealthChecker::new();
+        health_checker.active_unhealthy_targets.insert(
+            crate::load_balancer::target_key("orders", &unhealthy_target),
+            1,
+        );
+
+        let (host, port, _, _) =
+            resolve_backend_target(&proxy, &snapshot, &health_checker, "192.0.2.10")
+                .expect("healthy target selected");
+
+        assert_eq!(host, "blocked.local");
+        assert_eq!(port, 5432);
+    }
+
+    #[test]
+    fn resolve_backend_target_skips_passively_ejected_targets() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        let unhealthy_target = config.upstreams[0].targets[0].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let mut proxy = proxy_with_subset(None);
+        proxy.id = "orders-stream".to_string();
+        proxy.upstream_id = Some("orders".to_string());
+        let health_checker = HealthChecker::new();
+        let passive = crate::config::types::PassiveHealthCheck {
+            unhealthy_threshold: 1,
+            ..Default::default()
+        };
+        health_checker.report_response(&proxy.id, &unhealthy_target, 500, false, Some(&passive));
+
+        let (host, port, _, _) =
+            resolve_backend_target(&proxy, &snapshot, &health_checker, "192.0.2.10")
+                .expect("healthy target selected");
+
+        assert_eq!(host, "blocked.local");
+        assert_eq!(port, 5432);
     }
 
     #[test]
@@ -3713,7 +3785,8 @@ mod backend_target_selection_tests {
         let mut hosts = std::collections::HashSet::new();
         for _ in 0..8 {
             let (host, _, _, port_lane) =
-                resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+                resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                    .expect("target selected");
             assert_eq!(
                 port_lane, None,
                 "mixed-port upstream must not resolve a per-port lane from the placeholder"
@@ -3856,7 +3929,8 @@ mod backend_target_selection_tests {
         for i in 1..=64 {
             let key = format!("192.0.2.{i}");
             let (host, _, _, port_lane) =
-                resolve_backend_target(&proxy, &snapshot, &key).expect("target selected");
+                resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), &key)
+                    .expect("target selected");
             assert_eq!(port_lane, Some(5432));
             hosts.insert(host);
         }
@@ -3886,7 +3960,7 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+        let err = resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
             .expect_err("per-port LEAST_CONN must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
@@ -3917,7 +3991,7 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+        let err = resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
             .expect_err("per-port LEAST_LATENCY must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
@@ -3949,7 +4023,7 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+        let err = resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
             .expect_err("stream hash_on header must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
@@ -3981,7 +4055,7 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+        let err = resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
             .expect_err("inherited stream hash_on cookie must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
@@ -4040,7 +4114,8 @@ mod backend_target_selection_tests {
         let snapshot = cache.load();
 
         let (_, _, _, port_lane) =
-            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+            resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                .expect("target selected");
 
         assert_eq!(
             port_lane, None,
@@ -4095,7 +4170,8 @@ mod backend_target_selection_tests {
         let snapshot = cache.load();
 
         let (_, _, _, port_lane) =
-            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+            resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                .expect("target selected");
 
         assert_eq!(
             port_lane,
@@ -4150,7 +4226,7 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err = resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
+        let err = resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
             .expect_err("stream hash_on cookie must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
@@ -4211,9 +4287,11 @@ mod backend_target_selection_tests {
         let snapshot = cache.load();
 
         let (first_host, _, _, port_lane) =
-            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+            resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                .expect("target selected");
         let (second_host, _, _, second_port_lane) =
-            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+            resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                .expect("target selected");
 
         assert_eq!(
             port_lane,
@@ -4280,12 +4358,12 @@ mod backend_target_selection_tests {
         let snapshot = cache.load();
 
         let (_, _, _, port_lane) =
-            resolve_backend_target(&proxy, &snapshot, "192.0.2.10").expect("target selected");
+            resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                .expect("target selected");
 
         assert_eq!(
             port_lane, None,
-            "a passive-health-only port override cannot apply without HealthContext and must not \
-             bypass the subset LB lane"
+            "a passive-health-only port override must not bypass the subset LB lane"
         );
     }
 }

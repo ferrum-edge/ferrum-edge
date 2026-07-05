@@ -4765,6 +4765,7 @@ impl ProxyState {
                     v
                 },
                 env_config_arc.pool_shard_amount,
+                health_checker.clone(),
                 mesh_outbound_enforcement.clone(),
                 trusted_proxies.clone(),
             ),

@@ -73,7 +73,8 @@ pub(crate) async fn handle_mesh_tcp_egress(
     // Engage the per-port LB lane (algorithm / locality) only when all upstream
     // targets share a single dispatch port (non-zero override) — the relay
     // proxy's `backend_port` is a placeholder, so the HTTP path's fallback must
-    // not be used. Stream paths carry no HealthContext (issue #2018).
+    // not be used. Selection respects active/passive health state already
+    // recorded for the relay proxy/upstream.
     let override_port =
         LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id);
     let port_lane = (override_port != 0
@@ -115,16 +116,28 @@ pub(crate) async fn handle_mesh_tcp_egress(
         }
     }
     let lb_hash_key = mesh_stream_lb_hash_key_for_client_ip(remote_addr.ip());
+    let health_ctx = backend_dispatch::health_context_for_selection(
+        proxy,
+        &state.health_checker,
+        lb,
+        &entry.upstream_id,
+        port_lane,
+    );
     let Some(selection) = (if let Some(port) = port_lane {
         LoadBalancerCache::select_target_for_port_from(
             lb,
             &entry.upstream_id,
             &lb_hash_key,
             port,
-            None,
+            Some(&health_ctx),
         )
     } else {
-        LoadBalancerCache::select_target_from(lb, &entry.upstream_id, &lb_hash_key, None)
+        LoadBalancerCache::select_target_from(
+            lb,
+            &entry.upstream_id,
+            &lb_hash_key,
+            Some(&health_ctx),
+        )
     }) else {
         warn!(
             service = %entry.service_fqdn,
