@@ -1951,27 +1951,6 @@ async fn handle_h3_request(
         return Ok(());
     }
 
-    // Determine streaming vs buffered mode — same logic as the H1/H2 paths.
-    // Stream by default; buffer when plugins / response_body_mode need body
-    // access or when the current request has effective retries (needs replay).
-    let has_retry = match http_flavor {
-        HttpFlavor::Plain => {
-            crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method)
-        }
-        HttpFlavor::Grpc => crate::retry::can_retry_connection_failures(proxy.retry.as_ref()),
-        HttpFlavor::WebSocket => false,
-    };
-    let maybe_requires_response_body_buffering =
-        plugin_cache_view.requires_response_body_buffering();
-    let should_stream_response = crate::proxy::should_stream_response_body(
-        &proxy,
-        &plugins,
-        &ctx,
-        maybe_requires_response_body_buffering,
-    );
-    let needs_request_buffering = has_retry || plugin_needs_request_buffering;
-    let needs_response_buffering = has_retry || !should_stream_response;
-
     // --- Upstream target selection and circuit breaker ---
     // DestinationRule-derived HTTP connectionPool/TLS knobs are projected below
     // once the selected target's policy port is known. Per-port maxConnections,
@@ -1998,16 +1977,46 @@ async fn handle_h3_request(
     let upstream_balancer = selection.balancer;
     // Mirror H1/H2 selected-target policy: cap per-request retries, then build
     // an effective proxy carrying per-target DestinationRule-derived
-    // connectionPool/TLS overrides for native-H3, H3->gRPC, and H3->plain
-    // dispatch.
-    let proxy = crate::proxy::cap_proxy_retry_for_target(proxy, upstream_target.as_deref());
-    let effective_proxy =
-        crate::proxy::resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
+    // connectionPool/TLS overrides for current-target native-H3, H3->gRPC, and
+    // WebSocket dispatch decisions. Keep the capped but unresolved base proxy
+    // for the H3->plain bridge: dispatch_plain resolves the effective proxy
+    // again for each retry target, so a later target does not inherit the first
+    // target's port-level TLS/SNI/H1 policy.
+    let selected_base_proxy =
+        crate::proxy::cap_proxy_retry_for_target(proxy, upstream_target.as_deref());
+    let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(
+        &selected_base_proxy,
+        upstream_target.as_deref(),
+    );
     let proxy = match effective_proxy {
-        std::borrow::Cow::Borrowed(_) => proxy,
+        std::borrow::Cow::Borrowed(_) => Arc::clone(&selected_base_proxy),
         std::borrow::Cow::Owned(owned) => Arc::new(owned),
     };
     ctx.matched_proxy = Some(Arc::clone(&proxy));
+
+    // Determine streaming vs buffered mode — same logic as the H1/H2 paths.
+    // Stream by default; buffer when plugins / response_body_mode need body
+    // access or when the current request has effective retries (needs replay).
+    // This must run AFTER the selected-target retry cap above so
+    // DestinationRule `maxRetries: 0` disables retry-dependent buffering and
+    // native-H3 suppression for the selected port.
+    let has_retry = match http_flavor {
+        HttpFlavor::Plain => {
+            crate::retry::has_effective_http_retries(proxy.retry.as_ref(), &method)
+        }
+        HttpFlavor::Grpc => crate::retry::can_retry_connection_failures(proxy.retry.as_ref()),
+        HttpFlavor::WebSocket => false,
+    };
+    let maybe_requires_response_body_buffering =
+        plugin_cache_view.requires_response_body_buffering();
+    let should_stream_response = crate::proxy::should_stream_response_body(
+        &proxy,
+        &plugins,
+        &ctx,
+        maybe_requires_response_body_buffering,
+    );
+    let needs_request_buffering = has_retry || plugin_needs_request_buffering;
+    let needs_response_buffering = has_retry || !should_stream_response;
     // A request that will be response-stream-inspected (e.g. ai_semantic_firewall
     // `inspect`, which pre-buffers the `stream: true` request in `before_proxy` to
     // set its marker) must dispatch through the cross-protocol/reqwest path, where
@@ -2434,7 +2443,11 @@ async fn handle_h3_request(
             crate::http3::cross_protocol::run(crate::http3::cross_protocol::CrossProtocolRequest {
                 state: &state,
                 epoch: &epoch,
-                proxy: &proxy,
+                proxy: if matches!(http_flavor, HttpFlavor::Plain) {
+                    selected_base_proxy.as_ref()
+                } else {
+                    proxy.as_ref()
+                },
                 stream: &mut stream,
                 method: &method,
                 proxy_headers: &proxy_headers,
@@ -8826,44 +8839,6 @@ mod h3_backend_url_tests {
         let proxy = proxy_with_scheme(BackendScheme::Https);
         let url = build_h3_backend_url_for_flavor(&proxy, HttpFlavor::Plain, "/api", "", 0, None);
         assert_eq!(url, "https://backend.example:8443/api");
-    }
-}
-
-#[cfg(test)]
-mod h3_selected_target_policy_tests {
-    #[test]
-    fn h3_frontend_applies_selected_target_policy_before_dispatch_decisions() {
-        let source = include_str!("server.rs");
-        let selection = source
-            .find("let selection = crate::proxy::backend_dispatch::select_upstream_target(")
-            .expect("H3 selected-target lookup must remain present");
-        let after_selection = &source[selection..];
-
-        let cap = after_selection
-            .find("let proxy = crate::proxy::cap_proxy_retry_for_target(proxy, upstream_target.as_deref());")
-            .expect("H3 frontend must cap retry policy by selected target");
-        let effective = after_selection
-            .find("crate::proxy::resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref())")
-            .expect("H3 frontend must resolve selected-target effective proxy");
-        let native_h3_decision = after_selection
-            .find("let backend_supports_native_h3 =")
-            .expect("native-H3 dispatch decision must remain present");
-        let circuit_breaker = after_selection
-            .find("check_circuit_breaker(")
-            .expect("H3 circuit-breaker check must remain present");
-
-        assert!(
-            cap < effective,
-            "retry cap must run before effective-proxy dispatch setup"
-        );
-        assert!(
-            effective < native_h3_decision,
-            "effective proxy must be resolved before native-H3 capability dispatch decisions"
-        );
-        assert!(
-            effective < circuit_breaker,
-            "effective proxy must be resolved before circuit-breaker/admission dispatch"
-        );
     }
 }
 

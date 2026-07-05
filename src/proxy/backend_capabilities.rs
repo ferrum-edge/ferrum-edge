@@ -115,11 +115,16 @@ pub struct BackendCapabilityProbeTarget {
 
 impl BackendCapabilityProbeTarget {
     pub fn from_proxy(proxy: &Proxy, target: Option<&UpstreamTarget>) -> Self {
-        let mut probe_proxy = proxy.clone();
+        let effective_proxy = target
+            .map(|target| crate::proxy::resolve_effective_proxy_for_target(proxy, Some(target)));
+        let key_proxy = effective_proxy
+            .as_ref()
+            .map_or(proxy, |proxy| proxy.as_ref());
+        let mut probe_proxy = key_proxy.clone();
         let mut hbone_hint = false;
         let mut hbone_port = crate::modes::mesh::hbone::ISTIO_HBONE_PORT;
         let mut hbone_dial_host = probe_proxy.backend_host.clone();
-        let mut dispatch_policy_port = proxy.backend_port;
+        let mut dispatch_policy_port = key_proxy.backend_port;
         let mut hbone_expected_peer = None;
         if let Some(target) = target {
             probe_proxy.backend_host = target.host.clone();
@@ -153,10 +158,7 @@ impl BackendCapabilityProbeTarget {
                 }
             }
         }
-        let key = match target {
-            Some(_) => capability_key_for_proxy_target(proxy, target),
-            None => capability_key(&probe_proxy),
-        };
+        let key = capability_key_for_proxy_target(key_proxy, target);
         Self {
             key,
             proxy: probe_proxy,
@@ -394,6 +396,7 @@ pub fn capability_key_for_proxy_target(proxy: &Proxy, target: Option<&UpstreamTa
 
 /// Compute an owned capability key from a proxy that already reflects its
 /// target's host/port (i.e., a `BackendCapabilityProbeTarget.proxy`).
+#[allow(dead_code)] // Used by tests and library callers; binary hot paths use target-aware lookup.
 pub fn capability_key(proxy: &Proxy) -> String {
     capability_key_for_proxy_target(proxy, None)
 }
