@@ -958,6 +958,50 @@ async fn run_plain_attempt_local_policy_or_reject<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    // The H3 plain bridge has no HBONE / mesh-mTLS / east-west dispatch path.
+    // A direct dial to a mesh-tagged target would bypass the secured mesh
+    // transport, so fail closed before backend admission or body relay.
+    if let Some(reason) =
+        crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(current_target)
+    {
+        warn!(
+            proxy_id = %dispatch_proxy.id,
+            target_host = current_target.map(|target| target.host.as_str()).unwrap_or(""),
+            target_port = current_target.map(|target| target.port).unwrap_or(0),
+            reason,
+            "cross-protocol H3→HTTP: refusing direct dial to a mesh-transport-tagged target"
+        );
+        record_backend_outcome_no_conn_end(
+            state,
+            dispatch_proxy,
+            &epoch.load_balancer,
+            upstream_balancer,
+            current_target,
+            current_cb_target_key,
+            502,
+            false,
+            Some(ErrorClass::DispatchPolicyRejected),
+            cb_is_half_open_probe,
+            false,
+            backend_start.elapsed(),
+        );
+        if halt_request_body_before_reject {
+            crate::http3::stream_util::halt_request_body(stream);
+        }
+        let mut outcome = write_error_with_header(
+            stream,
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
+            Some(("gateway-error-reason", reason)),
+            backend_start,
+            bytes_sent,
+        )
+        .await?;
+        outcome.backend_target = Some(strip_query_from_backend_url(current_url));
+        outcome.error_class = Some(ErrorClass::DispatchPolicyRejected);
+        return Ok(Err(outcome));
+    }
+
     // Enforce the backend egress policy for a literal-IP backend on this
     // (possibly LB-rotated) cross-protocol attempt before dialing — reqwest and
     // the H2 pool skip the DnsCacheResolver for IP literals. The handler screens
