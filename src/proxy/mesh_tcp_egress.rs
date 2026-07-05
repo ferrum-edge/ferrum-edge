@@ -114,7 +114,7 @@ pub(crate) async fn handle_mesh_tcp_egress(
             return;
         }
     }
-    let lb_hash_key = remote_addr.ip().to_string();
+    let lb_hash_key = mesh_stream_lb_hash_key_for_client_ip(remote_addr.ip());
     let Some(selection) = (if let Some(port) = port_lane {
         LoadBalancerCache::select_target_for_port_from(
             lb,
@@ -363,6 +363,10 @@ fn stream_port_override_affects_selection(proxy: &crate::config::types::Proxy, p
         || override_config.locality_lb_setting.is_some()
 }
 
+fn mesh_stream_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
+    ip.to_canonical().to_string()
+}
+
 fn mesh_stream_port_lane_supported(
     proxy: &crate::config::types::Proxy,
     port: u16,
@@ -384,8 +388,12 @@ fn mesh_stream_port_lane_supported(
 
 #[cfg(test)]
 mod tests {
-    use super::{mesh_stream_port_lane_supported, stream_port_override_affects_selection};
+    use super::{
+        mesh_stream_lb_hash_key_for_client_ip, mesh_stream_port_lane_supported,
+        stream_port_override_affects_selection,
+    };
     use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     fn proxy_with_override(
         override_config: crate::config::types::ResolvedPortOverride,
@@ -443,5 +451,20 @@ listen_port: 15001
 
         assert!(stream_port_override_affects_selection(&least_latency, 5432));
         assert!(mesh_stream_port_lane_supported(&least_latency, 5432).is_err());
+    }
+
+    #[test]
+    fn mesh_stream_lb_hash_key_canonicalizes_ipv4_mapped_clients() {
+        let mapped = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x020a));
+        let plain = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+
+        assert_eq!(
+            mesh_stream_lb_hash_key_for_client_ip(mapped),
+            mesh_stream_lb_hash_key_for_client_ip(plain)
+        );
+        assert_eq!(mesh_stream_lb_hash_key_for_client_ip(plain), "192.0.2.10");
+
+        let ipv6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10));
+        assert_eq!(mesh_stream_lb_hash_key_for_client_ip(ipv6), "2001:db8::a");
     }
 }

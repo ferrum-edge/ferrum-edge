@@ -104,6 +104,11 @@ fn canonicalize_socket_addr(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
 
+#[cfg(target_os = "linux")]
+fn mesh_udp_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
+    ip.to_canonical().to_string()
+}
+
 /// Start the mesh UDP capture listener (Linux).
 ///
 /// Binds a transparent UDP socket on `cfg.addr`, enables per-datagram orig-dst
@@ -880,7 +885,7 @@ async fn run_udp_egress_session(
                 return;
             }
         }
-        let lb_hash_key = key.client.ip().to_string();
+        let lb_hash_key = mesh_udp_lb_hash_key_for_client_ip(key.client.ip());
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb,
@@ -1496,6 +1501,23 @@ listen_port: 15011
 
         assert!(stream_port_override_affects_selection(&least_latency, 53));
         assert!(mesh_stream_port_lane_supported(&least_latency, 53).is_err());
+    }
+
+    #[test]
+    fn mesh_udp_lb_hash_key_canonicalizes_ipv4_mapped_clients() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+        let mapped = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x020a));
+        let plain = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+
+        assert_eq!(
+            mesh_udp_lb_hash_key_for_client_ip(mapped),
+            mesh_udp_lb_hash_key_for_client_ip(plain)
+        );
+        assert_eq!(mesh_udp_lb_hash_key_for_client_ip(plain), "192.0.2.10");
+
+        let ipv6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 10));
+        assert_eq!(mesh_udp_lb_hash_key_for_client_ip(ipv6), "2001:db8::a");
     }
 
     #[test]
