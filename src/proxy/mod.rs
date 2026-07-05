@@ -5299,6 +5299,20 @@ impl ProxyState {
         probe_proxy.backend_connect_timeout_ms = probe_proxy
             .backend_connect_timeout_ms
             .clamp(1, BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP);
+        if let Some(overrides) = probe_proxy.dispatch_port_overrides.as_mut() {
+            for override_config in overrides.values_mut() {
+                if let Some(connect_timeout_ms) = override_config.connect_timeout_ms.as_mut() {
+                    *connect_timeout_ms =
+                        (*connect_timeout_ms).clamp(1, BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP);
+                }
+            }
+        }
+        if let Some(fallback) = probe_proxy.dispatch_port_override_fallback.as_mut()
+            && let Some(connect_timeout_ms) = fallback.connect_timeout_ms.as_mut()
+        {
+            *connect_timeout_ms =
+                (*connect_timeout_ms).clamp(1, BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP);
+        }
         probe_proxy
     }
 
@@ -25225,6 +25239,61 @@ mod tests {
         assert_eq!(
             rewrite_backend_url_authority_host("http://other-host:80/p", synth, "10.0.0.1"),
             "http://other-host:80/p"
+        );
+    }
+
+    #[test]
+    fn backend_capability_probe_proxy_clamps_per_port_connect_timeouts() {
+        let mut proxy = streaming_dispatch_test_proxy();
+        proxy.backend_connect_timeout_ms = 30_000;
+        proxy.dispatch_port_overrides = Some(HashMap::from([
+            (
+                8080,
+                crate::config::types::ResolvedPortOverride {
+                    connect_timeout_ms: Some(60_000),
+                    ..Default::default()
+                },
+            ),
+            (
+                9090,
+                crate::config::types::ResolvedPortOverride {
+                    connect_timeout_ms: Some(0),
+                    ..Default::default()
+                },
+            ),
+        ]));
+        proxy.dispatch_port_override_fallback = Some(crate::config::types::ResolvedPortOverride {
+            connect_timeout_ms: Some(120_000),
+            ..Default::default()
+        });
+
+        let probe_proxy = ProxyState::build_backend_capability_probe_proxy(&proxy);
+
+        assert_eq!(
+            probe_proxy.backend_connect_timeout_ms,
+            BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP
+        );
+        assert_eq!(
+            hbone_pool::effective_connect_timeout_ms_for_policy_port(&probe_proxy, 8080),
+            BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP,
+            "HBONE probes must not wait longer than the capability probe cap"
+        );
+        assert_eq!(
+            hbone_pool::effective_connect_timeout_ms_for_policy_port(&probe_proxy, 9090),
+            1,
+            "probe timeouts retain the existing lower-bound clamp"
+        );
+        assert_eq!(
+            probe_proxy
+                .dispatch_port_override_fallback
+                .as_ref()
+                .and_then(|override_config| override_config.connect_timeout_ms),
+            Some(BACKEND_CAPABILITY_PROBE_TIMEOUT_MS_CAP)
+        );
+        assert_eq!(
+            hbone_pool::effective_connect_timeout_ms_for_policy_port(&proxy, 8080),
+            60_000,
+            "real request dials keep the operator's per-port timeout"
         );
     }
 
