@@ -848,13 +848,13 @@ async fn run_udp_egress_session(
         // must not pin a mixed-port upstream (see tcp_proxy::resolve_backend_target).
         let override_port =
             LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id);
-        let port_lane = (override_port != 0
-            && backend_dispatch::has_effective_port_override(
-                proxy,
-                lb,
-                &entry.upstream_id,
-                override_port,
-            )
+        let health_port_scope = backend_dispatch::stream_health_port_scope(
+            proxy,
+            lb,
+            &entry.upstream_id,
+            override_port,
+        );
+        let port_lane = (health_port_scope.is_some()
             && match mesh_stream_port_lane_supported(proxy, override_port) {
                 Ok(supported) => supported,
                 Err(message) => {
@@ -892,7 +892,7 @@ async fn run_udp_egress_session(
             &state.health_checker,
             lb,
             &entry.upstream_id,
-            port_lane,
+            health_port_scope,
         );
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(

@@ -41,7 +41,6 @@ use crate::plugins::{
     Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
     StreamTransactionSummary,
 };
-use crate::proxy::backend_dispatch::has_effective_port_override;
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 use crate::retry::ErrorClass;
@@ -1685,6 +1684,10 @@ struct TcpConnParams {
     /// retries must rotate inside the same lane so a per-port algorithm /
     /// locality policy is not escaped by `retry_on_connect_failure`.
     lb_port_lane: Option<u16>,
+    /// Per-port health scope used for initial selection and connection-phase
+    /// retries. This is independent from `lb_port_lane`: a passive-health-only
+    /// port override must scope ejection caps without changing LB lane selection.
+    health_port_scope: Option<u16>,
 }
 
 /// Lightweight snapshot of the proxy fields needed per TCP connection.
@@ -2084,17 +2087,17 @@ async fn handle_tcp_connection_inner(
     };
 
     // Look up the proxy config and extract only the fields we need.
-    let (params, cb_info) = {
-        let proxy = epoch
-            .proxy_by_id(proxy_id)
-            .ok_or_else(|| anyhow::anyhow!("Proxy {} not found in config", proxy_id))?;
+    let proxy = epoch
+        .proxy_by_id(proxy_id)
+        .ok_or_else(|| anyhow::anyhow!("Proxy {} not found in config", proxy_id))?;
 
+    let (params, cb_info) = {
         stream_ctx.proxy_id = proxy.id.clone();
         stream_ctx.proxy_name = proxy.name.clone();
         stream_ctx.backend_scheme = proxy.effective_scheme();
 
         let lb_hash_key = stream_lb_hash_key_for_client_ip(remote_addr.ip());
-        let (backend_host, backend_port, backend_policy_port, lb_port_lane) =
+        let (backend_host, backend_port, backend_policy_port, lb_port_lane, health_port_scope) =
             resolve_backend_target(proxy, &epoch.load_balancer, health_checker, &lb_hash_key)?;
 
         // Populate backend target as soon as it's known — even if DNS or connect fails,
@@ -2147,6 +2150,7 @@ async fn handle_tcp_connection_inner(
             tcp_fastopen_enabled: tcp_fastopen,
             dispatch_port_overrides: proxy.dispatch_port_overrides.clone(),
             lb_port_lane,
+            health_port_scope,
         };
 
         (params, cb_info)
@@ -2700,6 +2704,8 @@ async fn handle_tcp_connection_inner(
                         // Circuit open on this target — try another
                         if let Some(next) = try_next_enforced_target(
                             &params,
+                            proxy,
+                            health_checker,
                             &current_host,
                             current_port,
                             current_policy_port,
@@ -2772,6 +2778,8 @@ async fn handle_tcp_connection_inner(
                     && attempt < max_retries
                     && let Some(next) = try_next_enforced_target(
                         &params,
+                        proxy,
+                        health_checker,
                         &current_host,
                         current_port,
                         current_policy_port,
@@ -2854,6 +2862,8 @@ async fn handle_tcp_connection_inner(
                     && attempt < max_retries
                     && let Some(next) = try_next_enforced_target(
                         &params,
+                        proxy,
+                        health_checker,
                         &current_host,
                         current_port,
                         current_policy_port,
@@ -2940,6 +2950,8 @@ async fn handle_tcp_connection_inner(
                     && attempt < max_retries
                     && let Some(next) = try_next_enforced_target(
                         &params,
+                        proxy,
+                        health_checker,
                         &current_host,
                         current_port,
                         current_policy_port,
@@ -3272,6 +3284,8 @@ fn enforce_mesh_tcp_outbound_target(
     }
 }
 
+type TcpResolvedBackendTarget = (String, u16, u16, Option<u16>, Option<u16>);
+
 /// Resolve the backend target — either direct from proxy config or via load balancer.
 ///
 /// Per-port DestinationRule policy (LB algorithm, locality-LB) is engaged only when
@@ -3283,21 +3297,28 @@ fn enforce_mesh_tcp_outbound_target(
 /// placeholder, and a coincidental match with one overridden port of a mixed-port
 /// upstream would silently pin selection to that port's targets.
 ///
-/// Returns `(host, port, policy_port, port_lane)` where `port_lane` is the engaged
-/// per-port selection lane (if any) — connection-phase retries must rotate inside
-/// the same lane (`try_next_target`). Stream target selection respects active
-/// health checks and passive ejection state recorded by HTTP-family traffic.
+/// Returns `(host, port, policy_port, port_lane, health_port_scope)` where
+/// `port_lane` is the engaged per-port selection lane (if any) — connection-phase
+/// retries must rotate inside the same lane (`try_next_target`). `health_port_scope`
+/// records the per-port health/ejection scope independently from lane selection.
+/// Stream target selection respects active health checks and passive ejection
+/// state recorded by HTTP-family traffic.
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
     health_checker: &HealthChecker,
     lb_hash_key: &str,
-) -> Result<(String, u16, u16, Option<u16>), anyhow::Error> {
+) -> Result<TcpResolvedBackendTarget, anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
         let override_port =
             LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
-        let port_lane = if override_port != 0
-            && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port)
+        let health_port_scope = crate::proxy::backend_dispatch::stream_health_port_scope(
+            proxy,
+            lb_snapshot,
+            upstream_id,
+            override_port,
+        );
+        let port_lane = if health_port_scope.is_some()
             && tcp_port_lane_selection_supported(proxy, lb_snapshot, upstream_id, override_port)?
         {
             Some(override_port)
@@ -3309,7 +3330,7 @@ fn resolve_backend_target(
             health_checker,
             lb_snapshot,
             upstream_id,
-            port_lane,
+            health_port_scope,
         );
 
         let selection = if let Some(subset_name) = proxy.upstream_subset.as_deref() {
@@ -3360,12 +3381,14 @@ fn resolve_backend_target(
             selection.target.port,
             selection.target.dispatch_policy_port(),
             port_lane,
+            health_port_scope,
         ))
     } else {
         Ok((
             proxy.backend_host.clone(),
             proxy.backend_port,
             proxy.backend_port,
+            None,
             None,
         ))
     }
@@ -3547,6 +3570,7 @@ mod backend_target_selection_tests {
             tcp_fastopen_enabled: false,
             dispatch_port_overrides: None,
             lb_port_lane: None,
+            health_port_scope: None,
         }
     }
 
@@ -3583,7 +3607,7 @@ mod backend_target_selection_tests {
         let snapshot = cache.load();
         let proxy = proxy_with_subset(Some("canary"));
 
-        let (host, port, policy_port, port_lane) =
+        let (host, port, policy_port, port_lane, _) =
             resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
                 .expect("target selected");
 
@@ -3621,7 +3645,7 @@ mod backend_target_selection_tests {
             1,
         );
 
-        let (host, port, _, _) =
+        let (host, port, _, _, _) =
             resolve_backend_target(&proxy, &snapshot, &health_checker, "192.0.2.10")
                 .expect("healthy target selected");
 
@@ -3646,7 +3670,7 @@ mod backend_target_selection_tests {
         };
         health_checker.report_response(&proxy.id, &unhealthy_target, 500, false, Some(&passive));
 
-        let (host, port, _, _) =
+        let (host, port, _, _, _) =
             resolve_backend_target(&proxy, &snapshot, &health_checker, "192.0.2.10")
                 .expect("healthy target selected");
 
@@ -3660,10 +3684,14 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
         let params = retry_params();
+        let proxy = proxy_with_subset(None);
+        let health_checker = HealthChecker::new();
         let enforcement = enforcement(&["allowed.local:5432"]);
 
         let err = try_next_enforced_target(
             &params,
+            &proxy,
+            &health_checker,
             "allowed.local",
             5432,
             5432,
@@ -3684,10 +3712,14 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
         let params = retry_params();
+        let proxy = proxy_with_subset(None);
+        let health_checker = HealthChecker::new();
         let enforcement = enforcement(&["allowed.local:5432"]);
 
         let (host, port, policy_port) = try_next_enforced_target(
             &params,
+            &proxy,
+            &health_checker,
             "allowed.local",
             5432,
             5432,
@@ -3731,8 +3763,18 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
         let params = retry_params();
+        let proxy = proxy_with_subset(None);
+        let health_checker = HealthChecker::new();
 
-        let next = try_next_target(&params, "shared.local", 6380, 6379, &snapshot);
+        let next = try_next_target(
+            &params,
+            &proxy,
+            &health_checker,
+            "shared.local",
+            6380,
+            6379,
+            &snapshot,
+        );
 
         assert!(
             next.is_some(),
@@ -3744,8 +3786,48 @@ mod backend_target_selection_tests {
         assert_eq!(policy_port, 6381);
 
         assert!(
-            try_next_target(&params, "shared.local", 6380, 6381, &snapshot).is_some(),
+            try_next_target(
+                &params,
+                &proxy,
+                &health_checker,
+                "shared.local",
+                6380,
+                6381,
+                &snapshot
+            )
+            .is_some(),
             "lane 6379 remains selectable when excluding lane 6381"
+        );
+    }
+
+    #[test]
+    fn tcp_retry_target_skips_unhealthy_alternate_target() {
+        let mut config = config_with_two_targets();
+        config.upstreams[0].algorithm = crate::config::types::LoadBalancerAlgorithm::RoundRobin;
+        let unhealthy_target = config.upstreams[0].targets[1].clone();
+        let cache = LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let params = retry_params();
+        let proxy = proxy_with_subset(None);
+        let health_checker = HealthChecker::new();
+        health_checker.active_unhealthy_targets.insert(
+            crate::load_balancer::target_key("orders", &unhealthy_target),
+            1,
+        );
+
+        let next = try_next_target(
+            &params,
+            &proxy,
+            &health_checker,
+            "allowed.local",
+            5432,
+            5432,
+            &snapshot,
+        );
+
+        assert_eq!(
+            next, None,
+            "connect retry must not rotate to an unhealthy alternate target"
         );
     }
 
@@ -3784,7 +3866,7 @@ mod backend_target_selection_tests {
 
         let mut hosts = std::collections::HashSet::new();
         for _ in 0..8 {
-            let (host, _, _, port_lane) =
+            let (host, _, _, port_lane, _) =
                 resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
                     .expect("target selected");
             assert_eq!(
@@ -3817,10 +3899,19 @@ mod backend_target_selection_tests {
         let snapshot = cache.load();
         let mut params = retry_params();
         params.lb_port_lane = Some(5432);
+        let proxy = proxy_with_subset(None);
+        let health_checker = HealthChecker::new();
 
-        let (host, port, policy_port) =
-            try_next_target(&params, "allowed.local", 5432, 5432, &snapshot)
-                .expect("alternate target inside the port lane");
+        let (host, port, policy_port) = try_next_target(
+            &params,
+            &proxy,
+            &health_checker,
+            "allowed.local",
+            5432,
+            5432,
+            &snapshot,
+        )
+        .expect("alternate target inside the port lane");
         assert_eq!(host, "blocked.local");
         assert_eq!(port, 5432);
         assert_eq!(policy_port, 5432);
@@ -3883,10 +3974,19 @@ mod backend_target_selection_tests {
         let mut params = retry_params();
         params.lb_port_lane = Some(5432);
         params.lb_hash_key = flow_key.clone();
+        let proxy = proxy_with_subset(None);
+        let health_checker = HealthChecker::new();
 
-        let (host, port, policy_port) =
-            try_next_target(&params, &failed.0, failed.1, 5432, &snapshot)
-                .expect("alternate target inside the port lane");
+        let (host, port, policy_port) = try_next_target(
+            &params,
+            &proxy,
+            &health_checker,
+            &failed.0,
+            failed.1,
+            5432,
+            &snapshot,
+        )
+        .expect("alternate target inside the port lane");
 
         let exclude = UpstreamTarget {
             host: failed.0,
@@ -3928,7 +4028,7 @@ mod backend_target_selection_tests {
         let mut hosts = std::collections::HashSet::new();
         for i in 1..=64 {
             let key = format!("192.0.2.{i}");
-            let (host, _, _, port_lane) =
+            let (host, _, _, port_lane, _) =
                 resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), &key)
                     .expect("target selected");
             assert_eq!(port_lane, Some(5432));
@@ -4113,7 +4213,7 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let (_, _, _, port_lane) =
+        let (_, _, _, port_lane, _) =
             resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
                 .expect("target selected");
 
@@ -4169,7 +4269,7 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let (_, _, _, port_lane) =
+        let (_, _, _, port_lane, _) =
             resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
                 .expect("target selected");
 
@@ -4286,10 +4386,10 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let (first_host, _, _, port_lane) =
+        let (first_host, _, _, port_lane, _) =
             resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
                 .expect("target selected");
-        let (second_host, _, _, second_port_lane) =
+        let (second_host, _, _, second_port_lane, _) =
             resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
                 .expect("target selected");
 
@@ -4357,13 +4457,18 @@ mod backend_target_selection_tests {
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let (_, _, _, port_lane) =
+        let (_, _, _, port_lane, health_port_scope) =
             resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
                 .expect("target selected");
 
         assert_eq!(
             port_lane, None,
             "a passive-health-only port override must not bypass the subset LB lane"
+        );
+        assert_eq!(
+            health_port_scope,
+            Some(5432),
+            "passive-health-only port overrides must still scope stream health selection"
         );
     }
 }
@@ -4386,12 +4491,21 @@ enum ClientRelayStream {
 /// Returns `None` if no upstream is configured or no alternate target is available.
 fn try_next_target(
     params: &TcpConnParams,
+    proxy: &Proxy,
+    health_checker: &HealthChecker,
     current_host: &str,
     current_port: u16,
     current_policy_port: u16,
     lb_snapshot: &LoadBalancerCacheInner,
 ) -> Option<(String, u16, u16)> {
     let upstream_id = params.upstream_id.as_ref()?;
+    let health_ctx = crate::proxy::backend_dispatch::health_context_for_selection(
+        proxy,
+        health_checker,
+        lb_snapshot,
+        upstream_id,
+        params.health_port_scope,
+    );
     let exclude = crate::config::types::UpstreamTarget {
         host: current_host.to_string(),
         port: current_port,
@@ -4413,7 +4527,7 @@ fn try_next_target(
                 port,
                 subset_name,
                 &exclude,
-                None,
+                Some(&health_ctx),
             )
         }
         (Some(subset_name), None) => LoadBalancerCache::select_next_target_subset_from(
@@ -4422,7 +4536,7 @@ fn try_next_target(
             lb_hash_key,
             subset_name,
             &exclude,
-            None,
+            Some(&health_ctx),
         ),
         (None, Some(port)) => LoadBalancerCache::select_next_target_for_port_from(
             lb_snapshot,
@@ -4430,14 +4544,14 @@ fn try_next_target(
             lb_hash_key,
             port,
             &exclude,
-            None,
+            Some(&health_ctx),
         ),
         (None, None) => LoadBalancerCache::select_next_target_from(
             lb_snapshot,
             upstream_id,
             lb_hash_key,
             &exclude,
-            None,
+            Some(&health_ctx),
         ),
     }?;
     Some((next.host.clone(), next.port, next.dispatch_policy_port()))
@@ -4446,6 +4560,8 @@ fn try_next_target(
 #[allow(clippy::too_many_arguments)]
 fn try_next_enforced_target(
     params: &TcpConnParams,
+    proxy: &Proxy,
+    health_checker: &HealthChecker,
     current_host: &str,
     current_port: u16,
     current_policy_port: u16,
@@ -4457,6 +4573,8 @@ fn try_next_enforced_target(
 ) -> Result<Option<(String, u16, u16)>, anyhow::Error> {
     let Some((next_host, next_port, next_policy_port)) = try_next_target(
         params,
+        proxy,
+        health_checker,
         current_host,
         current_port,
         current_policy_port,

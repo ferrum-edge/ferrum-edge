@@ -34,7 +34,6 @@ use crate::plugins::{
     StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
     UdpMetadataSink,
 };
-use crate::proxy::backend_dispatch::has_effective_port_override;
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
@@ -4146,8 +4145,13 @@ fn resolve_backend_target(
         // upstream would silently pin selection to that port's targets.
         let override_port =
             LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
-        let port_lane = if override_port != 0
-            && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port)
+        let health_port_scope = crate::proxy::backend_dispatch::stream_health_port_scope(
+            proxy,
+            lb_snapshot,
+            upstream_id,
+            override_port,
+        );
+        let port_lane = if health_port_scope.is_some()
             && udp_port_lane_selection_supported(proxy, lb_snapshot, upstream_id, override_port)?
         {
             Some(override_port)
@@ -4159,7 +4163,7 @@ fn resolve_backend_target(
             health_checker,
             lb_snapshot,
             upstream_id,
-            port_lane,
+            health_port_scope,
         );
 
         let selection = if let Some(port) = port_lane {

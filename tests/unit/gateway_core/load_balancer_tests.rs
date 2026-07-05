@@ -6,7 +6,7 @@ use ferrum_edge::config::types::{
     GatewayConfig, LoadBalancerAlgorithm, Upstream, UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::load_balancer::{
-    HealthContext, LoadBalancer, LoadBalancerCache, target_host_port_key,
+    HealthContext, LoadBalancer, LoadBalancerCache, target_host_port_key, target_key,
 };
 use std::collections::HashMap;
 
@@ -1310,6 +1310,65 @@ fn port_override_retry_exclusion_uses_policy_port_identity() {
     .expect("the sibling policy lane remains selectable");
     assert_eq!(other_lane.port, 8080);
     assert_eq!(other_lane.service_port_policy_key, Some(80));
+}
+
+#[test]
+fn retry_exclusion_returns_none_when_only_alternate_is_unhealthy() {
+    let targets = make_targets(2);
+    let cache = LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![make_upstream("u1", targets.clone())],
+        ..GatewayConfig::default()
+    });
+    let snapshot = cache.load();
+    let unhealthy: DashMap<String, u64> = DashMap::new();
+    unhealthy.insert(target_key("u1", &targets[1]), 1);
+
+    let retry = LoadBalancerCache::select_next_target_from(
+        &snapshot,
+        "u1",
+        "retry",
+        &targets[0],
+        Some(&active_health_ctx(&unhealthy)),
+    );
+
+    assert!(
+        retry.is_none(),
+        "retry selection must not synthesize an unhealthy alternate fallback"
+    );
+}
+
+#[test]
+fn port_retry_exclusion_returns_none_when_only_alternate_is_unhealthy() {
+    let targets = make_targets(2);
+    let mut upstream = make_upstream("u1", targets.clone());
+    upstream.port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            algorithm: Some(LoadBalancerAlgorithm::RoundRobin),
+            ..UpstreamPortOverride::default()
+        },
+    );
+    let cache = LoadBalancerCache::new(&GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    });
+    let snapshot = cache.load();
+    let unhealthy: DashMap<String, u64> = DashMap::new();
+    unhealthy.insert(target_key("u1", &targets[1]), 1);
+
+    let retry = LoadBalancerCache::select_next_target_for_port_from(
+        &snapshot,
+        "u1",
+        "retry",
+        8080,
+        &targets[0],
+        Some(&active_health_ctx(&unhealthy)),
+    );
+
+    assert!(
+        retry.is_none(),
+        "port-scoped retry selection must not synthesize an unhealthy alternate fallback"
+    );
 }
 
 #[test]

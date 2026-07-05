@@ -3664,24 +3664,9 @@ impl LoadBalancer {
         // excluding a previously tried local target for retry must not make a
         // local-containing upstream look remote-only and widen to remote.
         let scope = HealthBitset::all(n);
-        let mut retry_candidates = scope;
-        if let Some(ei) = exclude_idx {
-            retry_candidates.clear(ei);
-        }
 
         if healthy.is_empty() {
-            // No healthy targets except excluded — try any target except excluded
-            if retry_candidates.is_empty() {
-                return None;
-            }
-            let (fallback, _) = self.preferred_locality_bitset(
-                &retry_candidates,
-                &scope,
-                self.locality_lb.as_ref(),
-            );
-            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-            let target_idx = fallback.nth_set_bit(idx);
-            return Some(Arc::clone(&self.targets[target_idx]));
+            return None;
         }
 
         let (healthy, _) =
@@ -3727,30 +3712,13 @@ impl LoadBalancer {
         // Strict locality must decide local presence from the unexcluded port
         // lane; retry exclusion only applies to selectable candidates.
         let scope = bitset_for_indices(&port_state.target_indices);
-        let mut retry_candidates = scope;
-        if let Some(ei) = exclude_idx {
-            retry_candidates.clear(ei);
-        }
 
         let port_locality = port_state
             .locality_lb
             .as_ref()
             .or(self.locality_lb.as_ref());
         if healthy.is_empty() {
-            if retry_candidates.is_empty() {
-                return None;
-            }
-            let (fallback, _) =
-                self.preferred_locality_bitset(&retry_candidates, &scope, port_locality);
-            return self.select_with_bitset_using(
-                ctx_key,
-                &fallback,
-                port_state.algorithm,
-                &port_state.rr_counter,
-                &port_state.wrr_state,
-                &port_state.hash_ring,
-                port_locality,
-            );
+            return None;
         }
 
         let (healthy, _) = self.preferred_locality_bitset(&healthy, &scope, port_locality);
@@ -3923,27 +3891,8 @@ impl LoadBalancer {
         // Strict locality uses the unexcluded lane for local-presence decisions;
         // retry exclusion only applies to selectable candidates.
         let scope_indices: Vec<usize> = (0..self.targets.len()).collect();
-        let retry_indices: Vec<usize> = scope_indices
-            .iter()
-            .copied()
-            .filter(|i| exclude_idx.is_none_or(|ei| ei != *i))
-            .collect();
-
         if healthy.is_empty() {
-            let fallback: Vec<(usize, &Arc<UpstreamTarget>)> = retry_indices
-                .iter()
-                .map(|&i| (i, &self.targets[i]))
-                .collect();
-            if fallback.is_empty() {
-                return None;
-            }
-            let (fallback, _) = self.preferred_locality_candidates(
-                fallback,
-                &scope_indices,
-                self.locality_lb.as_ref(),
-            );
-            let idx = self.rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
-            return Some(Arc::clone(fallback[idx % fallback.len()].1));
+            return None;
         }
 
         let (healthy, _) =
@@ -3961,22 +3910,11 @@ impl LoadBalancer {
         // Strict locality uses the unexcluded port lane for local-presence
         // decisions; retry exclusion only applies to selectable candidates.
         let scope_indices: Vec<usize> = port_state.target_indices.clone();
-        let retry_indices: Vec<usize> = scope_indices
-            .iter()
-            .copied()
-            .filter(|&idx| exclude_idx.is_none_or(|ei| ei != idx))
-            .collect();
-        let mut candidates: Vec<(usize, &Arc<UpstreamTarget>)> = self
+        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = self
             .healthy_targets_vec_for_indices(health, &port_state.target_indices)
             .into_iter()
             .filter(|(idx, _)| exclude_idx.is_none_or(|ei| ei != *idx))
             .collect();
-        if candidates.is_empty() {
-            candidates = retry_indices
-                .iter()
-                .map(|&idx| (idx, &self.targets[idx]))
-                .collect();
-        }
         if candidates.is_empty() {
             return None;
         }

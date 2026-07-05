@@ -407,6 +407,18 @@ pub(crate) fn has_effective_port_override(
         && LoadBalancerCache::has_port_override_state_from(balancers, upstream_id, port)
 }
 
+#[inline]
+pub(crate) fn stream_health_port_scope(
+    proxy: &Proxy,
+    balancers: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    dispatch_port: u16,
+) -> Option<u16> {
+    (dispatch_port != 0
+        && has_effective_port_override(proxy, balancers, upstream_id, dispatch_port))
+    .then_some(dispatch_port)
+}
+
 pub(crate) fn health_context_for_selection<'a>(
     proxy: &Proxy,
     health_checker: &'a HealthChecker,
