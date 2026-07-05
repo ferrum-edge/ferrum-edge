@@ -1574,6 +1574,7 @@ struct PortLbState {
     wrr_needs_stale_check: AtomicBool,
     hash_ring: Vec<(u64, usize)>,
     hash_on_strategy: HashOnStrategy,
+    hash_on_override_strategy: Option<HashOnStrategy>,
     /// Per-port projection of `UpstreamPortOverride.locality_lb_setting`.
     /// When `Some`, dispatch on this port consults the per-port locality
     /// preference before falling through to the upstream-level
@@ -1824,6 +1825,10 @@ impl LoadBalancer {
                         wrr_needs_stale_check: AtomicBool::new(false),
                         hash_ring,
                         hash_on_strategy: HashOnStrategy::parse(effective_hash_on),
+                        hash_on_override_strategy: override_config
+                            .hash_on
+                            .as_deref()
+                            .map(|hash_on| HashOnStrategy::parse(Some(hash_on))),
                         locality_lb: port_locality_lb,
                     },
                 );
@@ -3189,9 +3194,16 @@ impl LoadBalancer {
     ) -> HashOnStrategy {
         if let Some(port) = port
             && let Some(state) = self.port_overrides.get(&port)
-            && (state.algorithm_overridden || subset_name.is_none())
         {
-            return state.hash_on_strategy.clone();
+            if state.algorithm_overridden || subset_name.is_none() {
+                return state.hash_on_strategy.clone();
+            }
+            if let Some(subset_name) = subset_name
+                && self.subset_algorithm(subset_name) == LoadBalancerAlgorithm::ConsistentHashing
+                && let Some(strategy) = &state.hash_on_override_strategy
+            {
+                return strategy.clone();
+            }
         }
         if let Some(subset_name) = subset_name {
             return self.hash_on_strategy_for_subset(subset_name);

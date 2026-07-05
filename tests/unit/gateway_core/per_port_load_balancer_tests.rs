@@ -4,7 +4,8 @@ use chrono::Utc;
 use dashmap::DashMap;
 use ferrum_edge::config::types::{
     GatewayConfig, HealthCheckConfig, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy,
-    ResolvedSubsetTrafficPolicy, SubsetDefinition, Upstream, UpstreamPortOverride, UpstreamTarget,
+    ResolvedSubsetTrafficPolicy, SubsetDefinition, SubsetTrafficPolicy, Upstream,
+    UpstreamPortOverride, UpstreamTarget,
 };
 use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::load_balancer::{
@@ -344,6 +345,71 @@ fn port_subset_vec_fallback_filters_intersection_for_large_upstreams() {
     assert_ne!(
         retry.host, selection.target.host,
         "retry should exclude the original target while staying in the port/subset intersection"
+    );
+}
+
+#[test]
+fn hash_on_only_port_override_preserves_subset_algorithm_with_port_hash_key() {
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            hash_on: Some("cookie:port-affinity".to_string()),
+            ..Default::default()
+        },
+    );
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        vec![
+            tagged_target("a", 8080, &[("version", "v1")]),
+            tagged_target("b", 8080, &[("version", "v1")]),
+            tagged_target("c", 9090, &[("version", "v1")]),
+            tagged_target("d", 8080, &[("version", "v2")]),
+        ],
+        port_overrides,
+    );
+    upstream.subsets = Some(vec![SubsetDefinition {
+        name: "v1".to_string(),
+        labels: HashMap::from([("version".to_string(), "v1".to_string())]),
+        traffic_policy: Some(SubsetTrafficPolicy {
+            load_balancer_algorithm: Some(LoadBalancerAlgorithm::ConsistentHashing),
+            hash_on: Some("header:x-subset".to_string()),
+            tls: None,
+            connect_timeout_ms: None,
+            passive_health_check: None,
+        }),
+    }]);
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    assert_eq!(
+        LoadBalancerCache::effective_algorithm_from(&snapshot, "u1", Some(8080), Some("v1")),
+        Some(LoadBalancerAlgorithm::ConsistentHashing),
+        "a hash_on-only port override must not replace the subset algorithm"
+    );
+    assert_eq!(
+        LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+            &snapshot,
+            "u1",
+            Some(8080),
+            Some("v1"),
+        ),
+        HashOnStrategy::Cookie("port-affinity".to_string()),
+        "an explicit per-port hash_on must override the subset hash key"
+    );
+    assert_eq!(
+        LoadBalancerCache::get_hash_on_strategy_for_selection_from(
+            &snapshot,
+            "u1",
+            None,
+            Some("v1"),
+        ),
+        HashOnStrategy::Header("x-subset".to_string()),
+        "subset-only selection still uses the subset hash key"
     );
 }
 
