@@ -690,6 +690,8 @@ pub fn merge_targets(
 ///
 /// - Hostnames must pass the same hostname validator as proxy host entries.
 /// - IP literals are accepted only when allowed by `FERRUM_BACKEND_ALLOW_IPS`.
+/// - Ambient cross-cluster HBONE targets may carry an opaque synthetic
+///   `target.host`; validate their real dial/CONNECT authority tags instead.
 pub fn filter_discovered_targets(
     upstream_id: &str,
     provider_name: &str,
@@ -699,7 +701,7 @@ pub fn filter_discovered_targets(
     targets
         .into_iter()
         .filter(
-            |target| match validate_discovered_target_host(&target.host, &backend_allow_ips) {
+            |target| match validate_discovered_target_host(target, &backend_allow_ips) {
             Ok(()) => true,
             Err(reason) => {
                 warn!(
@@ -714,14 +716,60 @@ pub fn filter_discovered_targets(
 }
 
 fn validate_discovered_target_host(
+    target: &UpstreamTarget,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<(), String> {
+    if is_synthetic_cross_cluster_hbone_target(target) {
+        let dial_host = crate::proxy::hbone_pool::target_hbone_dial_host(target)
+            .map_err(|err| err.to_string())?;
+        validate_discovered_real_host(
+            dial_host,
+            backend_allow_ips,
+            crate::proxy::hbone_pool::HBONE_DIAL_HOST_TAG,
+        )?;
+        let authority_host = crate::proxy::hbone_pool::target_hbone_authority_host(target)
+            .map_err(|err| err.to_string())?;
+        validate_discovered_real_host(
+            authority_host,
+            backend_allow_ips,
+            crate::proxy::hbone_pool::HBONE_AUTHORITY_HOST_TAG,
+        )?;
+        return Ok(());
+    }
+
+    validate_discovered_real_host(target.host.as_str(), backend_allow_ips, "host")
+}
+
+fn validate_discovered_real_host(
     host: &str,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
+    label: &str,
 ) -> Result<(), String> {
     if let Ok(addr) = host.parse::<IpAddr>() {
         if let Some(reason) = backend_allow_ips.deny_reason(&addr) {
-            return Err(format!("IP denied by backend egress policy: {reason}"));
+            return Err(format!(
+                "{label} IP denied by backend egress policy: {reason}"
+            ));
         }
         return Ok(());
     }
-    crate::config::types::validate_host_entry(host)
+    crate::config::types::validate_host_entry(host).map_err(|reason| format!("{label}: {reason}"))
+}
+
+fn is_synthetic_cross_cluster_hbone_target(target: &UpstreamTarget) -> bool {
+    target.host.starts_with("mesh-xc-hbone|")
+        && crate::proxy::hbone_pool::target_hbone_enabled(target)
+        && crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
+        && target
+            .tags
+            .contains_key(crate::proxy::hbone_pool::HBONE_DIAL_HOST_TAG)
+        && target
+            .tags
+            .contains_key(crate::proxy::hbone_pool::HBONE_AUTHORITY_HOST_TAG)
+        && target
+            .tags
+            .contains_key(crate::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG)
+        && target
+            .tags
+            .contains_key(crate::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG)
 }

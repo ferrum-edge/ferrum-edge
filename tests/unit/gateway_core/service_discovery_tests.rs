@@ -422,6 +422,59 @@ fn test_merge_targets_empty_static() {
     assert_eq!(merged[0].host, "discovered-1");
 }
 
+#[test]
+fn filter_discovered_targets_keeps_valid_cross_cluster_hbone_synthetic_host() {
+    let mut target = make_target("mesh-xc-hbone|west-gw.example.com|15443|10.9.0.1", 8080);
+    target.service_port_policy_key = Some(8080);
+    target.tags = HashMap::from([
+        (
+            ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG.to_string(),
+            "true".to_string(),
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG.to_string(),
+            "true".to_string(),
+        ),
+        (
+            ferrum_edge::proxy::hbone_pool::HBONE_DIAL_HOST_TAG.to_string(),
+            "west-gw.example.com".to_string(),
+        ),
+        (
+            ferrum_edge::proxy::hbone_pool::HBONE_AUTHORITY_HOST_TAG.to_string(),
+            "10.9.0.1".to_string(),
+        ),
+        (
+            ferrum_edge::proxy::hbone_pool::HBONE_PORT_TAG.to_string(),
+            "15443".to_string(),
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG.to_string(),
+            "api.ferrum.svc.cluster.local".to_string(),
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG.to_string(),
+            "west.local".to_string(),
+        ),
+    ]);
+
+    let filtered = ferrum_edge::service_discovery::filter_discovered_targets(
+        "up-mesh",
+        "mesh",
+        vec![target],
+        ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+    );
+
+    assert_eq!(
+        filtered.len(),
+        1,
+        "synthetic cross-cluster HBONE targets must survive production SD filtering"
+    );
+    assert_eq!(
+        filtered[0].host,
+        "mesh-xc-hbone|west-gw.example.com|15443|10.9.0.1"
+    );
+}
+
 // ── targets_equal ─────────────────────────────────────────────────────
 
 #[test]
@@ -2312,6 +2365,52 @@ async fn mesh_sd_ambient_topology_keeps_direct_remote_fallback_without_gateway()
     assert_eq!(
         targets[1].tags.get("mesh.remote").map(String::as_str),
         Some("true")
+    );
+}
+
+#[tokio::test]
+async fn mesh_sd_ambient_keeps_direct_remote_fallback_when_catch_all_gateway_cannot_route() {
+    // A network catch-all gateway only suppresses direct remote fallback when it
+    // is an actual candidate for this service/trust-domain. A catch-all that
+    // claims a different SNI would be rejected by the shared selector, so
+    // retaining direct fallback preserves the flat-network compatibility valve.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mut multi_cluster = mesh_west_multi_cluster();
+    multi_cluster.east_west_gateways[0].network = None;
+    multi_cluster.east_west_gateways[0].sni_hosts =
+        vec!["other.ferrum.svc.cluster.local".to_string()];
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![
+            mesh_workload(api_id, "api", "10.0.0.1", 8080),
+            mesh_remote_west_workload(remote_id, 8080),
+        ],
+        multi_cluster: Some(multi_cluster),
+        ..MeshConfig::default()
+    };
+
+    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+        .discover()
+        .await
+        .expect("discover succeeds");
+    targets.sort_by(|a, b| a.host.cmp(&b.host));
+
+    assert_eq!(targets.len(), 2);
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+    assert_eq!(targets[1].host, "10.9.0.1");
+    assert_eq!(
+        targets[1].tags.get("mesh.remote").map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !targets[1].tags.contains_key("mesh.cross_cluster"),
+        "non-candidate catch-all must not force the gateway-routed shape"
     );
 }
 

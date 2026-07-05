@@ -389,24 +389,58 @@ impl MeshServiceDiscoverer {
 
     /// Whether an Ambient remote workload may retain the old direct pod-IP
     /// target shape. This is the flat-network compatibility valve from issue
-    /// #2011: if no east-west gateway is declared for the workload network (and
-    /// no catch-all gateway exists), the direct remote-pod HBONE target remains
-    /// discoverable. Once the operator declares a gateway for that network (or a
-    /// catch-all gateway), the provider must attempt the gateway-routed shape and
-    /// fail closed on SNI/trust-domain/port mismatches instead of bypassing the
-    /// gateway with a direct pod dial.
+    /// #2011: if the same east-west gateway selection semantics used by the
+    /// shared cross-cluster materializer cannot route this service FQDN for the
+    /// workload network/trust-domain, the direct remote-pod HBONE target remains
+    /// discoverable. Once a matching exact-network gateway or applicable
+    /// catch-all gateway exists, the provider must attempt the gateway-routed
+    /// shape and fail closed on port/targetPort mismatches instead of bypassing
+    /// the gateway with a direct pod dial.
     fn ambient_direct_remote_fallback_allowed(
+        &self,
         multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+        service: &MeshService,
         workload: &Workload,
     ) -> bool {
         let Some(multi_cluster) = multi_cluster else {
             return true;
         };
+
+        let cluster_domain = self.cluster_domain.trim_matches('.');
+        let service_fqdn = format!(
+            "{}.{}.svc.{cluster_domain}",
+            service.name, service.namespace
+        );
+        let fqdn = [service_fqdn];
         let network = workload.network.as_deref();
+        let is_candidate = |gateway: &crate::modes::mesh::config::EastWestGateway| {
+            crate::config::types::hosts_overlap(&gateway.sni_hosts, &fqdn)
+                && gateway
+                    .trust_domain
+                    .as_ref()
+                    .is_none_or(|td| td == &workload.trust_domain)
+        };
+
+        if multi_cluster
+            .east_west_gateways
+            .iter()
+            .any(|gateway| gateway.network.as_deref() == network && is_candidate(gateway))
+        {
+            return false;
+        }
+
+        let network_has_gateway = multi_cluster
+            .east_west_gateways
+            .iter()
+            .any(|gateway| gateway.network.as_deref() == network);
+        if network_has_gateway {
+            return true;
+        }
+
         !multi_cluster
             .east_west_gateways
             .iter()
-            .any(|gateway| gateway.network.as_deref() == network || gateway.network.is_none())
+            .any(|gateway| gateway.network.is_none() && is_candidate(gateway))
     }
 
     /// Bridge Ambient REMOTE workloads to per-pod HBONE east-west gateway
@@ -554,7 +588,7 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             }
             if is_remote
                 && self.topology == MeshSdTopology::Ambient
-                && !Self::ambient_direct_remote_fallback_allowed(multi_cluster, workload)
+                && !self.ambient_direct_remote_fallback_allowed(multi_cluster, service, workload)
             {
                 remote_ambient_workloads.push(workload);
                 continue;

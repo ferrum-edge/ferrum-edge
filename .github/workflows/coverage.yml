@@ -16,6 +16,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
+  actions: read
   contents: read
 
 env:
@@ -315,29 +316,7 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
-      - name: Download coverage data
-        id: download-coverage-data
-        if: needs.coverage-plan.outputs.mode == 'full'
-        continue-on-error: true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: coverage-data-*
-          path: coverage-data
-          merge-multiple: true
-
-      # The GitHub artifact service intermittently 5xx's under load; a single
-      # transient download failure otherwise sinks a green coverage run and, via
-      # the "Coverage (CI mirror)" job, fails the required CI aggregate on main.
-      # Retry once before giving up (re-download overwrites any partial fetch).
-      - name: Download coverage data (retry)
-        if: needs.coverage-plan.outputs.mode == 'full' && steps.download-coverage-data.outcome == 'failure'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: coverage-data-*
-          path: coverage-data
-          merge-multiple: true
-
-      - name: Extract coverage data
+      - name: Download and extract coverage data
         if: needs.coverage-plan.outputs.mode == 'full'
         run: |
           set -euo pipefail
@@ -345,16 +324,55 @@ jobs:
           # their executable bit intact (see the shard "Package coverage data"
           # step), so cargo-llvm-cov can collect them as object files without a
           # chmod. Binaries shared across shards (e.g. the integration_tests
-          # binary) are identical and simply overwrite.
-          shopt -s nullglob
-          archives=(coverage-data/*.tar)
-          test "${#archives[@]}" -gt 0
-          for archive in "${archives[@]}"; do
+          # binary) are identical and simply overwrite. Download/extract one
+          # artifact at a time so the runner never has all large shard archives
+          # plus their extracted contents on disk simultaneously.
+          artifact_names="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts" \
+            --paginate \
+            --jq '.artifacts[] | select(.name | startswith("coverage-data-")) | .name' \
+            | sort)"
+          test -n "$artifact_names"
+
+          while IFS= read -r artifact_name; do
+            [ -z "$artifact_name" ] && continue
+            echo "downloading ${artifact_name}"
+            rm -rf coverage-data
+            mkdir -p coverage-data
+            downloaded=false
+            for attempt in 1 2; do
+              if gh run download "$GITHUB_RUN_ID" \
+                --repo "$GITHUB_REPOSITORY" \
+                --name "$artifact_name" \
+                --dir coverage-data; then
+                downloaded=true
+                break
+              fi
+              if [ "$attempt" -lt 2 ]; then
+                echo "::warning::artifact download for ${artifact_name} failed; retrying"
+                sleep 5
+              fi
+            done
+            if [ "$downloaded" != "true" ]; then
+              echo "::error::artifact download failed for ${artifact_name}"
+              exit 1
+            fi
+
+            archive_count="$(find coverage-data -maxdepth 1 -type f -name '*.tar' | wc -l | tr -d ' ')"
+            if [ "$archive_count" != "1" ]; then
+              echo "::error::expected exactly one tar in ${artifact_name}, found ${archive_count}"
+              find coverage-data -maxdepth 2 -type f -print
+              exit 1
+            fi
+            archive="$(find coverage-data -maxdepth 1 -type f -name '*.tar' -print -quit)"
             echo "extracting ${archive}"
             tar -xpf "${archive}"
-          done
+            rm -rf coverage-data
+          done <<< "$artifact_names"
+
           find target/llvm-cov-target -name '*.profraw' -print
           test -n "$(find target/llvm-cov-target -name '*.profraw' -print -quit)"
+        env:
+          GH_TOKEN: ${{ github.token }}
 
       - name: Generate coverage reports
         if: needs.coverage-plan.outputs.mode != 'skip'

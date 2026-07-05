@@ -21974,7 +21974,7 @@ async fn proxy_to_backend_hbone(
         }
     };
     parts.headers.clear();
-    let backend_host_header = hbone_pool::authority_for_host_port(&target.host, target.port);
+    let backend_host_header = hbone_pool::authority_for_host_port(app_host, target.port);
     let owned_hbone_headers =
         hbone_inner_headers_with_stripped_baggage(headers, &state.mesh_egress_strip_baggage_keys);
     let headers = owned_hbone_headers.as_ref().unwrap_or(headers);
