@@ -9,7 +9,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::load_balancer::{
-    HashOnStrategy, HealthContext, LoadBalancerCache, target_host_port_key,
+    HashOnStrategy, HealthContext, LoadBalancerCache, target_host_port_key, target_key,
 };
 
 fn target(host: &str, port: u16) -> UpstreamTarget {
@@ -423,7 +423,12 @@ fn port_retry_selection_does_not_escape_selected_port() {
             ..Default::default()
         },
     );
-    let targets = vec![target("a", 8080), target("b", 8080), target("c", 9090)];
+    let targets = vec![
+        target("a", 8080),
+        target("b", 8080),
+        target("c", 9090),
+        target("d", 8080),
+    ];
     let upstream = upstream_with_overrides(
         LoadBalancerAlgorithm::RoundRobin,
         targets.clone(),
@@ -436,7 +441,8 @@ fn port_retry_selection_does_not_escape_selected_port() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert("u1::a:8080".to_string(), 0);
+    active_unhealthy.insert(target_key("u1", &targets[0]), 0);
+    active_unhealthy.insert(target_key("u1", &targets[3]), 0);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -450,14 +456,29 @@ fn port_retry_selection_does_not_escape_selected_port() {
         8080,
         &targets[1],
         Some(&health),
+    );
+
+    assert!(
+        selection.is_none(),
+        "retry selection must not escape the selected port or pick an unhealthy same-port target"
+    );
+
+    active_unhealthy.remove(&target_key("u1", &targets[3]));
+    let selection = LoadBalancerCache::select_next_target_for_port_from(
+        &snapshot,
+        "u1",
+        "key",
+        8080,
+        &targets[1],
+        Some(&health),
     )
-    .expect("port retry selection");
+    .expect("healthy same-port retry selection");
 
     assert_eq!(
         selection.port, 8080,
         "retry selection for a port override must not escape to another destination port"
     );
-    assert_eq!(selection.host, "a");
+    assert_eq!(selection.host, "d");
 }
 
 fn proxy_for_upstream() -> Proxy {
