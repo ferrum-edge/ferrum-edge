@@ -811,9 +811,14 @@ pub(crate) async fn handle_h3_websocket(
                 }
             };
 
+        let ws_connection_proxy = crate::proxy::resolve_backend_connection_proxy_for_target(
+            &proxy,
+            current_target.as_deref(),
+        );
+        let ws_dial_proxy = ws_connection_proxy.as_ref();
         match crate::proxy::connect_websocket_backend(
             &current_backend_url,
-            &proxy,
+            ws_dial_proxy,
             &state.env_config,
             &client_headers,
             state.tls_policy.as_deref(),
@@ -1725,6 +1730,26 @@ mod tests {
     fn h3_ws_send_pump_buffer_is_smaller_than_duplex_capacity() {
         assert_eq!(H3_WS_DUPLEX_BUFFER_BYTES, 64 * 1024);
         assert_eq!(H3_WS_SEND_PUMP_READ_BUFFER_BYTES, 16 * 1024);
+    }
+
+    #[test]
+    fn direct_backend_retry_resolves_proxy_for_current_target() {
+        let source = include_str!("websocket.rs");
+        let loop_start = source
+            .find("let backend_handshake = loop {")
+            .expect("H3 WebSocket backend handshake loop must remain present");
+        let loop_body = &source[loop_start..];
+        let resolve_idx = loop_body
+            .find("resolve_backend_connection_proxy_for_target(\n            &proxy,\n            current_target.as_deref(),")
+            .expect("H3 WebSocket dial must resolve an effective proxy for the current target");
+        let dial_idx = loop_body
+            .find("connect_websocket_backend(\n            &current_backend_url,\n            ws_dial_proxy,")
+            .expect("H3 WebSocket direct dial must use the target-effective proxy");
+
+        assert!(
+            resolve_idx < dial_idx,
+            "H3 WebSocket retry attempts must resolve the backend policy after target rotation"
+        );
     }
 
     #[tokio::test]

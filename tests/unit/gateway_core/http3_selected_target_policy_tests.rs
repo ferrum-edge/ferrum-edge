@@ -41,7 +41,7 @@ fn h3_frontend_caps_retry_before_retry_dependent_decisions() {
 }
 
 #[test]
-fn h3_plain_bridge_keeps_unresolved_base_proxy_for_retries() {
+fn h3_plain_and_grpc_bridges_keep_unresolved_base_proxy_for_retries() {
     let source = include_str!("../../../src/http3/server.rs");
     let bridge_call = source
         .find(
@@ -50,17 +50,37 @@ fn h3_plain_bridge_keeps_unresolved_base_proxy_for_retries() {
         .expect("H3 cross-protocol bridge call must remain present");
     let bridge = &source[bridge_call..];
     let proxy_field = bridge
-        .find("proxy: if matches!(http_flavor, HttpFlavor::Plain)")
-        .expect("H3 plain bridge must choose an unresolved base proxy");
+        .find("proxy: if matches!(http_flavor, HttpFlavor::Plain | HttpFlavor::Grpc)")
+        .expect("H3 plain/gRPC bridge must choose an unresolved base proxy");
     let base_branch = bridge[proxy_field..]
         .find("selected_base_proxy.as_ref()")
-        .expect("H3 plain bridge must pass the capped unresolved base proxy");
+        .expect("H3 plain/gRPC bridge must pass the capped unresolved base proxy");
     let effective_branch = bridge[proxy_field..]
         .find("proxy.as_ref()")
-        .expect("non-plain H3 bridge paths must still use the effective proxy");
+        .expect("remaining H3 bridge paths must still use the effective proxy");
 
     assert!(
         base_branch < effective_branch,
-        "plain bridge must prefer selected_base_proxy so retry targets are resolved per attempt"
+        "plain/gRPC bridge must prefer selected_base_proxy so retry targets are resolved per attempt"
+    );
+}
+
+#[test]
+fn h3_websocket_bridge_keeps_unresolved_base_proxy_for_retries() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let websocket_call = source
+        .find("crate::http3::websocket::handle_h3_websocket(")
+        .expect("H3 WebSocket bridge call must remain present");
+    let websocket_args = &source[websocket_call..];
+    let proxy_arg = websocket_args
+        .find("Arc::clone(&selected_base_proxy)")
+        .expect("H3 WebSocket bridge must receive the capped unresolved base proxy");
+    let effective_proxy_arg = websocket_args
+        .find("\n            proxy,")
+        .unwrap_or(usize::MAX);
+
+    assert!(
+        proxy_arg < effective_proxy_arg,
+        "H3 WebSocket bridge must not inherit the first target's effective proxy"
     );
 }

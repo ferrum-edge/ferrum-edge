@@ -1773,6 +1773,8 @@ pub(crate) fn supports_native_http3_backend(
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
 ) -> bool {
+    let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
+    let proxy = effective_proxy.as_ref();
     proxy.dispatch_kind == DispatchKind::HttpsPool
         && state
             .backend_capabilities
@@ -31541,6 +31543,50 @@ mod tests {
         assert!(
             !target_uses_direct_h2_pool(&registry, &proxy, "h3only.test", 443),
             "h3=Supported alone is not sufficient — H1/H2 frontends still need reqwest"
+        );
+    }
+
+    #[tokio::test]
+    async fn supports_native_h3_uses_target_effective_capability_key() {
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "template.test", 443);
+        proxy.resolved_tls.sni = Some("base.mesh.internal".to_string());
+
+        let mut per_port_tls = BackendTlsConfig::default_verify();
+        per_port_tls.sni = Some("reviews.mesh.internal".to_string());
+        per_port_tls.server_ca_cert_path = Some("/mesh/reviews-ca.pem".to_string());
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080,
+            crate::config::types::ResolvedPortOverride {
+                tls: Some(per_port_tls),
+                ..Default::default()
+            },
+        )]));
+
+        let target = UpstreamTarget {
+            host: "reviews-v1.mesh.internal".to_string(),
+            port: 9443,
+            service_port_policy_key: Some(8080),
+            weight: 1,
+            tags: Default::default(),
+            locality: None,
+            path: None,
+        };
+        let probe = BackendCapabilityProbeTarget::from_proxy(&proxy, Some(&target));
+        let mut record = BackendCapabilityRecord::default();
+        record.plain_http.h3 = ProtocolSupport::Supported;
+        state.backend_capabilities.upsert(probe.key.clone(), record);
+
+        assert!(
+            state
+                .backend_capabilities
+                .get(&proxy, Some(&target))
+                .is_none(),
+            "base proxy lookup should miss the effective per-port TLS capability key"
+        );
+        assert!(
+            supports_native_http3_backend(&state, &proxy, Some(&target)),
+            "native-H3 decision must resolve the same target-effective capability key as probing"
         );
     }
 

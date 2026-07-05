@@ -2243,7 +2243,7 @@ async fn handle_h3_request(
             request_guard,
             per_ip_guard,
             epoch,
-            proxy,
+            Arc::clone(&selected_base_proxy),
             ctx,
             plugins,
             backend_admission_plugins,
@@ -2443,7 +2443,7 @@ async fn handle_h3_request(
             crate::http3::cross_protocol::run(crate::http3::cross_protocol::CrossProtocolRequest {
                 state: &state,
                 epoch: &epoch,
-                proxy: if matches!(http_flavor, HttpFlavor::Plain) {
+                proxy: if matches!(http_flavor, HttpFlavor::Plain | HttpFlavor::Grpc) {
                     selected_base_proxy.as_ref()
                 } else {
                     proxy.as_ref()
