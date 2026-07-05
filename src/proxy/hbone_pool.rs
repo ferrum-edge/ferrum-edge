@@ -326,6 +326,7 @@ impl HboneConnectionPool {
                 None,
                 &key,
                 &pool_config,
+                None,
             )
             .await?
         };
@@ -543,6 +544,13 @@ impl HboneConnectionPool {
         let (source_identity, fingerprint) = self.current_svid_identity_cached()?;
         let hbone_source_identity = asserted_source_identity.unwrap_or(&source_identity);
         let pool_config = self.pool_config.for_proxy(proxy);
+        let effective_connect_timeout_ms = proxy
+            .dispatch_port_overrides
+            .as_ref()
+            .and_then(|m| m.get(&app_policy_port))
+            .and_then(|o| o.connect_timeout_ms)
+            .unwrap_or(proxy.backend_connect_timeout_ms);
+        let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
 
         let fast_sender = with_hbone_pool_key(
             dial_host,
@@ -584,11 +592,12 @@ impl HboneConnectionPool {
                 sni_override,
                 &key,
                 &pool_config,
+                Some(connect_timeout),
             )
             .await?
         };
         tokio::time::timeout(
-            Duration::from_millis(proxy.backend_connect_timeout_ms),
+            connect_timeout,
             self.open_connect_stream(sender, app_host, app_port, hbone_source_identity),
         )
         .await
@@ -596,7 +605,7 @@ impl HboneConnectionPool {
             authority: authority_for_host_port(app_host, app_port),
             message: format!(
                 "timed out after {}ms waiting for HBONE CONNECT response",
-                proxy.backend_connect_timeout_ms
+                effective_connect_timeout_ms
             ),
         })?
     }
@@ -827,19 +836,19 @@ impl HboneConnectionPool {
         sni_override: Option<&str>,
         key: &str,
         pool_config: &PoolConfig,
+        connect_timeout_override: Option<Duration>,
     ) -> Result<SendRequest<Bytes>, HbonePoolError> {
         self.maybe_prune_idle_entries();
         let max_entries = pool_config.http2_connections_per_host.max(1);
+        let effective_connect_timeout_ms = connect_timeout_override
+            .map(|d| d.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(proxy.backend_connect_timeout_ms);
+        let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
         match self.cached_sender(key, max_entries) {
             Some(CachedSender::Ready(sender)) => return Ok(sender),
             Some(CachedSender::Pending(sender)) => {
                 let authority = authority_for_host_port(app_host, app_port);
-                match tokio::time::timeout(
-                    Duration::from_millis(proxy.backend_connect_timeout_ms),
-                    sender.ready(),
-                )
-                .await
-                {
+                match tokio::time::timeout(connect_timeout, sender.ready()).await {
                     Ok(Ok(sender)) => return Ok(sender),
                     Ok(Err(err)) => {
                         debug!(
@@ -856,7 +865,7 @@ impl HboneConnectionPool {
                             authority,
                             message: format!(
                                 "timed out after {}ms waiting for cached HBONE HTTP/2 sender readiness",
-                                proxy.backend_connect_timeout_ms
+                                effective_connect_timeout_ms
                             ),
                         });
                     }
@@ -865,7 +874,6 @@ impl HboneConnectionPool {
             None => {}
         }
 
-        let connect_timeout = Duration::from_millis(proxy.backend_connect_timeout_ms);
         let creation_started = Instant::now();
         let authority = authority_for_host_port(app_host, app_port);
         let creation_lock = self
@@ -879,7 +887,7 @@ impl HboneConnectionPool {
                 authority: authority.clone(),
                 message: format!(
                     "timed out after {}ms waiting to coalesce HBONE HTTP/2 sender creation",
-                    proxy.backend_connect_timeout_ms
+                    effective_connect_timeout_ms
                 ),
             })?;
         match self.cached_sender(key, max_entries) {
@@ -895,7 +903,7 @@ impl HboneConnectionPool {
                     authority: authority.clone(),
                     message: format!(
                         "timed out after {}ms waiting for coalesced HBONE HTTP/2 sender creation",
-                        proxy.backend_connect_timeout_ms
+                        effective_connect_timeout_ms
                     ),
                 })?;
                 match tokio::time::timeout(remaining, sender.ready()).await {
@@ -917,7 +925,7 @@ impl HboneConnectionPool {
                             authority,
                             message: format!(
                                 "timed out after {}ms waiting for coalesced HBONE HTTP/2 sender readiness",
-                                proxy.backend_connect_timeout_ms
+                                effective_connect_timeout_ms
                             ),
                         });
                     }
@@ -936,7 +944,7 @@ impl HboneConnectionPool {
                     authority: authority.clone(),
                     message: format!(
                         "timed out after {}ms waiting for coalesced HBONE HTTP/2 sender creation",
-                        proxy.backend_connect_timeout_ms
+                        effective_connect_timeout_ms
                     ),
                 });
             }
@@ -965,6 +973,7 @@ impl HboneConnectionPool {
                 sni_override,
                 pool_config,
                 keepalive_override,
+                connect_timeout_override,
             ),
         )
         .await
@@ -986,7 +995,7 @@ impl HboneConnectionPool {
                     authority,
                     message: format!(
                         "timed out after {}ms creating coalesced HBONE HTTP/2 sender",
-                        proxy.backend_connect_timeout_ms
+                        effective_connect_timeout_ms
                     ),
                 });
             }
@@ -1163,6 +1172,7 @@ impl HboneConnectionPool {
         sni_override: Option<&str>,
         pool_config: &PoolConfig,
         keepalive_override: Option<&crate::config::types::TcpKeepaliveCfg>,
+        connect_timeout_override: Option<Duration>,
     ) -> Result<SendRequest<Bytes>, HbonePoolError> {
         // The raw-`h2` dial over SVID-mTLS is the transport primitive shared
         // with the Sidecar mesh-mTLS raw-TCP egress path; only the dial port
@@ -1180,7 +1190,7 @@ impl HboneConnectionPool {
             sni_override,
             pool_config,
             keepalive_override,
-            None,
+            connect_timeout_override,
         )
         .await
     }
@@ -2997,6 +3007,7 @@ mod tests {
                 None,
                 &key,
                 &pool_config,
+                None,
             )
             .await
             .expect_err("coalesced lock wait should time out");

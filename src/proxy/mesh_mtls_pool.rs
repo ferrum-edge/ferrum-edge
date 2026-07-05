@@ -604,11 +604,15 @@ impl MeshMtlsConnectionPool {
         let pool_config = self.pool_config.for_proxy(proxy);
         // DR keepalive override resolved for the destination's APP port
         // (`target_port`), not the transport `mtls_port`.
-        let keepalive_override = proxy
+        let port_override = proxy
             .dispatch_port_overrides
             .as_ref()
-            .and_then(|m| m.get(&target_policy_port))
-            .and_then(|o| o.tcp_keepalive.as_ref());
+            .and_then(|m| m.get(&target_policy_port));
+        let keepalive_override = port_override.and_then(|o| o.tcp_keepalive.as_ref());
+        let effective_connect_timeout_ms = port_override
+            .and_then(|o| o.connect_timeout_ms)
+            .unwrap_or(proxy.backend_connect_timeout_ms);
+        let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
             &self.gateway_svid,
@@ -623,11 +627,11 @@ impl MeshMtlsConnectionPool {
             None,
             &pool_config,
             keepalive_override,
-            None,
+            Some(connect_timeout),
         )
         .await?;
         tokio::time::timeout(
-            Duration::from_millis(proxy.backend_connect_timeout_ms),
+            connect_timeout,
             open_h2_connect_stream(sender, target_host, target_port, None, None),
         )
         .await
@@ -635,7 +639,7 @@ impl MeshMtlsConnectionPool {
             authority: authority_for_host_port(target_host, target_port),
             message: format!(
                 "timed out after {}ms waiting for sidecar mesh-mTLS CONNECT response",
-                proxy.backend_connect_timeout_ms
+                effective_connect_timeout_ms
             ),
         })?
     }

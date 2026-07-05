@@ -83,7 +83,19 @@ pub(crate) async fn handle_mesh_tcp_egress(
             &entry.upstream_id,
             override_port,
         )
-        && stream_port_override_affects_selection(proxy, override_port))
+        && match mesh_stream_port_lane_supported(proxy, override_port) {
+            Ok(supported) => supported,
+            Err(message) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    port = override_port,
+                    orig_dst = %orig_dst,
+                    %message,
+                    "Raw-TCP mesh egress per-port LB policy is unsupported; closing captured connection"
+                );
+                return;
+            }
+        })
     .then_some(override_port);
     if let Some(port) = port_lane {
         let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
@@ -351,9 +363,28 @@ fn stream_port_override_affects_selection(proxy: &crate::config::types::Proxy, p
         || override_config.locality_lb_setting.is_some()
 }
 
+fn mesh_stream_port_lane_supported(
+    proxy: &crate::config::types::Proxy,
+    port: u16,
+) -> Result<bool, &'static str> {
+    let Some(override_config) = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&port))
+    else {
+        return Ok(false);
+    };
+    match override_config.algorithm {
+        Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency) => {
+            Err("per-port LEAST_LATENCY requires stream latency accounting")
+        }
+        _ => Ok(stream_port_override_affects_selection(proxy, port)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::stream_port_override_affects_selection;
+    use super::{mesh_stream_port_lane_supported, stream_port_override_affects_selection};
     use std::collections::HashMap;
 
     fn proxy_with_override(
@@ -401,5 +432,16 @@ listen_port: 15001
             ..Default::default()
         });
         assert!(stream_port_override_affects_selection(&hash, 5432));
+    }
+
+    #[test]
+    fn mesh_tcp_stream_port_lane_rejects_least_latency() {
+        let least_latency = proxy_with_override(crate::config::types::ResolvedPortOverride {
+            algorithm: Some(crate::config::types::LoadBalancerAlgorithm::LeastLatency),
+            ..Default::default()
+        });
+
+        assert!(stream_port_override_affects_selection(&least_latency, 5432));
+        assert!(mesh_stream_port_lane_supported(&least_latency, 5432).is_err());
     }
 }
