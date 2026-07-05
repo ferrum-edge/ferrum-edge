@@ -935,13 +935,13 @@ fn grpc_mesh_dispatch_same_cluster_mtls_routes_over_mesh_mtls() {
 }
 
 #[test]
-fn grpc_mesh_dispatch_same_cluster_hbone_fails_closed() {
+fn grpc_mesh_dispatch_same_cluster_hbone_is_out_of_scope_and_fails_closed() {
     use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
     let target = target_with_tags(&[(ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true")]);
     assert_eq!(
         classify_grpc_mesh_dispatch(&target),
         GrpcMeshDispatch::RefuseHbone,
-        "the HBONE inner protocol is HTTP/1.1 and cannot carry gRPC trailers — refuse, never dial"
+        "Ambient native gRPC over HBONE is out of scope: the inner protocol is HTTP/1.1 and cannot carry gRPC trailers — refuse, never dial"
     );
 }
 
