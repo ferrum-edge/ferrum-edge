@@ -230,6 +230,18 @@ struct HboneSvidIdentityCache {
     svid_generation: u64,
 }
 
+pub(crate) fn effective_connect_timeout_ms_for_policy_port(
+    proxy: &Proxy,
+    app_policy_port: u16,
+) -> u64 {
+    proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|m| m.get(&app_policy_port))
+        .and_then(|o| o.connect_timeout_ms)
+        .unwrap_or(proxy.backend_connect_timeout_ms)
+}
+
 impl HboneConnectionPool {
     #[allow(dead_code)] // Used by tests and external lib callers; binary wires the shared generation counter.
     pub fn new(
@@ -281,6 +293,9 @@ impl HboneConnectionPool {
     ) -> Result<(), HbonePoolError> {
         let (source_identity, fingerprint) = self.current_svid_identity_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
+        let effective_connect_timeout_ms =
+            effective_connect_timeout_ms_for_policy_port(proxy, app_policy_port);
+        let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
 
         // The capability-warmup probe runs only for in-cluster HBONE targets
         // (cross-cluster targets BYPASS the capability registry — they dial the
@@ -326,12 +341,12 @@ impl HboneConnectionPool {
                 None,
                 &key,
                 &pool_config,
-                None,
+                Some(connect_timeout),
             )
             .await?
         };
         tokio::time::timeout(
-            Duration::from_millis(proxy.backend_connect_timeout_ms),
+            connect_timeout,
             self.open_connect_stream(sender, app_host, app_port, &source_identity),
         )
         .await
@@ -339,7 +354,7 @@ impl HboneConnectionPool {
             authority: authority_for_host_port(app_host, app_port),
             message: format!(
                 "timed out after {}ms waiting for HBONE CONNECT probe response",
-                proxy.backend_connect_timeout_ms
+                effective_connect_timeout_ms
             ),
         })??;
         Ok(())
@@ -544,12 +559,8 @@ impl HboneConnectionPool {
         let (source_identity, fingerprint) = self.current_svid_identity_cached()?;
         let hbone_source_identity = asserted_source_identity.unwrap_or(&source_identity);
         let pool_config = self.pool_config.for_proxy(proxy);
-        let effective_connect_timeout_ms = proxy
-            .dispatch_port_overrides
-            .as_ref()
-            .and_then(|m| m.get(&app_policy_port))
-            .and_then(|o| o.connect_timeout_ms)
-            .unwrap_or(proxy.backend_connect_timeout_ms);
+        let effective_connect_timeout_ms =
+            effective_connect_timeout_ms_for_policy_port(proxy, app_policy_port);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
 
         let fast_sender = with_hbone_pool_key(
@@ -743,9 +754,8 @@ impl HboneConnectionPool {
             .as_ref()
             .and_then(|m| m.get(&app_policy_port));
         let keepalive_override = port_override.and_then(|o| o.tcp_keepalive.as_ref());
-        let effective_connect_timeout_ms = port_override
-            .and_then(|o| o.connect_timeout_ms)
-            .unwrap_or(proxy.backend_connect_timeout_ms);
+        let effective_connect_timeout_ms =
+            effective_connect_timeout_ms_for_policy_port(proxy, app_policy_port);
         let connect_timeout = Duration::from_millis(effective_connect_timeout_ms);
         let sender = dial_h2_connect_sender(
             &self.dns_cache,
@@ -2177,7 +2187,8 @@ fn spawn_h2_keepalive(mut ping_pong: h2::PingPong, interval_seconds: u64, timeou
 mod tests {
     use super::*;
     use crate::config::types::{
-        AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResponseBodyMode,
+        AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, ResolvedPortOverride,
+        ResponseBodyMode,
     };
     use crate::dns::DnsConfig;
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
@@ -2264,6 +2275,27 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn effective_connect_timeout_uses_policy_port_override() {
+        let mut proxy = test_proxy(5_000);
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080,
+            ResolvedPortOverride {
+                connect_timeout_ms: Some(30_000),
+                ..ResolvedPortOverride::default()
+            },
+        )]));
+
+        assert_eq!(
+            effective_connect_timeout_ms_for_policy_port(&proxy, 8080),
+            30_000
+        );
+        assert_eq!(
+            effective_connect_timeout_ms_for_policy_port(&proxy, 9090),
+            5_000
+        );
     }
 
     #[test]
@@ -3020,6 +3052,67 @@ mod tests {
             HbonePoolError::ConnectStream { authority, message } => {
                 assert_eq!(authority, "orders.default.svc.cluster.local:8080");
                 assert!(message.contains("waiting to coalesce HBONE HTTP/2 sender creation"));
+            }
+            other => panic!("expected ConnectStream timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn coalesced_creation_lock_wait_obeys_connect_timeout_override() {
+        let pool_config = PoolConfig {
+            idle_timeout_seconds: 60,
+            ..PoolConfig::default()
+        };
+        let pool = HboneConnectionPool::new(
+            pool_config.clone(),
+            DnsCache::new(DnsConfig::default()),
+            Arc::new(ArcSwap::new(Arc::new(None))),
+            4,
+        );
+        let proxy = test_proxy(2_000);
+        let key = pool_key_owned(
+            "orders.default.svc.cluster.local",
+            8080,
+            ISTIO_HBONE_PORT,
+            None,
+            "fingerprint",
+            None,
+            None,
+            None,
+            &pool_config,
+        );
+        let creation_lock = Arc::new(Mutex::new(()));
+        let _held_guard = creation_lock.lock().await;
+        pool.creation_locks
+            .insert(key.clone(), creation_lock.clone());
+
+        let started = Instant::now();
+        let err = pool
+            .get_or_create_sender(
+                &proxy,
+                "orders.default.svc.cluster.local",
+                "orders.default.svc.cluster.local",
+                8080,
+                8080,
+                ISTIO_HBONE_PORT,
+                None,
+                None,
+                None,
+                &key,
+                &pool_config,
+                Some(Duration::from_millis(25)),
+            )
+            .await
+            .expect_err("coalesced lock wait should time out");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "lock wait must respect the connect timeout override instead of the proxy default"
+        );
+        match err {
+            HbonePoolError::ConnectStream { authority, message } => {
+                assert_eq!(authority, "orders.default.svc.cluster.local:8080");
+                assert!(message.contains("timed out after 25ms"));
             }
             other => panic!("expected ConnectStream timeout, got {other:?}"),
         }

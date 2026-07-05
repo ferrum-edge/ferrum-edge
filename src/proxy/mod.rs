@@ -5373,7 +5373,6 @@ impl ProxyState {
         {
             self.probe_hbone(
                 &probe_proxy,
-                probe_timeout,
                 HboneProbeTarget {
                     host,
                     dial_host: target.hbone_dial_host.as_str(),
@@ -5490,7 +5489,6 @@ impl ProxyState {
     async fn probe_hbone(
         &self,
         probe_proxy: &Proxy,
-        probe_timeout: Duration,
         target: HboneProbeTarget<'_>,
         record: &mut BackendCapabilityRecord,
     ) {
@@ -5539,7 +5537,11 @@ impl ProxyState {
                     .await
             }
         };
-        match tokio::time::timeout(probe_timeout, warmup).await {
+        let probe_timeout_ms = hbone_pool::effective_connect_timeout_ms_for_policy_port(
+            probe_proxy,
+            target.policy_port,
+        );
+        match tokio::time::timeout(Duration::from_millis(probe_timeout_ms), warmup).await {
             Ok(Ok(())) => {
                 record.hbone = ProtocolSupport::Supported;
             }
@@ -5566,12 +5568,12 @@ impl ProxyState {
                     record,
                     format!(
                         "HBONE probe timed out for {}:{} via port {} after {}ms",
-                        host, port, hbone_port, probe_proxy.backend_connect_timeout_ms
+                        host, port, hbone_port, probe_timeout_ms
                     ),
                 );
                 debug!(
                     "HBONE probe for {}:{} via port {} timed out after {}ms; leaving unknown",
-                    host, port, hbone_port, probe_proxy.backend_connect_timeout_ms
+                    host, port, hbone_port, probe_timeout_ms
                 );
             }
         }
