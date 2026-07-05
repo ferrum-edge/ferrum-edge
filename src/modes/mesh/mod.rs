@@ -5233,6 +5233,36 @@ fn append_cross_cluster_ambient_hbone_targets(
         return;
     };
 
+    let all_remote_workloads =
+        matched_remote_service_workloads(service, workloads, Some(multi_cluster));
+    append_cross_cluster_ambient_hbone_targets_prematched(
+        targets,
+        &runtime.cluster_domain,
+        service,
+        service_port,
+        protocol,
+        &all_remote_workloads,
+        multi_cluster,
+    );
+}
+
+/// The pre-matched entry point of the Ambient/HBONE cross-cluster shared core
+/// (see [`append_cross_cluster_ambient_hbone_targets`], which documents the
+/// emitted target shape). `remote_workloads` must already be matched to
+/// `service` under the caller's matching semantics and classified remote
+/// against the same `multi_cluster`. The mesh-mode materializer calls the
+/// ref-based wrapper above; the gateway mesh-SD bridge calls this directly so
+/// it can preserve its service-name fallback matching while sharing the same
+/// reachability, gateway-selection, and collision rules.
+pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
+    targets: &mut Vec<UpstreamTarget>,
+    cluster_domain: &str,
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    protocol: AppProtocol,
+    remote_workloads: &[&crate::modes::mesh::config::Workload],
+    multi_cluster: &crate::modes::mesh::config::MultiClusterConfig,
+) {
     // FIRST-PORT ONLY: identical rationale to the Sidecar path — the east-west
     // gateway routes a service-FQDN SNI to only the service's FIRST declared port
     // (single-port-per-SNI; SNI carries no port). A later port would misroute
@@ -5242,9 +5272,7 @@ fn append_cross_cluster_ambient_hbone_targets(
         return;
     }
 
-    let all_remote_workloads =
-        matched_remote_service_workloads(service, workloads, Some(multi_cluster));
-    if all_remote_workloads.is_empty() {
+    if remote_workloads.is_empty() {
         return;
     }
 
@@ -5252,8 +5280,9 @@ fn append_cross_cluster_ambient_hbone_targets(
     // cluster's east-west materializer could itself back (≥1 address + resolvable
     // first-service-port targetPort), mirroring `build_east_west_service_targets`
     // — a workload the destination would drop must not produce a dead path here.
-    let remote_workloads: Vec<_> = all_remote_workloads
-        .into_iter()
+    let remote_workloads: Vec<_> = remote_workloads
+        .iter()
+        .copied()
         .filter(|workload| east_west_workload_is_reachable(service, workload))
         .collect();
     if remote_workloads.is_empty() {
@@ -5268,7 +5297,7 @@ fn append_cross_cluster_ambient_hbone_targets(
 
     // The SNI the remote east-west gateway passthrough routes on — the
     // destination service FQDN (matches `build_east_west_service_targets`).
-    let cluster_domain = runtime.cluster_domain.trim_matches('.');
+    let cluster_domain = cluster_domain.trim_matches('.');
     let service_fqdn = format!(
         "{}.{}.svc.{cluster_domain}",
         service.name, service.namespace

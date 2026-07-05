@@ -48,6 +48,11 @@ pub struct MeshServiceDiscoverer {
     /// selected port, or no `mesh.multi_cluster` in the snapshot), so a 30s
     /// poll loop does not repeat it forever.
     warned_sidecar_remote_unbridged: AtomicBool,
+    /// One-time guard for the analogous Ambient SD bridge warning. Ambient keeps
+    /// direct remote-pod fallback only when no east-west gateway is declared for
+    /// that workload network; when a gateway exists but the selected port cannot
+    /// be bridged, remote targets fail closed instead of silently bypassing it.
+    warned_ambient_remote_unbridged: AtomicBool,
 }
 
 impl MeshServiceDiscoverer {
@@ -72,6 +77,7 @@ impl MeshServiceDiscoverer {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string()),
             warned_sidecar_remote_unbridged: AtomicBool::new(false),
+            warned_ambient_remote_unbridged: AtomicBool::new(false),
         }
     }
 
@@ -380,6 +386,89 @@ impl MeshServiceDiscoverer {
         }
         targets.extend(gateway_targets);
     }
+
+    /// Whether an Ambient remote workload may retain the old direct pod-IP
+    /// target shape. This is the flat-network compatibility valve from issue
+    /// #2011: if no east-west gateway is declared for the workload network (and
+    /// no catch-all gateway exists), the direct remote-pod HBONE target remains
+    /// discoverable. Once the operator declares a gateway for that network (or a
+    /// catch-all gateway), the provider must attempt the gateway-routed shape and
+    /// fail closed on SNI/trust-domain/port mismatches instead of bypassing the
+    /// gateway with a direct pod dial.
+    fn ambient_direct_remote_fallback_allowed(
+        multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+        workload: &Workload,
+    ) -> bool {
+        let Some(multi_cluster) = multi_cluster else {
+            return true;
+        };
+        let network = workload.network.as_deref();
+        !multi_cluster
+            .east_west_gateways
+            .iter()
+            .any(|gateway| gateway.network.as_deref() == network || gateway.network.is_none())
+    }
+
+    /// Bridge Ambient REMOTE workloads to per-pod HBONE east-west gateway
+    /// targets. Shape and fail-closed rules come from the mesh-mode Ambient
+    /// materializer's pre-matched shared core: each remote pod keeps its real
+    /// pod address as the inner CONNECT authority while the east-west gateway is
+    /// carried in `mesh.hbone_dial_host` / `mesh.hbone_port`.
+    fn append_ambient_cross_cluster_targets(
+        &self,
+        service: &MeshService,
+        remote_workloads: &[&Workload],
+        multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+        selected_service_port: Option<&SelectedPort>,
+        targets: &mut Vec<UpstreamTarget>,
+    ) {
+        let first_port = service.ports.first();
+        let selected_is_first_declared = match (selected_service_port, first_port) {
+            (Some(selected), Some(first)) => selected.service_port == Some(first.port),
+            _ => false,
+        };
+        let first_is_http_family = first_port.is_some_and(|first| {
+            crate::modes::mesh::service_http_family_ports(service)
+                .iter()
+                .any(|sp| sp.port == first.port)
+        });
+        let (Some(first_port), Some(multi_cluster), true, true) = (
+            first_port,
+            multi_cluster,
+            selected_is_first_declared,
+            first_is_http_family,
+        ) else {
+            if !self
+                .warned_ambient_remote_unbridged
+                .swap(true, Ordering::Relaxed)
+            {
+                warn!(
+                    service = %self.service_name,
+                    namespace = %self.namespace,
+                    "ambient-topology mesh service discovery skips gateway-declared \
+                     remote-cluster workloads (fail closed): east-west bridging requires \
+                     mesh.multi_cluster in the snapshot and the upstream's selected service \
+                     port to be the service's first declared HTTP-family port"
+                );
+            }
+            return;
+        };
+
+        let protocol = service
+            .protocol_overrides
+            .get(&first_port.port)
+            .copied()
+            .unwrap_or(first_port.protocol);
+        crate::modes::mesh::append_cross_cluster_ambient_hbone_targets_prematched(
+            targets,
+            &self.cluster_domain,
+            service,
+            first_port,
+            protocol,
+            remote_workloads,
+            multi_cluster,
+        );
+    }
 }
 
 #[async_trait::async_trait]
@@ -435,12 +524,13 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             })
             .map(|workload| workload.spiffe_id.as_str())
             .collect();
-        // Sidecar remote workloads the loop matched (via `workload_matches_service`,
+        // Remote workloads the loop matched (via `workload_matches_service`,
         // the SD matching semantics) but skipped as direct dials — collected so
-        // the east-west bridge below honors the SAME matching the loop used
+        // the east-west bridges below honor the SAME matching the loop used
         // (including the no-refs service-name fallback) instead of re-matching
-        // through the materializer's ref-only matcher.
+        // through the mesh-mode materializer's ref-only matcher.
         let mut remote_sidecar_workloads: Vec<&Workload> = Vec::new();
+        let mut remote_ambient_workloads: Vec<&Workload> = Vec::new();
         for workload in mesh.workloads.iter().filter(|workload| {
             Self::workload_matches_service(service, workload, &matching_service_spiffe_ids)
         }) {
@@ -460,6 +550,13 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             // fail-closed (see `append_sidecar_cross_cluster_targets`).
             if is_remote && self.topology == MeshSdTopology::Sidecar {
                 remote_sidecar_workloads.push(workload);
+                continue;
+            }
+            if is_remote
+                && self.topology == MeshSdTopology::Ambient
+                && !Self::ambient_direct_remote_fallback_allowed(multi_cluster, workload)
+            {
+                remote_ambient_workloads.push(workload);
                 continue;
             }
 
@@ -528,6 +625,19 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             self.append_sidecar_cross_cluster_targets(
                 service,
                 &remote_sidecar_workloads,
+                multi_cluster,
+                selected_service_port.as_ref(),
+                &mut targets,
+            );
+        }
+        // East-west bridge for Ambient remote workloads on networks where an
+        // east-west gateway is declared: append per-pod gateway-dial-override
+        // targets after locals. Remote workloads on networks with no declared
+        // gateway retained the direct-pod fallback in the main loop above.
+        if !remote_ambient_workloads.is_empty() {
+            self.append_ambient_cross_cluster_targets(
+                service,
+                &remote_ambient_workloads,
                 multi_cluster,
                 selected_service_port.as_ref(),
                 &mut targets,
