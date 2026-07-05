@@ -2415,6 +2415,48 @@ async fn mesh_sd_ambient_keeps_direct_remote_fallback_when_catch_all_gateway_can
 }
 
 #[tokio::test]
+async fn mesh_sd_ambient_exact_network_gateway_without_candidate_skips_remote_fail_closed() {
+    // An exact-network gateway declaration is authoritative for that remote
+    // network. If it cannot route this service/trust-domain, Ambient SD must
+    // fail closed rather than re-enable the direct pod-IP compatibility path.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mut multi_cluster = mesh_west_multi_cluster();
+    multi_cluster.east_west_gateways[0].sni_hosts =
+        vec!["other.ferrum.svc.cluster.local".to_string()];
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![
+            mesh_workload(api_id, "api", "10.0.0.1", 8080),
+            mesh_remote_west_workload(remote_id, 8080),
+        ],
+        multi_cluster: Some(multi_cluster),
+        ..MeshConfig::default()
+    };
+
+    let targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+        .discover()
+        .await
+        .expect("discover succeeds");
+
+    assert_eq!(
+        targets.len(),
+        1,
+        "exact-network non-candidate gateway must suppress direct remote fallback"
+    );
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+    assert!(
+        !targets.iter().any(|target| target.host == "10.9.0.1"),
+        "remote pod IP must not be emitted when its network has a declared gateway"
+    );
+}
+
+#[tokio::test]
 async fn mesh_sd_ambient_topology_bridges_remote_workloads_via_east_west_gateway() {
     // When an east-west gateway is declared for the remote workload's network,
     // Ambient SD must use the mesh-mode Ambient shape: one per-pod synthetic

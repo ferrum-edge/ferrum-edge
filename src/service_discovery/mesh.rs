@@ -389,13 +389,13 @@ impl MeshServiceDiscoverer {
 
     /// Whether an Ambient remote workload may retain the old direct pod-IP
     /// target shape. This is the flat-network compatibility valve from issue
-    /// #2011: if the same east-west gateway selection semantics used by the
-    /// shared cross-cluster materializer cannot route this service FQDN for the
-    /// workload network/trust-domain, the direct remote-pod HBONE target remains
-    /// discoverable. Once a matching exact-network gateway or applicable
-    /// catch-all gateway exists, the provider must attempt the gateway-routed
-    /// shape and fail closed on port/targetPort mismatches instead of bypassing
-    /// the gateway with a direct pod dial.
+    /// #2011: when no east-west gateway is declared for this workload network
+    /// and no applicable catch-all gateway can route this service FQDN/trust
+    /// domain, the direct remote-pod HBONE target remains discoverable. Once an
+    /// exact-network gateway declaration exists, or an applicable catch-all
+    /// gateway exists, the provider must attempt the gateway-routed shape and
+    /// fail closed on port/targetPort or gateway-candidate mismatches instead of
+    /// bypassing the gateway with a direct pod dial.
     fn ambient_direct_remote_fallback_allowed(
         &self,
         multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
@@ -434,7 +434,7 @@ impl MeshServiceDiscoverer {
             .iter()
             .any(|gateway| gateway.network.as_deref() == network);
         if network_has_gateway {
-            return true;
+            return false;
         }
 
         !multi_cluster
