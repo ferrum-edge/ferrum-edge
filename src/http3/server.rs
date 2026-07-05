@@ -1973,19 +1973,11 @@ async fn handle_h3_request(
     let needs_response_buffering = has_retry || !should_stream_response;
 
     // --- Upstream target selection and circuit breaker ---
-    // NOTE (moot for mesh): this standalone H3 frontend's SELECTION path does
-    // not run `cap_proxy_retry_for_target` (the per-request `maxRetries` cap),
-    // so that DR knob is not applied on the H3 frontend. The H3→HTTP
-    // cross-protocol **plain** bridge DOES now apply the per-target
-    // effective-proxy overrides via `resolve_effective_proxy_for_target`
-    // (h2UpgradePolicy / idleTimeout / http2MaxRequests / connectTimeout / TLS,
-    // plus the service-discovery top-level fallback) — see
-    // `src/http3/cross_protocol.rs` `dispatch_plain`. The native-H3 backend pool
-    // and the gRPC bridge flavor, plus the `maxRetries` cap and per-port
-    // maxConnections / tcpKeepalive / LB+outlier, remain follow-ups. All moot
-    // for mesh: mesh capture is TCP-only (SO_ORIGINAL_DST/REDIRECT; UDP/H3 are
-    // out of mesh scope) and these are DestinationRule-derived (mesh-only) — see
-    // `docs/mesh.md` "Dispatch-path coverage".
+    // DestinationRule-derived HTTP connectionPool/TLS knobs are projected below
+    // once the selected target's policy port is known. Per-port maxConnections,
+    // tcpKeepalive, and LB/outlier knobs stay protocol-scope-specific:
+    // maxConnections applies to H3 WebSocket sessions, tcpKeepalive is N/A for
+    // QUIC, and LB/outlier selection is handled by select_upstream_target.
     // PASSTHROUGH orig-dst is `None` on H3: mesh capture is TCP-only
     // (SO_ORIGINAL_DST/REDIRECT; H3/UDP are out of mesh scope), so an H3
     // frontend never carries a captured original destination. A Passthrough
@@ -2004,6 +1996,18 @@ async fn handle_h3_request(
         request_host.as_deref(),
     );
     let upstream_balancer = selection.balancer;
+    // Mirror H1/H2 selected-target policy: cap per-request retries, then build
+    // an effective proxy carrying per-target DestinationRule-derived
+    // connectionPool/TLS overrides for native-H3, H3->gRPC, and H3->plain
+    // dispatch.
+    let proxy = crate::proxy::cap_proxy_retry_for_target(proxy, upstream_target.as_deref());
+    let effective_proxy =
+        crate::proxy::resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
+    let proxy = match effective_proxy {
+        std::borrow::Cow::Borrowed(_) => proxy,
+        std::borrow::Cow::Owned(owned) => Arc::new(owned),
+    };
+    ctx.matched_proxy = Some(Arc::clone(&proxy));
     // A request that will be response-stream-inspected (e.g. ai_semantic_firewall
     // `inspect`, which pre-buffers the `stream: true` request in `before_proxy` to
     // set its marker) must dispatch through the cross-protocol/reqwest path, where
@@ -8822,6 +8826,44 @@ mod h3_backend_url_tests {
         let proxy = proxy_with_scheme(BackendScheme::Https);
         let url = build_h3_backend_url_for_flavor(&proxy, HttpFlavor::Plain, "/api", "", 0, None);
         assert_eq!(url, "https://backend.example:8443/api");
+    }
+}
+
+#[cfg(test)]
+mod h3_selected_target_policy_tests {
+    #[test]
+    fn h3_frontend_applies_selected_target_policy_before_dispatch_decisions() {
+        let source = include_str!("server.rs");
+        let selection = source
+            .find("let selection = crate::proxy::backend_dispatch::select_upstream_target(")
+            .expect("H3 selected-target lookup must remain present");
+        let after_selection = &source[selection..];
+
+        let cap = after_selection
+            .find("let proxy = crate::proxy::cap_proxy_retry_for_target(proxy, upstream_target.as_deref());")
+            .expect("H3 frontend must cap retry policy by selected target");
+        let effective = after_selection
+            .find("crate::proxy::resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref())")
+            .expect("H3 frontend must resolve selected-target effective proxy");
+        let native_h3_decision = after_selection
+            .find("let backend_supports_native_h3 =")
+            .expect("native-H3 dispatch decision must remain present");
+        let circuit_breaker = after_selection
+            .find("check_circuit_breaker(")
+            .expect("H3 circuit-breaker check must remain present");
+
+        assert!(
+            cap < effective,
+            "retry cap must run before effective-proxy dispatch setup"
+        );
+        assert!(
+            effective < native_h3_decision,
+            "effective proxy must be resolved before native-H3 capability dispatch decisions"
+        );
+        assert!(
+            effective < circuit_breaker,
+            "effective proxy must be resolved before circuit-breaker/admission dispatch"
+        );
     }
 }
 

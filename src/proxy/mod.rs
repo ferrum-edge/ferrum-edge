@@ -18455,17 +18455,9 @@ pub(crate) fn resolve_effective_proxy_for_target<'a>(
 /// `Proxy.dispatch_port_overrides` (no `ArcSwap` load, no allocation unless a
 /// clone is actually needed to reduce the count).
 ///
-/// NOTE on the H3 frontend: the H3→HTTP cross-protocol **plain** bridge now
-/// applies the per-port effective-proxy overrides via
-/// `resolve_effective_proxy_for_target` (idleTimeout / http2MaxRequests / TLS /
-/// h2UpgradePolicy / connectTimeout, plus the service-discovery top-level
-/// fallback). This `maxRetries` cap is NOT yet applied on the H3 frontend
-/// (`cap_proxy_retry_for_target` runs once in `handle_proxy_request_inner` on
-/// the H1/H2 path; the standalone H3 frontend, `src/http3/server.rs`, defers
-/// it), and the native-H3 backend pool and the gRPC bridge flavor likewise
-/// remain effective-proxy-override follow-ups. All moot for mesh (TCP-only
-/// capture; H3 is out of mesh scope) — see `docs/mesh.md` "Dispatch-path
-/// coverage".
+/// The standalone H3 frontend mirrors this after target selection in
+/// `src/http3/server.rs`, before native-H3 and cross-protocol dispatch read the
+/// proxy.
 pub(crate) fn cap_proxy_retry_for_target(
     proxy: Arc<Proxy>,
     upstream_target: Option<&UpstreamTarget>,
