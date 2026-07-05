@@ -1920,7 +1920,7 @@ async fn process_new_session_datagram(
     let mut preselected_backend_target = None;
     if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
         use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS};
-        let lb_hash_key = client_addr.ip().to_string();
+        let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
         let (backend_host, backend_port) =
             resolve_backend_target(&view.proxy, &epoch.load_balancer, &lb_hash_key)?;
         preselected_backend_target = Some((backend_host.clone(), backend_port));
@@ -2744,7 +2744,7 @@ async fn handle_dtls_client_inner(
     let idle_timeout = Duration::from_secs(proxy.udp_idle_timeout_seconds.max(1));
 
     // Resolve backend target
-    let lb_hash_key = client_addr.ip().to_string();
+    let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
     let (backend_host, backend_port) =
         resolve_backend_target(&proxy, &epoch.load_balancer, &lb_hash_key)?;
     // Populate backend target as soon as it's known — even if DNS or connect fails.
@@ -3235,7 +3235,7 @@ async fn create_session(
         }
     }
 
-    let lb_hash_key = client_addr.ip().to_string();
+    let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
     let (backend_host, backend_port) = resolve_or_reuse_backend_target(
         preselected_backend_target,
         &proxy,
@@ -4141,6 +4141,10 @@ fn resolve_backend_target(
     } else {
         Ok((proxy.backend_host.clone(), proxy.backend_port))
     }
+}
+
+fn udp_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
+    ip.to_canonical().to_string()
 }
 
 fn udp_port_lane_selection_supported(
@@ -5070,6 +5074,20 @@ listen_port: 5300
             hosts.contains("a.local") && hosts.contains("b.local"),
             "per-port UDP consistent hashing must use the session key, not a constant proxy id: {hosts:?}"
         );
+    }
+
+    #[test]
+    fn udp_lb_hash_key_canonicalizes_ipv4_mapped_clients() {
+        let mapped: std::net::IpAddr = "::ffff:192.0.2.10".parse().expect("mapped IPv4");
+        let plain: std::net::IpAddr = "192.0.2.10".parse().expect("plain IPv4");
+        let v6: std::net::IpAddr = "2001:db8::10".parse().expect("plain IPv6");
+
+        assert_eq!(
+            super::udp_lb_hash_key_for_client_ip(mapped),
+            super::udp_lb_hash_key_for_client_ip(plain),
+            "IPv4-mapped UDP clients must hash like their plain IPv4 form"
+        );
+        assert_eq!(super::udp_lb_hash_key_for_client_ip(v6), "2001:db8::10");
     }
 
     #[test]
