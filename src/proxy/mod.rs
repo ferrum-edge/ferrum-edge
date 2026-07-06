@@ -8182,6 +8182,14 @@ async fn handle_websocket_request_authenticated(
                     state.max_websocket_frame_size_bytes,
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
+                    // Preserve the original authenticated mesh peer's identity into
+                    // the Ambient HBONE baggage (Finding B / issue #2010 codex):
+                    // for a WS request forwarded from an authenticated source
+                    // workload, `ctx.peer_spiffe_id` is stamped as the asserted
+                    // source so the remote AuthorizationPolicy / telemetry see the
+                    // source workload, not the gateway SVID. `None` on an
+                    // unauthenticated client → gateway SVID (HTTP-path parity).
+                    ctx.peer_spiffe_id.as_ref(),
                 )
                 .await
                 .map(|handshake| WsBackendHandshake::Mesh(Box::new(handshake))),
@@ -8479,6 +8487,54 @@ async fn handle_websocket_request_authenticated(
         }
     };
 
+    // A successful CROSS-CLUSTER Ambient HBONE WS dial leaves `current_target.host`
+    // and `current_backend_url` holding the SCOPED SYNTHETIC `mesh-xc-hbone|...`
+    // authority (only the earlier `ws_backend_url_for_parse` rewrite recovered
+    // `path_and_query`). The success path below reuses `current_backend_url` for
+    // the transaction / disconnect `backend_target` and `current_target.host` for
+    // `websocket_dns_resolution_host` — so without a fixup the session logs an
+    // invalid backend URL and tries to DNS-resolve a non-DNS synthetic name.
+    // Recompute a DISPLAY/RESOLVE target from the REAL dial `app_host`
+    // (`mesh.hbone_authority_host`) for this branch only; in-cluster / Sidecar /
+    // direct paths keep `current_backend_url` / `current_target.host` byte-for-byte
+    // (issue #2010 codex Finding C). Gated on the FINAL rotated `current_target`.
+    let ws_final_mesh_egress = current_target.as_deref().and_then(websocket_mesh_egress);
+    let (ws_display_backend_url, ws_resolve_host_override): (
+        std::borrow::Cow<'_, str>,
+        Option<&str>,
+    ) = match current_target.as_deref() {
+        Some(target)
+            if matches!(&ws_final_mesh_egress, Some(MeshWsEgress::AmbientHbone))
+                && hbone_pool::target_hbone_cross_cluster(target) =>
+        {
+            match hbone_pool::target_hbone_authority_host(target) {
+                // `app_host` is the real pod addr:app-port the tunnel dialed;
+                // swap it into the URL authority (path/query preserved) and use
+                // it as the DNS-resolve host. The dial succeeded, so the tag is
+                // present and non-synthetic here.
+                Ok(app_host) => (
+                    std::borrow::Cow::Owned(rewrite_backend_url_authority_host(
+                        &current_backend_url,
+                        &target.host,
+                        app_host,
+                    )),
+                    Some(app_host),
+                ),
+                // Unreachable on a successful dial (the pre-wire guard rejects a
+                // missing/invalid authority host before dialing), but stay
+                // fail-safe: fall back to the existing values rather than panic.
+                Err(_) => (
+                    std::borrow::Cow::Borrowed(current_backend_url.as_str()),
+                    None,
+                ),
+            }
+        }
+        _ => (
+            std::borrow::Cow::Borrowed(current_backend_url.as_str()),
+            None,
+        ),
+    };
+
     // Backend handshake succeeded — record the success so the breaker sees a
     // healthy outcome and, when this request was admitted as a HALF_OPEN
     // probe, the probe slot is released and the breaker can close. Without
@@ -8520,8 +8576,12 @@ async fn handle_websocket_request_authenticated(
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
     // Resolve backend IP from DNS cache for WebSocket tx log. Use the
-    // effective LB target when present, not the proxy's static backend_host.
-    let ws_resolve_host = websocket_dns_resolution_host(&proxy, current_target.as_deref());
+    // effective LB target when present, not the proxy's static backend_host. For a
+    // cross-cluster Ambient WS session `ws_resolve_host_override` carries the real
+    // pod `app_host` so we don't try to resolve the synthetic `mesh-xc-hbone|...`
+    // name (Finding C); it is `None` on every other path → the normal target host.
+    let ws_resolve_host = ws_resolve_host_override
+        .unwrap_or_else(|| websocket_dns_resolution_host(&proxy, current_target.as_deref()));
     let ws_resolved_ip = state
         .dns_cache
         .resolve(
@@ -8551,7 +8611,10 @@ async fn handle_websocket_request_authenticated(
         request_path: original_request_path.clone(),
         proxy_id: Some(proxy.id.clone()),
         proxy_name: proxy.name.clone(),
-        backend_target: Some(strip_query_params(&current_backend_url).to_string()),
+        // `ws_display_backend_url` == `current_backend_url` on every path except a
+        // cross-cluster Ambient WS session, where it carries the real pod authority
+        // instead of the synthetic `mesh-xc-hbone|...` key (Finding C).
+        backend_target: Some(strip_query_params(&ws_display_backend_url).to_string()),
         backend_resolved_ip: ws_resolved_ip,
         response_status_code: ws_status_code,
         latency_total_ms: total_ms,
@@ -8695,7 +8758,10 @@ async fn handle_websocket_request_authenticated(
         namespace: proxy.namespace.clone(),
         proxy_name: proxy.name.clone(),
         client_ip: ctx.client_ip.clone(),
-        backend_target: strip_query_params(&current_backend_url).to_string(),
+        // Real pod authority for a cross-cluster Ambient WS session, else the
+        // unchanged `current_backend_url` (Finding C) — so the disconnect log
+        // records a valid backend URL, not the synthetic `mesh-xc-hbone|...` key.
+        backend_target: strip_query_params(&ws_display_backend_url).to_string(),
         listen_port,
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
@@ -9528,6 +9594,14 @@ async fn connect_mesh_websocket_backend(
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
     idle_tracker: Option<Arc<WsIdleTracker>>,
+    // The ASSERTED source identity to stamp into the Ambient HBONE baggage — the
+    // request's `ctx.peer_spiffe_id` (the original authenticated mesh workload) so
+    // the destination's AuthorizationPolicy / telemetry see the source workload,
+    // not the gateway SVID. Consumed ONLY by the `AmbientHbone` branch (the
+    // Sidecar mesh-mTLS WS transport carries no source-identity baggage — the mTLS
+    // client cert authenticates the gateway; see `MeshMtlsConnectionPool`). `None`
+    // falls back to the gateway SVID, mirroring the HTTP HBONE path.
+    source_identity: Option<&crate::identity::SpiffeId>,
 ) -> Result<MeshBackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
@@ -9669,6 +9743,34 @@ async fn connect_mesh_websocket_backend(
             // tag for a cross-cluster target, else `target.host` in-cluster (the
             // tag is absent → returns `target.host`, byte-identical to before).
             let app_host = hbone_pool::target_hbone_authority_host(target)?;
+            // FAIL CLOSED PRE-WIRE for a corrupted cross-cluster target that omits
+            // `mesh.hbone_authority_host`: `target_hbone_authority_host` would then
+            // fall back to `target.host` = the SCOPED SYNTHETIC `mesh-xc-hbone|...`
+            // key (not a dialable authority). Without this guard the branch would
+            // establish the east-west TLS/H2 connection first and only fail LATER
+            // while building the HBONE CONNECT to the synthetic authority — a
+            // dial-then-fail that violates the fail-closed invariant. Require the
+            // real authority host BEFORE any dial (issue #2010 codex), typed so
+            // `classify_boxed_setup_error` recognizes it as PRE-WIRE
+            // (`ConnectionPoolError`) — mirrors the missing-SNI / missing-trust-
+            // domain rejects below. A present-but-empty tag already fails closed as
+            // `InvalidAuthorityHostTag` inside `target_hbone_authority_host`.
+            if hbone_pool::target_hbone_cross_cluster(target)
+                && !target
+                    .tags
+                    .contains_key(hbone_pool::HBONE_AUTHORITY_HOST_TAG)
+            {
+                warn!(
+                    proxy_id = %proxy.id,
+                    target_host = %target.host,
+                    "Refusing cross-cluster Ambient WebSocket egress: missing \
+                     mesh.hbone_authority_host (fail closed, never dial to the \
+                     synthetic identity as CONNECT authority)"
+                );
+                return Err(Box::new(
+                    hbone_pool::HbonePoolError::MissingCrossClusterAuthorityHost,
+                ));
+            }
             // The two cross-cluster fail-closed branches return a TYPED
             // `HbonePoolError` (not a boxed string) so `classify_boxed_setup_error`
             // → `classify_typed_chain` downcasts it to a PRE-WIRE class
@@ -9718,6 +9820,15 @@ async fn connect_mesh_websocket_backend(
                     expected_peer.as_ref(),
                     expected_trust_domain.as_ref(),
                     sni_override,
+                    // Preserve the ASSERTED source identity: a WS request from an
+                    // authenticated mesh peer stamps the ORIGINAL workload SPIFFE
+                    // into the HBONE baggage (mirroring `proxy_to_backend_hbone`'s
+                    // `source_identity_ctx.and_then(|ctx| ctx.peer_spiffe_id...)`),
+                    // so the destination's AuthorizationPolicy / telemetry see the
+                    // source workload, not the gateway's own SVID. `None` (ambient
+                    // egress from an unauthenticated client) falls back to the
+                    // gateway SVID inside `get_ws_byte_tunnel` (issue #2010 codex).
+                    source_identity,
                 )
                 .await?;
 
@@ -16656,6 +16767,25 @@ async fn handle_proxy_request_inner(
                 }
 
                 record_request(&state, 200); // gRPC errors use HTTP 200
+                // A gRPC-Web request must receive a gRPC-Web-shaped response even
+                // for a gateway-generated backend error: the terminal status has
+                // to ride in a gRPC-Web trailer frame under the gRPC-Web
+                // content-type, never a raw `application/grpc` trailers-only
+                // response the browser client cannot read. The mesh-retry-refusal
+                // (above) and backend-admission-rejection paths are already
+                // gRPC-Web aware; this backend-exchange-error arm was the last one
+                // that fell through to raw `application/grpc`, which is exactly the
+                // intermittent `200 + application/grpc` a gRPC-Web caller saw when
+                // a backend read/connect blipped under load (issue #2041).
+                if let Some(content_type) = grpc_web_response_content_type {
+                    return Ok(build_grpc_web_error_response(content_type, grpc_code, msg));
+                }
+                if grpc_request_is_web_translated
+                    && let Some(response) =
+                        build_translated_grpc_web_error_response(&ctx, grpc_code, msg)
+                {
+                    return Ok(response);
+                }
                 return Ok(grpc_proxy::build_grpc_error_response(grpc_code, msg));
             }
         }

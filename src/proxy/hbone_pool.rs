@@ -168,6 +168,22 @@ pub enum HbonePoolError {
          (fail closed, never any-federated verification)"
     )]
     MissingCrossClusterTrustDomain,
+    /// Cross-cluster east-west Ambient target with a missing / empty
+    /// `mesh.hbone_authority_host` tag. For a cross-cluster target `target.host`
+    /// is the SCOPED SYNTHETIC identity (`mesh-xc-hbone|...`), so
+    /// `target_hbone_authority_host()` would fall back to that synthetic key as
+    /// the inner CONNECT `:authority` — establishing the east-west TLS/H2
+    /// connection first and only failing LATER while building the CONNECT to the
+    /// synthetic authority. This variant rejects it PRE-WIRE (before any dial),
+    /// as the fail-closed invariant requires, so no gateway TLS/H2 connection is
+    /// ever opened for a corrupted cross-cluster target. Mirrors the
+    /// `MissingCrossClusterSni` / `MissingCrossClusterTrustDomain` pre-wire
+    /// rejects (issue #2010 codex).
+    #[error(
+        "cross-cluster Ambient HBONE target missing mesh.hbone_authority_host \
+         (fail closed, never dial to the synthetic identity as CONNECT authority)"
+    )]
+    MissingCrossClusterAuthorityHost,
 }
 
 impl HbonePoolError {
@@ -180,7 +196,8 @@ impl HbonePoolError {
             | Self::InvalidAuthorityHostTag { .. }
             | Self::InvalidPeerSpiffeTag { .. }
             | Self::MissingCrossClusterSni
-            | Self::MissingCrossClusterTrustDomain => ErrorClass::ConnectionPoolError,
+            | Self::MissingCrossClusterTrustDomain
+            | Self::MissingCrossClusterAuthorityHost => ErrorClass::ConnectionPoolError,
             Self::DnsLookup { .. } | Self::InvalidServerName { .. } => ErrorClass::DnsLookupError,
             Self::ConnectTimeout { .. } => ErrorClass::ConnectionTimeout,
             Self::Connect { source, .. } => {
@@ -702,8 +719,17 @@ impl HboneConnectionPool {
         // Both `None` for the in-cluster byte-tunnel (SNI = dial host, pinned peer).
         expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
         sni_override: Option<&str>,
+        // The ASSERTED SOURCE identity to stamp into the HBONE baggage (the W3C
+        // source-identity header the destination's AuthorizationPolicy / telemetry
+        // read). For a WS request forwarded from an authenticated mesh peer this
+        // is the ORIGINAL workload SPIFFE (`ctx.peer_spiffe_id`), so the remote
+        // sees the source workload — not the gateway's own SVID. `None` (the
+        // ambient egress default) falls back to the gateway SVID, exactly like the
+        // HTTP HBONE path (`get_tunnel_via`).
+        asserted_source_identity: Option<&crate::identity::SpiffeId>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
+        let hbone_source_identity = asserted_source_identity.unwrap_or(&source_identity);
         let pool_config = self.pool_config.for_proxy(proxy);
         // DR keepalive override resolved for the destination's APP port, not
         // the transport `hbone_port`.
@@ -726,7 +752,7 @@ impl HboneConnectionPool {
             None,
         )
         .await?;
-        let baggage = baggage_header_for_source(&source_identity);
+        let baggage = baggage_header_for_source(hbone_source_identity);
         tokio::time::timeout(
             Duration::from_millis(proxy.backend_connect_timeout_ms),
             open_h2_connect_stream(sender, app_host, app_port, Some(&baggage), Some("hbone")),
