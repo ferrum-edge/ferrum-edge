@@ -137,6 +137,10 @@ need them, or because they are blocked upstream / architecturally:
   preparation while the policy update still applies to supported TCP/HTTP
   traffic. Mesh-wide UDP/DTLS policy stays supported, and Sidecar remains the
   supported topology for workload-scoped UDP/DTLS authorization.
+- **Ambient native gRPC over HBONE** — explicit non-goal: the Ambient HBONE HTTP
+  path relays an inner HTTP/1.1 byte stream through the CONNECT tunnel, so it has
+  no HTTP/2 trailer path for native gRPC. Use Sidecar mesh-mTLS for native gRPC,
+  or use gRPC-Web pass-through when Ambient transport is required.
 - **DR `connectionPool.http.maxRequestsPerConnection`** — parsed and validated
   but **Deferred** in status; backend close-after-N-requests is unsupported, so
   it is not projected as effective policy. Use `http2MaxRequests`.
@@ -165,7 +169,6 @@ ledger unless they change the support contract.
 | Ambient gRPC over HBONE (inner tunnel protocol is HTTP/1.1 — no trailer path; fail-closed today) | [#2009](https://github.com/ferrum-edge/ferrum-edge/issues/2009) | `docs/mesh.md` protocol matrix gRPC row + note [5] |
 | Cross-cluster protocol parity: gRPC, WebSocket, multi-port (single-port-per-SNI), raw TCP/UDP (all fail-closed / not materialized today) | [#2010](https://github.com/ferrum-edge/ferrum-edge/issues/2010) | `docs/mesh.md` cross-cluster egress sections + matrix notes [2][3][5][7] |
 | Ambient SD east-west parity (gateway-routed remote targets on the SD bridge without regressing flat-network direct dials) | [#2011](https://github.com/ferrum-edge/ferrum-edge/issues/2011) | `docs/mesh.md` protocol matrix note [4] |
-| Port-level `connectionPool` merge semantics vs Istio complete-replacement (uniform follow-up across all applied knobs) | [#2012](https://github.com/ferrum-edge/ferrum-edge/issues/2012) | `docs/mesh.md` "Port-level `connectionPool` merge semantics" |
 | Ambient UDP capture producer (matrix rows are "transport half only") + the live UDP/raw-TCP source-capture e2e (`netns-capture-live`) | [#2013](https://github.com/ferrum-edge/ferrum-edge/issues/2013) | `docs/mesh.md` matrix UDP/DTLS rows + note [10], UDP TPROXY capture section |
 | DR `connectionPool` knob-coverage residuals on the H3 frontend / SD paths (post-#1806/#1816: H3 `maxRetries` cap, native-H3 / gRPC-bridge override threading, stale SD/H3 coverage-limitation wording) — moot for mesh, gateway-surface only | [#2020](https://github.com/ferrum-edge/ferrum-edge/issues/2020) | `docs/mesh.md` `http1MaxPendingRequests` coverage-limitations bullet + "Dispatch-path coverage" |
 

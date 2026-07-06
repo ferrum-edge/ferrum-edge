@@ -70,19 +70,15 @@ pub(crate) async fn handle_mesh_tcp_egress(
 ) {
     let proxy = entry.relay_proxy.as_ref();
     let lb = &epoch.load_balancer;
-    // Engage the per-port LB lane (algorithm / locality) only when all upstream
-    // targets share a single dispatch port (non-zero override) — the relay
-    // proxy's `backend_port` is a placeholder, so the HTTP path's fallback must
-    // not be used. Stream paths carry no HealthContext (issue #2018).
+    // Scope passive health to the stream-family dispatch port whenever an
+    // effective port override exists. The per-port LB lane is stricter: it only
+    // engages for selection-affecting policy fields, so passive-health-only
+    // overrides can cap ejection by port without bypassing subset/upstream LB.
     let override_port =
         LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id);
-    let port_lane = (override_port != 0
-        && backend_dispatch::has_effective_port_override(
-            proxy,
-            lb,
-            &entry.upstream_id,
-            override_port,
-        )
+    let health_port_scope =
+        backend_dispatch::stream_health_port_scope(proxy, lb, &entry.upstream_id, override_port);
+    let port_lane = (health_port_scope.is_some()
         && match mesh_stream_port_lane_supported(proxy, override_port) {
             Ok(supported) => supported,
             Err(message) => {
@@ -115,16 +111,28 @@ pub(crate) async fn handle_mesh_tcp_egress(
         }
     }
     let lb_hash_key = mesh_stream_lb_hash_key_for_client_ip(remote_addr.ip());
+    let health_ctx = backend_dispatch::health_context_for_selection(
+        proxy,
+        &state.health_checker,
+        lb,
+        &entry.upstream_id,
+        health_port_scope,
+    );
     let Some(selection) = (if let Some(port) = port_lane {
         LoadBalancerCache::select_target_for_port_from(
             lb,
             &entry.upstream_id,
             &lb_hash_key,
             port,
-            None,
+            Some(&health_ctx),
         )
     } else {
-        LoadBalancerCache::select_target_from(lb, &entry.upstream_id, &lb_hash_key, None)
+        LoadBalancerCache::select_target_from(
+            lb,
+            &entry.upstream_id,
+            &lb_hash_key,
+            Some(&health_ctx),
+        )
     }) else {
         warn!(
             service = %entry.service_fqdn,
@@ -451,6 +459,69 @@ listen_port: 15001
 
         assert!(stream_port_override_affects_selection(&least_latency, 5432));
         assert!(mesh_stream_port_lane_supported(&least_latency, 5432).is_err());
+    }
+
+    #[test]
+    fn mesh_tcp_passive_only_port_override_scopes_health_without_lb_lane() {
+        let mut config: crate::config::types::GatewayConfig =
+            serde_json::from_value(serde_json::json!({
+                "version": "1",
+                "proxies": [{
+                    "id": "mesh-tcp-relay",
+                    "backend_scheme": "tcp",
+                    "backend_host": "placeholder.local",
+                    "backend_port": 0,
+                    "listen_port": 15001,
+                    "upstream_id": "orders"
+                }],
+                "consumers": [],
+                "plugin_configs": [],
+                "upstreams": [{
+                    "id": "orders",
+                    "algorithm": "round_robin",
+                    "targets": [
+                        { "host": "orders-a.local", "port": 5432 },
+                        { "host": "orders-b.local", "port": 5432 }
+                    ],
+                    "port_overrides": {
+                        "5432": {
+                            "passive_health_check": {
+                                "unhealthy_threshold": 3,
+                                "max_ejection_percent": 50
+                            }
+                        }
+                    }
+                }]
+            }))
+            .expect("gateway config should deserialize");
+        config.resolve_dispatch_port_overrides();
+        let proxy = config.proxies[0].clone();
+        let cache = crate::load_balancer::LoadBalancerCache::new(&config);
+        let snapshot = cache.load();
+        let override_port =
+            crate::load_balancer::LoadBalancerCache::initial_dispatch_port_override_from(
+                &snapshot, "orders",
+            );
+
+        let health_port_scope = super::backend_dispatch::stream_health_port_scope(
+            &proxy,
+            &snapshot,
+            "orders",
+            override_port,
+        );
+        let port_lane = (health_port_scope.is_some()
+            && mesh_stream_port_lane_supported(&proxy, override_port).expect("supported policy"))
+        .then_some(override_port);
+
+        assert_eq!(
+            health_port_scope,
+            Some(5432),
+            "passive-health-only mesh TCP overrides must scope health by stream port"
+        );
+        assert_eq!(
+            port_lane, None,
+            "passive-health-only mesh TCP overrides must not engage a per-port LB lane"
+        );
     }
 
     #[test]

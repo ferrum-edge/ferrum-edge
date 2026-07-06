@@ -9,7 +9,7 @@ use ferrum_edge::config::types::{
 };
 use ferrum_edge::health_check::HealthChecker;
 use ferrum_edge::load_balancer::{
-    HashOnStrategy, HealthContext, LoadBalancerCache, target_host_port_key,
+    HashOnStrategy, HealthContext, LoadBalancerCache, target_host_port_key, target_key,
 };
 
 fn target(host: &str, port: u16) -> UpstreamTarget {
@@ -423,7 +423,12 @@ fn port_retry_selection_does_not_escape_selected_port() {
             ..Default::default()
         },
     );
-    let targets = vec![target("a", 8080), target("b", 8080), target("c", 9090)];
+    let targets = vec![
+        target("a", 8080),
+        target("b", 8080),
+        target("c", 9090),
+        target("d", 8080),
+    ];
     let upstream = upstream_with_overrides(
         LoadBalancerAlgorithm::RoundRobin,
         targets.clone(),
@@ -436,7 +441,8 @@ fn port_retry_selection_does_not_escape_selected_port() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
     let active_unhealthy = DashMap::new();
-    active_unhealthy.insert("u1::a:8080".to_string(), 0);
+    active_unhealthy.insert(target_key("u1", &targets[0]), 0);
+    active_unhealthy.insert(target_key("u1", &targets[3]), 0);
     let health = HealthContext {
         active_unhealthy: &active_unhealthy,
         proxy_passive: None,
@@ -450,14 +456,29 @@ fn port_retry_selection_does_not_escape_selected_port() {
         8080,
         &targets[1],
         Some(&health),
+    );
+
+    assert!(
+        selection.is_none(),
+        "retry selection must not escape the selected port or pick an unhealthy same-port target"
+    );
+
+    active_unhealthy.remove(&target_key("u1", &targets[3]));
+    let selection = LoadBalancerCache::select_next_target_for_port_from(
+        &snapshot,
+        "u1",
+        "key",
+        8080,
+        &targets[1],
+        Some(&health),
     )
-    .expect("port retry selection");
+    .expect("healthy same-port retry selection");
 
     assert_eq!(
         selection.port, 8080,
         "retry selection for a port override must not escape to another destination port"
     );
-    assert_eq!(selection.host, "a");
+    assert_eq!(selection.host, "d");
 }
 
 fn proxy_for_upstream() -> Proxy {
@@ -1348,6 +1369,114 @@ fn port_subset_ejection_cap_denominator_is_subset_intersect_port() {
 // candidate ejected — wrongly returning `None`.
 
 #[test]
+fn upstream_retry_excludes_previous_target_before_ejection_cap() {
+    // No-subset retry path: all three targets are passive-ejected, cap = 34%,
+    // and the retry excludes the oldest ejected target. Capping before the
+    // exclusion spends the readmission on the excluded target and leaves no
+    // retry candidate; excluding first readmits host-b.
+    let targets = vec![
+        target("host-a", 8080),
+        target("host-b", 8080),
+        target("host-c", 8080),
+    ];
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        targets.clone(),
+        HashMap::new(),
+    );
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            unhealthy_threshold: 1,
+            max_ejection_percent: Some(34),
+            ..PassiveHealthCheck::default()
+        }),
+    });
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let health = passive_ctx_ejecting(
+        &active_unhealthy,
+        &[&targets[0], &targets[1], &targets[2]],
+        Some(34),
+    );
+
+    let retry = LoadBalancerCache::select_next_target_from(
+        &snapshot,
+        "u1",
+        "retry",
+        &targets[0],
+        Some(&health),
+    )
+    .expect("upstream retry should re-admit a remaining candidate after exclusion");
+
+    assert_eq!(retry.host, "host-b");
+    assert_ne!(retry.host, "host-a");
+}
+
+#[test]
+fn port_retry_excludes_previous_target_before_ejection_cap() {
+    // Same bug shape on the port-only retry path. The port override owns the
+    // passive cap; retry must exclude before sizing that port candidate pool.
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            passive_health_check: Some(PassiveHealthCheck {
+                unhealthy_threshold: 1,
+                max_ejection_percent: Some(34),
+                ..PassiveHealthCheck::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    let targets = vec![
+        target("port-a", 8080),
+        target("port-b", 8080),
+        target("port-c", 8080),
+        target("other-port", 9090),
+    ];
+    let upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        targets.clone(),
+        port_overrides,
+    );
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let health = passive_ctx_ejecting(
+        &active_unhealthy,
+        &[&targets[0], &targets[1], &targets[2]],
+        Some(34),
+    );
+
+    let retry = LoadBalancerCache::select_next_target_for_port_from(
+        &snapshot,
+        "u1",
+        "retry",
+        8080,
+        &targets[0],
+        Some(&health),
+    )
+    .expect("port retry should re-admit a remaining same-port candidate after exclusion");
+
+    assert_eq!(retry.host, "port-b");
+    assert_eq!(retry.port, 8080);
+    assert_ne!(retry.host, "port-a");
+}
+
+#[test]
 fn subset_retry_excludes_previous_target_before_ejection_cap() {
     // Subset 'v1' = 3 tagged targets [a, b, c], ALL passive-ejected (a oldest,
     // then b, then c), subset cap = 34%. The retry excludes 'v1-a' — the
@@ -1625,9 +1754,8 @@ fn stream_path_per_port_selection_excludes_off_port_targets() {
 
 /// Pin the per-port LB primitive's health-context behavior: when a
 /// `HealthContext` IS provided, ejected targets are excluded by the
-/// `maxEjectionPercent` cap.  This is the path HTTP dispatch takes and the
-/// path that issue #2018 will wire for stream selection; it is NOT current
-/// stream behavior (see the companion test below).
+/// `maxEjectionPercent` cap. This is the path HTTP dispatch and stream
+/// selection both take.
 #[test]
 fn per_port_lane_filters_ejected_targets_when_health_context_provided() {
     let mut port_overrides = HashMap::new();
@@ -1672,9 +1800,8 @@ fn per_port_lane_filters_ejected_targets_when_health_context_provided() {
         "single-port upstream resolves dispatch port"
     );
 
-    // Calling select_target_for_port_from WITH a health context (as HTTP
-    // dispatch does, and as issue #2018 will wire for stream paths) must
-    // exclude the ejected target.
+    // Calling select_target_for_port_from WITH a health context must exclude
+    // the ejected target.
     for _ in 0..4 {
         let selected = LoadBalancerCache::select_target_for_port_from(
             &snapshot,
@@ -1691,12 +1818,12 @@ fn per_port_lane_filters_ejected_targets_when_health_context_provided() {
     }
 }
 
-/// Pin CURRENT stream behavior: stream paths call `select_target_for_port_from`
-/// with `health: None`, so ejection state and `maxEjectionPercent` have NO
-/// effect on stream target selection.  This is pre-existing, unchanged by PR
-/// #2016, and tracked in issue #2018.
+/// Pin the low-level primitive behavior for callers that intentionally omit a
+/// health context: ejection state has no effect unless a `HealthContext` is
+/// supplied. Stream call sites now supply one; this test remains here to keep
+/// the primitive's explicit `None` semantics stable.
 #[test]
-fn stream_path_per_port_selection_ignores_ejection_without_health_context() {
+fn per_port_selection_ignores_ejection_without_health_context() {
     // Same upstream setup as the companion test above.
     let mut port_overrides = HashMap::new();
     port_overrides.insert(
@@ -1724,18 +1851,16 @@ fn stream_path_per_port_selection_ignores_ejection_without_health_context() {
     let cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
 
-    // Record ejection for "a" using the upstream-scoped key format — but the
-    // stream call site passes `None`, so this map is never consulted.
+    // Record ejection for "a" using the upstream-scoped key format, then call
+    // the primitive with `None` so this map is never consulted.
     let active_unhealthy: DashMap<String, u64> = DashMap::new();
     active_unhealthy.insert("u1::a:9000".to_string(), 0);
 
     let dispatch_port = LoadBalancerCache::initial_dispatch_port_override_from(&snapshot, "u1");
     assert_eq!(dispatch_port, 9000);
 
-    // Stream call sites pass `health: None` — ejection state is NOT consulted.
-    // Both "a" and "b" must remain selectable, even though "a" is ejected in
-    // the active_unhealthy map above (issue #2018: stream ejection wiring is a
-    // follow-up).
+    // With no health context, ejection state is NOT consulted. Both "a" and
+    // "b" remain selectable, even though "a" is ejected above.
     let mut saw_a = false;
     let mut saw_b = false;
     for i in 0..8 {
@@ -1744,7 +1869,7 @@ fn stream_path_per_port_selection_ignores_ejection_without_health_context() {
             "u1",
             &format!("stream-key-{i}"),
             dispatch_port,
-            None, // no health context — current stream behavior
+            None, // no health context
         )
         .expect("all targets selectable when no health context is provided");
         match selected.target.host.as_str() {
@@ -1755,8 +1880,7 @@ fn stream_path_per_port_selection_ignores_ejection_without_health_context() {
     }
     assert!(
         saw_a,
-        "ejected target 'a' IS still selectable: stream paths carry no health context \
-         (issue #2018)"
+        "ejected target 'a' is still selectable when the caller supplies no health context"
     );
     assert!(saw_b, "target 'b' must also be selectable");
 }
