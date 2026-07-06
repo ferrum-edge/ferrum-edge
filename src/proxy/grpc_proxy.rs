@@ -1602,11 +1602,36 @@ pub enum GrpcMeshDispatch {
     /// dispatch (the H3 cross-protocol bridge, the gRPC retry loop after a
     /// target rotation) must fail closed instead.
     MeshMtls,
-    /// Cross-cluster east-west target (Ambient `mesh.hbone` or Sidecar
-    /// `mesh.mtls` with `mesh.cross_cluster=true`): fail closed. The gRPC
-    /// path has no east-west gateway dial-host override, destination-FQDN
-    /// SNI override, or trust-domain-scoped verification.
+    /// CROSS-CLUSTER Sidecar `mesh.mtls` east-west target that is WELL-FORMED
+    /// (carries `mesh.cross_cluster=true`, a destination-FQDN SNI override
+    /// `mesh.eastwest_sni`, and a remote trust domain `mesh.trust_domain`):
+    /// dispatch through the SAME generic SVID-mTLS HTTP/2 path
+    /// (`proxy_to_backend_mesh_mtls`) as [`MeshMtls`](Self::MeshMtls) — its
+    /// cross-cluster branch dials the east-west gateway, overrides the
+    /// ClientHello SNI to the destination service FQDN, and verifies the peer
+    /// SVID trust-domain-only (no pinned pod SPIFFE). gRPC is HTTP/2 with
+    /// trailers and rides that path natively, exactly like the HTTP family
+    /// already does cross-cluster (issue #2010). Falls through only on the
+    /// H1/H2 frontend path (like `MeshMtls`); the H3 bridge and the gRPC
+    /// retry loop still fail closed.
+    MeshMtlsCrossCluster,
+    /// Cross-cluster Ambient `mesh.hbone` east-west target (or a corrupted
+    /// target carrying BOTH transport tags): fail closed. The HBONE inner
+    /// protocol is HTTP/1.1 over a byte tunnel and cannot carry the HTTP/2
+    /// trailers gRPC requires — routing it cross-cluster does not change that,
+    /// so native gRPC over cross-cluster HBONE stays out of scope, the same
+    /// limitation as [`RefuseHbone`](Self::RefuseHbone) (declared out of scope
+    /// in #2023; issue #2010).
     RefuseCrossCluster,
+    /// Cross-cluster Sidecar `mesh.mtls` east-west target that is MALFORMED —
+    /// missing the destination-FQDN SNI override (`mesh.eastwest_sni`) or the
+    /// remote trust domain (`mesh.trust_domain`) the cross-cluster mesh-mTLS
+    /// dial requires: fail closed. The transport tag is present but the target
+    /// cannot be dialed safely (`proxy_to_backend_mesh_mtls`'s cross-cluster
+    /// branch would itself fail closed on the missing metadata), so refuse
+    /// here with a clean gRPC UNAVAILABLE rather than let it reach a 502
+    /// (issue #2010).
+    RefuseCrossClusterMalformed,
     /// Malformed cross-cluster target with no mesh transport tag: fail
     /// closed. It is not a valid pass-through gRPC-Web mesh transport either,
     /// so it must not use the plain HTTP-family fallback.
@@ -1622,10 +1647,14 @@ pub enum GrpcMeshDispatch {
 /// Classify how a gRPC request may dispatch for `target`. See
 /// [`GrpcMeshDispatch`]. A target that carries BOTH transport tags (should not
 /// happen — topologies are mutually exclusive) is classified by the stricter
-/// refusal so it can never fall through to a direct dial. The cross-cluster
-/// check runs FIRST and keys on the `mesh.cross_cluster` tag alone — the
-/// pre-existing guard refused such targets even without a transport tag, and
-/// that fail-closed posture is preserved.
+/// HBONE refusal so it can never fall through to a direct dial. The
+/// cross-cluster check runs FIRST: an Ambient HBONE cross-cluster target (or a
+/// transport-less one) stays fail-closed, but a WELL-FORMED Sidecar mesh-mTLS
+/// cross-cluster target (SNI override + trust domain present) is now allowed to
+/// ride the mesh-mTLS pool's cross-cluster branch (issue #2010) — the same
+/// east-west transport the HTTP family already uses. A cross-cluster target
+/// with no transport tag, or a Sidecar one missing its SNI/trust-domain
+/// metadata, still fails closed.
 pub fn classify_grpc_mesh_dispatch(
     target: &crate::config::types::UpstreamTarget,
 ) -> GrpcMeshDispatch {
@@ -1634,8 +1663,28 @@ pub fn classify_grpc_mesh_dispatch(
     let cross_cluster = crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
         || crate::proxy::mesh_mtls_pool::target_mesh_mtls_cross_cluster(target);
     if cross_cluster {
-        if hbone || mesh_mtls {
+        // HBONE cross-cluster (or a corrupted BOTH-tags target) takes the
+        // stricter refusal: gRPC over the HBONE HTTP/1.1 inner tunnel cannot
+        // carry trailers, and a mixed-tag target must never fall through to the
+        // mesh-mTLS pool. Checked FIRST so `hbone` wins over `mesh_mtls`.
+        if hbone {
             return GrpcMeshDispatch::RefuseCrossCluster;
+        }
+        // Sidecar cross-cluster mesh-mTLS is allowed to ride the mesh-mTLS
+        // pool's cross-cluster branch (east-west gateway dial + destination-FQDN
+        // SNI override + trust-domain-only verification) ONLY when the target is
+        // WELL-FORMED — it MUST carry the SNI override AND the remote trust
+        // domain the dial scopes verification to. A missing/empty/unparseable
+        // one fails closed here (the dispatch path would itself fail closed) so
+        // the gRPC caller sees a clean UNAVAILABLE instead of a 502.
+        if mesh_mtls {
+            if crate::proxy::mesh_mtls_pool::target_mesh_mtls_eastwest_sni(target).is_some()
+                && crate::proxy::mesh_mtls_pool::target_mesh_mtls_cross_cluster_trust_domain(target)
+                    .is_some()
+            {
+                return GrpcMeshDispatch::MeshMtlsCrossCluster;
+            }
+            return GrpcMeshDispatch::RefuseCrossClusterMalformed;
         }
         return GrpcMeshDispatch::RefuseCrossClusterNoTransport;
     }
@@ -1653,11 +1702,17 @@ pub fn classify_grpc_mesh_dispatch(
 /// target (issue #2003).
 ///
 /// * `Direct` never falls through — the direct `GrpcConnectionPool` serves it.
-/// * `MeshMtls` falls through only when the generic mesh-mTLS path can carry
-///   the request body without pre-buffering. Native streams and binary
-///   translated gRPC-Web are supported there; text-mode translated gRPC-Web
-///   still needs request-body buffering for base64 decode, which that path
-///   refuses today, so it fails closed before falling through.
+/// * `MeshMtls` / `MeshMtlsCrossCluster` fall through only when the generic
+///   mesh-mTLS path can carry the request body without pre-buffering (the
+///   cross-cluster variant rides the SAME pool, just its east-west branch).
+///   Native streams and binary translated gRPC-Web are supported there;
+///   text-mode translated gRPC-Web still needs request-body buffering for
+///   base64 decode, which that path refuses today, so it fails closed before
+///   falling through.
+/// * `RefuseCrossClusterMalformed` never falls through: the cross-cluster
+///   Sidecar mesh-mTLS transport tag is present but the target lacks the SNI
+///   override / trust domain the dial needs, so even pass-through gRPC-Web
+///   would fail closed at the mesh-mTLS dispatch — refuse cleanly in-branch.
 /// * `RefuseCrossCluster` / `RefuseHbone` fall through ONLY for PASS-THROUGH
 ///   gRPC-Web (body-framed trailers, rides the HTTP-family transport like
 ///   plain HTTP). Native gRPC must be refused inside the branch, and so must
@@ -1680,8 +1735,11 @@ pub fn grpc_mesh_dispatch_falls_through(
 ) -> bool {
     match dispatch {
         GrpcMeshDispatch::Direct => false,
-        GrpcMeshDispatch::MeshMtls => mesh_mtls_supports_request_body,
-        GrpcMeshDispatch::RefuseCrossClusterNoTransport => false,
+        GrpcMeshDispatch::MeshMtls | GrpcMeshDispatch::MeshMtlsCrossCluster => {
+            mesh_mtls_supports_request_body
+        }
+        GrpcMeshDispatch::RefuseCrossClusterNoTransport
+        | GrpcMeshDispatch::RefuseCrossClusterMalformed => false,
         GrpcMeshDispatch::RefuseCrossCluster | GrpcMeshDispatch::RefuseHbone => {
             !request_uses_grpc_content_type && !grpc_web_translated
         }

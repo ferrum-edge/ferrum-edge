@@ -380,6 +380,19 @@ fn classify_typed_chain(
         if let Some(hbone_err) = err.downcast_ref::<crate::proxy::hbone_pool::HbonePoolError>() {
             return Some(hbone_err.error_class());
         }
+        // `MeshMtlsDialError` is the mesh-mTLS dial-PLAN resolution failure the
+        // WebSocket egress path boxes when a cross-cluster target is missing its
+        // SNI override / trust domain (or its pinned peer is unusable). Every
+        // variant is a PRE-WIRE gateway-side reject — no backend was dialed — so
+        // its own `error_class()` is authoritative (mirrors the `HbonePoolError`
+        // arm above). Without this, the missing-SNI / trust-domain variants (no
+        // `#[source]`) would fall through to the post-wire `RequestError` default
+        // and get charged to backend / circuit-breaker health (issue #2010 codex).
+        if let Some(dial_err) =
+            err.downcast_ref::<crate::proxy::mesh_mtls_pool::MeshMtlsDialError>()
+        {
+            return Some(dial_err.error_class());
+        }
         if let Some(setup_err) = err.downcast_ref::<crate::proxy::stream_error::StreamSetupError>()
         {
             return Some(classify_stream_setup_kind(setup_err.kind));

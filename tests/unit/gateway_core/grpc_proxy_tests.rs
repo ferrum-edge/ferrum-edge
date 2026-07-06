@@ -946,9 +946,13 @@ fn grpc_mesh_dispatch_same_cluster_hbone_is_out_of_scope_and_fails_closed() {
 }
 
 #[test]
-fn grpc_mesh_dispatch_cross_cluster_fails_closed_for_both_transports() {
+fn grpc_mesh_dispatch_cross_cluster_sidecar_mtls_wellformed_routes_over_mesh_mtls() {
     use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
-    let mtls_xc = target_with_tags(&[
+    // A WELL-FORMED cross-cluster Sidecar mesh-mTLS target (transport tag +
+    // cross-cluster marker + destination-FQDN SNI override + remote trust
+    // domain) now rides the mesh-mTLS pool's cross-cluster east-west branch
+    // (issue #2010) — the same transport the HTTP family already uses.
+    let target = target_with_tags(&[
         (
             ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
             "true",
@@ -957,11 +961,27 @@ fn grpc_mesh_dispatch_cross_cluster_fails_closed_for_both_transports() {
             ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG,
             "true",
         ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG,
+            "svc-c.ferrum.svc.cluster.local",
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG,
+            "cluster-b.local",
+        ),
     ]);
     assert_eq!(
-        classify_grpc_mesh_dispatch(&mtls_xc),
-        GrpcMeshDispatch::RefuseCrossCluster
+        classify_grpc_mesh_dispatch(&target),
+        GrpcMeshDispatch::MeshMtlsCrossCluster,
+        "cross-cluster Sidecar mesh-mTLS gRPC routes over the east-west mesh-mTLS branch"
     );
+}
+
+#[test]
+fn grpc_mesh_dispatch_cross_cluster_ambient_hbone_fails_closed() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    // Ambient HBONE cross-cluster gRPC stays fail-closed: the HBONE inner
+    // protocol is HTTP/1.1 and cannot carry gRPC trailers, cross-cluster or not.
     let hbone_xc = target_with_tags(&[
         (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
         (
@@ -972,7 +992,82 @@ fn grpc_mesh_dispatch_cross_cluster_fails_closed_for_both_transports() {
     assert_eq!(
         classify_grpc_mesh_dispatch(&hbone_xc),
         GrpcMeshDispatch::RefuseCrossCluster,
-        "cross-cluster east-west targets refuse gRPC regardless of transport tag"
+        "cross-cluster Ambient HBONE gRPC must fail closed (HBONE has no trailer path)"
+    );
+}
+
+#[test]
+fn grpc_mesh_dispatch_cross_cluster_sidecar_mtls_missing_metadata_fails_closed() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    let mtls = ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG;
+    let xc = ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG;
+    let sni = ferrum_edge::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG;
+    let td = ferrum_edge::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG;
+    // Cross-cluster mesh-mTLS transport tag present but the dial metadata is
+    // incomplete — refuse cleanly instead of reaching a 502 at dispatch.
+    // Neither SNI nor trust domain.
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target_with_tags(&[(mtls, "true"), (xc, "true")])),
+        GrpcMeshDispatch::RefuseCrossClusterMalformed
+    );
+    // SNI present, trust domain missing.
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target_with_tags(&[
+            (mtls, "true"),
+            (xc, "true"),
+            (sni, "svc-c.ferrum.svc.cluster.local"),
+        ])),
+        GrpcMeshDispatch::RefuseCrossClusterMalformed
+    );
+    // Trust domain present, SNI missing.
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target_with_tags(&[
+            (mtls, "true"),
+            (xc, "true"),
+            (td, "cluster-b.local"),
+        ])),
+        GrpcMeshDispatch::RefuseCrossClusterMalformed
+    );
+    // Empty SNI is treated as absent — never dial the gateway address as SNI.
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&target_with_tags(&[
+            (mtls, "true"),
+            (xc, "true"),
+            (sni, ""),
+            (td, "cluster-b.local"),
+        ])),
+        GrpcMeshDispatch::RefuseCrossClusterMalformed
+    );
+}
+
+#[test]
+fn grpc_mesh_dispatch_cross_cluster_conflicting_tags_take_the_hbone_refusal() {
+    use grpc_proxy::{GrpcMeshDispatch, classify_grpc_mesh_dispatch};
+    // A corrupted cross-cluster target carrying BOTH transport tags must never
+    // fall through to the mesh-mTLS pool — HBONE wins as the stricter refusal
+    // even when SNI/trust-domain would otherwise make the mTLS side well-formed.
+    let both_xc = target_with_tags(&[
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
+            "true",
+        ),
+        (ferrum_edge::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG,
+            "true",
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG,
+            "svc-c.ferrum.svc.cluster.local",
+        ),
+        (
+            ferrum_edge::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG,
+            "cluster-b.local",
+        ),
+    ]);
+    assert_eq!(
+        classify_grpc_mesh_dispatch(&both_xc),
+        GrpcMeshDispatch::RefuseCrossCluster
     );
 }
 
@@ -1125,38 +1220,55 @@ fn grpc_mesh_fall_through_allows_only_pass_through_grpc_web_on_refused_transport
         ),
         "a cross-cluster-only target has no mesh transport for pass-through gRPC-Web to use"
     );
+    // A malformed cross-cluster Sidecar mesh-mTLS target (missing SNI/trust
+    // domain) never falls through EITHER — even pass-through gRPC-Web would
+    // fail closed at the mesh-mTLS dispatch, so refuse cleanly in-branch.
+    for (native_ct, translated) in [(false, false), (true, false), (false, true)] {
+        assert!(
+            !grpc_mesh_dispatch_falls_through(
+                GrpcMeshDispatch::RefuseCrossClusterMalformed,
+                native_ct,
+                translated,
+                true
+            ),
+            "malformed cross-cluster mesh-mTLS must fail closed for \
+             native_ct={native_ct} translated={translated}"
+        );
+    }
 }
 
 #[test]
 fn grpc_mesh_fall_through_mesh_mtls_requires_streamable_request_body() {
     use grpc_proxy::{GrpcMeshDispatch, grpc_mesh_dispatch_falls_through};
-    // Same-cluster Sidecar mesh-mTLS carries native gRPC (streaming trailer
-    // relay) AND binary translated gRPC-Web (buffered trailer re-encode) down
-    // the generic mesh path when the request body can stream.
-    for (native_ct, translated) in [(true, false), (false, true), (false, false)] {
+    // Same-cluster AND cross-cluster Sidecar mesh-mTLS carry native gRPC
+    // (streaming trailer relay) AND binary translated gRPC-Web (buffered
+    // trailer re-encode) down the generic mesh path when the request body can
+    // stream — the cross-cluster variant rides the SAME pool's east-west branch.
+    for dispatch in [
+        GrpcMeshDispatch::MeshMtls,
+        GrpcMeshDispatch::MeshMtlsCrossCluster,
+    ] {
+        for (native_ct, translated) in [(true, false), (false, true), (false, false)] {
+            assert!(
+                grpc_mesh_dispatch_falls_through(dispatch, native_ct, translated, true),
+                "{dispatch:?} must fall through for native_ct={native_ct} translated={translated}"
+            );
+            assert!(
+                !grpc_mesh_dispatch_falls_through(
+                    GrpcMeshDispatch::Direct,
+                    native_ct,
+                    translated,
+                    true
+                ),
+                "Direct targets stay on the direct gRPC pool"
+            );
+        }
         assert!(
-            grpc_mesh_dispatch_falls_through(
-                GrpcMeshDispatch::MeshMtls,
-                native_ct,
-                translated,
-                true
-            ),
-            "MeshMtls must fall through for native_ct={native_ct} translated={translated}"
-        );
-        assert!(
-            !grpc_mesh_dispatch_falls_through(
-                GrpcMeshDispatch::Direct,
-                native_ct,
-                translated,
-                true
-            ),
-            "Direct targets stay on the direct gRPC pool"
+            !grpc_mesh_dispatch_falls_through(dispatch, false, true, false),
+            "text-mode translated gRPC-Web still needs request-body buffering, which \
+             mesh-mTLS dispatch refuses ({dispatch:?})"
         );
     }
-    assert!(
-        !grpc_mesh_dispatch_falls_through(GrpcMeshDispatch::MeshMtls, false, true, false),
-        "text-mode translated gRPC-Web still needs request-body buffering, which mesh-mTLS dispatch refuses"
-    );
 }
 
 // ── Streaming gRPC response timeout regime (codex r2 finding 6) ─────────────

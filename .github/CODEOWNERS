@@ -1,0 +1,19 @@
+# CODEOWNERS — Ferrum Edge
+#
+# Scoped to vendored-dependency governance (see docs/dependency-policy.md).
+# Listed owners are auto-requested for review on changes to these paths, and —
+# if branch protection enables "Require review from Code Owners" — must approve.
+# This file is intentionally narrow; broaden ownership deliberately.
+
+# Vendored, patched upstream crates and their drift manifest.
+/vendor/                                    @jeremyjpj0916
+
+# Dependency gate + vendored-patch governance docs and scripts.
+/deny.toml                                  @jeremyjpj0916
+/docs/dependency-policy.md                  @jeremyjpj0916
+/docs/upstream-h3-patches/                  @jeremyjpj0916
+/docs/upstream-reqwest-patches/             @jeremyjpj0916
+/docs/upstream-tungstenite-patches/         @jeremyjpj0916
+/scripts/check_vendored_patch_status.sh     @jeremyjpj0916
+/scripts/update_vendor_integrity.sh         @jeremyjpj0916
+/.claude/rules/dependencies.md              @jeremyjpj0916

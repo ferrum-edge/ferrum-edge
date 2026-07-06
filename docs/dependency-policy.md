@@ -7,7 +7,8 @@ machine half is `deny.toml`, the scheduled `.github/workflows/dependency-audit.y
 workflow, and the drift guard in `tests/integration/vendor_integrity_tests.rs`.
 
 > TL;DR — vendored patches must be **auditable** (pinned + drift-tested),
-> **tracked** (upstream PR + retirement trigger recorded and polled weekly), and
+> **tracked** (an upstream PR — or a governed [deliberate-fork record](#deliberate-fork-policy-and-sla)
+> — plus a retirement trigger, recorded and polled weekly), and
 > **covered** (behavioral regression tests). Security advisories in the
 > dependency tree are gated on every PR and re-checked weekly, so a fix landing
 > in the reqwest/h3 lineage cannot be missed silently.
@@ -37,16 +38,51 @@ Each row is the authoritative tracking record. Keep this table, the
 |---|---|---|---|---|---|---|---|
 | `reqwest` | 0.13.3 | Per-request `RequestBuilder::connect_timeout` | [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) (OPEN) | Ferrum Edge maintainers | Pool keys exclude policy fields, so sibling proxies share one client; without per-request connect timeout the first proxy's timeout leaks to all | PR #3017 merges and ships in a release we consume | [docs/upstream-reqwest-patches/001-…](upstream-reqwest-patches/001-per-request-connect-timeout/README.md) |
 | `h3` | 0.0.8 | Drain buffered frames before propagating QUIC `CONNECTION_CLOSE` | issue [hyperium/h3#338](https://github.com/hyperium/h3/issues/338), PR [hyperium/h3#339](https://github.com/hyperium/h3/pull/339) | Ferrum Edge maintainers | io_uring batching of `STREAM(FIN)` + `CONNECTION_CLOSE(H3_NO_ERROR)` dropped a buffered HEADERS frame → false 502 on graceful close | Fix ships in an `h3` release **and** patches 002/003 are also retired | [docs/upstream-h3-patches/001-…](upstream-h3-patches/001-recv-frame-drain-on-quic-close/README.md) |
-| `h3` | 0.0.8 | Add `Protocol::WEB_SOCKET` (RFC 9220 Extended CONNECT) | **not yet filed** (drafts in docs) | Ferrum Edge maintainers | Stock `h3` 0.0.8 rejects `:protocol=websocket` at the HEADERS layer, making WebSocket-over-HTTP/3 unreachable | Upstream files + merges the variant **and** patches 001/003 are also retired | [docs/upstream-h3-patches/002-…](upstream-h3-patches/002-extended-connect-websocket-protocol/README.md) |
-| `h3` | 0.0.8 | Add `RequestStream::peek_recv_trailers()` for already-buffered trailers before FIN | **not yet filed** (drafts in docs) | Ferrum Edge maintainers | `poll_recv_trailers` buffers trailer HEADERS but waits for terminal FIN; gateway trailer-timeout collapse dropped trailers delivered before delayed FIN | Upstream files + merges the API **and** patches 001/002 are also retired | [docs/upstream-h3-patches/003-…](upstream-h3-patches/003-peek-buffered-trailers-before-fin/README.md) |
+| `h3` | 0.0.8 | Add `Protocol::WEB_SOCKET` (RFC 9220 Extended CONNECT) | **Deliberate fork** — unfiled upstream; branch `feat/extended-connect-websocket-protocol` on `jeremyjpj0916/h3` ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | Stock `h3` 0.0.8 rejects `:protocol=websocket` at the HEADERS layer, making WebSocket-over-HTTP/3 unreachable | Upstream files + merges the variant **and** patches 001/003 are also retired | [docs/upstream-h3-patches/002-…](upstream-h3-patches/002-extended-connect-websocket-protocol/README.md) |
+| `h3` | 0.0.8 | Add `RequestStream::peek_recv_trailers()` for already-buffered trailers before FIN | **Deliberate fork** — unfiled upstream; branch `feat/peek-buffered-trailers-before-fin` on `jeremyjpj0916/h3` ([policy](#deliberate-fork-policy-and-sla)) | Ferrum Edge maintainers | `poll_recv_trailers` buffers trailer HEADERS but waits for terminal FIN; gateway trailer-timeout collapse dropped trailers delivered before delayed FIN | Upstream files + merges the API **and** patches 001/002 are also retired | [docs/upstream-h3-patches/003-…](upstream-h3-patches/003-peek-buffered-trailers-before-fin/README.md) |
 | `tungstenite` | 0.29.0 | `WebSocket::into_inner_with_read_buffer()` (lossless raw takeover) | [snapview/tungstenite-rs#556](https://github.com/snapview/tungstenite-rs/pull/556) | Ferrum Edge maintainers | Tunnel mode lost backend bytes coalesced with the `101` response when dropping to raw relay | **Both** this and tokio-tungstenite#380 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
 | `tokio-tungstenite` | 0.29.0 | `WebSocketStream::into_inner_with_read_buffer()` | [snapview/tokio-tungstenite#380](https://github.com/snapview/tokio-tungstenite/pull/380) | Ferrum Edge maintainers | Same lossless-takeover gap on the async wrapper | **Both** this and tungstenite#556 ship in compatible releases | [docs/upstream-tungstenite-patches/README.md](upstream-tungstenite-patches/README.md) |
 
-> Ownership note: there is no `CODEOWNERS` file yet. Until one exists, the
-> "Ferrum Edge maintainers" own these patches collectively; the upstream `h3`
+> Ownership note: `vendor/`, `deny.toml`, this doc, `docs/upstream-*-patches/`,
+> and the vendored-patch scripts are owned via
+> [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`). Upstream `h3`
 > work is staged from the `jeremyjpj0916/h3` fork referenced in the h3 patch
-> docs. Adding `vendor/`, `deny.toml`, and `docs/upstream-*-patches/` to a
-> `CODEOWNERS` entry is recommended.
+> docs. Patches carried without an upstream PR are governed by the
+> [Deliberate fork policy and SLA](#deliberate-fork-policy-and-sla) below.
+
+### Deliberate fork policy and SLA
+
+Most vendored patches ride an **open upstream PR** (reqwest #3017, h3 #339,
+tungstenite #556 / tokio-tungstenite #380); the weekly
+`scripts/check_vendored_patch_status.sh` polls those and goes red when one
+merges. Two patches — **h3 002** (Extended CONNECT `:protocol=websocket`) and
+**h3 003** (`peek_recv_trailers`) — have **no upstream issue or PR filed yet**.
+They are not an untracked TODO; they are carried as a **deliberate, time-boxed
+fork** of `h3` on `jeremyjpj0916/h3` and are governed as follows:
+
+- **Owner.** The dependency-governance owner in
+  [`.github/CODEOWNERS`](../.github/CODEOWNERS) (`@jeremyjpj0916`) — the same
+  owner for `vendor/`, `deny.toml`, this doc, `docs/upstream-*-patches/`, and
+  the vendored-patch scripts.
+- **Review cadence (SLA).** Every weekly `dependency-audit` run lists each
+  fork-only patch as `NOT YET FILED`. At each run the owner either (a) files the
+  upstream issue/PR and records the numbers in the inventory table, the per-patch
+  `README.md` Status block, **and** the `PATCHES` array in
+  `scripts/check_vendored_patch_status.sh`, or (b) leaves it as a conscious
+  re-affirmation that the fork is still the right call.
+- **Hard checkpoint — no unfiled fork ships in a stable release.** A fork-only
+  patch (no upstream PR link) may **not** survive the first tagged stable release
+  (the schema-freeze milestone in
+  [migrations.md → Stability & Upgrade Contract](migrations.md#when-v002-migrations-start-the-schema-freeze))
+  without either a filed upstream issue/PR link recorded in the inventory table,
+  or an explicit dated re-affirmation
+  (`Deliberate fork — re-affirmed YYYY-MM-DD by <owner>: <reason>`) in the
+  patch's `README.md`. This keeps "not yet filed" from silently becoming
+  permanent in a released product.
+- **Retirement is unchanged.** Whether upstreamed via PR or carried as a fork,
+  each patch retires per its `README.md` retirement plan and the co-vendoring
+  rule (all three h3 patches retire together — see the inventory `Removal
+  trigger` column).
 
 ## Enforcement controls
 
