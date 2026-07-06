@@ -44,9 +44,10 @@ pub struct MeshServiceDiscoverer {
     /// discoverer runs in gateway modes that have no mesh runtime.
     cluster_domain: String,
     /// One-time guard for the "sidecar SD cannot bridge remote-cluster
-    /// workloads east-west for this upstream" warning (non-first / non-HTTP
-    /// selected port, or no `mesh.multi_cluster` in the snapshot), so a 30s
-    /// poll loop does not repeat it forever.
+    /// workloads east-west for this upstream" warning (a non-HTTP-family selected
+    /// port — every HTTP-family port bridges via its per-port SNI alias — or no
+    /// `mesh.multi_cluster` in the snapshot), so a 30s poll loop does not repeat
+    /// it forever.
     warned_sidecar_remote_unbridged: AtomicBool,
     /// One-time guard for the analogous Ambient SD bridge warning. Ambient keeps
     /// direct remote-pod fallback only when no east-west gateway is declared for
@@ -399,23 +400,46 @@ impl MeshServiceDiscoverer {
         &self,
         multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
         service: &MeshService,
+        selected_service_port: Option<&SelectedPort>,
         workload: &Workload,
     ) -> bool {
         let Some(multi_cluster) = multi_cluster else {
             return true;
         };
 
-        // Same FQDN construction as the shared cross-cluster core, so this
-        // valve and the bridge's gateway selection judge the same SNI.
-        let cluster_domain = self.cluster_domain.trim_matches('.');
-        let service_fqdn = format!(
-            "{}.{}.svc.{cluster_domain}",
-            service.name, service.namespace
-        );
+        // Same base FQDN + per-port alias the bridge's `append_ambient_cross_
+        // cluster_targets` would DIAL, derived from the SAME shared helpers, so
+        // this valve and the bridge's gateway selection judge the SAME acceptable
+        // SNI set (codex #2040 Finding C): a gateway that claims only the per-port
+        // alias must both be selectable by the bridge AND count as governing here,
+        // or an alias-only gateway would suppress the direct fallback while the
+        // bridge could not select it (fail closed with no path).
+        let base_fqdn =
+            crate::modes::mesh::cross_cluster_service_base_fqdn(service, &self.cluster_domain);
+        // The per-port alias only differs from the base for a MULTI-port service's
+        // selected HTTP-family port; fall back to the base FQDN alone when the
+        // selected port is absent or not HTTP-family (the bridge itself then stays
+        // fail-closed regardless, so the base-only judgment is safe).
+        let dial_sni = selected_service_port
+            .and_then(|selected| selected.service_port)
+            .and_then(|port| {
+                crate::modes::mesh::service_http_family_ports(service)
+                    .into_iter()
+                    .find(|sp| sp.port == port)
+            })
+            .map(|service_port| {
+                crate::modes::mesh::cross_cluster_service_sni(
+                    service,
+                    service_port,
+                    &self.cluster_domain,
+                )
+            });
+        let dial_sni = dial_sni.as_deref().unwrap_or(&base_fqdn);
+        let acceptable_snis = crate::modes::mesh::east_west_acceptable_snis(&base_fqdn, dial_sni);
         !crate::modes::mesh::east_west_gateway_governs_network(
             multi_cluster,
             workload.network.as_deref(),
-            &service_fqdn,
+            &acceptable_snis,
             &workload.trust_domain,
         )
     }
@@ -560,7 +584,12 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             }
             if is_remote
                 && self.topology == MeshSdTopology::Ambient
-                && !self.ambient_direct_remote_fallback_allowed(multi_cluster, service, workload)
+                && !self.ambient_direct_remote_fallback_allowed(
+                    multi_cluster,
+                    service,
+                    selected_service_port.as_ref(),
+                    workload,
+                )
             {
                 remote_ambient_workloads.push(workload);
                 continue;

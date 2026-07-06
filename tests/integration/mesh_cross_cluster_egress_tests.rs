@@ -473,8 +473,10 @@ fn cross_cluster_target_for_each_http_service_port() {
 
     let upstreams = materialize_all_upstream_targets(mesh, &runtime);
 
-    // First port (8080): exactly one cross-cluster target, routing on the BASE
-    // service FQDN.
+    // Multi-port service (codex #2040 Finding A): EVERY HTTP port — including the
+    // lowest (8080) — routes on an EXPLICIT per-port SNI alias `p<port>.<fqdn>`.
+    // The bare base FQDN routes to NO port, so a client + destination that differ
+    // in which ports they declare cannot cross-wire onto the base.
     let first = upstreams
         .get("__mesh-out-upstream-default-svc-b-8080")
         .expect("first-port upstream must materialize");
@@ -485,19 +487,19 @@ fn cross_cluster_target_for_each_http_service_port() {
     assert_eq!(
         first_cross.len(),
         1,
-        "the first service port must yield exactly one cross-cluster target"
+        "the lowest service port must yield exactly one cross-cluster target"
     );
     assert_eq!(
         first_cross[0]
             .tags
             .get(MESH_EASTWEST_SNI_TAG)
             .map(String::as_str),
-        Some(SVC_B_FQDN),
-        "the first port routes on the base service FQDN"
+        Some("p8080.svc-b.default.svc.cluster.local"),
+        "the lowest port of a MULTI-port service routes on its explicit p<port> alias, not the base FQDN"
     );
 
-    // Second port (9090): now ALSO one cross-cluster target, routing on the
-    // deterministic per-port SNI alias `p9090.<fqdn>`.
+    // Second port (9090): one cross-cluster target, routing on the deterministic
+    // per-port SNI alias `p9090.<fqdn>`.
     let second = upstreams
         .get("__mesh-out-upstream-default-svc-b-9090")
         .expect("second-port upstream must materialize");
@@ -518,6 +520,15 @@ fn cross_cluster_target_for_each_http_service_port() {
         Some("p9090.svc-b.default.svc.cluster.local"),
         "the second port routes on the p<port> SNI alias"
     );
+    // No port of a multi-port service routes on the bare base FQDN.
+    assert!(
+        !upstreams
+            .values()
+            .flatten()
+            .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+            .any(|t| t.tags.get(MESH_EASTWEST_SNI_TAG).map(String::as_str) == Some(SVC_B_FQDN)),
+        "a multi-port service must NOT route any port on the bare base FQDN (codex #2040 Finding A)"
+    );
     // The dial endpoint (identity) is still the east-west gateway for both ports;
     // the per-port SNI alias — not the identity — distinguishes the backend port.
     assert_eq!(
@@ -527,13 +538,15 @@ fn cross_cluster_target_for_each_http_service_port() {
     );
 }
 
-/// Order-independence (issue #2010 phase 3, codex #2040): the base FQDN goes to
-/// the numerically LOWEST HTTP-family port — NOT the first *declared* port — so
-/// two clusters that declare the same service's ports in different orders derive
-/// the SAME SNI per numeric port. Here the ports are declared `[9090, 8080]`
-/// (9090 first); 8080 (lowest) must still get the base FQDN and 9090 the alias.
+/// Order-independence + explicit-port channel (issue #2010 phase 3, codex #2040
+/// Finding A): for a MULTI-port service EVERY port routes on its own explicit
+/// `p<port>.<fqdn>` alias, so two clusters that declare the same service's ports
+/// in different orders — or with different port SETS — derive the SAME SNI per
+/// numeric port and NO port maps onto the bare base FQDN. Here the ports are
+/// declared `[9090, 8080]` (9090 first); both must get their explicit alias
+/// regardless of declaration order, and the base FQDN routes to nothing.
 #[test]
-fn cross_cluster_sni_alias_keys_on_lowest_port_not_declaration_order() {
+fn cross_cluster_sni_alias_keys_on_explicit_port_not_declaration_order() {
     let runtime = sidecar_client_runtime();
 
     let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
@@ -587,7 +600,10 @@ fn cross_cluster_sni_alias_keys_on_lowest_port_not_declaration_order() {
 
     let upstreams = materialize_all_upstream_targets(mesh, &runtime);
 
-    // 8080 is the LOWEST port → base FQDN, even though 9090 was declared first.
+    // Every port of a multi-port service routes on its explicit alias — 8080 on
+    // p8080 (NOT the base FQDN) even though it is lowest, 9090 on p9090 even
+    // though it was declared first. Declaration order and the port set are
+    // irrelevant; the numeric port is the channel.
     let sni_for = |port: u16| -> Option<String> {
         upstreams
             .get(&format!("__mesh-out-upstream-default-svc-b-{port}"))
@@ -600,13 +616,114 @@ fn cross_cluster_sni_alias_keys_on_lowest_port_not_declaration_order() {
     };
     assert_eq!(
         sni_for(8080).as_deref(),
-        Some(SVC_B_FQDN),
-        "the LOWEST port (8080) routes on the base FQDN regardless of declaration order"
+        Some("p8080.svc-b.default.svc.cluster.local"),
+        "the lowest port (8080) of a multi-port service routes on its explicit p<port> alias, never the base FQDN"
     );
     assert_eq!(
         sni_for(9090).as_deref(),
         Some("p9090.svc-b.default.svc.cluster.local"),
         "the higher port (9090) routes on the p<port> alias even though it was declared first"
+    );
+}
+
+/// codex #2040 Finding A (cross-cluster base-port skew fail-closed). Two clusters
+/// can declare DIFFERENT HTTP port sets for the same service. The dialed SNI for
+/// a given numeric port must depend ONLY on whether the DIALING service is
+/// single- or multi-port — never route a multi-port service's port onto the bare
+/// base FQDN — so a client and a destination that disagree on port sets can never
+/// silently cross-wire through a shared base-FQDN channel; a mismatch fails
+/// closed (the missing per-port/base proxy) instead.
+///
+/// Here the SAME service `svc-b` and SAME numeric port 9090 are materialized
+/// under two client shapes: single-port `{9090}` dials the BARE base FQDN, while
+/// multi-port `{8080,9090}` dials `p9090`. The two SNIs DIFFER — there is no
+/// shared base-FQDN mapping for :9090 that a skewed peer could misroute onto.
+#[test]
+fn cross_cluster_multiport_port_never_shares_base_fqdn_channel_with_single_port() {
+    let runtime = sidecar_client_runtime();
+
+    // Extract the cross-cluster dial SNI a client materializes for :9090 given a
+    // service whose HTTP port set is `ports`.
+    let dial_sni_for_9090 = |ports: Vec<u16>| -> Option<String> {
+        let mk_ports = || -> Vec<WorkloadPort> {
+            ports
+                .iter()
+                .map(|&p| WorkloadPort {
+                    port: p,
+                    protocol: AppProtocol::Http,
+                    name: Some(format!("http-{p}")),
+                })
+                .collect()
+        };
+        let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+        local.ports = mk_ports();
+        let mut remote = remote_workload(Some(REMOTE_NETWORK));
+        remote.ports = mk_ports();
+        let service = MeshService {
+            cluster_ips: Vec::new(),
+            name: "svc-b".to_string(),
+            namespace: "default".to_string(),
+            ports: ports
+                .iter()
+                .map(|&p| ServicePort {
+                    port: p,
+                    protocol: AppProtocol::Http,
+                    name: Some(format!("http-{p}")),
+                    target_port: None,
+                })
+                .collect(),
+            workloads: vec![
+                WorkloadRef {
+                    spiffe_id: local.spiffe_id.clone(),
+                },
+                WorkloadRef {
+                    spiffe_id: remote.spiffe_id.clone(),
+                },
+            ],
+            protocol_overrides: std::collections::HashMap::new(),
+        };
+        let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+        // Gateway claims the base FQDN AND both per-port aliases, so selection
+        // never gates this SNI-SHAPE assertion regardless of the port set under
+        // test. (`sni_hosts` must be non-empty — validation rejects a cleared
+        // list — so we enumerate rather than wildcard.)
+        let mut mc = multi_cluster_with_gateway(Some(REMOTE_NETWORK));
+        mc.east_west_gateways[0].sni_hosts = vec![
+            SVC_B_FQDN.to_string(),
+            "p8080.svc-b.default.svc.cluster.local".to_string(),
+            "p9090.svc-b.default.svc.cluster.local".to_string(),
+        ];
+        mesh.multi_cluster = Some(mc);
+        materialize_all_upstream_targets(mesh, &runtime)
+            .get("__mesh-out-upstream-default-svc-b-9090")
+            .and_then(|targets| {
+                targets
+                    .iter()
+                    .find(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+                    .and_then(|t| t.tags.get(MESH_EASTWEST_SNI_TAG).cloned())
+            })
+    };
+
+    // Single-port client: :9090 is the sole port ⇒ bare base FQDN.
+    assert_eq!(
+        dial_sni_for_9090(vec![9090]).as_deref(),
+        Some(SVC_B_FQDN),
+        "a single-port service dials the bare base FQDN for its sole port"
+    );
+    // Multi-port client: :9090 ⇒ explicit p9090 alias, NOT the base FQDN.
+    assert_eq!(
+        dial_sni_for_9090(vec![8080, 9090]).as_deref(),
+        Some("p9090.svc-b.default.svc.cluster.local"),
+        "a multi-port service dials the explicit p<port> alias for :9090, never the base FQDN"
+    );
+    // The two SNIs differ ⇒ no shared base-FQDN channel for :9090 that a skewed
+    // peer (different port set) could silently cross-wire onto — mismatches fail
+    // closed on the absent proxy instead.
+    assert_ne!(
+        dial_sni_for_9090(vec![9090]),
+        dial_sni_for_9090(vec![8080, 9090]),
+        "port :9090 must not resolve to the SAME SNI under single-port vs multi-port shapes \
+         (that shared channel is exactly the codex #2040 Finding A cross-cluster misroute)"
     );
 }
 
@@ -710,6 +827,126 @@ fn no_cross_cluster_target_when_no_gateway_claims_host() {
     assert_eq!(
         cross, 0,
         "no gateway claims svc-b's FQDN, so no cross-cluster target may be materialized"
+    );
+}
+
+/// codex #2040 Finding C: a gateway that lists ONLY the per-port alias SNI
+/// (`p9090.<fqdn>`) — not the base FQDN — must still be SELECTED for the :9090
+/// port being dialed on that alias. Previously selection tested only the base
+/// FQDN, so an alias-only gateway was rejected and the port emitted no
+/// cross-cluster target. The multi-port service's :9090 dials `p9090`, and the
+/// only gateway on the network claims exactly `p9090` — the target must be
+/// emitted, addressed at that gateway.
+#[test]
+fn gateway_selection_accepts_alias_only_gateway_for_dialed_port() {
+    let runtime = sidecar_client_runtime();
+
+    let mk_ports = || -> Vec<WorkloadPort> {
+        vec![
+            WorkloadPort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+            },
+            WorkloadPort {
+                port: 9090,
+                protocol: AppProtocol::Http,
+                name: Some("http-alt".to_string()),
+            },
+        ]
+    };
+    let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    local.ports = mk_ports();
+    let mut remote = remote_workload(Some(REMOTE_NETWORK));
+    remote.ports = mk_ports();
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![
+            ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            },
+            ServicePort {
+                port: 9090,
+                protocol: AppProtocol::Http,
+                name: Some("http-alt".to_string()),
+                target_port: None,
+            },
+        ],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    const ALIAS_9090: &str = "p9090.svc-b.default.svc.cluster.local";
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    // The ONLY gateway on net-b claims JUST the p9090 alias — NOT the base FQDN.
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-a".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![EastWestGateway {
+            name: "ew-net-b-alias-only".to_string(),
+            namespace: "default".to_string(),
+            host: GATEWAY_HOST.to_string(),
+            port: GATEWAY_PORT,
+            sni_hosts: vec![ALIAS_9090.to_string()],
+            trust_domain: Some(td(REMOTE_TRUST_DOMAIN)),
+            network: Some(REMOTE_NETWORK.to_string()),
+        }],
+    });
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+
+    // :9090 dials p9090, which the alias-only gateway claims ⇒ target emitted.
+    let nine = upstreams
+        .get("__mesh-out-upstream-default-svc-b-9090")
+        .expect("9090 upstream");
+    let nine_cross: Vec<_> = nine
+        .iter()
+        .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+        .collect();
+    assert_eq!(
+        nine_cross.len(),
+        1,
+        "an alias-only gateway must be selectable for the port dialing that alias"
+    );
+    assert_eq!(
+        nine_cross[0].host, GATEWAY_HOST,
+        "the alias-only gateway is the selected dial endpoint for :9090"
+    );
+    assert_eq!(
+        nine_cross[0]
+            .tags
+            .get(MESH_EASTWEST_SNI_TAG)
+            .map(String::as_str),
+        Some(ALIAS_9090),
+    );
+
+    // :8080 dials p8080, which NO gateway claims (and the base FQDN is not claimed
+    // either) ⇒ fail closed, no target for :8080.
+    let eight_cross = upstreams
+        .get("__mesh-out-upstream-default-svc-b-8080")
+        .map(|targets| {
+            targets
+                .iter()
+                .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(
+        eight_cross, 0,
+        ":8080 dials p8080 which no gateway claims — fail closed (no base-FQDN fallback)"
     );
 }
 
@@ -1768,9 +2005,10 @@ fn ambient_cross_cluster_skips_unresolvable_named_target_port() {
     );
 }
 
-/// Ambient multi-port east-west (issue #2010 phase 3): EVERY HTTP-family service
-/// port now gets per-pod cross-cluster HBONE targets — the first on the base
-/// service FQDN, additional ports on the `p<port>.<fqdn>` SNI alias.
+/// Ambient multi-port east-west (issue #2010 phase 3; codex #2040 Finding A):
+/// EVERY HTTP-family service port of a multi-port service gets per-pod
+/// cross-cluster HBONE targets on an EXPLICIT `p<port>.<fqdn>` SNI alias —
+/// including the lowest port. No port routes on the bare base FQDN.
 #[test]
 fn ambient_cross_cluster_for_each_http_service_port() {
     let runtime = ambient_client_runtime();
@@ -1840,8 +2078,8 @@ fn ambient_cross_cluster_for_each_http_service_port() {
             .tags
             .get(MESH_EASTWEST_SNI_TAG)
             .map(String::as_str),
-        Some(SVC_B_FQDN),
-        "the first port routes on the base service FQDN"
+        Some("p8080.svc-b.default.svc.cluster.local"),
+        "the lowest port of a MULTI-port service routes on its explicit p<port> alias, not the base FQDN"
     );
     let second_cross: Vec<_> = upstreams
         .get("__mesh-out-upstream-default-svc-b-9090")

@@ -169,16 +169,17 @@ fn east_west_gateway_materializes_per_port_proxies_for_multiport_service() {
     let prepared =
         prepare_gateway_config_for_mesh(config, &east_west_runtime()).expect("east-west prepared");
 
-    // First port → base FQDN passthrough proxy → backend container port 8080.
+    // Multi-port service (codex #2040 Finding A): the lowest port routes on its
+    // EXPLICIT `p8080.<fqdn>` alias, not the bare base FQDN.
     let first = prepared
         .proxies
         .iter()
         .find(|p| {
             p.hosts
                 .iter()
-                .any(|h| h == "reviews.default.svc.cluster.local")
+                .any(|h| h == "p8080.reviews.default.svc.cluster.local")
         })
-        .expect("first-port east-west proxy (base FQDN) must materialise");
+        .expect("first-port east-west proxy (p8080 alias) must materialise");
     assert!(first.passthrough);
     assert_eq!(first.listen_port, Some(15443));
     let first_upstream = prepared
@@ -226,6 +227,111 @@ fn east_west_gateway_materializes_per_port_proxies_for_multiport_service() {
     // The two ports are DISTINCT proxies (distinct ids, distinct SNI hosts) on the
     // shared east-west listen port.
     assert_ne!(first.id, second.id);
+
+    // No auto proxy claims the bare base FQDN for a multi-port service — the base
+    // FQDN routes to NO port, so a peer cluster with a different port set cannot
+    // cross-wire onto it (codex #2040 Finding A). (An operator MAY still add an
+    // explicit gateway on the base FQDN; that is a separate opt-in path.)
+    assert!(
+        !prepared
+            .proxies
+            .iter()
+            .any(|p| p.id.starts_with("__mesh-ew-svc-")
+                && p.hosts
+                    .iter()
+                    .any(|h| h == "reviews.default.svc.cluster.local")),
+        "no auto east-west proxy may claim the bare base FQDN for a multi-port service, got {:?}",
+        prepared
+            .proxies
+            .iter()
+            .map(|p| (&p.id, &p.hosts))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// codex #2040 Finding B (id collision): a MULTI-port service `foo` (ports 8080,
+/// 9090) and a DISTINCT single-port service literally named `foo-p8080` must NOT
+/// clobber each other in the materializer's id-keyed upsert map. The per-port id
+/// separator is `.` (a character a DNS-1035/1123 k8s service name cannot
+/// contain), so `foo`'s :8080 alias id is `__mesh-ew-svc-default-foo.p8080`
+/// while `foo-p8080`'s bare id is `__mesh-ew-svc-default-foo-p8080` (no dot) —
+/// distinct. The pre-`.` scheme (`-p8080`) produced the SAME id for both and one
+/// overwrote the other.
+#[test]
+fn east_west_per_port_ids_do_not_collide_with_literal_p_marker_service_name() {
+    let foo_wl = workload_for("foo", DEFAULT_NAMESPACE, [("app", "foo")], ["10.0.0.1"]);
+    let mut foo = service_for("foo", DEFAULT_NAMESPACE, &[&foo_wl]);
+    foo.ports = vec![
+        ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        },
+        ServicePort {
+            port: 9090,
+            protocol: AppProtocol::Http,
+            name: Some("http-alt".to_string()),
+            target_port: None,
+        },
+    ];
+
+    // A distinct service literally named `foo-p8080` — the id-space collision the
+    // `-p<port>` marker was vulnerable to. Single-port ⇒ port-less bare id.
+    let collide_wl = workload_for(
+        "foo-p8080",
+        DEFAULT_NAMESPACE,
+        [("app", "foo-p8080")],
+        ["10.0.0.2"],
+    );
+    let collide = service_for("foo-p8080", DEFAULT_NAMESPACE, &[&collide_wl]);
+
+    let mesh = mesh_config_with(vec![foo_wl, collide_wl], vec![foo, collide], Vec::new());
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &east_west_runtime()).expect("prepared");
+
+    let has_proxy = |id: &str| prepared.proxies.iter().any(|p| p.id == id);
+    let has_upstream = |id: &str| prepared.upstreams.iter().any(|u| u.id == id);
+
+    // `foo`'s two per-port aliases use the `.p<port>` marker.
+    assert!(
+        has_proxy("__mesh-ew-svc-default-foo.p8080"),
+        "foo :8080 alias proxy must exist with the dotted `.p8080` id, got {:?}",
+        prepared.proxies.iter().map(|p| &p.id).collect::<Vec<_>>()
+    );
+    assert!(has_proxy("__mesh-ew-svc-default-foo.p9090"));
+    assert!(has_upstream("__mesh-ew-upstream-default-foo.p8080"));
+    assert!(has_upstream("__mesh-ew-upstream-default-foo.p9090"));
+
+    // `foo-p8080`'s bare (port-less) id uses the `-p8080` name literally — a
+    // DIFFERENT string from foo's `.p8080` alias, so neither was overwritten.
+    assert!(
+        has_proxy("__mesh-ew-svc-default-foo-p8080"),
+        "the distinct `foo-p8080` service's bare proxy must survive (not clobbered), got {:?}",
+        prepared.proxies.iter().map(|p| &p.id).collect::<Vec<_>>()
+    );
+    assert!(has_upstream("__mesh-ew-upstream-default-foo-p8080"));
+
+    // The dotted alias id and the literal-name bare id are provably distinct.
+    assert_ne!(
+        "__mesh-ew-svc-default-foo.p8080", "__mesh-ew-svc-default-foo-p8080",
+        "the `.p<port>` alias id and the `-p<port>` literal-name id must never coincide"
+    );
+
+    // Both services keep their own backend: foo's alias backends 8080/9090,
+    // foo-p8080's bare upstream backends its 8080 workload port — no cross-wiring.
+    let foo_8080 = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.id == "__mesh-ew-upstream-default-foo.p8080")
+        .expect("foo :8080 upstream");
+    assert!(foo_8080.targets.iter().all(|t| t.host == "10.0.0.1"));
+    let collide_up = prepared
+        .upstreams
+        .iter()
+        .find(|u| u.id == "__mesh-ew-upstream-default-foo-p8080")
+        .expect("foo-p8080 upstream");
+    assert!(collide_up.targets.iter().all(|t| t.host == "10.0.0.2"));
 }
 
 #[test]
@@ -378,8 +484,10 @@ fn east_west_explicit_base_fqdn_keeps_per_port_aliases_routable() {
     let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
     let prepared = prepare_gateway_config_for_mesh(config, &east_west_runtime()).expect("prepared");
 
-    // The BASE auto proxy is suppressed (the explicit entry owns that exact SNI),
-    // so exactly one proxy claims the base FQDN — the explicit one.
+    // A multi-port service aliases EVERY port (p8080, p9090) and materializes NO
+    // auto proxy on the bare base FQDN (codex #2040 Finding A), so the explicit
+    // base-FQDN gateway is the ONLY proxy claiming the base FQDN — it suppresses
+    // nothing (there is no base auto proxy to suppress).
     let base_claimants = prepared
         .proxies
         .iter()
@@ -404,18 +512,21 @@ fn east_west_explicit_base_fqdn_keeps_per_port_aliases_routable() {
         "the surviving base claimant is the explicit east-west gateway proxy"
     );
 
-    // The p9090 alias auto proxy IS still materialized — the alias port stays
-    // routable to the local workload (never fails closed).
-    assert!(
-        prepared
-            .proxies
-            .iter()
-            .any(|p| p.id.starts_with("__mesh-ew-svc-")
-                && p.hosts
-                    .iter()
-                    .any(|h| h == "p9090.reviews.default.svc.cluster.local")),
-        "the p9090 alias auto proxy must survive so the non-base port stays routable"
-    );
+    // BOTH per-port alias auto proxies (p8080 AND p9090) survive — the explicit
+    // base-FQDN entry does not overlap either alias, so every port stays routable
+    // to the local workload (never fails closed).
+    for alias in [
+        "p8080.reviews.default.svc.cluster.local",
+        "p9090.reviews.default.svc.cluster.local",
+    ] {
+        assert!(
+            prepared
+                .proxies
+                .iter()
+                .any(|p| p.id.starts_with("__mesh-ew-svc-") && p.hosts.iter().any(|h| h == alias)),
+            "the {alias} alias auto proxy must survive so that port stays routable"
+        );
+    }
 }
 
 #[test]
