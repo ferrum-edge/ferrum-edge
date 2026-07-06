@@ -9729,10 +9729,23 @@ async fn connect_mesh_websocket_backend(
             // Host over the relay); `path_and_query` is the preserved client
             // `:path`. The relay forwards these plaintext bytes to the loopback
             // app, which completes the upgrade.
-            let inner_host = match client_host {
-                Some(host) if proxy.preserve_host_header && !host.is_empty() => host.to_string(),
-                _ => hbone_pool::authority_for_host_port(&target.host, target.port),
-            };
+            //
+            // The non-preserved Host fallback uses `app_host` (the real pod
+            // addr from `mesh.hbone_authority_host`), NOT `target.host`: for a
+            // cross-cluster target `target.host` is the scoped synthetic
+            // `mesh-xc-hbone|...` identity, so `ws://{target.host}...` is an
+            // invalid WS URI that `into_client_request()` would REJECT after the
+            // tunnel is already established. In-cluster `app_host == target.host`
+            // (the tag is absent), so this stays byte-identical there. Mirrors
+            // `proxy_to_backend_hbone`, whose backend Host header is
+            // `authority_for_host_port(app_host, target.port)` when the client
+            // Host is not preserved (issue #2010 codex).
+            let inner_host = hbone_pool::hbone_ws_inner_host(
+                client_host,
+                proxy.preserve_host_header,
+                app_host,
+                target.port,
+            );
             let ws_url = format!("ws://{inner_host}{path_and_query}");
             let mut ws_request = ws_url.into_client_request()?;
             // Force the routing Host the destination app matches on (the URL
@@ -9760,8 +9773,10 @@ async fn connect_mesh_websocket_backend(
             // `HbonePoolError` downcast.
             let connect_timeout =
                 std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
-            let handshake_authority =
-                hbone_pool::authority_for_host_port(&target.host, target.port);
+            // Use `app_host` (real pod addr) for the error surface too — for a
+            // cross-cluster target `target.host` is the synthetic identity, not
+            // a dialable authority; in-cluster this is byte-identical.
+            let handshake_authority = hbone_pool::authority_for_host_port(app_host, target.port);
             let (stream, response) = match tokio::time::timeout(
                 connect_timeout,
                 client_async_with_config(

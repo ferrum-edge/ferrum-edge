@@ -1970,6 +1970,37 @@ pub(crate) fn authority_for_host_port(host: &str, port: u16) -> String {
     }
 }
 
+/// The inner HTTP/1.1 WebSocket handshake `Host` for an Ambient HBONE WS egress
+/// spoken THROUGH the byte tunnel.
+///
+/// When the route preserves the client Host (`preserve_host_header`) and the
+/// client actually sent a non-empty Host, that Host rides through (mirroring the
+/// HTTP HBONE relay, which forwards the client Host). Otherwise the fallback is
+/// `authority_for_host_port(app_host, port)` — the REAL destination pod addr
+/// (`mesh.hbone_authority_host`), NOT `target.host`.
+///
+/// This distinction is load-bearing for CROSS-CLUSTER targets: their
+/// `target.host` is the scoped synthetic `mesh-xc-hbone|...` identity, which is
+/// not a valid URI authority. Falling back to it would make
+/// `ws://{target.host}...` an invalid WS URI that `into_client_request()`
+/// rejects AFTER the tunnel is already established (issue #2010 codex). For
+/// IN-CLUSTER targets `app_host == target.host` (the authority-host tag is
+/// absent), so the fallback is byte-identical to the pre-fix behavior. Mirrors
+/// `proxy_to_backend_hbone`, whose backend `Host` header is
+/// `authority_for_host_port(app_host, port)` when the client Host is not
+/// preserved.
+pub fn hbone_ws_inner_host(
+    client_host: Option<&str>,
+    preserve_host_header: bool,
+    app_host: &str,
+    port: u16,
+) -> String {
+    match client_host {
+        Some(host) if preserve_host_header && !host.is_empty() => host.to_string(),
+        _ => authority_for_host_port(app_host, port),
+    }
+}
+
 fn h2_window_sizes(pool_config: &PoolConfig) -> (u32, u32) {
     if pool_config.http2_adaptive_window {
         (

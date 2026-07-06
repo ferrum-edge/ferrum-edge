@@ -5675,6 +5675,93 @@ async fn functional_mesh_ambient_cross_cluster_ws_preserves_request_path() {
     );
 }
 
+/// Cross-cluster WebSocket HOST-FALLBACK regression (Ambient HBONE, issue #2010
+/// codex round 2): with a route that does NOT preserve the client Host
+/// (`preserve_host_header == false`, as ordinary gateway/SD proxies use) — or a
+/// client that sends no Host at all — the inner WebSocket handshake `Host` must
+/// fall back to the REAL destination pod addr (`app_host`, from
+/// `mesh.hbone_authority_host`), NOT to `target.host`.
+///
+/// For a cross-cluster target `target.host` is the scoped synthetic
+/// `mesh-xc-hbone|...` identity, which is not a valid URI authority, so a
+/// `target.host` fallback would build `ws://mesh-xc-hbone|...` and
+/// `into_client_request()` would ABORT the upgrade AFTER the HBONE tunnel is
+/// already established. The fix carries `app_host` into that fallback (mirroring
+/// `proxy_to_backend_hbone`, whose backend Host is `app_host` when the client
+/// Host is not preserved), so the WS URI stays valid and the upgrade completes.
+///
+/// This asserts the exact selection performed at the inner-request build site in
+/// `connect_mesh_websocket_backend` via the shared `hbone_ws_inner_host` helper.
+/// It is a focused-logic regression rather than a full A→B→C e2e because mesh
+/// materialization hardwires the outbound egress route to
+/// `preserve_host_header = true` (and outbound routing requires the Host), so no
+/// mesh fixture can drive the `preserve_host_header == false` branch end-to-end;
+/// the helper is the single source of the Host used by both the WS byte-tunnel
+/// handshake and the parallel `proxy_to_backend_hbone` relay. Mirrors the
+/// `functional_mesh_ambient_cross_cluster_ws_*` fixture's cross-cluster shape
+/// (synthetic `mesh-xc-hbone|...` host + real pod `app_host`). CI-validated
+/// (not run locally under this change).
+#[test]
+fn functional_mesh_ambient_cross_cluster_ws_host_fallback_uses_app_host() {
+    use ferrum_edge::proxy::hbone_pool::hbone_ws_inner_host;
+
+    // Cross-cluster shape: `target.host` is the scoped synthetic identity that is
+    // NOT a valid URI authority; `app_host` is the real remote pod addr the dest
+    // relay dials (what `mesh.hbone_authority_host` carries in production).
+    let synthetic_target_host = "mesh-xc-hbone|10.9.9.9|15443|10.244.5.5";
+    let app_host = "10.244.5.5";
+    let port = 8080u16;
+
+    // preserve_host_header == false + a present client Host ⇒ fallback to
+    // `app_host` (the fixed behavior), never the synthetic `target.host`.
+    let inner = hbone_ws_inner_host(
+        Some("svc-c.ferrum.svc.cluster.local"),
+        false,
+        app_host,
+        port,
+    );
+    assert_eq!(
+        inner, "10.244.5.5:8080",
+        "with preserve_host_header=false the cross-cluster WS inner Host must be the real pod \
+         app_host, so `ws://{inner}` is a valid upgrade URI"
+    );
+    assert!(
+        !inner.contains(synthetic_target_host),
+        "the cross-cluster WS inner Host must never fall back to the synthetic `target.host` \
+         (`{synthetic_target_host}`), which is an invalid WS URI authority"
+    );
+
+    // No client Host (client omitted it) ⇒ same `app_host` fallback regardless of
+    // preserve_host_header, so the upgrade URI is still valid.
+    assert_eq!(
+        hbone_ws_inner_host(None, true, app_host, port),
+        "10.244.5.5:8080",
+        "an absent client Host must fall back to the real pod app_host"
+    );
+    assert_eq!(
+        hbone_ws_inner_host(Some(""), true, app_host, port),
+        "10.244.5.5:8080",
+        "an empty client Host must fall back to the real pod app_host"
+    );
+
+    // preserve_host_header == true + a real client Host ⇒ the client Host rides
+    // through unchanged (the existing preserved-Host path, unregressed).
+    assert_eq!(
+        hbone_ws_inner_host(Some("svc-c.ferrum.svc.cluster.local"), true, app_host, port),
+        "svc-c.ferrum.svc.cluster.local",
+        "a preserved non-empty client Host must ride through unchanged"
+    );
+
+    // IN-CLUSTER invariant: `app_host == target.host` (no authority-host tag), so
+    // the fallback is byte-identical to the pre-fix `target.host` behavior.
+    let in_cluster_host = "orders.default.svc.cluster.local";
+    assert_eq!(
+        hbone_ws_inner_host(None, false, in_cluster_host, port),
+        "orders.default.svc.cluster.local:8080",
+        "in-cluster targets (app_host == target.host) keep the prior fallback byte-for-byte"
+    );
+}
+
 // ── Localized file config source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) ────────
 
 /// JSON mesh document equivalent of `inbound_authz_slice`: the same routing +
