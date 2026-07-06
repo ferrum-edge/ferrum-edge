@@ -1773,13 +1773,55 @@ pub(crate) fn supports_native_http3_backend(
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
 ) -> bool {
-    let effective_proxy = resolve_effective_proxy_for_target(proxy, upstream_target);
-    let proxy = effective_proxy.as_ref();
+    let capability_proxy = resolve_backend_capability_proxy_for_target(proxy, upstream_target);
+    let proxy = capability_proxy.as_ref();
     proxy.dispatch_kind == DispatchKind::HttpsPool
-        && state
-            .backend_capabilities
-            .get(proxy, upstream_target)
-            .is_some_and(|record| record.plain_http.h3.is_supported())
+        && get_backend_capability_for_target(
+            state.backend_capabilities.as_ref(),
+            proxy,
+            upstream_target,
+        )
+        .is_some_and(|record| record.plain_http.h3.is_supported())
+}
+
+/// Resolve the proxy shape used to build backend capability keys for a concrete
+/// target. Startup probing uses [`BackendCapabilityProbeTarget::from_proxy`],
+/// which first applies target-scoped policy/TLS overrides and then keys the
+/// registry from that effective proxy plus the target host/port. Request-path
+/// lookups and live downgrades must mirror that key exactly or they can miss a
+/// Supported probe record and/or write Unsupported to the base proxy key.
+fn resolve_backend_capability_proxy_for_target<'a>(
+    proxy: &'a Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> std::borrow::Cow<'a, Proxy> {
+    resolve_effective_proxy_for_target(proxy, upstream_target)
+}
+
+fn get_backend_capability_for_target(
+    registry: &BackendCapabilityRegistry,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> Option<Arc<BackendCapabilityRecord>> {
+    let capability_proxy = resolve_backend_capability_proxy_for_target(proxy, upstream_target);
+    registry.get(capability_proxy.as_ref(), upstream_target)
+}
+
+fn mark_h3_unsupported_for_backend_target(
+    registry: &BackendCapabilityRegistry,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) {
+    let capability_proxy = resolve_backend_capability_proxy_for_target(proxy, upstream_target);
+    registry.mark_h3_unsupported(capability_proxy.as_ref(), upstream_target);
+}
+
+fn mark_h2_tls_unsupported_for_backend_target(
+    registry: &BackendCapabilityRegistry,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) -> bool {
+    let capability_proxy = resolve_backend_capability_proxy_for_target(proxy, upstream_target);
+    registry.mark_h2_tls_unsupported(capability_proxy.as_ref(), upstream_target)
 }
 
 /// True when an `ErrorClass` represents an H3 / QUIC transport-level
@@ -17006,9 +17048,11 @@ async fn handle_proxy_request_inner(
             // before the attempt — but it does affect the next iteration
             // IF the LB rotates to a target that gets recomputed here.
             if current_dispatch_h3 && is_h3_transport_failure(&result) {
-                state
-                    .backend_capabilities
-                    .mark_h3_unsupported(&proxy, current_target.as_deref());
+                mark_h3_unsupported_for_backend_target(
+                    state.backend_capabilities.as_ref(),
+                    &proxy,
+                    current_target.as_deref(),
+                );
             }
             final_upstream_target = current_target.clone();
         }
@@ -18626,10 +18670,8 @@ pub(crate) fn reqwest_dispatch_is_http1_only(
     // `proxy_to_backend`'s direct-H2 fork keys this exact verdict
     // (`record.plain_http.h2_tls == Unsupported`) to bypass the H2 pool and fall
     // to reqwest-H1.
-    // Lookup is the same alloc-free thread-local-keyed `get` the H2 fork uses.
-    state
-        .backend_capabilities
-        .get(proxy, upstream_target)
+    // Lookup uses the same target-effective capability key as the H2 fork.
+    get_backend_capability_for_target(state.backend_capabilities.as_ref(), proxy, upstream_target)
         .is_some_and(|record| {
             matches!(
                 record.plain_http.h2_tls,
@@ -19661,9 +19703,11 @@ async fn proxy_to_backend(
                 error_class = ?resp.error_class,
                 "H3 backend transport failed; downgrading cached capability so subsequent requests route via reqwest"
             );
-            state
-                .backend_capabilities
-                .mark_h3_unsupported(proxy, upstream_target);
+            mark_h3_unsupported_for_backend_target(
+                state.backend_capabilities.as_ref(),
+                proxy,
+                upstream_target,
+            );
         }
         return backend_dispatch_response(resp, body_bytes, backend_admission_permits);
     }
@@ -19679,7 +19723,11 @@ async fn proxy_to_backend(
             resolve_backend_connection_proxy_for_target(proxy, upstream_target);
         let direct_h2_proxy = direct_h2_effective_proxy.as_ref();
         let requires_direct_h2_for_sni = direct_h2_proxy.resolved_tls.sni.is_some();
-        let direct_h2_capability = state.backend_capabilities.get(proxy, upstream_target);
+        let direct_h2_capability = get_backend_capability_for_target(
+            state.backend_capabilities.as_ref(),
+            direct_h2_proxy,
+            upstream_target,
+        );
         let direct_h2_known_unsupported = direct_h2_capability
             .as_ref()
             .is_some_and(|record| matches!(record.plain_http.h2_tls, ProtocolSupport::Unsupported));
@@ -19751,9 +19799,11 @@ async fn proxy_to_backend(
                         // direct-H2 handshake + ALPN-fallback cost until the
                         // 24 h refresh re-probes. Downgrade here so subsequent
                         // requests go straight to reqwest.
-                        let downgraded = state
-                            .backend_capabilities
-                            .mark_h2_tls_unsupported(proxy, upstream_target);
+                        let downgraded = mark_h2_tls_unsupported_for_backend_target(
+                            state.backend_capabilities.as_ref(),
+                            direct_h2_proxy,
+                            upstream_target,
+                        );
                         if requires_direct_h2_for_sni {
                             if downgraded {
                                 warn!(
@@ -31546,9 +31596,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn supports_native_h3_uses_target_effective_capability_key() {
-        let state = make_test_proxy_state(GatewayConfig::default());
+    fn proxy_with_target_effective_tls_override() -> (Proxy, UpstreamTarget) {
         let mut proxy = warmup_test_proxy("p", BackendScheme::Https, "template.test", 443);
         proxy.resolved_tls.sni = Some("base.mesh.internal".to_string());
 
@@ -31572,6 +31620,14 @@ mod tests {
             locality: None,
             path: None,
         };
+
+        (proxy, target)
+    }
+
+    #[tokio::test]
+    async fn supports_native_h3_uses_target_effective_capability_key() {
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let (proxy, target) = proxy_with_target_effective_tls_override();
         let probe = BackendCapabilityProbeTarget::from_proxy(&proxy, Some(&target));
         let mut record = BackendCapabilityRecord::default();
         record.plain_http.h3 = ProtocolSupport::Supported;
@@ -31587,6 +31643,78 @@ mod tests {
         assert!(
             supports_native_http3_backend(&state, &proxy, Some(&target)),
             "native-H3 decision must resolve the same target-effective capability key as probing"
+        );
+    }
+
+    #[test]
+    fn h3_downgrade_uses_target_effective_capability_key() {
+        let registry = BackendCapabilityRegistry::new();
+        let (proxy, target) = proxy_with_target_effective_tls_override();
+        let probe = BackendCapabilityProbeTarget::from_proxy(&proxy, Some(&target));
+        let mut record = BackendCapabilityRecord::default();
+        record.plain_http.h3 = ProtocolSupport::Supported;
+        registry.upsert(probe.key.clone(), record);
+
+        assert!(
+            registry.get(&proxy, Some(&target)).is_none(),
+            "base proxy lookup should miss the target-effective probe key"
+        );
+
+        mark_h3_unsupported_for_backend_target(&registry, &proxy, Some(&target));
+
+        let capability_proxy = resolve_backend_capability_proxy_for_target(&proxy, Some(&target));
+        let fetched = registry
+            .get(capability_proxy.as_ref(), Some(&target))
+            .expect("H3 downgrade must hit the existing target-effective record");
+        assert_eq!(fetched.plain_http.h3, ProtocolSupport::Unsupported);
+        assert!(
+            registry.get(&proxy, Some(&target)).is_none(),
+            "H3 downgrade must not create or mutate the base proxy key"
+        );
+    }
+
+    #[test]
+    fn direct_h2_lookup_and_downgrade_use_target_effective_capability_key() {
+        let registry = BackendCapabilityRegistry::new();
+        let (proxy, target) = proxy_with_target_effective_tls_override();
+        let probe = BackendCapabilityProbeTarget::from_proxy(&proxy, Some(&target));
+        let mut record = BackendCapabilityRecord::default();
+        record.plain_http.h1 = ProtocolSupport::Supported;
+        record.plain_http.h2_tls = ProtocolSupport::Supported;
+        record.grpc_transport.h2_tls = ProtocolSupport::Supported;
+        registry.upsert(probe.key.clone(), record);
+
+        assert!(
+            registry.get(&proxy, Some(&target)).is_none(),
+            "base proxy lookup should miss the target-effective H2 record"
+        );
+
+        let direct_h2_proxy = resolve_backend_connection_proxy_for_target(&proxy, Some(&target));
+        let direct_h2_record =
+            get_backend_capability_for_target(&registry, direct_h2_proxy.as_ref(), Some(&target))
+                .expect("direct-H2 lookup must hit the target-effective record");
+        assert_eq!(
+            direct_h2_record.plain_http.h2_tls,
+            ProtocolSupport::Supported
+        );
+
+        assert!(mark_h2_tls_unsupported_for_backend_target(
+            &registry,
+            direct_h2_proxy.as_ref(),
+            Some(&target)
+        ));
+
+        let downgraded =
+            get_backend_capability_for_target(&registry, direct_h2_proxy.as_ref(), Some(&target))
+                .expect("direct-H2 downgrade must update the target-effective record");
+        assert_eq!(downgraded.plain_http.h2_tls, ProtocolSupport::Unsupported);
+        assert_eq!(
+            downgraded.grpc_transport.h2_tls,
+            ProtocolSupport::Unsupported
+        );
+        assert!(
+            registry.get(&proxy, Some(&target)).is_none(),
+            "direct-H2 downgrade must not create or mutate the base proxy key"
         );
     }
 
