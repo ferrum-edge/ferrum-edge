@@ -76,7 +76,7 @@ Default behavior — compress long user prompts to ~50%:
 
 ```json
 {
-  "name": "ai_prompt_compressor",
+  "plugin_name": "ai_prompt_compressor",
   "config": {}
 }
 ```
@@ -85,7 +85,7 @@ Aggressive compression of both user and system messages, protecting a span:
 
 ```json
 {
-  "name": "ai_prompt_compressor",
+  "plugin_name": "ai_prompt_compressor",
   "config": {
     "compress_roles": ["user", "system"],
     "target_ratio": 0.35,

@@ -483,3 +483,117 @@ async fn before_proxy_skips_get_requests() {
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(ctx.metadata.get("request_body"), Some(&original));
 }
+
+// ─── Codex review regressions ────────────────────────────────────────────────
+
+#[tokio::test]
+async fn all_verbatim_prompt_does_not_panic() {
+    // A long prompt that tokenizes entirely into protected/verbatim tokens has
+    // zero scored words; the compressor must not panic on `clamp(1, 0)`.
+    let plugin = compressor(5, 0.5);
+    let numbers: String = (4000..4080)
+        .map(|n| n.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let body = chat_body("user", &numbers);
+    // No scored words → nothing to drop → passthrough (None), and above all no panic.
+    assert!(transform(&plugin, &body).await.is_none());
+
+    let code = format!(
+        "```\n{}\n```",
+        "let value = compute_widget(config);\n".repeat(20)
+    );
+    let code_body = chat_body("user", &code);
+    assert!(transform(&plugin, &code_body).await.is_none());
+}
+
+#[tokio::test]
+async fn urls_wrapped_in_punctuation_are_preserved() {
+    let plugin = compressor(5, 0.3);
+    let content = "Please read the cited references very carefully before answering \
+         because they contain the authoritative details, for example \
+         (https://example.com/ref/one) and also <https://example.com/ref/two> which \
+         must both survive even under an aggressive compression ratio setting."
+        .to_string();
+    let body = chat_body("user", &content);
+    let out = transform(&plugin, &body).await.expect("should compress");
+    let compressed = first_message_content(&out);
+    assert!(
+        compressed.contains("https://example.com/ref/one"),
+        "parenthesized URL must be preserved: {compressed:?}"
+    );
+    assert!(
+        compressed.contains("https://example.com/ref/two"),
+        "angle-bracketed URL must be preserved: {compressed:?}"
+    );
+}
+
+#[tokio::test]
+async fn non_post_body_skipped_by_context_hook() {
+    let plugin = compressor(5, 0.5);
+    let bytes = serde_json::to_vec(&chat_body("user", &long_prompt_text())).unwrap();
+    let headers = json_headers();
+
+    let mut put_ctx = create_test_context();
+    put_ctx.method = "PUT".to_string();
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut put_ctx,
+                &bytes,
+                Some("application/json"),
+                &headers
+            )
+            .await
+            .is_none(),
+        "non-POST bodies must not be compressed even when buffered"
+    );
+
+    let mut post_ctx = create_test_context();
+    post_ctx.method = "POST".to_string();
+    assert!(
+        plugin
+            .transform_request_body_with_context(
+                &mut post_ctx,
+                &bytes,
+                Some("application/json"),
+                &headers
+            )
+            .await
+            .is_some(),
+        "POST bodies are still compressed"
+    );
+}
+
+#[tokio::test]
+async fn non_post_method_pseudo_header_skips_base_hook() {
+    let plugin = compressor(5, 0.5);
+    let bytes = serde_json::to_vec(&chat_body("user", &long_prompt_text())).unwrap();
+    let mut headers = json_headers();
+    headers.insert(":method".to_string(), "PUT".to_string());
+    assert!(
+        plugin
+            .transform_request_body(&bytes, Some("application/json"), &headers)
+            .await
+            .is_none()
+    );
+}
+
+#[test]
+fn oversized_content_length_skips_buffering() {
+    let plugin = AiPromptCompressor::new(&json!({"max_scan_bytes": 100})).unwrap();
+    let mut ctx = post_ctx(&chat_body("user", "hello"));
+    ctx.headers
+        .insert("content-length".to_string(), "1000".to_string());
+    assert!(
+        !plugin.should_buffer_request_body(&ctx),
+        "a declared body over max_scan_bytes should not force buffering"
+    );
+
+    ctx.headers
+        .insert("content-length".to_string(), "50".to_string());
+    assert!(
+        plugin.should_buffer_request_body(&ctx),
+        "a body within the cap should still buffer"
+    );
+}

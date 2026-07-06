@@ -74,6 +74,7 @@ const PLUGIN_NAMES_UNDER_TEST: &[&str] = &[
     "ai_request_guard",
     "ai_rate_limiter",
     "ai_prompt_shield",
+    "ai_prompt_compressor",
     "ai_response_guard",
     "ai_semantic_cache",
     "ai_semantic_firewall",

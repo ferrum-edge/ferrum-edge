@@ -187,6 +187,26 @@ impl AiPromptCompressor {
         Some((serialized, stats))
     }
 
+    /// Shared wire-path compression used by both `transform_request_body` and
+    /// its context-aware variant: skip non-JSON and transport-encoded bodies,
+    /// otherwise return the compressed bytes (or `None` when unchanged).
+    fn compress_wire_body(
+        &self,
+        body: &[u8],
+        content_type: Option<&str>,
+        request_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        if let Some(ct) = content_type
+            && !is_json_content_type(ct)
+        {
+            return None;
+        }
+        if has_non_identity_content_encoding(request_headers) {
+            return None;
+        }
+        self.compress_body(body).map(|(bytes, _stats)| bytes)
+    }
+
     /// Walk the OpenAI-shaped request `Value`, compressing eligible prompt text
     /// in place and accumulating token stats.
     fn compress_json(&self, json: &mut Value) -> CompressionStats {
@@ -352,6 +372,10 @@ impl Plugin for AiPromptCompressor {
                 .get("content-type")
                 .is_some_and(|ct| is_json_content_type(ct))
             && !has_non_identity_content_encoding(&ctx.headers)
+            // A body already over the scan cap can never be compressed, so do
+            // not force buffering (and lose the streaming / direct-backend fast
+            // path) just to return it unchanged.
+            && !content_length_exceeds(&ctx.headers, self.max_scan_bytes)
     }
 
     async fn before_proxy(
@@ -405,15 +429,32 @@ impl Plugin for AiPromptCompressor {
         content_type: Option<&str>,
         request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if let Some(ct) = content_type
-            && !is_json_content_type(ct)
+        // The HTTP/3 cross-protocol path invokes this variant without a
+        // `RequestContext`. Honor a `:method` pseudo-header when present so a
+        // buffered non-POST body is still skipped; H1/H2 use the context-aware
+        // variant below, which gates on the real request method.
+        if request_headers
+            .get(":method")
+            .is_some_and(|method| !method.eq_ignore_ascii_case("POST"))
         {
             return None;
         }
-        if has_non_identity_content_encoding(request_headers) {
+        self.compress_wire_body(body, content_type, request_headers)
+    }
+
+    async fn transform_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        request_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        // Only compress POST bodies, even when a retry or another body-buffering
+        // plugin forced buffering that bypassed `should_buffer_request_body`.
+        if ctx.method != "POST" {
             return None;
         }
-        self.compress_body(body).map(|(bytes, _stats)| bytes)
+        self.compress_wire_body(body, content_type, request_headers)
     }
 }
 
@@ -439,6 +480,15 @@ fn record_stats_metadata(ctx: &mut RequestContext, stats: &CompressionStats) {
         "ai_prompt_compressor.fields_compressed".to_string(),
         stats.fields_compressed.to_string(),
     );
+}
+
+/// True when a declared `Content-Length` exceeds `cap`. A missing or
+/// unparseable length returns `false` (buffer and let the byte gate decide).
+fn content_length_exceeds(headers: &HashMap<String, String>, cap: usize) -> bool {
+    headers
+        .get("content-length")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .is_some_and(|len| len > cap as u64)
 }
 
 /// True when `content-encoding` marks the body as anything other than
@@ -560,6 +610,13 @@ fn statistical_compress_masked(text: &str, ratio: f32, preserved: &[(usize, usiz
         scored.push((i, word_score(token, &freq)));
     }
 
+    // Every token is verbatim (all code/URLs/numbers/identifiers) — there is
+    // nothing to score or drop, so keep them all rather than panicking on
+    // `clamp(1, 0)`. Both request-path hooks reach here, so this must not abort.
+    if word_count == 0 {
+        return reconstruct(&tokens, &keep);
+    }
+
     // Keep at least one word; criticals count toward the budget.
     let target_keep = ((ratio * word_count as f32).ceil() as usize).clamp(1, word_count);
     let remaining = target_keep.saturating_sub(critical_count);
@@ -668,7 +725,11 @@ fn tokenize<'a>(text: &'a str, preserved: &[(usize, usize)]) -> Vec<Token<'a>> {
         let in_preserved = preserved.iter().any(|&(s, e)| start < e && s < end);
         let core: &str =
             unit.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '\''));
-        if in_preserved || core.is_empty() || is_protected_word(core) {
+        // `contains_url` catches URLs wrapped in punctuation — Markdown
+        // `(https://…)`, `<https://…>`, `[text](https://…)` — that the
+        // leading-scheme fast path above misses; such a token stays verbatim so
+        // links are never scored and dropped.
+        if in_preserved || core.is_empty() || is_protected_word(core) || contains_url(unit) {
             push_verbatim(&mut tokens, unit, had_newline);
         } else {
             tokens.push(Token {
@@ -697,6 +758,12 @@ fn push_verbatim<'a>(tokens: &mut Vec<Token<'a>>, text: &'a str, leading_newline
         verbatim: true,
         leading_newline,
     });
+}
+
+/// True when `s` embeds an `http(s)://` URL, including when it is wrapped in
+/// punctuation such as `(https://…)` or `<https://…>`.
+fn contains_url(s: &str) -> bool {
+    s.contains("http://") || s.contains("https://")
 }
 
 /// A word whose form should never be split or dropped: contains a digit, is an
