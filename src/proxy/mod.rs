@@ -14306,8 +14306,9 @@ async fn handle_proxy_request_inner(
         //     (HTTP-first), mirroring the WebSocket cross-cluster guards.
         //   * Same-cluster Ambient `mesh.hbone` targets: the HBONE inner
         //     protocol is HTTP/1.1 over a byte tunnel, which cannot carry the
-        //     HTTP/2 trailers gRPC requires — a documented residual
-        //     (docs/mesh.md), fail closed rather than silently corrupt.
+        //     HTTP/2 trailers gRPC requires — an explicit non-goal (see the
+        //     out-of-scope list in docs/mesh_supported_matrix.md), fail
+        //     closed rather than silently corrupt.
         //   * `MeshMtls` is normally unreachable here (the fall-through above
         //     routes it down the generic mesh path) — refuse defensively.
         // Refuse cleanly with a gRPC UNAVAILABLE (14, the gRPC analog of a 502
