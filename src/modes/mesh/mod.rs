@@ -1911,97 +1911,113 @@ fn build_east_west_service_proxies_and_upstreams(
     let now = chrono::Utc::now();
 
     for service in &mesh_slice.services {
-        // Build upstream targets from workloads that belong to this service.
-        let targets = build_east_west_service_targets(
-            service,
-            &mesh_slice.workloads,
-            mesh_slice.multi_cluster.as_ref(),
-        );
-        if targets.is_empty() {
-            debug!(
-                service = %service.name,
-                namespace = %service.namespace,
-                "Skipping east-west service with no reachable workload targets"
+        // MULTI-PORT east-west (issue #2010 phase 3): materialize ONE
+        // SNI-passthrough proxy per HTTP-family service port. The first declared
+        // port keeps the base service FQDN as its SNI; each additional port gets
+        // the deterministic `p<port>.<fqdn>` alias (`cross_cluster_service_sni`)
+        // so one gateway routes many ports of one service by SNI. Non-HTTP-family
+        // ports get no east-west proxy (raw-TCP/UDP cross-cluster is a later
+        // phase). A single-port service materializes exactly one proxy on the
+        // base FQDN, byte-identical to the pre-multi-port behavior.
+        for service_port in service_http_family_ports(service) {
+            // Build upstream targets for THIS service port.
+            let targets = build_east_west_service_targets(
+                service,
+                service_port,
+                &mesh_slice.workloads,
+                mesh_slice.multi_cluster.as_ref(),
             );
-            continue;
-        }
+            if targets.is_empty() {
+                debug!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    service_port = service_port.port,
+                    "Skipping east-west service port with no reachable workload targets"
+                );
+                continue;
+            }
 
-        let cluster_domain = cluster_domain.trim_matches('.');
-        let sni_hostname = format!(
-            "{}.{}.svc.{}",
-            service.name, service.namespace, cluster_domain
-        );
+            let sni_hostname = cross_cluster_service_sni(service, service_port, cluster_domain);
 
-        // An explicit `EastWestGateway.sni_hosts` entry takes precedence over the
-        // auto-materialized local-service proxy: materializing both yields two
-        // TCP passthrough proxies claiming the same SNI on the shared east-west
-        // listen port, which `validate_stream_proxies` rejects as overlapping
-        // hosts — silently dropping the operator's explicit route. Skip the auto
-        // proxy (and its upstream) so the override survives. Use the SAME
-        // wildcard-aware `hosts_overlap` semantics validation uses (an exact
-        // match would miss a wildcard explicit entry); guard on non-empty so an
-        // absent explicit list (a catch-all under `hosts_overlap`) never
-        // suppresses every auto proxy.
-        let auto_sni_lower = sni_hostname.to_ascii_lowercase();
-        if !explicit_sni_hosts.is_empty()
-            && crate::config::types::hosts_overlap(
-                std::slice::from_ref(&auto_sni_lower),
-                explicit_sni_hosts,
-            )
-        {
-            debug!(
-                service = %service.name,
-                namespace = %service.namespace,
-                sni = %sni_hostname,
-                "Skipping east-west auto-materialization; an explicit EastWestGateway already owns this SNI host"
+            // An explicit `EastWestGateway.sni_hosts` entry takes precedence over
+            // the auto-materialized local-service proxy: materializing both yields
+            // two TCP passthrough proxies claiming the same SNI on the shared
+            // east-west listen port, which `validate_stream_proxies` rejects as
+            // overlapping hosts — silently dropping the operator's explicit route.
+            // Skip the auto proxy (and its upstream) so the override survives. Use
+            // the SAME wildcard-aware `hosts_overlap` semantics validation uses (an
+            // exact match would miss a wildcard explicit entry); guard on non-empty
+            // so an absent explicit list (a catch-all under `hosts_overlap`) never
+            // suppresses every auto proxy. Checked PER PORT ALIAS.
+            let auto_sni_lower = sni_hostname.to_ascii_lowercase();
+            if !explicit_sni_hosts.is_empty()
+                && crate::config::types::hosts_overlap(
+                    std::slice::from_ref(&auto_sni_lower),
+                    explicit_sni_hosts,
+                )
+            {
+                debug!(
+                    service = %service.name,
+                    namespace = %service.namespace,
+                    sni = %sni_hostname,
+                    "Skipping east-west auto-materialization; an explicit EastWestGateway already owns this SNI host"
+                );
+                continue;
+            }
+
+            let upstream_id = mesh_east_west_service_upstream_id(
+                &service.namespace,
+                &service.name,
+                service_port.port,
             );
-            continue;
+
+            let upstream = Upstream {
+                id: upstream_id.clone(),
+                name: Some(upstream_id.clone()),
+                namespace: namespace.to_string(),
+                targets,
+                algorithm: LoadBalancerAlgorithm::RoundRobin,
+                hash_on: None,
+                hash_on_cookie_config: None,
+                health_checks: Some(HealthCheckConfig {
+                    active: None,
+                    passive: Some(PassiveHealthCheck::default()),
+                }),
+                service_discovery: None,
+                subsets: None,
+                port_overrides: HashMap::new(),
+                source_locality: None,
+                locality_lb_strict: false,
+                locality_lb_setting: None,
+                backend_tls_client_cert_path: None,
+                backend_tls_client_key_path: None,
+                backend_tls_verify_server_cert: true,
+                backend_tls_server_ca_cert_path: None,
+                backend_tls_sni: None,
+                backend_tls_san_allow_list: Vec::new(),
+                resolved_subset_tls: HashMap::new(),
+                dispatch_port_override_fallback: None,
+                api_spec_id: None,
+                created_at: now,
+                updated_at: now,
+            };
+            upstreams.push(upstream);
+
+            let proxy_id = mesh_east_west_service_proxy_id(
+                &service.namespace,
+                &service.name,
+                service_port.port,
+            );
+            let proxy = east_west_service_proxy(
+                &proxy_id,
+                &sni_hostname,
+                namespace,
+                &upstream_id,
+                listen_port,
+                now,
+            );
+            proxies.push(proxy);
         }
-
-        let upstream_id = mesh_east_west_service_upstream_id(&service.namespace, &service.name);
-
-        let upstream = Upstream {
-            id: upstream_id.clone(),
-            name: Some(upstream_id.clone()),
-            namespace: namespace.to_string(),
-            targets,
-            algorithm: LoadBalancerAlgorithm::RoundRobin,
-            hash_on: None,
-            hash_on_cookie_config: None,
-            health_checks: Some(HealthCheckConfig {
-                active: None,
-                passive: Some(PassiveHealthCheck::default()),
-            }),
-            service_discovery: None,
-            subsets: None,
-            port_overrides: HashMap::new(),
-            source_locality: None,
-            locality_lb_strict: false,
-            locality_lb_setting: None,
-            backend_tls_client_cert_path: None,
-            backend_tls_client_key_path: None,
-            backend_tls_verify_server_cert: true,
-            backend_tls_server_ca_cert_path: None,
-            backend_tls_sni: None,
-            backend_tls_san_allow_list: Vec::new(),
-            resolved_subset_tls: HashMap::new(),
-            dispatch_port_override_fallback: None,
-            api_spec_id: None,
-            created_at: now,
-            updated_at: now,
-        };
-        upstreams.push(upstream);
-
-        let proxy_id = mesh_east_west_service_proxy_id(&service.namespace, &service.name);
-        let proxy = east_west_service_proxy(
-            &proxy_id,
-            &sni_hostname,
-            namespace,
-            &upstream_id,
-            listen_port,
-            now,
-        );
-        proxies.push(proxy);
     }
 
     (proxies, upstreams)
@@ -2101,46 +2117,78 @@ fn matched_remote_service_workloads<'a>(
     matched
 }
 
-/// Build upstream targets from workloads that belong to the given service.
+/// The base cross-cluster east-west SNI for a service — the destination service
+/// FQDN `<name>.<namespace>.svc.<cluster-domain>`. The FIRST declared port routes
+/// on this, and it is the host a client uses to SELECT an `EastWestGateway`
+/// (whose `sni_hosts` claim the base FQDN). See [`cross_cluster_service_sni`].
+pub(crate) fn cross_cluster_service_base_fqdn(
+    service: &crate::modes::mesh::config::MeshService,
+    cluster_domain: &str,
+) -> String {
+    let cluster_domain = cluster_domain.trim_matches('.');
+    format!(
+        "{}.{}.svc.{cluster_domain}",
+        service.name, service.namespace
+    )
+}
+
+/// The cross-cluster east-west SNI a `(service, service_port)` routes on
+/// (multi-port scheme, issue #2010 phase 3). The service's FIRST declared port
+/// keeps the base service FQDN ([`cross_cluster_service_base_fqdn`]) for backward
+/// compatibility; every ADDITIONAL port gets a deterministic DNS-safe alias
+/// `p<service_port>.<base_fqdn>` (e.g. `p9090.reviews.default.svc.cluster.local`)
+/// so one east-west gateway can route many ports of one service by SNI (SNI
+/// carries no port, so a per-port DNS-safe alias is the port channel). The
+/// NUMERIC service port is authoritative in the alias — a port NAME is never
+/// used for uniqueness. Both the client materializers (as the `mesh.eastwest_sni`
+/// dial override) and the destination gateway's per-port passthrough proxies
+/// derive their SNI from this one function so the two sides cannot drift.
+pub(crate) fn cross_cluster_service_sni(
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    cluster_domain: &str,
+) -> String {
+    let base = cross_cluster_service_base_fqdn(service, cluster_domain);
+    if service.ports.first().map(|sp| sp.port) == Some(service_port.port) {
+        base
+    } else {
+        format!("p{}.{base}", service_port.port)
+    }
+}
+
+/// Build upstream targets from workloads that belong to the given service, for
+/// ONE `service_port`.
 ///
-/// Matches workloads by SPIFFE ID against the service's `WorkloadRef` list.
-/// Each workload address + first port produces one `UpstreamTarget`. When a
-/// workload has no addresses, it is skipped (pod IP not yet assigned).
+/// Matches workloads by SPIFFE ID against the service's `WorkloadRef` list. Each
+/// workload address + the resolved container port for `service_port` produces one
+/// `UpstreamTarget`. When a workload has no addresses, it is skipped (pod IP not
+/// yet assigned). One passthrough proxy is materialized per HTTP-family service
+/// port (multi-port east-west, issue #2010 phase 3), each keyed by the port's SNI
+/// alias ([`cross_cluster_service_sni`]).
 fn build_east_west_service_targets(
     service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
     workloads: &[crate::modes::mesh::config::Workload],
     multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
 ) -> Vec<UpstreamTarget> {
     let mut targets = Vec::new();
     for workload in matched_local_service_workloads(service, workloads, multi_cluster) {
-        // Backend (container) port for this workload address: honor the first
-        // service port's `targetPort` (Kubernetes' authoritative
+        // Backend (container) port for this workload address: honor
+        // `service_port`'s `targetPort` (Kubernetes' authoritative
         // service-port→container-port binding). A DECLARED targetPort is
         // authoritative — resolve it, or SKIP this target (fail closed) rather
         // than fall back to the Service port, so an unresolved named targetPort
         // (rollout skew / typo like `targetPort: "http"` with no matching
         // container port) doesn't silently publish a target on the wrong port.
-        // Only an ABSENT targetPort falls back to the service port; a service
-        // with no ports at all uses the workload's first port.
-        //
-        // KNOWN LIMITATION (EastWestGateway is Beta): a multi-port service is
-        // reachable across clusters on only its FIRST port. The east-west
-        // gateway routes purely by SNI hostname (`{name}.{ns}.svc.{domain}`),
-        // and SNI carries no port, so one SNI cannot disambiguate per-port
-        // backends the way the inbound/outbound capture listeners do via
-        // `SO_ORIGINAL_DST`. Picking the first declared service port is the
-        // single-port-per-SNI compromise; full multi-port east-west routing
-        // would need a port-bearing transport (or one SNI per port). Documented
-        // here rather than changed because the behavior is partly inherent.
-        let target_port = match service.ports.first() {
-            Some(sp) => match sp.target_port.as_ref() {
-                Some(_) => match resolve_target_port(sp.target_port.as_ref(), &workload.ports) {
+        // Only an ABSENT targetPort falls back to the service port.
+        let target_port = match service_port.target_port.as_ref() {
+            Some(_) => {
+                match resolve_target_port(service_port.target_port.as_ref(), &workload.ports) {
                     Some(p) if p != 0 => p,
                     _ => continue,
-                },
-                None => sp.port,
-            },
-            None => workload.ports.first().map(|p| p.port).unwrap_or(80),
+                }
+            }
+            None => service_port.port,
         };
 
         for address in &workload.addresses {
@@ -2155,7 +2203,7 @@ fn build_east_west_service_targets(
             targets.push(UpstreamTarget {
                 host: address.clone(),
                 port: target_port,
-                service_port_policy_key: service.ports.first().map(|sp| sp.port),
+                service_port_policy_key: Some(service_port.port),
                 weight: 1,
                 tags,
                 locality: workload.locality.clone(),
@@ -2242,12 +2290,12 @@ fn east_west_service_proxy(
     }
 }
 
-fn mesh_east_west_service_proxy_id(namespace: &str, name: &str) -> String {
-    format!("__mesh-ew-svc-{namespace}-{name}").replace(['/', '.'], "-")
+fn mesh_east_west_service_proxy_id(namespace: &str, name: &str, service_port: u16) -> String {
+    format!("__mesh-ew-svc-{namespace}-{name}-{service_port}").replace(['/', '.'], "-")
 }
 
-fn mesh_east_west_service_upstream_id(namespace: &str, name: &str) -> String {
-    format!("__mesh-ew-upstream-{namespace}-{name}").replace(['/', '.'], "-")
+fn mesh_east_west_service_upstream_id(namespace: &str, name: &str, service_port: u16) -> String {
+    format!("__mesh-ew-upstream-{namespace}-{name}-{service_port}").replace(['/', '.'], "-")
 }
 
 // ── Sidecar inbound route materialization ─────────────────────────────────
@@ -4893,18 +4941,16 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
     remote_workloads: &[&crate::modes::mesh::config::Workload],
     multi_cluster: &crate::modes::mesh::config::MultiClusterConfig,
 ) {
-    // FIRST-PORT ONLY: the east-west gateway routes a service-FQDN SNI to only
-    // the service's FIRST DECLARED port (single-port-per-SNI — SNI carries no
-    // port; see `build_east_west_service_targets`, which picks
-    // `service.ports.first()`). Emitting a cross-cluster target for every
-    // HTTP-family `service_port` would misroute later ports through the gateway's
-    // first-port backend, so only the first declared port gets one. Non-first
-    // ports: no cross-cluster target (they are unreachable across clusters in
-    // this Beta east-west model).
-    if service.ports.first().map(|sp| sp.port) != Some(service_port.port) {
-        return;
-    }
-
+    // MULTI-PORT (issue #2010 phase 3): every HTTP-family `service_port` gets a
+    // cross-cluster target. The destination gateway auto-materializes one
+    // passthrough proxy per service port (`build_east_west_service_proxies_and_
+    // upstreams`), keyed by the port's SNI: the FIRST declared port on the base
+    // service FQDN, each additional port on the `p<port>.<fqdn>` alias
+    // (`cross_cluster_service_sni`). The client SELECTS the gateway by the BASE
+    // FQDN (which the operator's `sni_hosts` claim) but DIALS the per-port alias,
+    // so a gateway owning the base FQDN auto-owns its port aliases with no extra
+    // operator config. Non-HTTP-family ports never reach here (the caller gates
+    // the append on `is_http_family_mesh_protocol`).
     if remote_workloads.is_empty() {
         return;
     }
@@ -4912,36 +4958,34 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
     // [R2-2] REACHABILITY FILTER: keep only remote workloads the destination
     // cluster's east-west gateway could actually materialize a backend for —
     // MIRRORING `build_east_west_service_targets`'s per-workload skip conditions
-    // (the gateway-side materializer drops a workload with no pod IP or an
-    // unresolved first-service-port targetPort). A workload that fails those
-    // would be a DEAD gateway path (the SNI would reach the gateway, which would
-    // have no backend to forward to), so it must not produce a cross-cluster
-    // target here either. The check uses the SERVICE's FIRST port (the only port
-    // the single-SNI east-west model routes), exactly as the gateway side does.
+    // for THIS service port (the gateway-side materializer drops a workload with
+    // no pod IP or an unresolved targetPort). A workload that fails those would be
+    // a DEAD gateway path (the SNI would reach the gateway, which would have no
+    // backend to forward to), so it must not produce a cross-cluster target here.
     let remote_workloads: Vec<_> = remote_workloads
         .iter()
         .copied()
-        .filter(|workload| east_west_workload_is_reachable(service, workload))
+        .filter(|workload| east_west_workload_is_reachable(service_port, workload))
         .collect();
     if remote_workloads.is_empty() {
         warn!(
             service = %service.name,
             namespace = %service.namespace,
+            service_port = service_port.port,
             "Skipping cross-cluster egress: no reachable remote workload (every remote endpoint \
-             lacks an address or has an unresolved first-port targetPort; the east-west gateway \
+             lacks an address or has an unresolved targetPort for this port; the east-west gateway \
              would have no backend to forward the SNI to)"
         );
         return;
     }
 
-    // The SNI the remote east-west gateway passthrough routes on — the
-    // destination service FQDN. Matches `build_east_west_service_targets`'s
-    // gateway-side hosts (`{name}.{namespace}.svc.{cluster_domain}`).
-    let cluster_domain = cluster_domain.trim_matches('.');
-    let service_fqdn = format!(
-        "{}.{}.svc.{cluster_domain}",
-        service.name, service.namespace
-    );
+    // The client SELECTS the east-west gateway by the BASE service FQDN (the host
+    // the operator's `sni_hosts` claim) but stamps the PER-PORT SNI as the dial
+    // override (`mesh.eastwest_sni`), so the gateway's per-port passthrough proxy
+    // routes it to the right backend port. Both derive from
+    // `cross_cluster_service_{base_fqdn,sni}` so client + gateway cannot drift.
+    let base_fqdn = cross_cluster_service_base_fqdn(service, cluster_domain);
+    let dial_sni = cross_cluster_service_sni(service, service_port, cluster_domain);
 
     // Group the reachable remote workloads by `(network, trust_domain)`. Each
     // group needs a gateway that fronts its network, claims the service FQDN,
@@ -4970,7 +5014,7 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
         let Some(gateway) = select_east_west_gateway_for_network(
             multi_cluster,
             network,
-            &service_fqdn,
+            &base_fqdn,
             &representative.trust_domain,
         ) else {
             warn!(
@@ -4978,7 +5022,7 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
                 namespace = %service.namespace,
                 network = network.unwrap_or("<none>"),
                 trust_domain = %representative.trust_domain.as_str(),
-                service_fqdn = %service_fqdn,
+                service_fqdn = %base_fqdn,
                 "Skipping cross-cluster egress: no EastWestGateway on the remote network whose \
                  sni_hosts claim the destination service FQDN AND whose trust domain matches the \
                  remote workloads' (fail closed; never broaden to a different-network catch-all or \
@@ -5032,15 +5076,17 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
         );
         tags.insert(
             crate::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG.to_string(),
-            service_fqdn.clone(),
+            dial_sni.clone(),
         );
         tags.insert(
             crate::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG.to_string(),
             "true".to_string(),
         );
-        // The east-west gateway routes purely by SNI (single-port-per-SNI Beta
-        // limitation; see `build_east_west_service_targets`), so multi-port
-        // `mesh.mtls_authority_port` is moot for cross-cluster — never stamped.
+        // Multi-port east-west (issue #2010 phase 3) rides the per-port SNI alias
+        // (`dial_sni`), NOT a `mesh.mtls_authority_port` rewrite: the destination
+        // gateway routes the alias SNI to the correct per-port passthrough proxy,
+        // whose backend already carries the right container port. The inner
+        // mesh-mTLS request authority stays the service FQDN (the route host).
 
         built.push(UpstreamTarget {
             // [R2-4] IDENTITY = the gateway DIAL ENDPOINT (`host:port`). The
@@ -5266,45 +5312,43 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
     remote_workloads: &[&crate::modes::mesh::config::Workload],
     multi_cluster: &crate::modes::mesh::config::MultiClusterConfig,
 ) {
-    // FIRST-PORT ONLY: identical rationale to the Sidecar path — the east-west
-    // gateway routes a service-FQDN SNI to only the service's FIRST declared port
-    // (single-port-per-SNI; SNI carries no port). A later port would misroute
-    // through the gateway's first-port backend, so only the first declared port
-    // gets cross-cluster targets.
-    if service.ports.first().map(|sp| sp.port) != Some(service_port.port) {
-        return;
-    }
-
+    // MULTI-PORT (issue #2010 phase 3): every HTTP-family `service_port` gets
+    // per-remote-pod cross-cluster targets — identical scheme to the Sidecar path.
+    // The client SELECTS the gateway by the BASE service FQDN but DIALS the
+    // per-port SNI alias (`cross_cluster_service_sni`); the inner HBONE CONNECT
+    // `:authority` already carries the per-port app port (`resolve_app_port`
+    // below, which honors `service_port.target_port`). Non-HTTP-family ports never
+    // reach here (the caller gates on `is_http_family_mesh_protocol`).
     if remote_workloads.is_empty() {
         return;
     }
 
     // [R2-2] REACHABILITY FILTER: keep only remote workloads the destination
     // cluster's east-west materializer could itself back (≥1 address + resolvable
-    // first-service-port targetPort), mirroring `build_east_west_service_targets`
+    // targetPort for THIS service port), mirroring `build_east_west_service_targets`
     // — a workload the destination would drop must not produce a dead path here.
     let remote_workloads: Vec<_> = remote_workloads
         .iter()
         .copied()
-        .filter(|workload| east_west_workload_is_reachable(service, workload))
+        .filter(|workload| east_west_workload_is_reachable(service_port, workload))
         .collect();
     if remote_workloads.is_empty() {
         warn!(
             service = %service.name,
             namespace = %service.namespace,
+            service_port = service_port.port,
             "Skipping Ambient cross-cluster egress: no reachable remote workload (every remote \
-             endpoint lacks an address or has an unresolved first-port targetPort)"
+             endpoint lacks an address or has an unresolved targetPort for this port)"
         );
         return;
     }
 
-    // The SNI the remote east-west gateway passthrough routes on — the
-    // destination service FQDN (matches `build_east_west_service_targets`).
-    let cluster_domain = cluster_domain.trim_matches('.');
-    let service_fqdn = format!(
-        "{}.{}.svc.{cluster_domain}",
-        service.name, service.namespace
-    );
+    // SELECT the gateway by the BASE service FQDN (the host the operator's
+    // `sni_hosts` claim); DIAL the per-port SNI alias (`mesh.eastwest_sni`). Both
+    // derive from `cross_cluster_service_{base_fqdn,sni}` so client + gateway
+    // cannot drift.
+    let base_fqdn = cross_cluster_service_base_fqdn(service, cluster_domain);
+    let dial_sni = cross_cluster_service_sni(service, service_port, cluster_domain);
 
     // The app (container) port the inner CONNECT `:authority` carries. Same
     // fail-closed targetPort rule as the local pass: a DECLARED `targetPort` must
@@ -5336,7 +5380,7 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
         let Some(gateway) = select_east_west_gateway_for_network(
             multi_cluster,
             workload.network.as_deref(),
-            &service_fqdn,
+            &base_fqdn,
             &workload.trust_domain,
         ) else {
             warn!(
@@ -5344,7 +5388,7 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
                 namespace = %service.namespace,
                 network = workload.network.as_deref().unwrap_or("<none>"),
                 trust_domain = %workload.trust_domain.as_str(),
-                service_fqdn = %service_fqdn,
+                service_fqdn = %base_fqdn,
                 "Skipping Ambient cross-cluster egress for a remote workload: no EastWestGateway on \
                  its network whose sni_hosts claim the destination service FQDN AND whose trust \
                  domain matches (fail closed; never broaden to a different-network catch-all or a \
@@ -5398,10 +5442,12 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
                 crate::proxy::hbone_pool::HBONE_PORT_TAG.to_string(),
                 gateway.port.to_string(),
             );
-            // Outer-TLS SNI override = the destination service FQDN.
+            // Outer-TLS SNI override = the destination service FQDN for the FIRST
+            // port, or the `p<port>.<fqdn>` alias for additional ports (multi-port
+            // east-west, issue #2010 phase 3).
             tags.insert(
                 crate::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG.to_string(),
-                service_fqdn.clone(),
+                dial_sni.clone(),
             );
             tags.insert(
                 crate::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG.to_string(),
@@ -5501,30 +5547,25 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
 /// the destination would drop never produces a dead cross-cluster gateway path
 /// (codex r2 [R2-2]):
 /// - the workload must have ≥1 address (no pod IP ⇒ skipped there); AND
-/// - the SERVICE's FIRST port (the only port the single-SNI east-west model
-///   routes) must resolve to a usable backend port: a DECLARED `target_port`
-///   must `resolve_target_port` to a non-zero port (an unresolved named
-///   targetPort ⇒ skipped there); an ABSENT `target_port` uses the service port;
-///   a service with no ports uses the workload's first port.
+/// - the given `service_port` (multi-port east-west, issue #2010 phase 3 — each
+///   HTTP-family port materializes its own gateway proxy on a per-port SNI alias)
+///   must resolve to a usable backend port: a DECLARED `target_port` must
+///   `resolve_target_port` to a non-zero port (an unresolved named targetPort ⇒
+///   skipped there); an ABSENT `target_port` uses the service port.
 fn east_west_workload_is_reachable(
-    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
     workload: &crate::modes::mesh::config::Workload,
 ) -> bool {
     if workload.addresses.is_empty() {
         return false;
     }
-    match service.ports.first() {
-        Some(sp) => match sp.target_port.as_ref() {
-            Some(_) => matches!(
-                resolve_target_port(sp.target_port.as_ref(), &workload.ports),
-                Some(p) if p != 0
-            ),
-            // Absent targetPort falls back to the service port — always usable.
-            None => true,
-        },
-        // A service with no ports uses the workload's first port; reachable as
-        // long as the workload declares one (it has ≥1 address above).
-        None => !workload.ports.is_empty(),
+    match service_port.target_port.as_ref() {
+        Some(_) => matches!(
+            resolve_target_port(service_port.target_port.as_ref(), &workload.ports),
+            Some(p) if p != 0
+        ),
+        // Absent targetPort falls back to the service port — always usable.
+        None => true,
     }
 }
 
@@ -13540,7 +13581,12 @@ mod tests {
             .insert("mesh.hbone".to_string(), "true".to_string());
 
         let service = http_mesh_service("reviews", 8080, spiffe);
-        let targets = build_east_west_service_targets(&service, std::slice::from_ref(&wl), None);
+        let targets = build_east_west_service_targets(
+            &service,
+            &service.ports[0],
+            std::slice::from_ref(&wl),
+            None,
+        );
         assert_eq!(targets.len(), 1, "one address → one target");
         let tags = &targets[0].tags;
         // The legitimate operator labels survive.
@@ -21152,7 +21198,8 @@ mod tests {
             protocol_overrides: HashMap::new(),
         };
 
-        let targets = build_east_west_service_targets(&service, &[first, second], None);
+        let targets =
+            build_east_west_service_targets(&service, &service.ports[0], &[first, second], None);
 
         let hosts: Vec<&str> = targets.iter().map(|target| target.host.as_str()).collect();
         assert_eq!(hosts, vec!["10.0.0.5", "10.0.0.6"]);
@@ -21605,7 +21652,7 @@ mod tests {
             protocol_overrides: HashMap::new(),
         };
 
-        let targets = build_east_west_service_targets(&service, &[wl], None);
+        let targets = build_east_west_service_targets(&service, &service.ports[0], &[wl], None);
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].host, "10.0.0.5");
         assert_eq!(
@@ -21634,7 +21681,7 @@ mod tests {
             protocol_overrides: HashMap::new(),
         };
 
-        let targets = build_east_west_service_targets(&service, &[legacy], None);
+        let targets = build_east_west_service_targets(&service, &service.ports[0], &[legacy], None);
 
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].host, "10.0.0.5");
@@ -26977,7 +27024,7 @@ mod tests {
             protocol: AppProtocol::Http,
             name: Some("grpc".to_string()),
         }];
-        let targets = build_east_west_service_targets(&svc, &[wl], None);
+        let targets = build_east_west_service_targets(&svc, &svc.ports[0], &[wl], None);
         assert!(
             targets.is_empty(),
             "an unresolved named targetPort must drop the east-west target, not dial the Service port"

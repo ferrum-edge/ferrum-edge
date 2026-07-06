@@ -136,6 +136,98 @@ fn east_west_gateway_materializes_local_service_proxies_for_sni_routing() {
     );
 }
 
+/// Multi-port east-west (issue #2010 phase 3): a service with two HTTP ports
+/// materializes ONE SNI-passthrough proxy PER port — the first on the base
+/// service FQDN, the second on the deterministic `p<port>.<fqdn>` alias — each
+/// backed by that port's container port. This is the gateway (destination) side
+/// of the per-port SNI scheme the client materializers dial.
+#[test]
+fn east_west_gateway_materializes_per_port_proxies_for_multiport_service() {
+    let workload = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.0.0.5"],
+    );
+    let mut service = service_for("reviews", DEFAULT_NAMESPACE, &[&workload]);
+    service.ports = vec![
+        ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        },
+        ServicePort {
+            port: 9090,
+            protocol: AppProtocol::Http,
+            name: Some("http-alt".to_string()),
+            target_port: None,
+        },
+    ];
+    let mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared =
+        prepare_gateway_config_for_mesh(config, &east_west_runtime()).expect("east-west prepared");
+
+    // First port → base FQDN passthrough proxy → backend container port 8080.
+    let first = prepared
+        .proxies
+        .iter()
+        .find(|p| {
+            p.hosts
+                .iter()
+                .any(|h| h == "reviews.default.svc.cluster.local")
+        })
+        .expect("first-port east-west proxy (base FQDN) must materialise");
+    assert!(first.passthrough);
+    assert_eq!(first.listen_port, Some(15443));
+    let first_upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| Some(&u.id) == first.upstream_id.as_ref())
+        .expect("first-port upstream");
+    assert!(
+        first_upstream.targets.iter().all(|t| t.port == 8080),
+        "first-port upstream backends the 8080 container port, got {:?}",
+        first_upstream
+            .targets
+            .iter()
+            .map(|t| t.port)
+            .collect::<Vec<_>>()
+    );
+
+    // Second port → `p9090.<fqdn>` alias passthrough proxy → container port 9090.
+    let second = prepared
+        .proxies
+        .iter()
+        .find(|p| {
+            p.hosts
+                .iter()
+                .any(|h| h == "p9090.reviews.default.svc.cluster.local")
+        })
+        .expect("second-port east-west proxy (p9090 alias) must materialise");
+    assert!(second.passthrough);
+    assert_eq!(second.listen_port, Some(15443));
+    let second_upstream = prepared
+        .upstreams
+        .iter()
+        .find(|u| Some(&u.id) == second.upstream_id.as_ref())
+        .expect("second-port upstream");
+    assert!(
+        second_upstream.targets.iter().all(|t| t.port == 9090),
+        "second-port upstream backends the 9090 container port, got {:?}",
+        second_upstream
+            .targets
+            .iter()
+            .map(|t| t.port)
+            .collect::<Vec<_>>()
+    );
+
+    // The two ports are DISTINCT proxies (distinct ids, distinct SNI hosts) on the
+    // shared east-west listen port.
+    assert_ne!(first.id, second.id);
+}
+
 #[test]
 fn east_west_materialisation_is_a_no_op_on_other_topologies() {
     // Sidecar topology should NOT materialise the east-west gateway

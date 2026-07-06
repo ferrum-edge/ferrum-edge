@@ -414,11 +414,12 @@ fn no_cross_cluster_target_for_tcp_service_port() {
     );
 }
 
-/// [6] P2: a multi-port HTTP service must yield a cross-cluster target only for
-/// its FIRST declared port (the east-west gateway routes a service-FQDN SNI to
-/// only the first port — single-port-per-SNI).
+/// Multi-port east-west (issue #2010 phase 3): a multi-port HTTP service now
+/// yields a cross-cluster target for EVERY HTTP-family port. The FIRST declared
+/// port routes on the base service FQDN; each additional port routes on the
+/// deterministic `p<port>.<fqdn>` SNI alias.
 #[test]
-fn cross_cluster_target_only_for_first_service_port() {
+fn cross_cluster_target_for_each_http_service_port() {
     let runtime = sidecar_client_runtime();
 
     let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
@@ -472,31 +473,57 @@ fn cross_cluster_target_only_for_first_service_port() {
 
     let upstreams = materialize_all_upstream_targets(mesh, &runtime);
 
-    // First port (8080): exactly one cross-cluster target.
+    // First port (8080): exactly one cross-cluster target, routing on the BASE
+    // service FQDN.
     let first = upstreams
         .get("__mesh-out-upstream-default-svc-b-8080")
         .expect("first-port upstream must materialize");
-    let first_cross = first
+    let first_cross: Vec<_> = first
         .iter()
         .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
-        .count();
+        .collect();
     assert_eq!(
-        first_cross, 1,
+        first_cross.len(),
+        1,
         "the first service port must yield exactly one cross-cluster target"
     );
+    assert_eq!(
+        first_cross[0]
+            .tags
+            .get(MESH_EASTWEST_SNI_TAG)
+            .map(String::as_str),
+        Some(SVC_B_FQDN),
+        "the first port routes on the base service FQDN"
+    );
 
-    // Second port (9090): NO cross-cluster target (it is unreachable across
-    // clusters in the single-port-per-SNI east-west model).
+    // Second port (9090): now ALSO one cross-cluster target, routing on the
+    // deterministic per-port SNI alias `p9090.<fqdn>`.
     let second = upstreams
         .get("__mesh-out-upstream-default-svc-b-9090")
         .expect("second-port upstream must materialize");
-    let second_cross = second
+    let second_cross: Vec<_> = second
         .iter()
         .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
-        .count();
+        .collect();
     assert_eq!(
-        second_cross, 0,
-        "a non-first service port must NOT yield a cross-cluster target"
+        second_cross.len(),
+        1,
+        "a non-first HTTP service port now yields a cross-cluster target too"
+    );
+    assert_eq!(
+        second_cross[0]
+            .tags
+            .get(MESH_EASTWEST_SNI_TAG)
+            .map(String::as_str),
+        Some("p9090.svc-b.default.svc.cluster.local"),
+        "the second port routes on the p<port> SNI alias"
+    );
+    // The dial endpoint (identity) is still the east-west gateway for both ports;
+    // the per-port SNI alias — not the identity — distinguishes the backend port.
+    assert_eq!(
+        second_cross[0].tags.get(MESH_MTLS_PORT_TAG),
+        first_cross[0].tags.get(MESH_MTLS_PORT_TAG),
+        "both ports dial the same east-west gateway endpoint"
     );
 }
 
@@ -1658,10 +1685,11 @@ fn ambient_cross_cluster_skips_unresolvable_named_target_port() {
     );
 }
 
-/// Ambient: only the FIRST declared service port gets cross-cluster targets
-/// (single-port-per-SNI east-west model).
+/// Ambient multi-port east-west (issue #2010 phase 3): EVERY HTTP-family service
+/// port now gets per-pod cross-cluster HBONE targets — the first on the base
+/// service FQDN, additional ports on the `p<port>.<fqdn>` SNI alias.
 #[test]
-fn ambient_cross_cluster_only_for_first_service_port() {
+fn ambient_cross_cluster_for_each_http_service_port() {
     let runtime = ambient_client_runtime();
 
     let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
@@ -1713,25 +1741,43 @@ fn ambient_cross_cluster_only_for_first_service_port() {
     mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
 
     let upstreams = materialize_all_upstream_targets(mesh, &runtime);
-    let first_cross = upstreams
+    let first_cross: Vec<_> = upstreams
         .get("__mesh-out-upstream-default-svc-b-8080")
         .expect("first-port upstream")
         .iter()
         .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
-        .count();
+        .collect();
     assert_eq!(
-        first_cross, 1,
+        first_cross.len(),
+        1,
         "first port yields one per-pod cross-cluster target"
     );
-    let second_cross = upstreams
+    assert_eq!(
+        first_cross[0]
+            .tags
+            .get(MESH_EASTWEST_SNI_TAG)
+            .map(String::as_str),
+        Some(SVC_B_FQDN),
+        "the first port routes on the base service FQDN"
+    );
+    let second_cross: Vec<_> = upstreams
         .get("__mesh-out-upstream-default-svc-b-9090")
         .expect("second-port upstream")
         .iter()
         .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
-        .count();
+        .collect();
     assert_eq!(
-        second_cross, 0,
-        "a non-first service port yields no cross-cluster target"
+        second_cross.len(),
+        1,
+        "a non-first HTTP service port now yields a per-pod cross-cluster target too"
+    );
+    assert_eq!(
+        second_cross[0]
+            .tags
+            .get(MESH_EASTWEST_SNI_TAG)
+            .map(String::as_str),
+        Some("p9090.svc-b.default.svc.cluster.local"),
+        "the second port routes on the p<port> SNI alias"
     );
 }
 
