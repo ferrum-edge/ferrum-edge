@@ -38,10 +38,13 @@
 //!   dispatches directly from that metadata (notably `ai_federation`, priority
 //!   2985) sends the compressed prompt. It also records `ai_prompt_compressor.*`
 //!   observability metadata.
-//! * `transform_request_body` re-derives the compressed body for the wire on the
-//!   standard backend-dispatch path (this hook, not the metadata copy, produces
-//!   the bytes actually sent upstream, and it is the only hook the HTTP/3 cross
-//!   protocol path invokes). Compression is deterministic, so both paths agree.
+//! * `transform_request_body` (and its context-aware variant) re-derive the
+//!   compressed body for the wire on the standard backend-dispatch path — this
+//!   hook, not the metadata copy, produces the bytes actually sent upstream.
+//!   Compression is gated to POST requests: the context-aware variant checks
+//!   `ctx.method` (H1/H2 and the H3 cross-protocol bridge), and the no-context
+//!   variant requires an explicit `:method` POST pseudo-header, which the native
+//!   H3 buffered path injects. Compression is deterministic, so all paths agree.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -196,9 +199,10 @@ impl AiPromptCompressor {
         content_type: Option<&str>,
         request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if let Some(ct) = content_type
-            && !is_json_content_type(ct)
-        {
+        // Require an explicit JSON content type; a missing Content-Type is
+        // treated as ineligible so a JSON-looking body without the header is
+        // never rewritten (matches `should_buffer_request_body`'s JSON gate).
+        if !content_type.is_some_and(is_json_content_type) {
             return None;
         }
         if has_non_identity_content_encoding(request_headers) {
@@ -304,38 +308,40 @@ impl AiPromptCompressor {
         }
     }
 
-    /// Compress a string that may contain `preserve_tag` spans: enclosed content
-    /// is copied verbatim (tags stripped) while everything else is compressed as
-    /// one token stream, so spacing across the boundaries is preserved.
+    /// Compress a string that may contain `preserve_tag` spans. Text outside the
+    /// tags is compressed; the enclosed span is copied **verbatim** — its exact
+    /// internal whitespace is retained, only the markers are stripped. A single
+    /// separating space is inserted at a boundary only when needed to avoid
+    /// gluing two adjacent non-whitespace characters.
     fn compress_with_preserve(&self, text: &str, tags: &(String, String)) -> String {
         let (open, close) = tags;
-        let mut cleaned = String::with_capacity(text.len());
-        // Byte ranges within `cleaned` that must be kept verbatim.
-        let mut preserved: Vec<(usize, usize)> = Vec::new();
+        let mut out = String::with_capacity(text.len());
         let mut rest = text;
         loop {
             let Some(op) = rest.find(open.as_str()) else {
-                cleaned.push_str(rest);
+                append_segment(&mut out, &statistical_compress(rest, self.target_ratio));
                 break;
             };
-            cleaned.push_str(&rest[..op]);
+            append_segment(
+                &mut out,
+                &statistical_compress(&rest[..op], self.target_ratio),
+            );
             let inner_start = &rest[op + open.len()..];
-            let start = cleaned.len();
             match inner_start.find(close.as_str()) {
                 Some(cp) => {
-                    cleaned.push_str(&inner_start[..cp]);
-                    preserved.push((start, cleaned.len()));
+                    // Preserved span: emit the raw slice so its internal spacing
+                    // (blank lines, alignment) survives exactly.
+                    append_segment(&mut out, &inner_start[..cp]);
                     rest = &inner_start[cp + close.len()..];
                 }
                 None => {
                     // Unterminated preserve span: keep the remainder verbatim.
-                    cleaned.push_str(inner_start);
-                    preserved.push((start, cleaned.len()));
+                    append_segment(&mut out, inner_start);
                     break;
                 }
             }
         }
-        statistical_compress_masked(&cleaned, self.target_ratio, &preserved)
+        out
     }
 }
 
@@ -429,13 +435,14 @@ impl Plugin for AiPromptCompressor {
         content_type: Option<&str>,
         request_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        // The HTTP/3 cross-protocol path invokes this variant without a
-        // `RequestContext`. Honor a `:method` pseudo-header when present so a
-        // buffered non-POST body is still skipped; H1/H2 use the context-aware
-        // variant below, which gates on the real request method.
-        if request_headers
+        // No `RequestContext` here. Require an explicit POST marker: the native
+        // H3 buffered path injects a `:method` pseudo-header, and other bridges
+        // (H3 cross-protocol) run the context-aware variant below. A missing
+        // marker is treated as ineligible so a non-POST body buffered on any
+        // no-context path is never compressed.
+        if !request_headers
             .get(":method")
-            .is_some_and(|method| !method.eq_ignore_ascii_case("POST"))
+            .is_some_and(|method| method.eq_ignore_ascii_case("POST"))
         {
             return None;
         }
@@ -567,15 +574,26 @@ struct Token<'a> {
     leading_newline: bool,
 }
 
-/// Compress a plain text chunk to roughly `ratio` of its word-tokens.
-fn statistical_compress(text: &str, ratio: f32) -> String {
-    statistical_compress_masked(text, ratio, &[])
+/// Append `seg` to `out`, inserting a single separating space only when needed
+/// to avoid gluing two non-whitespace characters at the boundary. `seg`'s own
+/// internal whitespace is preserved exactly, so this is safe for verbatim
+/// `preserve_tag` spans.
+fn append_segment(out: &mut String, seg: &str) {
+    if seg.is_empty() {
+        return;
+    }
+    if let (Some(last), Some(first)) = (out.chars().last(), seg.chars().next())
+        && !last.is_whitespace()
+        && !first.is_whitespace()
+    {
+        out.push(' ');
+    }
+    out.push_str(seg);
 }
 
-/// Like [`statistical_compress`] but forces any token overlapping a
-/// `preserved` byte range (in `text` coordinates) to be kept verbatim.
-fn statistical_compress_masked(text: &str, ratio: f32, preserved: &[(usize, usize)]) -> String {
-    let tokens = tokenize(text, preserved);
+/// Compress a plain text chunk to roughly `ratio` of its word-tokens.
+fn statistical_compress(text: &str, ratio: f32) -> String {
+    let tokens = tokenize(text);
     if tokens.is_empty() {
         return String::new();
     }
@@ -663,11 +681,10 @@ fn word_score(token: &Token<'_>, freq: &HashMap<&str, u32>) -> f32 {
     score
 }
 
-/// Split `text` into [`Token`]s, marking spans inside `preserved` ranges (and
-/// code / URLs / numbers / identifiers / punctuation) as verbatim. Whitespace
-/// boundaries are ASCII-only, which is UTF-8 safe because multi-byte sequences
-/// never contain ASCII bytes.
-fn tokenize<'a>(text: &'a str, preserved: &[(usize, usize)]) -> Vec<Token<'a>> {
+/// Split `text` into [`Token`]s, marking code / URLs / numbers / identifiers /
+/// punctuation as verbatim. Whitespace boundaries are ASCII-only, which is UTF-8
+/// safe because multi-byte sequences never contain ASCII bytes.
+fn tokenize(text: &str) -> Vec<Token<'_>> {
     let bytes = text.as_bytes();
     let mut tokens = Vec::new();
     let mut i = 0usize;
@@ -722,14 +739,13 @@ fn tokenize<'a>(text: &'a str, preserved: &[(usize, usize)]) -> Vec<Token<'a>> {
         let unit = &text[start..end];
         i = end;
 
-        let in_preserved = preserved.iter().any(|&(s, e)| start < e && s < end);
         let core: &str =
             unit.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '\''));
         // `contains_url` catches URLs wrapped in punctuation — Markdown
         // `(https://…)`, `<https://…>`, `[text](https://…)` — that the
         // leading-scheme fast path above misses; such a token stays verbatim so
         // links are never scored and dropped.
-        if in_preserved || core.is_empty() || is_protected_word(core) || contains_url(unit) {
+        if core.is_empty() || is_protected_word(core) || contains_url(unit) {
             push_verbatim(&mut tokens, unit, had_newline);
         } else {
             tokens.push(Token {

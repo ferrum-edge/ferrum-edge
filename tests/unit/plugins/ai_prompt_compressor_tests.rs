@@ -17,9 +17,13 @@ fn compressor(min_content_tokens: u64, ratio: f64) -> AiPromptCompressor {
     .unwrap()
 }
 
+/// JSON request headers with the `:method` pseudo-header that the native-H3
+/// buffered path injects, so the no-context `transform_request_body` hook is
+/// exercised the way it runs in production.
 fn json_headers() -> HashMap<String, String> {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert(":method".to_string(), "POST".to_string());
     headers
 }
 
@@ -368,7 +372,8 @@ async fn legacy_prompt_field_compressed_for_user() {
 async fn non_json_content_type_passthrough() {
     let plugin = compressor(5, 0.5);
     let bytes = serde_json::to_vec(&chat_body("user", &long_prompt_text())).unwrap();
-    let headers = HashMap::new();
+    let mut headers = HashMap::new();
+    headers.insert(":method".to_string(), "POST".to_string());
     assert!(
         plugin
             .transform_request_body(&bytes, Some("text/plain"), &headers)
@@ -595,5 +600,79 @@ fn oversized_content_length_skips_buffering() {
     assert!(
         plugin.should_buffer_request_body(&ctx),
         "a body within the cap should still buffer"
+    );
+}
+
+// ─── Codex review round 3 regressions ────────────────────────────────────────
+
+#[tokio::test]
+async fn no_context_hook_requires_explicit_post_marker() {
+    // The no-context (H3) hook must not compress unless an explicit `:method`
+    // POST marker is present, so a non-POST body buffered on a no-context bridge
+    // is never rewritten.
+    let plugin = compressor(5, 0.5);
+    let bytes = serde_json::to_vec(&chat_body("user", &long_prompt_text())).unwrap();
+
+    let mut no_method = HashMap::new();
+    no_method.insert("content-type".to_string(), "application/json".to_string());
+    assert!(
+        plugin
+            .transform_request_body(&bytes, Some("application/json"), &no_method)
+            .await
+            .is_none(),
+        "a missing :method marker must be treated as ineligible"
+    );
+
+    // With the marker the native-H3 path still compresses.
+    assert!(
+        plugin
+            .transform_request_body(&bytes, Some("application/json"), &json_headers())
+            .await
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn missing_content_type_is_not_compressed() {
+    let plugin = compressor(5, 0.5);
+    let bytes = serde_json::to_vec(&chat_body("user", &long_prompt_text())).unwrap();
+    let mut headers = HashMap::new();
+    headers.insert(":method".to_string(), "POST".to_string());
+    // content_type = None must be treated as ineligible.
+    assert!(
+        plugin
+            .transform_request_body(&bytes, None, &headers)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn preserve_tag_keeps_internal_whitespace_exactly() {
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 5,
+        "target_ratio": 0.4,
+    }))
+    .unwrap();
+    // The preserved span has a blank line and leading indentation that must
+    // survive byte-for-byte (only the markers are stripped).
+    let span = "line one\n\n    line two (indented)";
+    let content = format!(
+        "Please compress all of this surrounding filler text that does not really \
+         matter at all, but keep the block <keep>{span}</keep> exactly as written \
+         because it is padding long enough to exceed the token threshold here."
+    );
+    let body = chat_body("user", &content);
+    let out = transform(&plugin, &body).await.expect("should compress");
+    let compressed = first_message_content(&out);
+
+    assert!(
+        compressed.contains(span),
+        "preserved span must retain internal whitespace exactly: {compressed:?}"
+    );
+    assert!(
+        !compressed.contains("<keep>") && !compressed.contains("</keep>"),
+        "markers must be stripped: {compressed:?}"
     );
 }
