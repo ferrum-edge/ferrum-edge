@@ -9055,12 +9055,6 @@ async fn serve_mesh_runtime(
                      not starting it (UDP egress passes through un-captured)"
                 );
             } else {
-                // Preflight the in-netns tooling before starting the manager: a
-                // distroless runtime image has no `sh`/`ip`/`iptables`, which would
-                // make every pod fail to open and the manager retry forever with
-                // nothing captured. Fail closed with a clear message (codex).
-                crate::proxy::netns_udp_capture::preflight_capture_tools()
-                    .map_err(|e| anyhow::anyhow!(e))?;
                 // Fail closed on a malformed capture config (codex): an invalid
                 // include/exclude CIDR, port list, or FERRUM_MESH_IP6TABLES_ENABLED
                 // value must abort startup, not silently disable the datapath.
@@ -9089,6 +9083,17 @@ async fn serve_mesh_runtime(
                 // OUTPUT-mark loop without an owner match, and the proxy's own relay
                 // egress never traverses the pod netns anyway.
                 capture_config.proxy_uid = None;
+                // Preflight the in-netns tooling NOW — after the config is built —
+                // so it can ALSO require `ip6tables` when IPv6 UDP capture is set to
+                // `required` with IPv6 CIDRs (the per-pod script would otherwise
+                // FATALLY preflight `ip6tables` and fail every setup forever on an
+                // image that lacks it). A distroless runtime image has no
+                // `sh`/`ip`/`iptables` at all; fail closed with a clear message
+                // instead of retrying forever with nothing captured (codex).
+                crate::proxy::netns_udp_capture::preflight_capture_tools(
+                    capture_config.udp_ipv6_capture_required(),
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
                 let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
                     env_config.mesh_node_waypoint_pod_registry_dir.clone(),
                 ));

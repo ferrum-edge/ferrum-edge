@@ -236,6 +236,24 @@ pub struct CaptureConfig {
 }
 
 impl CaptureConfig {
+    /// Whether the Ambient UDP producer's per-pod setup will FATALLY require
+    /// `ip6tables`: `FERRUM_MESH_IP6TABLES_ENABLED=required` AND at least one IPv6
+    /// UDP include/exclude CIDR, so `udp_iptables_script` emits its required-mode
+    /// `ip6tables` preflight (which `exit 1`s the per-pod script when `ip6tables`
+    /// is missing). The producer's STARTUP preflight (`preflight_capture_tools`)
+    /// consults this to fail fast when the runtime image lacks `ip6tables`, rather
+    /// than letting every per-pod setup fail and retry forever (codex). The exact
+    /// condition mirrors `udp_only_for_config`'s v6-command gate.
+    pub(crate) fn udp_ipv6_capture_required(&self) -> bool {
+        self.udp_capture_enabled
+            && self.ip6tables_mode == Ip6TablesMode::Required
+            && self
+                .include_cidrs
+                .iter()
+                .chain(self.exclude_cidrs.iter())
+                .any(|cidr| cidr_family(cidr) == Some(CidrFamily::V6))
+    }
+
     /// Build an `Explicit`-mode capture config with the implicit `0.0.0.0/0`
     /// include CIDR default.
     ///

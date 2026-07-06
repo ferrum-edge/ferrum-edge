@@ -337,17 +337,28 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
 }
 
 /// Preflight the external tools the Ambient UDP producer needs — a shell plus
-/// `ip` + `iptables` — before starting the manager. The producer runs `sh -c`
-/// scripts that call `ip`/`iptables` inside each pod netns; a distroless runtime
-/// image ships none of them, so without this check every pod's `open_udp_capture`
-/// would fail `NotFound`, return `None`, and the manager would retry forever with
+/// `ip` + `iptables` (and `ip6tables` when IPv6 UDP capture is REQUIRED) — before
+/// starting the manager. The producer runs `sh -c` scripts that call
+/// `ip`/`iptables`/`ip6tables` inside each pod netns; a distroless runtime image
+/// ships none of them, so without this check every pod's `open_udp_capture` would
+/// fail `NotFound`, return `None`, and the manager would retry forever with
 /// nothing captured (codex). Fail startup with a clear, actionable message
-/// instead. Non-`cfg`-gated so the `cfg!(target_os = "linux")` runtime gate at the
-/// call site compiles on every platform; it only runs on Linux.
-pub(crate) fn preflight_capture_tools() -> Result<(), String> {
+/// instead. `require_ip6tables` mirrors the per-pod script's FATAL `ip6tables`
+/// preflight (`CaptureConfig::udp_ipv6_capture_required`): with
+/// `FERRUM_MESH_IP6TABLES_ENABLED=required` + IPv6 UDP CIDRs, an image missing
+/// `ip6tables` would otherwise pass startup and then fail every per-pod setup
+/// forever — the exact failure mode this check exists to prevent (codex).
+/// Non-`cfg`-gated so the `cfg!(target_os = "linux")` runtime gate at the call
+/// site compiles on every platform; it only runs on Linux.
+pub(crate) fn preflight_capture_tools(require_ip6tables: bool) -> Result<(), String> {
+    let mut probe =
+        String::from("command -v ip >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1");
+    if require_ip6tables {
+        probe.push_str(" && command -v ip6tables >/dev/null 2>&1");
+    }
     let output = std::process::Command::new("sh")
         .arg("-c")
-        .arg("command -v ip >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1")
+        .arg(&probe)
         .output()
         .map_err(|e| {
             format!(
@@ -358,11 +369,17 @@ pub(crate) fn preflight_capture_tools() -> Result<(), String> {
             )
         })?;
     if !output.status.success() {
-        return Err("Ambient UDP capture is enabled but `ip` and/or `iptables` are not available in \
-             the runtime image; the per-pod-netns producer needs both to install UDP TPROXY rules. \
-             Use a runtime image that ships iproute2 + iptables (the distroless default lacks them), \
-             or unset FERRUM_MESH_CAPTURE_UDP_ENABLED."
-            .to_string());
+        let tools = if require_ip6tables {
+            "`ip`, `iptables`, and `ip6tables` (IPv6 UDP capture is set to `required`)"
+        } else {
+            "`ip` and/or `iptables`"
+        };
+        return Err(format!(
+            "Ambient UDP capture is enabled but {tools} are not available in the runtime image; \
+             the per-pod-netns producer needs them to install UDP TPROXY rules. Use a runtime \
+             image that ships iproute2 + iptables (the distroless default lacks them), or unset \
+             FERRUM_MESH_CAPTURE_UDP_ENABLED."
+        ));
     }
     Ok(())
 }
