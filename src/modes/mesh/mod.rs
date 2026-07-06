@@ -5616,10 +5616,13 @@ fn select_east_west_gateway_for_network<'a>(
 /// attempted and mismatches must fail closed rather than bypass the gateway
 /// with a direct pod dial. True when EITHER holds:
 ///
-/// 1. ANY gateway is declared with `gateway.network == network` (exact) —
-///    authoritative even when it is NOT a candidate (SNI/trust-domain miss):
-///    the operator declared how this network is reached, so a non-routable
-///    destination fails closed instead of re-enabling a direct dial; or
+/// 1. For a NAMED network, ANY gateway declared with `gateway.network == network`
+///    (exact) is authoritative even when it is NOT a candidate
+///    (SNI/trust-domain miss): the operator declared how this network is
+///    reached, so a non-routable destination fails closed instead of
+///    re-enabling a direct dial. `network == None` is not a named exact network;
+///    `network: None` gateways are catch-alls and are authoritative only when
+///    the selector accepts them as candidates; or
 /// 2. [`select_east_west_gateway_for_network`] selects a gateway — which, when
 ///    the network has no exact declaration, is an APPLICABLE catch-all
 ///    (`network: None` AND an SNI/trust-domain candidate). A NON-candidate
@@ -5636,17 +5639,19 @@ pub(crate) fn east_west_gateway_governs_network(
     service_fqdn: &str,
     expected_trust_domain: &crate::identity::spiffe::TrustDomain,
 ) -> bool {
-    select_east_west_gateway_for_network(
+    let selected_gateway = select_east_west_gateway_for_network(
         multi_cluster,
         network,
         service_fqdn,
         expected_trust_domain,
-    )
-    .is_some()
-        || multi_cluster
+    );
+    let exact_named_network_declared = network.is_some()
+        && multi_cluster
             .east_west_gateways
             .iter()
-            .any(|gateway| gateway.network.as_deref() == network)
+            .any(|gateway| gateway.network.as_deref() == network);
+
+    selected_gateway.is_some() || exact_named_network_declared
 }
 
 /// An HTTP-family `/` proxy on the outbound capture listener whose `HttpPool`

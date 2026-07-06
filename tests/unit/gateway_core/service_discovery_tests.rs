@@ -2415,6 +2415,55 @@ async fn mesh_sd_ambient_keeps_direct_remote_fallback_when_catch_all_gateway_can
 }
 
 #[tokio::test]
+async fn mesh_sd_ambient_keeps_unknown_network_direct_fallback_when_catch_all_cannot_route() {
+    // `network: None` east-west gateways are catch-alls, not exact declarations
+    // for workloads missing a network label. If the catch-all is not a candidate
+    // for this service/trust-domain, it must not suppress the flat-network
+    // direct fallback for an unknown-network remote workload.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(remote_id),
+    });
+    let mut remote = mesh_remote_west_workload(remote_id, 8080);
+    remote.network = None;
+    let mut multi_cluster = mesh_west_multi_cluster();
+    multi_cluster.east_west_gateways[0].network = None;
+    multi_cluster.east_west_gateways[0].sni_hosts =
+        vec!["other.ferrum.svc.cluster.local".to_string()];
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![mesh_workload(api_id, "api", "10.0.0.1", 8080), remote],
+        multi_cluster: Some(multi_cluster),
+        ..MeshConfig::default()
+    };
+
+    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+        .discover()
+        .await
+        .expect("discover succeeds");
+    targets.sort_by(|a, b| a.host.cmp(&b.host));
+
+    assert_eq!(
+        targets.len(),
+        2,
+        "non-candidate catch-all gateway must not suppress unknown-network direct fallback"
+    );
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+    assert_eq!(targets[1].host, "10.9.0.1");
+    assert_eq!(
+        targets[1].tags.get("mesh.remote").map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !targets[1].tags.contains_key("mesh.cross_cluster"),
+        "unknown-network direct fallback must not be rewritten into a non-candidate gateway target"
+    );
+}
+
+#[tokio::test]
 async fn mesh_sd_ambient_exact_network_gateway_without_candidate_skips_remote_fail_closed() {
     // An exact-network gateway declaration is authoritative for that remote
     // network. If it cannot route this service/trust-domain, Ambient SD must
