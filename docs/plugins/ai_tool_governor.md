@@ -1,0 +1,166 @@
+# ai_tool_governor
+
+Deterministic allow / deny / approval policy for AI **tool and function calls** —
+the concrete actions an agent asks a client runtime (or an upstream agent/tool)
+to execute: file writes, ticket creation, deploys, DB queries, code execution,
+account changes.
+
+`ai_tool_governor` complements [`ai_semantic_firewall`](../plugin_execution_order.md):
+the firewall catches *intent* with semantic policy; the governor enforces
+*deterministic* policy on concrete **tool names, arguments, JSON Schema,
+regexes, risk, caller identity, proxy, and model/provider metadata**, plus an
+optional out-of-band approval webhook. It never tries to prove intent — every
+decision is a deterministic function of the request/response bytes plus the
+approval endpoint's answer.
+
+- **Priority:** `2978` (Admission band) — after `ai_request_guard` (2975), before
+  `ai_semantic_cache` (2980) and `ai_federation` (2985), so disallowed tool
+  schemas are screened before caching or federation routing. Set
+  `priority_override` (e.g. `2994`, just after `a2a_gateway`) if you want to
+  consume MCP/A2A metadata emitted by `mcp_gateway`/`a2a_gateway` first.
+- **Protocols:** HTTP family (HTTP/1.1, HTTP/2, HTTP/3). Raw WebSocket frame
+  tools are out of scope for the MVP.
+- **Failure policy:** `FailClosed`.
+
+## Inspection surfaces
+
+Each is toggled independently under `inspect`; at least one must be enabled.
+
+| Surface | Default | What it governs |
+| --- | --- | --- |
+| `request_tool_definitions` | `false` | Tool definitions the client exposes to the model (`tools[].function.name`, `functions[].name`). A disallowed definition is rejected/dry-run. |
+| `response_tool_calls` | `true` | Buffered response tool calls (`choices[].message.tool_calls[]` and legacy `choices[].message.function_call`). |
+| `streaming_response_tool_calls` | `false` | OpenAI SSE `choices[].delta.tool_calls` deltas, reassembled across frames. |
+| `mcp_tool_calls` | `false` | MCP JSON-RPC `tools/call` request bodies (`params.name` + `params.arguments`). |
+| `a2a_methods` | `false` | A2A JSON-RPC method names (governed against the `tools` map). |
+
+For **streaming**, tool-call SSE frames are **held** (not forwarded) until the
+call is complete and cleared by policy/approval, then the held frames are
+released; on a block the stream is **cut with a terminal SSE error event** and
+the held frames are dropped — the disallowed call never reaches the client.
+Ordinary content/role deltas stream through live.
+
+## Actions
+
+Per tool (`tools.<name>.action`): `allow`, `deny`, `redact_args`,
+`require_approval`, `dry_run`. `default_action` (`allow` / `deny` /
+`require_approval`) applies to any tool without an explicit entry.
+
+Argument checks apply to every non-deny action: `max_arg_bytes`,
+`required_args`, `json_schema`, and `blocked_arg_patterns`. A blocked-pattern
+match denies under `allow`/`require_approval`/`dry_run`, and is **redacted**
+under `redact_args` (buffered path). In the **streaming** path a `redact_args`
+match fails closed (cuts the stream), since mid-stream surgical redaction of
+split-JSON arguments is out of MVP scope.
+
+## Examples
+
+### Allowlist-only (deny everything not explicitly permitted)
+
+```yaml
+plugin_name: ai_tool_governor
+config:
+  mode: enforce
+  default_action: deny
+  inspect:
+    request_tool_definitions: true
+    response_tool_calls: true
+  tools:
+    "github.create_pr":
+      action: allow
+      max_arg_bytes: 32768
+      required_args: ["repo", "title", "body"]
+      blocked_arg_patterns:
+        - name: secret
+          regex: "(?i)(api[_-]?key|password|token)"
+```
+
+Any tool other than `github.create_pr` — whether exposed as a definition or
+returned as a call — is rejected with `502`.
+
+### Approval-required production writes
+
+```yaml
+plugin_name: ai_tool_governor
+config:
+  mode: enforce
+  default_action: deny
+  tools:
+    "filesystem.write":
+      action: require_approval
+      risk: high
+      json_schema:
+        type: object
+        required: ["path", "content"]
+        properties:
+          path: { type: string, pattern: "^/workspace/" }
+          content: { type: string }
+    "kubectl.apply":
+      action: deny
+  approval:
+    endpoint_url: https://approval.internal.example.com/ferrum/tool-approval
+    timeout_ms: 1500
+    cache_ttl_seconds: 300
+    fail_on_error: reject      # reject | warn | allow
+    include_prompt_excerpt: false
+```
+
+`filesystem.write` calls are POSTed to the approval webhook with request
+correlation, consumer/proxy/model/provider, tool name, arguments hash, and risk.
+Identical calls reuse the cached decision for `cache_ttl_seconds`. When the
+endpoint is unreachable, `fail_on_error: reject` blocks the call
+(`warn`/`allow` fail open).
+
+The webhook returns `{"decision":"allow"|"deny"}` (or `{"allow":true|false}`),
+optionally with `{"approval_id":"..."}`.
+
+### Dry-run rollout
+
+```yaml
+plugin_name: ai_tool_governor
+config:
+  mode: dry_run          # evaluate + emit metadata, never reject, never call the webhook
+  default_action: deny
+  tools:
+    "github.create_pr": { action: allow }
+```
+
+`dry_run` records `ai_tool_governor.decision` (what *would* have happened) without
+blocking any request — use it to observe policy impact before switching to
+`enforce`.
+
+## Observability metadata
+
+When `observability.emit_metadata` is on (default), the plugin writes
+`ai_tool_governor.*` transaction metadata: `enabled`, `mode`, `decision`
+(`allow` / `deny` / `require_approval` / `approved` / `approval_denied`),
+`tool_names`, `risk` (max), `policy_ids`, `approval_id`, `arguments_hashes`
+(SHA-256, when `hash_arguments` is on), and `redacted_tools`.
+
+Raw arguments are **never** placed in metadata and never logged unless
+`observability.max_argument_log_bytes > 0` (then a bounded excerpt of a blocked
+call's arguments is logged at `debug` for audit). Raw arguments are sent to the
+approval webhook only when `approval.include_prompt_excerpt: true`.
+
+## Composition
+
+- **`ai_semantic_firewall`** — the semantic firewall catches *intent* (prompt
+  injection, tool-abuse language, exfiltration). `ai_tool_governor` enforces
+  *deterministic* tool/action policy on the concrete call. Run both: the
+  firewall (2968) evaluates the prompt/response text; the governor (2978)
+  gates the specific tool name and arguments.
+- **`mcp_gateway`** — MCP routing, aggregation, and session mediation remain in
+  `mcp_gateway`. Enable `inspect.mcp_tool_calls` on `ai_tool_governor` to add
+  deterministic approval/argument policy over selected MCP `tools/call` traffic;
+  the governor parses the JSON-RPC body directly and does not depend on
+  `mcp_gateway` being present.
+
+## Limitations (MVP)
+
+- Streaming `redact_args` fails closed (cuts the stream) rather than redacting
+  split-JSON arguments mid-flight.
+- Held streaming tool-call frames are released together at call completion;
+  content and tool-call deltas are assumed not to interleave within a single
+  response (the dominant OpenAI streaming shape).
+- The plugin governs tool calls; it does not execute tools, manage MCP sessions,
+  or replace `mcp_gateway`/A2A routing.

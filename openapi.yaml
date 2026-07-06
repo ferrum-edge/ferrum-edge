@@ -3790,6 +3790,7 @@ paths:
                 - ai_response_guard
                 - ai_semantic_cache
                 - ai_federation
+                - ai_tool_governor
                 - mcp_gateway
                 - a2a_gateway
                 - ws_message_size_limiting
@@ -7010,6 +7011,16 @@ components:
             properties:
               config:
                 $ref: "#/components/schemas/AiFederationConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_tool_governor
+          then:
+            required: [config]
+            properties:
+              config:
+                $ref: "#/components/schemas/AiToolGovernorConfig"
         - if:
             required: [plugin_name]
             properties:
@@ -14821,6 +14832,150 @@ components:
           type: integer
           default: 0
           description: "Maximum allowed length of completion content, measured in characters (Unicode scalar values, not UTF-8 bytes). 0 = no limit"
+
+    AiToolGovernorConfig:
+      type: object
+      description: "Plugin: ai_tool_governor — Deterministic allow/deny/approval policy for AI tool/function calls. Inspects request tool definitions (tools[].function.name / functions[].name), buffered response tool calls (choices[].message.tool_calls[] and legacy function_call), streaming SSE tool-call deltas (held until complete and cleared by policy/approval, then released — or the stream is cut with an SSE error event, never leaking the held call), and optionally MCP tools/call and A2A JSON-RPC methods. Complements ai_semantic_firewall (which catches intent): every decision here is a deterministic function of names, arguments, JSON Schema, regexes, identity, and an optional approval webhook. Does not execute tools or replace mcp_gateway/A2A routing. HTTP-family only."
+      properties:
+        enabled:
+          type: boolean
+          default: true
+          description: "When false the plugin is inert (no buffering, no inspection)."
+        mode:
+          type: string
+          enum: [enforce, dry_run]
+          default: enforce
+          description: "enforce rejects/cuts blocked tool calls; dry_run evaluates and emits metadata but never rejects and never calls the approval webhook (safe rollout)."
+        default_action:
+          type: string
+          enum: [allow, deny, require_approval]
+          default: deny
+          description: "Action for a tool with no explicit policy entry. tools may be empty only when default_action governs (deny/require_approval)."
+        inspect:
+          type: object
+          description: "Independently toggled inspection surfaces. At least one must be enabled."
+          properties:
+            request_tool_definitions:
+              type: boolean
+              default: false
+              description: "Reject/dry-run requests that expose disallowed tool definitions to the model."
+            response_tool_calls:
+              type: boolean
+              default: true
+              description: "Govern tool calls in buffered (non-streaming) responses."
+            streaming_response_tool_calls:
+              type: boolean
+              default: false
+              description: "Govern OpenAI SSE tool-call deltas. Held tool-call frames are released only after policy/approval clears the call; a block cuts the stream with a terminal SSE error event. In streaming, a redact_args match fails closed (denies) since mid-stream surgical redaction of split-JSON arguments is out of scope."
+            mcp_tool_calls:
+              type: boolean
+              default: false
+              description: "Inspect MCP JSON-RPC tools/call request bodies directly (params.name + params.arguments)."
+            a2a_methods:
+              type: boolean
+              default: false
+              description: "Govern A2A JSON-RPC method names against the tools policy map (params carried as arguments)."
+        tools:
+          type: object
+          description: "Per-tool policy, keyed by exact tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name)."
+          additionalProperties:
+            type: object
+            required: [action]
+            properties:
+              action:
+                type: string
+                enum: [allow, deny, redact_args, require_approval, dry_run]
+                description: "allow forwards; deny blocks; redact_args replaces blocked_arg_patterns matches with redaction_placeholder (buffered path); require_approval calls the approval webhook; dry_run forwards and records the observational decision."
+              risk:
+                type: string
+                enum: [low, medium, high, critical]
+                default: low
+                description: "Risk band surfaced as ai_tool_governor.risk (max across a batch) and in approval requests."
+              max_arg_bytes:
+                type: integer
+                minimum: 0
+                description: "Deny when the raw arguments string exceeds this many bytes."
+              required_args:
+                type: array
+                items:
+                  type: string
+                description: "Deny when any listed key is absent from the parsed arguments object."
+              blocked_arg_patterns:
+                type: array
+                items:
+                  type: object
+                  required: [name, regex]
+                  properties:
+                    name:
+                      type: string
+                      description: "Pattern identifier; substituted into redaction_placeholder {name}."
+                    regex:
+                      type: string
+                      description: "Regex matched against the raw arguments string. Under a non-redact action a match denies; under redact_args a match is redacted."
+                description: "Named regexes screening tool arguments."
+              json_schema:
+                type: object
+                description: "JSON Schema (validated with the jsonschema crate) the parsed arguments must satisfy, else deny."
+        approval:
+          type: object
+          description: "Approval webhook, required when any policy can reach require_approval."
+          required: [endpoint_url]
+          properties:
+            endpoint_url:
+              type: string
+              description: "http/https URL POSTed with request_id, consumer, proxy, model, provider, tool_name, arguments_hash, risk (and raw arguments only when include_prompt_excerpt=true). Response: {\"decision\":\"allow|deny\"} or {\"allow\":true|false}, optional approval_id."
+            timeout_ms:
+              type: integer
+              minimum: 1
+              default: 1500
+              description: "Per-request approval webhook timeout."
+            cache_ttl_seconds:
+              type: integer
+              minimum: 0
+              default: 300
+              description: "TTL for caching an approval decision keyed by consumer+proxy+model+tool+arguments. 0 disables caching."
+            fail_on_error:
+              type: string
+              enum: [reject, warn, allow]
+              default: reject
+              description: "Behavior when the approval endpoint cannot be evaluated: reject fails closed, warn/allow fail open."
+            include_prompt_excerpt:
+              type: boolean
+              default: false
+              description: "Include the raw tool arguments in the approval request body. Off by default so secrets are not sent."
+        response:
+          type: object
+          properties:
+            deny_status_code:
+              type: integer
+              minimum: 100
+              maximum: 599
+              default: 502
+              description: "HTTP status returned when a tool call/definition is blocked in enforce mode."
+            redaction_placeholder:
+              type: string
+              default: "[REDACTED_TOOL_ARG:{name}]"
+              description: "Template for redacted argument matches; {name} is replaced with the matched pattern name."
+            streaming_deny_event:
+              type: boolean
+              default: true
+              description: "Emit a terminal SSE error event when cutting a streamed tool call."
+        observability:
+          type: object
+          properties:
+            emit_metadata:
+              type: boolean
+              default: true
+              description: "Emit ai_tool_governor.* transaction metadata (enabled, mode, decision, tool_names, risk, policy_ids, approval_id, arguments_hashes, redacted_tools)."
+            hash_arguments:
+              type: boolean
+              default: true
+              description: "Emit SHA-256 hashes of tool arguments as ai_tool_governor.arguments_hashes. Raw arguments are never placed in metadata."
+            max_argument_log_bytes:
+              type: integer
+              minimum: 0
+              default: 0
+              description: "When > 0, log up to this many bytes of a blocked call's raw arguments at debug for audit. 0 keeps raw arguments out of logs entirely."
 
     AiFederationConfig:
       type: object
