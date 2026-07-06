@@ -9616,41 +9616,68 @@ async fn connect_mesh_websocket_backend(
             })
         }
         MeshWsEgress::AmbientHbone => {
-            // Cross-cluster Ambient WebSocket egress is NOT yet supported
-            // (HTTP-first; tracked as a follow-up like the deferred Sidecar WS
-            // cross-cluster path). A cross-cluster HBONE target carries NO
-            // `mesh.spiffe_id` (so `target_expected_peer_spiffe` returns
-            // `Ok(None)` rather than erroring) and the bare-byte-tunnel WS path
-            // has no SNI-override / trust-domain-scope plumbing — dialing it would
-            // hit the gateway with the WRONG (dial-host) SNI. FAIL CLOSED here so
-            // the upgrade errors cleanly (no plaintext, no wrong-SNI dial) and is
-            // diagnosable, mirroring the Sidecar WS cross-cluster guard.
-            if hbone_pool::target_hbone_cross_cluster(target) {
-                warn!(
-                    proxy_id = %proxy.id,
-                    target_host = %target.host,
-                    "Cross-cluster Ambient WebSocket egress is not yet supported; failing the \
-                     upgrade closed (no cross-cluster SNI override / trust-domain scope on the \
-                     HBONE WS byte-tunnel path). Tracked as a follow-up."
-                );
-                return Err("cross-cluster Ambient WebSocket egress is not supported".into());
-            }
-            let expected_peer = hbone_pool::target_expected_peer_spiffe(target)?;
+            // Resolve the HBONE byte-tunnel dial (issue #2010), mirroring
+            // `proxy_to_backend_hbone`'s cross-cluster branch so the WS and HTTP
+            // HBONE paths cannot drift:
+            //   * IN-CLUSTER: pin the destination pod SPIFFE, dial the pod addr,
+            //     no SNI/trust-domain override; the inner CONNECT `:authority` is
+            //     the pod addr:port.
+            //   * CROSS-CLUSTER east-west (`mesh.cross_cluster`): dial the REMOTE
+            //     gateway (`mesh.hbone_dial_host`) with the ClientHello SNI
+            //     OVERRIDDEN to the destination service FQDN (`mesh.eastwest_sni`)
+            //     and TRUST-DOMAIN-ONLY verification (`mesh.trust_domain`, no
+            //     pinned pod SPIFFE); the inner CONNECT `:authority` is the REAL
+            //     pod addr (`mesh.hbone_authority_host`, since `target.host` is a
+            //     scoped synthetic identity) the dest relay byte-copies to.
+            // A malformed cross-cluster target (missing SNI / trust domain) FAILS
+            // THE UPGRADE CLOSED here — never a plaintext / wrong-SNI dial.
             let hbone_port = hbone_pool::target_hbone_port(target);
             let dial_host = hbone_pool::target_hbone_dial_host(target)?;
-            // Bare HBONE byte tunnel to the destination workload's app addr:port
-            // (the CONNECT `:authority` the relay byte-copies to) — NOT an
-            // Extended CONNECT (see this fn's doc comment + `get_ws_byte_tunnel`).
+            // The inner CONNECT `:authority` host: the `mesh.hbone_authority_host`
+            // tag for a cross-cluster target, else `target.host` in-cluster (the
+            // tag is absent → returns `target.host`, byte-identical to before).
+            let app_host = hbone_pool::target_hbone_authority_host(target)?;
+            let (expected_peer, expected_trust_domain, sni_override) =
+                if hbone_pool::target_hbone_cross_cluster(target) {
+                    let sni = hbone_pool::target_hbone_eastwest_sni(target).ok_or_else(|| {
+                        warn!(
+                            proxy_id = %proxy.id,
+                            target_host = %target.host,
+                            "Refusing cross-cluster Ambient WebSocket egress: missing/empty \
+                             mesh.eastwest_sni (fail closed, never dial the gateway IP as SNI)"
+                        );
+                        "cross-cluster Ambient WebSocket target missing mesh.eastwest_sni"
+                    })?;
+                    let td = hbone_pool::target_hbone_cross_cluster_trust_domain(target)
+                        .ok_or_else(|| {
+                            warn!(
+                                proxy_id = %proxy.id,
+                                target_host = %target.host,
+                                "Refusing cross-cluster Ambient WebSocket egress: missing/empty/\
+                                 unparseable mesh.trust_domain (fail closed, never any-federated)"
+                            );
+                            "cross-cluster Ambient WebSocket target missing mesh.trust_domain"
+                        })?;
+                    (None, Some(td), Some(sni))
+                } else {
+                    (hbone_pool::target_expected_peer_spiffe(target)?, None, None)
+                };
+            // Bare HBONE byte tunnel to the CONNECT `:authority` (the pod app
+            // addr:port the relay byte-copies to) — NOT an Extended CONNECT (see
+            // `get_ws_byte_tunnel`). For cross-cluster the outer TLS dials the
+            // gateway with the SNI override + trust-domain scope resolved above.
             let tunnel = state
                 .hbone_pool
                 .get_ws_byte_tunnel(
                     proxy,
                     dial_host,
                     hbone_port,
-                    &target.host,
+                    app_host,
                     target.port,
                     target.dispatch_policy_port(),
                     expected_peer.as_ref(),
+                    expected_trust_domain.as_ref(),
+                    sni_override,
                 )
                 .await?;
 

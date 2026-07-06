@@ -662,6 +662,7 @@ impl HboneConnectionPool {
     /// current SVID. The dial PINS `expected_peer`; a missing gateway SVID fails
     /// closed before the dial.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_ws_byte_tunnel(
         &self,
         proxy: &Proxy,
@@ -671,6 +672,13 @@ impl HboneConnectionPool {
         app_port: u16,
         app_policy_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
+        // CROSS-CLUSTER east-west (issue #2010): `expected_trust_domain` scopes
+        // the peer-cert verifier to a single remote trust domain (`expected_peer =
+        // None`, since the SNI-passthrough gateway LB-picks the destination) and
+        // `sni_override` sets the ClientHello SNI to the destination service FQDN.
+        // Both `None` for the in-cluster byte-tunnel (SNI = dial host, pinned peer).
+        expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
+        sni_override: Option<&str>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
         let pool_config = self.pool_config.for_proxy(proxy);
@@ -688,10 +696,8 @@ impl HboneConnectionPool {
             dial_host,
             hbone_port,
             expected_peer,
-            // WS-over-HBONE is in-cluster only (cross-cluster WS is a documented
-            // follow-up); no trust-domain scope / SNI override.
-            None,
-            None,
+            expected_trust_domain,
+            sni_override,
             &pool_config,
             keepalive_override,
             None,
