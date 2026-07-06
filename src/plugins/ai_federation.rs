@@ -2717,6 +2717,21 @@ impl Plugin for AiFederation {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Coordinate with `ai_stream_router` (priority 2984, runs first). When it
+        // claims a streaming request it rewrites the route to a provider and sets
+        // `ai_stream_router_claimed = true`; `ai_federation` must not re-inspect
+        // or reject that request (its terminate-and-respond path rejects
+        // `"stream": true` with 501). `ai_stream_router` owns the streaming path;
+        // `ai_federation` owns the non-streaming path, so the two compose.
+        if ctx
+            .metadata
+            .get("ai_stream_router_claimed")
+            .map(String::as_str)
+            == Some("true")
+        {
+            return PluginResult::Continue;
+        }
+
         // Only handle POST requests with JSON content-type
         if ctx.method != "POST" {
             return PluginResult::Continue;

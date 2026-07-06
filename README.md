@@ -336,6 +336,7 @@ Nine plugins for AI and agent gateway use cases — cost visibility, budget enfo
 - **`ai_semantic_cache`** — LLM response caching with normalized exact-match keys, optional embedding-based semantic similarity, and local or Redis exact-response storage
 - **`ai_response_guard`** — Output-side content guardrails: PII detection, blocked phrases, response format validation
 - **`ai_federation`** — Universal AI gateway routing non-streaming Chat Completions requests to 11+ providers with model-based routing and priority fallback; matched `"stream": true` requests return `501`
+- **`ai_stream_router`** — Streaming counterpart to `ai_federation`: claims `"stream": true` OpenAI Chat Completions, route-overrides to the matched provider, and normalizes provider-native SSE (e.g. Anthropic) to OpenAI `chat.completion.chunk` SSE without buffering
 - **`mcp_gateway`** — MCP / Agent Tool Gateway for HTTP JSON-RPC MCP traffic: transparent proxying, aggregate discovery, namespaced tool/resource/prompt routing, session mediation, tool argument validation, and `mcp.*` metadata for downstream Ferrum plugins
 - **`a2a_gateway`** — Transparent Agent-to-Agent gateway for HTTP/HTTPS JSON-RPC, HTTP+JSON/REST, and gRPC/grpcs traffic: method detection, lightweight method policy, HTTP Agent Card URL rewriting, streaming-safe pass-through, and `a2a.*` metadata
 
