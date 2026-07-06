@@ -1,0 +1,56 @@
+# cargo-nextest configuration.
+#
+# ── HTTP/3 functional-test concurrency throttle ──────────────────────────────
+# Fixes the intermittent "Functional Tests (protocols)" CI flake. Each H3/QUIC
+# functional test spawns its OWN in-process QUIC gateway + backend. When the
+# `protocols` shard runs many of them in parallel, the simultaneous QUIC gateway
+# startups + handshakes contend for the runner's UDP-socket + tokio-runtime
+# resources and intermittently either:
+#   * exhaust a gateway's startup retry budget
+#     ("Gateway (TLS) did not start after N attempts" — the H3 WebSocket tests), or
+#   * race H3 gRPC trailer delivery
+#     ("grpc-status trailer must be forwarded; trailers: None" — the native-H3
+#      gRPC tests, which fast-fail with the gateway already reported ready).
+#
+# Both families pass in isolation and when the shard is run serially, so this is
+# a test-harness resource-contention artifact (N independent gateways racing on
+# one box), NOT a single-gateway production race — throttling HTTP/3 test
+# concurrency removes the trigger without masking a product bug. This mirrors the
+# `data-plane` functional shard's `nextest_jobs: 1` serialization for its
+# exclusive-port races (see `.github/workflows/ci.yml`), but is surgical: only
+# HTTP/3 tests are serialized, so the rest of the `protocols` shard keeps running
+# fully parallel and the CI-time cost is limited to the few dozen H3 tests.
+#
+# Scope note: most HTTP/3 tests are named with either `h3` or `http3`
+# (`scripted_backend_h3_tests`, `functional_h3_*`, `functional_protocol_h3_*`, the
+# `test_h3_websocket_*` cases inside the WebSocket suites, and the cross-cutting
+# `*_http3_*` cases such as `functional_allowed_methods_http3_*`,
+# `functional_ws_origin_http3_*`, `functional_protocol_validation_*_http3`) — both
+# forms are needed, since `"http3"` does not contain the substring `"h3"`.
+#
+# A few QUIC-spawning tests carry NEITHER token and would otherwise slip the
+# throttle (codex): the backend-capability-classification tests probe a backend
+# over QUIC to decide h3-support, so `functional_capability_registry_test::{
+# initial_refresh_when_warmup_off_classifies_before_traffic,
+# refresh_coalescer_under_rapid_config_reload }` and
+# `functional_retry_test::retry_rotation_across_mixed_capability_targets_recomputes_dispatch`
+# each start a `ScriptedH3Backend`. All three match `test(/capability/)` (the
+# capability-registry module name + the `mixed_capability` retry test), so adding
+# that term catches the whole QUIC-spawning set. It also pulls in ~2 non-QUIC
+# capability tests (`h2_alpn_*`), which is harmless — they merely run serially
+# with the group. Plain HTTP/1.1 + HTTP/2 tests without `capability`/`h3`/`http3`
+# in their path keep running fully parallel.
+#
+# Maintenance: a NEW functional test that spawns a QUIC gateway (`ScriptedH3Backend`
+# / `spawn_h3_harness` / `Http3Client`) but whose path contains none of
+# `h3`/`http3`/`capability` must be added to this filter, or it will reintroduce
+# the flake. `git grep -l 'ScriptedH3Backend\|spawn_h3_harness\|Http3Client' tests/functional`
+# lists the QUIC-spawning files.
+
+[test-groups]
+# At most one HTTP/3 test's QUIC gateway starts up / runs at a time.
+http3-serial = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'test(/h3/) or test(/http3/) or test(/capability/)'
+test-group = 'http3-serial'

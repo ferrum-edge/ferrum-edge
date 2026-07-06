@@ -16574,6 +16574,25 @@ async fn handle_proxy_request_inner(
                 }
 
                 record_request(&state, 200); // gRPC errors use HTTP 200
+                // A gRPC-Web request must receive a gRPC-Web-shaped response even
+                // for a gateway-generated backend error: the terminal status has
+                // to ride in a gRPC-Web trailer frame under the gRPC-Web
+                // content-type, never a raw `application/grpc` trailers-only
+                // response the browser client cannot read. The mesh-retry-refusal
+                // (above) and backend-admission-rejection paths are already
+                // gRPC-Web aware; this backend-exchange-error arm was the last one
+                // that fell through to raw `application/grpc`, which is exactly the
+                // intermittent `200 + application/grpc` a gRPC-Web caller saw when
+                // a backend read/connect blipped under load (issue #2041).
+                if let Some(content_type) = grpc_web_response_content_type {
+                    return Ok(build_grpc_web_error_response(content_type, grpc_code, msg));
+                }
+                if grpc_request_is_web_translated
+                    && let Some(response) =
+                        build_translated_grpc_web_error_response(&ctx, grpc_code, msg)
+                {
+                    return Ok(response);
+                }
                 return Ok(grpc_proxy::build_grpc_error_response(grpc_code, msg));
             }
         }
