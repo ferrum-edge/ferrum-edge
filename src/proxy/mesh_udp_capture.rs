@@ -1,21 +1,30 @@
-//! Mesh UDP TPROXY capture listener (F3 §3.3 Stage 3).
+//! Mesh UDP TPROXY capture listener + datagram-over-mesh egress (F3 §3.3).
 //!
 //! Stage 2 (`src/capture/mod.rs`) emits the flag-gated, default-off netfilter
 //! `TPROXY` rules that divert a captured pod's UDP egress to a transparent
 //! local socket WITHOUT rewriting the destination. This module is the consuming
-//! listener: it binds that socket (`IP_TRANSPARENT` + `IP_RECVORIGDSTADDR` /
-//! `IPV6_RECVORIGDSTADDR`), drains datagrams via `recvmmsg`, recovers each
-//! datagram's ORIGINAL destination from the per-datagram cmsg (NOT
-//! `SO_ORIGINAL_DST`, which is TCP/conntrack-only), and keys a lightweight
-//! session by `(client SocketAddr, orig-dst SocketAddr)`.
+//! listener + egress relay: it binds that socket (`IP_TRANSPARENT` +
+//! `IP_RECVORIGDSTADDR` / `IPV6_RECVORIGDSTADDR`), drains datagrams via
+//! `recvmmsg`, recovers each datagram's ORIGINAL destination from the
+//! per-datagram cmsg (NOT `SO_ORIGINAL_DST`, which is TCP/conntrack-only), keys a
+//! session by `(client SocketAddr, orig-dst SocketAddr)`, and relays it over the
+//! topology's mesh transport (Ambient HBONE `:15008`, Sidecar mesh-mTLS `:15006`)
+//! to the destination workload, spoofing replies back from the captured
+//! destination via a per-session transparent reply socket. All gated behind
+//! `FERRUM_MESH_CAPTURE_UDP_ENABLED` (default-off) so there is no behavior change
+//! when the flag is off.
 //!
-//! **Stage 3 is capture → DROP, intentionally inert.** For now a captured
-//! datagram whose orig-dst would route to mesh egress is DROPPED with a debug
-//! log — the egress relay (forwarding the datagram over the topology's mesh
-//! transport to the destination workload) is Stage 4. This stage exercises the
-//! listener, the `IP_TRANSPARENT` bind, the cmsg orig-dst extraction, and the
-//! session keying, all gated behind `FERRUM_MESH_CAPTURE_UDP_ENABLED`
-//! (default-off) so there is no behavior change when the flag is off.
+//! **Two producers, one relay.** The recv/session/egress loop is factored into
+//! [`run_mesh_udp_capture_on_socket`], which runs over an already-bound
+//! transparent socket regardless of which network namespace it was bound in:
+//! - [`start_mesh_udp_capture_listener`] binds in the CURRENT netns — Sidecar,
+//!   whose injected sidecar shares the pod netns where the injector installed the
+//!   TPROXY rules.
+//! - The Ambient per-pod-netns producer (`src/proxy/netns_udp_capture.rs`) binds
+//!   the capture socket, and each session's reply socket, INSIDE each enrolled
+//!   pod's netns via a [`ReplySocketFactory`] — Ambient's proxy runs outside the
+//!   pod netns, so the producer installs the TPROXY rules and binds the sockets
+//!   from within each pod's namespace.
 //!
 //! **DoS bounds** are reused from the plain UDP proxy (`udp_proxy.rs`): a
 //! bounded session map (`FERRUM_UDP_MAX_SESSIONS`), an idle-expiry sweep
@@ -109,34 +118,87 @@ fn mesh_udp_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
     ip.to_canonical().to_string()
 }
 
-/// Start the mesh UDP capture listener (Linux).
+/// Creates a per-session transparent UDP reply socket bound (non-locally, via
+/// `IP_TRANSPARENT`) to a captured datagram's original destination, so replies
+/// to the pod are sourced from the VIP:port it dialed.
 ///
-/// Binds a transparent UDP socket on `cfg.addr`, enables per-datagram orig-dst
-/// recovery, and drains datagrams in a `recvmmsg` loop. Each captured datagram
-/// is keyed into a bounded session map and then DROPPED (Stage 3 has no egress
-/// relay). The listener runs until either shutdown channel fires.
+/// The capture socket and its reply sockets MUST live in the SAME network
+/// namespace: the Sidecar/current-netns listener binds both in the process
+/// netns; the Ambient per-pod-netns producer binds both INSIDE the captured
+/// pod's netns. A reply socket in the wrong netns cannot deliver replies back to
+/// the pod client and would spoof the wrong source (risk #1). The factory
+/// returns a bound `std::net::UdpSocket` (not a tokio socket) so the pod-netns
+/// implementation can build it on a `setns`-bound OS thread with no tokio
+/// dependency; the caller adopts it onto the runtime.
 #[cfg(target_os = "linux")]
-pub async fn start_mesh_udp_capture_listener(
-    cfg: MeshUdpCaptureConfig,
-) -> Result<(), anyhow::Error> {
+pub(crate) trait ReplySocketFactory: Send + Sync + 'static {
+    fn bind_transparent_reply_socket(
+        &self,
+        orig_dst: SocketAddr,
+    ) -> std::io::Result<std::net::UdpSocket>;
+}
+
+/// Current-netns reply-socket factory: binds the transparent reply socket in the
+/// process's own network namespace (Sidecar, whose capture listener already runs
+/// inside the injected pod's netns).
+#[cfg(target_os = "linux")]
+pub(crate) struct CurrentNetnsReplySocketFactory;
+
+#[cfg(target_os = "linux")]
+impl ReplySocketFactory for CurrentNetnsReplySocketFactory {
+    fn bind_transparent_reply_socket(
+        &self,
+        orig_dst: SocketAddr,
+    ) -> std::io::Result<std::net::UdpSocket> {
+        build_transparent_reply_socket(orig_dst)
+    }
+}
+
+/// Pod-netns reply-socket factory for the Ambient per-pod-netns producer: builds
+/// each session's transparent reply socket INSIDE the captured pod's network
+/// namespace, so the spoofed reply source (the captured VIP:port) is emitted from
+/// the correct netns and the datagram reaches the pod client. Holds a STABLE
+/// netns handle (`/proc/<pid>/ns/net`, opened once at capture start) so the
+/// `setns` works for the whole capture lifetime even after the resolving PID
+/// exits. Every reply-socket build runs on a dedicated `setns`-bound OS thread
+/// via [`crate::proxy::netns_capture::run_in_netns`] (never a tokio worker).
+#[cfg(target_os = "linux")]
+pub(crate) struct PodNetnsReplySocketFactory {
+    netns: std::sync::Arc<std::fs::File>,
+}
+
+#[cfg(target_os = "linux")]
+impl PodNetnsReplySocketFactory {
+    pub(crate) fn new(netns: std::sync::Arc<std::fs::File>) -> Self {
+        Self { netns }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ReplySocketFactory for PodNetnsReplySocketFactory {
+    fn bind_transparent_reply_socket(
+        &self,
+        orig_dst: SocketAddr,
+    ) -> std::io::Result<std::net::UdpSocket> {
+        crate::proxy::netns_capture::run_in_netns(self.netns.as_ref(), move || {
+            build_transparent_reply_socket(orig_dst)
+        })
+    }
+}
+
+/// Bind the transparent UDP capture socket on `addr` in the CURRENT network
+/// namespace, preferring the dual-stack `[::]` bind and falling back to the v4
+/// wildcard only when IPv6 is genuinely unavailable. Returns the bound std
+/// socket, the resolved bind address, and which orig-dst cmsg families were
+/// enabled. Sync (socket2 only, no tokio) so the Ambient per-pod-netns producer
+/// can call it from a `setns`-bound OS thread to bind INSIDE a pod netns.
+#[cfg(target_os = "linux")]
+pub(crate) fn bind_mesh_udp_capture_socket(
+    addr: SocketAddr,
+) -> Result<(std::net::UdpSocket, SocketAddr, bool, bool), anyhow::Error> {
     use std::net::{IpAddr, Ipv4Addr};
     use std::os::fd::AsRawFd;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
-    use tokio::net::UdpSocket;
-    use tracing::{info, warn};
-
-    let MeshUdpCaptureConfig {
-        addr,
-        state,
-        shutdown,
-        global_shutdown,
-        max_sessions,
-        cleanup_interval_seconds,
-        recvmmsg_batch_size,
-        session_shard_amount,
-        started_tx,
-    } = cfg;
+    use tracing::warn;
 
     // Build a bound transparent capture socket on `bind_addr`. Factored into a
     // closure so the preferred dual-stack `[::]` bind can fall back to the v4
@@ -203,8 +265,8 @@ pub async fn start_mesh_udp_capture_listener(
     // report the listener "started" on v4 while ip6tables still diverts IPv6 UDP
     // to this port with no working v6 listener — blackholing v6 while the pod
     // looks ready. So a non-IPv6-availability error is returned, not masked.
-    let (std_socket, addr, v4_origdst, v6_origdst) = match build_bound_socket(addr) {
-        Ok((s, v4, v6)) => (s, addr, v4, v6),
+    match build_bound_socket(addr) {
+        Ok((s, v4, v6)) => Ok((s, addr, v4, v6)),
         Err(e) if addr.ip().is_ipv6() && is_ipv6_unavailable_error(&e) => {
             let v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), addr.port());
             warn!(
@@ -213,11 +275,103 @@ pub async fn start_mesh_udp_capture_listener(
                 "Mesh UDP capture: IPv6 unavailable for dual-stack [::] bind ({e}); falling back to v4 wildcard (IPv6 UDP capture unavailable on this host)"
             );
             let (s, v4, v6) = build_bound_socket(v4_addr)?;
-            (s, v4_addr, v4, v6)
+            Ok((s, v4_addr, v4, v6))
         }
-        Err(e) => return Err(e),
-    };
-    let frontend_socket = Arc::new(UdpSocket::from_std(std_socket)?);
+        Err(e) => Err(e),
+    }
+}
+
+/// Shared runtime knobs for the capture recv/session loop, independent of HOW
+/// the transparent socket was bound. Built by both the current-netns wrapper and
+/// the Ambient per-pod-netns producer.
+#[cfg(target_os = "linux")]
+pub(crate) struct MeshUdpCaptureRuntime {
+    pub state: std::sync::Arc<super::ProxyState>,
+    pub max_sessions: usize,
+    pub cleanup_interval_seconds: u64,
+    pub recvmmsg_batch_size: usize,
+    pub session_shard_amount: usize,
+    /// Builds each session's transparent reply socket in the SAME netns as the
+    /// capture socket (current-netns for Sidecar, pod-netns for Ambient).
+    pub reply_socket_factory: std::sync::Arc<dyn ReplySocketFactory>,
+}
+
+/// Start the mesh UDP capture listener in the CURRENT network namespace
+/// (Sidecar: the injected pod's own netns). Binds the transparent socket here,
+/// then runs the shared capture loop with a current-netns reply-socket factory.
+/// The Ambient per-pod-netns producer instead binds inside each enrolled pod's
+/// netns and calls [`run_mesh_udp_capture_on_socket`] directly with a pod-netns
+/// reply-socket factory.
+#[cfg(target_os = "linux")]
+pub async fn start_mesh_udp_capture_listener(
+    cfg: MeshUdpCaptureConfig,
+) -> Result<(), anyhow::Error> {
+    let MeshUdpCaptureConfig {
+        addr,
+        state,
+        shutdown,
+        global_shutdown,
+        max_sessions,
+        cleanup_interval_seconds,
+        recvmmsg_batch_size,
+        session_shard_amount,
+        started_tx,
+    } = cfg;
+    let (std_socket, addr, v4_origdst, v6_origdst) = bind_mesh_udp_capture_socket(addr)?;
+    let frontend_socket = tokio::net::UdpSocket::from_std(std_socket)?;
+    run_mesh_udp_capture_on_socket(
+        frontend_socket,
+        addr,
+        v4_origdst,
+        v6_origdst,
+        MeshUdpCaptureRuntime {
+            state,
+            max_sessions,
+            cleanup_interval_seconds,
+            recvmmsg_batch_size,
+            session_shard_amount,
+            reply_socket_factory: std::sync::Arc::new(CurrentNetnsReplySocketFactory),
+        },
+        shutdown,
+        global_shutdown,
+        started_tx,
+    )
+    .await
+}
+
+/// Run the mesh UDP capture recv/session loop over an ALREADY-BOUND transparent
+/// socket. Shared by [`start_mesh_udp_capture_listener`] (current netns) and the
+/// Ambient per-pod-netns producer (`netns_udp_capture`). `addr` is used only for
+/// logging; `v4_origdst`/`v6_origdst` report which orig-dst cmsg families the
+/// bind enabled. The recovered orig-dst, session keying, DoS bounds, egress
+/// relay, and return-path behavior are identical regardless of which netns the
+/// socket was bound in — only [`MeshUdpCaptureRuntime::reply_socket_factory`]
+/// differs.
+#[cfg(target_os = "linux")]
+pub(crate) async fn run_mesh_udp_capture_on_socket(
+    frontend_socket: tokio::net::UdpSocket,
+    addr: SocketAddr,
+    v4_origdst: bool,
+    v6_origdst: bool,
+    runtime: MeshUdpCaptureRuntime,
+    shutdown: watch::Receiver<bool>,
+    global_shutdown: Option<watch::Receiver<bool>>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
+    use std::os::fd::AsRawFd;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use tracing::{info, warn};
+
+    let MeshUdpCaptureRuntime {
+        state,
+        max_sessions,
+        cleanup_interval_seconds,
+        recvmmsg_batch_size,
+        session_shard_amount,
+        reply_socket_factory,
+    } = runtime;
+    let frontend_socket = Arc::new(frontend_socket);
 
     let session_shard_amount = crate::util::sharding::pool_shard_amount(session_shard_amount);
     // Bounded session map keyed by (client, orig-dst). Kernel-provided keys, so
@@ -317,6 +471,7 @@ pub async fn start_mesh_udp_capture_listener(
                                                 orig_dst,
                                                 chunk,
                                                 max_sessions,
+                                                &reply_socket_factory,
                                             );
                                         }
                                     }
@@ -329,6 +484,7 @@ pub async fn start_mesh_udp_capture_listener(
                                             orig_dst,
                                             data,
                                             max_sessions,
+                                            &reply_socket_factory,
                                         );
                                     }
                                 }
@@ -470,6 +626,7 @@ fn handle_captured_datagram(
     orig_dst: Option<SocketAddr>,
     data: &[u8],
     max_sessions: usize,
+    reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
 ) -> bool {
     use tracing::debug;
 
@@ -560,6 +717,7 @@ fn handle_captured_datagram(
                 last_activity,
                 queued_bytes,
                 epoch,
+                reply_factory.clone(),
             );
             true
         }
@@ -768,9 +926,20 @@ fn spawn_udp_egress_session(
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
+    reply_factory: std::sync::Arc<dyn ReplySocketFactory>,
 ) {
     tokio::spawn(async move {
-        run_udp_egress_session(&state, &entry, key, rx, last_activity, queued_bytes, epoch).await;
+        run_udp_egress_session(
+            &state,
+            &entry,
+            key,
+            rx,
+            last_activity,
+            queued_bytes,
+            epoch,
+            &reply_factory,
+        )
+        .await;
         // Session teardown: remove the map entry and decrement the live count so
         // a finished/failed flow frees its slot immediately (the idle sweep is a
         // backstop for sessions whose task is still alive but quiescent).
@@ -819,6 +988,7 @@ async fn run_udp_egress_session(
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
+    reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
 ) {
     use super::{LoadBalancerConnectionGuard, backend_dispatch};
     use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
@@ -1087,8 +1257,24 @@ async fn run_udp_egress_session(
     // captured original destination so replies to the pod appear sourced from
     // the VIP:port it dialed (IP_TRANSPARENT lets us bind a non-local addr;
     // the reply's source IP AND port then come from this bind). Risk #1. ──────
-    let reply_socket = match build_transparent_reply_socket(key.orig_dst) {
-        Ok(sock) => std::sync::Arc::new(sock),
+    // Built through the reply-socket factory so the socket lands in the SAME
+    // netns as the capture socket: current-netns for Sidecar, the captured pod's
+    // netns for Ambient. A reply socket in the wrong netns would not reach the
+    // pod client and would spoof the wrong source.
+    let reply_socket = match reply_factory.bind_transparent_reply_socket(key.orig_dst) {
+        Ok(std_sock) => match tokio::net::UdpSocket::from_std(std_sock) {
+            Ok(sock) => std::sync::Arc::new(sock),
+            Err(e) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    orig_dst = %key.orig_dst,
+                    error = %e,
+                    "Mesh UDP egress could not adopt the transparent reply socket onto the \
+                     runtime; ending session"
+                );
+                return;
+            }
+        },
         Err(e) => {
             warn!(
                 service = %entry.service_fqdn,
@@ -1251,9 +1437,7 @@ async fn run_udp_egress_session(
 /// pattern: the kernel emits replies from the bound transparent address rather
 /// than the host's own IP.
 #[cfg(target_os = "linux")]
-fn build_transparent_reply_socket(
-    orig_dst: SocketAddr,
-) -> Result<tokio::net::UdpSocket, anyhow::Error> {
+fn build_transparent_reply_socket(orig_dst: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     use std::net::IpAddr;
     use std::os::fd::AsRawFd;
 
@@ -1271,9 +1455,11 @@ fn build_transparent_reply_socket(
     }
     // Bind to the captured original destination (the VIP:port the pod dialed).
     // IP_TRANSPARENT makes this non-local bind succeed; replies sent on this
-    // socket then originate from orig_dst.
+    // socket then originate from orig_dst. Returns a std socket (no tokio) so the
+    // pod-netns factory can build it on a `setns`-bound OS thread; the caller
+    // adopts it onto the runtime via `tokio::net::UdpSocket::from_std`.
     socket.bind(&orig_dst.into())?;
-    Ok(tokio::net::UdpSocket::from_std(socket.into())?)
+    Ok(socket.into())
 }
 
 /// Resolve the per-session idle timeout for an egress session from the relay

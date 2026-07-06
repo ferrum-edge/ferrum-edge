@@ -282,7 +282,22 @@ impl NodeAgentConfig {
         {
             capture_config.include_cidrs.push("::/0".to_string());
         }
-        let node_waypoint_pod_registry_dir = if node_waypoint_in_netns {
+        // Publish the per-pod registry (uid → cgroup) when EITHER the NodeWaypoint
+        // TCP in-netns capture path needs it (the historical consumer) OR an
+        // Ambient UDP capture producer will consume it (`FERRUM_MESH_CAPTURE_UDP_
+        // ENABLED`, #2013): Ambient's mesh proxy runs the `NetnsUdpCaptureManager`
+        // over this same registry to open per-pod-netns UDP capture. The registry
+        // is a generic per-pod map; publishing it does NOT change eBPF/redirect
+        // behavior — that stays gated on `node_waypoint_in_netns` via the capture
+        // contract, so a plain Ambient (LocalPod) deployment gets the registry for
+        // the UDP producer WITHOUT the NodeWaypoint ipv6-deny / connect4-deferral
+        // posture. Requires outbound capture on (a pod whose egress is not captured
+        // has nothing to produce). The UDP producer needs no readiness handshake
+        // (it binds the socket then installs rules, self-contained per pod), so no
+        // `.ready` markers are involved on this path.
+        let should_publish_registry = node_waypoint_in_netns
+            || (capture_config.udp_capture_enabled && capture_config.outbound_capture_enabled);
+        let node_waypoint_pod_registry_dir = if should_publish_registry {
             Some(std::path::PathBuf::from(
                 &env_config.mesh_node_waypoint_pod_registry_dir,
             ))
@@ -4155,9 +4170,10 @@ fn ip6tables_best_effort_wrapped_udp_command(cmd: &str) -> String {
 }
 
 fn ip6tables_best_effort_wrapped_command_for_table(cmd: &str, table: &str) -> String {
-    format!(
-        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables {table} table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\n  echo \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
-    )
+    // Shared with the Ambient per-pod-netns UDP producer's teardown so the probe
+    // shape can never drift between the node-agent fallback cleanup and the
+    // producer (`IptablesPlan::udp_teardown_script`).
+    crate::capture::ip6tables_probe_guard(cmd, table)
 }
 
 /// Execute a list of shell commands (iptables/ip6tables setup or cleanup)
@@ -4530,6 +4546,62 @@ mod tests {
                     .iter()
                     .any(|cidr| cidr == "::/0"),
                 "non-NodeWaypoint modes preserve the normal IPv4-only default include"
+            );
+        });
+    }
+
+    #[test]
+    fn from_env_config_publishes_registry_for_ambient_udp_capture() {
+        // #2013: a plain Ambient (LocalPod) node-agent with UDP capture enabled
+        // must publish the per-pod registry so the mesh proxy's per-pod-netns UDP
+        // producer can discover enrolled pods — WITHOUT taking on the NodeWaypoint
+        // ipv6-deny / connect4-deferral posture (which stays gated on
+        // `node_waypoint_in_netns`).
+        let local_pod = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
+            ..EnvConfig::default()
+        };
+        with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_NAME", "node-udp"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+            ],
+            || {
+                let config = NodeAgentConfig::from_env_config(&local_pod)
+                    .expect("node-agent config should parse");
+                assert!(
+                    config.node_waypoint_pod_registry_dir.is_some(),
+                    "Ambient/LocalPod + UDP capture must publish the per-pod registry (#2013)"
+                );
+                assert!(
+                    !config.capture_contract.ipv6_outbound_deny,
+                    "the UDP producer must not flip the NodeWaypoint ipv6-deny posture"
+                );
+                assert!(
+                    !config
+                        .capture_config
+                        .include_cidrs
+                        .iter()
+                        .any(|cidr| cidr == "::/0"),
+                    "the UDP producer must not force the NodeWaypoint ::/0 include"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_config_no_registry_for_local_pod_without_udp() {
+        // A plain LocalPod with no UDP capture stays registry-free (no consumer).
+        let local_pod = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
+            ..EnvConfig::default()
+        };
+        with_env_vars(&[("FERRUM_NODE_AGENT_NODE_NAME", "node-x")], || {
+            let config = NodeAgentConfig::from_env_config(&local_pod)
+                .expect("node-agent config should parse");
+            assert!(
+                config.node_waypoint_pod_registry_dir.is_none(),
+                "LocalPod without UDP capture must not publish a registry"
             );
         });
     }

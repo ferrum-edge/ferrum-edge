@@ -46,6 +46,7 @@ mod mesh_tcp_inbound;
 pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;
 pub mod netns_capture;
+pub mod netns_udp_capture;
 pub mod proxy_protocol;
 pub mod sni;
 pub mod stream_error;

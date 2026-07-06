@@ -190,7 +190,7 @@ node-waypoint accept fails closed.
 > a disposable dual-stack kind cluster, validates BPF attachments/maps, and
 > exercises same-node and cross-node policy-scoped traffic.
 
-## Pod registry for in-netns capture listeners (node-waypoint)
+## Pod registry for in-netns capture (node-waypoint TCP + Ambient UDP)
 
 In node-waypoint topology the mesh proxy's in-pod-netns outbound capture
 listeners (always on for NodeWaypoint) accept the captured pod-loopback
@@ -234,6 +234,33 @@ closing on removal). The family-specific `ipv4=` and `ipv6=` lines are used as
 dynamic source-IP overrides for the matching listener family so IPv6 captured
 traffic is attributed to the pod's IPv6 address instead of reusing the IPv4
 override or the pod-loopback peer.
+
+### Also consumed by the Ambient UDP capture producer (#2013)
+
+The **same** registry is published for **Ambient** deployments when UDP capture
+is enabled (`FERRUM_MESH_CAPTURE_UDP_ENABLED=true`): the node-agent publish gate
+is `should_publish_registry = node_waypoint_in_netns || (udp_capture_enabled &&
+outbound_capture_enabled)`. Publishing for the Ambient-UDP case does **not** flip
+the NodeWaypoint ipv6-outbound-deny / connect4-deferral posture (that stays gated
+on `node_waypoint_in_netns`) — it only makes the per-pod `uid → cgroup` registry
+available so the Ambient mesh proxy's `NetnsUdpCaptureManager`
+(`src/proxy/netns_udp_capture.rs`) can discover enrolled pods. For each pod the
+producer enters the pod netns (`setns(CLONE_NEWNET)` on a dedicated thread),
+installs the UDP TPROXY rules, and binds the transparent capture + reply sockets
+there. It writes **no** `.ready` markers (unlike the NodeWaypoint TCP path): the
+producer binds the socket **before** installing the rules, so there is no window
+where captured UDP is diverted to a not-yet-bound socket, and no cross-process
+readiness handshake is needed.
+
+The Ambient UDP producer needs the same host access the NodeWaypoint in-netns
+listener needs — the read-only host cgroup mount + host `/proc` to resolve pod
+netns and `SYS_ADMIN`/`SYS_PTRACE` for `setns(CLONE_NEWNET)` — plus **`NET_ADMIN`**
+to install the in-netns `iptables`/`ip` TPROXY rules and to bind the
+`IP_TRANSPARENT` capture and reply sockets, and `iptables`/`ip6tables`/`ip`/`sh`
+present in the proxy image. The proxy's own (host) network namespace is never
+given UDP TPROXY rules — the host-netns iptables fallback emits none (there is no
+host-netns-safe direction discriminator); the rules live **only** inside each pod
+netns.
 
 **Fail-closed startup enforcement.** In-netns listener startup is asynchronous,
 so the mesh proxy may not yet have accepted the registry entry when pod

@@ -20,6 +20,20 @@
 {{- if hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" -}}
 {{- $nodeWaypointRegistryMountPath = toString (index $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR") -}}
 {{- end -}}
+{{- /* Ambient per-pod-netns UDP capture producer (#2013): when the Ambient
+       topology has UDP capture enabled, the proxy enters each enrolled pod's
+       netns (setns) to install UDP TPROXY rules + bind transparent sockets, so
+       it needs the SAME registry mount + host cgroup/proc access + setns/NET_ADMIN
+       capabilities the NodeWaypoint in-netns TCP path needs (but NOT bpffs/BPF —
+       the UDP producer touches no eBPF maps). */ -}}
+{{- $ambientUdpCaptureEnabled := false -}}
+{{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED" -}}
+{{- $ambientUdpCaptureEnabled = has (lower (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED"))) (list "true" "1" "yes" "on") -}}
+{{- end -}}
+{{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
+{{- /* In-netns capture (either NodeWaypoint TCP listeners or the Ambient UDP
+       producer) requires the registry mount, host cgroup/proc, and setns caps. */ -}}
+{{- $ambientInNetnsCapture := or $nodeWaypointRegistryEnabled $ambientUdpProducer -}}
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
 {{- $ambientAdminPort := "9000" -}}
@@ -101,7 +115,7 @@ spec:
     spec:
       serviceAccountName: ferrum-mesh
       hostNetwork: true
-      {{- if $nodeWaypointRegistryEnabled }}
+      {{- if $ambientInNetnsCapture }}
       hostPID: true
       {{- end }}
       dnsPolicy: ClusterFirstWithHostNet
@@ -111,7 +125,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run"]
           securityContext:
-            {{- if $nodeWaypointRegistryEnabled }}
+            {{- if $ambientInNetnsCapture }}
             runAsUser: 0
             runAsGroup: 0
             {{- end }}
@@ -119,11 +133,14 @@ spec:
               add:
                 {{- if $nodeWaypointRegistryEnabled }}
                 - BPF
+                - PERFMON
                 {{- end }}
                 - NET_ADMIN
                 - NET_RAW
-                {{- if $nodeWaypointRegistryEnabled }}
-                - PERFMON
+                {{- if $ambientInNetnsCapture }}
+                {{- /* setns(CLONE_NEWNET) + ptrace_may_access on /proc/pid/ns/net;
+                       shared by the NodeWaypoint TCP path and the Ambient UDP
+                       producer. BPF/PERFMON stay NodeWaypoint-only (no eBPF here). */}}
                 - SYS_ADMIN
                 - SYS_PTRACE
                 {{- end }}
@@ -137,7 +154,7 @@ spec:
           env:
             - name: FERRUM_MESH_CAPTURE_MODE
               value: {{ .Values.ambient.captureMode | quote }}
-            {{- if and $nodeWaypointRegistryEnabled (not (hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR")) }}
+            {{- if and $ambientInNetnsCapture (not (hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR")) }}
             - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
               value: {{ .Values.nodeAgent.podRegistryDir | quote }}
             {{- end }}
@@ -161,12 +178,14 @@ spec:
             - name: {{ $name }}
               value: {{ $value | quote }}
             {{- end }}
-          {{- if or $nodeWaypointRegistryEnabled $ambientSpireEnabled }}
+          {{- if or $ambientInNetnsCapture $ambientSpireEnabled }}
           volumeMounts:
             {{- if $nodeWaypointRegistryEnabled }}
             - name: bpf-fs
               mountPath: {{ .Values.nodeAgent.bpfFsPath }}
               readOnly: true
+            {{- end }}
+            {{- if $ambientInNetnsCapture }}
             - name: cgroup
               mountPath: {{ .Values.nodeAgent.cgroupRoot }}
               readOnly: true
@@ -194,13 +213,15 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 3
           {{- end }}
-      {{- if or $nodeWaypointRegistryEnabled $ambientSpireEnabled }}
+      {{- if or $ambientInNetnsCapture $ambientSpireEnabled }}
       volumes:
         {{- if $nodeWaypointRegistryEnabled }}
         - name: bpf-fs
           hostPath:
             path: {{ .Values.nodeAgent.bpfFsPath }}
             type: DirectoryOrCreate
+        {{- end }}
+        {{- if $ambientInNetnsCapture }}
         - name: cgroup
           hostPath:
             path: {{ .Values.nodeAgent.cgroupRoot }}

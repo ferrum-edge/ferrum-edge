@@ -51,6 +51,18 @@
 {{- $nodeWaypointRegistryEnabled := eq $nodeAgentProxyMode "node_waypoint" -}}
 {{- $ambientEnv := default dict .Values.ambient.env -}}
 {{- $ambientTopology := replace "-" "_" (lower (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY"))) -}}
+{{- /* Ambient per-pod-netns UDP capture producer (#2013): when the Ambient
+       topology has UDP capture enabled, the node-agent must publish the per-pod
+       registry so the ambient proxy's producer can discover enrolled pods. The
+       node-agent only WRITES the registry files (no setns / extra caps needed);
+       the ambient proxy does the in-netns work. Derived from ambient.env so the
+       flag has a single source of truth across both DaemonSets. */ -}}
+{{- $ambientUdpCaptureEnabled := false -}}
+{{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED" -}}
+{{- $ambientUdpCaptureEnabled = has (lower (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED"))) (list "true" "1" "yes" "on") -}}
+{{- end -}}
+{{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
+{{- $nodeAgentPublishesRegistry := or $nodeWaypointRegistryEnabled $ambientUdpProducer -}}
 {{- $nodeAgentManagedEnv := list
   "FERRUM_MODE"
   "FERRUM_MESH_CAPTURE_MODE"
@@ -63,6 +75,7 @@
   "FERRUM_NODE_AGENT_CGROUP_ROOT"
   "FERRUM_NODE_AGENT_BPF_FS_PATH"
   "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR"
+  "FERRUM_MESH_CAPTURE_UDP_ENABLED"
   "FERRUM_NODE_AGENT_ADMIN_ENABLED"
   "FERRUM_ADMIN_BIND_ADDRESS"
   "FERRUM_ADMIN_HTTP_PORT"
@@ -188,9 +201,17 @@ spec:
               value: {{ .Values.nodeAgent.cgroupRoot | quote }}
             - name: FERRUM_NODE_AGENT_BPF_FS_PATH
               value: {{ .Values.nodeAgent.bpfFsPath | quote }}
-            {{- if $nodeWaypointRegistryEnabled }}
+            {{- if $nodeAgentPublishesRegistry }}
             - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
               value: {{ .Values.nodeAgent.podRegistryDir | quote }}
+            {{- end }}
+            {{- if $ambientUdpProducer }}
+            {{- /* Propagate the Ambient UDP producer flag (#2013) so the
+                   node-agent's capture config publishes the per-pod registry
+                   (should_publish_registry). The node-agent installs no UDP rules
+                   itself (host-netns emits none); it only writes the registry. */}}
+            - name: FERRUM_MESH_CAPTURE_UDP_ENABLED
+              value: "true"
             {{- end }}
             {{- if .Values.nodeAgent.admin.enabled }}
             - name: FERRUM_NODE_AGENT_ADMIN_ENABLED
@@ -235,7 +256,7 @@ spec:
             - name: host-ferrum-socket-dir
               mountPath: {{ $cni.hostSocketDir }}
             {{- end }}
-            {{- if $nodeWaypointRegistryEnabled }}
+            {{- if $nodeAgentPublishesRegistry }}
             - name: node-waypoint-pod-registry
               mountPath: {{ .Values.nodeAgent.podRegistryDir }}
             {{- end }}
@@ -283,7 +304,7 @@ spec:
             path: {{ $cni.hostSocketDir }}
             type: DirectoryOrCreate
         {{- end }}
-        {{- if $nodeWaypointRegistryEnabled }}
+        {{- if $nodeAgentPublishesRegistry }}
         - name: node-waypoint-pod-registry
           hostPath:
             path: {{ .Values.nodeAgent.podRegistryDir }}

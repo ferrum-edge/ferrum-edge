@@ -824,7 +824,7 @@ mod imp {
     /// Resolve the pod's netns identity (the `net` namespace inode) from a live
     /// PID in its cgroup. The inode is stable for the life of the netns and is a
     /// good dedup key across the pod sandbox + container cgroups.
-    pub(super) fn netns_inode_for_cgroup(cgroup_path: &str) -> io::Result<u64> {
+    pub(crate) fn netns_inode_for_cgroup(cgroup_path: &str) -> io::Result<u64> {
         let pid = first_pid_in_cgroup(cgroup_path)?;
         let path = format!("/proc/{pid}/ns/net");
         let meta = std::fs::metadata(&path).map_err(|error| {
@@ -834,6 +834,49 @@ mod imp {
             )
         })?;
         Ok(meta.ino())
+    }
+
+    /// Open a STABLE handle to a pod's network namespace (`/proc/<pid>/ns/net`)
+    /// resolved from its cgroup. The returned `File` keeps the netns alive even
+    /// if the resolving PID later exits, so the Ambient UDP producer can `setns`
+    /// to it for the whole capture lifetime (the capture socket AND every
+    /// per-session reply socket) without re-resolving a live PID each time. Used
+    /// by `netns_udp_capture`.
+    pub(crate) fn open_pod_netns_handle(cgroup_path: &str) -> io::Result<File> {
+        let pid = first_pid_in_cgroup(cgroup_path)?;
+        let path = format!("/proc/{pid}/ns/net");
+        File::open(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to open pod netns {path}: {error}"),
+            )
+        })
+    }
+
+    /// Run `f` inside the network namespace `netns` on a DEDICATED OS thread,
+    /// restoring the thread's original netns before it exits. `setns(CLONE_NEWNET)`
+    /// mutates the CALLING thread's netns, so it must never run on a tokio worker
+    /// (it would corrupt unrelated tasks); a scoped thread confines the switch and
+    /// any fd/socket `f` returns is process-global and outlives the thread. Used by
+    /// the Ambient UDP producer to bind capture/reply sockets and run the in-netns
+    /// iptables setup/teardown inside a pod netns. Shares the exact `setns` recipe
+    /// with `bind_capture_listener_in_pod_netns`.
+    pub(crate) fn run_in_netns<T, F>(netns: &File, f: F) -> io::Result<T>
+    where
+        T: Send,
+        F: FnOnce() -> io::Result<T> + Send,
+    {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _guard = NetnsGuard::enter_fd(netns.as_raw_fd())?;
+                    f()
+                    // `_guard` drops here, on this thread, restoring the original
+                    // netns before the scoped thread joins.
+                })
+                .join()
+                .map_err(|_| io::Error::other("in-netns worker thread panicked"))?
+        })
     }
 
     /// Bind `addr` (the capture loopback endpoint) inside the pod's network
@@ -956,6 +999,16 @@ mod imp {
             setns_net(target.as_raw_fd())?;
             Ok(Self { original })
         }
+
+        /// Enter a netns given an already-open handle fd (from
+        /// [`open_pod_netns_handle`]) instead of a live PID, so the switch works
+        /// even after the resolving PID has exited. Saves and restores the
+        /// caller's netns exactly like [`Self::enter`].
+        fn enter_fd(fd: std::os::fd::RawFd) -> std::io::Result<Self> {
+            let original = File::open("/proc/self/ns/net")?;
+            setns_net(fd)?;
+            Ok(Self { original })
+        }
     }
 
     impl Drop for NetnsGuard {
@@ -979,7 +1032,7 @@ mod imp {
 mod imp {
     use std::net::SocketAddr;
 
-    pub(super) fn netns_inode_for_cgroup(_cgroup_path: &str) -> std::io::Result<u64> {
+    pub(crate) fn netns_inode_for_cgroup(_cgroup_path: &str) -> std::io::Result<u64> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "in-netns capture listeners are Linux-only",
@@ -995,7 +1048,30 @@ mod imp {
             "in-netns capture listeners are Linux-only",
         ))
     }
+
+    pub(crate) fn open_pod_netns_handle(_cgroup_path: &str) -> std::io::Result<std::fs::File> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "in-netns UDP capture is Linux-only",
+        ))
+    }
+
+    pub(crate) fn run_in_netns<T, F>(_netns: &std::fs::File, _f: F) -> std::io::Result<T>
+    where
+        T: Send,
+        F: FnOnce() -> std::io::Result<T> + Send,
+    {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "in-netns UDP capture is Linux-only",
+        ))
+    }
 }
+
+/// Shared low-level netns primitives, re-exported for the Ambient per-pod-netns
+/// UDP producer (`netns_udp_capture`) so it reuses the SAME `setns`/cgroup
+/// resolution recipe as the TCP node-waypoint capture path.
+pub(crate) use imp::{netns_inode_for_cgroup, open_pod_netns_handle, run_in_netns};
 
 #[cfg(test)]
 mod tests {
