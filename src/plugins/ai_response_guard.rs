@@ -101,21 +101,10 @@ pub struct AiResponseGuard {
     max_completion_length: usize,
 }
 
-/// Built-in PII pattern definitions (shared with ai_prompt_shield).
+/// Built-in PII pattern definitions (shared with ai_prompt_shield and
+/// ai_transcript_audit via [`crate::plugins::utils::ai_pii`]).
 fn builtin_pii_pattern(name: &str) -> Option<&'static str> {
-    match name {
-        "ssn" => Some(r"\b\d{3}[-.\s]?\d{2}[-.\s]?\d{4}\b"),
-        "credit_card" => Some(
-            r"\b(?:4\d{3}|5[1-5]\d{2}|3[47]\d{2}|6(?:011|5\d{2}))[-.\s]?\d{4}[-.\s]?\d{4}[-.\s]?\d{0,4}\b",
-        ),
-        "email" => Some(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
-        "phone_us" => Some(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
-        "api_key" => Some(r"\b(?:sk|pk|api|key|token|secret|password)[-_]?[A-Za-z0-9]{20,}\b"),
-        "aws_key" => Some(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
-        "ip_address" => Some(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"),
-        "iban" => Some(r"\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}(?:[A-Z0-9]?\d{0,16})\b"),
-        _ => None,
-    }
+    crate::plugins::utils::ai_pii::builtin_pii_pattern(name)
 }
 
 impl AiResponseGuard {

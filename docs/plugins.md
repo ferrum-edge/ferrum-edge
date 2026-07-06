@@ -3288,7 +3288,7 @@ config:
 
 ## AI / LLM Plugins
 
-Eight plugins purpose-built for AI/LLM API gateway use cases. Response-parsing AI plugins auto-detect common provider JSON structures, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock** where applicable.
+Nine plugins purpose-built for AI/LLM API gateway use cases. Response-parsing AI plugins auto-detect common provider JSON structures, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock** where applicable.
 
 ### Upgrade notes (breaking config validation changes)
 
@@ -3306,6 +3306,57 @@ Validation follows the same per-mode tolerance model as other file-dependent con
 - **File mode** — fatal at startup. The gateway refuses to start.
 - **Database mode** — warnings are logged, but the gateway keeps serving with the previous valid config.
 - **DP mode** — the config update from the CP is rejected and the DP continues with its previously applied config.
+
+### `ai_transcript_audit`
+
+Controlled AI payload capture for compliance review, incident response, customer-support debugging, and offline evaluation datasets. It captures the AI request and response (after redaction), canonical SHA-256 hashes, model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. It complements the transaction-logging plugins (which summarize metadata/metrics); this plugin is for controlled *payload* capture with redaction, hashing, sampling, size caps, and retention boundaries.
+
+**Not a security boundary by itself.** `ai_transcript_audit` observes and redacts — it does not enforce. Combine it with `ai_prompt_shield`, `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in `ai_semantic_firewall`. It reads the guardrail/model/token metadata those plugins publish into `ctx.metadata` and folds it into each record.
+
+**Placement.** Priority `2979` (`AI_TRANSCRIPT_AUDIT`): after `ai_request_guard` (2975) so request-guard defaults/transforms are visible, and before `ai_semantic_cache` (2980) / `ai_federation` (2985) so cache hits and federated requests remain observable. HTTP-family only (`HTTP_ONLY_PROTOCOLS`); gRPC payload capture is future work.
+
+**Capture modes** (`mode`):
+
+- `metadata_only` — hashes, sizes, model/provider, token and guardrail metadata; no body.
+- `redacted_body` (default) — capped, PII-redacted request/response excerpts.
+- `full_body` — capped **unredacted** excerpts. Requires `allow_full_body: true`; construction fails otherwise so raw capture is never enabled accidentally.
+- `hash_only` — canonical hashes plus the record envelope only (no harvested model/token/guardrail metadata).
+
+**Redaction.** Built-in PII patterns are shared with `ai_prompt_shield` / `ai_response_guard` (`ssn`, `credit_card`, `email`, `phone_us`, `api_key`, `aws_key`, `ip_address`, `iban`) via `plugins/utils/ai_pii.rs`, plus `custom_patterns`. With `hash_redacted_values: true` (default), a match is replaced with `[REDACTED:<type>:<sha256-prefix>]` so identical values stay correlatable without the raw value ever being stored. Redaction runs before a record is enqueued; harvested `ctx.metadata` values are additionally passed through the transaction-log redaction predicate. This plugin never defeats upstream prompt/response redaction — it captures the already-redacted client-visible body.
+
+**What is captured.** Only likely-AI JSON is narrowed in: request bodies are inspected only for `POST` + `application/json` and must look like an LLM call (OpenAI/Anthropic/Gemini/Cohere-shaped markers, mirroring `ai_rate_limiter`). Buffered JSON responses are captured via `on_final_response_body`; SSE responses are captured with a streaming tee (`response_stream_inspector`) up to `max_stream_capture_bytes`, forwarding bytes unchanged and emitting the record at stream termination (so response-side guardrail metadata is included; abnormally-terminated streams emit a truncated, body-omitted record).
+
+**Sampling.** `sampling.rate` (0.0–1.0) is the fraction of eligible AI transactions emitted as full records; `always_capture_on_guardrail` / `always_capture_on_error` override the roll so guardrail trips and error responses are always captured (with their bodies, for incident response). `max_records_per_minute` caps sink volume (0 = unlimited); over the cap, records are dropped and never reject traffic.
+
+**Async HTTP sink.** Records batch through the shared `BatchingLogger` + `PluginHttpClient` framework: a bounded queue, batch-by-size/interval, and retry on transient (5xx/408/429) failures. The `endpoint_url` is SSRF-screened against the backend egress policy (literal IPs at construction, resolved hostnames at send time), matching every other logger sink. `sink.custom_headers` values support `${ENV_VAR}` expansion resolved lazily at send time, so a token is referenced by env and never stored in config:
+
+```yaml
+plugin_name: ai_transcript_audit
+config:
+  mode: redacted_body
+  capture: { request: true, response: true, streaming_response: sampled, tool_calls: true }
+  sampling: { rate: 0.10, always_capture_on_guardrail: true, always_capture_on_error: true, max_records_per_minute: 1000 }
+  redaction:
+    builtins: [ssn, credit_card, email, phone_us, api_key, aws_key, iban]
+    custom_patterns: [{ name: internal_customer_id, regex: "CUST-[0-9]{8}" }]
+    hash_redacted_values: true
+  limits: { max_request_bytes: 65536, max_response_bytes: 65536, max_stream_capture_bytes: 65536 }
+  sink:
+    type: http
+    endpoint_url: https://audit.internal.example.com/ferrum/ai-transcripts
+    custom_headers: { Authorization: "Bearer ${AUDIT_TOKEN}" }
+    batch_size: 50
+    flush_interval_ms: 1000
+    buffer_capacity: 10000
+    max_retries: 3
+    on_buffer_full: drop   # drop | reject (reject fails buffered-response requests 503 when the queue is full)
+    on_sink_error: warn    # warn | reject (reject fails buffered-response requests 503 while the sink is unhealthy)
+  privacy: { include_consumer_username: true, include_client_ip: false, include_raw_headers: false }
+```
+
+**Never blocks by default.** Enqueue is non-blocking; a full buffer or a failing sink drops records (warned) unless the operator opts into `on_buffer_full: reject` / `on_sink_error: reject`, which fail **buffered-response** requests with `503` (a response already being streamed cannot be rejected). **Safe defaults:** `redacted_body`, no raw headers, no client IP, 64 KiB body caps.
+
+**Transaction-log metadata.** The plugin also emits small correlation fields onto the normal transaction logs: `ai_transcript_audit.record_id`, `ai_transcript_audit.request_hash`, `ai_transcript_audit.response_hash`, `ai_transcript_audit.sampled`, and `ai_transcript_audit.sink_status` (`queued` | `dropped` | `skipped` | `rejected`). Response-phase fields are emitted for buffered responses; streamed responses carry the request-phase fields.
 
 ### `ai_federation`
 

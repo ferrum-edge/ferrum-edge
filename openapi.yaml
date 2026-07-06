@@ -3790,6 +3790,7 @@ paths:
                 - ai_response_guard
                 - ai_semantic_cache
                 - ai_federation
+                - ai_transcript_audit
                 - mcp_gateway
                 - a2a_gateway
                 - ws_message_size_limiting
@@ -7010,6 +7011,16 @@ components:
             properties:
               config:
                 $ref: "#/components/schemas/AiFederationConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_transcript_audit
+          then:
+            required: [config]
+            properties:
+              config:
+                $ref: "#/components/schemas/AiTranscriptAuditConfig"
         - if:
             required: [plugin_name]
             properties:
@@ -14058,6 +14069,164 @@ components:
               description: Customer semantic examples for this built-in pack.
           description: Object form for tuning a built-in AI semantic firewall pack.
       description: Built-in pack toggle or tuning object.
+
+    AiTranscriptAuditConfig:
+      type: object
+      required: [sink]
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Captures AI request/response bodies (after redaction), canonical SHA-256 hashes, model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, and ai_response_guard for enforcement. HTTP-only; gRPC capture is future work."
+      properties:
+        mode:
+          type: string
+          enum: [metadata_only, redacted_body, full_body, hash_only]
+          default: redacted_body
+          description: "metadata_only: hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: canonical hashes + envelope only."
+        allow_full_body:
+          type: boolean
+          default: false
+          description: "Required guardrail for mode=full_body, which captures unredacted payloads. Construction fails if full_body is set without this opt-in."
+        capture:
+          type: object
+          description: "What to capture."
+          properties:
+            request:
+              type: boolean
+              default: true
+            response:
+              type: boolean
+              default: true
+            streaming_response:
+              default: false
+              description: "Capture SSE response excerpts. false | true | 'sampled'. When enabled for a candidate request the response is forced onto the stream-inspection path."
+              oneOf:
+                - type: boolean
+                - type: string
+                  enum: [sampled]
+            headers:
+              type: boolean
+              default: false
+              description: "Capture response headers (redacted by key). Also gated by privacy.include_raw_headers."
+            tool_calls:
+              type: boolean
+              default: true
+              description: "Extract tool/function names from the request body."
+        sampling:
+          type: object
+          properties:
+            rate:
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+              default: 1.0
+              description: "Fraction of eligible AI transactions emitted as full records. Guardrail/error captures override the roll."
+            always_capture_on_guardrail:
+              type: boolean
+              default: true
+            always_capture_on_error:
+              type: boolean
+              default: true
+            max_records_per_minute:
+              type: integer
+              minimum: 0
+              default: 0
+              description: "Records-per-minute cap (0 = unlimited). Over the cap, records are dropped (never reject traffic)."
+        redaction:
+          type: object
+          properties:
+            builtins:
+              type: array
+              items:
+                type: string
+                enum: [ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban]
+              description: "Built-in PII patterns, shared with ai_prompt_shield/ai_response_guard."
+            custom_patterns:
+              type: array
+              items:
+                type: object
+                required: [name, regex]
+                properties:
+                  name:
+                    type: string
+                  regex:
+                    type: string
+            placeholder:
+              type: string
+              default: "[REDACTED:{type}]"
+              description: "Non-hashing replacement template; {type} is substituted with the pattern name."
+            hash_redacted_values:
+              type: boolean
+              default: true
+              description: "Replace matches with [REDACTED:<type>:<sha256-prefix>] so identical values stay correlatable without storing the raw value."
+        limits:
+          type: object
+          properties:
+            max_request_bytes:
+              type: integer
+              minimum: 1
+              default: 65536
+            max_response_bytes:
+              type: integer
+              minimum: 1
+              default: 65536
+            max_stream_capture_bytes:
+              type: integer
+              minimum: 1
+              default: 65536
+        sink:
+          type: object
+          required: [endpoint_url]
+          description: "Async batched HTTP sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames)."
+          properties:
+            type:
+              type: string
+              enum: [http]
+              default: http
+            endpoint_url:
+              type: string
+              format: uri
+              description: "http(s) collector URL."
+            custom_headers:
+              type: object
+              additionalProperties:
+                type: string
+              description: "Extra headers sent on every batch. Values support ${ENV_VAR} expansion resolved lazily at send time, so secrets are not stored in config (e.g. Authorization: 'Bearer ${AUDIT_TOKEN}')."
+            batch_size:
+              type: integer
+              minimum: 1
+              default: 50
+            flush_interval_ms:
+              type: integer
+              minimum: 100
+              default: 1000
+            buffer_capacity:
+              type: integer
+              minimum: 1
+              default: 10000
+            max_retries:
+              type: integer
+              minimum: 0
+              default: 3
+            on_buffer_full:
+              type: string
+              enum: [drop, reject]
+              default: drop
+              description: "drop: silently drop when the queue is full (never block). reject: fail the request 503 when a buffered-response record cannot be enqueued (fail-closed audit)."
+            on_sink_error:
+              type: string
+              enum: [warn, reject]
+              default: warn
+              description: "warn: log and drop on permanent sink failure. reject: fail buffered-response requests 503 while the sink is unhealthy (transient/transport failures)."
+        privacy:
+          type: object
+          properties:
+            include_consumer_username:
+              type: boolean
+              default: true
+            include_client_ip:
+              type: boolean
+              default: false
+            include_raw_headers:
+              type: boolean
+              default: false
 
     AiSemanticFirewallConfig:
       type: object

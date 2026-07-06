@@ -31,6 +31,7 @@ pub mod ai_response_guard;
 pub mod ai_semantic_cache;
 pub mod ai_semantic_firewall;
 pub mod ai_token_metrics;
+pub mod ai_transcript_audit;
 pub mod api_chargeback;
 pub mod api_chargeback_sink;
 pub mod basic_auth;
@@ -2147,6 +2148,10 @@ pub mod priority {
     pub const OPENAPI_VALIDATOR: u16 = 2960;
     pub const AI_SEMANTIC_FIREWALL: u16 = 2968;
     pub const AI_REQUEST_GUARD: u16 = 2975;
+    /// Runs after `ai_request_guard` (request-guard defaults/transforms are
+    /// visible) and before `ai_semantic_cache` / `ai_federation` (cache hits and
+    /// federated requests remain observable).
+    pub const AI_TRANSCRIPT_AUDIT: u16 = 2979;
     pub const AI_SEMANTIC_CACHE: u16 = 2980;
     pub const AI_FEDERATION: u16 = 2985;
     /// `mcp_gateway`: parses MCP JSON-RPC bodies and applies MCP-aware route
@@ -3288,6 +3293,10 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )?))),
+        "ai_transcript_audit" => Ok(Some(Arc::new(ai_transcript_audit::AiTranscriptAudit::new(
+            config,
+            http_client.clone(),
+        )?))),
         "mcp_gateway" => Ok(Some(Arc::new(mcp_gateway::McpGateway::new(
             config,
             http_client.clone(),
@@ -3632,6 +3641,7 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("ai_response_guard", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_semantic_cache", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("ai_federation", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("ai_transcript_audit", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("mcp_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("a2a_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("ws_message_size_limiting", PluginFailurePolicy::FailClosed),
