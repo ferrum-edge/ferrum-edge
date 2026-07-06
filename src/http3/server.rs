@@ -2315,7 +2315,7 @@ async fn handle_h3_request(
             crate::http3::cross_protocol::dispatch_grpc_streaming(
                 &state,
                 &epoch,
-                &proxy,
+                &selected_base_proxy,
                 stream,
                 &method,
                 &proxy_headers,

@@ -3943,11 +3943,14 @@ pub(crate) async fn dispatch_grpc_streaming(
     // authenticated principal (codex P2).
     let body_size_exceeded = Arc::new(AtomicBool::new(false));
     let identity_proxy_headers = trusted_identity_proxy_headers(proxy_headers);
+    let grpc_connection_proxy =
+        crate::proxy::resolve_backend_connection_proxy_for_target(proxy, current_target.as_deref());
+    let grpc_dispatch_proxy = grpc_connection_proxy.as_ref();
     let result = grpc_proxy::proxy_grpc_request_streaming_channel(
         hyper_method,
         hmap,
         rx,
-        proxy,
+        grpc_dispatch_proxy,
         backend_url,
         &state.grpc_pool,
         &identity_proxy_headers,
@@ -6521,6 +6524,21 @@ mod tests {
         assert!(
             body.contains("proxy_grpc_request_streaming_channel("),
             "dispatch_grpc_streaming must dispatch via the channel-backed streaming entry"
+        );
+        assert!(
+            body.contains("let grpc_connection_proxy =\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20crate::proxy::resolve_backend_connection_proxy_for_target(proxy, current_target.as_deref());"),
+            "dispatch_grpc_streaming must resolve the backend connection proxy for the selected target"
+        );
+        assert!(
+            body.contains(
+                "proxy_grpc_request_streaming_channel(\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20hyper_method,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20hmap,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20rx,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20grpc_dispatch_proxy,"
+            ),
+            "dispatch_grpc_streaming must pass the selected-target effective proxy to the gRPC pool"
         );
         assert!(
             body.contains("stream.split()"),

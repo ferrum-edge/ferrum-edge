@@ -84,3 +84,23 @@ fn h3_websocket_bridge_keeps_unresolved_base_proxy_for_retries() {
         "H3 WebSocket bridge must not inherit the first target's effective proxy"
     );
 }
+
+#[test]
+fn h3_grpc_streaming_bridge_keeps_unresolved_base_proxy_for_selected_target() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let streaming_call = source
+        .find("crate::http3::cross_protocol::dispatch_grpc_streaming(")
+        .expect("H3 streaming gRPC bridge call must remain present");
+    let streaming_args = &source[streaming_call..];
+    let base_proxy_arg = streaming_args
+        .find("&selected_base_proxy")
+        .expect("H3 streaming gRPC bridge must receive the capped unresolved base proxy");
+    let effective_proxy_arg = streaming_args
+        .find("\n                &proxy,")
+        .unwrap_or(usize::MAX);
+
+    assert!(
+        base_proxy_arg < effective_proxy_arg,
+        "H3 streaming gRPC bridge must not inherit the first target's effective proxy"
+    );
+}
