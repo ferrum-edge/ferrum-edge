@@ -658,7 +658,7 @@ proxies:
 - **HTTP status-code failures** (e.g., 502, 503) are only retried for methods in `retryable_methods` — `POST` and `PATCH` are excluded by default.
 - **Status-code retries are opt-in** — `retryable_status_codes` defaults to empty. Set it explicitly to enable (e.g., `[502, 503, 504]`).
 - When combined with an upstream, retries **exclude the previously tried target** so each attempt goes to a different backend.
-- Retries apply to HTTP/1.1, HTTP/2, HTTP/3, gRPC, and WebSocket protocols. TCP and UDP stream proxies do not use retry logic.
+- Retries apply to HTTP/1.1, HTTP/2, HTTP/3, gRPC, and WebSocket protocols. TCP stream proxies rotate to an alternate target only for connection-phase failures when `retry_on_connect_failure` is enabled; UDP stream proxies do not use retry logic.
 
 ## Circuit Breaker
 

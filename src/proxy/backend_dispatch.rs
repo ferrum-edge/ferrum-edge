@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 use crate::config::types::{
     HttpFlavor, LoadBalancerAlgorithm, PassiveHealthCheck, Proxy, Upstream, UpstreamTarget,
 };
+use crate::health_check::HealthChecker;
 use crate::load_balancer::{
     HashOnStrategy, HealthContext, LoadBalancer, LoadBalancerCache, LoadBalancerCacheInner,
 };
@@ -211,12 +212,6 @@ pub(crate) fn select_upstream_target(
         };
     };
 
-    let proxy_passive = state
-        .health_checker
-        .passive_health
-        .get(&proxy.id)
-        .map(|r| r.value().clone());
-
     let balancers = &epoch.load_balancer;
 
     // Resolve the ejection cap with the SAME precedence the passive-health
@@ -228,21 +223,16 @@ pub(crate) fn select_upstream_target(
     );
     let has_port_override =
         has_effective_port_override(proxy, balancers, upstream_id, dispatch_port);
-    let max_ejection_percent = LoadBalancerCache::max_ejection_percent_resolved_from(
+    let port_scope = has_port_override.then_some(dispatch_port);
+    let health_ctx = health_context_for_selection(
+        proxy,
+        &state.health_checker,
         balancers,
         upstream_id,
-        proxy,
-        has_port_override.then_some(dispatch_port),
+        port_scope,
     );
 
-    let health_ctx = HealthContext {
-        active_unhealthy: &state.health_checker.active_unhealthy_targets,
-        proxy_passive: proxy_passive.clone(),
-        max_ejection_percent,
-    };
-
     let subset_name = proxy.upstream_subset.as_deref();
-    let port_scope = has_port_override.then_some(dispatch_port);
     let strategy = LoadBalancerCache::get_hash_on_strategy_for_selection_from(
         balancers,
         upstream_id,
@@ -415,6 +405,43 @@ pub(crate) fn has_effective_port_override(
         .as_ref()
         .is_some_and(|overrides| overrides.contains_key(&port))
         && LoadBalancerCache::has_port_override_state_from(balancers, upstream_id, port)
+}
+
+#[inline]
+pub(crate) fn stream_health_port_scope(
+    proxy: &Proxy,
+    balancers: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    dispatch_port: u16,
+) -> Option<u16> {
+    (dispatch_port != 0
+        && has_effective_port_override(proxy, balancers, upstream_id, dispatch_port))
+    .then_some(dispatch_port)
+}
+
+pub(crate) fn health_context_for_selection<'a>(
+    proxy: &Proxy,
+    health_checker: &'a HealthChecker,
+    balancers: &LoadBalancerCacheInner,
+    upstream_id: &str,
+    port_scope: Option<u16>,
+) -> HealthContext<'a> {
+    let proxy_passive = health_checker
+        .passive_health
+        .get(&proxy.id)
+        .map(|r| r.value().clone());
+    let max_ejection_percent = LoadBalancerCache::max_ejection_percent_resolved_from(
+        balancers,
+        upstream_id,
+        proxy,
+        port_scope,
+    );
+
+    HealthContext {
+        active_unhealthy: &health_checker.active_unhealthy_targets,
+        proxy_passive,
+        max_ejection_percent,
+    }
 }
 
 #[inline]

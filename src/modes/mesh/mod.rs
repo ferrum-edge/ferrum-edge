@@ -6542,23 +6542,18 @@ fn apply_traffic_policy_to_port_override(
         .locality_lb_setting
         .as_ref()
         .map(into_upstream_locality);
-    // Per-port `connectionPool.tcp.{maxConnections,tcpKeepalive}`. Per-port
-    // overrides win over any top-level fan-out applied above; an unset
-    // per-port field leaves the existing slot value (which may have come from
-    // the top-level fan-out) in place rather than clearing it. This matches
-    // Istio's "per-port settings layer over top-level" semantics for
-    // connectionPool fields.
+    // Per-port `connectionPool.tcp.{maxConnections,tcpKeepalive}`. Ferrum's
+    // documented port-level connectionPool contract is field-level merge:
+    // per-port fields win when set, while omitted fields keep any top-level
+    // fan-out value already present on the slot.
     if let Some(max_conn) = policy.max_connections {
         slot.max_connections = Some(max_conn);
     }
     if let Some(ref keepalive) = policy.tcp_keepalive {
         slot.tcp_keepalive = Some(keepalive.clone());
     }
-    // Per-port `connectionPool.http.*`. Per-port overrides win over any
-    // top-level fan-out applied earlier; an unset per-port field leaves the
-    // existing slot value (which may have come from the top-level fan-out) in
-    // place rather than clearing it, matching Istio's "per-port settings
-    // layer over top-level" semantics for connectionPool fields.
+    // Per-port `connectionPool.http.*` follows the same field-level merge
+    // contract as the TCP fields above.
     if let Some(ref http) = policy.connection_pool_http {
         apply_connection_pool_http_to_port_override(slot, http);
     }
@@ -6570,16 +6565,11 @@ fn apply_traffic_policy_to_port_override(
 /// existing slot value untouched so a per-port partial overlay can layer over
 /// a top-level fan-out without clearing fields the operator did not respecify.
 ///
-/// **Field-level merge — a known divergence from Istio.** Istio treats a
-/// matching `portLevelSettings` entry as a COMPLETE REPLACEMENT of the
-/// destination-level `connectionPool` for that port; Ferrum instead does a
-/// per-field merge (top-level fan-out, then this additive per-port overlay).
-/// This is pre-existing and CONSISTENT across every `connectionPool` knob
-/// (`idleTimeout` / `http2MaxRequests` / `maxConnections` / `tcpKeepalive`),
-/// so unifying it to complete-replacement
-/// is a separate uniform follow-up (it would change existing
-/// idleTimeout/http2MaxRequests behavior + their tests). It is documented in
-/// `docs/mesh.md`.
+/// **Field-level merge — intentional Ferrum semantics.** Istio treats a matching
+/// `portLevelSettings` entry as a COMPLETE REPLACEMENT of the destination-level
+/// `connectionPool` for that port; Ferrum instead does a per-field merge
+/// (top-level fan-out, then this additive per-port overlay). This is the
+/// documented product contract across every applied `connectionPool` knob.
 ///
 /// `h2_upgrade_policy` carries an explicit `H2UpgradePolicy::Default` rather
 /// than collapsing Istio's `DEFAULT` to `None`. That distinction matters HERE:

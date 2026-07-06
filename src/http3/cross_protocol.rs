@@ -3043,11 +3043,14 @@ where
     // reserved `x-consumer-*` from `hmap` and re-adds them solely from this arg,
     // so an empty map would drop the authenticated principal (codex P2).
     let identity_proxy_headers = trusted_identity_proxy_headers(proxy_headers);
+    let grpc_connection_proxy =
+        crate::proxy::resolve_backend_connection_proxy_for_target(proxy, current_target.as_deref());
+    let grpc_dispatch_proxy = grpc_connection_proxy.as_ref();
     let mut result = proxy_grpc_request_from_bytes(
         hyper_method.clone(),
         initial_hmap,
         initial_body,
-        proxy,
+        grpc_dispatch_proxy,
         &current_url,
         &state.grpc_pool,
         &state.dns_cache,
@@ -3205,11 +3208,17 @@ where
             // exactly the trailer-stall PR #497 fixed on the H1/H2 path.
             // Safe because this loop only retries pre-headers connection
             // errors; once a response begins it breaks out untouched.
+            let grpc_retry_connection_proxy =
+                crate::proxy::resolve_backend_connection_proxy_for_target(
+                    proxy,
+                    current_target.as_deref(),
+                );
+            let grpc_retry_dispatch_proxy = grpc_retry_connection_proxy.as_ref();
             result = proxy_grpc_request_from_bytes(
                 hyper_method.clone(),
                 hmap.clone(),
                 body_bytes.clone(),
-                proxy,
+                grpc_retry_dispatch_proxy,
                 &current_url,
                 &state.grpc_pool,
                 &state.dns_cache,
@@ -3934,11 +3943,14 @@ pub(crate) async fn dispatch_grpc_streaming(
     // authenticated principal (codex P2).
     let body_size_exceeded = Arc::new(AtomicBool::new(false));
     let identity_proxy_headers = trusted_identity_proxy_headers(proxy_headers);
+    let grpc_connection_proxy =
+        crate::proxy::resolve_backend_connection_proxy_for_target(proxy, current_target.as_deref());
+    let grpc_dispatch_proxy = grpc_connection_proxy.as_ref();
     let result = grpc_proxy::proxy_grpc_request_streaming_channel(
         hyper_method,
         hmap,
         rx,
-        proxy,
+        grpc_dispatch_proxy,
         backend_url,
         &state.grpc_pool,
         &identity_proxy_headers,
@@ -5965,6 +5977,18 @@ mod tests {
              cross-protocol retry call; argument list was:\n{}",
             call_args
         );
+        assert!(
+            tail[..call_idx].contains("resolve_backend_connection_proxy_for_target(\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20proxy,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20current_target.as_deref(),"),
+            "retry attempt must resolve the backend connection proxy after target rotation"
+        );
+        assert!(
+            call_args.contains("grpc_retry_dispatch_proxy"),
+            "retry attempt must pass the target-effective backend connection proxy; \
+             argument list was:\n{}",
+            call_args
+        );
     }
 
     // -----------------------------------------------------------------
@@ -6459,9 +6483,16 @@ mod tests {
                 "proxy_grpc_request_from_bytes(\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20hyper_method.clone(),\n\
                  \x20\x20\x20\x20\x20\x20\x20\x20initial_hmap,\n\
-                 \x20\x20\x20\x20\x20\x20\x20\x20initial_body,"
+                 \x20\x20\x20\x20\x20\x20\x20\x20initial_body,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20grpc_dispatch_proxy,"
             ),
-            "initial gRPC dispatch must move the prepared headers/body instead of cloning them"
+            "initial gRPC dispatch must move the prepared headers/body and use the \
+             target-effective backend connection proxy"
+        );
+        assert!(
+            src.contains("let grpc_connection_proxy =\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20crate::proxy::resolve_backend_connection_proxy_for_target(proxy, current_target.as_deref());"),
+            "initial gRPC dispatch must resolve the backend connection proxy for the current target"
         );
         let forbidden_retry_hmap = ["retry_hmap", ".expect("].concat();
         let forbidden_retry_body = ["retry_body", ".expect("].concat();
@@ -6493,6 +6524,21 @@ mod tests {
         assert!(
             body.contains("proxy_grpc_request_streaming_channel("),
             "dispatch_grpc_streaming must dispatch via the channel-backed streaming entry"
+        );
+        assert!(
+            body.contains("let grpc_connection_proxy =\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20crate::proxy::resolve_backend_connection_proxy_for_target(proxy, current_target.as_deref());"),
+            "dispatch_grpc_streaming must resolve the backend connection proxy for the selected target"
+        );
+        assert!(
+            body.contains(
+                "proxy_grpc_request_streaming_channel(\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20hyper_method,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20hmap,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20rx,\n\
+                 \x20\x20\x20\x20\x20\x20\x20\x20grpc_dispatch_proxy,"
+            ),
+            "dispatch_grpc_streaming must pass the selected-target effective proxy to the gRPC pool"
         );
         assert!(
             body.contains("stream.split()"),

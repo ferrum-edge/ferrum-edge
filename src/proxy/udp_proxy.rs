@@ -27,13 +27,13 @@ use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{BackendScheme, Proxy};
 use crate::consumer_index::ConsumerIndex;
 use crate::dns::DnsCache;
+use crate::health_check::HealthChecker;
 use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
 use crate::plugins::{
     Direction, Plugin, PluginResult, ProxyProtocol, StreamBytesKind, StreamConnectionContext,
     StreamTransactionSummary, UdpDatagramContext, UdpDatagramDirection, UdpDatagramVerdict,
     UdpMetadataSink,
 };
-use crate::proxy::backend_dispatch::has_effective_port_override;
 use crate::proxy::stream_error::{StreamSetupError, StreamSetupKind, find_stream_setup_error};
 use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
@@ -907,6 +907,7 @@ pub struct UdpListenerConfig {
     pub proxy_id: String,
     pub dns_cache: DnsCache,
     pub request_epoch: Arc<RequestEpochStore>,
+    pub health_checker: Arc<HealthChecker>,
     pub shutdown: watch::Receiver<bool>,
     /// Optional gateway-wide shutdown receiver (SIGTERM/SIGINT). When `Some`,
     /// the receive loop exits as soon as either this OR the per-listener
@@ -992,6 +993,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
         proxy_id,
         dns_cache,
         request_epoch,
+        health_checker,
         shutdown,
         global_shutdown,
         metrics,
@@ -1029,6 +1031,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
             proxy_id,
             dns_cache,
             request_epoch,
+            health_checker,
             shutdown,
             global_shutdown,
             metrics,
@@ -1245,6 +1248,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     addr2,
                                                     &proxy_id,
                                                     &request_epoch,
+                                                    &health_checker,
                                                     &dns_cache,
                                                     &frontend_socket,
                                                     &sessions,
@@ -1288,6 +1292,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         addr2,
                                         &proxy_id,
                                         &request_epoch,
+                                        &health_checker,
                                         &dns_cache,
                                         &frontend_socket,
                                         &sessions,
@@ -1368,6 +1373,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                     client_addr,
                     &proxy_id,
                     &request_epoch,
+                    &health_checker,
                     &dns_cache,
                     &frontend_socket,
                     &sessions,
@@ -1447,6 +1453,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                                     addr2,
                                                     &proxy_id,
                                                     &request_epoch,
+                                                    &health_checker,
                                                     &dns_cache,
                                                     &frontend_socket,
                                                     &sessions,
@@ -1490,6 +1497,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                         addr2,
                                         &proxy_id,
                                         &request_epoch,
+                                        &health_checker,
                                         &dns_cache,
                                         &frontend_socket,
                                         &sessions,
@@ -1547,6 +1555,7 @@ pub async fn start_udp_listener(cfg: UdpListenerConfig) -> Result<(), anyhow::Er
                                     addr2,
                                     &proxy_id,
                                     &request_epoch,
+                                    &health_checker,
                                     &dns_cache,
                                     &frontend_socket,
                                     &sessions,
@@ -1617,6 +1626,7 @@ async fn process_datagram(
     client_addr: SocketAddr,
     proxy_id: &str,
     request_epoch: &Arc<RequestEpochStore>,
+    health_checker: &Arc<HealthChecker>,
     dns_cache: &DnsCache,
     frontend_socket: &Arc<UdpSocket>,
     sessions: &SessionMap,
@@ -1702,6 +1712,7 @@ async fn process_datagram(
             client_addr,
             proxy_id.to_string(),
             Arc::clone(request_epoch),
+            Arc::clone(health_checker),
             dns_cache.clone(),
             Arc::clone(frontend_socket),
             Arc::clone(sessions),
@@ -1764,6 +1775,7 @@ fn spawn_new_session_datagram(
     client_addr: SocketAddr,
     proxy_id: String,
     request_epoch: Arc<RequestEpochStore>,
+    health_checker: Arc<HealthChecker>,
     dns_cache: DnsCache,
     frontend_socket: Arc<UdpSocket>,
     sessions: SessionMap,
@@ -1801,6 +1813,7 @@ fn spawn_new_session_datagram(
             client_addr,
             &proxy_id,
             &request_epoch,
+            &health_checker,
             &dns_cache,
             &frontend_socket,
             &sessions,
@@ -1865,6 +1878,7 @@ async fn process_new_session_datagram(
     client_addr: SocketAddr,
     proxy_id: &str,
     request_epoch: &RequestEpochStore,
+    health_checker: &HealthChecker,
     dns_cache: &DnsCache,
     frontend_socket: &Arc<UdpSocket>,
     sessions: &SessionMap,
@@ -1921,8 +1935,12 @@ async fn process_new_session_datagram(
     if let Some(enforcement) = mesh_enforcement_snapshot.as_ref() {
         use crate::modes::mesh::outbound_enforcement::{Decision, PROTOCOL_UDP, PROTOCOL_UDP_DTLS};
         let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
-        let (backend_host, backend_port) =
-            resolve_backend_target(&view.proxy, &epoch.load_balancer, &lb_hash_key)?;
+        let (backend_host, backend_port) = resolve_backend_target(
+            &view.proxy,
+            &epoch.load_balancer,
+            health_checker,
+            &lb_hash_key,
+        )?;
         preselected_backend_target = Some((backend_host.clone(), backend_port));
         let protocol_label = if matches!(view.proxy.effective_scheme(), BackendScheme::Dtls) {
             PROTOCOL_UDP_DTLS
@@ -1972,6 +1990,7 @@ async fn process_new_session_datagram(
         listener_shutdown,
         global_shutdown,
         overload,
+        health_checker,
         preselected_backend_target,
     )
     .await?;
@@ -2181,6 +2200,7 @@ async fn start_dtls_frontend_listener(
     proxy_id: String,
     dns_cache: DnsCache,
     request_epoch: Arc<RequestEpochStore>,
+    health_checker: Arc<HealthChecker>,
     shutdown: watch::Receiver<bool>,
     global_shutdown: Option<watch::Receiver<bool>>,
     metrics: Arc<UdpProxyMetrics>,
@@ -2374,6 +2394,7 @@ async fn start_dtls_frontend_listener(
                 // Spawn per-client handler
                 let handler_proxy_id = proxy.id.clone();
                 let handler_epoch = Arc::clone(&epoch);
+                let handler_health_checker = health_checker.clone();
                 let handler_dns = dns_cache.clone();
                 let handler_metrics = metrics.clone();
                 let handler_plugins = plugins.clone();
@@ -2407,6 +2428,7 @@ async fn start_dtls_frontend_listener(
                         client_addr,
                         &handler_proxy_id,
                         &handler_epoch,
+                        &handler_health_checker,
                         &handler_dns,
                         &handler_metrics,
                         tls_no_verify,
@@ -2556,6 +2578,7 @@ async fn handle_dtls_client(
     client_addr: SocketAddr,
     proxy_id: &str,
     epoch: &RequestEpoch,
+    health_checker: &HealthChecker,
     dns_cache: &DnsCache,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
@@ -2583,6 +2606,7 @@ async fn handle_dtls_client(
         client_addr,
         proxy_id,
         epoch,
+        health_checker,
         dns_cache,
         metrics,
         tls_no_verify,
@@ -2723,6 +2747,7 @@ async fn handle_dtls_client_inner(
     client_addr: SocketAddr,
     proxy_id: &str,
     epoch: &RequestEpoch,
+    health_checker: &HealthChecker,
     dns_cache: &DnsCache,
     metrics: &Arc<UdpProxyMetrics>,
     tls_no_verify: bool,
@@ -2749,7 +2774,7 @@ async fn handle_dtls_client_inner(
     // Resolve backend target
     let lb_hash_key = udp_lb_hash_key_for_client_ip(client_addr.ip());
     let (backend_host, backend_port) =
-        resolve_backend_target(&proxy, &epoch.load_balancer, &lb_hash_key)?;
+        resolve_backend_target(&proxy, &epoch.load_balancer, health_checker, &lb_hash_key)?;
     // Populate backend target as soon as it's known — even if DNS or connect fails.
     backend_info.backend_target = format!("{}:{}", backend_host, backend_port);
 
@@ -3180,6 +3205,7 @@ async fn create_session(
     listener_shutdown: &watch::Receiver<bool>,
     global_shutdown: Option<&watch::Receiver<bool>>,
     overload: &Arc<crate::overload::OverloadState>,
+    health_checker: &HealthChecker,
     preselected_backend_target: Option<(String, u16)>,
 ) -> Result<Arc<UdpSession>, anyhow::Error> {
     let UdpSessionEpochView {
@@ -3246,6 +3272,7 @@ async fn create_session(
         preselected_backend_target,
         &proxy,
         &epoch.load_balancer,
+        health_checker,
         &lb_hash_key,
     )?;
 
@@ -4100,11 +4127,13 @@ async fn create_session(
 /// Per-port DestinationRule LB/locality policy engages only when
 /// `initial_dispatch_port_override` is non-zero (all targets on one port);
 /// the HTTP path's `backend_port` fallback is deliberately not used (a
-/// placeholder port must never pin a mixed-port upstream). Stream paths
-/// carry no `HealthContext` (issue #2018).
+/// placeholder port must never pin a mixed-port upstream). Stream target
+/// selection respects active health checks and passive ejection state recorded
+/// by HTTP-family traffic.
 fn resolve_backend_target(
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
+    health_checker: &HealthChecker,
     lb_hash_key: &str,
 ) -> Result<(String, u16), anyhow::Error> {
     if let Some(upstream_id) = &proxy.upstream_id {
@@ -4116,14 +4145,26 @@ fn resolve_backend_target(
         // upstream would silently pin selection to that port's targets.
         let override_port =
             LoadBalancerCache::initial_dispatch_port_override_from(lb_snapshot, upstream_id);
-        let port_lane = if override_port != 0
-            && has_effective_port_override(proxy, lb_snapshot, upstream_id, override_port)
+        let health_port_scope = crate::proxy::backend_dispatch::stream_health_port_scope(
+            proxy,
+            lb_snapshot,
+            upstream_id,
+            override_port,
+        );
+        let port_lane = if health_port_scope.is_some()
             && udp_port_lane_selection_supported(proxy, lb_snapshot, upstream_id, override_port)?
         {
             Some(override_port)
         } else {
             None
         };
+        let health_ctx = crate::proxy::backend_dispatch::health_context_for_selection(
+            proxy,
+            health_checker,
+            lb_snapshot,
+            upstream_id,
+            health_port_scope,
+        );
 
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
@@ -4131,10 +4172,15 @@ fn resolve_backend_target(
                 upstream_id,
                 lb_hash_key,
                 port,
-                None,
+                Some(&health_ctx),
             )
         } else {
-            LoadBalancerCache::select_target_from(lb_snapshot, upstream_id, lb_hash_key, None)
+            LoadBalancerCache::select_target_from(
+                lb_snapshot,
+                upstream_id,
+                lb_hash_key,
+                Some(&health_ctx),
+            )
         }
         .ok_or_else(|| -> anyhow::Error {
             StreamSetupError::new(
@@ -4220,11 +4266,12 @@ fn resolve_or_reuse_backend_target(
     preselected: Option<(String, u16)>,
     proxy: &Proxy,
     lb_snapshot: &LoadBalancerCacheInner,
+    health_checker: &HealthChecker,
     lb_hash_key: &str,
 ) -> Result<(String, u16), anyhow::Error> {
     match preselected {
         Some(target) => Ok(target),
-        None => resolve_backend_target(proxy, lb_snapshot, lb_hash_key),
+        None => resolve_backend_target(proxy, lb_snapshot, health_checker, lb_hash_key),
     }
 }
 
@@ -4278,6 +4325,7 @@ mod tests {
         reserve_udp_session_slot, resolve_or_reuse_backend_target, udp_session_shard_amount,
     };
     use crate::config::types::{BackendScheme, BackendTlsConfig, Proxy};
+    use crate::health_check::HealthChecker;
     use crate::load_balancer::LoadBalancerCache;
     use crate::plugins::{Plugin, StreamTransactionSummary};
     use crate::proxy::GatewayConfig;
@@ -5027,6 +5075,7 @@ listen_port: 5300
             Some(("admitted.local".to_string(), 5354)),
             &proxy,
             &snapshot,
+            &HealthChecker::new(),
             "127.0.0.1",
         )
         .unwrap();
@@ -5071,7 +5120,8 @@ listen_port: 5300
         for i in 1..=64 {
             let key = format!("192.0.2.{i}");
             let (host, port) =
-                super::resolve_backend_target(&proxy, &snapshot, &key).expect("target selected");
+                super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), &key)
+                    .expect("target selected");
             assert_eq!(port, 5353);
             hosts.insert(host);
         }
@@ -5128,8 +5178,9 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err = super::resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
-            .expect_err("per-port LEAST_CONN must be rejected explicitly");
+        let err =
+            super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                .expect_err("per-port LEAST_CONN must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
@@ -5172,8 +5223,9 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err = super::resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
-            .expect_err("per-port LEAST_LATENCY must be rejected explicitly");
+        let err =
+            super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                .expect_err("per-port LEAST_LATENCY must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
@@ -5219,8 +5271,9 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err = super::resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
-            .expect_err("stream hash_on cookie must be rejected explicitly");
+        let err =
+            super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                .expect_err("stream hash_on cookie must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);
@@ -5264,8 +5317,9 @@ listen_port: 5300
         let cache = LoadBalancerCache::new(&config);
         let snapshot = cache.load();
 
-        let err = super::resolve_backend_target(&proxy, &snapshot, "192.0.2.10")
-            .expect_err("inherited stream hash_on header must be rejected explicitly");
+        let err =
+            super::resolve_backend_target(&proxy, &snapshot, &HealthChecker::new(), "192.0.2.10")
+                .expect_err("inherited stream hash_on header must be rejected explicitly");
         let setup = find_stream_setup_error(&err).expect("typed stream setup error");
 
         assert_eq!(setup.kind, StreamSetupKind::UnsupportedStreamPolicy);

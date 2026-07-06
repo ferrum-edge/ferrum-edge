@@ -458,8 +458,8 @@ fn seed_connection_pool_http_from_fallback_merges_field_by_field() {
     // Per-port entry sets connectTimeout + one connectionPool.http field; the
     // remaining http fields must be inherited from the SD top-level fallback and
     // the per-port-set field must win. Non-http fields are untouched. This is the
-    // exact field-merge `resolve_effective_proxy_for_target` performs for an SD
-    // upstream (#1806 codex r1 finding 3).
+    // exact field-level merge `resolve_effective_proxy_for_target` performs for
+    // an SD upstream under Ferrum's documented connectionPool semantics.
     let mut per_port = ResolvedPortOverride {
         connect_timeout_ms: Some(750),
         h2_max_concurrent_streams: Some(10),

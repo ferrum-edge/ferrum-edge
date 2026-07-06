@@ -835,7 +835,8 @@ async fn run_udp_egress_session(
     // ── Fail-closed egress gates (mirrors handle_mesh_tcp_egress) ──────────
     // Engage the per-port LB lane (algorithm / locality) when all upstream
     // targets share a single port — same pre-selection semantics as the HTTP
-    // dispatch path. Stream paths carry no HealthContext (issue #2018).
+    // dispatch path. Selection respects active/passive health state already
+    // recorded for the relay proxy/upstream.
     //
     // All lb operations are done in a scoped block so the reference to
     // `epoch.load_balancer` (the Arc inner snapshot) is released before
@@ -847,13 +848,13 @@ async fn run_udp_egress_session(
         // must not pin a mixed-port upstream (see tcp_proxy::resolve_backend_target).
         let override_port =
             LoadBalancerCache::initial_dispatch_port_override_from(lb, &entry.upstream_id);
-        let port_lane = (override_port != 0
-            && backend_dispatch::has_effective_port_override(
-                proxy,
-                lb,
-                &entry.upstream_id,
-                override_port,
-            )
+        let health_port_scope = backend_dispatch::stream_health_port_scope(
+            proxy,
+            lb,
+            &entry.upstream_id,
+            override_port,
+        );
+        let port_lane = (health_port_scope.is_some()
             && match mesh_stream_port_lane_supported(proxy, override_port) {
                 Ok(supported) => supported,
                 Err(message) => {
@@ -886,16 +887,28 @@ async fn run_udp_egress_session(
             }
         }
         let lb_hash_key = mesh_udp_lb_hash_key_for_client_ip(key.client.ip());
+        let health_ctx = backend_dispatch::health_context_for_selection(
+            proxy,
+            &state.health_checker,
+            lb,
+            &entry.upstream_id,
+            health_port_scope,
+        );
         let selection = if let Some(port) = port_lane {
             LoadBalancerCache::select_target_for_port_from(
                 lb,
                 &entry.upstream_id,
                 &lb_hash_key,
                 port,
-                None,
+                Some(&health_ctx),
             )
         } else {
-            LoadBalancerCache::select_target_from(lb, &entry.upstream_id, &lb_hash_key, None)
+            LoadBalancerCache::select_target_from(
+                lb,
+                &entry.upstream_id,
+                &lb_hash_key,
+                Some(&health_ctx),
+            )
         };
         let Some(selection) = selection else {
             warn!(
@@ -943,11 +956,16 @@ async fn run_udp_egress_session(
     let tunnel = if crate::proxy::hbone_pool::target_hbone_enabled(&target) {
         // HBONE capability must be proven (the enrollment pass + widened probe
         // gate keep these records alive; the dispatch gate fails closed until
-        // proven).
-        if !state
-            .backend_capabilities
-            .get(proxy, Some(&target))
-            .is_some_and(|record| record.hbone.is_supported())
+        // proven). Target-effective keying: enrollment builds probe keys from
+        // the relay proxy AFTER per-target override resolution, so this
+        // fail-closed gate must read the same key or a per-port DR TLS override
+        // on the stream upstream drops every UDP session forever.
+        if !crate::proxy::get_backend_capability_for_target(
+            state.backend_capabilities.as_ref(),
+            proxy,
+            Some(&target),
+        )
+        .is_some_and(|record| record.hbone.is_supported())
         {
             debug!(
                 service = %entry.service_fqdn,

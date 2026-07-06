@@ -209,7 +209,7 @@ YAML
   kubectl -n "$CP_NAMESPACE" rollout status "deployment/${DP_SERVICE_NAME}" --timeout=240s
 }
 
-create_gateway_class() {
+apply_gateway_class() {
   cat <<'YAML' | kubectl apply -f -
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
@@ -218,17 +218,16 @@ metadata:
 spec:
   controllerName: ferrum.io/gateway-controller
 YAML
+}
 
+wait_for_gateway_class() {
   # Block until the control plane reconciles the GatewayClass to Accepted before
   # handing off to the upstream Go suite. The suite has its own 180s wait for this
-  # condition, but on a cold kind cluster the CP's first reconcile (informer sync
-  # + FERRUM_K8S_FULL_SYNC_INTERVAL_SECS) can outlast it, surfacing as
-  # "GatewayClass ... Accepted (generation 0) ... context deadline exceeded" and
-  # flaking the suite before any test runs. A generous script-side wait here
-  # absorbs that cold-start reconcile so the suite starts against an already-
-  # Accepted class; kubectl polls the condition until it flips True or the
-  # timeout elapses, so a slow reconcile is retried rather than fatal on the
-  # first miss.
+  # condition, but on a cold kind cluster the CP's first reconcile can outlast it,
+  # surfacing as "GatewayClass ... Accepted ... context deadline exceeded" and
+  # flaking the suite before any test runs. The class is applied before the CP
+  # rollout so the controller's initial reflector list sees it; this wait confirms
+  # the status writer completed before the conformance suite starts.
   if ! kubectl wait --for=condition=Accepted gatewayclass/ferrum --timeout=240s; then
     echo "GatewayClass 'ferrum' did not reach Accepted within timeout; current status:" >&2
     kubectl get gatewayclass ferrum -o yaml >&2 || true
@@ -239,9 +238,10 @@ YAML
 setup() {
   create_kind_cluster
   install_gateway_api_crds
+  apply_gateway_class
   deploy_control_plane
   deploy_data_plane
-  create_gateway_class
+  wait_for_gateway_class
 }
 
 run_upstream_conformance() {

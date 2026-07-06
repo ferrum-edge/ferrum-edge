@@ -577,8 +577,9 @@ impl ResolvedPortOverride {
     /// service-discovery TOP-LEVEL fallback overlay onto this (per-port) entry.
     ///
     /// For each supported `connectionPool.http` field, the per-port value wins
-    /// when set; otherwise the fallback's value is inherited. This mirrors the
-    /// NON-SD apply-time layering EXACTLY: there, the top-level
+    /// when set; otherwise the fallback's value is inherited. This mirrors
+    /// Ferrum's documented NON-SD apply-time field-level merge exactly: there,
+    /// the top-level
     /// `connectionPool.http` is fanned onto the port slot FIRST and a partial
     /// per-port `portLevelSettings.connectionPool.http` then overlays only the
     /// fields it sets (see `apply_connection_pool_http_to_port_override` in
