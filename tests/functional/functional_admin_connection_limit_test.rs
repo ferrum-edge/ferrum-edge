@@ -32,6 +32,28 @@ upstreams: []
 plugin_configs: []
 "#;
 
+/// Admin connection cap used by both cap tests.
+///
+/// The cap is a single global semaphore shared across the plaintext and TLS
+/// admin listeners (`AdminConnLimiter`, cloned into both `admin_http_limiter`
+/// and `admin_https_limiter`). The harness's `/health` probe opens a *plaintext*
+/// admin connection, and its server-side permit is released only after the
+/// serving task observes the socket close — which lags the client-side drop
+/// under CI load. So a couple of just-closed management-plane probe permits can
+/// still be held at the instant a test begins probing the listener under test.
+///
+/// A cap of 2 (the original value) could be fully occupied by that transient
+/// background, starving the listener under test to zero admitted connections and
+/// tripping the `!held.is_empty()` assertion intermittently. A larger cap keeps
+/// comfortable headroom over the bounded background occupancy while still proving
+/// the listener admits a bounded set and rejects beyond it.
+const CAP: usize = 6;
+
+/// How many connections each test opens while probing the cap. Must exceed `CAP`
+/// so a rejection is always observed once the listener's permits are exhausted
+/// (background occupancy only makes the rejection happen sooner, never later).
+const PROBE_FANOUT: usize = 12;
+
 /// Open a raw TCP connection that sends no bytes. On an admin listener with the
 /// relevant pre-request timeout disabled, this holds a limiter permit until the
 /// connection is closed.
@@ -69,7 +91,7 @@ async fn functional_admin_connection_cap_plaintext_rejects_over_limit() {
     let mut gw = TestGateway::builder()
         .mode_file(ADMIN_CONFIG)
         .log_level("warn")
-        .env("FERRUM_ADMIN_MAX_CONNECTIONS", "2")
+        .env("FERRUM_ADMIN_MAX_CONNECTIONS", CAP.to_string())
         // Idle raw connections must hold their permits for the duration.
         .env("FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS", "0")
         // `/metrics` is gated by default; this test scrapes it from loopback to
@@ -84,19 +106,19 @@ async fn functional_admin_connection_cap_plaintext_rejects_over_limit() {
 
     let port = gw.admin_port;
 
-    // Hold connections until the cap rejects one. Robust to a management-plane
-    // permit the harness health probe may briefly hold (the cap is shared
-    // across admin listeners), so this checks the rejection boundary rather than
-    // an exact admitted count.
-    let (held, rejected) = hold_until_rejected(port, 6).await;
+    // Hold connections until the cap rejects one. Robust to the management-plane
+    // permits the harness health probe may briefly hold (the cap is shared
+    // across admin listeners and CAP carries headroom over that background), so
+    // this checks the rejection boundary rather than an exact admitted count.
+    let (held, rejected) = hold_until_rejected(port, PROBE_FANOUT).await;
     assert!(
         !held.is_empty(),
         "at least one admin connection should be admitted"
     );
     assert!(rejected, "an over-cap admin connection should be dropped");
     assert!(
-        held.len() <= 2,
-        "admitted {} connections, exceeding the cap of 2",
+        held.len() <= CAP,
+        "admitted {} connections, exceeding the cap of {CAP}",
         held.len()
     );
 
@@ -137,7 +159,7 @@ async fn functional_admin_connection_cap_plaintext_rejects_over_limit() {
 /// startup fails closed when the admin HTTPS port cannot bind (the listener's
 /// readiness signal gates `startup_ready`), so a successful `spawn()` implies
 /// the HTTPS listener is bound.
-async fn start_tls_admin_gateway(max_conns: &str) -> (TestGateway, u16) {
+async fn start_tls_admin_gateway(max_conns: usize) -> (TestGateway, u16) {
     for attempt in 1..=5u32 {
         let https = reserve_port().await.expect("reserve admin https port");
         let https_port = https.port;
@@ -149,7 +171,7 @@ async fn start_tls_admin_gateway(max_conns: &str) -> (TestGateway, u16) {
             // Drive retries here (fresh port per attempt) instead of letting the
             // harness retry against the fixed FERRUM_ADMIN_HTTPS_PORT.
             .max_attempts(1)
-            .env("FERRUM_ADMIN_MAX_CONNECTIONS", max_conns)
+            .env("FERRUM_ADMIN_MAX_CONNECTIONS", max_conns.to_string())
             .env("FERRUM_ADMIN_HTTPS_PORT", https_port.to_string())
             .env("FERRUM_ADMIN_TLS_CERT_PATH", "tests/certs/server.crt")
             .env("FERRUM_ADMIN_TLS_KEY_PATH", "tests/certs/server.key")
@@ -197,14 +219,14 @@ async fn hold_until_rejected(port: u16, max_open: usize) -> (Vec<TcpStream>, boo
 #[ignore]
 #[tokio::test]
 async fn functional_admin_connection_cap_tls_rejects_over_limit() {
-    // Health is served on the plaintext admin port; the cap (2) is shared
-    // across the HTTP and HTTPS admin listeners, so a management-plane probe may
-    // transiently hold a permit. Idle raw connections to the HTTPS port hold a
-    // permit (acquired before the TLS handshake, which is disabled-timeout), so
-    // no TLS client is needed. Assert the rejection boundary, not exact counts.
-    let (mut gw, https_port) = start_tls_admin_gateway("2").await;
+    // Health is served on the plaintext admin port; the cap is shared across the
+    // HTTP and HTTPS admin listeners, so a management-plane probe may transiently
+    // hold one or more permits (see CAP). Idle raw connections to the HTTPS port
+    // hold a permit (acquired before the TLS handshake, which is disabled-timeout),
+    // so no TLS client is needed. Assert the rejection boundary, not exact counts.
+    let (mut gw, https_port) = start_tls_admin_gateway(CAP).await;
 
-    let (held, rejected) = hold_until_rejected(https_port, 6).await;
+    let (held, rejected) = hold_until_rejected(https_port, PROBE_FANOUT).await;
     assert!(
         !held.is_empty(),
         "at least one admin TLS connection should be admitted"
@@ -214,8 +236,8 @@ async fn functional_admin_connection_cap_tls_rejects_over_limit() {
         "an over-cap admin TLS connection should be dropped before the handshake"
     );
     assert!(
-        held.len() <= 2,
-        "admitted {} TLS connections, exceeding the cap of 2",
+        held.len() <= CAP,
+        "admitted {} TLS connections, exceeding the cap of {CAP}",
         held.len()
     );
 
