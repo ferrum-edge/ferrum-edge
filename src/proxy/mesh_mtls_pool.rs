@@ -274,6 +274,29 @@ impl std::error::Error for MeshMtlsDialError {
     }
 }
 
+impl MeshMtlsDialError {
+    /// PRE-WIRE error class for a dial-plan resolution failure — no backend dial
+    /// happened, so this is a gateway-side (connect-phase) failure that stays
+    /// neutral to backend/circuit-breaker health and is retryable onto another
+    /// target. The WebSocket egress path boxes this error, and
+    /// `retry::classify_boxed_setup_error` recognizes it via
+    /// [`retry::classify_typed_chain`] so a metadata reject is not charged to the
+    /// backend as post-wire (issue #2010 codex). `PinnedPeer` delegates to the
+    /// wrapped [`HbonePoolError`] (which the same walk would reach via `source`,
+    /// but delegating keeps one mapping); the missing-SNI / trust-domain variants
+    /// map to `ConnectionPoolError`, exactly like the HTTP mesh-mTLS path returns
+    /// for these cases.
+    pub fn error_class(&self) -> crate::retry::ErrorClass {
+        match self {
+            MeshMtlsDialError::PinnedPeer(err) => err.error_class(),
+            MeshMtlsDialError::MissingCrossClusterSni
+            | MeshMtlsDialError::MissingCrossClusterTrustDomain => {
+                crate::retry::ErrorClass::ConnectionPoolError
+            }
+        }
+    }
+}
+
 /// Resolved peer-verification + SNI parameters for a Sidecar mesh-mTLS dial,
 /// derived ONCE from a target's mesh tags and shared by every mesh-mTLS dispatch
 /// surface — HTTP/gRPC (`proxy_to_backend_mesh_mtls`) and WebSocket

@@ -9422,10 +9422,18 @@ enum MeshWsEgress {
 /// fail-closed contract, but the SVID/capability check is deferred to the dial
 /// because returning `None` here would route to the plaintext path.
 fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
-    if mesh_mtls_pool::target_mesh_mtls_enabled(target) {
-        Some(MeshWsEgress::SidecarMtls)
-    } else if hbone_pool::target_hbone_enabled(target) {
+    // HBONE is checked FIRST so a corrupted target carrying BOTH transport tags
+    // (`mesh.hbone` + `mesh.mtls`) resolves to the Ambient branch, mirroring the
+    // gRPC classifier's HBONE-wins precedence (`classify_grpc_mesh_dispatch`).
+    // Without this, `mesh_mtls` won and a mixed-tag CROSS-CLUSTER target would be
+    // dispatched over mesh-mTLS — bypassing the fail-closed cross-cluster HBONE
+    // WebSocket refusal; the Ambient branch instead fails such a target closed
+    // (issue #2010 codex). Legitimate targets carry exactly one transport tag, so
+    // this only re-routes corrupted shapes.
+    if hbone_pool::target_hbone_enabled(target) {
         Some(MeshWsEgress::AmbientHbone)
+    } else if mesh_mtls_pool::target_mesh_mtls_enabled(target) {
+        Some(MeshWsEgress::SidecarMtls)
     } else {
         None
     }
