@@ -3592,11 +3592,20 @@ async fn handle_h3_request(
         && capabilities.has(crate::plugin_cache::PluginCapabilities::MODIFIES_REQUEST_BODY)
     {
         let content_type = proxy_headers.get("content-type").map(|s| s.as_str());
+        // Body-transform plugins run without a `RequestContext` on the H3 path,
+        // so expose the request method as a `:method` pseudo-header for
+        // method-sensitive plugins (e.g. `ai_prompt_compressor` skips non-POST
+        // bodies). This mirrors the gRPC path's hook-only header map and is never
+        // forwarded to the backend (dispatch uses `proxy_headers`).
+        let mut hook_headers = proxy_headers.clone();
+        hook_headers
+            .entry(":method".to_string())
+            .or_insert_with(|| method.clone());
         let mut current = body_data;
         for plugin in plugins.iter() {
             if plugin.modifies_request_body()
                 && let Some(transformed) = plugin
-                    .transform_request_body(&current, content_type, &proxy_headers)
+                    .transform_request_body(&current, content_type, &hook_headers)
                     .await
             {
                 current = transformed;
