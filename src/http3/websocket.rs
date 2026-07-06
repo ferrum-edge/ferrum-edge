@@ -713,6 +713,69 @@ pub(crate) async fn handle_h3_websocket(
     // connection closes. Captured out of the loop alongside the handshake.
     let backend_conn_guard;
     let backend_handshake = loop {
+        // The H3 WebSocket bridge has no `websocket_mesh_egress` fork —
+        // `connect_websocket_backend` is a plain TCP/TLS dial. A direct dial to
+        // a mesh-tagged target would bypass the secured mesh transport, so fail
+        // closed BEFORE dialing (issue #2007). Sits at the loop top so the
+        // initial target AND every retry-rotated target re-entering the loop
+        // are screened.
+        if let Some(reason) = crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(
+            current_target.as_deref(),
+        ) {
+            warn!(
+                proxy_id = %proxy.id,
+                target_host = current_target.as_deref().map(|target| target.host.as_str()).unwrap_or(""),
+                target_port = current_target.as_deref().map(|target| target.port).unwrap_or(0),
+                reason,
+                "H3 WebSocket: refusing direct dial to a mesh-transport-tagged target"
+            );
+            // Gateway-side dispatch-policy shed with no backend dialed: neutral
+            // to the breaker (releases a claimed HALF_OPEN probe slot) and to
+            // passive health / latency, matching the H3 plain bridge's refusal
+            // arm. No conn slot, admission permits, or LB connection start are
+            // held at the loop top, so nothing else needs releasing.
+            crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
+                &state,
+                &proxy,
+                &epoch.load_balancer,
+                upstream_balancer.as_ref(),
+                current_target.as_deref(),
+                current_cb_target_key.as_deref(),
+                502,
+                false,
+                Some(retry::ErrorClass::DispatchPolicyRejected),
+                ws_cb_probe_slot_available,
+                false,
+                start_time.elapsed(),
+            );
+            crate::proxy::record_request(&state, 502);
+            emit_failed_upgrade_summary(
+                &state,
+                &proxy,
+                &ctx,
+                &proxy_headers,
+                &plugins,
+                plugin_execution_ns,
+                start_time,
+                &current_backend_url,
+                crate::proxy::websocket_dns_resolution_host(&proxy, current_target.as_deref()),
+                retry::ErrorClass::DispatchPolicyRejected,
+                &original_request_path,
+            )
+            .await;
+            let reason_headers =
+                HashMap::from([("gateway-error-reason".to_string(), reason.to_string())]);
+            send_h3_reject_body(
+                &mut stream,
+                StatusCode::BAD_GATEWAY,
+                br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
+                &reason_headers,
+            )
+            .await;
+            drop(ws_connection_permit);
+            return Ok(());
+        }
+
         // Enforce DestinationRule `connectionPool.tcp.maxConnections` for this
         // destination policy port BEFORE dialing — same semantics and ordering
         // as the H1/H2 path in `src/proxy/mod.rs`. No cap => `Ok(None)`, a

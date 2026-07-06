@@ -2526,6 +2526,53 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // Native-H3 pool branch (Plain flavor, backend probed H3-capable). The QUIC
+    // backend pool is a direct dial with no HBONE / mesh-mTLS / east-west path,
+    // so fail closed on a mesh-transport-tagged target BEFORE any pool
+    // admission (issue #2007, defensive: mesh capture is TCP-only, so a
+    // mesh-tagged target passing the QUIC capability probe is a narrow case).
+    // Covers both the streaming and buffered native sub-paths below.
+    if let Some(reason) = crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(
+        upstream_target.as_deref(),
+    ) {
+        warn!(
+            proxy_id = %proxy.id,
+            target_host = upstream_target.as_deref().map(|target| target.host.as_str()).unwrap_or(""),
+            target_port = upstream_target.as_deref().map(|target| target.port).unwrap_or(0),
+            reason,
+            "native H3 dispatch: refusing direct dial to a mesh-transport-tagged target"
+        );
+        // Neutral to the breaker (releases a claimed HALF_OPEN probe slot) and
+        // to passive health / latency — same recording as the H3 plain bridge's
+        // refusal arm. No admission permits or LB connection start exist yet.
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
+            &state,
+            &proxy,
+            &epoch.load_balancer,
+            upstream_balancer.as_ref(),
+            upstream_target.as_deref(),
+            cb_target_key.as_deref(),
+            502,
+            false,
+            Some(crate::retry::ErrorClass::DispatchPolicyRejected),
+            cb_is_half_open_probe,
+            false,
+            backend_start.elapsed(),
+        );
+        record_request(&state, 502);
+        let reason_headers =
+            HashMap::from([("gateway-error-reason".to_string(), reason.to_string())]);
+        send_h3_reject_flavor_aware(
+            &mut stream,
+            http_flavor,
+            StatusCode::BAD_GATEWAY,
+            br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
+            &reason_headers,
+        )
+        .await?;
+        return Ok(());
+    }
+
     if can_stream_request_body {
         // ===== STREAMING REQUEST + RESPONSE PATH =====
         // Stream both the request body (frontend → backend) and response body
