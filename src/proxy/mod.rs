@@ -8131,7 +8131,39 @@ async fn handle_websocket_request_authenticated(
         // mesh path and the direct path forward the identical path+query. Default
         // to `/` if the URL somehow carries none (Extended CONNECT / inner H1
         // both require a leading `/`).
-        let ws_path_and_query: std::borrow::Cow<'_, str> = current_backend_url
+        //
+        // For a CROSS-CLUSTER Ambient HBONE target `current_backend_url`'s
+        // authority is the SCOPED SYNTHETIC identity (`mesh-xc-hbone|...`, with `|`
+        // separators) — NOT a valid URI authority — so the parse below would fail
+        // and silently collapse a real `/ws?room=1` to `/`. Mirror
+        // `proxy_to_backend_hbone`: swap the synthetic authority for the real
+        // `app_host` (the `mesh.hbone_authority_host` CONNECT authority) FIRST so
+        // the URI parses and the client path is preserved through the tunnel. Only
+        // `path_and_query` is read out (the host is dropped — the inner CONNECT
+        // already targets the pod), so the rewritten authority is parse-only.
+        // In-cluster targets have no synthetic host, so this is a byte-identical
+        // no-op for them (the branch is gated on `target_hbone_cross_cluster`).
+        let ws_backend_url_for_parse: std::borrow::Cow<'_, str> = match current_target.as_deref() {
+            Some(target)
+                if matches!(&ws_mesh_egress, Some(MeshWsEgress::AmbientHbone))
+                    && hbone_pool::target_hbone_cross_cluster(target) =>
+            {
+                match hbone_pool::target_hbone_authority_host(target) {
+                    Ok(app_host) => std::borrow::Cow::Owned(rewrite_backend_url_authority_host(
+                        &current_backend_url,
+                        &target.host,
+                        app_host,
+                    )),
+                    // A malformed cross-cluster target (missing/invalid
+                    // `mesh.hbone_authority_host`) fails CLOSED in the dial branch
+                    // below with a typed pre-wire error; leave the URL as-is so the
+                    // parse falls back to `/` and the branch surfaces the reject.
+                    Err(_) => std::borrow::Cow::Borrowed(current_backend_url.as_str()),
+                }
+            }
+            _ => std::borrow::Cow::Borrowed(current_backend_url.as_str()),
+        };
+        let ws_path_and_query: std::borrow::Cow<'_, str> = ws_backend_url_for_parse
             .parse::<hyper::Uri>()
             .ok()
             .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_string()))
@@ -9637,6 +9669,14 @@ async fn connect_mesh_websocket_backend(
             // tag for a cross-cluster target, else `target.host` in-cluster (the
             // tag is absent → returns `target.host`, byte-identical to before).
             let app_host = hbone_pool::target_hbone_authority_host(target)?;
+            // The two cross-cluster fail-closed branches return a TYPED
+            // `HbonePoolError` (not a boxed string) so `classify_boxed_setup_error`
+            // → `classify_typed_chain` downcasts it to a PRE-WIRE class
+            // (`ConnectionPoolError`) via `error_class()`. That keeps a metadata
+            // reject retry-eligible under `retry_on_connect_failure` and recorded
+            // as a mesh SETUP failure — not charged to the backend / circuit
+            // breaker as a post-wire request failure (issue #2010 codex). Mirrors
+            // the Sidecar `MeshMtlsDialError::MissingCrossCluster*` pattern.
             let (expected_peer, expected_trust_domain, sni_override) =
                 if hbone_pool::target_hbone_cross_cluster(target) {
                     let sni = hbone_pool::target_hbone_eastwest_sni(target).ok_or_else(|| {
@@ -9646,7 +9686,7 @@ async fn connect_mesh_websocket_backend(
                             "Refusing cross-cluster Ambient WebSocket egress: missing/empty \
                              mesh.eastwest_sni (fail closed, never dial the gateway IP as SNI)"
                         );
-                        "cross-cluster Ambient WebSocket target missing mesh.eastwest_sni"
+                        hbone_pool::HbonePoolError::MissingCrossClusterSni
                     })?;
                     let td = hbone_pool::target_hbone_cross_cluster_trust_domain(target)
                         .ok_or_else(|| {
@@ -9656,7 +9696,7 @@ async fn connect_mesh_websocket_backend(
                                 "Refusing cross-cluster Ambient WebSocket egress: missing/empty/\
                                  unparseable mesh.trust_domain (fail closed, never any-federated)"
                             );
-                            "cross-cluster Ambient WebSocket target missing mesh.trust_domain"
+                            hbone_pool::HbonePoolError::MissingCrossClusterTrustDomain
                         })?;
                     (None, Some(td), Some(sni))
                 } else {

@@ -5589,6 +5589,92 @@ async fn functional_mesh_ambient_cross_cluster_ws_rejects_untrusted_client() {
     }
 }
 
+/// Cross-cluster Ambient WS egress driver that drives a NON-ROOT request path
+/// (`/ws/echo?room=42`) against a path-capturing WS echo backend, then returns
+/// the echoed reply (which embeds the path the backend actually observed).
+/// Mirrors [`drive_ambient_cross_cluster_ws_egress`] but with the path-echo
+/// backend so the test can assert the client `:path` is preserved through the
+/// cross-cluster HBONE byte tunnel (issue #2010 codex Finding 1).
+async fn drive_ambient_cross_cluster_ws_path_egress() -> Result<(String, String), String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+
+    const CLIENT_PATH: &str = "/ws/echo?room=42";
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let backend_port = start_websocket_path_echo_backend().await;
+        let Some(fixture) =
+            try_start_ambient_cross_cluster_fixture(attempt, true, backend_port).await
+        else {
+            last_failure = format!("attempt {attempt}: ambient cross-cluster fixture never bound");
+            continue;
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let last: Result<String, String> = loop {
+            let observed = mesh_websocket_echo_roundtrip_path(
+                fixture.a_outbound_port,
+                "svc-c.ferrum.svc.cluster.local",
+                CLIENT_PATH,
+                "mesh-amb-xc-ws-path-hello",
+            )
+            .await;
+            if let Ok(ref reply) = observed
+                && reply.contains("mesh-amb-xc-ws-path-hello")
+            {
+                break observed;
+            }
+            if Instant::now() >= deadline {
+                break observed;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        let logs = fixture.logs();
+        fixture.shutdown().await;
+        return match last {
+            Ok(reply) => Ok((reply, logs)),
+            Err(e) => Err(format!("{e}\n{logs}")),
+        };
+    }
+
+    Err(format!(
+        "ambient cross-cluster WS path gateways never bound their listeners after \
+         {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// Cross-cluster WebSocket PATH-PRESERVATION regression (Ambient HBONE, issue
+/// #2010 codex Finding 1): a WebSocket upgrade to a non-root path
+/// (`/ws/echo?room=42`) must reach C's backend on THAT EXACT path — not `/`.
+/// Before the fix, the caller derived `path_and_query` by parsing a backend URL
+/// whose authority was the cross-cluster scoped synthetic `mesh-xc-hbone|...`
+/// host; that authority is not a valid URI, so the parse failed and the path
+/// silently collapsed to `/`, upgrading every cross-cluster WS endpoint against
+/// the root. The fix rewrites the authority to the real pod addr
+/// (`mesh.hbone_authority_host`) before parsing (mirroring `proxy_to_backend_hbone`),
+/// so the client path survives. The path-echo backend echoes the path it
+/// observed, so this asserts the exact non-root path arrived.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_cross_cluster_ws_preserves_request_path() {
+    let (reply, logs) = drive_ambient_cross_cluster_ws_path_egress()
+        .await
+        .expect("ambient cross-cluster websocket path-preservation egress drive");
+    // The echoed reply is `backend-ws-path:<observed_path>:<text>`; the observed
+    // path MUST be the full non-root client target, proving it was not collapsed
+    // to `/` by the synthetic-host URL parse failure.
+    assert!(
+        reply.contains("backend-ws-path:/ws/echo?room=42:mesh-amb-xc-ws-path-hello"),
+        "the cross-cluster Ambient WS upgrade must reach the backend on the exact client path \
+         `/ws/echo?room=42` (not `/`); reply: {reply:?}\n{logs}"
+    );
+    // Guard against a false pass if the path ever silently degrades to root.
+    assert!(
+        !reply.contains("backend-ws-path:/:"),
+        "the cross-cluster Ambient WS path must not collapse to `/`; reply: {reply:?}\n{logs}"
+    );
+}
+
 // ── Localized file config source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) ────────
 
 /// JSON mesh document equivalent of `inbound_authz_slice`: the same routing +
@@ -5990,6 +6076,84 @@ async fn start_websocket_echo_backend() -> u16 {
     port
 }
 
+/// Start a WebSocket echo server that captures the inner upgrade's request
+/// **path+query** (via `accept_hdr_async`) and echoes it back in-band as
+/// `backend-ws-path:<path_and_query>:<text>`. Used to prove the cross-cluster
+/// Ambient WS egress PRESERVES the client `:path` through the HBONE byte tunnel
+/// (issue #2010 codex Finding 1): before the fix, the synthetic
+/// `mesh-xc-hbone|...` authority made the caller's URL fail to parse and the
+/// path silently collapsed to `/`. The captured path lets the client assert the
+/// exact non-root path arrived at the backend.
+// The `accept_hdr_async` callback returns tungstenite's large `ErrorResponse`
+// in its `Err` arm — the same accepted shape as `functional_websocket_test.rs`.
+#[allow(clippy::result_large_err)]
+async fn start_websocket_path_echo_backend() -> u16 {
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::{Arc, Mutex};
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind websocket path-echo backend");
+    let port = listener
+        .local_addr()
+        .expect("websocket path-echo backend addr")
+        .port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                // Capture the inner HTTP/1.1 upgrade request target the relay
+                // forwarded. `accept_hdr_async`'s callback sees the raw request,
+                // so record its path+query for the client to assert on.
+                let observed_path = Arc::new(Mutex::new(String::from("<none>")));
+                let observed_path_cb = Arc::clone(&observed_path);
+                let callback = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                                     resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    let pq = req
+                        .uri()
+                        .path_and_query()
+                        .map(|pq| pq.as_str().to_string())
+                        .unwrap_or_else(|| req.uri().path().to_string());
+                    if let Ok(mut slot) = observed_path_cb.lock() {
+                        *slot = pq;
+                    }
+                    Ok(resp)
+                };
+                let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(sock, callback).await else {
+                    return;
+                };
+                use tokio_tungstenite::tungstenite::Message;
+                let path_snapshot = observed_path
+                    .lock()
+                    .map(|slot| slot.clone())
+                    .unwrap_or_else(|_| String::from("<lock-poisoned>"));
+                while let Some(Ok(msg)) = ws.next().await {
+                    let send_result = match msg {
+                        Message::Text(text) => {
+                            ws.send(Message::Text(
+                                format!("backend-ws-path:{path_snapshot}:{text}").into(),
+                            ))
+                            .await
+                        }
+                        Message::Binary(bytes) => ws.send(Message::Binary(bytes)).await,
+                        Message::Ping(payload) => ws.send(Message::Pong(payload)).await,
+                        Message::Close(_) => {
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        _ => Ok(()),
+                    };
+                    if send_result.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
 /// Open a plaintext HTTP/1.1 WebSocket upgrade to gateway A's outbound capture
 /// listener (the same channel `plaintext_http_get` uses), send one text frame,
 /// and return the echoed reply. The `Host` selects A's `mesh.mtls` egress route
@@ -5999,6 +6163,18 @@ async fn start_websocket_echo_backend() -> u16 {
 async fn mesh_websocket_echo_roundtrip(
     port: u16,
     host: &str,
+    payload: &str,
+) -> Result<String, String> {
+    mesh_websocket_echo_roundtrip_path(port, host, "/", payload).await
+}
+
+/// Same as [`mesh_websocket_echo_roundtrip`] but drives an arbitrary request
+/// `path` (e.g. `/ws/echo?room=x`) instead of `/`, so a test can assert the
+/// client `:path`+query is preserved end-to-end across a mesh WS egress.
+async fn mesh_websocket_echo_roundtrip_path(
+    port: u16,
+    host: &str,
+    path: &str,
     payload: &str,
 ) -> Result<String, String> {
     use futures_util::{SinkExt, StreamExt};
@@ -6015,7 +6191,7 @@ async fn mesh_websocket_echo_roundtrip(
 
     // Build the upgrade request with the egress-route Host (tungstenite would
     // otherwise key the Host off the raw 127.0.0.1 address and miss the route).
-    let mut request = format!("ws://{host}/")
+    let mut request = format!("ws://{host}{path}")
         .into_client_request()
         .map_err(|e| format!("build ws request: {e}"))?;
     request.headers_mut().insert(

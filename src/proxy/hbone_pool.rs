@@ -147,6 +147,27 @@ pub enum HbonePoolError {
          cannot open a WebSocket Extended CONNECT (RFC 8441) stream"
     )]
     ExtendedConnectUnsupported { authority: String },
+    /// Cross-cluster east-west Ambient target with a missing / empty
+    /// `mesh.eastwest_sni` tag — the destination-FQDN SNI the remote gateway's
+    /// passthrough routes on is mandatory (never dial the gateway IP as SNI).
+    /// A PRE-WIRE fail-closed reject: no gateway is dialed. Mirrors the Sidecar
+    /// `MeshMtlsDialError::MissingCrossClusterSni` so the WebSocket egress path
+    /// can box a TYPED error that `classify_boxed_setup_error` recognizes as
+    /// pre-wire (issue #2010 codex).
+    #[error(
+        "cross-cluster Ambient HBONE target missing mesh.eastwest_sni \
+         (fail closed, never dial the gateway address as SNI)"
+    )]
+    MissingCrossClusterSni,
+    /// Cross-cluster east-west Ambient target with a missing / empty /
+    /// unparseable `mesh.trust_domain` tag — the remote trust domain verification
+    /// is scoped to is mandatory (never fall back to any-federated verification).
+    /// A PRE-WIRE fail-closed reject: no gateway is dialed.
+    #[error(
+        "cross-cluster Ambient HBONE target missing mesh.trust_domain \
+         (fail closed, never any-federated verification)"
+    )]
+    MissingCrossClusterTrustDomain,
 }
 
 impl HbonePoolError {
@@ -157,7 +178,9 @@ impl HbonePoolError {
             | Self::TlsConfig(_)
             | Self::InvalidDialHostTag { .. }
             | Self::InvalidAuthorityHostTag { .. }
-            | Self::InvalidPeerSpiffeTag { .. } => ErrorClass::ConnectionPoolError,
+            | Self::InvalidPeerSpiffeTag { .. }
+            | Self::MissingCrossClusterSni
+            | Self::MissingCrossClusterTrustDomain => ErrorClass::ConnectionPoolError,
             Self::DnsLookup { .. } | Self::InvalidServerName { .. } => ErrorClass::DnsLookupError,
             Self::ConnectTimeout { .. } => ErrorClass::ConnectionTimeout,
             Self::Connect { source, .. } => {
