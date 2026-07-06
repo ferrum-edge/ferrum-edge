@@ -1977,11 +1977,14 @@ async fn handle_h3_request(
     let upstream_balancer = selection.balancer;
     // Mirror H1/H2 selected-target policy: cap per-request retries, then build
     // an effective proxy carrying per-target DestinationRule-derived
-    // connectionPool/TLS overrides for current-target native-H3, H3->gRPC, and
-    // WebSocket dispatch decisions. Keep the capped but unresolved base proxy
-    // for the H3->plain bridge: dispatch_plain resolves the effective proxy
-    // again for each retry target, so a later target does not inherit the first
-    // target's port-level TLS/SNI/H1 policy.
+    // connectionPool/TLS overrides for the FIRST selected target. That
+    // effective proxy backs the single-target dispatch decisions below
+    // (retry-dependent buffering, native-H3 capability, streaming dispatch).
+    // Every dispatch loop that can rotate retry targets — the buffered
+    // native-H3 retry loop, the H3->plain and H3->gRPC bridges, and the H3
+    // WebSocket dial loop — re-resolves the effective proxy per attempt from
+    // the capped but UNRESOLVED base proxy, so a later target does not inherit
+    // the first target's port-level TLS/SNI/H1 policy.
     let selected_base_proxy =
         crate::proxy::cap_proxy_retry_for_target(proxy, upstream_target.as_deref());
     let effective_proxy = crate::proxy::resolve_effective_proxy_for_target(
@@ -1992,7 +1995,12 @@ async fn handle_h3_request(
         std::borrow::Cow::Borrowed(_) => Arc::clone(&selected_base_proxy),
         std::borrow::Cow::Owned(owned) => Arc::new(owned),
     };
-    ctx.matched_proxy = Some(Arc::clone(&proxy));
+    // Plugins/logging see the retry-capped BASE proxy, matching the H1/H2 path
+    // (`handle_proxy_request_inner` assigns `ctx.matched_proxy` right after
+    // `cap_proxy_retry_for_target`). Per-port TLS/timeout overrides are a
+    // dispatch-time concern and must not appear baked into the plugin-visible
+    // proxy on H3 only.
+    ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));
 
     // Determine streaming vs buffered mode — same logic as the H1/H2 paths.
     // Stream by default; buffer when plugins / response_body_mode need body
@@ -2443,11 +2451,14 @@ async fn handle_h3_request(
             crate::http3::cross_protocol::run(crate::http3::cross_protocol::CrossProtocolRequest {
                 state: &state,
                 epoch: &epoch,
-                proxy: if matches!(http_flavor, HttpFlavor::Plain | HttpFlavor::Grpc) {
-                    selected_base_proxy.as_ref()
-                } else {
-                    proxy.as_ref()
-                },
+                // Only Plain and Grpc flavors reach this bridge (WebSocket
+                // returned via its dedicated bridge above), and both resolve
+                // the per-target effective proxy per attempt inside their own
+                // dispatch loops — so hand them the retry-capped but otherwise
+                // UNRESOLVED base proxy. Passing the first target's effective
+                // proxy would bake its port-level TLS/SNI/H1 policy into every
+                // retry attempt.
+                proxy: selected_base_proxy.as_ref(),
                 stream: &mut stream,
                 method: &method,
                 proxy_headers: &proxy_headers,
@@ -3967,9 +3978,23 @@ async fn handle_h3_request(
             let mut current_cb_target_key = cb_target_key.clone();
             let mut current_url = backend_url.clone();
 
+            // Resolve the dispatch proxy for THIS attempt's target from the
+            // retry-capped BASE proxy — never from the first target's effective
+            // proxy — mirroring the per-attempt re-resolution the H3->plain
+            // bridge (`dispatch_plain`) and the H1/H2 retry path
+            // (`proxy_to_backend_retry`) perform. Rotation is port-lane-pinned
+            // only when the failed target's policy port has a live per-port
+            // override, so a rotation can cross from the SD fallback into a
+            // policy port that carries its own `portLevelSettings` (TLS/SNI/
+            // connectTimeout); dialing with a stale first-target proxy would
+            // use the wrong TLS identity for the rotated target.
+            let attempt_dispatch_proxy = crate::proxy::resolve_effective_proxy_for_target(
+                &selected_base_proxy,
+                current_target.as_deref(),
+            );
             let mut result = proxy_to_backend_h3(
                 &state,
-                &proxy,
+                attempt_dispatch_proxy.as_ref(),
                 &current_url,
                 &method,
                 &proxy_headers,
@@ -4121,9 +4146,18 @@ async fn handle_h3_request(
                     "Retrying backend request (HTTP/3 frontend)"
                 );
 
+                // Re-resolve the effective proxy for the (possibly rotated)
+                // retry target from the retry-capped BASE proxy, so this
+                // attempt dials with ITS policy port's TLS/SNI/connectTimeout
+                // posture instead of inheriting the first target's (see the
+                // pre-loop resolution comment above).
+                let attempt_dispatch_proxy = crate::proxy::resolve_effective_proxy_for_target(
+                    &selected_base_proxy,
+                    current_target.as_deref(),
+                );
                 result = proxy_to_backend_h3(
                     &state,
-                    &proxy,
+                    attempt_dispatch_proxy.as_ref(),
                     &current_url,
                     &method,
                     &proxy_headers,

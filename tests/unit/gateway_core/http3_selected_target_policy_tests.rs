@@ -49,19 +49,86 @@ fn h3_plain_and_grpc_bridges_keep_unresolved_base_proxy_for_retries() {
         )
         .expect("H3 cross-protocol bridge call must remain present");
     let bridge = &source[bridge_call..];
+    // Only Plain and Grpc reach this bridge (WebSocket returns via its
+    // dedicated bridge earlier), and both resolve the effective proxy per
+    // attempt inside their dispatch loops — so the capped, UNRESOLVED base
+    // proxy must be passed unconditionally, with no flavor-forked fallback to
+    // the first target's effective proxy.
     let proxy_field = bridge
-        .find("proxy: if matches!(http_flavor, HttpFlavor::Plain | HttpFlavor::Grpc)")
-        .expect("H3 plain/gRPC bridge must choose an unresolved base proxy");
-    let base_branch = bridge[proxy_field..]
-        .find("selected_base_proxy.as_ref()")
-        .expect("H3 plain/gRPC bridge must pass the capped unresolved base proxy");
-    let effective_branch = bridge[proxy_field..]
-        .find("proxy.as_ref()")
-        .expect("remaining H3 bridge paths must still use the effective proxy");
-
+        .find("proxy: selected_base_proxy.as_ref(),")
+        .expect("H3 plain/gRPC bridge must pass the capped unresolved base proxy unconditionally");
+    let stream_field = bridge
+        .find("stream: &mut stream,")
+        .expect("H3 cross-protocol request literal must remain present");
     assert!(
-        base_branch < effective_branch,
-        "plain/gRPC bridge must prefer selected_base_proxy so retry targets are resolved per attempt"
+        proxy_field < stream_field,
+        "the base-proxy field must belong to this CrossProtocolRequest literal"
+    );
+    assert!(
+        !bridge[..stream_field].contains("proxy: if matches!"),
+        "the flavor-forked proxy selection was dead code (WebSocket never reaches this bridge); \
+         do not reintroduce it"
+    );
+}
+
+#[test]
+fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let retry_loop = source
+        .find("} else if let Some(retry_config) = &proxy.retry {")
+        .expect("buffered native-H3 retry loop must remain present");
+    let loop_src = &source[retry_loop..];
+
+    // Initial attempt: resolve from the retry-capped BASE proxy (never the
+    // first target's effective proxy) before dispatching.
+    let initial_resolve = loop_src
+        .find("let attempt_dispatch_proxy = crate::proxy::resolve_effective_proxy_for_target(")
+        .expect("native-H3 retry loop must resolve the attempt dispatch proxy");
+    assert!(
+        loop_src[initial_resolve..].contains("&selected_base_proxy"),
+        "per-attempt resolution must feed from the retry-capped base proxy"
+    );
+    let initial_dispatch = loop_src
+        .find("proxy_to_backend_h3(")
+        .expect("buffered native-H3 dispatch must remain present");
+    assert!(
+        initial_resolve < initial_dispatch,
+        "the initial native-H3 attempt must dispatch with the resolved attempt proxy"
+    );
+    assert!(
+        loop_src[initial_dispatch..].contains("attempt_dispatch_proxy.as_ref(),"),
+        "proxy_to_backend_h3 must receive the per-attempt resolved proxy"
+    );
+
+    // Rotated attempt: a rotation can cross from the SD fallback into a policy
+    // port with its own per-port override (TLS/SNI/connectTimeout), so the
+    // loop must RE-resolve after `select_next_retry_target` and before the
+    // retried dispatch.
+    let rotation = loop_src
+        .find("select_next_retry_target(")
+        .expect("native-H3 retry rotation must remain present");
+    let re_resolve = loop_src[rotation..]
+        .find("let attempt_dispatch_proxy = crate::proxy::resolve_effective_proxy_for_target(")
+        .expect("rotated native-H3 retry attempts must re-resolve the effective proxy");
+    let rotated_dispatch = loop_src[rotation..]
+        .find("result = proxy_to_backend_h3(")
+        .expect("rotated native-H3 dispatch must remain present");
+    assert!(
+        re_resolve < rotated_dispatch,
+        "the rotated attempt must re-resolve the effective proxy before dispatching"
+    );
+}
+
+#[test]
+fn h3_frontend_exposes_retry_capped_base_proxy_to_plugins() {
+    // H1/H2 parity: `handle_proxy_request_inner` assigns `ctx.matched_proxy`
+    // the retry-capped BASE proxy (right after `cap_proxy_retry_for_target`),
+    // so plugins/logging must not see per-port TLS/timeout overrides baked
+    // into the proxy on the H3 frontend only.
+    let source = include_str!("../../../src/http3/server.rs");
+    assert!(
+        source.contains("ctx.matched_proxy = Some(Arc::clone(&selected_base_proxy));"),
+        "H3 must expose the retry-capped base proxy via ctx.matched_proxy (H1/H2 parity)"
     );
 }
 

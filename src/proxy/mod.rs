@@ -1773,8 +1773,13 @@ pub(crate) fn supports_native_http3_backend(
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
 ) -> bool {
-    let capability_proxy = resolve_backend_capability_proxy_for_target(proxy, upstream_target);
-    let proxy = capability_proxy.as_ref();
+    // Cheap gate FIRST — this runs per request and per retry rotation on the
+    // H1/H2 dispatch path. `dispatch_kind` is not target-overridable: the
+    // per-target projection (`resolve_effective_proxy_for_target`) writes only
+    // connect timeout / pool knobs / `resolved_tls` / `h2_upgrade_policy`, and
+    // `resolve_backend_connection_proxy_for_target` only rebases host/port —
+    // so the common non-HttpsPool case returns before any per-target
+    // capability-key resolution work.
     proxy.dispatch_kind == DispatchKind::HttpsPool
         && get_backend_capability_for_target(
             state.backend_capabilities.as_ref(),
@@ -1786,18 +1791,59 @@ pub(crate) fn supports_native_http3_backend(
 
 /// Resolve the proxy shape used to build backend capability keys for a concrete
 /// target. Startup probing uses [`BackendCapabilityProbeTarget::from_proxy`],
-/// which first applies target-scoped policy/TLS overrides and then keys the
-/// registry from that effective proxy plus the target host/port. Request-path
-/// lookups and live downgrades must mirror that key exactly or they can miss a
-/// Supported probe record and/or write Unsupported to the base proxy key.
+/// which first applies the full target-scoped override projection
+/// (`resolve_effective_proxy_for_target`) and then keys the registry from that
+/// effective proxy plus the target host/port. Request-path lookups and live
+/// downgrades must mirror that key exactly or they can miss a Supported probe
+/// record and/or write Unsupported to the base proxy key.
+///
+/// Hot-path discipline: capability keys read exactly these proxy fields
+/// (`write_capability_key`): `backend_scheme`, `backend_host`/`backend_port`
+/// (superseded by the target's host/port when a target is present),
+/// `dns_override`, and `resolved_tls`. Of those, the ONLY field the per-target
+/// projection can change is `resolved_tls` (DestinationRule
+/// `portLevelSettings[].tls`; the SD top-level fallback slot carries
+/// `connectionPool.http` fields only — see
+/// `dispatch_port_override_fallback_from_upstream`). So this resolver projects
+/// ONLY the effective TLS override — mirroring
+/// `resolve_effective_proxy_for_target`'s merged-override `tls` semantics (a
+/// present per-port entry's `tls` governs; the fallback slot's `tls` applies
+/// only when the port has no per-port entry) — and skips the full-proxy clone
+/// a non-key-relevant delta (per-port `connectTimeout`, the most common DR
+/// knob) would otherwise force onto every per-request capability lookup. Keys
+/// built from this resolver are identical to keys built from the full
+/// effective proxy (pinned by
+/// `capability_proxy_resolution_matches_effective_proxy_keys`).
 fn resolve_backend_capability_proxy_for_target<'a>(
     proxy: &'a Proxy,
     upstream_target: Option<&UpstreamTarget>,
 ) -> std::borrow::Cow<'a, Proxy> {
-    resolve_effective_proxy_for_target(proxy, upstream_target)
+    let Some(target) = upstream_target else {
+        return std::borrow::Cow::Borrowed(proxy);
+    };
+    let per_port = proxy
+        .dispatch_port_overrides
+        .as_ref()
+        .and_then(|overrides| overrides.get(&target.dispatch_policy_port()));
+    let tls_override = match per_port {
+        Some(override_config) => override_config.tls.as_ref(),
+        None => proxy
+            .dispatch_port_override_fallback
+            .as_ref()
+            .and_then(|fallback| fallback.tls.as_ref()),
+    }
+    .filter(|tls| **tls != proxy.resolved_tls);
+    match tls_override {
+        None => std::borrow::Cow::Borrowed(proxy),
+        Some(tls) => {
+            let mut owned = proxy.clone();
+            owned.resolved_tls = tls.clone();
+            std::borrow::Cow::Owned(owned)
+        }
+    }
 }
 
-fn get_backend_capability_for_target(
+pub(crate) fn get_backend_capability_for_target(
     registry: &BackendCapabilityRegistry,
     proxy: &Proxy,
     upstream_target: Option<&UpstreamTarget>,
@@ -1822,6 +1868,15 @@ fn mark_h2_tls_unsupported_for_backend_target(
 ) -> bool {
     let capability_proxy = resolve_backend_capability_proxy_for_target(proxy, upstream_target);
     registry.mark_h2_tls_unsupported(capability_proxy.as_ref(), upstream_target)
+}
+
+fn mark_hbone_unsupported_for_backend_target(
+    registry: &BackendCapabilityRegistry,
+    proxy: &Proxy,
+    upstream_target: Option<&UpstreamTarget>,
+) {
+    let capability_proxy = resolve_backend_capability_proxy_for_target(proxy, upstream_target);
+    registry.mark_hbone_unsupported(capability_proxy.as_ref(), upstream_target);
 }
 
 /// True when an `ErrorClass` represents an H3 / QUIC transport-level
@@ -1951,8 +2006,13 @@ fn can_attempt_hbone_backend(
     let registry_ok = if hbone_pool::target_hbone_cross_cluster(target) {
         true
     } else {
-        registry
-            .get(proxy, Some(target))
+        // Target-effective keying: probes (`BackendCapabilityProbeTarget::
+        // from_proxy`) and live downgrades (`mark_hbone_unsupported_for_
+        // backend_target`) key records under the target-effective proxy, so
+        // this fail-open gate must read the SAME key or it never sees an
+        // Unsupported downgrade when a per-port DR TLS override shifts the key
+        // off the base proxy — resetting HBONE failure dampening every dial.
+        get_backend_capability_for_target(registry, proxy, Some(target))
             .is_none_or(|record| !matches!(record.hbone, ProtocolSupport::Unsupported))
     };
     proxy_can_dispatch_hbone(proxy)
@@ -21904,9 +21964,15 @@ async fn proxy_to_backend_hbone(
                     error = %err,
                     "HBONE capability establishment failed; downgrading cached capability so subsequent requests skip the tunnel"
                 );
-                state
-                    .backend_capabilities
-                    .mark_hbone_unsupported(proxy, Some(target));
+                // `proxy` here is already the effective proxy resolved by
+                // `proxy_to_backend`; the helper's re-resolution is idempotent
+                // and keeps this downgrade on the same target-effective key the
+                // probes and `can_attempt_hbone_backend` use.
+                mark_hbone_unsupported_for_backend_target(
+                    state.backend_capabilities.as_ref(),
+                    proxy,
+                    Some(target),
+                );
             }
             return (
                 hbone_pool_error_response(state, proxy, &err, resolved_ip),
@@ -31715,6 +31781,100 @@ mod tests {
         assert!(
             registry.get(&proxy, Some(&target)).is_none(),
             "direct-H2 downgrade must not create or mutate the base proxy key"
+        );
+    }
+
+    #[test]
+    fn capability_proxy_resolution_matches_effective_proxy_keys() {
+        let (mut proxy, target) = proxy_with_target_effective_tls_override();
+        // Add a capability-key-IRRELEVANT per-port delta alongside the TLS one:
+        // the TLS-only capability resolver must still produce the same key the
+        // probe path builds from the FULL effective proxy.
+        if let Some(overrides) = proxy.dispatch_port_overrides.as_mut()
+            && let Some(entry) = overrides.get_mut(&8080)
+        {
+            entry.connect_timeout_ms = Some(1_234);
+        }
+
+        let capability_proxy = resolve_backend_capability_proxy_for_target(&proxy, Some(&target));
+        let effective_proxy = resolve_effective_proxy_for_target(&proxy, Some(&target));
+        assert_eq!(
+            capability_key_for_proxy_target(capability_proxy.as_ref(), Some(&target)),
+            capability_key_for_proxy_target(effective_proxy.as_ref(), Some(&target)),
+            "capability keying must match the probe path's full effective-proxy key"
+        );
+
+        // A key-irrelevant delta alone (per-port `connectTimeout`, the most
+        // common DR knob) must NOT force a per-request Proxy clone for
+        // capability keying, even though full effective resolution clones.
+        let mut timeout_only = warmup_test_proxy("t", BackendScheme::Https, "template.test", 443);
+        timeout_only.dispatch_port_overrides = Some(HashMap::from([(
+            8080,
+            crate::config::types::ResolvedPortOverride {
+                connect_timeout_ms: Some(1_234),
+                ..Default::default()
+            },
+        )]));
+        assert!(
+            matches!(
+                resolve_backend_capability_proxy_for_target(&timeout_only, Some(&target)),
+                std::borrow::Cow::Borrowed(_)
+            ),
+            "connectTimeout-only override must keep capability keying alloc-free"
+        );
+        assert!(
+            matches!(
+                resolve_effective_proxy_for_target(&timeout_only, Some(&target)),
+                std::borrow::Cow::Owned(_)
+            ),
+            "sanity: the full effective resolution does clone for the same override"
+        );
+    }
+
+    #[test]
+    fn hbone_gate_and_downgrade_use_target_effective_capability_key() {
+        let registry = BackendCapabilityRegistry::new();
+        let mut proxy = warmup_test_proxy("ambient", BackendScheme::Http, "10.0.0.8", 8080);
+        let mut per_port_tls = BackendTlsConfig::default_verify();
+        per_port_tls.sni = Some("reviews.mesh.internal".to_string());
+        proxy.dispatch_port_overrides = Some(HashMap::from([(
+            8080,
+            crate::config::types::ResolvedPortOverride {
+                tls: Some(per_port_tls),
+                ..Default::default()
+            },
+        )]));
+        let target = hbone_dispatch_test_target();
+
+        let probe = BackendCapabilityProbeTarget::from_proxy(&proxy, Some(&target));
+        let record = BackendCapabilityRecord {
+            hbone: ProtocolSupport::Supported,
+            ..Default::default()
+        };
+        registry.upsert(probe.key.clone(), record);
+
+        assert!(
+            registry.get(&proxy, Some(&target)).is_none(),
+            "base relay-proxy lookup should miss the target-effective probe key"
+        );
+        assert!(
+            get_backend_capability_for_target(&registry, &proxy, Some(&target))
+                .is_some_and(|record| record.hbone.is_supported()),
+            "the raw-TCP/UDP egress fail-closed gate must see the probe's Supported record"
+        );
+        assert!(
+            can_attempt_hbone_backend(&registry, &proxy, Some(&target), true),
+            "hbone=Supported at the effective key must allow dispatch"
+        );
+
+        mark_hbone_unsupported_for_backend_target(&registry, &proxy, Some(&target));
+        assert!(
+            !can_attempt_hbone_backend(&registry, &proxy, Some(&target), true),
+            "a live HBONE downgrade must stay visible to the dispatch gate (failure dampening)"
+        );
+        assert!(
+            registry.get(&proxy, Some(&target)).is_none(),
+            "downgrades must not create or mutate the base relay-proxy key"
         );
     }
 
