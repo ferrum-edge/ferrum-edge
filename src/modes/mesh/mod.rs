@@ -1958,18 +1958,23 @@ fn build_east_west_service_proxies_and_upstreams(
             // the SAME wildcard-aware `hosts_overlap` semantics validation uses (an
             // exact match would miss a wildcard explicit entry); guard on non-empty
             // so an absent explicit list (a catch-all under `hosts_overlap`) never
-            // suppresses every auto proxy. Suppress a port's auto proxy when the
-            // explicit list overlaps THIS PORT'S SNI *or the BASE service FQDN*
-            // (codex #2040): an operator owning the base FQDN owns its per-port
-            // aliases too (the ownership model), so an explicit base-FQDN route
-            // suppresses every auto port proxy for the service — never a split
-            // between the explicit backend and local auto aliases.
+            // suppresses every auto proxy.
+            //
+            // Suppress PER PORT SNI ONLY (codex #2040): suppress an auto proxy only
+            // when the explicit list overlaps THIS port's SNI. An explicit entry
+            // that lists only the base FQDN suppresses the base auto proxy but
+            // leaves the per-port ALIAS auto proxies materialized, so the alias
+            // ports stay routable to the local workload. Suppressing the aliases
+            // WITHOUT the explicit route also owning them (its `hosts` are not
+            // expanded with the aliases) would make every non-base port fail closed
+            // — no SNI match at the destination gateway. A partial explicit
+            // override therefore SPLITS the service (base ⇒ explicit backend,
+            // aliases ⇒ local auto route); an operator who wants all ports on the
+            // explicit backend lists the aliases (or a wildcard) in `sni_hosts`.
             let auto_sni_lower = sni_hostname.to_ascii_lowercase();
-            let base_fqdn_lower =
-                cross_cluster_service_base_fqdn(service, cluster_domain).to_ascii_lowercase();
             if !explicit_sni_hosts.is_empty()
                 && crate::config::types::hosts_overlap(
-                    &[auto_sni_lower.clone(), base_fqdn_lower],
+                    std::slice::from_ref(&auto_sni_lower),
                     explicit_sni_hosts,
                 )
             {
@@ -2324,8 +2329,13 @@ fn east_west_service_proxy(
 /// East-west per-service proxy id. `service_port` is `None` for the service's
 /// BASE (lowest HTTP-family) port — which keeps the historic port-LESS
 /// `__mesh-ew-svc-<ns>-<name>` id so a SINGLE-port service is byte-identical to
-/// the pre-multi-port shape (codex #2040) — and `Some(port)` for each additional
-/// port, which appends `-<port>` (multi-port east-west, issue #2010 phase 3).
+/// the pre-multi-port shape — and `Some(port)` for each additional port, which
+/// appends the `-p<port>` marker (multi-port east-west, issue #2010 phase 3).
+/// The `p` prefix on the port number (matching the `p<port>.<fqdn>` SNI alias
+/// convention) keeps the additional-port id from COLLIDING with the port-less
+/// base id of a distinct service literally named `<name>-<port>` (codex #2040):
+/// `foo` port 8080 → `...-foo-p8080`, never `...-foo-8080` (which would clobber
+/// `foo-8080`'s base proxy in the materializer's id-keyed map).
 fn mesh_east_west_service_proxy_id(
     namespace: &str,
     name: &str,
@@ -2333,7 +2343,7 @@ fn mesh_east_west_service_proxy_id(
 ) -> String {
     match service_port {
         None => format!("__mesh-ew-svc-{namespace}-{name}"),
-        Some(port) => format!("__mesh-ew-svc-{namespace}-{name}-{port}"),
+        Some(port) => format!("__mesh-ew-svc-{namespace}-{name}-p{port}"),
     }
     .replace(['/', '.'], "-")
 }
@@ -2347,7 +2357,7 @@ fn mesh_east_west_service_upstream_id(
 ) -> String {
     match service_port {
         None => format!("__mesh-ew-upstream-{namespace}-{name}"),
-        Some(port) => format!("__mesh-ew-upstream-{namespace}-{name}-{port}"),
+        Some(port) => format!("__mesh-ew-upstream-{namespace}-{name}-p{port}"),
     }
     .replace(['/', '.'], "-")
 }
