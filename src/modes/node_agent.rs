@@ -291,12 +291,22 @@ impl NodeAgentConfig {
         // behavior — that stays gated on `node_waypoint_in_netns` via the capture
         // contract, so a plain Ambient (LocalPod) deployment gets the registry for
         // the UDP producer WITHOUT the NodeWaypoint ipv6-deny / connect4-deferral
-        // posture. Requires outbound capture on (a pod whose egress is not captured
-        // has nothing to produce). The UDP producer needs no readiness handshake
-        // (it binds the socket then installs rules, self-contained per pod), so no
-        // `.ready` markers are involved on this path.
-        let should_publish_registry = node_waypoint_in_netns
-            || (capture_config.udp_capture_enabled && capture_config.outbound_capture_enabled);
+        // posture. The UDP gate is `udp_capture_enabled` ALONE (NOT anded with
+        // `outbound_capture_enabled`): the Ambient UDP producer binds its own
+        // `FERRUM_MESH_CAPTURE_UDP_PORT` inside each pod netns and does not use the
+        // TCP `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` listener at all, so a port-0
+        // outbound listener (which clears `outbound_capture_enabled` for the TCP
+        // connect4/connect6 redirect path) MUST NOT suppress UDP registry
+        // publication — doing so would leave the producer polling an empty
+        // directory while pod UDP egress bypasses capture/authz (fail-open, #2013
+        // codex). The UDP producer installs its pod-netns rules on its own polling
+        // loop AFTER this registry entry appears; the enrollment→rules-installed
+        // window (during which pod UDP is not yet captured) is a known fail-open
+        // gap that needs a producer→node-agent readiness handshake + a fail-closed
+        // default posture to close, tracked as a live-verified follow-up (#2013 —
+        // there is no `.ready`-marker mirror because Ambient UDP has no default
+        // redirect to refuse against, unlike the NodeWaypoint TCP connect-hook path).
+        let should_publish_registry = node_waypoint_in_netns || capture_config.udp_capture_enabled;
         let node_waypoint_pod_registry_dir = if should_publish_registry {
             Some(std::path::PathBuf::from(
                 &env_config.mesh_node_waypoint_pod_registry_dir,
@@ -4584,6 +4594,43 @@ mod tests {
                         .iter()
                         .any(|cidr| cidr == "::/0"),
                     "the UDP producer must not force the NodeWaypoint ::/0 include"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_config_publishes_udp_registry_when_tcp_outbound_disabled() {
+        // #2013 (codex): a port-0 FERRUM_MESH_OUTBOUND_LISTEN_ADDR clears
+        // `outbound_capture_enabled` for the TCP connect4/connect6 redirect path,
+        // but the Ambient UDP producer binds its OWN FERRUM_MESH_CAPTURE_UDP_PORT
+        // inside each pod netns and does not use the TCP outbound listener at all.
+        // The registry MUST still be published so the producer can discover pods —
+        // otherwise it polls an empty directory while pod UDP egress bypasses
+        // capture/authz (fail-open). This pins the gate to `udp_capture_enabled`
+        // ALONE, not anded with `outbound_capture_enabled`.
+        let local_pod = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
+            ..EnvConfig::default()
+        };
+        with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_NAME", "node-udp-no-tcp"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+                ("FERRUM_MESH_OUTBOUND_LISTEN_ADDR", "127.0.0.1:0"),
+            ],
+            || {
+                let config = NodeAgentConfig::from_env_config(&local_pod)
+                    .expect("node-agent config should parse");
+                assert!(
+                    !config.capture_config.outbound_capture_enabled,
+                    "port-0 outbound listener must clear the TCP outbound-capture flag"
+                );
+                assert!(
+                    config.node_waypoint_pod_registry_dir.is_some(),
+                    "UDP capture must publish the registry even when TCP outbound is \
+                     disabled (port 0) — the producer is independent of the TCP \
+                     listener (#2013)"
                 );
             },
         );

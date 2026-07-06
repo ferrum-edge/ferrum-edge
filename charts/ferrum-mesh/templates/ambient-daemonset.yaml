@@ -106,7 +106,17 @@
 {{- end -}}
 {{- end -}}
 {{- end -}}
-{{- if and (or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq $ambientTopology "node_waypoint")) (not (hasSuffix "-ebpf" $ambientImageTag)) -}}
+{{- /* Select the tools-capable "-ebpf" runtime image (shell + iproute2 +
+       iptables) instead of the default distroless image (`Dockerfile` FROM
+       distroless/cc, no shell/`ip`/`iptables`) whenever this pod needs OS tools:
+       eBPF capture, the NodeWaypoint topology, OR the Ambient UDP producer
+       (#2013). The producer runs in-netns `sh -c` scripts calling `ip`/`iptables`
+       (`netns_udp_capture.rs` `preflight_capture_tools`) and hard-fails startup on
+       a distroless image, so without adding `$ambientUdpProducer` here the
+       documented `FERRUM_MESH_CAPTURE_UDP_ENABLED=true` path renders the default
+       image and crash-loops before the producer starts (codex). Mirrors the
+       established auto-append convention (values.yaml image docs). */ -}}
+{{- if and (or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq $ambientTopology "node_waypoint") $ambientUdpProducer) (not (hasSuffix "-ebpf" $ambientImageTag)) -}}
 {{- $ambientImageTag = printf "%s-ebpf" $ambientImageTag -}}
 {{- end -}}
 {{- $ambientImage := printf "%s:%s" $ambientImageRepository $ambientImageTag -}}
