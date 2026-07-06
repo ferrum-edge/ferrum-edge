@@ -50,7 +50,7 @@
 {{- end -}}
 {{- $nodeWaypointRegistryEnabled := eq $nodeAgentProxyMode "node_waypoint" -}}
 {{- $ambientEnv := default dict .Values.ambient.env -}}
-{{- $ambientTopology := replace "-" "_" (lower (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY"))) -}}
+{{- $ambientTopology := replace "-" "_" (lower (trim (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY")))) -}}
 {{- /* Ambient per-pod-netns UDP capture producer (#2013): when the Ambient
        topology has UDP capture enabled, the node-agent must publish the per-pod
        registry so the ambient proxy's producer can discover enrolled pods. The
@@ -61,7 +61,7 @@
        kept in lock-step with the ambient DaemonSet predicate (codex). */ -}}
 {{- $ambientUdpCaptureEnabled := false -}}
 {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED" -}}
-{{- $ambientUdpCaptureEnabled = has (lower (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED"))) (list "true" "1") -}}
+{{- $ambientUdpCaptureEnabled = has (lower (trim (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED")))) (list "true" "1") -}}
 {{- end -}}
 {{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
 {{- $nodeAgentPublishesRegistry := or $nodeWaypointRegistryEnabled $ambientUdpProducer -}}

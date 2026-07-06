@@ -1065,36 +1065,12 @@ mod imp {
             "in-netns capture listeners are Linux-only",
         ))
     }
-
-    pub(crate) fn host_netns_inode() -> std::io::Result<u64> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "in-netns UDP capture is Linux-only",
-        ))
-    }
-
-    pub(crate) fn open_pod_netns_handle(_cgroup_path: &str) -> std::io::Result<std::fs::File> {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "in-netns UDP capture is Linux-only",
-        ))
-    }
-
-    pub(crate) fn run_in_netns<T, F>(_netns: &std::fs::File, _f: F) -> std::io::Result<T>
-    where
-        T: Send,
-        F: FnOnce() -> std::io::Result<T> + Send,
-    {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "in-netns UDP capture is Linux-only",
-        ))
-    }
 }
 
 /// Shared low-level netns primitives, re-exported for the Ambient per-pod-netns
 /// UDP producer (`netns_udp_capture`) so it reuses the SAME `setns`/cgroup
 /// resolution recipe as the TCP node-waypoint capture path.
+#[cfg(target_os = "linux")]
 pub(crate) use imp::{
     host_netns_inode, netns_inode_for_cgroup, open_pod_netns_handle, run_in_netns,
 };

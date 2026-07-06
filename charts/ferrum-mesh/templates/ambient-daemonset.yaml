@@ -14,7 +14,7 @@
 {{- $ambientSpireProductionMode = $ambientSpire.productionMode -}}
 {{- end -}}
 {{- $ambientSpireUsesNodeName := contains "$(FERRUM_K8S_NODE_NAME)" $ambientSpireWorkloadSpiffeId -}}
-{{- $ambientTopology := replace "-" "_" (lower (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY"))) -}}
+{{- $ambientTopology := replace "-" "_" (lower (trim (toString (index $ambientEnv "FERRUM_MESH_TOPOLOGY")))) -}}
 {{- $nodeWaypointRegistryEnabled := eq $ambientTopology "node_waypoint" -}}
 {{- $nodeWaypointRegistryMountPath := toString .Values.nodeAgent.podRegistryDir -}}
 {{- if hasKey $ambientEnv "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR" -}}
@@ -32,7 +32,7 @@
        startup (codex). */ -}}
 {{- $ambientUdpCaptureEnabled := false -}}
 {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED" -}}
-{{- $ambientUdpCaptureEnabled = has (lower (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED"))) (list "true" "1") -}}
+{{- $ambientUdpCaptureEnabled = has (lower (trim (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED")))) (list "true" "1") -}}
 {{- end -}}
 {{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
 {{- /* Ambient UDP capture requires the node-agent publisher: it publishes the

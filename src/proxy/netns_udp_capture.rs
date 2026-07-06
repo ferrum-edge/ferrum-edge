@@ -58,6 +58,7 @@ pub struct OpenedUdpCapture {
 }
 
 impl OpenedUdpCapture {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn new(stop: watch::Sender<bool>, task: tokio::task::JoinHandle<()>) -> Self {
         Self {
             stop,
@@ -98,9 +99,15 @@ pub trait NetnsUdpBackend: Send + Sync + 'static {
     fn netns_key(&self, target: &PodCaptureTarget) -> Result<u64, String>;
 
     /// Install UDP TPROXY rules + bind the capture socket + start the capture
-    /// loop INSIDE the target pod's netns. `None` on failure (retried next
+    /// loop INSIDE the target pod's netns. `expected_netns` is the inode resolved
+    /// during this reconcile pass; the backend must fail closed if the reopened
+    /// netns handle no longer matches it. `None` on failure (retried next
     /// reconcile); the backend must leave no partial rules behind on failure.
-    fn open_udp_capture(&self, target: &PodCaptureTarget) -> Option<OpenedUdpCapture>;
+    fn open_udp_capture(
+        &self,
+        target: &PodCaptureTarget,
+        expected_netns: u64,
+    ) -> Option<OpenedUdpCapture>;
 }
 
 /// One active pod-netns UDP producer, keyed in the manager by netns inode.
@@ -327,7 +334,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                      before reopen; proceeding to reinstall rules"
                 );
             }
-            match self.backend.open_udp_capture(target) {
+            match self.backend.open_udp_capture(target, netns) {
                 Some(handle) => {
                     info!(
                         netns_inode = netns,
@@ -488,7 +495,11 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         super::netns_capture::netns_inode_for_cgroup(&target.cgroup_path).map_err(|e| e.to_string())
     }
 
-    fn open_udp_capture(&self, target: &PodCaptureTarget) -> Option<OpenedUdpCapture> {
+    fn open_udp_capture(
+        &self,
+        target: &PodCaptureTarget,
+        expected_netns: u64,
+    ) -> Option<OpenedUdpCapture> {
         use crate::capture::{Ip6TablesMode, IptablesPlan};
 
         // The UDP-only setup + teardown scripts for THIS pod netns. `host_netns`
@@ -519,6 +530,34 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             }
         };
 
+        let opened_netns = match netns
+            .metadata()
+            .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
+        {
+            Ok(inode) => inode,
+            Err(error) => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    cgroup = %target.cgroup_path,
+                    %error,
+                    "Ambient UDP producer: could not read opened pod netns identity; \
+                     refusing to install pod UDP rules (fail closed)"
+                );
+                return None;
+            }
+        };
+        if opened_netns != expected_netns {
+            warn!(
+                pod_uid = %target.pod_uid,
+                cgroup = %target.cgroup_path,
+                reconciled_netns_inode = expected_netns,
+                opened_netns_inode = opened_netns,
+                "Ambient UDP producer: pod netns changed between reconcile and open; \
+                 refusing to install rules under a stale key"
+            );
+            return None;
+        }
+
         // Refuse to run pod UDP setup INSIDE the host/proxy network namespace.
         // A registry entry can resolve to the host netns for a mesh-labeled
         // `hostNetwork` workload, or a stale/manual entry whose cgroup points at
@@ -529,18 +568,13 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         // against our own (host) netns inode; skip when they match. Fail closed:
         // if either inode cannot be read we cannot prove the target is not the
         // host netns, so we do NOT install rules.
-        match (
-            netns
-                .metadata()
-                .map(|m| std::os::unix::fs::MetadataExt::ino(&m)),
-            super::netns_capture::host_netns_inode(),
-        ) {
-            (Ok(pod_ino), Ok(host_ino)) => {
-                if pod_ino == host_ino {
+        match super::netns_capture::host_netns_inode() {
+            Ok(host_ino) => {
+                if opened_netns == host_ino {
                     warn!(
                         pod_uid = %target.pod_uid,
                         cgroup = %target.cgroup_path,
-                        netns_inode = pod_ino,
+                        netns_inode = opened_netns,
                         "Ambient UDP producer: target resolves to the host/proxy netns \
                          (hostNetwork or stale entry); refusing to install pod UDP rules \
                          in the node namespace"
@@ -548,12 +582,11 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                     return None;
                 }
             }
-            (pod_ino, host_ino) => {
+            Err(error) => {
                 warn!(
                     pod_uid = %target.pod_uid,
                     cgroup = %target.cgroup_path,
-                    pod_netns_error = ?pod_ino.err(),
-                    host_netns_error = ?host_ino.err(),
+                    %error,
                     "Ambient UDP producer: could not compare pod vs host netns identity; \
                      refusing to install pod UDP rules (fail closed)"
                 );
@@ -679,7 +712,11 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         Err("Ambient per-pod-netns UDP capture is Linux-only".to_string())
     }
 
-    fn open_udp_capture(&self, _target: &PodCaptureTarget) -> Option<OpenedUdpCapture> {
+    fn open_udp_capture(
+        &self,
+        _target: &PodCaptureTarget,
+        _expected_netns: u64,
+    ) -> Option<OpenedUdpCapture> {
         // Touch every field so the non-Linux build does not flag them dead.
         let _ = (
             &self.state,
@@ -740,6 +777,7 @@ mod tests {
     /// a real netns, `setns`, or iptables.
     struct MockBackend {
         netns_by_cgroup: Mutex<HashMap<String, Option<u64>>>,
+        open_netns_by_cgroup: Mutex<HashMap<String, Option<u64>>>,
         opened: Arc<Mutex<Vec<u64>>>,
         closed: Arc<Mutex<Vec<u64>>>,
         /// Ordered open/teardown log across all netns, used by the reopen-race
@@ -760,6 +798,7 @@ mod tests {
                 netns_by_cgroup: Mutex::new(
                     mapping.iter().map(|(c, n)| (c.to_string(), *n)).collect(),
                 ),
+                open_netns_by_cgroup: Mutex::new(HashMap::new()),
                 opened: Arc::new(Mutex::new(Vec::new())),
                 closed: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(Vec::new())),
@@ -778,6 +817,13 @@ mod tests {
 
         fn set_netns(&self, cgroup: &str, netns: Option<u64>) {
             self.netns_by_cgroup
+                .lock()
+                .unwrap()
+                .insert(cgroup.to_string(), netns);
+        }
+
+        fn set_open_netns(&self, cgroup: &str, netns: Option<u64>) {
+            self.open_netns_by_cgroup
                 .lock()
                 .unwrap()
                 .insert(cgroup.to_string(), netns);
@@ -806,15 +852,30 @@ mod tests {
             }
         }
 
-        fn open_udp_capture(&self, target: &PodCaptureTarget) -> Option<OpenedUdpCapture> {
-            let netns = *self
-                .netns_by_cgroup
+        fn open_udp_capture(
+            &self,
+            target: &PodCaptureTarget,
+            expected_netns: u64,
+        ) -> Option<OpenedUdpCapture> {
+            let open_netns = self
+                .open_netns_by_cgroup
                 .lock()
                 .unwrap()
                 .get(&target.cgroup_path)
-                .unwrap()
-                .as_ref()
+                .copied();
+            let netns = open_netns
+                .unwrap_or_else(|| {
+                    *self
+                        .netns_by_cgroup
+                        .lock()
+                        .unwrap()
+                        .get(&target.cgroup_path)
+                        .unwrap()
+                })
                 .unwrap();
+            if netns != expected_netns {
+                return None;
+            }
             if self.fail_open.lock().unwrap().contains(&netns) {
                 return None;
             }
@@ -979,6 +1040,33 @@ mod tests {
         mgr.backend.set_fail_open(100, false);
         assert_eq!(mgr.reconcile_once().await, 1);
         assert_eq!(*opened.lock().unwrap(), vec![100]);
+    }
+
+    #[tokio::test]
+    async fn opened_netns_mismatch_skips_stale_key_and_retries() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        backend.set_open_netns("/cg/a", Some(200));
+        let opened = backend.opened.clone();
+        let mut mgr = manager(source, backend);
+
+        assert_eq!(
+            mgr.reconcile_once().await,
+            0,
+            "a producer must not be marked active under a stale reconciled inode"
+        );
+        assert!(
+            opened.lock().unwrap().is_empty(),
+            "mismatched second lookup must not install rules"
+        );
+
+        mgr.backend.set_netns("/cg/a", Some(200));
+        assert_eq!(mgr.reconcile_once().await, 1);
+        assert_eq!(
+            *opened.lock().unwrap(),
+            vec![200],
+            "the next consistent reconcile opens under the actual netns"
+        );
     }
 
     #[tokio::test]
