@@ -1369,6 +1369,114 @@ fn port_subset_ejection_cap_denominator_is_subset_intersect_port() {
 // candidate ejected — wrongly returning `None`.
 
 #[test]
+fn upstream_retry_excludes_previous_target_before_ejection_cap() {
+    // No-subset retry path: all three targets are passive-ejected, cap = 34%,
+    // and the retry excludes the oldest ejected target. Capping before the
+    // exclusion spends the readmission on the excluded target and leaves no
+    // retry candidate; excluding first readmits host-b.
+    let targets = vec![
+        target("host-a", 8080),
+        target("host-b", 8080),
+        target("host-c", 8080),
+    ];
+    let mut upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        targets.clone(),
+        HashMap::new(),
+    );
+    upstream.health_checks = Some(HealthCheckConfig {
+        active: None,
+        passive: Some(PassiveHealthCheck {
+            unhealthy_threshold: 1,
+            max_ejection_percent: Some(34),
+            ..PassiveHealthCheck::default()
+        }),
+    });
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let health = passive_ctx_ejecting(
+        &active_unhealthy,
+        &[&targets[0], &targets[1], &targets[2]],
+        Some(34),
+    );
+
+    let retry = LoadBalancerCache::select_next_target_from(
+        &snapshot,
+        "u1",
+        "retry",
+        &targets[0],
+        Some(&health),
+    )
+    .expect("upstream retry should re-admit a remaining candidate after exclusion");
+
+    assert_eq!(retry.host, "host-b");
+    assert_ne!(retry.host, "host-a");
+}
+
+#[test]
+fn port_retry_excludes_previous_target_before_ejection_cap() {
+    // Same bug shape on the port-only retry path. The port override owns the
+    // passive cap; retry must exclude before sizing that port candidate pool.
+    let mut port_overrides = HashMap::new();
+    port_overrides.insert(
+        8080,
+        UpstreamPortOverride {
+            passive_health_check: Some(PassiveHealthCheck {
+                unhealthy_threshold: 1,
+                max_ejection_percent: Some(34),
+                ..PassiveHealthCheck::default()
+            }),
+            ..Default::default()
+        },
+    );
+
+    let targets = vec![
+        target("port-a", 8080),
+        target("port-b", 8080),
+        target("port-c", 8080),
+        target("other-port", 9090),
+    ];
+    let upstream = upstream_with_overrides(
+        LoadBalancerAlgorithm::RoundRobin,
+        targets.clone(),
+        port_overrides,
+    );
+    let config = GatewayConfig {
+        upstreams: vec![upstream],
+        ..GatewayConfig::default()
+    };
+    let cache = LoadBalancerCache::new(&config);
+    let snapshot = cache.load();
+
+    let active_unhealthy: DashMap<String, u64> = DashMap::new();
+    let health = passive_ctx_ejecting(
+        &active_unhealthy,
+        &[&targets[0], &targets[1], &targets[2]],
+        Some(34),
+    );
+
+    let retry = LoadBalancerCache::select_next_target_for_port_from(
+        &snapshot,
+        "u1",
+        "retry",
+        8080,
+        &targets[0],
+        Some(&health),
+    )
+    .expect("port retry should re-admit a remaining same-port candidate after exclusion");
+
+    assert_eq!(retry.host, "port-b");
+    assert_eq!(retry.port, 8080);
+    assert_ne!(retry.host, "port-a");
+}
+
+#[test]
 fn subset_retry_excludes_previous_target_before_ejection_cap() {
     // Subset 'v1' = 3 tagged targets [a, b, c], ALL passive-ejected (a oldest,
     // then b, then c), subset cap = 34%. The retry excludes 'v1-a' — the

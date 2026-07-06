@@ -3654,17 +3654,23 @@ impl LoadBalancer {
             return self.select_excluding_vec_fallback(ctx_key, exclude_idx, health);
         }
 
-        // Build healthy bitset excluding the specified target
-        let mut healthy = self.compute_health_bitset(health);
+        // Drop the excluded (previously tried) target from the candidate mask
+        // BEFORE sizing the passive ejection cap. Otherwise a readmission
+        // budget can be spent on the excluded target, and clearing it afterward
+        // leaves viable retry candidates ejected.
+        let scope = HealthBitset::all(n);
+        let mut candidate_mask = scope;
         if let Some(ei) = exclude_idx {
-            healthy.clear(ei);
+            candidate_mask.clear(ei);
         }
+        if candidate_mask.is_empty() {
+            return None;
+        }
+        let healthy = self.compute_health_bitset_for_mask(health, &candidate_mask);
 
         // Strict locality must decide local presence from the unexcluded lane:
         // excluding a previously tried local target for retry must not make a
         // local-containing upstream look remote-only and widen to remote.
-        let scope = HealthBitset::all(n);
-
         if healthy.is_empty() {
             return None;
         }
@@ -3703,16 +3709,18 @@ impl LoadBalancer {
             );
         }
 
-        let mut healthy =
-            self.compute_health_bitset_for_indices(health, &port_state.target_indices);
+        let scope = bitset_for_indices(&port_state.target_indices);
+        let mut candidate_mask = scope;
         if let Some(ei) = exclude_idx {
-            healthy.clear(ei);
+            candidate_mask.clear(ei);
         }
+        if candidate_mask.is_empty() {
+            return None;
+        }
+        let healthy = self.compute_health_bitset_for_mask(health, &candidate_mask);
 
         // Strict locality must decide local presence from the unexcluded port
         // lane; retry exclusion only applies to selectable candidates.
-        let scope = bitset_for_indices(&port_state.target_indices);
-
         let port_locality = port_state
             .locality_lb
             .as_ref()
@@ -3882,15 +3890,21 @@ impl LoadBalancer {
         exclude_idx: Option<usize>,
         health: Option<&HealthContext<'_>>,
     ) -> Option<Arc<UpstreamTarget>> {
-        let healthy: Vec<(usize, &Arc<UpstreamTarget>)> = self
-            .healthy_targets_vec(health)
-            .into_iter()
-            .filter(|(i, _)| exclude_idx.is_none_or(|ei| ei != *i))
-            .collect();
-
         // Strict locality uses the unexcluded lane for local-presence decisions;
         // retry exclusion only applies to selectable candidates.
         let scope_indices: Vec<usize> = (0..self.targets.len()).collect();
+        let candidate_indices: Vec<usize> = match exclude_idx {
+            Some(ei) => scope_indices
+                .iter()
+                .copied()
+                .filter(|&idx| idx != ei)
+                .collect(),
+            None => scope_indices.clone(),
+        };
+        if candidate_indices.is_empty() {
+            return None;
+        }
+        let healthy = self.healthy_targets_vec_for_indices(health, &candidate_indices);
         if healthy.is_empty() {
             return None;
         }
@@ -3910,11 +3924,19 @@ impl LoadBalancer {
         // Strict locality uses the unexcluded port lane for local-presence
         // decisions; retry exclusion only applies to selectable candidates.
         let scope_indices: Vec<usize> = port_state.target_indices.clone();
-        let candidates: Vec<(usize, &Arc<UpstreamTarget>)> = self
-            .healthy_targets_vec_for_indices(health, &port_state.target_indices)
-            .into_iter()
-            .filter(|(idx, _)| exclude_idx.is_none_or(|ei| ei != *idx))
-            .collect();
+        let candidate_indices: Vec<usize> = match exclude_idx {
+            Some(ei) => port_state
+                .target_indices
+                .iter()
+                .copied()
+                .filter(|&idx| idx != ei)
+                .collect(),
+            None => scope_indices.clone(),
+        };
+        if candidate_indices.is_empty() {
+            return None;
+        }
+        let candidates = self.healthy_targets_vec_for_indices(health, &candidate_indices);
         if candidates.is_empty() {
             return None;
         }
