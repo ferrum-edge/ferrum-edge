@@ -348,6 +348,7 @@ pub async fn start_mesh_udp_capture_listener(
 /// socket was bound in — only [`MeshUdpCaptureRuntime::reply_socket_factory`]
 /// differs.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_mesh_udp_capture_on_socket(
     frontend_socket: tokio::net::UdpSocket,
     addr: SocketAddr,
@@ -616,6 +617,7 @@ struct CaptureSession {
 /// `false` if it was dropped (no orig-dst, not routable, cap reached, or the
 /// egress channel was full) — exposed for unit testing the keying/cap logic.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn handle_captured_datagram(
     sessions: &std::sync::Arc<
         dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
@@ -980,6 +982,7 @@ fn remove_session_if_owned(
 /// Body of the per-session egress task. Returns when the session ends (client
 /// idle, tunnel closed, or a fail-closed gate tripped). Never panics.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn run_udp_egress_session(
     state: &std::sync::Arc<super::ProxyState>,
     entry: &std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
