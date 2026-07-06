@@ -2554,6 +2554,110 @@ async fn mesh_sd_ambient_topology_bridges_remote_workloads_via_east_west_gateway
 }
 
 #[tokio::test]
+async fn mesh_sd_ambient_mixed_networks_bridge_gatewayed_and_keep_gatewayless_direct() {
+    // The exact mixed-network scenario from issue #2011, in ONE snapshot: a
+    // gateway is declared for network A (west) while network B (east) has no
+    // gateway and no catch-all applies. The west workload must bridge through
+    // its east-west gateway (synthetic identity + dial override) while the
+    // east workload keeps the direct pod-IP flat-network fallback — gateway
+    // authority is judged PER WORKLOAD NETWORK, never snapshot-wide.
+    let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
+    let west_id = "spiffe://west.local/ns/ferrum/sa/api";
+    let east_id = "spiffe://east.local/ns/ferrum/sa/api";
+    let mut svc = mesh_service("api", api_id, 8080);
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(west_id),
+    });
+    svc.workloads.push(WorkloadRef {
+        spiffe_id: mesh_spiffe(east_id),
+    });
+    let mut east_remote = mesh_workload(east_id, "api", "10.8.0.1", 8080);
+    east_remote.remote_provenance = true;
+    east_remote.network = Some("east-network".to_string());
+    east_remote.trust_domain = TrustDomain::new("east.local").expect("trust domain");
+    let mesh = MeshConfig {
+        services: vec![svc],
+        workloads: vec![
+            mesh_workload(api_id, "api", "10.0.0.1", 8080),
+            mesh_remote_west_workload(west_id, 8080),
+            east_remote,
+        ],
+        // Gateway declared for west-network ONLY: no east-network entry and no
+        // catch-all, so east keeps the flat-network compatibility valve.
+        multi_cluster: Some(mesh_west_multi_cluster()),
+        ..MeshConfig::default()
+    };
+
+    let mut targets = mesh_sd_discoverer(mesh, None, MeshSdTopology::Ambient)
+        .discover()
+        .await
+        .expect("discover succeeds");
+    targets.sort_by(|a, b| a.host.cmp(&b.host));
+
+    assert_eq!(
+        targets.len(),
+        3,
+        "one local target, one direct east fallback, one west gateway bridge"
+    );
+
+    // Local workload is unchanged.
+    assert_eq!(targets[0].host, "10.0.0.1");
+    assert!(!targets[0].tags.contains_key("mesh.remote"));
+    assert!(!targets[0].tags.contains_key("mesh.cross_cluster"));
+
+    // Gatewayless east-network workload keeps the direct pod-IP HBONE target.
+    let east = &targets[1];
+    assert_eq!(east.host, "10.8.0.1");
+    assert_eq!(
+        east.tags.get("mesh.remote").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        east.tags.get("mesh.hbone").map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !east.tags.contains_key("mesh.cross_cluster"),
+        "no gateway is declared for east-network: the direct fallback must not \
+         be forced into the gateway-routed shape"
+    );
+    assert!(
+        !east.tags.contains_key("mesh.hbone_dial_host"),
+        "the direct fallback dials the pod address itself, never a gateway"
+    );
+
+    // West-network workload bridges through its declared east-west gateway.
+    let west = &targets[2];
+    assert!(
+        west.host.contains("west-gw.example.com") && west.host.contains("10.9.0.1"),
+        "west target must carry the gateway-scoped synthetic identity, got {:?}",
+        west.host
+    );
+    assert_eq!(
+        west.tags.get("mesh.hbone_dial_host").map(String::as_str),
+        Some("west-gw.example.com")
+    );
+    assert_eq!(
+        west.tags
+            .get("mesh.hbone_authority_host")
+            .map(String::as_str),
+        Some("10.9.0.1")
+    );
+    assert_eq!(
+        west.tags.get("mesh.cross_cluster").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        west.tags.get("mesh.remote").map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !targets.iter().any(|target| target.host == "10.9.0.1"),
+        "the gateway-declared west workload must not also emit a direct pod-IP target"
+    );
+}
+
+#[tokio::test]
 async fn mesh_sd_ambient_gateway_declared_non_first_port_skips_remote_fail_closed() {
     // A gateway-declared Ambient remote workload must not fall back to a direct
     // remote pod dial when the selected port is not bridgeable. The east-west

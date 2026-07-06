@@ -5141,7 +5141,10 @@ fn cross_cluster_hbone_synthetic_host(
     gateway_port: u16,
     pod_addr: &str,
 ) -> String {
-    format!("mesh-xc-hbone|{gateway_host}|{gateway_port}|{pod_addr}")
+    format!(
+        "{}{gateway_host}|{gateway_port}|{pod_addr}",
+        crate::proxy::hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX
+    )
 }
 
 /// Append AMBIENT (HBONE) cross-cluster east-west targets for `service` on
@@ -5606,6 +5609,44 @@ fn select_east_west_gateway_for_network<'a>(
         .east_west_gateways
         .iter()
         .find(|gateway| gateway.network.is_none() && is_candidate(gateway))
+}
+
+/// Whether an east-west gateway declaration makes cross-cluster routing
+/// AUTHORITATIVE for `network` — i.e. the gateway-routed shape must be
+/// attempted and mismatches must fail closed rather than bypass the gateway
+/// with a direct pod dial. True when EITHER holds:
+///
+/// 1. ANY gateway is declared with `gateway.network == network` (exact) —
+///    authoritative even when it is NOT a candidate (SNI/trust-domain miss):
+///    the operator declared how this network is reached, so a non-routable
+///    destination fails closed instead of re-enabling a direct dial; or
+/// 2. [`select_east_west_gateway_for_network`] selects a gateway — which, when
+///    the network has no exact declaration, is an APPLICABLE catch-all
+///    (`network: None` AND an SNI/trust-domain candidate). A NON-candidate
+///    catch-all is NOT authoritative: it could never route this destination,
+///    so it does not suppress the flat-network direct fallback.
+///
+/// The gateway mesh-SD bridge uses the NEGATION of this as the Ambient
+/// direct-pod flat-network fallback valve (issue #2011,
+/// `service_discovery::mesh`); keeping the predicate next to the selector
+/// guarantees the fallback rule and the selection precedence can never drift.
+pub(crate) fn east_west_gateway_governs_network(
+    multi_cluster: &crate::modes::mesh::config::MultiClusterConfig,
+    network: Option<&str>,
+    service_fqdn: &str,
+    expected_trust_domain: &crate::identity::spiffe::TrustDomain,
+) -> bool {
+    select_east_west_gateway_for_network(
+        multi_cluster,
+        network,
+        service_fqdn,
+        expected_trust_domain,
+    )
+    .is_some()
+        || multi_cluster
+            .east_west_gateways
+            .iter()
+            .any(|gateway| gateway.network.as_deref() == network)
 }
 
 /// An HTTP-family `/` proxy on the outbound capture listener whose `HttpPool`

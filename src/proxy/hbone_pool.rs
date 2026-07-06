@@ -53,6 +53,16 @@ pub const HBONE_DIAL_HOST_TAG: &str = "mesh.hbone_dial_host";
 /// in-cluster target — `target.host` is then both the identity and the CONNECT
 /// authority host, byte-identical to the pre-cross-cluster behavior.
 pub const HBONE_AUTHORITY_HOST_TAG: &str = "mesh.hbone_authority_host";
+/// Prefix of the SCOPED SYNTHETIC `UpstreamTarget.host` minted for AMBIENT
+/// CROSS-CLUSTER HBONE targets (see [`HBONE_AUTHORITY_HOST_TAG`]). One shared
+/// constant on purpose: the mesh materializer MINTS the synthetic host with it
+/// (`modes::mesh::cross_cluster_hbone_synthetic_host`) and SD target validation
+/// RECOGNIZES it (`service_discovery::is_synthetic_cross_cluster_hbone_target`)
+/// so it can validate the real dial/authority hosts instead of the synthetic
+/// identity — if the two strings drifted, every discovered cross-cluster target
+/// would fail real-hostname validation and be silently dropped (remote failover
+/// vanishes fail-closed).
+pub const HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX: &str = "mesh-xc-hbone|";
 /// Optional tag overriding the server SVID the HBONE mTLS handshake pins. This
 /// is used when the peer is a waypoint/relay identity rather than the workload
 /// identity carried in [`MESH_SPIFFE_ID_TAG`].

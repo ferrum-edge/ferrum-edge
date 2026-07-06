@@ -395,7 +395,10 @@ impl MeshServiceDiscoverer {
     /// exact-network gateway declaration exists, or an applicable catch-all
     /// gateway exists, the provider must attempt the gateway-routed shape and
     /// fail closed on port/targetPort or gateway-candidate mismatches instead of
-    /// bypassing the gateway with a direct pod dial.
+    /// bypassing the gateway with a direct pod dial. The predicate is the
+    /// negation of `crate::modes::mesh::east_west_gateway_governs_network`,
+    /// which lives next to the bridge's gateway selector so the two rules can
+    /// never drift.
     fn ambient_direct_remote_fallback_allowed(
         &self,
         multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
@@ -406,41 +409,19 @@ impl MeshServiceDiscoverer {
             return true;
         };
 
+        // Same FQDN construction as the shared cross-cluster core, so this
+        // valve and the bridge's gateway selection judge the same SNI.
         let cluster_domain = self.cluster_domain.trim_matches('.');
         let service_fqdn = format!(
             "{}.{}.svc.{cluster_domain}",
             service.name, service.namespace
         );
-        let fqdn = [service_fqdn];
-        let network = workload.network.as_deref();
-        let is_candidate = |gateway: &crate::modes::mesh::config::EastWestGateway| {
-            crate::config::types::hosts_overlap(&gateway.sni_hosts, &fqdn)
-                && gateway
-                    .trust_domain
-                    .as_ref()
-                    .is_none_or(|td| td == &workload.trust_domain)
-        };
-
-        if multi_cluster
-            .east_west_gateways
-            .iter()
-            .any(|gateway| gateway.network.as_deref() == network && is_candidate(gateway))
-        {
-            return false;
-        }
-
-        let network_has_gateway = multi_cluster
-            .east_west_gateways
-            .iter()
-            .any(|gateway| gateway.network.as_deref() == network);
-        if network_has_gateway {
-            return false;
-        }
-
-        !multi_cluster
-            .east_west_gateways
-            .iter()
-            .any(|gateway| gateway.network.is_none() && is_candidate(gateway))
+        !crate::modes::mesh::east_west_gateway_governs_network(
+            multi_cluster,
+            workload.network.as_deref(),
+            &service_fqdn,
+            &workload.trust_domain,
+        )
     }
 
     /// Bridge Ambient REMOTE workloads to per-pod HBONE east-west gateway

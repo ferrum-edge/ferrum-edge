@@ -757,7 +757,9 @@ fn validate_discovered_real_host(
 }
 
 fn is_synthetic_cross_cluster_hbone_target(target: &UpstreamTarget) -> bool {
-    target.host.starts_with("mesh-xc-hbone|")
+    target
+        .host
+        .starts_with(crate::proxy::hbone_pool::HBONE_CROSS_CLUSTER_SYNTHETIC_HOST_PREFIX)
         && crate::proxy::hbone_pool::target_hbone_enabled(target)
         && crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
         && target
