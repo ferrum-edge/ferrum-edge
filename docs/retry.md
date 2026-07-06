@@ -160,6 +160,8 @@ The default backoff strategy (when `backoff` is not specified) is `!fixed { dela
 
 When a proxy has both `retry` and `upstream_id` configured, retries automatically select a **different target** from the upstream on each attempt. The retry loop calls `select_next_target()` with the previous target excluded, maximizing the chance of reaching a healthy backend.
 
+Rotation honors health state across **all protocols**: candidates that are actively unhealthy or passive-ejected (the `maxEjectionPercent` cap is evaluated against the post-exclusion candidate pool) are skipped. When every remaining candidate is unhealthy or ejected, rotation returns no alternate rather than synthesizing a dial to a known-unhealthy target — HTTP-family retries then re-attempt the previously tried target, and TCP `retry_on_connect_failure` rotation stops looking for an alternate.
+
 ```yaml
 proxies:
   - id: "my-api"
