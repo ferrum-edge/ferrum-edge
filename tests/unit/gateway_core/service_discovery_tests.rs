@@ -2274,12 +2274,12 @@ async fn mesh_sd_sidecar_remote_workloads_without_matching_gateway_skip_fail_clo
 }
 
 #[tokio::test]
-async fn mesh_sd_sidecar_remote_workloads_on_non_first_port_skip_fail_closed() {
-    // The east-west model routes a service-FQDN SNI to only the FIRST declared
-    // service port on the destination gateway (SNI carries no port). An
-    // upstream that selected a NON-first port cannot be bridged — the gateway
-    // would forward its SNI to the first port's backend, silently misrouting —
-    // so remote workloads stay skipped fail-closed for that upstream.
+async fn mesh_sd_sidecar_remote_workloads_on_non_first_port_bridge_with_alias() {
+    // MULTI-PORT east-west (issue #2010 phase 3): the SD bridge now bridges a
+    // NON-first HTTP-family selected port too. The destination gateway
+    // auto-materializes a per-port passthrough proxy on the `p<port>.<fqdn>` SNI
+    // alias, so a remote workload selected on port 81 is bridged with
+    // `mesh.eastwest_sni = p81.api.ferrum.svc.cluster.local`.
     let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
     let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
     let mut svc = mesh_service_with_ports(
@@ -2322,14 +2322,29 @@ async fn mesh_sd_sidecar_remote_workloads_on_non_first_port_skip_fail_closed() {
         .await
         .expect("discover succeeds");
 
+    // Local target (10.0.0.1:81) + one east-west gateway target for the remote.
     assert_eq!(
         targets.len(),
-        1,
-        "a non-first selected port must not emit a cross-cluster gateway target"
+        2,
+        "a non-first HTTP port now bridges the remote workload east-west, got {:?}",
+        targets
+            .iter()
+            .map(|t| (&t.host, t.port))
+            .collect::<Vec<_>>()
     );
-    assert_eq!(targets[0].host, "10.0.0.1");
-    assert_eq!(targets[0].port, 81);
-    assert!(!targets[0].tags.contains_key("mesh.cross_cluster"));
+    let cross = targets
+        .iter()
+        .find(|t| t.tags.contains_key("mesh.cross_cluster"))
+        .expect("a cross-cluster gateway target must be emitted for the non-first port");
+    assert_eq!(
+        cross.tags.get("mesh.eastwest_sni").map(String::as_str),
+        Some("p81.api.ferrum.svc.cluster.local"),
+        "the non-first port routes on the p<port> SNI alias"
+    );
+    assert!(
+        targets.iter().any(|t| t.host == "10.0.0.1" && t.port == 81),
+        "the local workload target is still present"
+    );
 }
 
 #[tokio::test]
@@ -2707,11 +2722,11 @@ async fn mesh_sd_ambient_mixed_networks_bridge_gatewayed_and_keep_gatewayless_di
 }
 
 #[tokio::test]
-async fn mesh_sd_ambient_gateway_declared_non_first_port_skips_remote_fail_closed() {
-    // A gateway-declared Ambient remote workload must not fall back to a direct
-    // remote pod dial when the selected port is not bridgeable. The east-west
-    // gateway routes the service FQDN SNI to the first declared service port
-    // only, so non-first remote targets are skipped fail-closed.
+async fn mesh_sd_ambient_gateway_declared_non_first_port_bridges_with_alias() {
+    // MULTI-PORT east-west (issue #2010 phase 3): a gateway-declared Ambient
+    // remote workload selected on a NON-first HTTP-family port is now bridged to a
+    // per-pod HBONE east-west target on the `p<port>.<fqdn>` SNI alias — NOT a
+    // direct remote pod dial.
     let api_id = "spiffe://cluster.local/ns/ferrum/sa/api";
     let remote_id = "spiffe://west.local/ns/ferrum/sa/api";
     let mut svc = mesh_service_with_ports(
@@ -2754,13 +2769,32 @@ async fn mesh_sd_ambient_gateway_declared_non_first_port_skips_remote_fail_close
         .await
         .expect("discover succeeds");
 
+    // Local target (10.0.0.1:81) + one per-pod east-west HBONE target (synthetic
+    // host) for the remote, on the p81 alias.
     assert_eq!(
         targets.len(),
-        1,
-        "gateway-declared non-first remote target must not fall back to direct pod dial"
+        2,
+        "a non-first HTTP port now bridges the remote workload east-west, got {:?}",
+        targets
+            .iter()
+            .map(|t| (&t.host, t.port))
+            .collect::<Vec<_>>()
     );
-    assert_eq!(targets[0].host, "10.0.0.1");
-    assert_eq!(targets[0].port, 81);
-    assert!(!targets[0].tags.contains_key("mesh.cross_cluster"));
-    assert!(!targets[0].tags.contains_key("mesh.remote"));
+    let cross = targets
+        .iter()
+        .find(|t| t.tags.contains_key("mesh.cross_cluster"))
+        .expect("a per-pod cross-cluster HBONE target must be emitted for the non-first port");
+    assert_eq!(
+        cross.tags.get("mesh.eastwest_sni").map(String::as_str),
+        Some("p81.api.ferrum.svc.cluster.local"),
+        "the non-first port routes on the p<port> SNI alias"
+    );
+    assert_eq!(
+        cross.tags.get("mesh.remote").map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        !targets.iter().any(|t| t.host == "10.9.0.1"),
+        "the remote pod must be reached via the east-west gateway, never a direct pod dial"
+    );
 }

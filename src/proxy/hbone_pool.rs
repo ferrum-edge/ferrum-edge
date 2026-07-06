@@ -147,6 +147,43 @@ pub enum HbonePoolError {
          cannot open a WebSocket Extended CONNECT (RFC 8441) stream"
     )]
     ExtendedConnectUnsupported { authority: String },
+    /// Cross-cluster east-west Ambient target with a missing / empty
+    /// `mesh.eastwest_sni` tag — the destination-FQDN SNI the remote gateway's
+    /// passthrough routes on is mandatory (never dial the gateway IP as SNI).
+    /// A PRE-WIRE fail-closed reject: no gateway is dialed. Mirrors the Sidecar
+    /// `MeshMtlsDialError::MissingCrossClusterSni` so the WebSocket egress path
+    /// can box a TYPED error that `classify_boxed_setup_error` recognizes as
+    /// pre-wire (issue #2010 codex).
+    #[error(
+        "cross-cluster Ambient HBONE target missing mesh.eastwest_sni \
+         (fail closed, never dial the gateway address as SNI)"
+    )]
+    MissingCrossClusterSni,
+    /// Cross-cluster east-west Ambient target with a missing / empty /
+    /// unparseable `mesh.trust_domain` tag — the remote trust domain verification
+    /// is scoped to is mandatory (never fall back to any-federated verification).
+    /// A PRE-WIRE fail-closed reject: no gateway is dialed.
+    #[error(
+        "cross-cluster Ambient HBONE target missing mesh.trust_domain \
+         (fail closed, never any-federated verification)"
+    )]
+    MissingCrossClusterTrustDomain,
+    /// Cross-cluster east-west Ambient target with a missing / empty
+    /// `mesh.hbone_authority_host` tag. For a cross-cluster target `target.host`
+    /// is the SCOPED SYNTHETIC identity (`mesh-xc-hbone|...`), so
+    /// `target_hbone_authority_host()` would fall back to that synthetic key as
+    /// the inner CONNECT `:authority` — establishing the east-west TLS/H2
+    /// connection first and only failing LATER while building the CONNECT to the
+    /// synthetic authority. This variant rejects it PRE-WIRE (before any dial),
+    /// as the fail-closed invariant requires, so no gateway TLS/H2 connection is
+    /// ever opened for a corrupted cross-cluster target. Mirrors the
+    /// `MissingCrossClusterSni` / `MissingCrossClusterTrustDomain` pre-wire
+    /// rejects (issue #2010 codex).
+    #[error(
+        "cross-cluster Ambient HBONE target missing mesh.hbone_authority_host \
+         (fail closed, never dial to the synthetic identity as CONNECT authority)"
+    )]
+    MissingCrossClusterAuthorityHost,
 }
 
 impl HbonePoolError {
@@ -157,7 +194,10 @@ impl HbonePoolError {
             | Self::TlsConfig(_)
             | Self::InvalidDialHostTag { .. }
             | Self::InvalidAuthorityHostTag { .. }
-            | Self::InvalidPeerSpiffeTag { .. } => ErrorClass::ConnectionPoolError,
+            | Self::InvalidPeerSpiffeTag { .. }
+            | Self::MissingCrossClusterSni
+            | Self::MissingCrossClusterTrustDomain
+            | Self::MissingCrossClusterAuthorityHost => ErrorClass::ConnectionPoolError,
             Self::DnsLookup { .. } | Self::InvalidServerName { .. } => ErrorClass::DnsLookupError,
             Self::ConnectTimeout { .. } => ErrorClass::ConnectionTimeout,
             Self::Connect { source, .. } => {
@@ -662,6 +702,7 @@ impl HboneConnectionPool {
     /// current SVID. The dial PINS `expected_peer`; a missing gateway SVID fails
     /// closed before the dial.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn get_ws_byte_tunnel(
         &self,
         proxy: &Proxy,
@@ -671,8 +712,24 @@ impl HboneConnectionPool {
         app_port: u16,
         app_policy_port: u16,
         expected_peer: Option<&crate::identity::SpiffeId>,
+        // CROSS-CLUSTER east-west (issue #2010): `expected_trust_domain` scopes
+        // the peer-cert verifier to a single remote trust domain (`expected_peer =
+        // None`, since the SNI-passthrough gateway LB-picks the destination) and
+        // `sni_override` sets the ClientHello SNI to the destination service FQDN.
+        // Both `None` for the in-cluster byte-tunnel (SNI = dial host, pinned peer).
+        expected_trust_domain: Option<&crate::identity::spiffe::TrustDomain>,
+        sni_override: Option<&str>,
+        // The ASSERTED SOURCE identity to stamp into the HBONE baggage (the W3C
+        // source-identity header the destination's AuthorizationPolicy / telemetry
+        // read). For a WS request forwarded from an authenticated mesh peer this
+        // is the ORIGINAL workload SPIFFE (`ctx.peer_spiffe_id`), so the remote
+        // sees the source workload — not the gateway's own SVID. `None` (the
+        // ambient egress default) falls back to the gateway SVID, exactly like the
+        // HTTP HBONE path (`get_tunnel_via`).
+        asserted_source_identity: Option<&crate::identity::SpiffeId>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         let (source_identity, _fingerprint) = self.current_svid_identity_cached()?;
+        let hbone_source_identity = asserted_source_identity.unwrap_or(&source_identity);
         let pool_config = self.pool_config.for_proxy(proxy);
         // DR keepalive override resolved for the destination's APP port, not
         // the transport `hbone_port`.
@@ -688,16 +745,14 @@ impl HboneConnectionPool {
             dial_host,
             hbone_port,
             expected_peer,
-            // WS-over-HBONE is in-cluster only (cross-cluster WS is a documented
-            // follow-up); no trust-domain scope / SNI override.
-            None,
-            None,
+            expected_trust_domain,
+            sni_override,
             &pool_config,
             keepalive_override,
             None,
         )
         .await?;
-        let baggage = baggage_header_for_source(&source_identity);
+        let baggage = baggage_header_for_source(hbone_source_identity);
         tokio::time::timeout(
             Duration::from_millis(proxy.backend_connect_timeout_ms),
             open_h2_connect_stream(sender, app_host, app_port, Some(&baggage), Some("hbone")),
@@ -1938,6 +1993,37 @@ pub(crate) fn authority_for_host_port(host: &str, port: u16) -> String {
         format!("[{host}]:{port}")
     } else {
         format!("{host}:{port}")
+    }
+}
+
+/// The inner HTTP/1.1 WebSocket handshake `Host` for an Ambient HBONE WS egress
+/// spoken THROUGH the byte tunnel.
+///
+/// When the route preserves the client Host (`preserve_host_header`) and the
+/// client actually sent a non-empty Host, that Host rides through (mirroring the
+/// HTTP HBONE relay, which forwards the client Host). Otherwise the fallback is
+/// `authority_for_host_port(app_host, port)` — the REAL destination pod addr
+/// (`mesh.hbone_authority_host`), NOT `target.host`.
+///
+/// This distinction is load-bearing for CROSS-CLUSTER targets: their
+/// `target.host` is the scoped synthetic `mesh-xc-hbone|...` identity, which is
+/// not a valid URI authority. Falling back to it would make
+/// `ws://{target.host}...` an invalid WS URI that `into_client_request()`
+/// rejects AFTER the tunnel is already established (issue #2010 codex). For
+/// IN-CLUSTER targets `app_host == target.host` (the authority-host tag is
+/// absent), so the fallback is byte-identical to the pre-fix behavior. Mirrors
+/// `proxy_to_backend_hbone`, whose backend `Host` header is
+/// `authority_for_host_port(app_host, port)` when the client Host is not
+/// preserved.
+pub fn hbone_ws_inner_host(
+    client_host: Option<&str>,
+    preserve_host_header: bool,
+    app_host: &str,
+    port: u16,
+) -> String {
+    match client_host {
+        Some(host) if preserve_host_header && !host.is_empty() => host.to_string(),
+        _ => authority_for_host_port(app_host, port),
     }
 }
 
