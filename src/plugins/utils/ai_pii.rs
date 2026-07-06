@@ -34,19 +34,6 @@ pub fn builtin_pii_pattern(name: &str) -> Option<&'static str> {
     }
 }
 
-/// The names of every built-in PII pattern, in a stable order. Useful for
-/// documentation, validation, and "all built-ins" config shortcuts.
-pub const BUILTIN_PII_PATTERN_NAMES: &[&str] = &[
-    "ssn",
-    "credit_card",
-    "email",
-    "phone_us",
-    "api_key",
-    "aws_key",
-    "ip_address",
-    "iban",
-];
-
 struct CompiledPattern {
     name: String,
     regex: Regex,
@@ -54,14 +41,6 @@ struct CompiledPattern {
     /// once so redaction does not re-render per call. Used verbatim (no
     /// `$`-expansion) in non-hashing mode.
     placeholder: String,
-}
-
-/// Outcome of a redaction pass.
-pub struct RedactionOutcome {
-    /// The redacted text (equal to the input when nothing matched).
-    pub text: String,
-    /// Number of individual PII spans that were replaced.
-    pub matches: usize,
 }
 
 /// A compiled set of PII patterns plus a redaction policy.
@@ -132,25 +111,14 @@ impl PiiRedactor {
         })
     }
 
-    /// Whether any patterns are configured. A redactor with no patterns is a
-    /// pass-through.
-    pub fn has_patterns(&self) -> bool {
-        !self.patterns.is_empty()
-    }
-
-    /// Redact every PII span in `text`. Returns the input unchanged (with a
-    /// zero match count) when nothing matches, so the common no-PII path is a
-    /// single `RegexSet` scan.
-    pub fn redact(&self, text: &str) -> RedactionOutcome {
+    /// Redact every PII span in `text`. Returns the input unchanged when nothing
+    /// matches, so the common no-PII path is a single `RegexSet` scan.
+    pub fn redact(&self, text: &str) -> String {
         if self.patterns.is_empty() || !self.detection_set.is_match(text) {
-            return RedactionOutcome {
-                text: text.to_string(),
-                matches: 0,
-            };
+            return text.to_string();
         }
 
         let mut result = text.to_string();
-        let mut matches = 0usize;
         for pattern in &self.patterns {
             let hash_values = self.hash_values;
             let name = pattern.name.as_str();
@@ -158,7 +126,6 @@ impl PiiRedactor {
             let replaced = pattern
                 .regex
                 .replace_all(&result, |caps: &regex::Captures| {
-                    matches += 1;
                     if hash_values {
                         // Never emit the raw matched value — only a stable hash
                         // prefix so identical secrets remain correlatable.
@@ -174,10 +141,7 @@ impl PiiRedactor {
             result = replaced;
         }
 
-        RedactionOutcome {
-            text: result,
-            matches,
-        }
+        result
     }
 }
 

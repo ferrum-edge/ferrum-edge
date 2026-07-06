@@ -156,14 +156,17 @@ async fn name_priority_and_protocols() {
 
 #[tokio::test]
 async fn config_must_be_object() {
-    let err = AiTranscriptAudit::new(&json!("nope"), loopback_http_client()).unwrap_err();
+    let err = AiTranscriptAudit::new(&json!("nope"), loopback_http_client())
+        .err()
+        .expect("expected config rejection");
     assert!(err.contains("must be an object"), "got: {err}");
 }
 
 #[tokio::test]
 async fn sink_is_required() {
     let err = AiTranscriptAudit::new(&json!({ "mode": "redacted_body" }), loopback_http_client())
-        .unwrap_err();
+        .err()
+        .expect("expected config rejection");
     assert!(
         err.contains("'sink' configuration is required"),
         "got: {err}"
@@ -176,7 +179,9 @@ async fn full_body_requires_explicit_opt_in() {
         "https://audit.example.com/x",
         json!({ "mode": "full_body" }),
     );
-    let err = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap_err();
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .err()
+        .expect("expected config rejection");
     assert!(err.contains("allow_full_body"), "got: {err}");
 
     // With the opt-in it constructs.
@@ -193,7 +198,9 @@ async fn invalid_mode_rejected() {
         "https://audit.example.com/x",
         json!({ "mode": "everything" }),
     );
-    let err = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap_err();
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .err()
+        .expect("expected config rejection");
     assert!(err.contains("'mode' must be one of"), "got: {err}");
 }
 
@@ -203,7 +210,9 @@ async fn all_captures_disabled_rejected() {
         "https://audit.example.com/x",
         json!({ "capture": { "request": false, "response": false, "streaming_response": false } }),
     );
-    let err = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap_err();
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .err()
+        .expect("expected config rejection");
     assert!(err.contains("at least one of"), "got: {err}");
 }
 
@@ -213,7 +222,9 @@ async fn sampling_rate_out_of_range_rejected() {
         "https://audit.example.com/x",
         json!({ "sampling": { "rate": 1.5 } }),
     );
-    let err = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap_err();
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .err()
+        .expect("expected config rejection");
     assert!(err.contains("sampling.rate"), "got: {err}");
 }
 
@@ -223,7 +234,9 @@ async fn zero_limit_rejected() {
         "https://audit.example.com/x",
         json!({ "limits": { "max_request_bytes": 0 } }),
     );
-    let err = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap_err();
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .err()
+        .expect("expected config rejection");
     assert!(err.contains("max_request_bytes"), "got: {err}");
 }
 
@@ -232,7 +245,9 @@ async fn invalid_on_buffer_full_rejected() {
     let config = json!({
         "sink": { "type": "http", "endpoint_url": "https://audit.example.com/x", "on_buffer_full": "explode" }
     });
-    let err = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap_err();
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .err()
+        .expect("expected config rejection");
     assert!(err.contains("on_buffer_full"), "got: {err}");
 }
 
@@ -242,7 +257,9 @@ async fn invalid_custom_regex_rejected() {
         "https://audit.example.com/x",
         json!({ "redaction": { "custom_patterns": [{ "name": "bad", "regex": "([" }] } }),
     );
-    let err = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap_err();
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .err()
+        .expect("expected config rejection");
     assert!(err.contains("custom redaction pattern"), "got: {err}");
 }
 
@@ -252,7 +269,9 @@ async fn unknown_builtin_pattern_rejected() {
         "https://audit.example.com/x",
         json!({ "redaction": { "builtins": ["not_a_real_pattern"] } }),
     );
-    let err = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap_err();
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .err()
+        .expect("expected config rejection");
     assert!(
         err.contains("unknown built-in redaction pattern"),
         "got: {err}"
@@ -264,7 +283,9 @@ async fn non_http_sink_scheme_rejected() {
     let config = json!({
         "sink": { "type": "http", "endpoint_url": "ftp://audit.example.com/x" }
     });
-    let err = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap_err();
+    let err = AiTranscriptAudit::new(&config, loopback_http_client())
+        .err()
+        .expect("expected config rejection");
     assert!(err.contains("http:// or https://"), "got: {err}");
 }
 

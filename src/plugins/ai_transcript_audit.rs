@@ -1221,7 +1221,7 @@ fn shape_bytes(
     let capped = &raw[..raw.len().min(max_bytes)];
     let text = String::from_utf8_lossy(capped);
     let shaped = if mode.redacts_body() {
-        redactor.redact(&text).text
+        redactor.redact(&text)
     } else {
         text.into_owned()
     };
