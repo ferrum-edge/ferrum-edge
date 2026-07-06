@@ -1,10 +1,17 @@
 name: Prune Stale PRs and Branches
 
 # SAFETY NOTES:
-# - This workflow ONLY deletes branches, never tags
-# - Protected branches (main, master, develop, release/*) are always skipped
-# - Tags like v1.0.0, release-2024, etc. are NEVER affected by this workflow
-# - Only remote branches associated with merged/closed PRs are removed
+# - This workflow ONLY deletes branches, never tags. Deletions target the
+#   explicit `refs/heads/<branch>` ref, so a same-named tag can never be hit.
+# - Protected branches (main, master, develop, release/*) are always skipped.
+# - A branch that is the head of any OPEN PR is always skipped (branch-reuse guard).
+# - Only remote branches in THIS repo (forks excluded) are considered.
+# - Coverage rule: `gh pr list` defaults to only 30 results. Every call MUST pass
+#   `--limit "$PR_LIST_LIMIT"`, otherwise older PRs are silently skipped and their
+#   branches linger forever. PR_LIST_LIMIT must stay above the repo's total PR count.
+# - Policy: merged-PR branches are deleted immediately; closed-but-unmerged PR
+#   branches are deleted once the PR has been closed for `days_stale` days (grace
+#   window so an accidentally-closed PR's branch can still be reopened/reused).
 
 on:
   schedule:
@@ -20,7 +27,7 @@ on:
           - 'true'
           - 'false'
       days_stale:
-        description: 'Days after which a closed PR is considered stale'
+        description: 'Days a closed (unmerged) PR must be closed before its branch is pruned (0 = immediate)'
         required: false
         default: '30'
         type: string
@@ -28,6 +35,11 @@ on:
 permissions:
   contents: write
   pull-requests: read
+
+env:
+  # Must exceed the repo's total PR count. gh paginates up to this value; the
+  # default of 30 would leave every older PR's branch un-pruned.
+  PR_LIST_LIMIT: '10000'
 
 jobs:
   prune-merged-branches:
@@ -43,63 +55,70 @@ jobs:
       - name: Delete merged PR branches
         id: delete_merged
         run: |
+          set -euo pipefail
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
           echo "Dry run mode: $DRY_RUN"
           REPO_OWNER="${GITHUB_REPOSITORY%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          
-          # Get merged/closed PRs whose head repo is this repository (exclude forks)
-          MERGED_PRS=$(gh pr list --state merged --json headRefName,headRepositoryOwner,headRepository --jq "map(select(.headRepositoryOwner.login == \"$REPO_OWNER\" and .headRepository.name == \"$REPO_NAME\")) | .[].headRefName")
-          CLOSED_PRS=$(gh pr list --state closed --json headRefName,headRepositoryOwner,headRepository --jq "map(select(.headRepositoryOwner.login == \"$REPO_OWNER\" and .headRepository.name == \"$REPO_NAME\")) | .[].headRefName")
-          
-          # Combine and remove duplicates
-          ALL_PR_BRANCHES=$(echo -e "$MERGED_PRS\n$CLOSED_PRS" | sort -u)
-          
+
+          # Head branches of MERGED PRs whose head repo is this repository (exclude forks).
+          # --limit is mandatory (gh defaults to 30 and would skip older PRs).
+          MERGED_PRS=$(gh pr list --state merged --limit "$PR_LIST_LIMIT" \
+            --json headRefName,headRepositoryOwner,headRepository \
+            --jq "map(select(.headRepositoryOwner.login == \"$REPO_OWNER\" and .headRepository.name == \"$REPO_NAME\")) | .[].headRefName" | sort -u)
+
+          # Never delete a branch that is still the head of an OPEN PR (branch reuse).
+          OPEN_BRANCHES=$(gh pr list --state open --limit "$PR_LIST_LIMIT" \
+            --json headRefName --jq '.[].headRefName' | sort -u)
+
+          # Snapshot every live remote branch once (one network call, not one per branch).
+          LIVE_BRANCHES="$RUNNER_TEMP/live_branches.txt"
+          git ls-remote --heads origin | sed 's#.*refs/heads/##' | sort -u > "$LIVE_BRANCHES"
+
           DELETED_COUNT=0
           SKIPPED_COUNT=0
-          
-          for branch in $ALL_PR_BRANCHES; do
-            # Skip empty lines
+
+          while IFS= read -r branch; do
             [[ -z "$branch" ]] && continue
-            
-            # Extra safety: skip if somehow a tag reference made it here
-            if [[ "$branch" == refs/tags/* ]] || [[ "$branch" == v*.* ]] || [[ "$branch" == release-* ]]; then
-              echo "⏭️ Skipping potential tag: $branch"
-              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
-              continue
-            fi
-            
+
             # Skip protected branches
-            if [[ "$branch" == "main" ]] || [[ "$branch" == "master" ]] || [[ "$branch" == release/* ]] || [[ "$branch" == "develop" ]]; then
+            if [[ "$branch" == "main" || "$branch" == "master" || "$branch" == "develop" || "$branch" == release/* ]]; then
               echo "⏭️ Skipping protected branch: $branch"
               SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
             fi
-            
-            # Check if branch exists remotely
-            if git ls-remote --heads origin "$branch" | grep -q "$branch"; then
+
+            # Skip branches still referenced by an open PR
+            if grep -Fxq "$branch" <<< "$OPEN_BRANCHES"; then
+              echo "⏭️ Skipping branch with an open PR: $branch"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+
+            # Exact-name existence check (no substring/regex false matches)
+            if grep -Fxq "$branch" "$LIVE_BRANCHES"; then
               if [[ "$DRY_RUN" == "true" ]]; then
-                echo "🧪 [DRY RUN] Would delete: $branch"
+                echo "🧪 [DRY RUN] Would delete merged PR branch: $branch"
               else
-                echo "🗑️ Deleting: $branch"
-                git push origin --delete "$branch" || echo "⚠️ Failed to delete $branch"
+                echo "🗑️ Deleting merged PR branch: $branch"
+                git push origin --delete "refs/heads/$branch" || echo "⚠️ Failed to delete $branch"
               fi
               DELETED_COUNT=$((DELETED_COUNT + 1))
             else
               echo "✅ Already deleted: $branch"
             fi
-          done
-          
-          echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
-          echo "skipped_count=$SKIPPED_COUNT" >> $GITHUB_OUTPUT
+          done <<< "$MERGED_PRS"
+
+          echo "deleted_count=$DELETED_COUNT" >> "$GITHUB_OUTPUT"
+          echo "skipped_count=$SKIPPED_COUNT" >> "$GITHUB_OUTPUT"
           echo ""
-          echo "📊 Summary: $DELETED_COUNT branches processed, $SKIPPED_COUNT protected branches skipped"
+          echo "📊 Merged PR branches: $DELETED_COUNT processed, $SKIPPED_COUNT skipped"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   prune-stale-closed-prs:
-    name: Delete branches from stale closed PRs
+    name: Delete branches from stale closed (unmerged) PRs
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -111,47 +130,72 @@ jobs:
       - name: Delete stale closed PR branches
         id: delete_stale
         run: |
+          set -euo pipefail
           DRY_RUN="${{ github.event.inputs.dry_run || 'false' }}"
           DAYS_STALE="${{ github.event.inputs.days_stale || '30' }}"
-          
+
           echo "Dry run mode: $DRY_RUN"
           echo "Stale threshold: $DAYS_STALE days"
           REPO_OWNER="${GITHUB_REPOSITORY%/*}"
           REPO_NAME="${GITHUB_REPOSITORY#*/}"
-          
-          # Calculate cutoff date
-          CUTOFF_DATE=$(date -d "$DAYS_STALE days ago" +%Y-%m-%dT%H:%M:%SZ)
+
+          # Calculate cutoff date (UTC, to match GitHub's Z-suffixed timestamps)
+          CUTOFF_DATE=$(date -u -d "$DAYS_STALE days ago" +%Y-%m-%dT%H:%M:%SZ)
           echo "Cutoff date: $CUTOFF_DATE"
-          
-          # Get closed PRs older than threshold that weren't merged
-          STALE_PRS=$(gh pr list --state closed --json headRefName,number,closedAt,mergedAt,headRepositoryOwner,headRepository --jq "map(select(.mergedAt == null and .closedAt < \"$CUTOFF_DATE\" and .headRepositoryOwner.login == \"$REPO_OWNER\" and .headRepository.name == \"$REPO_NAME\")) | .[].headRefName")
-          
+
+          # Closed-but-UNMERGED PRs in this repo, closed before the cutoff.
+          # --limit is mandatory (gh defaults to 30 and would skip older PRs).
+          # NB: `gh pr list --state closed` returns both CLOSED and MERGED PRs, so
+          # the `mergedAt == null` filter is what isolates the truly-unmerged ones.
+          STALE_PRS=$(gh pr list --state closed --limit "$PR_LIST_LIMIT" \
+            --json headRefName,number,closedAt,mergedAt,headRepositoryOwner,headRepository \
+            --jq "map(select(.mergedAt == null and .closedAt < \"$CUTOFF_DATE\" and .headRepositoryOwner.login == \"$REPO_OWNER\" and .headRepository.name == \"$REPO_NAME\")) | .[].headRefName" | sort -u)
+
+          # Never delete a branch that is still the head of an OPEN PR (branch reuse).
+          OPEN_BRANCHES=$(gh pr list --state open --limit "$PR_LIST_LIMIT" \
+            --json headRefName --jq '.[].headRefName' | sort -u)
+
+          # Snapshot every live remote branch once.
+          LIVE_BRANCHES="$RUNNER_TEMP/live_branches.txt"
+          git ls-remote --heads origin | sed 's#.*refs/heads/##' | sort -u > "$LIVE_BRANCHES"
+
           DELETED_COUNT=0
-          
-          for branch in $STALE_PRS; do
-            # Skip empty lines
+          SKIPPED_COUNT=0
+
+          while IFS= read -r branch; do
             [[ -z "$branch" ]] && continue
-            
+
             # Skip protected branches
-            if [[ "$branch" == "main" ]] || [[ "$branch" == "master" ]] || [[ "$branch" == release/* ]] || [[ "$branch" == "develop" ]]; then
+            if [[ "$branch" == "main" || "$branch" == "master" || "$branch" == "develop" || "$branch" == release/* ]]; then
               echo "⏭️ Skipping protected branch: $branch"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
               continue
             fi
-            
-            if git ls-remote --heads origin "$branch" | grep -q "$branch"; then
+
+            # Skip branches still referenced by an open PR
+            if grep -Fxq "$branch" <<< "$OPEN_BRANCHES"; then
+              echo "⏭️ Skipping branch with an open PR: $branch"
+              SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              continue
+            fi
+
+            if grep -Fxq "$branch" "$LIVE_BRANCHES"; then
               if [[ "$DRY_RUN" == "true" ]]; then
-                echo "🧪 [DRY RUN] Would delete stale PR branch: $branch"
+                echo "🧪 [DRY RUN] Would delete stale closed PR branch: $branch"
               else
-                echo "🗑️ Deleting stale PR branch: $branch"
-                git push origin --delete "$branch" || echo "⚠️ Failed to delete $branch"
+                echo "🗑️ Deleting stale closed PR branch: $branch"
+                git push origin --delete "refs/heads/$branch" || echo "⚠️ Failed to delete $branch"
               fi
               DELETED_COUNT=$((DELETED_COUNT + 1))
+            else
+              echo "✅ Already deleted: $branch"
             fi
-          done
-          
-          echo "deleted_count=$DELETED_COUNT" >> $GITHUB_OUTPUT
+          done <<< "$STALE_PRS"
+
+          echo "deleted_count=$DELETED_COUNT" >> "$GITHUB_OUTPUT"
+          echo "skipped_count=$SKIPPED_COUNT" >> "$GITHUB_OUTPUT"
           echo ""
-          echo "📊 Summary: $DELETED_COUNT stale closed PR branches processed"
+          echo "📊 Stale closed PR branches: $DELETED_COUNT processed, $SKIPPED_COUNT skipped"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
