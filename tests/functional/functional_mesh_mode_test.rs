@@ -4171,6 +4171,509 @@ async fn functional_mesh_sidecar_cross_cluster_egress_rejects_untrusted_client()
     );
 }
 
+// ── Cross-cluster L7 app protocols (Sidecar mesh-mTLS): gRPC + WebSocket ──────
+//
+// The gRPC and WebSocket counterparts of the cross-cluster keystone above
+// (issue #2010). Both ride the SAME three-gateway east-west fixture (client A
+// sidecar → east-west B SNI-passthrough → dest C sidecar, two trust domains,
+// federated bundle) and the SAME cross-cluster mesh-mTLS transport the HTTP
+// keystone proved — the app protocol is a runtime flavor layered on top, so only
+// the C-side backend and the driving request differ. The 3-gateway setup +
+// SVID minting + bind-retry is factored into one fixture helper reusing the
+// `cross_cluster_{dest,east_west,client}_slice` builders (the HTTP driver keeps
+// its own inline copy so this change cannot regress the proven keystone path).
+
+/// A running Sidecar cross-cluster east-west fixture: client A's outbound
+/// capture port plus every child process / control plane / temp dir, so a driver
+/// can drive app requests against `a_outbound_port` then tear it all down.
+struct SidecarCrossClusterFixture {
+    child_a: Child,
+    child_b: Child,
+    child_c: Child,
+    cp_a: MeshCpHandle,
+    cp_b: MeshCpHandle,
+    cp_c: MeshCpHandle,
+    // Held so the temp dirs (SVID material + gateway logs) outlive the run; read
+    // by `logs()` and cleaned up on drop.
+    temp_a: TempDir,
+    temp_b: TempDir,
+    temp_c: TempDir,
+    a_outbound_port: u16,
+}
+
+impl SidecarCrossClusterFixture {
+    /// Combined A/B/C gateway logs (read while the processes are still alive,
+    /// before [`Self::shutdown`]).
+    fn logs(&self) -> String {
+        format!(
+            "--- gateway A (client) ---\n{}\n--- gateway B (east-west) ---\n{}\n\
+             --- gateway C (dest) ---\n{}",
+            captured_output(&self.temp_a),
+            captured_output(&self.temp_b),
+            captured_output(&self.temp_c),
+        )
+    }
+
+    async fn shutdown(mut self) {
+        kill_child(&mut self.child_a);
+        kill_child(&mut self.child_b);
+        kill_child(&mut self.child_c);
+        self.cp_a.shutdown().await;
+        self.cp_b.shutdown().await;
+        self.cp_c.shutdown().await;
+    }
+}
+
+/// Start the three-gateway Sidecar cross-cluster fixture for one attempt, or
+/// return `None` (after cleaning up) on any bind failure so the caller retries
+/// with fresh ports/dirs. `backend_port` is C's already-spawned app backend (its
+/// inbound loopback route targets it, and it drives the client/dest slice service
+/// port), so gRPC / WebSocket / HTTP all share this identical topology.
+async fn try_start_sidecar_cross_cluster_fixture(
+    attempt: u32,
+    client_trusted: bool,
+    backend_port: u16,
+) -> Option<SidecarCrossClusterFixture> {
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+    let c_spiffe = "spiffe://cluster-b.local/ns/ferrum/sa/svc-c";
+    let b_spiffe = "spiffe://cluster-b.local/ns/ferrum/sa/ew-gateway";
+    let trust_label = if client_trusted {
+        "trusted"
+    } else {
+        "untrusted"
+    };
+    let node_a = format!("functional-mesh-xc-l7-{trust_label}-a-{attempt}");
+    let node_b = format!("functional-mesh-xc-l7-{trust_label}-b-{attempt}");
+    let node_c = format!("functional-mesh-xc-l7-{trust_label}-c-{attempt}");
+    let temp_a = TempDir::new().ok()?;
+    let temp_b = TempDir::new().ok()?;
+    let temp_c = TempDir::new().ok()?;
+
+    // Cluster-B CA backs both the east-west gateway B and the dest C; cluster-A
+    // CA backs client A. The untrusted case federates throwaway CAs both ways so
+    // neither side can verify the other (identical shape to the HTTP driver).
+    let (c_svid, b_ca) = mint_cross_cluster_svid(temp_c.path(), "gateway-c", c_spiffe);
+    let b_ca_pem = b_ca.0.clone();
+    let b_svid =
+        mint_cross_cluster_svid_under(temp_b.path(), "gateway-b", b_spiffe, &b_ca_pem, &b_ca.1);
+    let (a_svid, a_ca_pem) = {
+        let (svid, ca) = mint_cross_cluster_svid(temp_a.path(), "gateway-a", a_spiffe);
+        (svid, ca.0)
+    };
+    let a_ca_for_c_federation = if client_trusted {
+        a_ca_pem.clone()
+    } else {
+        mint_cross_cluster_svid(
+            temp_c.path(),
+            "throwaway-a",
+            "spiffe://cluster.local/ns/ferrum/sa/nobody",
+        )
+        .1
+        .0
+    };
+    let b_ca_for_a_federation = if client_trusted {
+        b_ca_pem.clone()
+    } else {
+        mint_cross_cluster_svid(
+            temp_a.path(),
+            "throwaway-b",
+            "spiffe://cluster-b.local/ns/ferrum/sa/nobody",
+        )
+        .1
+        .0
+    };
+
+    let ports_a = reserve_mesh_ports().await;
+    let ports_b = reserve_mesh_ports().await;
+    let ports_c = reserve_mesh_ports().await;
+    let a_outbound_port = ports_a.outbound;
+    let b_east_west_port = ports_b.east_west;
+    let c_inbound_port = ports_c.inbound;
+
+    let cp_c = start_static_mesh_cp(cross_cluster_dest_slice(
+        &node_c,
+        c_spiffe,
+        backend_port,
+        &b_ca_pem,
+        &a_ca_for_c_federation,
+    ))
+    .await;
+    let cp_b = start_static_mesh_cp(cross_cluster_east_west_slice(
+        &node_b,
+        c_spiffe,
+        c_inbound_port,
+    ))
+    .await;
+    let cp_a = start_static_mesh_cp(cross_cluster_client_slice(
+        &node_a,
+        c_spiffe,
+        backend_port,
+        b_east_west_port,
+        &a_ca_pem,
+        &b_ca_for_a_federation,
+    ))
+    .await;
+
+    // Gateway C (dest): serves svc-c inbound STRICT → the app backend.
+    let mut child_c = spawn_mesh_gateway(
+        &temp_c,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_c.addr,
+            ports: ports_c,
+            node_id: &node_c,
+            config_protocol: "native",
+            topology: "sidecar",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", c_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", c_svid.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", c_svid.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    temp_c
+                        .path()
+                        .join("gateway-c-bundle.pem")
+                        .to_str()
+                        .expect("bundle path utf8")
+                        .to_string(),
+                ),
+            ],
+        },
+    );
+    if !wait_for_tcp_port(c_inbound_port, STARTUP_TIMEOUT).await {
+        kill_child(&mut child_c);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+        cp_c.shutdown().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        return None;
+    }
+
+    // Gateway B (east-west): SNI passthrough → C's inbound.
+    let mut child_b = spawn_mesh_gateway(
+        &temp_b,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_b.addr,
+            ports: ports_b,
+            node_id: &node_b,
+            config_protocol: "native",
+            topology: "east_west_gateway",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", b_svid.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", b_svid.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    temp_b
+                        .path()
+                        .join("gateway-b-bundle.pem")
+                        .to_str()
+                        .expect("bundle path utf8")
+                        .to_string(),
+                ),
+            ],
+        },
+    );
+    if !wait_for_tcp_port(b_east_west_port, STARTUP_TIMEOUT).await {
+        kill_child(&mut child_b);
+        kill_child(&mut child_c);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+        cp_c.shutdown().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        return None;
+    }
+
+    // Gateway A (client): outbound capture → cross-cluster egress route.
+    let mut child_a = spawn_mesh_gateway(
+        &temp_a,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_a.addr,
+            ports: ports_a,
+            node_id: &node_a,
+            config_protocol: "native",
+            topology: "sidecar",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_LOG_LEVEL", "debug".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", a_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", a_svid.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", a_svid.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    temp_a
+                        .path()
+                        .join("gateway-a-bundle.pem")
+                        .to_str()
+                        .expect("bundle path utf8")
+                        .to_string(),
+                ),
+            ],
+        },
+    );
+    if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+        kill_child(&mut child_a);
+        kill_child(&mut child_b);
+        kill_child(&mut child_c);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+        cp_c.shutdown().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        return None;
+    }
+
+    Some(SidecarCrossClusterFixture {
+        child_a,
+        child_b,
+        child_c,
+        cp_a,
+        cp_b,
+        cp_c,
+        temp_a,
+        temp_b,
+        temp_c,
+        a_outbound_port,
+    })
+}
+
+/// Drive one captured native-gRPC request from client gateway A across the
+/// east-west gateway B to the gRPC trailers-echo backend behind dest gateway C
+/// (two trust domains, federated bundle). `converged` is the caller's success
+/// predicate (the positive path polls until it accepts a response; the untrusted
+/// negative passes a predicate that never accepts and asserts the FINAL state).
+async fn drive_cross_cluster_grpc_egress(
+    client_trusted: bool,
+    converged: fn(&GrpcEgressResponse) -> bool,
+) -> Result<(GrpcEgressResponse, String), String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+    let payload = b"ferrum-mesh-xc-grpc-payload";
+    let framed = grpc_framed_payload(payload);
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let backend_port = start_grpc_trailers_echo_backend().await;
+        let Some(fixture) =
+            try_start_sidecar_cross_cluster_fixture(attempt, client_trusted, backend_port).await
+        else {
+            last_failure = format!("attempt {attempt}: cross-cluster fixture never bound");
+            continue;
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let last: Result<GrpcEgressResponse, String> = loop {
+            let observed = grpc_egress_request(
+                fixture.a_outbound_port,
+                "svc-c.ferrum.svc.cluster.local",
+                "/echo.Mesh/Call",
+                &framed,
+            )
+            .await
+            .map_err(|e| format!("cross-cluster gRPC egress request failed: {e}"));
+            match observed {
+                Ok(resp) if converged(&resp) => break Ok(resp),
+                other => {
+                    if Instant::now() >= deadline {
+                        break other;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        let logs = fixture.logs();
+        fixture.shutdown().await;
+        return match last {
+            Ok(resp) => Ok((resp, logs)),
+            Err(e) => Err(format!("{e}\n{logs}")),
+        };
+    }
+
+    Err(format!(
+        "cross-cluster gRPC gateways never bound their listeners after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// Cross-cluster gRPC keystone (Sidecar mesh-mTLS, issue #2010): a captured
+/// native-gRPC request at client gateway A (trust domain A) reaches the gRPC
+/// trailers-echo backend behind dest gateway C (trust domain B) THROUGH the
+/// east-west gateway B — outbound capture → materialized CROSS-CLUSTER
+/// `mesh.mtls` egress target (dial the remote east-west gateway with SNI = the
+/// destination service FQDN, TRUST-DOMAIN-ONLY peer verification) → the SAME
+/// mesh-mTLS `StreamingH2` relay the HTTP/gRPC path uses → B's SNI passthrough →
+/// C's STRICT inbound → C's gRPC backend. The backend's REAL HTTP/2 trailers
+/// (`grpc-status`, a custom trailer) survive the whole two-trust-domain relay, and
+/// the remote workload pod IP (`10.244.7.7`) is NEVER dialed directly.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_cross_cluster_grpc_routes_a_to_c_over_east_west_with_trailers() {
+    let (resp, logs) = drive_cross_cluster_grpc_egress(true, |resp| {
+        resp.status == 200
+            && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")
+            && resp
+                .body
+                .windows(b"ferrum-mesh-xc-grpc-payload".len())
+                .any(|w| w == b"ferrum-mesh-xc-grpc-payload")
+    })
+    .await
+    .expect("cross-cluster gRPC egress drive");
+    assert_eq!(
+        resp.status, 200,
+        "the captured gRPC request must traverse A's cross-cluster mesh-mTLS egress through the \
+         east-west gateway to C's gRPC backend: {resp:?}\n{logs}"
+    );
+    assert_eq!(
+        resp.trailers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "the backend's grpc-status TRAILER must survive the cross-cluster mesh-mTLS relay: \
+         {resp:?}\n{logs}"
+    );
+    assert_eq!(
+        resp.trailers.get("x-mesh-trailer").map(String::as_str),
+        Some("echo-ok"),
+        "custom (non-hop-by-hop) trailers must survive the cross-cluster relay: {resp:?}\n{logs}"
+    );
+    assert!(
+        resp.body
+            .windows(b"ferrum-mesh-xc-grpc-payload".len())
+            .any(|w| w == b"ferrum-mesh-xc-grpc-payload"),
+        "the echoed gRPC payload must ride the relayed DATA frames: {resp:?}\n{logs}"
+    );
+    // The remote pod IP is never dialed directly — the request rides the
+    // east-west gateway. A direct dial of the unroutable 10.244.7.7 would have
+    // failed the call; its success proves the gateway path was used.
+    assert!(
+        !logs.contains("10.244.7.7:"),
+        "the remote workload pod IP must never be dialed directly (east-west only)\n{logs}"
+    );
+}
+
+/// Cross-cluster gRPC negative (Sidecar mesh-mTLS, issue #2010): an untrusted
+/// gateway A (SVID not in C's federated trust set) must NEVER complete a
+/// cross-cluster gRPC call — the dispatch rides the SAME verified mesh-mTLS
+/// transport as HTTP, so an unverifiable peer fails closed instead of falling
+/// back to a direct dial of the remote workload.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_cross_cluster_grpc_rejects_untrusted_client() {
+    let (resp, logs) = drive_cross_cluster_grpc_egress(false, |resp| {
+        // The success shape must never be observed; poll to the deadline.
+        resp.status == 200 && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")
+    })
+    .await
+    .expect("untrusted cross-cluster gRPC egress drive");
+    assert!(
+        !(resp.status == 200 && resp.trailers.get("grpc-status").map(String::as_str) == Some("0")),
+        "an untrusted gateway's cross-cluster gRPC request must fail closed, not complete: \
+         {resp:?}\n{logs}"
+    );
+    assert!(
+        !resp
+            .body
+            .windows(b"ferrum-mesh-xc-grpc-payload".len())
+            .any(|w| w == b"ferrum-mesh-xc-grpc-payload"),
+        "no backend payload may leak through an unverified cross-cluster mTLS session: \
+         {resp:?}\n{logs}"
+    );
+}
+
+/// Drive one captured WebSocket upgrade from client gateway A across the
+/// east-west gateway B to the WS echo backend behind dest gateway C. Returns
+/// `Ok((reply, logs))` on a completed roundtrip; `Err` when the upgrade never
+/// completes (the expected fail-closed outcome for an untrusted A).
+async fn drive_cross_cluster_ws_egress(client_trusted: bool) -> Result<(String, String), String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let backend_port = start_websocket_echo_backend().await;
+        let Some(fixture) =
+            try_start_sidecar_cross_cluster_fixture(attempt, client_trusted, backend_port).await
+        else {
+            last_failure = format!("attempt {attempt}: cross-cluster fixture never bound");
+            continue;
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let last: Result<String, String> = loop {
+            let observed = mesh_websocket_echo_roundtrip(
+                fixture.a_outbound_port,
+                "svc-c.ferrum.svc.cluster.local",
+                "mesh-xc-ws-hello",
+            )
+            .await;
+            if let Ok(ref reply) = observed
+                && reply.contains("backend-ws:mesh-xc-ws-hello")
+            {
+                break observed;
+            }
+            if Instant::now() >= deadline {
+                break observed;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        let logs = fixture.logs();
+        fixture.shutdown().await;
+        return match last {
+            Ok(reply) => Ok((reply, logs)),
+            Err(e) => Err(format!("{e}\n{logs}")),
+        };
+    }
+
+    Err(format!(
+        "cross-cluster WS gateways never bound their listeners after {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// Cross-cluster WebSocket keystone (Sidecar mesh-mTLS, issue #2010): a
+/// WebSocket upgrade captured at client gateway A reaches the WS echo backend
+/// behind dest gateway C THROUGH the east-west gateway B, over an **RFC 8441
+/// Extended CONNECT carried on the cross-cluster mesh-mTLS transport** (dial the
+/// remote east-west gateway with SNI = the destination service FQDN,
+/// TRUST-DOMAIN-ONLY peer verification — the same `MeshMtlsDialPlan` the HTTP
+/// path resolves). B's SNI passthrough delivers the Extended CONNECT to C's
+/// STRICT `:15006` inbound, which bridges it to the local WS app. Proves the WS
+/// upgrade rides the SAME cross-cluster secured transport as HTTP/gRPC.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_cross_cluster_ws_routes_a_to_c_over_east_west() {
+    let (reply, logs) = drive_cross_cluster_ws_egress(true)
+        .await
+        .expect("cross-cluster websocket egress drive");
+    assert!(
+        reply.contains("backend-ws:mesh-xc-ws-hello"),
+        "the WebSocket frame must traverse A's cross-cluster mesh-mTLS Extended CONNECT egress \
+         through the east-west gateway to C's WS backend and echo back; reply: {reply:?}\n{logs}"
+    );
+}
+
+/// Cross-cluster WebSocket negative (Sidecar mesh-mTLS, issue #2010): an
+/// untrusted gateway A must not reach C's WS backend. The cross-cluster mesh-mTLS
+/// dial underpinning the Extended CONNECT fails SVID verification (A rejects C's
+/// server SVID; C's STRICT inbound rejects A's client cert), so the upgrade fails
+/// closed — never a plaintext / wrong-SNI dial, never a backend frame.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_sidecar_cross_cluster_ws_rejects_untrusted_client() {
+    // The driver returns `Err` when the upgrade never completes (the expected
+    // fail-closed outcome). It returns `Ok(reply)` only if a handshake somehow
+    // succeeded — in which case the reply must NOT carry a backend frame.
+    if let Ok((reply, logs)) = drive_cross_cluster_ws_egress(false).await {
+        assert!(
+            !reply.contains("backend-ws:"),
+            "an untrusted gateway's cross-cluster WebSocket egress must fail closed, not echo a \
+             backend frame: {reply:?}\n{logs}"
+        );
+    }
+}
+
 // ── Ambient (HBONE) cross-cluster east-west e2e ──────────────────────────────
 //
 // The HBONE counterpart of the Sidecar cross-cluster keystone above. Client A

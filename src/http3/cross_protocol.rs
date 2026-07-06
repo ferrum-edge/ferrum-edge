@@ -2865,12 +2865,22 @@ fn grpc_mesh_transport_refusal(target: Option<&UpstreamTarget>) -> Option<&'stat
     let target = target?;
     match grpc_proxy::classify_grpc_mesh_dispatch(target) {
         grpc_proxy::GrpcMeshDispatch::Direct => None,
-        grpc_proxy::GrpcMeshDispatch::MeshMtls => Some(
+        // The H3 bridge has no mesh-mTLS dispatch path, so BOTH the same-cluster
+        // and cross-cluster sidecar mesh-mTLS classes fail closed here — gRPC
+        // over cross-cluster east-west is supported only on the H1/H2 frontend
+        // (issue #2010); H3 mesh dispatch is a separate documented residual.
+        grpc_proxy::GrpcMeshDispatch::MeshMtls
+        | grpc_proxy::GrpcMeshDispatch::MeshMtlsCrossCluster => Some(
             "gRPC over the sidecar mesh mTLS transport is not supported on the HTTP/3 frontend",
         ),
-        grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => {
-            Some("gRPC over cross-cluster east-west routing is not supported")
-        }
+        grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => Some(
+            "gRPC over cross-cluster Ambient HBONE east-west routing is not supported \
+             (HBONE inner protocol cannot carry gRPC trailers)",
+        ),
+        grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterMalformed => Some(
+            "gRPC over cross-cluster east-west routing requires a destination SNI \
+             override and a remote trust domain",
+        ),
         grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterNoTransport => {
             Some("gRPC over cross-cluster east-west routing requires a mesh transport tag")
         }

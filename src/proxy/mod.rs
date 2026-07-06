@@ -9547,22 +9547,32 @@ async fn connect_mesh_websocket_backend(
             };
             let forwarded_headers: &[(String, String)] =
                 forwarded_headers_owned.as_deref().unwrap_or(client_headers);
-            // Cross-cluster WebSocket egress is NOT yet supported (HTTP-first;
-            // tracked as a follow-up with Ambient HBONE cross-cluster). A
-            // cross-cluster target carries NO `mesh.spiffe_id`, so
-            // `target_mesh_mtls_expected_peer` below FAILS CLOSED — the WS upgrade
-            // errors cleanly (no plaintext, no panic). Warn so the failure is
-            // diagnosable rather than a bare missing-pin error.
-            if mesh_mtls_pool::target_mesh_mtls_cross_cluster(target) {
-                warn!(
-                    proxy_id = %proxy.id,
-                    target_host = %target.host,
-                    "Cross-cluster WebSocket egress is not yet supported; the upgrade will fail \
-                     closed (no cross-cluster SNI override / trust-domain scope on the WS path). \
-                     Tracked as a follow-up with Ambient HBONE cross-cluster."
-                );
-            }
-            let expected_peer = mesh_mtls_pool::target_mesh_mtls_expected_peer(target)?;
+            // Resolve the mesh-mTLS dial plan (issue #2010), shared with the
+            // HTTP/gRPC path (`proxy_to_backend_mesh_mtls`):
+            //   * IN-CLUSTER: pin the destination workload SPIFFE, SNI = dial
+            //     host, no trust-domain scope.
+            //   * CROSS-CLUSTER east-west: NO pinned pod SPIFFE
+            //     (`expected_peer = None`), verification scoped to the remote
+            //     `mesh.trust_domain`, and the ClientHello SNI OVERRIDDEN to the
+            //     destination service FQDN (`mesh.eastwest_sni`) so the remote
+            //     gateway's SNI passthrough routes to the destination sidecar's
+            //     `:15006` Extended-CONNECT listener.
+            // A missing pinned identity (in-cluster) or a malformed cross-cluster
+            // target (missing SNI / trust domain) FAILS THE UPGRADE CLOSED here —
+            // never a plaintext / wrong-SNI dial of a mesh destination.
+            let dial_plan = match mesh_mtls_pool::MeshMtlsDialPlan::resolve(target) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        target_host = %target.host,
+                        error = %err,
+                        "Refusing sidecar mesh-mTLS WebSocket egress: unresolved dial plan; \
+                         failing the upgrade closed (no plaintext / wrong-SNI fallback)"
+                    );
+                    return Err(Box::new(err));
+                }
+            };
             let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
             let ws_tunnel = state
                 .mesh_mtls_pool
@@ -9574,7 +9584,9 @@ async fn connect_mesh_websocket_backend(
                     mtls_port,
                     &authority,
                     path_and_query,
-                    &expected_peer,
+                    dial_plan.expected_peer.as_ref(),
+                    dial_plan.expected_trust_domain.as_ref(),
+                    dial_plan.sni_override,
                     forwarded_headers,
                 )
                 .await?;
@@ -14423,9 +14435,14 @@ async fn handle_proxy_request_inner(
         if let Some(target) = upstream_target.as_deref() {
             let refusal = match grpc_proxy::classify_grpc_mesh_dispatch(target) {
                 grpc_proxy::GrpcMeshDispatch::Direct => None,
-                grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => {
-                    Some("gRPC over cross-cluster east-west routing is not supported")
-                }
+                grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => Some(
+                    "gRPC over cross-cluster Ambient HBONE east-west routing is not supported \
+                     (HBONE inner protocol cannot carry gRPC trailers)",
+                ),
+                grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterMalformed => Some(
+                    "gRPC over cross-cluster east-west routing requires a destination SNI \
+                     override and a remote trust domain",
+                ),
                 grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterNoTransport => {
                     Some("gRPC over cross-cluster east-west routing requires a mesh transport tag")
                 }
@@ -14433,7 +14450,11 @@ async fn handle_proxy_request_inner(
                     "gRPC over the Ambient HBONE mesh transport is not supported \
                      (HBONE inner protocol cannot carry gRPC trailers)",
                 ),
-                grpc_proxy::GrpcMeshDispatch::MeshMtls => {
+                // `MeshMtlsCrossCluster` normally falls through to the generic
+                // mesh-mTLS path (its east-west branch) like `MeshMtls`; both are
+                // refused defensively here in case they reach this branch.
+                grpc_proxy::GrpcMeshDispatch::MeshMtls
+                | grpc_proxy::GrpcMeshDispatch::MeshMtlsCrossCluster => {
                     Some("gRPC to a sidecar mesh mTLS target cannot be dialed directly")
                 }
             };
@@ -15159,7 +15180,8 @@ async fn handle_proxy_request_inner(
                 // and this loop dials `GrpcConnectionPool` directly — a rotation
                 // onto a mesh-tagged target (mixed mesh/non-mesh upstream) must
                 // fail closed, never direct-dial past the secured transport.
-                // `MeshMtls` also refuses here: the generic mesh-mTLS path
+                // `MeshMtls` / `MeshMtlsCrossCluster` also refuse here (any
+                // non-`Direct` classification does): the generic mesh-mTLS path
                 // cannot dispatch retries (`!has_retry` gate), so there is no
                 // transport to switch to mid-loop. No circuit-breaker probe
                 // slot is held for the new target yet (the breaker is checked
@@ -22487,96 +22509,88 @@ async fn proxy_to_backend_mesh_mtls(
     //   SNI resolves to).
     // - In-cluster (default): the pinned destination identity is mandatory —
     //   missing or corrupt fails closed before any dial — and no SNI override.
-    let cross_cluster = mesh_mtls_pool::target_mesh_mtls_cross_cluster(target);
-    let expected_peer = if cross_cluster {
-        None
-    } else {
-        match mesh_mtls_pool::target_mesh_mtls_expected_peer(target) {
-            Ok(peer) => Some(peer),
-            Err(err) => {
-                error!(
-                    proxy_id = %proxy.id,
-                    target_host = %target.host,
-                    error = %err,
-                    "Refusing sidecar mTLS dispatch: unusable pinned peer identity"
-                );
-                return (
-                    hbone_pool_error_response(state, proxy, &err, resolved_ip),
-                    None,
-                    None,
-                );
-            }
+    // Resolve the peer-verification + SNI plan ONCE, shared with the WebSocket
+    // egress path via `MeshMtlsDialPlan` so the in-cluster-pinned vs
+    // cross-cluster (east-west) split cannot drift between the two transports:
+    //   * IN-CLUSTER: the pinned destination identity is mandatory — missing or
+    //     corrupt fails closed before any dial — and no SNI override.
+    //   * CROSS-CLUSTER (`mesh.cross_cluster`): the dial host is the REMOTE
+    //     east-west gateway, which SNI-passes the opaque TLS to an LB-picked
+    //     destination workload the client cannot name. Verification is
+    //     TRUST-DOMAIN-ONLY (`expected_peer = None`; the destination SVID must
+    //     still chain to the remote/federated trust domain — never unverified)
+    //     scoped to `mesh.trust_domain`, and the ClientHello SNI is OVERRIDDEN to
+    //     the destination service FQDN (`mesh.eastwest_sni`). A missing SNI or
+    //     trust domain FAILS CLOSED (502) — never a fallback to the gateway
+    //     address as SNI or any-federated verification.
+    let mesh_mtls_pool::MeshMtlsDialPlan {
+        cross_cluster,
+        expected_peer,
+        expected_trust_domain,
+        sni_override,
+    } = match mesh_mtls_pool::MeshMtlsDialPlan::resolve(target) {
+        Ok(plan) => plan,
+        Err(mesh_mtls_pool::MeshMtlsDialError::PinnedPeer(err)) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                error = %err,
+                "Refusing sidecar mTLS dispatch: unusable pinned peer identity"
+            );
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+                None,
+            );
         }
-    };
-    let sni_override = if cross_cluster {
-        match mesh_mtls_pool::target_mesh_mtls_eastwest_sni(target) {
-            Some(sni) => Some(sni),
-            None => {
-                error!(
-                    proxy_id = %proxy.id,
-                    target_host = %target.host,
-                    "Refusing cross-cluster sidecar mTLS dispatch: missing or empty \
-                     mesh.eastwest_sni tag (fail closed, never dial the gateway IP as SNI)"
-                );
-                return (
-                    retry::BackendResponse {
-                        status_code: 502,
-                        body: ResponseBody::Buffered(
-                            r#"{"error":"Cross-cluster mTLS target missing SNI"}"#
-                                .as_bytes()
-                                .to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: true,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ConnectionPoolError),
-                    },
-                    None,
-                    None,
-                );
-            }
+        Err(mesh_mtls_pool::MeshMtlsDialError::MissingCrossClusterSni) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                "Refusing cross-cluster sidecar mTLS dispatch: missing or empty \
+                 mesh.eastwest_sni tag (fail closed, never dial the gateway IP as SNI)"
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Cross-cluster mTLS target missing SNI"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                },
+                None,
+                None,
+            );
         }
-    } else {
-        None
-    };
-    // Cross-cluster verification is SCOPED to the TARGET's remote trust domain
-    // (`mesh.trust_domain`): the SNI-passthrough gateway LB-picks the destination
-    // workload, so a pod SPIFFE cannot be pinned, but the server SVID MUST be in
-    // exactly the remote trust domain (and chain to a federated bundle) — a
-    // federated cert from a DIFFERENT trust domain is rejected. A cross-cluster
-    // target with a missing/empty/unparseable `mesh.trust_domain` FAILS CLOSED
-    // (502) — it NEVER falls back to any-federated verification. The in-cluster
-    // pinned path passes `None` (the pinned peer already constrains the domain).
-    let expected_trust_domain = if cross_cluster {
-        match mesh_mtls_pool::target_mesh_mtls_cross_cluster_trust_domain(target) {
-            Some(td) => Some(td),
-            None => {
-                error!(
-                    proxy_id = %proxy.id,
-                    target_host = %target.host,
-                    "Refusing cross-cluster sidecar mTLS dispatch: missing, empty, or unparseable \
-                     mesh.trust_domain tag (fail closed, never any-federated verification)"
-                );
-                return (
-                    retry::BackendResponse {
-                        status_code: 502,
-                        body: ResponseBody::Buffered(
-                            r#"{"error":"Cross-cluster mTLS target missing trust domain"}"#
-                                .as_bytes()
-                                .to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: true,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ConnectionPoolError),
-                    },
-                    None,
-                    None,
-                );
-            }
+        Err(mesh_mtls_pool::MeshMtlsDialError::MissingCrossClusterTrustDomain) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                "Refusing cross-cluster sidecar mTLS dispatch: missing, empty, or unparseable \
+                 mesh.trust_domain tag (fail closed, never any-federated verification)"
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Cross-cluster mTLS target missing trust domain"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                },
+                None,
+                None,
+            );
         }
-    } else {
-        None
     };
 
     debug!(
