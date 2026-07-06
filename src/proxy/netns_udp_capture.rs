@@ -121,6 +121,13 @@ pub struct NetnsUdpCaptureManager<B: NetnsUdpBackend> {
     poll_interval: Duration,
     /// netns inode → its active producer.
     active: HashMap<u64, ActiveUdpCapture>,
+    /// netns inode → the still-running teardown of a producer we just closed
+    /// (pod removal / netns move / registry flap). The reopen path AWAITS the
+    /// entry for a netns before opening a new producer for that same netns, so a
+    /// lagging old teardown can never delete the fresh producer's
+    /// `FERRUM_MESH_UDP_*` chains/routing after they were installed (codex
+    /// fail-open race). Empty for the test mock, whose `close()` carries no task.
+    pending_teardowns: HashMap<u64, tokio::task::JoinHandle<()>>,
     /// Last registry UID set logged, so churn diagnostics don't repeat per poll.
     last_registry_uids: HashSet<String>,
     /// Last unresolved-netns reason per pod UID, so persistent cgroup/proc
@@ -141,6 +148,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             backend,
             poll_interval,
             active: HashMap::new(),
+            pending_teardowns: HashMap::new(),
             last_registry_uids: HashSet::new(),
             unresolved_reasons: HashMap::new(),
         }
@@ -155,7 +163,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             "Ambient per-pod-netns UDP capture manager started"
         );
         loop {
-            self.reconcile_once();
+            self.reconcile_once().await;
             tokio::select! {
                 _ = tokio::time::sleep(self.poll_interval) => {}
                 changed = shutdown.changed() => {
@@ -171,7 +179,13 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
     /// One reconcile pass: open producers for newly enrolled pod netns, close
     /// producers whose pods are all gone. Returns the count of active producers
     /// (used by tests).
-    fn reconcile_once(&mut self) -> usize {
+    ///
+    /// Async because reopening a netns that we just closed must AWAIT the old
+    /// producer's in-netns teardown to completion before the new producer
+    /// installs its rules — otherwise a lagging teardown could delete the fresh
+    /// `FERRUM_MESH_UDP_*` chains after install and silently drop the pod out of
+    /// mesh capture (codex fail-open race).
+    async fn reconcile_once(&mut self) -> usize {
         let targets = self.source.list_targets();
 
         // Resolve every enrolled pod's current netns once, into three buckets:
@@ -260,9 +274,22 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             .collect();
         for netns in gone {
             if let Some(active) = self.active.remove(&netns) {
-                // Pod removal: fire-and-forget. Dropping the handle does not abort
-                // the supervising task, so its in-netns rule teardown still runs.
-                let _ = active.handle.close();
+                // Close the producer (signal its loop to stop). Rather than drop
+                // the supervising task's handle fire-and-forget, RETAIN it keyed
+                // by netns so the open pass can await this teardown to completion
+                // before installing a new producer's rules in the same netns — a
+                // registry flap (file disappears then reappears for the same pod
+                // netns) must not let this old teardown fire AFTER the new install
+                // and delete the fresh chains (codex fail-open race). The handle
+                // is `None` for the test mock (no supervising task).
+                if let Some(task) = active.handle.close() {
+                    // Defensive: an unlikely pre-existing pending teardown for the
+                    // same netns is awaited first, so handles cannot accumulate.
+                    if let Some(prior) = self.pending_teardowns.remove(&netns) {
+                        let _ = prior.await;
+                    }
+                    self.pending_teardowns.insert(netns, task);
+                }
                 info!(
                     netns_inode = netns,
                     "Closed Ambient per-pod-netns UDP capture producer"
@@ -282,6 +309,24 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             let Some(target) = targets.iter().find(|t| pod_uids.contains(&t.pod_uid)) else {
                 continue;
             };
+            // Before installing fresh rules in this netns, await a prior
+            // producer's teardown (registry flap: closed then reopened for the
+            // same pod netns). Take the handle OUT of the map first, then await
+            // with no map borrow held, so the awaited teardown's chain deletion
+            // is guaranteed to run BEFORE `open_udp_capture` reinstalls — a
+            // lagging old teardown can never delete the new chains (codex). A
+            // cancelled/panicked teardown is logged and we proceed to reinstall
+            // (the new producer's own pre-teardown reaps any stale rules).
+            if let Some(prior) = self.pending_teardowns.remove(&netns) {
+                if let Err(error) = prior.await {
+                    warn!(
+                        netns_inode = netns,
+                        %error,
+                        "Ambient UDP producer: prior teardown task did not complete cleanly \
+                         before reopen; proceeding to reinstall rules"
+                    );
+                }
+            }
             match self.backend.open_udp_capture(target) {
                 Some(handle) => {
                     info!(
@@ -303,6 +348,12 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             }
         }
 
+        // Reap teardowns that have already finished for netns not reopened this
+        // pass, so completed handles for permanently-gone pods don't accumulate.
+        // Non-blocking: unfinished teardowns stay retained and are still awaited
+        // on a future reopen of that netns (or on shutdown).
+        self.pending_teardowns.retain(|_, task| !task.is_finished());
+
         self.active.len()
     }
 
@@ -319,6 +370,14 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                     let _ = handle.await;
                 });
             }
+        }
+        // Also await teardowns already in flight for producers closed but not
+        // reopened (registry flap / pod removal between polls), so shutdown does
+        // not race ahead of their in-netns rule deletion.
+        for (_, task) in self.pending_teardowns.drain() {
+            tasks.spawn(async move {
+                let _ = task.await;
+            });
         }
         if tasks.is_empty() {
             return;
@@ -668,6 +727,14 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// One ordered lifecycle event, recorded so the reopen-after-close ordering
+    /// (teardown-before-install) can be asserted, not just the open/close sets.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Event {
+        Opened(u64),
+        TornDown(u64),
+    }
+
     /// Mock backend: maps each pod cgroup path to a caller-provided netns inode
     /// and records every open/close so the reconcile diff can be asserted without
     /// a real netns, `setns`, or iptables.
@@ -675,8 +742,16 @@ mod tests {
         netns_by_cgroup: Mutex<HashMap<String, Option<u64>>>,
         opened: Arc<Mutex<Vec<u64>>>,
         closed: Arc<Mutex<Vec<u64>>>,
+        /// Ordered open/teardown log across all netns, used by the reopen-race
+        /// regression test to prove a prior teardown completes before reinstall.
+        events: Arc<Mutex<Vec<Event>>>,
         /// netns inodes for which `open_udp_capture` should fail (retry testing).
         fail_open: Mutex<HashSet<u64>>,
+        /// When true, `close()` returns a real supervising task that records the
+        /// teardown only AFTER yielding — so a reopen that does not await it would
+        /// record `Opened(N)` before `TornDown(N)` in `events`. This models the
+        /// production lagging fire-and-forget teardown the fix must serialize.
+        slow_teardown: bool,
     }
 
     impl MockBackend {
@@ -687,8 +762,18 @@ mod tests {
                 ),
                 opened: Arc::new(Mutex::new(Vec::new())),
                 closed: Arc::new(Mutex::new(Vec::new())),
+                events: Arc::new(Mutex::new(Vec::new())),
                 fail_open: Mutex::new(HashSet::new()),
+                slow_teardown: false,
             }
+        }
+
+        /// Variant whose closed producers carry a real (lagging) teardown task, so
+        /// the reopen path must await it. Mirrors the production supervising task.
+        fn new_with_slow_teardown(mapping: &[(&str, Option<u64>)]) -> Self {
+            let mut backend = Self::new(mapping);
+            backend.slow_teardown = true;
+            backend
         }
 
         fn set_netns(&self, cgroup: &str, netns: Option<u64>) {
@@ -734,12 +819,31 @@ mod tests {
                 return None;
             }
             self.opened.lock().unwrap().push(netns);
-            let (stop_tx, _stop_rx) = watch::channel(false);
+            self.events.lock().unwrap().push(Event::Opened(netns));
+            let (stop_tx, mut stop_rx) = watch::channel(false);
             let closed = self.closed.clone();
-            Some(OpenedUdpCapture::with_on_close(
-                stop_tx,
-                Box::new(move || closed.lock().unwrap().push(netns)),
-            ))
+            let events = self.events.clone();
+            if self.slow_teardown {
+                // Real supervising task, like production: wait for the stop
+                // signal, then yield before recording teardown so a non-awaited
+                // reopen would interleave ahead of it.
+                let task = tokio::spawn(async move {
+                    let _ = stop_rx.changed().await;
+                    tokio::task::yield_now().await;
+                    tokio::task::yield_now().await;
+                    closed.lock().unwrap().push(netns);
+                    events.lock().unwrap().push(Event::TornDown(netns));
+                });
+                Some(OpenedUdpCapture::new(stop_tx, task))
+            } else {
+                Some(OpenedUdpCapture::with_on_close(
+                    stop_tx,
+                    Box::new(move || {
+                        closed.lock().unwrap().push(netns);
+                        events.lock().unwrap().push(Event::TornDown(netns));
+                    }),
+                ))
+            }
         }
     }
 
@@ -774,8 +878,8 @@ mod tests {
         NetnsUdpCaptureManager::new(15011, source, backend, Duration::from_secs(2))
     }
 
-    #[test]
-    fn opens_one_producer_per_netns_and_dedupes_shared_netns() {
+    #[tokio::test]
+    async fn opens_one_producer_per_netns_and_dedupes_shared_netns() {
         // Two pods in ONE netns (shared) + one pod in another → 2 producers.
         let source = Arc::new(StaticSource(Mutex::new(vec![
             target("pod-a", "/cg/a"),
@@ -789,26 +893,26 @@ mod tests {
         ]);
         let opened = backend.opened.clone();
         let mut mgr = manager(source, backend);
-        assert_eq!(mgr.reconcile_once(), 2);
+        assert_eq!(mgr.reconcile_once().await, 2);
         let mut got = opened.lock().unwrap().clone();
         got.sort_unstable();
         assert_eq!(got, vec![100, 200], "one producer per distinct netns");
         // Idempotent: a second reconcile opens nothing new.
-        assert_eq!(mgr.reconcile_once(), 2);
+        assert_eq!(mgr.reconcile_once().await, 2);
         assert_eq!(opened.lock().unwrap().len(), 2);
     }
 
-    #[test]
-    fn closes_producer_and_cleans_up_when_pod_removed() {
+    #[tokio::test]
+    async fn closes_producer_and_cleans_up_when_pod_removed() {
         let targets = Mutex::new(vec![target("pod-a", "/cg/a")]);
         let source = Arc::new(StaticSource(targets));
         let backend = MockBackend::new(&[("/cg/a", Some(100))]);
         let closed = backend.closed.clone();
         let mut mgr = manager(source.clone(), backend);
-        assert_eq!(mgr.reconcile_once(), 1);
+        assert_eq!(mgr.reconcile_once().await, 1);
         // Pod removed from the registry → producer closed + cleanup invoked.
         source.0.lock().unwrap().clear();
-        assert_eq!(mgr.reconcile_once(), 0);
+        assert_eq!(mgr.reconcile_once().await, 0);
         assert_eq!(
             *closed.lock().unwrap(),
             vec![100],
@@ -816,8 +920,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn transient_unresolvable_netns_does_not_flap_producer() {
+    #[tokio::test]
+    async fn transient_unresolvable_netns_does_not_flap_producer() {
         let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
         let backend = MockBackend::new(&[("/cg/a", Some(100))]);
         let closed = backend.closed.clone();
@@ -825,11 +929,11 @@ mod tests {
         // the backend map through a shared handle instead.
         let netns_map_probe = "/cg/a";
         let mut mgr = manager(source, backend);
-        assert_eq!(mgr.reconcile_once(), 1);
+        assert_eq!(mgr.reconcile_once().await, 1);
         // Netns momentarily unresolvable (container restart) — producer retained.
         mgr.backend.set_netns(netns_map_probe, None);
         assert_eq!(
-            mgr.reconcile_once(),
+            mgr.reconcile_once().await,
             1,
             "an unresolvable-but-still-registered pod keeps its producer (grace)"
         );
@@ -839,20 +943,20 @@ mod tests {
         );
         // Resolves again → still one, no reopen.
         mgr.backend.set_netns(netns_map_probe, Some(100));
-        assert_eq!(mgr.reconcile_once(), 1);
+        assert_eq!(mgr.reconcile_once().await, 1);
     }
 
-    #[test]
-    fn pod_moving_netns_reopens_in_new_netns() {
+    #[tokio::test]
+    async fn pod_moving_netns_reopens_in_new_netns() {
         let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
         let backend = MockBackend::new(&[("/cg/a", Some(100))]);
         let opened = backend.opened.clone();
         let closed = backend.closed.clone();
         let mut mgr = manager(source, backend);
-        assert_eq!(mgr.reconcile_once(), 1);
+        assert_eq!(mgr.reconcile_once().await, 1);
         // Pod's sandbox restarted into a new netns inode.
         mgr.backend.set_netns("/cg/a", Some(300));
-        assert_eq!(mgr.reconcile_once(), 1);
+        assert_eq!(mgr.reconcile_once().await, 1);
         assert_eq!(
             *closed.lock().unwrap(),
             vec![100],
@@ -861,19 +965,19 @@ mod tests {
         assert_eq!(*opened.lock().unwrap(), vec![100, 300], "new netns opened");
     }
 
-    #[test]
-    fn open_failure_is_retried_next_reconcile() {
+    #[tokio::test]
+    async fn open_failure_is_retried_next_reconcile() {
         let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
         let backend = MockBackend::new(&[("/cg/a", Some(100))]);
         backend.set_fail_open(100, true);
         let opened = backend.opened.clone();
         let mut mgr = manager(source, backend);
         // First pass fails to open → no active producer.
-        assert_eq!(mgr.reconcile_once(), 0);
+        assert_eq!(mgr.reconcile_once().await, 0);
         assert!(opened.lock().unwrap().is_empty());
         // Recover → next reconcile opens it.
         mgr.backend.set_fail_open(100, false);
-        assert_eq!(mgr.reconcile_once(), 1);
+        assert_eq!(mgr.reconcile_once().await, 1);
         assert_eq!(*opened.lock().unwrap(), vec![100]);
     }
 
@@ -886,10 +990,76 @@ mod tests {
         let backend = MockBackend::new(&[("/cg/a", Some(100)), ("/cg/c", Some(200))]);
         let closed = backend.closed.clone();
         let mut mgr = manager(source, backend);
-        assert_eq!(mgr.reconcile_once(), 2);
+        assert_eq!(mgr.reconcile_once().await, 2);
         mgr.shutdown_all().await;
         let mut got = closed.lock().unwrap().clone();
         got.sort_unstable();
         assert_eq!(got, vec![100, 200], "shutdown closes every producer");
+    }
+
+    /// The core codex fix: a registry flap (a pod's netns closed, then the same
+    /// netns reopened before the old teardown finished) must AWAIT the prior
+    /// teardown to completion BEFORE the new producer installs its rules — so the
+    /// lagging teardown can never delete the fresh `FERRUM_MESH_UDP_*` chains and
+    /// silently drop the pod out of mesh capture. With the (lagging) slow-teardown
+    /// mock, a fire-and-forget close would record `Opened(100)` before
+    /// `TornDown(100)`; the fix forces `TornDown(100)` first.
+    #[tokio::test]
+    async fn reopening_same_netns_awaits_prior_teardown_before_reinstall() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new_with_slow_teardown(&[("/cg/a", Some(100))]);
+        let events = backend.events.clone();
+        let mut mgr = manager(source.clone(), backend);
+        // Open the producer for netns 100.
+        assert_eq!(mgr.reconcile_once().await, 1);
+        // Registry file for the pod disappears → producer closed (teardown starts
+        // but lags, mirroring the fire-and-forget supervising task).
+        source.0.lock().unwrap().clear();
+        assert_eq!(mgr.reconcile_once().await, 0);
+        // Registry file reappears for the SAME pod netns → producer reopened. The
+        // reopen must await the lagging teardown first.
+        source.0.lock().unwrap().push(target("pod-a", "/cg/a"));
+        assert_eq!(mgr.reconcile_once().await, 1);
+        // Ordering proof: the first netns-100 teardown completed BEFORE the second
+        // netns-100 open, so the old teardown cannot delete the new chains.
+        let log = events.lock().unwrap().clone();
+        let second_open = log
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| **e == Event::Opened(100))
+            .nth(1)
+            .map(|(i, _)| i)
+            .expect("netns 100 must be opened twice (flap → reopen)");
+        let first_teardown = log
+            .iter()
+            .position(|e| *e == Event::TornDown(100))
+            .expect("the first producer must have been torn down");
+        assert!(
+            first_teardown < second_open,
+            "prior teardown must complete before reinstall; got {log:?}"
+        );
+    }
+
+    /// A netns closed but not reopened must still have its lagging teardown drained
+    /// on shutdown (not just the currently-active producers), so the process does
+    /// not exit ahead of that netns's in-netns rule deletion.
+    #[tokio::test]
+    async fn shutdown_drains_pending_teardown_of_closed_producer() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new_with_slow_teardown(&[("/cg/a", Some(100))]);
+        let closed = backend.closed.clone();
+        let mut mgr = manager(source.clone(), backend);
+        assert_eq!(mgr.reconcile_once().await, 1);
+        // Pod removed → producer closed; its teardown is still in flight (pending).
+        source.0.lock().unwrap().clear();
+        assert_eq!(mgr.reconcile_once().await, 0);
+        // Shutdown must await the pending teardown, so it is recorded by the time
+        // shutdown returns.
+        mgr.shutdown_all().await;
+        assert_eq!(
+            *closed.lock().unwrap(),
+            vec![100],
+            "shutdown must drain the pending teardown of a closed-but-not-reopened producer"
+        );
     }
 }
