@@ -512,6 +512,7 @@ Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the h
 | Custom plugins | [CUSTOM_PLUGINS.md](CUSTOM_PLUGINS.md) |
 | Feature list | [FEATURES.md](FEATURES.md) |
 | OpenAPI spec | [openapi.yaml](openapi.yaml) |
+| Gateway API conformance | [docs/gateway_api_conformance.md](docs/gateway_api_conformance.md) (canonical) — indexed from [CONFORMANCE.md](CONFORMANCE.md) |
 | Istio + xDS conformance matrix | [CONFORMANCE.md](CONFORMANCE.md) (run `cargo test --test conformance_tests` to refresh `target/conformance/coverage.md`) |
 
 ## CI/CD

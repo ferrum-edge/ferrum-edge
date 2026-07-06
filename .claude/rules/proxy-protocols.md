@@ -82,7 +82,7 @@ paths:
 - H3 cross-protocol buffering: request bodies buffer because `RequestStream` cannot be captured by reqwest's static body; responses stream with the H3 coalesce window.
 - Forward gRPC trailers with `send_trailers` on buffered and streaming H3 bridge responses.
 - QUIC connection migration must compare `remote_address()` per request. Rebuild `Arc<str>` only on actual change so per-IP limits follow migrated clients.
-- The vendored `h3` crate at `vendor/h3-0.0.8-ferrum-patched/` carries Ferrum's frame-drain-on-QUIC-close and H3 WebSocket Extended CONNECT patches. Keep `docs/upstream-h3-patches/` lifecycle notes in sync when touching H3 dispatch, graceful-close classification, or the vendor copy.
+- The vendored `h3` crate at `vendor/h3-0.0.8-ferrum-patched/` carries Ferrum's frame-drain-on-QUIC-close, H3 WebSocket Extended CONNECT, and buffered-trailer-peek (`peek_recv_trailers`) patches. Keep `docs/upstream-h3-patches/` lifecycle notes in sync when touching H3 dispatch, graceful-close classification, or the vendor copy.
 - gRPC `GrpcBody::Streaming(Incoming)` is used when no body plugins and no retries. Otherwise use `Buffered(Full<Bytes>)`.
 - Streaming gRPC responses use `coalescing_h2_body`, preserve trailers, and keep the 128 KiB target unless tests justify a change.
 

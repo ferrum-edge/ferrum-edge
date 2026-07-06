@@ -42,7 +42,7 @@ for row in "${PATCHES[@]}"; do
   [ -n "${latest:-}" ] && echo "- crates.io latest stable: ${latest}"
 
   if [ "$pr" = "NONE" ]; then
-    echo "- upstream PR: NOT YET FILED (backlog — see the docs hand-off section)"
+    echo "- upstream PR: NOT YET FILED — deliberate fork; see the docs hand-off section and dependency-policy.md 'Deliberate fork policy and SLA'"
   else
     st="$(gh pr view "$pr" --repo "$repo" --json state --jq '.state' 2>/dev/null || echo "")"
     if [ -z "$st" ]; then

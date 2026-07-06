@@ -28,6 +28,59 @@ it is not the default workflow for new core schema fields during build-out.
 Custom plugin migrations still use the plugin migration system because plugin
 storage is independently owned.
 
+## Stability & Upgrade Contract
+
+Ferrum Edge is in active build-out (crate version `0.9.x`, DB baseline `V001`).
+This section states, in one place, what stability you can rely on across
+branches and releases, when the schema freeze happens, and how breaking changes
+are announced.
+
+### What each channel guarantees
+
+| Channel | What it is | Schema / config / API stability |
+|---|---|---|
+| `main` / build-out branches | Every push to `main` overwrites the `latest` prerelease image (see [ci_cd.md](ci_cd.md)). | **No cross-commit stability.** Core schema changes are folded into the `V001` baseline (see [Build-Out Schema Policy](#build-out-schema-policy)); breaking changes to schema, env vars, config shapes, and DB values are acceptable and are **not** shimmed. Treat any schema change as requiring a fresh database or an operator-managed rebuild. Do not run `latest` in production with data you cannot recreate. |
+| Tagged release `vX.Y.Z` | A `v*` tag cuts a versioned GitHub Release + Docker tags from a green CI/coverage SHA. | Semantic versioning per [ci_cd.md → Version Numbering](ci_cd.md#version-numbering). The promises in [Version Compatibility](upgrade_guide.md#version-compatibility) apply **between tagged releases**, not between arbitrary `main` commits. |
+
+The CP↔DP gRPC protocol is the one compatibility contract enforced in code
+today: a DP and CP must share the same **major.minor** version
+(`check_version_compatibility`; patch differences are allowed). Mixed-version
+CP/DP fleets outside that window are rejected at connect time.
+
+### When V002+ migrations start (the schema freeze)
+
+Today there is exactly one core migration, `V001` (`initial_schema`), and all
+built-in schema changes are folded into it rather than shipped as `V002`,
+`V003`, … The transition from *fold-into-baseline* to *incremental migrations*
+happens at a single, declared point:
+
+> **The `V001` baseline freezes at the first tagged release designated stable —
+> the first `v1.0.0`, or an earlier `vX.Y.Z` whose release notes explicitly
+> declare the stable schema baseline.** From that release onward, any change to
+> a built-in table/column/index ships as a new versioned migration (`V002`+, per
+> [Writing New Migrations](#writing-new-migrations-developer-guide)), and the
+> fold-into-`V001` and no-legacy-shims allowances are retired. Before that
+> release, `V001` remains editable and breaking, as above.
+
+Until that release is cut, "add a `V002`" is **not** the workflow — update the
+`V001` baseline in `v001_initial_schema.rs` / `sql_dialect.rs`. The `V002+`
+developer guide below exists for the migration framework and the post-freeze
+path, not for routine build-out schema work.
+
+### How breaking changes are announced
+
+- **Between tagged releases:** breaking schema / config / env / API changes are
+  called out in that release's GitHub Release notes, keyed to the migration or
+  the env/config surface that changed. Operators upgrade tag-to-tag using
+  [upgrade_guide.md](upgrade_guide.md) (back up → dry-run migrate → validate on
+  non-production ports → cut over).
+- **On `main` / build-out branches:** there is no per-commit changelog promise.
+  New `FERRUM_*` env vars land with `docs/configuration.md` + `ferrum.conf`
+  updates in the same change, and schema-affecting changes update the `V001`
+  baseline and its tests. The authoritative "we are still folding" statement is
+  the [Build-Out Schema Policy](#build-out-schema-policy) above; its end
+  condition is the schema freeze defined here.
+
 ## Database Migrations
 
 ### How It Works
@@ -285,8 +338,9 @@ Do not add new core schema migrations during the active build-out phase. For
 new built-in tables, columns, or indexes, update the baseline schema in
 `src/config/migrations/v001_initial_schema.rs` /
 `src/config/migrations/sql_dialect.rs` and the corresponding tests. Add a new
-versioned core migration only after the schema is declared stable, or when a
-task explicitly asks for an upgrade path.
+versioned core migration only after the schema is declared stable (see
+[When V002+ migrations start](#when-v002-migrations-start-the-schema-freeze)),
+or when a task explicitly asks for an upgrade path.
 
 The steps below are retained for post-stabilization core migrations and for
 reference when working on the migration framework itself.

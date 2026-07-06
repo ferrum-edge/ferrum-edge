@@ -115,8 +115,14 @@ latency during rollout.
 
 `GET /charges` now requires an admin JWT. Update Prometheus or external billing
 collectors that scrape this endpoint to send `Authorization: Bearer <token>`
-(for example, Prometheus `bearer_token_file`) before upgrading. `/metrics`,
-`/health`, `/status`, and `/overload` remain unauthenticated.
+(for example, Prometheus `bearer_token_file`) before upgrading. Observability
+endpoints are also tiered by default now: `/metrics` returns `401` unless the
+caller presents an admin JWT, a matching `FERRUM_METRICS_BEARER_TOKEN`, or a
+source IP in `FERRUM_METRICS_ALLOWED_CIDRS`; `/health`, `/status`, and
+`/overload` return only a coarse status/level summary unauthenticated and full
+diagnostics only to an authenticated caller; `/live` stays unauthenticated and
+minimal. Update any collector that scrapes `/metrics` (or that relies on full
+`/health` / `/status` / `/overload` detail) to authenticate before upgrading.
 
 #### 4. Cut Over Production
 

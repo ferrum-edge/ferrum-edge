@@ -8,8 +8,8 @@
 | Target crate | `h3` |
 | Target version | 0.0.8 |
 | State | **Applied via vendored crate at `vendor/h3-0.0.8-ferrum-patched`** |
-| Upstream issue | _Not yet filed - see hand-off below_ |
-| Upstream PR | _Not yet filed - see hand-off below_ |
+| Upstream issue | _Deliberate fork — unfiled upstream (see hand-off below + [policy](../../dependency-policy.md#deliberate-fork-policy-and-sla))_ |
+| Upstream PR | _Deliberate fork — unfiled; target branch `feat/peek-buffered-trailers-before-fin` on `jeremyjpj0916/h3`_ |
 | Tracks | Ferrum Edge delayed-FIN backend trailer preservation (#1948) |
 
 ## Why this directory exists
