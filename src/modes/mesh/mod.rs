@@ -2138,9 +2138,12 @@ fn matched_remote_service_workloads<'a>(
 }
 
 /// The base cross-cluster east-west SNI for a service — the destination service
-/// FQDN `<name>.<namespace>.svc.<cluster-domain>`. The FIRST declared port routes
-/// on this, and it is the host a client uses to SELECT an `EastWestGateway`
-/// (whose `sni_hosts` claim the base FQDN). See [`cross_cluster_service_sni`].
+/// FQDN `<name>.<namespace>.svc.<cluster-domain>`. A SINGLE-HTTP-port service's
+/// sole port routes on this; a MULTI-HTTP-port service routes NO port on it
+/// (every port takes a `p<port>.<fqdn>` alias). It is also the host a client
+/// uses to SELECT an `EastWestGateway` (whose `sni_hosts` claiming the base
+/// FQDN auto-extends to the per-port aliases; see
+/// [`east_west_acceptable_snis`]). See [`cross_cluster_service_sni`].
 pub(crate) fn cross_cluster_service_base_fqdn(
     service: &crate::modes::mesh::config::MeshService,
     cluster_domain: &str,
@@ -5037,7 +5040,7 @@ pub(crate) fn append_cross_cluster_mesh_targets(
 /// (b) classified remote via
 /// [`crate::modes::mesh::multicluster::workload_is_remote`] against the SAME
 /// `multi_cluster`. Everything downstream of matching lives here — the
-/// first-port rule, the [R2-2] reachability filter, `(network, trust_domain)`
+/// per-port SNI scheme, the [R2-2] reachability filter, `(network, trust_domain)`
 /// grouping, fail-closed gateway selection, and the [R3-3]/[R5-3] duplicate
 /// dial-endpoint resolution — so it can never diverge between the mesh-mode
 /// materializer and the SD bridge.
@@ -5053,13 +5056,14 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
     // MULTI-PORT (issue #2010 phase 3): every HTTP-family `service_port` gets a
     // cross-cluster target. The destination gateway auto-materializes one
     // passthrough proxy per service port (`build_east_west_service_proxies_and_
-    // upstreams`), keyed by the port's SNI: the FIRST declared port on the base
-    // service FQDN, each additional port on the `p<port>.<fqdn>` alias
-    // (`cross_cluster_service_sni`). The client SELECTS the gateway by the BASE
-    // FQDN (which the operator's `sni_hosts` claim) but DIALS the per-port alias,
-    // so a gateway owning the base FQDN auto-owns its port aliases with no extra
-    // operator config. Non-HTTP-family ports never reach here (the caller gates
-    // the append on `is_http_family_mesh_protocol`).
+    // upstreams`), keyed by the port's SNI: a single-HTTP-port service's sole
+    // port on the bare base service FQDN, every port of a multi-port service on
+    // its `p<port>.<fqdn>` alias (`cross_cluster_service_sni`). The client
+    // SELECTS the gateway by the base FQDN or the exact dialed alias
+    // (`east_west_acceptable_snis`) but DIALS the per-port SNI, so a gateway
+    // owning the base FQDN auto-owns its port aliases with no extra operator
+    // config. Non-HTTP-family ports never reach here (the caller gates the
+    // append on `is_http_family_mesh_protocol`).
     if remote_workloads.is_empty() {
         return;
     }
@@ -5443,8 +5447,9 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
 ) {
     // MULTI-PORT (issue #2010 phase 3): every HTTP-family `service_port` gets
     // per-remote-pod cross-cluster targets — identical scheme to the Sidecar path.
-    // The client SELECTS the gateway by the BASE service FQDN but DIALS the
-    // per-port SNI alias (`cross_cluster_service_sni`); the inner HBONE CONNECT
+    // The client SELECTS the gateway by the base FQDN or the exact dialed alias
+    // (`east_west_acceptable_snis`) but DIALS the per-port SNI
+    // (`cross_cluster_service_sni`); the inner HBONE CONNECT
     // `:authority` already carries the per-port app port (`resolve_app_port`
     // below, which honors `service_port.target_port`). Non-HTTP-family ports never
     // reach here (the caller gates on `is_http_family_mesh_protocol`).
@@ -5573,9 +5578,10 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
                 crate::proxy::hbone_pool::HBONE_PORT_TAG.to_string(),
                 gateway.port.to_string(),
             );
-            // Outer-TLS SNI override = the destination service FQDN for the FIRST
-            // port, or the `p<port>.<fqdn>` alias for additional ports (multi-port
-            // east-west, issue #2010 phase 3).
+            // Outer-TLS SNI override = the bare destination service FQDN for a
+            // single-HTTP-port service, or the `p<port>.<fqdn>` alias for every
+            // port of a multi-port service (multi-port east-west, issue #2010
+            // phase 3).
             tags.insert(
                 crate::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG.to_string(),
                 dial_sni.clone(),

@@ -289,18 +289,19 @@ impl MeshServiceDiscoverer {
     /// unify them — only the SD path routes around the ref-only one.
     ///
     /// BRIDGEABILITY (fail closed otherwise, one-time warn): the east-west
-    /// model routes a service-FQDN SNI to only the service's FIRST DECLARED
-    /// port on the destination gateway (SNI carries no port — see the shared
-    /// core's first-port rule), and only over the HTTP-family cross-cluster
-    /// dial. So the bridge runs ONLY when the snapshot carries
-    /// `mesh.multi_cluster` AND this upstream's selected service port IS the
-    /// first declared port AND that port is effective-HTTP-family
+    /// model routes each HTTP-family service port on its own SNI — a
+    /// single-HTTP-port service on the bare base FQDN, every port of a
+    /// multi-port service on its explicit `p<port>.<fqdn>` alias
+    /// (`cross_cluster_service_sni`; multi-port east-west, issue #2010 phase
+    /// 3) — and only over the HTTP-family cross-cluster dial. So the bridge
+    /// runs ONLY when the snapshot carries `mesh.multi_cluster` AND this
+    /// upstream's selected service port is effective-HTTP-family
     /// (`protocol_overrides` applied, via the shared
-    /// `service_http_family_ports` predicate). A non-first selected port
-    /// cannot be honored — the destination gateway would forward its SNI to
-    /// the first port's backend, silently misrouting — so those upstreams keep
-    /// the fail-closed remote skip. A remote group with no matching gateway is
-    /// likewise skipped fail-closed inside the shared core (logged per poll).
+    /// `service_http_family_ports` predicate). A non-HTTP-family selected
+    /// port cannot be honored (raw-TCP / UDP cross-cluster is a later phase),
+    /// so those upstreams keep the fail-closed remote skip. A remote group
+    /// with no matching gateway is likewise skipped fail-closed inside the
+    /// shared core (logged per poll).
     ///
     /// SD-BRIDGE DELTA vs the materializer's cross-cluster targets (the ONLY
     /// intentional difference): each gateway target additionally carries
