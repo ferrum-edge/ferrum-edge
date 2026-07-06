@@ -317,15 +317,15 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             // lagging old teardown can never delete the new chains (codex). A
             // cancelled/panicked teardown is logged and we proceed to reinstall
             // (the new producer's own pre-teardown reaps any stale rules).
-            if let Some(prior) = self.pending_teardowns.remove(&netns) {
-                if let Err(error) = prior.await {
-                    warn!(
-                        netns_inode = netns,
-                        %error,
-                        "Ambient UDP producer: prior teardown task did not complete cleanly \
-                         before reopen; proceeding to reinstall rules"
-                    );
-                }
+            if let Some(prior) = self.pending_teardowns.remove(&netns)
+                && let Err(error) = prior.await
+            {
+                warn!(
+                    netns_inode = netns,
+                    %error,
+                    "Ambient UDP producer: prior teardown task did not complete cleanly \
+                     before reopen; proceeding to reinstall rules"
+                );
             }
             match self.backend.open_udp_capture(target) {
                 Some(handle) => {
