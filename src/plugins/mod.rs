@@ -24,6 +24,7 @@ pub mod a2a_gateway;
 pub mod access_control;
 pub mod adaptive_concurrency;
 pub mod ai_federation;
+pub mod ai_prompt_compressor;
 pub mod ai_prompt_shield;
 pub mod ai_rate_limiter;
 pub mod ai_request_guard;
@@ -2148,6 +2149,12 @@ pub mod priority {
     pub const AI_SEMANTIC_FIREWALL: u16 = 2968;
     pub const AI_REQUEST_GUARD: u16 = 2975;
     pub const AI_SEMANTIC_CACHE: u16 = 2980;
+    /// `ai_prompt_compressor`: shortens prompt text to cut LLM token usage.
+    /// Runs after the AI security/guard/cache plugins have inspected the
+    /// original prompt (shield 2925, firewall 2968, guard 2975, semantic cache
+    /// 2980) and just before `ai_federation` (2985), so a federated direct
+    /// dispatch forwards the compressed body.
+    pub const AI_PROMPT_COMPRESSOR: u16 = 2983;
     pub const AI_FEDERATION: u16 = 2985;
     /// `mcp_gateway`: parses MCP JSON-RPC bodies and applies MCP-aware route
     /// overrides after generic admission/auth plugins but before final dispatch.
@@ -3274,6 +3281,9 @@ pub fn create_plugin_with_http_client(
         "ai_prompt_shield" => Ok(Some(Arc::new(ai_prompt_shield::AiPromptShield::new(
             config,
         )?))),
+        "ai_prompt_compressor" => Ok(Some(Arc::new(
+            ai_prompt_compressor::AiPromptCompressor::new(config)?,
+        ))),
         "ai_semantic_firewall" => Ok(Some(Arc::new(
             ai_semantic_firewall::AiSemanticFirewall::new(config, http_client.clone())?,
         ))),
@@ -3628,6 +3638,10 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("ai_request_guard", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_rate_limiter", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_prompt_shield", PluginFailurePolicy::FailClosed),
+    builtin_plugin(
+        "ai_prompt_compressor",
+        PluginFailurePolicy::KeepLastKnownGood,
+    ),
     builtin_plugin("ai_semantic_firewall", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_response_guard", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_semantic_cache", PluginFailurePolicy::KeepLastKnownGood),

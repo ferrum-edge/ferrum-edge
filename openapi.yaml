@@ -3786,6 +3786,7 @@ paths:
                 - ai_request_guard
                 - ai_rate_limiter
                 - ai_prompt_shield
+                - ai_prompt_compressor
                 - ai_semantic_firewall
                 - ai_response_guard
                 - ai_semantic_cache
@@ -6971,6 +6972,15 @@ components:
             properties:
               config:
                 $ref: "#/components/schemas/AiPromptShieldConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_prompt_compressor
+          then:
+            properties:
+              config:
+                $ref: "#/components/schemas/AiPromptCompressorConfig"
         - if:
             required: [plugin_name]
             properties:
@@ -14715,6 +14725,38 @@ components:
           type: integer
           default: 1048576
           description: Skip scanning if body exceeds this size
+
+    AiPromptCompressorConfig:
+      type: object
+      description: "Plugin: ai_prompt_compressor — Shortens LLM prompt text to reduce token usage, cost, and latency using a model-free statistical (extractive) filter. Rewrites messages[].content (per role) and the legacy top-level prompt in OpenAI-shaped chat/completions bodies. Code blocks, inline code, URLs, numbers, and identifiers are preserved verbatim, and negations are always kept. No model files, network calls, or external services are used."
+      properties:
+        compress_roles:
+          type: array
+          items:
+            type: string
+          default: [user]
+          minItems: 1
+          description: "Message roles whose content is compressed (case-insensitive). Defaults to user only so system instructions are preserved; add 'system'/'assistant'/'tool' to compress those too. When 'user' is included, the legacy top-level `prompt` field is also compressed."
+        target_ratio:
+          type: number
+          format: float
+          default: 0.5
+          exclusiveMinimum: 0
+          exclusiveMaximum: 1
+          description: "Fraction of word-tokens to keep. 0.5 targets ~50% reduction; 0.3 is more aggressive. Must be between 0 and 1 (exclusive)."
+        min_content_tokens:
+          type: integer
+          minimum: 0
+          default: 200
+          description: "Estimated-token floor per content string. Content below this is passed through unchanged so short prompts are not mangled. Token counts are estimated (~4 characters per token); no model tokenizer is embedded."
+        max_scan_bytes:
+          type: integer
+          minimum: 1
+          default: 1048576
+          description: "Skip compression when the request body exceeds this size."
+        preserve_tag:
+          type: string
+          description: "Optional marker name. Text wrapped in <TAG>...</TAG> is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Name may contain ASCII letters, digits, '-', and '_'."
 
     AiResponseGuardConfig:
       type: object

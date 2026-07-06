@@ -3492,6 +3492,7 @@ Use this only when the normal backend has equivalent authentication, model allow
 - `ai_prompt_shield` (2925) scans/redacts PII before federation
 - `ai_semantic_firewall` (2968) blocks semantic prompt injection, exfiltration, tool-abuse, and topic-policy violations before semantic cache or federation
 - `ai_request_guard` (2975) validates model, tokens, temperature before federation
+- `ai_prompt_compressor` (2983) shortens prompt text so the federated provider receives fewer tokens
 - `ai_federation` (2985) routes to provider, writes token metadata to `ctx.metadata`
 - `ai_rate_limiter` (4200) records token usage from federation metadata via `applies_after_proxy_on_reject`
 
@@ -4026,6 +4027,35 @@ config:
     - name: internal_account
       regex: "ACCT-\\d{8}"
   exclude_roles: [system]
+```
+
+### `ai_prompt_compressor`
+
+Shortens prompt text to cut LLM token usage, cost, and latency using a model-free statistical (extractive) filter — no external models, services, or new dependencies. It rewrites `messages[].content` (for the configured roles) and the legacy top-level `prompt` in OpenAI-shaped chat/completions bodies, replacing long content strings with shorter versions.
+
+Request buffering is only enabled for matching JSON `POST` requests without a non-`identity` `Content-Encoding`.
+
+**Priority:** 2983 (after `ai_semantic_cache`, before `ai_federation`)
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `compress_roles` | String[] | `["user"]` | Message roles whose `content` is compressed (case-insensitive; non-empty). When it includes `user`, the legacy top-level `prompt` is compressed too. |
+| `target_ratio` | Number | `0.5` | Fraction of word-tokens to keep. `0.5` ≈ 50% reduction; `0.3` is more aggressive. Strictly between 0 and 1. |
+| `min_content_tokens` | Integer | `200` | Estimated-token floor per content string; shorter content is passed through unchanged. |
+| `max_scan_bytes` | Integer | `1048576` | Skip compression when the request body exceeds this size. |
+| `preserve_tag` | String | _(unset)_ | Optional marker name; text in `<TAG>…</TAG>` is kept verbatim and the markers are stripped. ASCII letters, digits, `-`, `_`. |
+
+The filter scores each word by stop-word membership, length, in-document rarity, and a proper-noun signal, then drops the lowest-scoring words until `target_ratio` is met. Fenced code blocks, inline code, URLs, numbers, `snake_case`/identifier tokens, uppercase acronyms, and negations (`not`, `never`, `cannot`, …) are always preserved. Token counts are estimated (~4 characters per token); no model tokenizer is embedded.
+
+Runs after the AI security/guard/cache plugins (`ai_prompt_shield`, `ai_semantic_firewall`, `ai_request_guard`, `ai_semantic_cache`) so they inspect the original prompt, and just before `ai_federation`. It rewrites `ctx.metadata["request_body"]` in `before_proxy` (so a federated direct dispatch forwards the compressed prompt) and re-derives the wire body in `transform_request_body` (authoritative for the bytes sent upstream, including the HTTP/3 cross-protocol path). Only `messages[].content` and the legacy `prompt` are compressed; embeddings `input` and Anthropic top-level `system` are deliberately left intact. When compression reduces the estimate, it records `ai_prompt_compressor.original_tokens`, `.compressed_tokens`, `.tokens_saved`, and `.fields_compressed` metadata for logging. See [`ai_prompt_compressor.md`](ai_prompt_compressor.md) for the full reference.
+
+```yaml
+plugin_name: ai_prompt_compressor
+config:
+  compress_roles: [user, system]
+  target_ratio: 0.4
+  min_content_tokens: 150
+  preserve_tag: keep
 ```
 
 ### `ai_response_guard`
