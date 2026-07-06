@@ -836,6 +836,23 @@ mod imp {
         Ok(meta.ino())
     }
 
+    /// The inode of the CALLING process's own (host/proxy) network namespace.
+    /// The Ambient UDP producer runs in the host netns, so this is the identity
+    /// of the node namespace. It is compared against a resolved pod netns inode
+    /// to refuse installing pod TPROXY/OUTPUT rules in the NODE namespace when a
+    /// registry entry resolves to the host netns (a `hostNetwork` workload, or a
+    /// stale/manual entry pointing at a host-netns cgroup). Fails closed: any
+    /// error means the caller cannot prove the target is NOT the host netns.
+    pub(crate) fn host_netns_inode() -> io::Result<u64> {
+        let meta = std::fs::metadata("/proc/self/ns/net").map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to stat host netns /proc/self/ns/net: {error}"),
+            )
+        })?;
+        Ok(meta.ino())
+    }
+
     /// Open a STABLE handle to a pod's network namespace (`/proc/<pid>/ns/net`)
     /// resolved from its cgroup. The returned `File` keeps the netns alive even
     /// if the resolving PID later exits, so the Ambient UDP producer can `setns`
@@ -1049,6 +1066,13 @@ mod imp {
         ))
     }
 
+    pub(crate) fn host_netns_inode() -> std::io::Result<u64> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "in-netns UDP capture is Linux-only",
+        ))
+    }
+
     pub(crate) fn open_pod_netns_handle(_cgroup_path: &str) -> std::io::Result<std::fs::File> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -1071,7 +1095,9 @@ mod imp {
 /// Shared low-level netns primitives, re-exported for the Ambient per-pod-netns
 /// UDP producer (`netns_udp_capture`) so it reuses the SAME `setns`/cgroup
 /// resolution recipe as the TCP node-waypoint capture path.
-pub(crate) use imp::{netns_inode_for_cgroup, open_pod_netns_handle, run_in_netns};
+pub(crate) use imp::{
+    host_netns_inode, netns_inode_for_cgroup, open_pod_netns_handle, run_in_netns,
+};
 
 #[cfg(test)]
 mod tests {

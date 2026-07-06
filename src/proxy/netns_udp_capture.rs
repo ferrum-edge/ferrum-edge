@@ -460,6 +460,48 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             }
         };
 
+        // Refuse to run pod UDP setup INSIDE the host/proxy network namespace.
+        // A registry entry can resolve to the host netns for a mesh-labeled
+        // `hostNetwork` workload, or a stale/manual entry whose cgroup points at
+        // a host-netns process. Running the setup there would install the
+        // TPROXY/OUTPUT rules in the NODE namespace and divert host UDP into a
+        // pod capture socket. Compare the identity of the netns we are about to
+        // `setns` into (the inode of the opened `/proc/<pid>/ns/net` handle)
+        // against our own (host) netns inode; skip when they match. Fail closed:
+        // if either inode cannot be read we cannot prove the target is not the
+        // host netns, so we do NOT install rules.
+        match (
+            netns
+                .metadata()
+                .map(|m| std::os::unix::fs::MetadataExt::ino(&m)),
+            super::netns_capture::host_netns_inode(),
+        ) {
+            (Ok(pod_ino), Ok(host_ino)) => {
+                if pod_ino == host_ino {
+                    warn!(
+                        pod_uid = %target.pod_uid,
+                        cgroup = %target.cgroup_path,
+                        netns_inode = pod_ino,
+                        "Ambient UDP producer: target resolves to the host/proxy netns \
+                         (hostNetwork or stale entry); refusing to install pod UDP rules \
+                         in the node namespace"
+                    );
+                    return None;
+                }
+            }
+            (pod_ino, host_ino) => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    cgroup = %target.cgroup_path,
+                    pod_netns_error = ?pod_ino.err(),
+                    host_netns_error = ?host_ino.err(),
+                    "Ambient UDP producer: could not compare pod vs host netns identity; \
+                     refusing to install pod UDP rules (fail closed)"
+                );
+                return None;
+            }
+        }
+
         // Best-effort in-netns teardown helper (pod removal / failure paths).
         // `Fn` (clones its captures per call) so it can be borrowed on the error
         // paths AND moved into the loop's cleanup task.
