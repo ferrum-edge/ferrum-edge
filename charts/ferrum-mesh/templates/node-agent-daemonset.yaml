@@ -57,9 +57,11 @@
        node-agent only WRITES the registry files (no setns / extra caps needed);
        the ambient proxy does the in-netns work. Derived from ambient.env so the
        flag has a single source of truth across both DaemonSets. */ -}}
+{{- /* Only `true`/`1` (matches the Rust parse_bool_env, which rejects yes/on);
+       kept in lock-step with the ambient DaemonSet predicate (codex). */ -}}
 {{- $ambientUdpCaptureEnabled := false -}}
 {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED" -}}
-{{- $ambientUdpCaptureEnabled = has (lower (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED"))) (list "true" "1" "yes" "on") -}}
+{{- $ambientUdpCaptureEnabled = has (lower (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED"))) (list "true" "1") -}}
 {{- end -}}
 {{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
 {{- $nodeAgentPublishesRegistry := or $nodeWaypointRegistryEnabled $ambientUdpProducer -}}

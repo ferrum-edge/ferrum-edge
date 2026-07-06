@@ -48,15 +48,21 @@ use super::netns_capture::{PodCaptureSource, PodCaptureTarget};
 pub struct OpenedUdpCapture {
     stop: watch::Sender<bool>,
     /// Test-only close hook so a mock backend can record teardown. Production
-    /// leaves this `None` — real teardown runs in the loop task after `stop`.
+    /// leaves this `None` — real teardown runs in the supervising task after `stop`.
     on_close: Option<Box<dyn FnOnce() + Send>>,
+    /// The production backend's supervising task (capture loop → in-netns rule
+    /// teardown). On graceful shutdown the manager awaits it (bounded) so the
+    /// TPROXY/routing rules are actually removed from the pod netns before the
+    /// process exits, instead of leaking them (codex). `None` for the test mock.
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl OpenedUdpCapture {
-    pub(crate) fn new(stop: watch::Sender<bool>) -> Self {
+    pub(crate) fn new(stop: watch::Sender<bool>, task: tokio::task::JoinHandle<()>) -> Self {
         Self {
             stop,
             on_close: None,
+            task: Some(task),
         }
     }
 
@@ -65,17 +71,21 @@ impl OpenedUdpCapture {
         Self {
             stop,
             on_close: Some(on_close),
+            task: None,
         }
     }
 
-    fn close(mut self) {
-        // Signal the capture loop to stop. The production backend's loop task
-        // observes this, exits, and then tears down THIS netns's UDP rules
-        // (best-effort). `on_close` is a test hook only.
+    /// Signal the capture loop to stop and return the supervising task handle (if
+    /// any) so the caller can await its in-netns teardown. `on_close` is a test
+    /// hook only. Dropping the returned handle does NOT abort the task — teardown
+    /// still runs in the background (used on pod removal); the shutdown path awaits
+    /// it instead.
+    fn close(mut self) -> Option<tokio::task::JoinHandle<()>> {
         let _ = self.stop.send(true);
         if let Some(cb) = self.on_close.take() {
             cb();
         }
+        self.task.take()
     }
 }
 
@@ -155,7 +165,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                 }
             }
         }
-        self.shutdown_all();
+        self.shutdown_all().await;
     }
 
     /// One reconcile pass: open producers for newly enrolled pod netns, close
@@ -250,7 +260,9 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             .collect();
         for netns in gone {
             if let Some(active) = self.active.remove(&netns) {
-                active.handle.close();
+                // Pod removal: fire-and-forget. Dropping the handle does not abort
+                // the supervising task, so its in-netns rule teardown still runs.
+                let _ = active.handle.close();
                 info!(
                     netns_inode = netns,
                     "Closed Ambient per-pod-netns UDP capture producer"
@@ -294,11 +306,65 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
         self.active.len()
     }
 
-    fn shutdown_all(&mut self) {
+    /// Close every producer on graceful shutdown and AWAIT their in-netns rule
+    /// teardown (bounded), so the process does not exit while pod netns still hold
+    /// this producer's TPROXY/routing rules (codex). The wait is bounded so a pod
+    /// netns that has already disappeared (its teardown blocking on `setns`) can't
+    /// hang shutdown.
+    async fn shutdown_all(&mut self) {
+        let mut tasks = tokio::task::JoinSet::new();
         for (_, active) in self.active.drain() {
-            active.handle.close();
+            if let Some(handle) = active.handle.close() {
+                tasks.spawn(async move {
+                    let _ = handle.await;
+                });
+            }
+        }
+        if tasks.is_empty() {
+            return;
+        }
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await;
+        if drained.is_err() {
+            warn!(
+                "Ambient UDP capture: timed out awaiting per-pod-netns rule teardown on shutdown; \
+                 some rules may remain until the pod netns is removed"
+            );
         }
     }
+}
+
+/// Preflight the external tools the Ambient UDP producer needs — a shell plus
+/// `ip` + `iptables` — before starting the manager. The producer runs `sh -c`
+/// scripts that call `ip`/`iptables` inside each pod netns; a distroless runtime
+/// image ships none of them, so without this check every pod's `open_udp_capture`
+/// would fail `NotFound`, return `None`, and the manager would retry forever with
+/// nothing captured (codex). Fail startup with a clear, actionable message
+/// instead. Non-`cfg`-gated so the `cfg!(target_os = "linux")` runtime gate at the
+/// call site compiles on every platform; it only runs on Linux.
+pub(crate) fn preflight_capture_tools() -> Result<(), String> {
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("command -v ip >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1")
+        .output()
+        .map_err(|e| {
+            format!(
+                "Ambient UDP capture is enabled but `sh` is not available in the runtime image \
+                 (the producer runs in-netns `sh -c` scripts that call `ip`/`iptables`): {e}. Use a \
+                 runtime image that ships a shell + iproute2 + iptables, or unset \
+                 FERRUM_MESH_CAPTURE_UDP_ENABLED."
+            )
+        })?;
+    if !output.status.success() {
+        return Err("Ambient UDP capture is enabled but `ip` and/or `iptables` are not available in \
+             the runtime image; the per-pod-netns producer needs both to install UDP TPROXY rules. \
+             Use a runtime image that ships iproute2 + iptables (the distroless default lacks them), \
+             or unset FERRUM_MESH_CAPTURE_UDP_ENABLED."
+            .to_string());
+    }
+    Ok(())
 }
 
 /// Production backend: resolves each pod's netns from its cgroup, installs the
@@ -460,7 +526,10 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             v6_origdst,
             "Ambient UDP producer: per-pod-netns capture socket bound and rules installed"
         );
-        tokio::spawn(async move {
+        // Keep the supervising task's handle so graceful shutdown can await its
+        // in-netns teardown (codex): the task runs the capture loop until stopped,
+        // then removes THIS netns's UDP rules.
+        let task = tokio::spawn(async move {
             let _ = super::mesh_udp_capture::run_mesh_udp_capture_on_socket(
                 frontend_socket,
                 bound_addr,
@@ -482,7 +551,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             .await;
         });
 
-        Some(OpenedUdpCapture::new(stop_tx))
+        Some(OpenedUdpCapture::new(stop_tx, task))
     }
 }
 
@@ -749,8 +818,8 @@ mod tests {
         assert_eq!(*opened.lock().unwrap(), vec![100]);
     }
 
-    #[test]
-    fn shutdown_all_closes_every_producer() {
+    #[tokio::test]
+    async fn shutdown_all_closes_every_producer() {
         let source = Arc::new(StaticSource(Mutex::new(vec![
             target("pod-a", "/cg/a"),
             target("pod-c", "/cg/c"),
@@ -759,7 +828,7 @@ mod tests {
         let closed = backend.closed.clone();
         let mut mgr = manager(source, backend);
         assert_eq!(mgr.reconcile_once(), 2);
-        mgr.shutdown_all();
+        mgr.shutdown_all().await;
         let mut got = closed.lock().unwrap().clone();
         got.sort_unstable();
         assert_eq!(got, vec![100, 200], "shutdown closes every producer");

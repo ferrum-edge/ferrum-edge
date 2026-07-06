@@ -26,11 +26,27 @@
        it needs the SAME registry mount + host cgroup/proc access + setns/NET_ADMIN
        capabilities the NodeWaypoint in-netns TCP path needs (but NOT bpffs/BPF —
        the UDP producer touches no eBPF maps). */ -}}
+{{- /* Only `true`/`1` enable capture — matches the Rust parser (parse_bool_env,
+       which REJECTS `yes`/`on`). A looser predicate would mount privileges + set
+       the node-agent registry flag while the proxy rejects its env and fails
+       startup (codex). */ -}}
 {{- $ambientUdpCaptureEnabled := false -}}
 {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED" -}}
-{{- $ambientUdpCaptureEnabled = has (lower (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED"))) (list "true" "1" "yes" "on") -}}
+{{- $ambientUdpCaptureEnabled = has (lower (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED"))) (list "true" "1") -}}
 {{- end -}}
 {{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
+{{- /* Ambient UDP capture requires the node-agent publisher: it publishes the
+       pod uid->cgroup registry the producer consumes (mirrors the NodeWaypoint
+       validations). Without it the producer polls an empty hostPath forever and
+       never captures. Require nodeAgent.enabled=true + eBPF capture (codex). */ -}}
+{{- if $ambientUdpProducer -}}
+{{- if not .Values.nodeAgent.enabled -}}
+{{- fail "ambient FERRUM_MESH_CAPTURE_UDP_ENABLED=true requires nodeAgent.enabled=true: the node-agent publishes the per-pod registry the Ambient UDP producer consumes" -}}
+{{- end -}}
+{{- if ne (lower (toString .Values.nodeAgent.captureMode)) "ebpf" -}}
+{{- fail "ambient FERRUM_MESH_CAPTURE_UDP_ENABLED=true requires nodeAgent.captureMode=ebpf so the node-agent enrolls pods and publishes the registry" -}}
+{{- end -}}
+{{- end -}}
 {{- /* In-netns capture (either NodeWaypoint TCP listeners or the Ambient UDP
        producer) requires the registry mount, host cgroup/proc, and setns caps. */ -}}
 {{- $ambientInNetnsCapture := or $nodeWaypointRegistryEnabled $ambientUdpProducer -}}

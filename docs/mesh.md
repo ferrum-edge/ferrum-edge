@@ -1949,16 +1949,24 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   and binds the transparent capture + reply sockets INSIDE each enrolled pod's netns
   (`setns` on a dedicated OS thread), then runs the SAME
   `run_mesh_udp_capture_on_socket` capture/egress loop with a
-  `PodNetnsReplySocketFactory`. It reuses the EXACT injector rule shapes
+  `PodNetnsReplySocketFactory`. It reuses the injector's OUTBOUND rule shapes
   (`IptablesPlan::udp_setup_script` / `udp_teardown_script` over the shared
-  `udp_tproxy_commands_for_family`, so Ambient-produced and Sidecar-injected pods
-  capture UDP identically) and the per-pod registry the node-agent publishes (now
-  also published for Ambient when UDP capture is enabled). It binds the socket
-  BEFORE installing the rules (no black-hole window) and tears down only its own
-  rules on pod removal / config change / shutdown. The producer **disables the
-  proxy-UID owner-match RETURN** — there is no co-located proxy in the pod netns to
-  exclude, so all app UDP egress is captured; keeping the sidecar's `1337` exclusion
-  here would fail OPEN for a pod app that ran as `1337`. **Scoped-policy
+  `udp_tproxy_commands_for_family`) but is **outbound-only** — it does NOT emit the
+  inbound `--dst-type LOCAL` chain the injector does. The producer installs rules
+  inside EVERY enrolled pod netns (including DESTINATION pods), where an inbound
+  chain would capture and drop the HBONE relay's own delivery to the local app
+  (`handle_hbone_udp_request` → local `UdpSocket`) AND the source pod's return-path
+  reply to the client — black-holing the relayed UDP both ways. It rides the per-pod
+  registry the node-agent publishes (now also published for Ambient when UDP capture
+  is enabled). It binds the socket BEFORE installing the rules (no black-hole window)
+  and tears down only its own rules on pod removal / config change / shutdown
+  (graceful shutdown AWAITS the per-netns teardown). Startup is **fail-closed**: an
+  invalid capture config, or a runtime image missing `sh`/`ip`/`iptables`, aborts
+  mesh startup rather than silently retrying with nothing captured. The producer
+  **disables the proxy-UID owner-match RETURN** — there is no co-located proxy in the
+  pod netns to exclude, so all app UDP egress is captured; keeping the sidecar's
+  `1337` exclusion here would fail OPEN for a pod app that ran as `1337`.
+  **Scoped-policy
   limitation:** Ambient UDP source-capture carries no per-pod policy evidence, so
   captured UDP is authorized **mesh-wide** (relayed under the gateway identity), not
   per-pod. The reconcile / rule-generation / registry logic is unit-tested; the full

@@ -1110,6 +1110,8 @@ fn commands_for_family(
             family,
             &include_cidrs,
             &exclude_cidrs,
+            // Injector (Sidecar): capture inbound-to-pod UDP too (fail-closed).
+            true,
         ));
     }
     commands
@@ -1210,6 +1212,7 @@ fn udp_tproxy_commands_for_family(
     family: CidrFamily,
     include_cidrs: &[&str],
     exclude_cidrs: &[&str],
+    emit_inbound: bool,
 ) -> Vec<String> {
     // Host-netns UDP suppression (codex r5, finding #1). The `addrtype --dst-type
     // LOCAL` direction split below is only valid in the pod netns; in the host
@@ -1329,14 +1332,23 @@ fn udp_tproxy_commands_for_family(
         .map(|sel| format!("{sel} {outbound_dst_scope} {mark_jump}"))
         .collect();
 
-    // INBOUND UDP must remain captured when sidecar UDP capture is enabled. The
-    // destination-side HBONE datagram relay requires an authenticated mesh peer
-    // before opening a local UDP socket; letting pod-destined UDP bypass TPROXY
-    // would bypass mesh identity and mesh_authz policy. Until a dedicated inbound
-    // UDP relay exists, the captured LOCAL-destination path intentionally
-    // fail-closes in the egress-only listener instead of passing unauthenticated
-    // traffic directly to the workload.
-    let emit_inbound = true;
+    // Whether to emit the INBOUND `--dst-type LOCAL` TPROXY chain/jump, decided by
+    // the CALLER (the `emit_inbound` parameter):
+    //
+    // * The **injector** (Sidecar, `commands_for_family`) passes `true`: inbound
+    //   UDP to the pod is captured so unauthenticated pod-destined UDP can't bypass
+    //   mesh identity/authz, fail-closing in the egress-only listener.
+    //
+    // * The **Ambient per-pod-netns producer** (`udp_only_commands_for_family`)
+    //   passes `false` — OUTBOUND-ONLY. The producer installs rules INSIDE every
+    //   enrolled pod netns, including DESTINATION pods, where an inbound
+    //   `--dst-type LOCAL` chain would capture the HBONE datagram relay's own
+    //   delivery to the local app (`handle_hbone_udp_request` → local `UdpSocket`
+    //   send to the pod app) AND the source pod's return-path reply to the client,
+    //   TPROXY them into the egress-only listener, and DROP them — black-holing the
+    //   relayed UDP both ways. The producer only needs to capture the pod's
+    //   OUTBOUND egress (to relay it); inbound-to-pod UDP must flow to the app
+    //   untouched (codex).
 
     // If this family emits NO TPROXY rule at all (e.g. a pure-CIDR cross-family
     // skip with no port includes), produce NO UDP state for it — no chains, no
@@ -1774,7 +1786,18 @@ fn udp_only_commands_for_family(config: &CaptureConfig, family: CidrFamily) -> V
         .filter(|cidr| cidr_family(cidr) == Some(family))
         .map(String::as_str)
         .collect();
-    udp_tproxy_commands_for_family(binary, config, family, &include_cidrs, &exclude_cidrs)
+    // OUTBOUND-ONLY for the Ambient producer: it installs rules inside every
+    // enrolled pod netns (incl. destination pods), where capturing inbound
+    // `--dst-type LOCAL` UDP would black-hole the HBONE relay's delivery to the
+    // local app and the source pod's return-path reply (codex).
+    udp_tproxy_commands_for_family(
+        binary,
+        config,
+        family,
+        &include_cidrs,
+        &exclude_cidrs,
+        false,
+    )
 }
 
 fn cleanup_commands_for(binary: &str, udp_capture_enabled: bool) -> CleanupCommands {
@@ -2997,21 +3020,65 @@ mod tests {
     }
 
     #[test]
-    fn udp_only_plan_matches_the_injectors_udp_rules() {
-        // The producer's UDP rules must be byte-identical to the UDP rules the
-        // injector emits (both flow through `udp_tproxy_commands_for_family`), so
-        // Sidecar-injected and Ambient-produced pods capture UDP identically.
-        // `commands_for_family` appends the UDP rules AFTER the TCP nat chains, so
-        // the injector's command list must END WITH the producer's UDP-only list.
+    fn udp_only_plan_is_outbound_only_unlike_injector() {
+        // The Ambient producer installs rules INSIDE every enrolled pod netns
+        // (including DESTINATION pods), so it must be OUTBOUND-ONLY: an inbound
+        // `--dst-type LOCAL` chain would capture + drop the HBONE relay's delivery
+        // to the local app AND the source pod's return-path reply (codex). The
+        // injector (Sidecar) still emits the inbound chain. Both flow through the
+        // SAME `udp_tproxy_commands_for_family`, so the producer's OUTBOUND rules
+        // stay byte-identical to the injector's — only the inbound chain differs.
         let config = udp_enabled_iptables_config();
         let producer = IptablesPlan::udp_only_for_config(&config).v4_commands;
         let injector = IptablesPlan::for_config(&config).v4_commands;
         assert!(!producer.is_empty());
+
+        // Producer captures egress: OUTBOUND chain + OUTPUT MARK loop + routing.
         assert!(
-            injector.ends_with(&producer),
-            "the injector's rules must end with the producer's UDP-only rules\n\
-             producer={producer:#?}\ninjector={injector:#?}"
+            producer
+                .iter()
+                .any(|c| c.contains("-N FERRUM_MESH_UDP_OUTBOUND")),
+            "producer must create the outbound UDP chain: {producer:#?}"
         );
+        assert!(
+            producer
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_OUTPUT_MARK")),
+            "producer must emit the OUTPUT MARK loop for locally-generated egress"
+        );
+        assert!(
+            producer
+                .iter()
+                .any(|c| c.contains("ip rule add") && c.contains("fwmark")),
+            "producer must install the fwmark policy route"
+        );
+
+        // Producer emits NO inbound chain/jump (outbound-only) — this is what keeps
+        // the destination relay's delivery + the return-path reply from being
+        // captured and dropped in the pod netns.
+        for cmd in &producer {
+            assert!(
+                !cmd.contains("FERRUM_MESH_UDP_INBOUND"),
+                "producer must not emit the inbound UDP chain: {cmd}"
+            );
+        }
+        // The injector (Sidecar) DOES still emit the inbound chain — contrast.
+        assert!(
+            injector
+                .iter()
+                .any(|c| c.contains("FERRUM_MESH_UDP_INBOUND")),
+            "injector should still emit the inbound UDP chain"
+        );
+
+        // Every producer (outbound) rule matches an injector rule verbatim: the
+        // producer is the injector's UDP rules MINUS the inbound chain, so
+        // Ambient-produced and Sidecar-injected pods capture EGRESS identically.
+        for cmd in &producer {
+            assert!(
+                injector.contains(cmd),
+                "producer outbound rule must equal an injector rule: {cmd}"
+            );
+        }
     }
 
     #[test]

@@ -9042,87 +9042,81 @@ async fn serve_mesh_runtime(
     // Sidecar keeps its current-netns `PlaintextUdpCapture` listener; any other
     // topology captures no UDP. Linux-only; a clear warning is emitted elsewhere.
     if runtime.topology == MeshTopology::Ambient {
-        match crate::capture::udp_capture_settings_from_env() {
-            Ok(settings) if settings.udp_capture_enabled => {
-                if !cfg!(target_os = "linux") {
-                    warn!(
-                        "Ambient UDP capture is enabled but the per-pod-netns producer is \
-                         Linux-only; not starting it (UDP egress passes through un-captured)"
-                    );
-                } else {
-                    match crate::capture::CaptureConfig::from_env() {
-                        Ok(mut capture_config) => {
-                            // Producer posture: UDP enabled, POD netns (never
-                            // host-netns — the producer installs rules INSIDE each
-                            // pod netns), on the resolved capture port/mark. The
-                            // include/exclude scope is node-level (from the proxy's
-                            // `FERRUM_MESH_CAPTURE_*` env); per-pod
-                            // `includeOutboundPorts` annotation scoping is a
-                            // documented follow-up (it would ride the registry).
-                            capture_config.udp_capture_enabled = true;
-                            capture_config.host_netns = false;
-                            capture_config.udp_outbound_port = settings.udp_outbound_port;
-                            capture_config.tproxy_mark = settings.tproxy_mark;
-                            // NO proxy-UID owner-match self-exclusion. That RETURN
-                            // exists to skip the co-located SIDECAR's own egress; in
-                            // Ambient the proxy is OUTSIDE the pod netns, so the only
-                            // egress in the pod netns is the app's — which is exactly
-                            // what we capture. Keeping the default UID (1337) here
-                            // would fail OPEN for a pod app that happened to run as
-                            // 1337 (its UDP egress would RETURN un-captured). The
-                            // anti-loop mark RETURN + `! --dst-type LOCAL` scope still
-                            // bound the OUTPUT-mark loop without an owner match, and
-                            // the proxy's own relay egress never traverses the pod
-                            // netns anyway.
-                            capture_config.proxy_uid = None;
-                            let source =
-                                Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
-                                    env_config.mesh_node_waypoint_pod_registry_dir.clone(),
-                                ));
-                            let backend =
-                                crate::proxy::netns_udp_capture::ProxyNetnsUdpBackend::new(
-                                    Arc::new(proxy_state.clone()),
-                                    capture_config,
-                                    settings.udp_outbound_port,
-                                    env_config.udp_max_sessions,
-                                    env_config.udp_cleanup_interval_seconds,
-                                    env_config.udp_recvmmsg_batch_size,
-                                    env_config.pool_shard_amount,
-                                    shutdown_tx.subscribe(),
-                                );
-                            let manager =
-                                crate::proxy::netns_udp_capture::NetnsUdpCaptureManager::new(
-                                    settings.udp_outbound_port,
-                                    source,
-                                    backend,
-                                    std::time::Duration::from_secs(2),
-                                );
-                            let manager_shutdown = shutdown_tx.subscribe();
-                            info!(
-                                registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
-                                capture_port = settings.udp_outbound_port,
-                                "Ambient per-pod-netns UDP capture producer enabled"
-                            );
-                            mesh_background_handles.push(tokio::spawn(async move {
-                                manager.run(manager_shutdown).await;
-                            }));
-                        }
-                        Err(error) => {
-                            warn!(
-                                %error,
-                                "Ambient UDP capture is enabled but the capture config is invalid; \
-                                 not starting the producer (UDP egress passes through un-captured)"
-                            );
-                        }
-                    }
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
+        // Fail closed on a malformed UDP setting (codex): the operator explicitly
+        // enabled UDP capture, so a typo must not silently start the mesh with the
+        // producer disabled and pod UDP egress bypassing the mesh.
+        let settings = crate::capture::udp_capture_settings_from_env().map_err(|e| {
+            anyhow::anyhow!("invalid UDP capture settings for the Ambient UDP producer: {e}")
+        })?;
+        if settings.udp_capture_enabled {
+            if !cfg!(target_os = "linux") {
                 warn!(
-                    %error,
-                    "Skipping Ambient UDP capture producer: invalid UDP capture settings"
+                    "Ambient UDP capture is enabled but the per-pod-netns producer is Linux-only; \
+                     not starting it (UDP egress passes through un-captured)"
                 );
+            } else {
+                // Preflight the in-netns tooling before starting the manager: a
+                // distroless runtime image has no `sh`/`ip`/`iptables`, which would
+                // make every pod fail to open and the manager retry forever with
+                // nothing captured. Fail closed with a clear message (codex).
+                crate::proxy::netns_udp_capture::preflight_capture_tools()
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                // Fail closed on a malformed capture config (codex): an invalid
+                // include/exclude CIDR, port list, or FERRUM_MESH_IP6TABLES_ENABLED
+                // value must abort startup, not silently disable the datapath.
+                let mut capture_config =
+                    crate::capture::CaptureConfig::from_env().map_err(|e| {
+                        anyhow::anyhow!(
+                            "Ambient UDP capture is enabled but the capture config is invalid: {e}"
+                        )
+                    })?;
+                // Producer posture: UDP enabled, POD netns (never host-netns — the
+                // producer installs rules INSIDE each pod netns), on the resolved
+                // capture port/mark. The include/exclude scope is node-level (from
+                // the proxy's `FERRUM_MESH_CAPTURE_*` env); per-pod
+                // `includeOutboundPorts` annotation scoping is a documented
+                // follow-up (it would ride the registry).
+                capture_config.udp_capture_enabled = true;
+                capture_config.host_netns = false;
+                capture_config.udp_outbound_port = settings.udp_outbound_port;
+                capture_config.tproxy_mark = settings.tproxy_mark;
+                // NO proxy-UID owner-match self-exclusion. That RETURN exists to
+                // skip the co-located SIDECAR's own egress; in Ambient the proxy is
+                // OUTSIDE the pod netns, so the only egress in the pod netns is the
+                // app's — exactly what we capture. Keeping the default UID (1337)
+                // would fail OPEN for a pod app that happened to run as 1337. The
+                // anti-loop mark RETURN + `! --dst-type LOCAL` scope still bound the
+                // OUTPUT-mark loop without an owner match, and the proxy's own relay
+                // egress never traverses the pod netns anyway.
+                capture_config.proxy_uid = None;
+                let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+                    env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+                ));
+                let backend = crate::proxy::netns_udp_capture::ProxyNetnsUdpBackend::new(
+                    Arc::new(proxy_state.clone()),
+                    capture_config,
+                    settings.udp_outbound_port,
+                    env_config.udp_max_sessions,
+                    env_config.udp_cleanup_interval_seconds,
+                    env_config.udp_recvmmsg_batch_size,
+                    env_config.pool_shard_amount,
+                    shutdown_tx.subscribe(),
+                );
+                let manager = crate::proxy::netns_udp_capture::NetnsUdpCaptureManager::new(
+                    settings.udp_outbound_port,
+                    source,
+                    backend,
+                    std::time::Duration::from_secs(2),
+                );
+                let manager_shutdown = shutdown_tx.subscribe();
+                info!(
+                    registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+                    capture_port = settings.udp_outbound_port,
+                    "Ambient per-pod-netns UDP capture producer enabled"
+                );
+                mesh_background_handles.push(tokio::spawn(async move {
+                    manager.run(manager_shutdown).await;
+                }));
             }
         }
     }
