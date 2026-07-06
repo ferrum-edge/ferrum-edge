@@ -187,6 +187,33 @@ pub(crate) struct UpstreamSelection {
     pub sticky_cookie_needed: bool,
 }
 
+/// Whether a direct HTTP-family dial would bypass a target's required mesh
+/// transport.
+///
+/// Same-cluster plain HTTP can ride HBONE or mesh-mTLS only through the mesh
+/// dispatch paths. Cross-cluster mesh targets additionally require east-west
+/// SNI/trust-domain handling, so a direct dial is invalid even if the transport
+/// tag is malformed or missing.
+pub(crate) fn direct_http_mesh_transport_refusal(
+    target: Option<&UpstreamTarget>,
+) -> Option<&'static str> {
+    let target = target?;
+    let hbone = crate::proxy::hbone_pool::target_hbone_enabled(target);
+    let mesh_mtls = crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(target);
+    let cross_cluster = crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
+        || crate::proxy::mesh_mtls_pool::target_mesh_mtls_cross_cluster(target);
+
+    if cross_cluster {
+        Some("cross-cluster mesh transport dispatch required for this backend target")
+    } else if hbone {
+        Some("HBONE dispatch required for this backend target")
+    } else if mesh_mtls {
+        Some("Sidecar mTLS dispatch required for this backend target")
+    } else {
+        None
+    }
+}
+
 /// Select an upstream target for the given proxy using load balancing with
 /// health-aware filtering.
 ///
@@ -1165,6 +1192,62 @@ mod tests {
             locality: None,
             path: None,
         })
+    }
+
+    fn target_with_tags(tags: &[(&str, &str)]) -> UpstreamTarget {
+        UpstreamTarget {
+            host: "10.0.0.10".to_string(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 1,
+            tags: tags
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            locality: None,
+            path: None,
+        }
+    }
+
+    #[test]
+    fn direct_http_mesh_transport_refusal_detects_mesh_required_targets() {
+        assert_eq!(direct_http_mesh_transport_refusal(None), None);
+        assert_eq!(
+            direct_http_mesh_transport_refusal(Some(&target_with_tags(&[]))),
+            None
+        );
+        assert_eq!(
+            direct_http_mesh_transport_refusal(Some(&target_with_tags(&[(
+                crate::proxy::hbone_pool::HBONE_TARGET_TAG,
+                "true",
+            )]))),
+            Some("HBONE dispatch required for this backend target")
+        );
+        assert_eq!(
+            direct_http_mesh_transport_refusal(Some(&target_with_tags(&[(
+                crate::proxy::mesh_mtls_pool::MESH_MTLS_TARGET_TAG,
+                "true",
+            )]))),
+            Some("Sidecar mTLS dispatch required for this backend target")
+        );
+        assert_eq!(
+            direct_http_mesh_transport_refusal(Some(&target_with_tags(&[(
+                crate::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG,
+                "true",
+            )]))),
+            Some("cross-cluster mesh transport dispatch required for this backend target")
+        );
+    }
+
+    #[test]
+    fn direct_http_mesh_transport_refusal_prioritizes_cross_cluster_shape() {
+        assert_eq!(
+            direct_http_mesh_transport_refusal(Some(&target_with_tags(&[
+                (crate::proxy::hbone_pool::HBONE_TARGET_TAG, "true"),
+                (crate::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG, "true",),
+            ]))),
+            Some("cross-cluster mesh transport dispatch required for this backend target")
+        );
     }
 
     #[test]

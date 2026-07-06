@@ -16980,6 +16980,38 @@ async fn handle_proxy_request_inner(
                 }
             }
 
+            if let Some(reason) =
+                backend_dispatch::direct_http_mesh_transport_refusal(current_target.as_deref())
+            {
+                warn!(
+                    proxy_id = %proxy.id,
+                    target_host = current_target.as_deref().map(|target| target.host.as_str()).unwrap_or(""),
+                    target_port = current_target.as_deref().map(|target| target.port).unwrap_or(0),
+                    reason,
+                    "HTTP retry rotated onto a mesh-transport-tagged target; refusing direct retry dispatch"
+                );
+                result = retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#
+                            .to_vec(),
+                    ),
+                    headers: HashMap::from([(
+                        "gateway-error-reason".to_string(),
+                        reason.to_string(),
+                    )]),
+                    connection_error: false,
+                    backend_resolved_ip: None,
+                    error_class: Some(retry::ErrorClass::DispatchPolicyRejected),
+                };
+                final_upstream_target = current_target.clone();
+                backend_admission_started_at = Instant::now();
+                // No backend attempt was made for the rotated target. Keep the
+                // synthetic policy refusal neutral for CB/passive-health.
+                skip_final_cb_record = true;
+                break;
+            }
+
             // Enforce per-target circuit breaker before each retry attempt.
             // Retries may switch to a different upstream target, so the
             // breaker gate must be re-evaluated for the currently selected

@@ -2165,6 +2165,59 @@ async fn handle_h3_request(
         && !forces_reqwest_dispatch
         && backend_supports_native_h3;
 
+    // Native-H3 pool branches (Plain + gRPC flavor, backend probed H3-capable)
+    // are direct QUIC dials with no HBONE / mesh-mTLS / east-west path, so fail
+    // closed on a mesh-transport-tagged target BEFORE either native branch can
+    // open the H3 backend pool.
+    let native_h3_direct_dispatch = use_native_h3_pool || use_native_h3_grpc;
+    if native_h3_direct_dispatch
+        && let Some(reason) = crate::proxy::backend_dispatch::direct_http_mesh_transport_refusal(
+            upstream_target.as_deref(),
+        )
+    {
+        warn!(
+            proxy_id = %proxy.id,
+            target_host = upstream_target.as_deref().map(|target| target.host.as_str()).unwrap_or(""),
+            target_port = upstream_target.as_deref().map(|target| target.port).unwrap_or(0),
+            reason,
+            "native H3 dispatch: refusing direct dial to a mesh-transport-tagged target"
+        );
+        // Neutral to the breaker (releases a claimed HALF_OPEN probe slot) and
+        // to passive health / latency — same recording as the H3 plain bridge's
+        // refusal arm. No admission permits or LB connection start exist yet.
+        crate::proxy::backend_dispatch::record_backend_outcome_no_conn_end(
+            &state,
+            &proxy,
+            &epoch.load_balancer,
+            upstream_balancer.as_ref(),
+            upstream_target.as_deref(),
+            cb_target_key.as_deref(),
+            502,
+            false,
+            Some(crate::retry::ErrorClass::DispatchPolicyRejected),
+            cb_is_half_open_probe,
+            false,
+            backend_start.elapsed(),
+        );
+        let reject_metric_status = if http_flavor == HttpFlavor::Grpc {
+            200
+        } else {
+            502
+        };
+        record_request(&state, reject_metric_status);
+        let reason_headers =
+            HashMap::from([("gateway-error-reason".to_string(), reason.to_string())]);
+        send_h3_reject_flavor_aware(
+            &mut stream,
+            http_flavor,
+            StatusCode::BAD_GATEWAY,
+            br#"{"error":"Bad Gateway","message":"Mesh transport dispatch required for this backend target"}"#,
+            &reason_headers,
+        )
+        .await?;
+        return Ok(());
+    }
+
     // ========================================================================
     // Cross-protocol bridge: H3 client → non-H3 backend.
     //
