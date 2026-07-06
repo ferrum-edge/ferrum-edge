@@ -239,18 +239,29 @@ override or the pod-loopback peer.
 
 The **same** registry is published for **Ambient** deployments when UDP capture
 is enabled (`FERRUM_MESH_CAPTURE_UDP_ENABLED=true`): the node-agent publish gate
-is `should_publish_registry = node_waypoint_in_netns || (udp_capture_enabled &&
-outbound_capture_enabled)`. Publishing for the Ambient-UDP case does **not** flip
-the NodeWaypoint ipv6-outbound-deny / connect4-deferral posture (that stays gated
-on `node_waypoint_in_netns`) — it only makes the per-pod `uid → cgroup` registry
-available so the Ambient mesh proxy's `NetnsUdpCaptureManager`
-(`src/proxy/netns_udp_capture.rs`) can discover enrolled pods. For each pod the
-producer enters the pod netns (`setns(CLONE_NEWNET)` on a dedicated thread),
-installs the UDP TPROXY rules, and binds the transparent capture + reply sockets
-there. It writes **no** `.ready` markers (unlike the NodeWaypoint TCP path): the
-producer binds the socket **before** installing the rules, so there is no window
-where captured UDP is diverted to a not-yet-bound socket, and no cross-process
-readiness handshake is needed.
+is `should_publish_registry = node_waypoint_in_netns || udp_capture_enabled`.
+The UDP term is deliberately **not** anded with `outbound_capture_enabled`: the
+Ambient UDP producer binds its own `FERRUM_MESH_CAPTURE_UDP_PORT` inside each
+pod netns and never uses the TCP `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` listener, so
+a port-0 outbound listener (which disables the TCP connect-redirect path) must
+not suppress registry publication — that would leave the producer polling an
+empty directory while pod UDP egress bypasses capture. Publishing for the
+Ambient-UDP case does **not** flip the NodeWaypoint ipv6-outbound-deny /
+connect4-deferral posture (that stays gated on `node_waypoint_in_netns`) — it
+only makes the per-pod `uid → cgroup` registry available so the Ambient mesh
+proxy's `NetnsUdpCaptureManager` (`src/proxy/netns_udp_capture.rs`) can discover
+enrolled pods. For each pod the producer enters the pod netns
+(`setns(CLONE_NEWNET)` on a dedicated thread), installs the UDP TPROXY rules,
+and binds the transparent capture + reply sockets there. It writes **no**
+`.ready` markers (unlike the NodeWaypoint TCP path): the producer binds the
+socket **before** installing the rules, so a captured datagram is never diverted
+to a not-yet-bound socket. Note the residual **enrollment window**: between the
+registry entry appearing and the producer's next poll installing the pod's
+rules, pod UDP egress passes **uncaptured** (fail-open for that window — there
+is no default UDP redirect to refuse against, unlike the NodeWaypoint TCP
+connect-hook path). Closing it needs a producer→node-agent readiness handshake
+plus a deny-before-enroll default, tracked with the other live-datapath
+residuals under issue #2013.
 
 The Ambient UDP producer needs the same host access the NodeWaypoint in-netns
 listener needs — the read-only host cgroup mount + host `/proc` to resolve pod
