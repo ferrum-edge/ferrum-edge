@@ -333,6 +333,70 @@ fn east_west_explicit_sni_override_suppresses_auto_local_service_proxy() {
     );
 }
 
+/// Multi-port explicit suppression (issue #2010 phase 3, codex #2040): an
+/// explicit `EastWestGateway.sni_hosts` entry that owns a service's BASE FQDN
+/// must suppress the ENTIRE auto local-service route for that service — the base
+/// proxy AND every per-port `p<port>` alias — so a multi-port service is never
+/// split between the explicit backend and local auto alias routes.
+#[test]
+fn east_west_explicit_base_fqdn_suppresses_all_per_port_aliases() {
+    let workload = workload_for(
+        "reviews",
+        DEFAULT_NAMESPACE,
+        [("app", "reviews")],
+        ["10.0.0.5"],
+    );
+    let mut service = service_for("reviews", DEFAULT_NAMESPACE, &[&workload]);
+    service.ports = vec![
+        ServicePort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+            target_port: None,
+        },
+        ServicePort {
+            port: 9090,
+            protocol: AppProtocol::Http,
+            name: Some("http-alt".to_string()),
+            target_port: None,
+        },
+    ];
+    let mut mesh = mesh_config_with(vec![workload], vec![service], Vec::new());
+    // Explicit gateway claims ONLY the base FQDN — not the p9090 alias.
+    mesh.multi_cluster = Some(MultiClusterConfig {
+        local_cluster: Some("cluster-1".to_string()),
+        federation_endpoint: None,
+        remote_clusters: Vec::new(),
+        east_west_gateways: vec![east_west_gateway(
+            "explicit-reviews",
+            vec!["reviews.default.svc.cluster.local"],
+        )],
+    });
+    let config = gateway_config_with_mesh(Vec::new(), Vec::new(), mesh);
+    let prepared = prepare_gateway_config_for_mesh(config, &east_west_runtime()).expect("prepared");
+
+    // NO auto `__mesh-ew-svc-` proxy survives for reviews — neither the base nor
+    // the p9090 alias (the explicit base-FQDN entry owns the whole service).
+    let auto_reviews: Vec<&str> = prepared
+        .proxies
+        .iter()
+        .filter(|p| p.id.starts_with("__mesh-ew-svc-") && p.id.contains("reviews"))
+        .flat_map(|p| p.hosts.iter().map(String::as_str))
+        .collect();
+    assert!(
+        auto_reviews.is_empty(),
+        "an explicit base-FQDN gateway must suppress every auto per-port alias too, got {auto_reviews:?}"
+    );
+    // The p9090 alias must NOT be auto-materialized (it would bypass the explicit route).
+    assert!(
+        !prepared.proxies.iter().any(|p| p
+            .hosts
+            .iter()
+            .any(|h| h == "p9090.reviews.default.svc.cluster.local")),
+        "the p9090 alias auto proxy must be suppressed by the explicit base-FQDN entry"
+    );
+}
+
 #[test]
 fn east_west_overwritten_duplicate_gateway_does_not_suppress_auto_proxy() {
     // Two EastWestGateway entries in the same namespace that reuse the same

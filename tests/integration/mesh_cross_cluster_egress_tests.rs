@@ -527,6 +527,89 @@ fn cross_cluster_target_for_each_http_service_port() {
     );
 }
 
+/// Order-independence (issue #2010 phase 3, codex #2040): the base FQDN goes to
+/// the numerically LOWEST HTTP-family port — NOT the first *declared* port — so
+/// two clusters that declare the same service's ports in different orders derive
+/// the SAME SNI per numeric port. Here the ports are declared `[9090, 8080]`
+/// (9090 first); 8080 (lowest) must still get the base FQDN and 9090 the alias.
+#[test]
+fn cross_cluster_sni_alias_keys_on_lowest_port_not_declaration_order() {
+    let runtime = sidecar_client_runtime();
+
+    let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+    local.ports = vec![
+        WorkloadPort {
+            port: 9090,
+            protocol: AppProtocol::Http,
+            name: Some("http-alt".to_string()),
+        },
+        WorkloadPort {
+            port: 8080,
+            protocol: AppProtocol::Http,
+            name: Some("http".to_string()),
+        },
+    ];
+    let mut remote = remote_workload(Some(REMOTE_NETWORK));
+    remote.ports = local.ports.clone();
+
+    // Ports declared 9090 FIRST, 8080 second — reversed from the natural order.
+    let service = MeshService {
+        cluster_ips: Vec::new(),
+        name: "svc-b".to_string(),
+        namespace: "default".to_string(),
+        ports: vec![
+            ServicePort {
+                port: 9090,
+                protocol: AppProtocol::Http,
+                name: Some("http-alt".to_string()),
+                target_port: None,
+            },
+            ServicePort {
+                port: 8080,
+                protocol: AppProtocol::Http,
+                name: Some("http".to_string()),
+                target_port: None,
+            },
+        ],
+        workloads: vec![
+            WorkloadRef {
+                spiffe_id: local.spiffe_id.clone(),
+            },
+            WorkloadRef {
+                spiffe_id: remote.spiffe_id.clone(),
+            },
+        ],
+        protocol_overrides: std::collections::HashMap::new(),
+    };
+
+    let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+    mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+
+    let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+
+    // 8080 is the LOWEST port → base FQDN, even though 9090 was declared first.
+    let sni_for = |port: u16| -> Option<String> {
+        upstreams
+            .get(&format!("__mesh-out-upstream-default-svc-b-{port}"))
+            .and_then(|targets| {
+                targets
+                    .iter()
+                    .find(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+                    .and_then(|t| t.tags.get(MESH_EASTWEST_SNI_TAG).cloned())
+            })
+    };
+    assert_eq!(
+        sni_for(8080).as_deref(),
+        Some(SVC_B_FQDN),
+        "the LOWEST port (8080) routes on the base FQDN regardless of declaration order"
+    );
+    assert_eq!(
+        sni_for(9090).as_deref(),
+        Some("p9090.svc-b.default.svc.cluster.local"),
+        "the higher port (9090) routes on the p<port> alias even though it was declared first"
+    );
+}
+
 /// [3] P2: when a network has multiple east-west gateways with different
 /// `sni_hosts`, selection must pick the one whose `sni_hosts` claims the
 /// destination service FQDN — not merely the first gateway on the network.
