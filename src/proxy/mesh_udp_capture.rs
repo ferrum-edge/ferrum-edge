@@ -956,11 +956,16 @@ async fn run_udp_egress_session(
     let tunnel = if crate::proxy::hbone_pool::target_hbone_enabled(&target) {
         // HBONE capability must be proven (the enrollment pass + widened probe
         // gate keep these records alive; the dispatch gate fails closed until
-        // proven).
-        if !state
-            .backend_capabilities
-            .get(proxy, Some(&target))
-            .is_some_and(|record| record.hbone.is_supported())
+        // proven). Target-effective keying: enrollment builds probe keys from
+        // the relay proxy AFTER per-target override resolution, so this
+        // fail-closed gate must read the same key or a per-port DR TLS override
+        // on the stream upstream drops every UDP session forever.
+        if !crate::proxy::get_backend_capability_for_target(
+            state.backend_capabilities.as_ref(),
+            proxy,
+            Some(&target),
+        )
+        .is_some_and(|record| record.hbone.is_supported())
         {
             debug!(
                 service = %entry.service_fqdn,

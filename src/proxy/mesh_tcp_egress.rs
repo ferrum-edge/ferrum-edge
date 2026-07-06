@@ -169,10 +169,18 @@ pub(crate) async fn handle_mesh_tcp_egress(
     // pool (capability-probe-gated); Sidecar relays over a fresh mesh-mTLS
     // CONNECT tunnel with no capability registry.
     let (tunnel, transport) = if hbone_pool::target_hbone_enabled(&target) {
-        if !state
-            .backend_capabilities
-            .get(proxy, Some(&target))
-            .is_some_and(|record| record.hbone.is_supported())
+        // Target-effective capability keying: the enrollment pass builds probe
+        // keys from the relay proxy AFTER per-target override resolution
+        // (`BackendCapabilityProbeTarget::from_proxy`), so a DR
+        // `portLevelSettings[].tls` on this stream upstream moves the Supported
+        // record off the base relay-proxy key. This fail-closed gate must read
+        // the SAME key or every session to that port drops forever.
+        if !crate::proxy::get_backend_capability_for_target(
+            state.backend_capabilities.as_ref(),
+            proxy,
+            Some(&target),
+        )
+        .is_some_and(|record| record.hbone.is_supported())
         {
             debug!(
                 service = %entry.service_fqdn,

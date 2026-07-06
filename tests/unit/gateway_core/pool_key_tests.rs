@@ -8,15 +8,18 @@
 use chrono::Utc;
 use ferrum_edge::config::PoolConfig;
 use ferrum_edge::config::types::{
-    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResponseBodyMode,
-    UpstreamTarget,
+    AuthMode, BackendScheme, BackendTlsConfig, DispatchKind, Proxy, ResolvedPortOverride,
+    ResponseBodyMode, UpstreamTarget,
 };
 use ferrum_edge::connection_pool::ConnectionPool;
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::http3::client::Http3ConnectionPool;
-use ferrum_edge::proxy::backend_capabilities::{capability_key, capability_key_for_proxy_target};
+use ferrum_edge::proxy::backend_capabilities::{
+    BackendCapabilityProbeTarget, capability_key, capability_key_for_proxy_target,
+};
 use ferrum_edge::proxy::grpc_proxy::GrpcConnectionPool;
 use ferrum_edge::proxy::http2_pool::Http2ConnectionPool;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
@@ -1574,6 +1577,59 @@ fn backend_capability_key_prefers_upstream_target_over_proxy_backend() {
     assert!(
         key_without_target.starts_with("http|backend.example.com|8080|"),
         "proxy backend host/port should appear when no target is supplied: {key_without_target}"
+    );
+}
+
+#[test]
+fn backend_capability_probe_target_applies_per_port_tls_before_keying() {
+    let mut proxy = minimal_proxy();
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::from(BackendScheme::Https);
+    proxy.resolved_tls.sni = Some("base.mesh.internal".to_string());
+
+    let mut per_port_tls = BackendTlsConfig::default_verify();
+    per_port_tls.sni = Some("reviews.mesh.internal".to_string());
+    per_port_tls.server_ca_cert_path = Some("/mesh/reviews-ca.pem".to_string());
+    proxy.dispatch_port_overrides = Some(HashMap::from([(
+        8080,
+        ResolvedPortOverride {
+            tls: Some(per_port_tls),
+            ..Default::default()
+        },
+    )]));
+
+    let target = UpstreamTarget {
+        host: "reviews-v1.mesh.internal".to_string(),
+        port: 9443,
+        service_port_policy_key: Some(8080),
+        weight: 1,
+        tags: Default::default(),
+        locality: None,
+        path: None,
+    };
+
+    let probe = BackendCapabilityProbeTarget::from_proxy(&proxy, Some(&target));
+    let base_key = capability_key_for_proxy_target(&proxy, Some(&target));
+
+    assert_eq!(probe.host(), "reviews-v1.mesh.internal");
+    assert_eq!(probe.port(), 9443);
+    assert_eq!(
+        probe.proxy.resolved_tls.sni.as_deref(),
+        Some("reviews.mesh.internal"),
+        "capability probes must use the same per-port backend TLS SNI as dispatch"
+    );
+    assert_eq!(
+        probe.proxy.resolved_tls.server_ca_cert_path.as_deref(),
+        Some("/mesh/reviews-ca.pem")
+    );
+    assert_ne!(
+        probe.key, base_key,
+        "probe key must be built from the per-target effective proxy, not the base proxy"
+    );
+    assert_eq!(
+        probe.key,
+        capability_key(&probe.proxy),
+        "ordinary probe target key should match the effective probe proxy identity"
     );
 }
 
