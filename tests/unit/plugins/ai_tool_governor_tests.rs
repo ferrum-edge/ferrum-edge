@@ -1,8 +1,12 @@
 //! Tests for the ai_tool_governor plugin.
 
-use ferrum_edge::plugins::{
-    Plugin, PluginHttpClient, RequestContext, ResponseStreamAction, ResponseStreamInspector,
-    ai_tool_governor::AiToolGovernor, available_plugins, create_plugin_with_http_client, priority,
+use ferrum_edge::{
+    config::{BackendAllowIps, BackendEgressPolicy},
+    plugins::{
+        Plugin, PluginHttpClient, RequestContext, ResponseStreamAction, ResponseStreamInspector,
+        ai_tool_governor::AiToolGovernor, available_plugins, create_plugin_with_http_client,
+        priority,
+    },
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -227,6 +231,53 @@ fn rejects_noop_empty_tools_with_default_allow() {
 fn accepts_empty_tools_when_default_action_denies() {
     // default_action=deny governs everything, so no explicit tool policies is fine.
     assert!(try_make(json!({ "default_action": "deny", "tools": {} })).is_ok());
+}
+
+#[test]
+fn disabled_config_skips_policy_validation() {
+    assert!(
+        try_make(json!({
+            "enabled": false,
+            "mode": "invalid",
+            "tools": { "": { "action": "invalid" } },
+            "inspect": {
+                "request_tool_definitions": false,
+                "response_tool_calls": false,
+                "streaming_response_tool_calls": false,
+                "mcp_tool_calls": false,
+                "a2a_methods": false
+            }
+        }))
+        .is_ok()
+    );
+}
+
+#[test]
+fn dry_run_require_approval_does_not_require_endpoint() {
+    assert!(
+        try_make(json!({
+            "mode": "dry_run",
+            "tools": { "deploy": { "action": "require_approval" } }
+        }))
+        .is_ok()
+    );
+}
+
+#[test]
+fn approval_endpoint_literal_ip_is_screened_by_egress_policy() {
+    let client = PluginHttpClient::default_with_backend_allow_ips(
+        BackendEgressPolicy::from_allow_ips(BackendAllowIps::Public),
+    );
+    let err = AiToolGovernor::new(
+        &json!({
+            "tools": { "deploy": { "action": "require_approval" } },
+            "approval": { "endpoint_url": "http://10.0.0.5/approve" }
+        }),
+        client,
+    )
+    .err()
+    .unwrap();
+    assert!(err.contains("backend egress policy"), "{err}");
 }
 
 // ---------------------------------------------------------------------------
@@ -481,6 +532,47 @@ async fn redacts_matched_args_and_never_leaks_secret_in_metadata() {
 }
 
 #[tokio::test]
+async fn redacts_non_string_response_arguments_before_forwarding() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        }
+    }));
+
+    let body = json!({
+        "choices": [{
+            "message": {
+                "tool_calls": [{
+                    "function": {
+                        "name": "filesystem.write",
+                        "arguments": { "path": "/tmp/a", "token": "sk-STRUCTUREDSECRET123" }
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string()
+    .into_bytes();
+    let mut ctx = create_test_context();
+
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    let transformed = plugin
+        .transform_response_body(&body, Some("application/json"), &json_headers())
+        .await
+        .expect("structured arguments are redacted");
+    let text = String::from_utf8(transformed).unwrap();
+    assert!(!text.contains("STRUCTUREDSECRET"), "secret leaked: {text}");
+    assert!(text.contains("[REDACTED_TOOL_ARG:secret]"), "{text}");
+}
+
+#[tokio::test]
 async fn arguments_hashes_do_not_contain_raw_arguments() {
     let plugin = make(json!({ "tools": { "github.create_pr": { "action": "allow" } } }));
     let mut ctx = create_test_context();
@@ -713,6 +805,26 @@ async fn approval_endpoint_error_fails_open_when_configured() {
     );
 }
 
+#[tokio::test]
+async fn approval_endpoint_with_credentials_and_query_still_calls_webhook() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .mount(&server)
+        .await;
+
+    let endpoint = server.uri().replacen("http://", "http://user:secret@", 1);
+    let plugin = make(approval_config(&format!("{endpoint}/approve?token=secret")));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Streaming SSE tool-call inspection
 // ---------------------------------------------------------------------------
@@ -852,6 +964,51 @@ async fn streaming_inspector_only_for_event_stream_2xx() {
     );
 }
 
+#[tokio::test]
+async fn streaming_approval_cache_key_includes_streamed_model() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 300 },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+
+    for model in ["gpt-4o", "gpt-5"] {
+        let ctx = create_test_context();
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        let tool_frame = json!({
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": { "name": "deploy", "arguments": "{\"env\":\"prod\"}" }
+                    }]
+                }
+            }]
+        });
+        let finish_frame = json!({
+            "model": model,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
+        });
+        let body = format!("data: {tool_frame}\n\ndata: {finish_frame}\n\ndata: [DONE]\n\n");
+        let (_out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+        assert!(!terminated);
+    }
+
+    server.verify().await;
+}
+
 // ---------------------------------------------------------------------------
 // Fail-closed request-body inspection (encoded / oversized / unparseable)
 // ---------------------------------------------------------------------------
@@ -882,6 +1039,27 @@ async fn enforce_rejects_content_encoded_request_body() {
             .map(String::as_str),
         Some("deny")
     );
+}
+
+#[tokio::test]
+async fn before_proxy_uses_live_header_argument_for_request_inspection() {
+    let plugin = make(mcp_config("enforce"));
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "kubectl.apply", "arguments": { "manifest": "kind: Pod" } }
+        })
+        .to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
 }
 
 #[tokio::test]
@@ -1102,6 +1280,21 @@ async fn dry_run_forwards_oversized_json_response() {
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &body)
             .await,
+    );
+}
+
+#[tokio::test]
+async fn enforce_rejects_content_encoded_json_response() {
+    let plugin = make(json!({ "tools": { "kubectl.apply": { "action": "deny" } } }));
+    let mut ctx = create_test_context();
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let body = response_with_tool_call("kubectl.apply", "{}");
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+        Some(502),
     );
 }
 

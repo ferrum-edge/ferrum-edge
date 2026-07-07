@@ -42,12 +42,14 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use regex::Regex;
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
+use url::Url;
 
 use sha2::{Digest, Sha256};
 
@@ -89,6 +91,7 @@ const MAX_APPROVAL_CACHE_ENTRIES: usize = 4096;
 /// response must stay on the reqwest dispatch path where the SSE stream
 /// inspector is wired.
 const STREAM_REQUESTED_KEY: &str = "ai_tool_governor.stream_requested";
+const STREAM_MODEL_KEY: &str = "ai_tool_governor.stream_model";
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -196,6 +199,7 @@ struct ToolPolicy {
 /// Approval webhook configuration.
 struct ApprovalConfig {
     endpoint_url: String,
+    redacted_endpoint_url: String,
     hostname: String,
     timeout: Duration,
     cache_ttl: Duration,
@@ -697,7 +701,12 @@ impl GovernorEngine {
 
         let response = self
             .http_client
-            .execute_tracked(request, "ai_tool_governor_approval", input.ns)
+            .execute_redacted_tracked(
+                request,
+                "ai_tool_governor_approval",
+                &approval.redacted_endpoint_url,
+                input.ns,
+            )
             .await
             .map_err(|e| format!("request failed: {e}"))?;
 
@@ -756,6 +765,39 @@ impl AiToolGovernor {
         }
 
         let enabled = optional_bool(config, "enabled")?.unwrap_or(true);
+        if !enabled {
+            let engine = GovernorEngine {
+                mode: Mode::Enforce,
+                default_action: DefaultAction::Allow,
+                tools: HashMap::new(),
+                approval: None,
+                response: ResponseConfig {
+                    deny_status_code: DEFAULT_DENY_STATUS,
+                    redaction_placeholder: DEFAULT_REDACTION_PLACEHOLDER.to_string(),
+                    streaming_deny_event: true,
+                },
+                observability: ObservabilityConfig {
+                    emit_metadata: true,
+                    hash_arguments: true,
+                    max_argument_log_bytes: 0,
+                },
+                http_client,
+                approval_cache: DashMap::new(),
+            };
+            return Ok(Self {
+                enabled: false,
+                inspect: InspectConfig {
+                    request_tool_definitions: false,
+                    response_tool_calls: false,
+                    streaming_response_tool_calls: false,
+                    mcp_tool_calls: false,
+                    a2a_methods: false,
+                },
+                engine: Arc::new(engine),
+                needs_response_transform: false,
+                redaction_placeholder: DEFAULT_REDACTION_PLACEHOLDER.to_string(),
+            });
+        }
 
         let mode = match optional_string(config, "mode")?.unwrap_or("enforce") {
             "enforce" => Mode::Enforce,
@@ -822,8 +864,8 @@ impl AiToolGovernor {
         }
 
         // Approval endpoint is required when any policy can reach require_approval.
-        let approval = parse_approval(config)?;
-        if any_require_approval && approval.is_none() {
+        let approval = parse_approval(config, http_client.backend_allow_ips())?;
+        if mode == Mode::Enforce && any_require_approval && approval.is_none() {
             return Err(
                 "ai_tool_governor: 'approval.endpoint_url' is required when any policy uses 'require_approval'"
                     .to_string(),
@@ -1153,11 +1195,15 @@ impl AiToolGovernor {
         if policy.action != ToolAction::RedactArgs || policy.blocked_arg_patterns.is_empty() {
             return false;
         }
-        let Some(args) = function.get("arguments").and_then(Value::as_str) else {
+        let Some(args_value) = function.get("arguments") else {
             return false;
         };
+        let args = match args_value {
+            Value::String(s) => Cow::Borrowed(s.as_str()),
+            value => Cow::Owned(value.to_string()),
+        };
         let (redacted, changed) = redact_arguments(
-            args,
+            &args,
             &policy.blocked_arg_patterns,
             &self.redaction_placeholder,
         );
@@ -1214,7 +1260,7 @@ impl Plugin for AiToolGovernor {
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut HashMap<String, String>,
+        headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if !self.enabled {
             return PluginResult::Continue;
@@ -1226,10 +1272,9 @@ impl Plugin for AiToolGovernor {
         }
         // Mirror `should_buffer_request_body`: only JSON POST bodies are in scope.
         if ctx.method != "POST"
-            || !ctx
-                .headers
-                .get("content-type")
-                .is_some_and(|ct| is_json_content_type(ct))
+            || !header_value(headers, "content-type")
+                .or_else(|| header_value(&ctx.headers, "content-type"))
+                .is_some_and(is_json_content_type)
         {
             return PluginResult::Continue;
         }
@@ -1244,10 +1289,9 @@ impl Plugin for AiToolGovernor {
         let enforce_request = governs_request && self.engine.mode == Mode::Enforce;
         let mut uninspectable: Option<&'static str> = None;
 
-        if ctx
-            .headers
-            .get("content-encoding")
-            .map(|enc| enc.trim())
+        if header_value(headers, "content-encoding")
+            .or_else(|| header_value(&ctx.headers, "content-encoding"))
+            .map(str::trim)
             .is_some_and(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"))
         {
             uninspectable = Some("request body has a content-encoding that cannot be inspected");
@@ -1292,6 +1336,9 @@ impl Plugin for AiToolGovernor {
         if detects_streaming && json.get("stream").and_then(Value::as_bool) == Some(true) {
             ctx.metadata
                 .insert(STREAM_REQUESTED_KEY.to_string(), "true".to_string());
+            if let Some(model) = request_model(&json) {
+                ctx.metadata.insert(STREAM_MODEL_KEY.to_string(), model);
+            }
         }
         if governs_request {
             return self.govern_request(ctx, &json).await;
@@ -1350,14 +1397,21 @@ impl Plugin for AiToolGovernor {
         if !(200..300).contains(&response_status) {
             return PluginResult::Continue;
         }
-        let content_type = response_headers
-            .get("content-type")
-            .map(String::as_str)
-            .unwrap_or("");
+        let content_type = header_value(response_headers, "content-type").unwrap_or("");
         if !is_json_content_type(content_type) {
             return PluginResult::Continue;
         }
         if body.is_empty() {
+            return PluginResult::Continue;
+        }
+        if has_non_identity_content_encoding(response_headers) {
+            if self.engine.mode == Mode::Enforce {
+                return self.reject_uninspectable(
+                    ctx,
+                    "response body",
+                    "response body has a content-encoding that cannot be inspected",
+                );
+            }
             return PluginResult::Continue;
         }
         if body.len() > MAX_PARSE_BYTES {
@@ -1464,7 +1518,17 @@ impl Plugin for AiToolGovernor {
         if !content_type.is_some_and(is_event_stream_content_type) {
             return None;
         }
-        let corr = self.correlation(ctx, None, None);
+        let model = ctx
+            .metadata
+            .get(STREAM_MODEL_KEY)
+            .or_else(|| ctx.metadata.get("ai_model"))
+            .cloned();
+        let provider = ctx
+            .metadata
+            .get("ai_provider")
+            .or_else(|| ctx.metadata.get("ai_federation_provider"))
+            .map(String::as_str);
+        let corr = self.correlation(ctx, model, provider);
         Some(Box::new(ToolCallStreamInspector::new(
             Arc::clone(&self.engine),
             corr,
@@ -1627,7 +1691,7 @@ impl ToolCallStreamInspector {
             return;
         };
         for (cpos, choice) in choices.iter().enumerate() {
-            if !choice.get("finish_reason").is_some_and(|r| !r.is_null()) {
+            if choice.get("finish_reason").is_none_or(|r| r.is_null()) {
                 continue;
             }
             let cidx = choice
@@ -1655,6 +1719,19 @@ impl ToolCallStreamInspector {
         self.accumulator = StreamingToolCallAccumulator::default();
         self.finished_choices.clear();
         self.saw_tool_calls = false;
+    }
+
+    fn record_frame_context(&mut self, frame: &Value) {
+        if self.corr.model.is_none()
+            && let Some(model) = frame.get("model").and_then(Value::as_str)
+        {
+            self.corr.model = Some(model.to_string());
+        }
+        if self.corr.provider.is_none()
+            && let Some(provider) = detect_response_provider(frame)
+        {
+            self.corr.provider = Some(provider.as_str().to_string());
+        }
     }
 
     /// Evaluate the accumulated tool calls at a completion boundary. On
@@ -1728,6 +1805,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
             let event: Vec<u8> = self.carry.drain(..end).collect();
             match classify_event(&event) {
                 SseEvent::Frame(frame) => {
+                    self.record_frame_context(&frame);
                     let has_tool_calls = frame_has_tool_calls(&frame);
                     if has_tool_calls {
                         self.saw_tool_calls = true;
@@ -1799,6 +1877,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
             let event = std::mem::take(&mut self.carry);
             match classify_event(&event) {
                 SseEvent::Frame(frame) if frame_has_tool_calls(&frame) => {
+                    self.record_frame_context(&frame);
                     self.saw_tool_calls = true;
                     self.accumulator.push_frame(&frame);
                     self.held.extend_from_slice(&event);
@@ -1984,6 +2063,31 @@ fn request_model(json: &Value) -> Option<String> {
     json.get("model")
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers.get(name).map(String::as_str).or_else(|| {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    })
+}
+
+fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
+    header_value(headers, "content-encoding")
+        .map(str::trim)
+        .is_some_and(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"))
+}
+
+fn redacted_approval_url(parsed: &Url) -> String {
+    let mut redacted = parsed.clone();
+    let _ = redacted.set_username("");
+    let _ = redacted.set_password(None);
+    redacted.set_path("/...");
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    redacted.to_string()
 }
 
 /// Replace each blocked-pattern match in a raw arguments string with the
@@ -2192,7 +2296,10 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
     })
 }
 
-fn parse_approval(config: &Value) -> Result<Option<ApprovalConfig>, String> {
+fn parse_approval(
+    config: &Value,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+) -> Result<Option<ApprovalConfig>, String> {
     let Some(approval) = config.get("approval") else {
         return Ok(None);
     };
@@ -2214,6 +2321,12 @@ fn parse_approval(config: &Value) -> Result<Option<ApprovalConfig>, String> {
             "ai_tool_governor: 'approval.endpoint_url' must be an http/https URL".to_string(),
         );
     }
+    crate::plugins::utils::log_helpers::screen_url_host_egress(
+        "ai_tool_governor",
+        "approval.endpoint_url",
+        &parsed,
+        backend_allow_ips,
+    )?;
     let hostname = parsed
         .host_str()
         .filter(|h| !h.is_empty())
@@ -2257,6 +2370,7 @@ fn parse_approval(config: &Value) -> Result<Option<ApprovalConfig>, String> {
 
     Ok(Some(ApprovalConfig {
         endpoint_url: endpoint_url.to_string(),
+        redacted_endpoint_url: redacted_approval_url(&parsed),
         hostname,
         timeout: Duration::from_millis(timeout_ms),
         cache_ttl: Duration::from_secs(cache_ttl_seconds),
