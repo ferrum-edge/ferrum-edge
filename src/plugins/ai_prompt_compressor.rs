@@ -107,7 +107,15 @@ impl AiPromptCompressor {
                             .to_string(),
                     );
                 }
-                roles.into_iter().map(|r| r.to_lowercase()).collect()
+                let normalized: HashSet<String> =
+                    roles.into_iter().map(|r| r.trim().to_lowercase()).collect();
+                if normalized.iter().any(String::is_empty) {
+                    return Err(
+                        "ai_prompt_compressor: 'compress_roles' entries must not be blank"
+                            .to_string(),
+                    );
+                }
+                normalized
             }
             // Default: compress user prompts only. System messages usually carry
             // load-bearing instructions and are preserved unless opted in.

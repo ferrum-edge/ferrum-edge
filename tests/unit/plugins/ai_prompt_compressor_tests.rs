@@ -101,6 +101,8 @@ fn invalid_configs_rejected() {
         json!({"target_ratio": -0.2}),
         json!({"target_ratio": "half"}),
         json!({"compress_roles": []}),
+        json!({"compress_roles": [""]}),
+        json!({"compress_roles": ["   "]}),
         json!({"compress_roles": "user"}),
         json!({"compress_roles": [1, 2]}),
         json!({"min_content_tokens": "lots"}),
