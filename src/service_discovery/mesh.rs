@@ -44,9 +44,10 @@ pub struct MeshServiceDiscoverer {
     /// discoverer runs in gateway modes that have no mesh runtime.
     cluster_domain: String,
     /// One-time guard for the "sidecar SD cannot bridge remote-cluster
-    /// workloads east-west for this upstream" warning (non-first / non-HTTP
-    /// selected port, or no `mesh.multi_cluster` in the snapshot), so a 30s
-    /// poll loop does not repeat it forever.
+    /// workloads east-west for this upstream" warning (a non-HTTP-family selected
+    /// port — every HTTP-family port bridges via its per-port SNI alias — or no
+    /// `mesh.multi_cluster` in the snapshot), so a 30s poll loop does not repeat
+    /// it forever.
     warned_sidecar_remote_unbridged: AtomicBool,
     /// One-time guard for the analogous Ambient SD bridge warning. Ambient keeps
     /// direct remote-pod fallback only when no east-west gateway is declared for
@@ -288,18 +289,19 @@ impl MeshServiceDiscoverer {
     /// unify them — only the SD path routes around the ref-only one.
     ///
     /// BRIDGEABILITY (fail closed otherwise, one-time warn): the east-west
-    /// model routes a service-FQDN SNI to only the service's FIRST DECLARED
-    /// port on the destination gateway (SNI carries no port — see the shared
-    /// core's first-port rule), and only over the HTTP-family cross-cluster
-    /// dial. So the bridge runs ONLY when the snapshot carries
-    /// `mesh.multi_cluster` AND this upstream's selected service port IS the
-    /// first declared port AND that port is effective-HTTP-family
+    /// model routes each HTTP-family service port on its own SNI — a
+    /// single-HTTP-port service on the bare base FQDN, every port of a
+    /// multi-port service on its explicit `p<port>.<fqdn>` alias
+    /// (`cross_cluster_service_sni`; multi-port east-west, issue #2010 phase
+    /// 3) — and only over the HTTP-family cross-cluster dial. So the bridge
+    /// runs ONLY when the snapshot carries `mesh.multi_cluster` AND this
+    /// upstream's selected service port is effective-HTTP-family
     /// (`protocol_overrides` applied, via the shared
-    /// `service_http_family_ports` predicate). A non-first selected port
-    /// cannot be honored — the destination gateway would forward its SNI to
-    /// the first port's backend, silently misrouting — so those upstreams keep
-    /// the fail-closed remote skip. A remote group with no matching gateway is
-    /// likewise skipped fail-closed inside the shared core (logged per poll).
+    /// `service_http_family_ports` predicate). A non-HTTP-family selected
+    /// port cannot be honored (raw-TCP / UDP cross-cluster is a later phase),
+    /// so those upstreams keep the fail-closed remote skip. A remote group
+    /// with no matching gateway is likewise skipped fail-closed inside the
+    /// shared core (logged per poll).
     ///
     /// SD-BRIDGE DELTA vs the materializer's cross-cluster targets (the ONLY
     /// intentional difference): each gateway target additionally carries
@@ -324,22 +326,19 @@ impl MeshServiceDiscoverer {
         selected_service_port: Option<&SelectedPort>,
         targets: &mut Vec<UpstreamTarget>,
     ) {
-        let first_port = service.ports.first();
-        let selected_is_first_declared = match (selected_service_port, first_port) {
-            (Some(selected), Some(first)) => selected.service_port == Some(first.port),
-            _ => false,
-        };
-        let first_is_http_family = first_port.is_some_and(|first| {
+        // MULTI-PORT east-west (issue #2010 phase 3): bridge the upstream's
+        // SELECTED service port when it is HTTP-family. The destination gateway
+        // auto-materializes a per-port passthrough proxy on the port's SNI alias
+        // (`cross_cluster_service_sni`), so any HTTP-family port — not just the
+        // first — is reachable across clusters.
+        let selected_port_num = selected_service_port.and_then(|selected| selected.service_port);
+        let selected_http_family_port = selected_port_num.and_then(|port| {
             crate::modes::mesh::service_http_family_ports(service)
-                .iter()
-                .any(|sp| sp.port == first.port)
+                .into_iter()
+                .find(|sp| sp.port == port)
         });
-        let (Some(first_port), Some(multi_cluster), true, true) = (
-            first_port,
-            multi_cluster,
-            selected_is_first_declared,
-            first_is_http_family,
-        ) else {
+        let (Some(service_port), Some(multi_cluster)) = (selected_http_family_port, multi_cluster)
+        else {
             if !self
                 .warned_sidecar_remote_unbridged
                 .swap(true, Ordering::Relaxed)
@@ -349,27 +348,26 @@ impl MeshServiceDiscoverer {
                     namespace = %self.namespace,
                     "sidecar-topology mesh service discovery skips remote-cluster workloads \
                      (fail closed): east-west bridging requires mesh.multi_cluster in the \
-                     snapshot and the upstream's selected service port to be the service's \
-                     first declared HTTP-family port (the destination east-west gateway \
-                     routes a service-FQDN SNI to the first declared port only)"
+                     snapshot and the upstream's selected service port to be an HTTP-family \
+                     port the destination east-west gateway materializes a per-port SNI for"
                 );
             }
             return;
         };
 
-        // Effective protocol of the first declared port (`protocol_overrides`
-        // applied), exactly as the mesh-mode materializer passes it.
+        // Effective protocol of the selected port (`protocol_overrides` applied),
+        // exactly as the mesh-mode materializer passes it.
         let protocol = service
             .protocol_overrides
-            .get(&first_port.port)
+            .get(&service_port.port)
             .copied()
-            .unwrap_or(first_port.protocol);
+            .unwrap_or(service_port.protocol);
         let mut gateway_targets = Vec::new();
         crate::modes::mesh::append_cross_cluster_mesh_targets_prematched(
             &mut gateway_targets,
             &self.cluster_domain,
             service,
-            first_port,
+            service_port,
             protocol,
             remote_workloads,
             multi_cluster,
@@ -403,23 +401,46 @@ impl MeshServiceDiscoverer {
         &self,
         multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
         service: &MeshService,
+        selected_service_port: Option<&SelectedPort>,
         workload: &Workload,
     ) -> bool {
         let Some(multi_cluster) = multi_cluster else {
             return true;
         };
 
-        // Same FQDN construction as the shared cross-cluster core, so this
-        // valve and the bridge's gateway selection judge the same SNI.
-        let cluster_domain = self.cluster_domain.trim_matches('.');
-        let service_fqdn = format!(
-            "{}.{}.svc.{cluster_domain}",
-            service.name, service.namespace
-        );
+        // Same base FQDN + per-port alias the bridge's `append_ambient_cross_
+        // cluster_targets` would DIAL, derived from the SAME shared helpers, so
+        // this valve and the bridge's gateway selection judge the SAME acceptable
+        // SNI set (codex #2040 Finding C): a gateway that claims only the per-port
+        // alias must both be selectable by the bridge AND count as governing here,
+        // or an alias-only gateway would suppress the direct fallback while the
+        // bridge could not select it (fail closed with no path).
+        let base_fqdn =
+            crate::modes::mesh::cross_cluster_service_base_fqdn(service, &self.cluster_domain);
+        // The per-port alias only differs from the base for a MULTI-port service's
+        // selected HTTP-family port; fall back to the base FQDN alone when the
+        // selected port is absent or not HTTP-family (the bridge itself then stays
+        // fail-closed regardless, so the base-only judgment is safe).
+        let dial_sni = selected_service_port
+            .and_then(|selected| selected.service_port)
+            .and_then(|port| {
+                crate::modes::mesh::service_http_family_ports(service)
+                    .into_iter()
+                    .find(|sp| sp.port == port)
+            })
+            .map(|service_port| {
+                crate::modes::mesh::cross_cluster_service_sni(
+                    service,
+                    service_port,
+                    &self.cluster_domain,
+                )
+            });
+        let dial_sni = dial_sni.as_deref().unwrap_or(&base_fqdn);
+        let acceptable_snis = crate::modes::mesh::east_west_acceptable_snis(&base_fqdn, dial_sni);
         !crate::modes::mesh::east_west_gateway_governs_network(
             multi_cluster,
             workload.network.as_deref(),
-            &service_fqdn,
+            &acceptable_snis,
             &workload.trust_domain,
         )
     }
@@ -437,22 +458,16 @@ impl MeshServiceDiscoverer {
         selected_service_port: Option<&SelectedPort>,
         targets: &mut Vec<UpstreamTarget>,
     ) {
-        let first_port = service.ports.first();
-        let selected_is_first_declared = match (selected_service_port, first_port) {
-            (Some(selected), Some(first)) => selected.service_port == Some(first.port),
-            _ => false,
-        };
-        let first_is_http_family = first_port.is_some_and(|first| {
+        // MULTI-PORT east-west (issue #2010 phase 3): bridge the upstream's
+        // SELECTED HTTP-family port (identical scheme to the Sidecar bridge).
+        let selected_port_num = selected_service_port.and_then(|selected| selected.service_port);
+        let selected_http_family_port = selected_port_num.and_then(|port| {
             crate::modes::mesh::service_http_family_ports(service)
-                .iter()
-                .any(|sp| sp.port == first.port)
+                .into_iter()
+                .find(|sp| sp.port == port)
         });
-        let (Some(first_port), Some(multi_cluster), true, true) = (
-            first_port,
-            multi_cluster,
-            selected_is_first_declared,
-            first_is_http_family,
-        ) else {
+        let (Some(service_port), Some(multi_cluster)) = (selected_http_family_port, multi_cluster)
+        else {
             if !self
                 .warned_ambient_remote_unbridged
                 .swap(true, Ordering::Relaxed)
@@ -463,7 +478,8 @@ impl MeshServiceDiscoverer {
                     "ambient-topology mesh service discovery skips gateway-declared \
                      remote-cluster workloads (fail closed): east-west bridging requires \
                      mesh.multi_cluster in the snapshot and the upstream's selected service \
-                     port to be the service's first declared HTTP-family port"
+                     port to be an HTTP-family port the destination gateway materializes a \
+                     per-port SNI for"
                 );
             }
             return;
@@ -471,14 +487,14 @@ impl MeshServiceDiscoverer {
 
         let protocol = service
             .protocol_overrides
-            .get(&first_port.port)
+            .get(&service_port.port)
             .copied()
-            .unwrap_or(first_port.protocol);
+            .unwrap_or(service_port.protocol);
         crate::modes::mesh::append_cross_cluster_ambient_hbone_targets_prematched(
             targets,
             &self.cluster_domain,
             service,
-            first_port,
+            service_port,
             protocol,
             remote_workloads,
             multi_cluster,
@@ -569,7 +585,12 @@ impl super::ServiceDiscoverer for MeshServiceDiscoverer {
             }
             if is_remote
                 && self.topology == MeshSdTopology::Ambient
-                && !self.ambient_direct_remote_fallback_allowed(multi_cluster, service, workload)
+                && !self.ambient_direct_remote_fallback_allowed(
+                    multi_cluster,
+                    service,
+                    selected_service_port.as_ref(),
+                    workload,
+                )
             {
                 remote_ambient_workloads.push(workload);
                 continue;
