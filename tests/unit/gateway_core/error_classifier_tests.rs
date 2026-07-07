@@ -521,3 +521,57 @@ fn test_boxed_hbone_connect_refused_is_pre_wire_connection_refused() {
     assert_eq!(class, ErrorClass::ConnectionRefused);
     assert!(!request_reached_wire(class));
 }
+
+#[test]
+fn test_boxed_hbone_missing_cross_cluster_sni_is_pre_wire_connection_pool_error() {
+    // A cross-cluster Ambient WebSocket target missing `mesh.eastwest_sni` is
+    // refused BEFORE any gateway dial (issue #2010 codex Finding 2). The WS
+    // egress path boxes this typed variant so `classify_boxed_setup_error`
+    // downcasts it to a PRE-WIRE class — keeping the reject retry-eligible under
+    // `retry_on_connect_failure` and recorded as a mesh SETUP failure, not a
+    // post-wire backend request failure. Mirrors the Sidecar
+    // `MeshMtlsDialError::MissingCrossClusterSni` posture.
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(HbonePoolError::MissingCrossClusterSni);
+    let class = classify_boxed_setup_error(err.as_ref());
+    assert_eq!(class, ErrorClass::ConnectionPoolError);
+    assert!(
+        !request_reached_wire(class),
+        "a missing cross-cluster SNI override is a pre-wire fail-closed reject (no dial happened)"
+    );
+}
+
+#[test]
+fn test_boxed_hbone_missing_cross_cluster_trust_domain_is_pre_wire_connection_pool_error() {
+    // Sibling of the SNI case: a cross-cluster Ambient WebSocket target missing
+    // `mesh.trust_domain` is refused pre-dial and must stay pre-wire so the
+    // retry / health accounting treats it as a mesh setup failure.
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(HbonePoolError::MissingCrossClusterTrustDomain);
+    let class = classify_boxed_setup_error(err.as_ref());
+    assert_eq!(class, ErrorClass::ConnectionPoolError);
+    assert!(
+        !request_reached_wire(class),
+        "a missing cross-cluster trust domain is a pre-wire fail-closed reject (no dial happened)"
+    );
+}
+
+#[test]
+fn test_boxed_hbone_missing_cross_cluster_authority_host_is_pre_wire_connection_pool_error() {
+    // Third sibling (issue #2010 codex Finding A): a cross-cluster Ambient
+    // WebSocket target missing `mesh.hbone_authority_host` would otherwise fall
+    // back to the synthetic `mesh-xc-hbone|...` key as the inner CONNECT
+    // authority, establishing the east-west TLS/H2 connection FIRST and only
+    // failing later. The WS egress path now rejects it BEFORE any dial with this
+    // typed variant, which must classify PRE-WIRE (`ConnectionPoolError`) so it is
+    // recorded as a mesh setup failure and stays retry-eligible under
+    // `retry_on_connect_failure` — never charged to the backend / circuit breaker.
+    let err: Box<dyn std::error::Error + Send + Sync> =
+        Box::new(HbonePoolError::MissingCrossClusterAuthorityHost);
+    let class = classify_boxed_setup_error(err.as_ref());
+    assert_eq!(class, ErrorClass::ConnectionPoolError);
+    assert!(
+        !request_reached_wire(class),
+        "a missing cross-cluster authority host is a pre-wire fail-closed reject (no dial happened)"
+    );
+}
