@@ -3502,6 +3502,58 @@ Use this only when the normal backend has equivalent authentication, model allow
 
 **URL template caching:** Each provider's request URL is pre-computed at config-load time. URLs that are fully static for the provider (Azure OpenAI deployment URL, OpenAI default base URL) are cached as a single `Arc<str>`; URLs that embed the request model (Gemini, Vertex AI, Bedrock) are cached as `prefix + model + suffix` so the per-request hot path performs one `String` concatenation rather than the multi-allocation `format!()` machinery.
 
+### `ai_stream_router`
+
+Streaming counterpart to `ai_federation` — the answer to "can I use Ferrum as my OpenAI-compatible **streaming** AI gateway?". It runs at priority `2984`, before `ai_federation` (`4060`), and claims **only** OpenAI Chat Completions requests with a real `"stream": true` boolean. Non-streaming requests are left untouched for `ai_federation` to handle.
+
+Unlike `ai_federation`'s buffered "terminate and respond" pattern, `ai_stream_router` does **not** make its own HTTP call. In `before_proxy` it rewrites the routing decision on `RequestContext` (`route_override_backend_scheme` / `_host` / `_port` / `_path` / `_authority`, with `route_override_path_is_absolute = true`) so the **normal proxy dispatch path** streams the provider response straight back to the client. This preserves true end-to-end streaming and keeps per-proxy backend TLS/DNS egress policy in force (in contrast to `ai_federation`, which only honors global TLS settings).
+
+```yaml
+plugin_name: ai_stream_router
+config:
+  enabled: true
+  fail_on_missing_model: true
+  fail_on_no_matching_provider: true
+  inject_usage_options: true
+  normalize_response_stream: true
+  providers:
+    - name: openai
+      provider_type: openai
+      endpoint: https://api.openai.com/v1/chat/completions
+      api_key: ${OPENAI_API_KEY}
+      model_patterns: ["gpt-*", "o*"]
+      priority: 1
+    - name: anthropic
+      provider_type: anthropic
+      endpoint: https://api.anthropic.com/v1/messages
+      api_key: ${ANTHROPIC_API_KEY}
+      model_patterns: ["claude-*"]
+      priority: 2
+      anthropic_version: "2023-06-01"
+```
+
+**Provider types (MVP):**
+
+- `openai` / `openai_compatible` — route + header rewrite only. The request and the provider's response SSE are already OpenAI-shaped, so the stream passes through unchanged (with optional `stream_options.include_usage` injection when `inject_usage_options: true`). No response-stream inspector runs, so these requests stay on the fast dispatch path.
+- `anthropic` — the OpenAI request is translated to the Anthropic Messages API streaming request (system extraction, user/assistant messages, `max_tokens`, `temperature`, `top_p`, `stop` → `stop_sequences`, `tools`/`tool_choice`, `stream: true`). A `ResponseStreamInspector` then normalizes Anthropic SSE events into OpenAI `chat.completion.chunk` SSE on the fly: `content_block_delta` text deltas → `choices[].delta.content`, tool-use blocks / `input_json_delta` → `choices[].delta.tool_calls`, `message_delta` → the final `finish_reason` chunk and (when `normalize_response_stream: true`) a terminal usage chunk, followed by `data: [DONE]`. The normalizer is robust to chunk splits — it accumulates raw bytes and only transcodes complete SSE events — and bounds that accumulation at 1 MiB per event: a provider that streams a pathological or never-terminated SSE event fails safe with a terminal SSE error event + `data: [DONE]` instead of buffering without bound.
+- `google_gemini` — the config shape is accepted for forward-compatibility, but construction fails with a clear "not yet implemented" error until the second phase lands.
+
+**Header rewriting.** Client `Authorization`, `Proxy-Authorization`, `Cookie`, `x-api-key`, `api-key`, `x-goog-api-key`, and `anthropic-version` headers are stripped before forwarding (unlike `ai_federation`, this path reuses the client's header map, so session-bearing headers must be dropped explicitly), and the provider's credential is injected (`Authorization: Bearer …` for OpenAI-compatible, `x-api-key` for Anthropic). `Host`, `Content-Type: application/json`, and `Accept: text/event-stream` are set for the provider. Gateway-asserted consumer-identity headers (`x-consumer-username` / `x-consumer-custom-id`) are also **suppressed** for claimed requests via the shared `suppress_backend_consumer_identity_headers` metadata marker, so an authenticated consumer's internal identifiers never reach the third-party provider (the resolved principal still drives rate limiting, logging, and policy plugins).
+
+**Endpoint URLs.** An endpoint that carries its own query string (e.g. an Azure-style `?api-version=…`) is preserved: the endpoint query and the client's own query are merged with `&` into the forwarded URL (the client's parameters are marked as consumed so the dispatch path does not append a second `?`). IPv6 literal hosts are bracketed in the forwarded authority/`Host`. By default an `https` endpoint is verified against the system trust store; set `inherit_backend_tls: true` on a provider to keep the proxy's own resolved backend TLS (custom CA bundle, SNI/SAN policy, backend mTLS client certificate) for internal `openai_compatible` endpoints behind private PKI.
+
+**Composition with `ai_federation`.** Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`. `ai_federation` checks this at the top of its `before_proxy` and immediately `Continue`s, so the two plugins compose on the same proxy: `stream: true` is served by `ai_stream_router`, `stream: false` by `ai_federation`. Claimed requests also set the shared `ai_request_streaming` marker so response-side plugins (`ai_response_guard`, `ai_token_metrics`, …) keep the provider SSE on the streaming path even when the client did not send `Accept: text/event-stream`.
+
+**Metadata keys written:** `ai_stream_router.enabled`, `ai_stream_router.claimed`, `ai_stream_router_claimed`, `ai_request_streaming`, `suppress_backend_consumer_identity_headers`, `ai_stream_router.provider`, `ai_stream_router.provider_type`, `ai_stream_router.model`, `ai_stream_router.normalized_response_stream`, and `ai_stream_router.fallback_attempts`.
+
+**Fail-closed defaults.** A streaming request that lacks a top-level string `model` is rejected with an OpenAI-shaped `400`; one whose `model` matches no provider is rejected with a `404`. Set `fail_on_missing_model: false` / `fail_on_no_matching_provider: false` to pass such requests through instead.
+
+**Limitations (MVP):**
+
+- **Fallback cannot switch providers after the first downstream byte.** Once response bytes have streamed to the client the provider is fixed; `ai_stream_router.fallback_attempts` is always `0`. The nested `fallback` block is parsed and validated for forward-compatibility but has no runtime effect yet.
+- **Usage accounting depends on the provider emitting usage in the stream.** OpenAI-compatible providers emit a final usage event only when `stream_options.include_usage` is set (hence `inject_usage_options`); Anthropic usage is derived from `message_start`/`message_delta`. Providers that omit usage yield no token counts.
+- Anthropic request translation is text-first for message content in this MVP (top-level `tools`/`tool_choice` are translated; non-text message-content parts are dropped).
+
 ### `ai_semantic_firewall`
 
 Semantically inspects LLM request and response bodies for prompt injection, jailbreaks, system/developer prompt exfiltration, sensitive data exfiltration intent, indirect prompt injection in RAG/tool/document content, tool-call abuse, business-topic allowlists/denylists, and response leakage. This plugin does not implement generic request/response size limits, timeouts, retries, circuit breaking, token budgets, or regex PII scanning; use the native gateway controls and existing AI guard plugins for those surfaces.

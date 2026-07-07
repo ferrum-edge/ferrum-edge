@@ -2717,6 +2717,25 @@ impl Plugin for AiFederation {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Coordinate with `ai_stream_router` (priority 2984, runs first). When it
+        // claims a streaming request, or explicitly passes one through because
+        // the operator disabled fail-closed missing/unmatched-model behavior,
+        // `ai_federation` must not re-inspect or reject that same `stream:true`
+        // request.
+        if ctx
+            .metadata
+            .get("ai_stream_router_claimed")
+            .map(String::as_str)
+            == Some("true")
+            || ctx
+                .metadata
+                .get("ai_stream_router_pass_through")
+                .map(String::as_str)
+                == Some("true")
+        {
+            return PluginResult::Continue;
+        }
+
         // Only handle POST requests with JSON content-type
         if ctx.method != "POST" {
             return PluginResult::Continue;

@@ -3790,6 +3790,7 @@ paths:
                 - ai_semantic_firewall
                 - ai_response_guard
                 - ai_semantic_cache
+                - ai_stream_router
                 - ai_federation
                 - ai_tool_governor
                 - mcp_gateway
@@ -7031,6 +7032,16 @@ components:
             properties:
               config:
                 $ref: "#/components/schemas/AiToolGovernorConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_stream_router
+          then:
+            required: [config]
+            properties:
+              config:
+                $ref: "#/components/schemas/AiStreamRouterConfig"
         - if:
             required: [plugin_name]
             properties:
@@ -15146,6 +15157,95 @@ components:
           type: boolean
           default: true
           description: Reject requests whose `model` does not match any configured provider. Set to false only to explicitly pass unsupported models through to the normal backend.
+
+    AiStreamRouterConfig:
+      type: object
+      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (after ai_semantic_cache at 2980, before ai_federation at 2985). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Fallback across providers after the first downstream byte is out of scope (ai_stream_router.fallback_attempts is always 0). NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
+      required: [providers]
+      properties:
+        enabled:
+          type: boolean
+          default: true
+          description: Master switch. When false the plugin never claims requests.
+        fail_on_missing_model:
+          type: boolean
+          default: true
+          description: Reject a streaming request that lacks a top-level string `model`. Set to false to pass such requests through (to ai_federation / normal backend).
+        fail_on_no_matching_provider:
+          type: boolean
+          default: true
+          description: Reject a streaming request whose `model` matches no configured provider. Set to false to pass such requests through.
+        inject_usage_options:
+          type: boolean
+          default: true
+          description: For openai/openai_compatible providers, inject stream_options.include_usage=true so the provider emits a final usage event.
+        normalize_response_stream:
+          type: boolean
+          default: true
+          description: Normalize provider-native SSE (e.g. Anthropic Messages API events) to OpenAI chat.completion.chunk SSE. Disabling forwards provider-native SSE verbatim.
+        providers:
+          type: array
+          minItems: 1
+          description: One or more streaming provider definitions. The first provider (in priority order) whose model_patterns match the request `model` wins.
+          items:
+            type: object
+            required: [name, provider_type, endpoint, api_key, model_patterns]
+            properties:
+              name:
+                type: string
+                description: Unique provider name (surfaced in ai_stream_router.provider metadata).
+              provider_type:
+                type: string
+                enum:
+                  - openai
+                  - openai_compatible
+                  - anthropic
+                  - google_gemini
+                description: "Provider wire format. openai/openai_compatible pass through; anthropic is translated + normalized; google_gemini is reserved (rejected at construction in this MVP)."
+              endpoint:
+                type: string
+                description: "Full https (or http with allow_plaintext) provider streaming endpoint URL, e.g. https://api.openai.com/v1/chat/completions or https://api.anthropic.com/v1/messages. May contain a literal {model} path placeholder for future providers. An endpoint query string (e.g. an Azure-style ?api-version=...) is preserved and merged with the client's own query using '&'. IPv6 literal hosts are bracketed in the forwarded authority."
+              api_key:
+                type: string
+                description: "Provider API key. Supports a ${ENV_VAR} reference resolved from the process environment. Injected as Authorization: Bearer for openai(-compatible), x-api-key for anthropic."
+              model_patterns:
+                type: array
+                minItems: 1
+                items:
+                  type: string
+                description: "Non-empty glob patterns matched against the request `model` (exact or prefix, e.g. ['gpt-*', 'o*'] or ['claude-*'])."
+              priority:
+                type: integer
+                minimum: 1
+                description: "Lower = matched first. Defaults to provider index + 1."
+              allow_plaintext:
+                type: boolean
+                default: false
+                description: Permit an http:// endpoint (rejected by default).
+              anthropic_version:
+                type: string
+                default: "2023-06-01"
+                description: anthropic-version header value sent to Anthropic providers.
+              inherit_backend_tls:
+                type: boolean
+                default: false
+                description: "By default an https provider endpoint is verified against the system trust store (default backend TLS). Set true to keep the proxy's own resolved backend TLS instead — custom CA bundle, SNI/SAN policy, and backend mTLS client certificate — for internal openai_compatible endpoints behind private PKI. No effect on http endpoints."
+        fallback:
+          type: object
+          description: "Reserved fallback policy. Parsed and validated but not yet active: ai_stream_router cannot switch providers after the first downstream byte."
+          properties:
+            enabled:
+              type: boolean
+              default: false
+            on_connect_error:
+              type: boolean
+              default: true
+            on_5xx_before_first_byte:
+              type: boolean
+              default: true
+            max_attempts:
+              type: integer
+              default: 2
 
     A2aGatewayConfig:
       type: object

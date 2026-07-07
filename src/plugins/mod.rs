@@ -31,6 +31,7 @@ pub mod ai_request_guard;
 pub mod ai_response_guard;
 pub mod ai_semantic_cache;
 pub mod ai_semantic_firewall;
+pub mod ai_stream_router;
 pub mod ai_token_metrics;
 pub mod ai_tool_governor;
 pub mod api_chargeback;
@@ -1001,6 +1002,8 @@ impl RequestContext {
         let backend_port_changed = self
             .route_override_backend_port
             .is_some_and(|port| proxy.backend_port != port);
+        let dns_override_changed =
+            direct_backend_override && backend_host_changed && proxy.dns_override.is_some();
 
         let upstream_tls_override = if upstream_id_changed {
             self.route_override_upstream_id
@@ -1093,6 +1096,7 @@ impl RequestContext {
             && !backend_host_changed
             && !backend_scheme_changed
             && !backend_port_changed
+            && !dns_override_changed
             && !resolved_tls_changed
             && !dispatch_port_overrides_changed
             && !dispatch_port_override_fallback_changed
@@ -1124,6 +1128,9 @@ impl RequestContext {
         }
         if let Some(port) = self.route_override_backend_port {
             overridden.backend_port = port;
+        }
+        if dns_override_changed {
+            overridden.dns_override = None;
         }
         if let Some(resolved_tls) = resolved_tls_override {
             overridden.resolved_tls = resolved_tls;
@@ -1331,22 +1338,64 @@ impl RequestContext {
     /// `X-Consumer-Username`. This prefers the gateway Consumer username, then
     /// a plugin-provided display/header identity, then the raw external auth
     /// identity.
+    ///
+    /// Returns `None` when a plugin set the shared
+    /// [`SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY`] marker (e.g.
+    /// `ai_stream_router` routing to a third-party AI provider), so every
+    /// backend-dispatch injection site (H1/H2, gRPC, WebSocket, native H3, H3
+    /// WebSocket) skips the identity headers without leaking internal user
+    /// identifiers to the external destination. The authenticated principal
+    /// itself stays resolved — `effective_identity()` is unaffected, so rate
+    /// limiting, logging, and policy plugins keep working.
     pub fn backend_consumer_username(&self) -> Option<&str> {
-        self.identified_consumer
+        let username = self
+            .identified_consumer
             .as_ref()
             .map(|consumer| consumer.username.as_str())
             .or(self.authenticated_identity_header.as_deref())
-            .or(self.authenticated_identity.as_deref())
+            .or(self.authenticated_identity.as_deref())?;
+        if self.suppresses_backend_consumer_identity_headers() {
+            return None;
+        }
+        Some(username)
     }
 
     /// Return the Consumer custom ID to forward to the backend, if a gateway
-    /// Consumer was resolved.
+    /// Consumer was resolved. Suppressed together with
+    /// [`Self::backend_consumer_username`] — see that method's contract.
     pub fn backend_consumer_custom_id(&self) -> Option<&str> {
-        self.identified_consumer
+        let custom_id = self
+            .identified_consumer
             .as_ref()
-            .and_then(|consumer| consumer.custom_id.as_deref())
+            .and_then(|consumer| consumer.custom_id.as_deref())?;
+        if self.suppresses_backend_consumer_identity_headers() {
+            return None;
+        }
+        Some(custom_id)
+    }
+
+    /// Whether a plugin opted this request out of gateway consumer-identity
+    /// header injection (`x-consumer-username` / `x-consumer-custom-id`).
+    /// Checked only after a principal resolved, so unauthenticated requests
+    /// pay no extra metadata lookup.
+    pub(crate) fn suppresses_backend_consumer_identity_headers(&self) -> bool {
+        self.metadata
+            .get(SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY)
+            .map(String::as_str)
+            == Some("true")
     }
 }
+
+/// Shared metadata key a plugin sets to `"true"` to suppress gateway
+/// consumer-identity header injection (`x-consumer-username` /
+/// `x-consumer-custom-id`) toward the backend for this request. Used by
+/// plugins that reroute a request to an external third party (e.g.
+/// `ai_stream_router` provider overrides) where internal user identifiers
+/// must not leak. All injection sites consume this via
+/// [`RequestContext::backend_consumer_username`] /
+/// [`RequestContext::backend_consumer_custom_id`].
+pub const SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY: &str =
+    "suppress_backend_consumer_identity_headers";
 
 /// Separator used when materializing repeated request header field lines.
 ///
@@ -2099,7 +2148,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), mcp_gateway (2992), a2a_gateway (2993) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_federation (4060), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365) |
@@ -2156,6 +2205,13 @@ pub mod priority {
     /// federation routing.
     pub const AI_TOOL_GOVERNOR: u16 = 2978;
     pub const AI_SEMANTIC_CACHE: u16 = 2980;
+    /// `ai_stream_router`: claims streaming (`"stream": true`) OpenAI Chat
+    /// Completions requests, rewrites `route_override_*` to the matched provider,
+    /// and normalizes provider-native SSE to OpenAI `chat.completion.chunk` SSE.
+    /// Runs after `ai_semantic_cache` and before `ai_federation` (now in the
+    /// response band at 4060) so the non-streaming federation path can defer to
+    /// it via the `ai_stream_router_claimed` marker.
+    pub const AI_STREAM_ROUTER: u16 = 2984;
     /// `mcp_gateway`: parses MCP JSON-RPC bodies and applies MCP-aware route
     /// overrides after generic admission/auth plugins but before final dispatch.
     pub const MCP_GATEWAY: u16 = 2992;
@@ -3299,6 +3355,10 @@ pub fn create_plugin_with_http_client(
         "ai_response_guard" => Ok(Some(Arc::new(ai_response_guard::AiResponseGuard::new(
             config,
         )?))),
+        "ai_stream_router" => Ok(Some(Arc::new(ai_stream_router::AiStreamRouter::new(
+            config,
+            http_client.clone(),
+        )?))),
         "ai_federation" => Ok(Some(Arc::new(ai_federation::AiFederation::new(
             config,
             http_client.clone(),
@@ -3655,6 +3715,7 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("ai_response_guard", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_tool_governor", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_semantic_cache", PluginFailurePolicy::KeepLastKnownGood),
+    builtin_plugin("ai_stream_router", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_federation", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("mcp_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("a2a_gateway", PluginFailurePolicy::FailClosed),
@@ -3881,6 +3942,29 @@ mod tests {
         assert!(
             result.dispatch_port_override_fallback.is_none(),
             "a direct-backend override must clear the SD fallback"
+        );
+    }
+
+    #[test]
+    fn direct_backend_override_clears_inherited_dns_override_when_host_changes() {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "stable.svc",
+            "backend_port": 8080,
+        }))
+        .expect("minimal proxy should deserialize");
+        proxy.dns_override = Some("192.0.2.10".to_string());
+
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.route_override_backend_host = Some("api.openai.com".to_string());
+        ctx.route_override_backend_port = Some(443);
+
+        let result = ctx.apply_route_overrides_with_upstreams(Arc::new(proxy), &HashMap::new());
+        assert_eq!(result.backend_host, "api.openai.com");
+        assert_eq!(result.backend_port, 443);
+        assert!(
+            result.dns_override.is_none(),
+            "a direct-backend host override must not inherit the original proxy dns_override"
         );
     }
 

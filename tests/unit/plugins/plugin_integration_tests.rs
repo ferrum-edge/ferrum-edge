@@ -256,6 +256,7 @@ async fn test_all_plugins_available() {
         "workload_metrics",
         "__mesh_bpf_metrics",
         "ai_federation",
+        "ai_stream_router",
         "mcp_gateway",
         "a2a_gateway",
         "api_chargeback",
@@ -379,6 +380,15 @@ async fn test_plugin_creation_all_plugins() {
             "ai_federation" => {
                 json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})
             }
+            "ai_stream_router" => json!({
+                "providers": [{
+                    "name": "test",
+                    "provider_type": "openai",
+                    "endpoint": "https://api.openai.com/v1/chat/completions",
+                    "api_key": "sk-test",
+                    "model_patterns": ["gpt-*"]
+                }]
+            }),
             "mcp_gateway" => json!({
                 "mode": "transparent_proxy",
                 "endpoint": {"path": "/mcp"},

@@ -14,6 +14,7 @@ mod ai_request_guard_tests;
 mod ai_response_guard_tests;
 mod ai_semantic_cache_tests;
 mod ai_semantic_firewall_tests;
+mod ai_stream_router_tests;
 mod ai_token_metrics_tests;
 mod ai_tool_governor_tests;
 mod api_chargeback_sink_tests;
