@@ -528,8 +528,17 @@ where
     // `apply_request_body_plugins`.
     let prebuffered_body = match prebuffered_body {
         Some(body) if !plugins.is_empty() => {
-            let transformed =
-                crate::proxy::apply_request_body_plugins(plugins, proxy_headers, body).await;
+            // Use the context-aware variant so method-sensitive body plugins
+            // (e.g. `ai_prompt_compressor`) can gate on the real request method;
+            // this bridge path has no `:method` pseudo-header for the no-context
+            // hook to consult.
+            let transformed = crate::proxy::apply_request_body_plugins_with_context(
+                plugins,
+                Some(&mut *ctx),
+                proxy_headers,
+                body,
+            )
+            .await;
             // Run validators. Reject = emit a trailers-only gRPC error
             // (Grpc flavor) or a plain JSON error (everything else) and
             // return early WITHOUT dispatching to the backend.

@@ -34,6 +34,17 @@
 //! request inspection is on; oversized JSON response bodies; and streaming
 //! holds past [`MAX_STREAM_HOLD_BYTES`].
 //!
+//! Request and response policy is evaluated in `before_proxy` / `on_response_body`
+//! and then re-evaluated on the FINAL backend-/client-visible body in
+//! `on_final_request_body` / `on_final_response_body`, because `request_transformer`
+//! (3000) and `response_transformer` (4000) run body rules afterward. An unchanged
+//! body (matched by hash) is not governed twice; a body a later transform rewrote
+//! into a denied `tools/call`, a disallowed `tools[]` definition, or an injected
+//! `choices[].message.tool_calls[]` is fail-closed before dispatch/delivery. The
+//! response re-check is scoped to still-inspectable bodies: when a later transform
+//! (e.g. the `compression` plugin) encodes the response, the plaintext backend
+//! body was already governed in `on_response_body`.
+//!
 //! Non-goals (MVP): it does not execute tools, manage MCP sessions, replace
 //! `mcp_gateway`/A2A routing, or implement an approval UI.
 
@@ -95,6 +106,14 @@ const MAX_APPROVAL_CACHE_ENTRIES: usize = 4096;
 /// inspector is wired.
 const STREAM_REQUESTED_KEY: &str = "ai_tool_governor.stream_requested";
 const STREAM_MODEL_KEY: &str = "ai_tool_governor.stream_model";
+/// SHA-256 (hex) of the request/response body the deterministic policy last ran
+/// over, recorded in `before_proxy` / `on_response_body`. The post-transform
+/// `on_final_request_body` / `on_final_response_body` re-checks compare against
+/// it so an unchanged body is not governed twice (avoids duplicate approval
+/// webhooks) while a body a later `request_transformer` / `response_transformer`
+/// rewrote is re-evaluated against the same policy.
+const GOVERNED_REQUEST_HASH_KEY: &str = "ai_tool_governor.governed_request_hash";
+const GOVERNED_RESPONSE_HASH_KEY: &str = "ai_tool_governor.governed_response_hash";
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -650,17 +669,25 @@ impl GovernorEngine {
         approval: &ApprovalConfig,
         input: &ApprovalInput<'_>,
     ) -> Result<(bool, Option<String>), String> {
-        let cache_key = sha256_hex(&format!(
-            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
-            input.corr.consumer.as_deref().unwrap_or(""),
-            input.corr.proxy.as_deref().unwrap_or(""),
-            input.corr.model.as_deref().unwrap_or(""),
-            // Provider is sent to the webhook and can change its decision, so
-            // an approval for one provider must never be reused for another.
-            input.corr.provider.as_deref().unwrap_or(""),
-            input.name,
-            input.raw_args,
-        ));
+        // Hash a JSON array rather than a delimiter-joined string: tool/method
+        // names and A2A/MCP argument JSON are not restricted from containing the
+        // delimiter, so a flat `a\u{1}b` join collides `(name="n", args="x\u{1}y")`
+        // with `(name="n\u{1}x", args="y")`. serde escapes control characters
+        // inside each element, so distinct inputs always serialize distinctly.
+        // Provider is included because it is sent to the webhook and can change
+        // its decision — an approval for one provider must never be reused for
+        // another. `Value::to_string` is infallible, so no fallback key is needed.
+        let cache_key = sha256_hex(
+            &json!([
+                input.corr.consumer.as_deref().unwrap_or(""),
+                input.corr.proxy.as_deref().unwrap_or(""),
+                input.corr.model.as_deref().unwrap_or(""),
+                input.corr.provider.as_deref().unwrap_or(""),
+                input.name,
+                input.raw_args,
+            ])
+            .to_string(),
+        );
 
         if let Some(entry) = self.approval_cache.get(&cache_key) {
             let (allowed, expiry) = *entry.value();
@@ -1374,9 +1401,107 @@ impl Plugin for AiToolGovernor {
             }
         }
         if governs_request {
+            // Record the hash of the exact body governed here so the
+            // post-transform `on_final_request_body` re-check can skip an
+            // unchanged backend-visible body instead of governing (and, for
+            // `require_approval` policies, calling the webhook) a second time.
+            if let Some(hash) = ctx.metadata.get("request_body").map(|b| sha256_hex(b)) {
+                ctx.metadata
+                    .insert(GOVERNED_REQUEST_HASH_KEY.to_string(), hash);
+            }
             return self.govern_request(ctx, &json).await;
         }
         PluginResult::Continue
+    }
+
+    // --- Final backend-visible request body (post-transform re-check) ------
+
+    fn requires_request_body_buffering(&self) -> bool {
+        self.enabled && self.inspect.any_request()
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        // `govern_request` needs the real request context: consumer/proxy
+        // correlation, `plugin_http_call_ns` for approval webhooks, and metadata
+        // writes must survive back to the live request.
+        self.enabled && self.inspect.any_request()
+    }
+
+    /// Re-run the deterministic request policy on the FINAL backend-visible body.
+    ///
+    /// `before_proxy` governs the body as first buffered, but `request_transformer`
+    /// (3000) and other `transform_request_body` hooks run afterward and can add
+    /// or rewrite JSON fields — turning an allowed body into a denied `tools/call`
+    /// or a disallowed `tools[]` definition before it reaches the backend. This
+    /// hook closes that gap. Request decompression also runs in `transform_request_body`,
+    /// so a body opaque to `before_proxy` may be plaintext here.
+    async fn on_final_request_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if !self.enabled || !self.inspect.any_request() {
+            return PluginResult::Continue;
+        }
+        // Only JSON POST bodies are governed (mirror `should_buffer_request_body`).
+        if ctx.method != "POST"
+            || !header_value(headers, "content-type").is_some_and(is_json_content_type)
+        {
+            return PluginResult::Continue;
+        }
+
+        // Unchanged since `before_proxy` governed it: nothing new to check, and
+        // re-governing would risk a duplicate approval webhook.
+        let final_hash = sha256_hex_bytes(body);
+        if ctx.metadata.get(GOVERNED_REQUEST_HASH_KEY) == Some(&final_hash) {
+            return PluginResult::Continue;
+        }
+
+        let enforce_request = self.engine.mode == Mode::Enforce;
+
+        // A still-encoded / oversized / unparseable final body cannot be
+        // inspected: fail closed in enforce mode so a transform (or a body
+        // `before_proxy` could not read) cannot smuggle a denied call past policy.
+        if has_non_identity_content_encoding(headers) {
+            if enforce_request {
+                return self.reject_uninspectable(
+                    ctx,
+                    "request body",
+                    "request body has a content-encoding that cannot be inspected",
+                );
+            }
+            return PluginResult::Continue;
+        }
+        if body.is_empty() {
+            return PluginResult::Continue;
+        }
+        if body.len() > MAX_PARSE_BYTES {
+            if enforce_request {
+                return self.reject_uninspectable(
+                    ctx,
+                    "request body",
+                    "request body exceeds the inspectable size limit",
+                );
+            }
+            return PluginResult::Continue;
+        }
+        let json = match serde_json::from_slice::<Value>(body) {
+            Ok(json) => json,
+            Err(_) => {
+                if enforce_request {
+                    return self.reject_uninspectable(
+                        ctx,
+                        "request body",
+                        "request body is not parseable JSON despite a JSON content-type",
+                    );
+                }
+                return PluginResult::Continue;
+            }
+        };
+        ctx.metadata
+            .insert(GOVERNED_REQUEST_HASH_KEY.to_string(), final_hash);
+        self.govern_request(ctx, &json).await
     }
 
     // --- Buffered response path -------------------------------------------
@@ -1465,6 +1590,16 @@ impl Plugin for AiToolGovernor {
             }
         };
 
+        // Record the hash of the raw backend body governed here so the
+        // post-transform `on_final_response_body` re-check can skip an unchanged
+        // client-visible body (recorded even when there are no calls: a later
+        // `response_transformer` that injects one changes the hash and forces a
+        // fresh evaluation).
+        ctx.metadata.insert(
+            GOVERNED_RESPONSE_HASH_KEY.to_string(),
+            sha256_hex_bytes(body),
+        );
+
         let calls = extract_response_tool_calls(&json);
         if calls.is_empty() {
             return PluginResult::Continue;
@@ -1520,6 +1655,87 @@ impl Plugin for AiToolGovernor {
             return serde_json::to_vec(&json).ok();
         }
         None
+    }
+
+    /// Re-run the deterministic response policy on the FINAL client-visible body.
+    ///
+    /// `on_response_body` governs the raw backend body, but `response_transformer`
+    /// (4000) and other `transform_response_body` hooks run afterward and can add
+    /// or rewrite JSON fields — injecting a denied `choices[].message.tool_calls[]`
+    /// into a response the governor already cleared. This hook re-evaluates the
+    /// still-inspectable final body so such an injection is fail-closed before
+    /// delivery. When a later transform makes the body opaque (for example the
+    /// `compression` plugin encodes it), the plaintext backend body was already
+    /// governed in `on_response_body`, so the opaque final body is skipped rather
+    /// than falsely rejected.
+    async fn on_final_response_body(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        body: &[u8],
+    ) -> PluginResult {
+        if !self.enabled || !self.inspect.response_tool_calls {
+            return PluginResult::Continue;
+        }
+        if !(200..300).contains(&response_status) {
+            return PluginResult::Continue;
+        }
+        let content_type = header_value(response_headers, "content-type").unwrap_or("");
+        if !is_json_content_type(content_type) {
+            return PluginResult::Continue;
+        }
+        if body.is_empty() {
+            return PluginResult::Continue;
+        }
+
+        // Unchanged since `on_response_body` governed the raw backend body: no
+        // transform rewrote it, so re-governing would only risk a duplicate
+        // approval webhook.
+        let final_hash = sha256_hex_bytes(body);
+        if ctx.metadata.get(GOVERNED_RESPONSE_HASH_KEY) == Some(&final_hash) {
+            return PluginResult::Continue;
+        }
+
+        // Oversized or non-parseable FINAL body: `on_response_body` already
+        // fail-closed a genuinely uninspectable backend body in enforce mode
+        // before delivery, so an opaque body here is a later transform of an
+        // already-governed plaintext body — do not re-reject.
+        if body.len() > MAX_PARSE_BYTES {
+            return PluginResult::Continue;
+        }
+        let Ok(json) = serde_json::from_slice::<Value>(body) else {
+            return PluginResult::Continue;
+        };
+
+        let calls = extract_response_tool_calls(&json);
+        if calls.is_empty() {
+            return PluginResult::Continue;
+        }
+
+        let provider = detect_response_provider(&json).map(|p| p.as_str());
+        let model = json
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let corr = self.correlation(ctx, model, provider);
+
+        let batch = self
+            .engine
+            .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, false)
+            .await;
+        self.write_metadata(ctx, &batch);
+
+        if batch.enforce_blocks {
+            debug!(
+                target: "ai_tool_governor",
+                decision = batch.overall_label,
+                "rejecting response after transforms: {}",
+                batch.deny_reason.as_deref().unwrap_or("blocked")
+            );
+            return self.reject(&batch);
+        }
+        PluginResult::Continue
     }
 
     // --- Streaming response path ------------------------------------------
@@ -2162,8 +2378,12 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
 }
 
 fn sha256_hex(input: &str) -> String {
+    sha256_hex_bytes(input.as_bytes())
+}
+
+fn sha256_hex_bytes(input: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
+    hasher.update(input);
     let digest = hasher.finalize();
     let mut out = String::with_capacity(64);
     for byte in digest {

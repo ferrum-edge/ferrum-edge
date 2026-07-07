@@ -1,21 +1,30 @@
-//! Mesh UDP TPROXY capture listener (F3 §3.3 Stage 3).
+//! Mesh UDP TPROXY capture listener + datagram-over-mesh egress (F3 §3.3).
 //!
 //! Stage 2 (`src/capture/mod.rs`) emits the flag-gated, default-off netfilter
 //! `TPROXY` rules that divert a captured pod's UDP egress to a transparent
 //! local socket WITHOUT rewriting the destination. This module is the consuming
-//! listener: it binds that socket (`IP_TRANSPARENT` + `IP_RECVORIGDSTADDR` /
-//! `IPV6_RECVORIGDSTADDR`), drains datagrams via `recvmmsg`, recovers each
-//! datagram's ORIGINAL destination from the per-datagram cmsg (NOT
-//! `SO_ORIGINAL_DST`, which is TCP/conntrack-only), and keys a lightweight
-//! session by `(client SocketAddr, orig-dst SocketAddr)`.
+//! listener + egress relay: it binds that socket (`IP_TRANSPARENT` +
+//! `IP_RECVORIGDSTADDR` / `IPV6_RECVORIGDSTADDR`), drains datagrams via
+//! `recvmmsg`, recovers each datagram's ORIGINAL destination from the
+//! per-datagram cmsg (NOT `SO_ORIGINAL_DST`, which is TCP/conntrack-only), keys a
+//! session by `(client SocketAddr, orig-dst SocketAddr)`, and relays it over the
+//! topology's mesh transport (Ambient HBONE `:15008`, Sidecar mesh-mTLS `:15006`)
+//! to the destination workload, spoofing replies back from the captured
+//! destination via a per-session transparent reply socket. All gated behind
+//! `FERRUM_MESH_CAPTURE_UDP_ENABLED` (default-off) so there is no behavior change
+//! when the flag is off.
 //!
-//! **Stage 3 is capture → DROP, intentionally inert.** For now a captured
-//! datagram whose orig-dst would route to mesh egress is DROPPED with a debug
-//! log — the egress relay (forwarding the datagram over the topology's mesh
-//! transport to the destination workload) is Stage 4. This stage exercises the
-//! listener, the `IP_TRANSPARENT` bind, the cmsg orig-dst extraction, and the
-//! session keying, all gated behind `FERRUM_MESH_CAPTURE_UDP_ENABLED`
-//! (default-off) so there is no behavior change when the flag is off.
+//! **Two producers, one relay.** The recv/session/egress loop is factored into
+//! [`run_mesh_udp_capture_on_socket`], which runs over an already-bound
+//! transparent socket regardless of which network namespace it was bound in:
+//! - [`start_mesh_udp_capture_listener`] binds in the CURRENT netns — Sidecar,
+//!   whose injected sidecar shares the pod netns where the injector installed the
+//!   TPROXY rules.
+//! - The Ambient per-pod-netns producer (`src/proxy/netns_udp_capture.rs`) binds
+//!   the capture socket, and each session's reply socket, INSIDE each enrolled
+//!   pod's netns via a [`ReplySocketFactory`] — Ambient's proxy runs outside the
+//!   pod netns, so the producer installs the TPROXY rules and binds the sockets
+//!   from within each pod's namespace.
 //!
 //! **DoS bounds** are reused from the plain UDP proxy (`udp_proxy.rs`): a
 //! bounded session map (`FERRUM_UDP_MAX_SESSIONS`), an idle-expiry sweep
@@ -31,6 +40,53 @@ use std::net::SocketAddr;
 use std::net::SocketAddr as StdSocketAddr;
 
 use tokio::sync::watch;
+
+/// Process-local admission counter for captured UDP sessions.
+///
+/// Sidecar has one current-netns UDP producer, so its limiter is listener-local.
+/// Ambient starts one producer per pod netns; those producers must share a single
+/// limiter so `FERRUM_UDP_MAX_SESSIONS` remains a node-wide cap instead of being
+/// multiplied by the number of enrolled pods.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct MeshUdpSessionLimiter {
+    max_sessions: usize,
+    active_sessions: std::sync::atomic::AtomicU64,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl MeshUdpSessionLimiter {
+    pub(crate) fn new(max_sessions: usize) -> Self {
+        Self {
+            max_sessions,
+            active_sessions: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn try_reserve(&self) -> bool {
+        let prev = self
+            .active_sessions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if prev >= self.max_sessions as u64 {
+            self.active_sessions
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    fn release(&self, count: u64) {
+        if count > 0 {
+            self.active_sessions
+                .fetch_sub(count, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    fn active_count(&self) -> u64 {
+        self.active_sessions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
 
 /// Configuration for the mesh UDP capture listener.
 pub struct MeshUdpCaptureConfig {
@@ -109,34 +165,87 @@ fn mesh_udp_lb_hash_key_for_client_ip(ip: std::net::IpAddr) -> String {
     ip.to_canonical().to_string()
 }
 
-/// Start the mesh UDP capture listener (Linux).
+/// Creates a per-session transparent UDP reply socket bound (non-locally, via
+/// `IP_TRANSPARENT`) to a captured datagram's original destination, so replies
+/// to the pod are sourced from the VIP:port it dialed.
 ///
-/// Binds a transparent UDP socket on `cfg.addr`, enables per-datagram orig-dst
-/// recovery, and drains datagrams in a `recvmmsg` loop. Each captured datagram
-/// is keyed into a bounded session map and then DROPPED (Stage 3 has no egress
-/// relay). The listener runs until either shutdown channel fires.
+/// The capture socket and its reply sockets MUST live in the SAME network
+/// namespace: the Sidecar/current-netns listener binds both in the process
+/// netns; the Ambient per-pod-netns producer binds both INSIDE the captured
+/// pod's netns. A reply socket in the wrong netns cannot deliver replies back to
+/// the pod client and would spoof the wrong source (risk #1). The factory
+/// returns a bound `std::net::UdpSocket` (not a tokio socket) so the pod-netns
+/// implementation can build it on a `setns`-bound OS thread with no tokio
+/// dependency; the caller adopts it onto the runtime.
 #[cfg(target_os = "linux")]
-pub async fn start_mesh_udp_capture_listener(
-    cfg: MeshUdpCaptureConfig,
-) -> Result<(), anyhow::Error> {
+pub(crate) trait ReplySocketFactory: Send + Sync + 'static {
+    fn bind_transparent_reply_socket(
+        &self,
+        orig_dst: SocketAddr,
+    ) -> std::io::Result<std::net::UdpSocket>;
+}
+
+/// Current-netns reply-socket factory: binds the transparent reply socket in the
+/// process's own network namespace (Sidecar, whose capture listener already runs
+/// inside the injected pod's netns).
+#[cfg(target_os = "linux")]
+pub(crate) struct CurrentNetnsReplySocketFactory;
+
+#[cfg(target_os = "linux")]
+impl ReplySocketFactory for CurrentNetnsReplySocketFactory {
+    fn bind_transparent_reply_socket(
+        &self,
+        orig_dst: SocketAddr,
+    ) -> std::io::Result<std::net::UdpSocket> {
+        build_transparent_reply_socket(orig_dst)
+    }
+}
+
+/// Pod-netns reply-socket factory for the Ambient per-pod-netns producer: builds
+/// each session's transparent reply socket INSIDE the captured pod's network
+/// namespace, so the spoofed reply source (the captured VIP:port) is emitted from
+/// the correct netns and the datagram reaches the pod client. Holds a STABLE
+/// netns handle (`/proc/<pid>/ns/net`, opened once at capture start) so the
+/// `setns` works for the whole capture lifetime even after the resolving PID
+/// exits. Every reply-socket build runs on a dedicated `setns`-bound OS thread
+/// via [`crate::proxy::netns_capture::run_in_netns`] (never a tokio worker).
+#[cfg(target_os = "linux")]
+pub(crate) struct PodNetnsReplySocketFactory {
+    netns: std::sync::Arc<std::fs::File>,
+}
+
+#[cfg(target_os = "linux")]
+impl PodNetnsReplySocketFactory {
+    pub(crate) fn new(netns: std::sync::Arc<std::fs::File>) -> Self {
+        Self { netns }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl ReplySocketFactory for PodNetnsReplySocketFactory {
+    fn bind_transparent_reply_socket(
+        &self,
+        orig_dst: SocketAddr,
+    ) -> std::io::Result<std::net::UdpSocket> {
+        crate::proxy::netns_capture::run_in_netns(self.netns.as_ref(), move || {
+            build_transparent_reply_socket(orig_dst)
+        })
+    }
+}
+
+/// Bind the transparent UDP capture socket on `addr` in the CURRENT network
+/// namespace, preferring the dual-stack `[::]` bind and falling back to the v4
+/// wildcard only when IPv6 is genuinely unavailable. Returns the bound std
+/// socket, the resolved bind address, and which orig-dst cmsg families were
+/// enabled. Sync (socket2 only, no tokio) so the Ambient per-pod-netns producer
+/// can call it from a `setns`-bound OS thread to bind INSIDE a pod netns.
+#[cfg(target_os = "linux")]
+pub(crate) fn bind_mesh_udp_capture_socket(
+    addr: SocketAddr,
+) -> Result<(std::net::UdpSocket, SocketAddr, bool, bool), anyhow::Error> {
     use std::net::{IpAddr, Ipv4Addr};
     use std::os::fd::AsRawFd;
-    use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
-    use tokio::net::UdpSocket;
-    use tracing::{info, warn};
-
-    let MeshUdpCaptureConfig {
-        addr,
-        state,
-        shutdown,
-        global_shutdown,
-        max_sessions,
-        cleanup_interval_seconds,
-        recvmmsg_batch_size,
-        session_shard_amount,
-        started_tx,
-    } = cfg;
+    use tracing::warn;
 
     // Build a bound transparent capture socket on `bind_addr`. Factored into a
     // closure so the preferred dual-stack `[::]` bind can fall back to the v4
@@ -203,8 +312,8 @@ pub async fn start_mesh_udp_capture_listener(
     // report the listener "started" on v4 while ip6tables still diverts IPv6 UDP
     // to this port with no working v6 listener — blackholing v6 while the pod
     // looks ready. So a non-IPv6-availability error is returned, not masked.
-    let (std_socket, addr, v4_origdst, v6_origdst) = match build_bound_socket(addr) {
-        Ok((s, v4, v6)) => (s, addr, v4, v6),
+    match build_bound_socket(addr) {
+        Ok((s, v4, v6)) => Ok((s, addr, v4, v6)),
         Err(e) if addr.ip().is_ipv6() && is_ipv6_unavailable_error(&e) => {
             let v4_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), addr.port());
             warn!(
@@ -213,11 +322,103 @@ pub async fn start_mesh_udp_capture_listener(
                 "Mesh UDP capture: IPv6 unavailable for dual-stack [::] bind ({e}); falling back to v4 wildcard (IPv6 UDP capture unavailable on this host)"
             );
             let (s, v4, v6) = build_bound_socket(v4_addr)?;
-            (s, v4_addr, v4, v6)
+            Ok((s, v4_addr, v4, v6))
         }
-        Err(e) => return Err(e),
-    };
-    let frontend_socket = Arc::new(UdpSocket::from_std(std_socket)?);
+        Err(e) => Err(e),
+    }
+}
+
+/// Shared runtime knobs for the capture recv/session loop, independent of HOW
+/// the transparent socket was bound. Built by both the current-netns wrapper and
+/// the Ambient per-pod-netns producer.
+#[cfg(target_os = "linux")]
+pub(crate) struct MeshUdpCaptureRuntime {
+    pub state: std::sync::Arc<super::ProxyState>,
+    pub cleanup_interval_seconds: u64,
+    pub recvmmsg_batch_size: usize,
+    pub session_shard_amount: usize,
+    pub session_limiter: std::sync::Arc<MeshUdpSessionLimiter>,
+    /// Builds each session's transparent reply socket in the SAME netns as the
+    /// capture socket (current-netns for Sidecar, pod-netns for Ambient).
+    pub reply_socket_factory: std::sync::Arc<dyn ReplySocketFactory>,
+}
+
+/// Start the mesh UDP capture listener in the CURRENT network namespace
+/// (Sidecar: the injected pod's own netns). Binds the transparent socket here,
+/// then runs the shared capture loop with a current-netns reply-socket factory.
+/// The Ambient per-pod-netns producer instead binds inside each enrolled pod's
+/// netns and calls [`run_mesh_udp_capture_on_socket`] directly with a pod-netns
+/// reply-socket factory.
+#[cfg(target_os = "linux")]
+pub async fn start_mesh_udp_capture_listener(
+    cfg: MeshUdpCaptureConfig,
+) -> Result<(), anyhow::Error> {
+    let MeshUdpCaptureConfig {
+        addr,
+        state,
+        shutdown,
+        global_shutdown,
+        max_sessions,
+        cleanup_interval_seconds,
+        recvmmsg_batch_size,
+        session_shard_amount,
+        started_tx,
+    } = cfg;
+    let (std_socket, addr, v4_origdst, v6_origdst) = bind_mesh_udp_capture_socket(addr)?;
+    let frontend_socket = tokio::net::UdpSocket::from_std(std_socket)?;
+    run_mesh_udp_capture_on_socket(
+        frontend_socket,
+        addr,
+        v4_origdst,
+        v6_origdst,
+        MeshUdpCaptureRuntime {
+            state,
+            cleanup_interval_seconds,
+            recvmmsg_batch_size,
+            session_shard_amount,
+            session_limiter: std::sync::Arc::new(MeshUdpSessionLimiter::new(max_sessions)),
+            reply_socket_factory: std::sync::Arc::new(CurrentNetnsReplySocketFactory),
+        },
+        shutdown,
+        global_shutdown,
+        started_tx,
+    )
+    .await
+}
+
+/// Run the mesh UDP capture recv/session loop over an ALREADY-BOUND transparent
+/// socket. Shared by [`start_mesh_udp_capture_listener`] (current netns) and the
+/// Ambient per-pod-netns producer (`netns_udp_capture`). `addr` is used only for
+/// logging; `v4_origdst`/`v6_origdst` report which orig-dst cmsg families the
+/// bind enabled. The recovered orig-dst, session keying, DoS bounds, egress
+/// relay, and return-path behavior are identical regardless of which netns the
+/// socket was bound in — only [`MeshUdpCaptureRuntime::reply_socket_factory`]
+/// differs.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_mesh_udp_capture_on_socket(
+    frontend_socket: tokio::net::UdpSocket,
+    addr: SocketAddr,
+    v4_origdst: bool,
+    v6_origdst: bool,
+    runtime: MeshUdpCaptureRuntime,
+    shutdown: watch::Receiver<bool>,
+    global_shutdown: Option<watch::Receiver<bool>>,
+    started_tx: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<(), anyhow::Error> {
+    use std::os::fd::AsRawFd;
+    use std::sync::Arc;
+    use tracing::{info, warn};
+
+    let MeshUdpCaptureRuntime {
+        state,
+        cleanup_interval_seconds,
+        recvmmsg_batch_size,
+        session_shard_amount,
+        session_limiter,
+        reply_socket_factory,
+    } = runtime;
+    let frontend_socket = Arc::new(frontend_socket);
 
     let session_shard_amount = crate::util::sharding::pool_shard_amount(session_shard_amount);
     // Bounded session map keyed by (client, orig-dst). Kernel-provided keys, so
@@ -227,14 +428,6 @@ pub async fn start_mesh_udp_capture_listener(
             ahash::RandomState::default(),
             session_shard_amount,
         ));
-    // Cheap atomic session count for the per-datagram cap check. The spoofed-
-    // source flood path hits a map miss for every new (client, orig-dst), so the
-    // cap MUST NOT call `DashMap::len()` there (it walks/locks every shard —
-    // exactly what the cap defends against). Mirror the plain UDP proxy's
-    // `active_sessions` atomic: bumped on insert, decremented as the idle sweep
-    // reaps (codex r3 P2).
-    let active_sessions = Arc::new(AtomicU64::new(0));
-
     if let Some(tx) = started_tx {
         let _ = tx.send(());
     }
@@ -251,7 +444,7 @@ pub async fn start_mesh_udp_capture_listener(
     // expiry, simplified (no backend leg / plugins in Stage 3).
     spawn_capture_session_cleanup(
         sessions.clone(),
-        active_sessions.clone(),
+        session_limiter.clone(),
         shutdown.clone(),
         cleanup_interval_seconds,
     );
@@ -311,24 +504,24 @@ pub async fn start_mesh_udp_capture_listener(
                                         for chunk in data.chunks(seg as usize) {
                                             handle_captured_datagram(
                                                 &sessions,
-                                                &active_sessions,
+                                                &session_limiter,
                                                 &state,
                                                 client,
                                                 orig_dst,
                                                 chunk,
-                                                max_sessions,
+                                                &reply_socket_factory,
                                             );
                                         }
                                     }
                                     _ => {
                                         handle_captured_datagram(
                                             &sessions,
-                                            &active_sessions,
+                                            &session_limiter,
                                             &state,
                                             client,
                                             orig_dst,
                                             data,
-                                            max_sessions,
+                                            &reply_socket_factory,
                                         );
                                     }
                                 }
@@ -460,16 +653,17 @@ struct CaptureSession {
 /// `false` if it was dropped (no orig-dst, not routable, cap reached, or the
 /// egress channel was full) — exposed for unit testing the keying/cap logic.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 fn handle_captured_datagram(
     sessions: &std::sync::Arc<
         dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
     >,
-    active_sessions: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    session_limiter: &std::sync::Arc<MeshUdpSessionLimiter>,
     state: &std::sync::Arc<super::ProxyState>,
     client: SocketAddr,
     orig_dst: Option<SocketAddr>,
     data: &[u8],
-    max_sessions: usize,
+    reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
 ) -> bool {
     use tracing::debug;
 
@@ -521,14 +715,7 @@ fn handle_captured_datagram(
         Some(entry)
     };
 
-    match admit_or_refresh_session(
-        sessions,
-        active_sessions,
-        key,
-        data,
-        max_sessions,
-        resolve_entry,
-    ) {
+    match admit_or_refresh_session(sessions, session_limiter, key, data, resolve_entry) {
         SessionAdmission::Refreshed => true,
         SessionAdmission::Admitted {
             entry,
@@ -552,7 +739,7 @@ fn handle_captured_datagram(
             spawn_udp_egress_session(
                 state.clone(),
                 sessions.clone(),
-                active_sessions.clone(),
+                session_limiter.clone(),
                 key,
                 session_id,
                 entry,
@@ -560,6 +747,7 @@ fn handle_captured_datagram(
                 last_activity,
                 queued_bytes,
                 epoch,
+                reply_factory.clone(),
             );
             true
         }
@@ -610,10 +798,9 @@ enum SessionAdmission {
 #[cfg(target_os = "linux")]
 fn admit_or_refresh_session<F>(
     sessions: &dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
-    active_sessions: &std::sync::atomic::AtomicU64,
+    session_limiter: &MeshUdpSessionLimiter,
     key: CaptureSessionKey,
     data: &[u8],
-    max_sessions: usize,
     resolve_entry: F,
 ) -> SessionAdmission
 where
@@ -650,9 +837,7 @@ where
             };
 
             // Reserve a slot atomically; hand it back and shed if over the cap.
-            let prev = active_sessions.fetch_add(1, Ordering::Relaxed);
-            if prev >= max_sessions as u64 {
-                active_sessions.fetch_sub(1, Ordering::Relaxed);
+            if !session_limiter.try_reserve() {
                 debug!(
                     client = %key.client,
                     orig_dst = %key.orig_dst,
@@ -760,7 +945,7 @@ fn spawn_udp_egress_session(
     sessions: std::sync::Arc<
         dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
     >,
-    active_sessions: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    session_limiter: std::sync::Arc<MeshUdpSessionLimiter>,
     key: CaptureSessionKey,
     session_id: u64,
     entry: std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
@@ -768,15 +953,26 @@ fn spawn_udp_egress_session(
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
+    reply_factory: std::sync::Arc<dyn ReplySocketFactory>,
 ) {
     tokio::spawn(async move {
-        run_udp_egress_session(&state, &entry, key, rx, last_activity, queued_bytes, epoch).await;
+        run_udp_egress_session(
+            &state,
+            &entry,
+            key,
+            rx,
+            last_activity,
+            queued_bytes,
+            epoch,
+            &reply_factory,
+        )
+        .await;
         // Session teardown: remove the map entry and decrement the live count so
         // a finished/failed flow frees its slot immediately (the idle sweep is a
         // backstop for sessions whose task is still alive but quiescent).
         //
         // CONDITIONAL removal (codex r1 P2): see [`remove_session_if_owned`].
-        remove_session_if_owned(&sessions, &active_sessions, &key, session_id);
+        remove_session_if_owned(&sessions, &session_limiter, &key, session_id);
     });
 }
 
@@ -794,7 +990,7 @@ fn spawn_udp_egress_session(
 #[cfg(target_os = "linux")]
 fn remove_session_if_owned(
     sessions: &dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
-    active_sessions: &std::sync::atomic::AtomicU64,
+    session_limiter: &MeshUdpSessionLimiter,
     key: &CaptureSessionKey,
     session_id: u64,
 ) {
@@ -804,13 +1000,14 @@ fn remove_session_if_owned(
         .remove_if(key, |_, session| session.session_id == session_id)
         .is_some()
     {
-        active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        session_limiter.release(1);
     }
 }
 
 /// Body of the per-session egress task. Returns when the session ends (client
 /// idle, tunnel closed, or a fail-closed gate tripped). Never panics.
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
 async fn run_udp_egress_session(
     state: &std::sync::Arc<super::ProxyState>,
     entry: &std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
@@ -819,6 +1016,7 @@ async fn run_udp_egress_session(
     last_activity: std::sync::Arc<std::sync::atomic::AtomicU64>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     epoch: std::sync::Arc<crate::request_epoch::RequestEpoch>,
+    reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
 ) {
     use super::{LoadBalancerConnectionGuard, backend_dispatch};
     use crate::load_balancer::{LoadBalancerCache, LoadBalancerCacheInner};
@@ -1087,8 +1285,24 @@ async fn run_udp_egress_session(
     // captured original destination so replies to the pod appear sourced from
     // the VIP:port it dialed (IP_TRANSPARENT lets us bind a non-local addr;
     // the reply's source IP AND port then come from this bind). Risk #1. ──────
-    let reply_socket = match build_transparent_reply_socket(key.orig_dst) {
-        Ok(sock) => std::sync::Arc::new(sock),
+    // Built through the reply-socket factory so the socket lands in the SAME
+    // netns as the capture socket: current-netns for Sidecar, the captured pod's
+    // netns for Ambient. A reply socket in the wrong netns would not reach the
+    // pod client and would spoof the wrong source.
+    let reply_socket = match reply_factory.bind_transparent_reply_socket(key.orig_dst) {
+        Ok(std_sock) => match tokio::net::UdpSocket::from_std(std_sock) {
+            Ok(sock) => std::sync::Arc::new(sock),
+            Err(e) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    orig_dst = %key.orig_dst,
+                    error = %e,
+                    "Mesh UDP egress could not adopt the transparent reply socket onto the \
+                     runtime; ending session"
+                );
+                return;
+            }
+        },
         Err(e) => {
             warn!(
                 service = %entry.service_fqdn,
@@ -1251,9 +1465,7 @@ async fn run_udp_egress_session(
 /// pattern: the kernel emits replies from the bound transparent address rather
 /// than the host's own IP.
 #[cfg(target_os = "linux")]
-fn build_transparent_reply_socket(
-    orig_dst: SocketAddr,
-) -> Result<tokio::net::UdpSocket, anyhow::Error> {
+fn build_transparent_reply_socket(orig_dst: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
     use std::net::IpAddr;
     use std::os::fd::AsRawFd;
 
@@ -1271,9 +1483,11 @@ fn build_transparent_reply_socket(
     }
     // Bind to the captured original destination (the VIP:port the pod dialed).
     // IP_TRANSPARENT makes this non-local bind succeed; replies sent on this
-    // socket then originate from orig_dst.
+    // socket then originate from orig_dst. Returns a std socket (no tokio) so the
+    // pod-netns factory can build it on a `setns`-bound OS thread; the caller
+    // adopts it onto the runtime via `tokio::net::UdpSocket::from_std`.
     socket.bind(&orig_dst.into())?;
-    Ok(tokio::net::UdpSocket::from_std(socket.into())?)
+    Ok(socket.into())
 }
 
 /// Resolve the per-session idle timeout for an egress session from the relay
@@ -1294,7 +1508,7 @@ fn spawn_capture_session_cleanup(
     sessions: std::sync::Arc<
         dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
     >,
-    active_sessions: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    session_limiter: std::sync::Arc<MeshUdpSessionLimiter>,
     mut shutdown: watch::Receiver<bool>,
     cleanup_interval_seconds: u64,
 ) {
@@ -1334,9 +1548,7 @@ fn spawn_capture_session_cleanup(
                         }
                         keep
                     });
-                    if reaped > 0 {
-                        active_sessions.fetch_sub(reaped, Ordering::Relaxed);
-                    }
+                    session_limiter.release(reaped);
                 }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
@@ -1543,24 +1755,23 @@ listen_port: 15011
         // A captured datagram whose orig-dst matches no mesh UDP destination is
         // dropped: no session, no slot consumed (fail closed).
         let sessions = new_sessions(0);
-        let active = std::sync::atomic::AtomicU64::new(0);
+        let limiter = MeshUdpSessionLimiter::new(1000);
         let outcome = admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.5:40000", "1.1.1.1:53"),
             b"q",
-            1000,
             unroutable,
         );
         assert!(matches!(outcome, SessionAdmission::Dropped));
         assert_eq!(sessions.len(), 0);
-        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(limiter.active_count(), 0);
     }
 
     #[test]
     fn session_keyed_by_client_and_origdst() {
         let sessions = new_sessions(0);
-        let active = std::sync::atomic::AtomicU64::new(0);
+        let limiter = MeshUdpSessionLimiter::new(1000);
         // Hold the receivers so refreshes' channel sends don't fail (irrelevant
         // to the keying assertions, but keeps the sessions' channels open).
         let mut keepalive = Vec::new();
@@ -1569,10 +1780,9 @@ listen_port: 15011
         for dst in ["10.96.0.10:53", "10.96.0.11:53"] {
             match admit_or_refresh_session(
                 &sessions,
-                &active,
+                &limiter,
                 key("10.0.0.5:40000", dst),
                 b"x",
-                1000,
                 routable,
             ) {
                 SessionAdmission::Admitted { rx, .. } => keepalive.push(rx),
@@ -1585,10 +1795,9 @@ listen_port: 15011
         // session.
         let outcome = admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.5:40000", "10.96.0.10:53"),
             b"x",
-            1000,
             routable,
         );
         assert!(matches!(outcome, SessionAdmission::Refreshed));
@@ -1597,10 +1806,9 @@ listen_port: 15011
         // A different client to the same dst is a distinct session.
         match admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.6:50000", "10.96.0.10:53"),
             b"x",
-            1000,
             routable,
         ) {
             SessionAdmission::Admitted { rx, .. } => keepalive.push(rx),
@@ -1615,13 +1823,12 @@ listen_port: 15011
         // the DashMap (`len()`) while an entry guard is held — a plain return
         // here is the proof it no longer nests map ops under a guard.
         let sessions = new_sessions(0);
-        let active = std::sync::atomic::AtomicU64::new(0);
+        let limiter = MeshUdpSessionLimiter::new(64);
         let outcome = admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.5:40000", "10.96.0.10:53"),
             b"x",
-            64,
             routable,
         );
         assert!(matches!(outcome, SessionAdmission::Admitted { .. }));
@@ -1631,15 +1838,14 @@ listen_port: 15011
     #[test]
     fn session_cap_sheds_new_flows_but_serves_existing() {
         let sessions = new_sessions(0);
-        let active = std::sync::atomic::AtomicU64::new(0);
+        let limiter = MeshUdpSessionLimiter::new(1);
 
         // Cap of 1: first new flow admitted.
         let first = admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.5:40000", "10.96.0.10:53"),
             b"x",
-            1,
             routable,
         );
         let _rx = match first {
@@ -1651,10 +1857,9 @@ listen_port: 15011
         // Second NEW flow is shed at the cap.
         let second = admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.6:40000", "10.96.0.10:53"),
             b"x",
-            1,
             routable,
         );
         assert!(matches!(second, SessionAdmission::Dropped));
@@ -1663,14 +1868,48 @@ listen_port: 15011
         // The already-admitted flow is still served (refresh), even at the cap.
         let refreshed = admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.5:40000", "10.96.0.10:53"),
             b"x",
-            1,
             routable,
         );
         assert!(matches!(refreshed, SessionAdmission::Refreshed));
         assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn shared_limiter_caps_sessions_across_producers() {
+        // Ambient runs one capture loop per pod netns, each with its own session
+        // map. The limiter is the shared node-wide cap: a flow admitted by one
+        // producer must consume the only slot and shed a new flow in another.
+        let producer_a = new_sessions(0);
+        let producer_b = new_sessions(0);
+        let limiter = MeshUdpSessionLimiter::new(1);
+
+        let first = admit_or_refresh_session(
+            &producer_a,
+            &limiter,
+            key("10.0.0.5:40000", "10.96.0.10:53"),
+            b"x",
+            routable,
+        );
+        let _rx = match first {
+            SessionAdmission::Admitted { rx, .. } => rx,
+            other => panic!("expected Admitted, got {}", admission_name(&other)),
+        };
+
+        let second = admit_or_refresh_session(
+            &producer_b,
+            &limiter,
+            key("10.0.0.6:40000", "10.96.0.10:53"),
+            b"x",
+            routable,
+        );
+
+        assert!(matches!(second, SessionAdmission::Dropped));
+        assert_eq!(producer_a.len(), 1);
+        assert_eq!(producer_b.len(), 0);
+        assert_eq!(limiter.active_count(), 1);
     }
 
     #[test]
@@ -1736,20 +1975,20 @@ listen_port: 15011
         // must stamp DISTINCT session_ids, so a teardown carrying the old token
         // can be told apart from the replacement.
         let sessions = new_sessions(0);
-        let active = std::sync::atomic::AtomicU64::new(0);
+        let limiter = MeshUdpSessionLimiter::new(1000);
         let k = key("10.0.0.5:40000", "10.96.0.10:53");
 
         let (first_id, _rx1) =
-            match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+            match admit_or_refresh_session(&sessions, &limiter, k, b"x", routable) {
                 SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
                 other => panic!("expected Admitted, got {}", admission_name(&other)),
             };
         // Simulate the idle sweep reaping the first session.
         sessions.remove(&k);
-        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        limiter.release(1);
 
         let (second_id, _rx2) =
-            match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+            match admit_or_refresh_session(&sessions, &limiter, k, b"x", routable) {
                 SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
                 other => panic!("expected Admitted, got {}", admission_name(&other)),
             };
@@ -1763,44 +2002,43 @@ listen_port: 15011
         // session that reused the same (client, orig-dst) key, and must NOT
         // decrement the cap counter for it.
         let sessions = new_sessions(0);
-        let active = std::sync::atomic::AtomicU64::new(0);
+        let limiter = MeshUdpSessionLimiter::new(1000);
         let k = key("10.0.0.5:40000", "10.96.0.10:53");
 
         // Admit the original (session_id A), then simulate the idle sweep
         // reaping it (drop entry + decrement), exactly as the sweep would.
-        let old_id = match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+        let old_id = match admit_or_refresh_session(&sessions, &limiter, k, b"x", routable) {
             SessionAdmission::Admitted { session_id, .. } => session_id,
             other => panic!("expected Admitted, got {}", admission_name(&other)),
         };
         sessions.remove(&k);
-        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        limiter.release(1);
+        assert_eq!(limiter.active_count(), 0);
 
         // A new datagram on the same key admits a REPLACEMENT (session_id B).
-        let (new_id, _rx) =
-            match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
-                SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
-                other => panic!("expected Admitted, got {}", admission_name(&other)),
-            };
+        let (new_id, _rx) = match admit_or_refresh_session(&sessions, &limiter, k, b"x", routable) {
+            SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
+            other => panic!("expected Admitted, got {}", admission_name(&other)),
+        };
         assert_ne!(old_id, new_id);
         assert_eq!(sessions.len(), 1);
-        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(limiter.active_count(), 1);
 
         // The OLD task finally runs its teardown with the stale token: it must be
         // a no-op (replacement survives, counter unchanged).
-        remove_session_if_owned(&sessions, &active, &k, old_id);
+        remove_session_if_owned(&sessions, &limiter, &k, old_id);
         assert_eq!(sessions.len(), 1, "replacement session must survive");
         assert_eq!(
-            active.load(std::sync::atomic::Ordering::Relaxed),
+            limiter.active_count(),
             1,
             "cap counter must not be decremented for the replacement"
         );
 
         // The replacement's OWN teardown (matching token) removes it and frees
         // the slot.
-        remove_session_if_owned(&sessions, &active, &k, new_id);
+        remove_session_if_owned(&sessions, &limiter, &k, new_id);
         assert_eq!(sessions.len(), 0);
-        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(limiter.active_count(), 0);
     }
 
     #[test]

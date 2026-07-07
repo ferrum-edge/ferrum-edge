@@ -167,13 +167,11 @@ impl OpenLdapContainer {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD.encode(ldif);
         // base64-decode the LDIF on the container side to sidestep all shell
-        // quoting/heredoc concerns, then feed it to ldapadd. `2>&1` folds
-        // stderr into stdout so a single capture sees both the "adding new
-        // entry" lines and any "Can't contact LDAP server" error.
+        // quoting/heredoc concerns, then feed it to ldapadd.
         let script = format!(
             "echo {b64} | base64 -d | \
              ldapadd -x -H ldap://localhost:{LDAP_CONTAINER_PORT} \
-             -D '{LDAP_ADMIN_DN}' -w '{LDAP_ADMIN_PASSWORD}' 2>&1"
+             -D '{LDAP_ADMIN_DN}' -w '{LDAP_ADMIN_PASSWORD}'"
         );
 
         // Give the first-boot bootstrap a moment to hand off to the final slapd
@@ -183,28 +181,64 @@ impl OpenLdapContainer {
         let mut last = String::new();
         for _ in 0..40 {
             let out = self.exec_sh(&script).await?;
-            if out.contains("adding new entry") {
+            let combined = out.combined();
+            if out.exit_code == Some(0) {
                 return Ok(());
             }
             // slapd not up yet (or mid-restart during first-boot bootstrap).
-            if out.contains("Can't contact LDAP server")
-                || out.contains("Can't connect")
-                || out.trim().is_empty()
+            if combined.contains("Can't contact LDAP server")
+                || combined.contains("Can't connect")
+                || combined.trim().is_empty()
             {
-                last = out;
+                last = combined;
                 tokio::time::sleep(Duration::from_millis(750)).await;
                 continue;
             }
+            if combined.contains("adding new entry") {
+                return Err(format!(
+                    "ldapadd partially applied LDIF before failing with exit {:?}: {}",
+                    out.exit_code,
+                    combined.trim()
+                )
+                .into());
+            }
             // A real LDIF/schema error — surface it immediately.
-            return Err(format!("ldapadd failed: {out}").into());
+            return Err(format!(
+                "ldapadd failed with exit {:?}: {}",
+                out.exit_code,
+                combined.trim()
+            )
+            .into());
         }
         Err(format!("ldapadd never succeeded; last output: {last}").into())
     }
 
-    async fn exec_sh(&self, script: &str) -> Result<String, BoxError> {
+    async fn exec_sh(&self, script: &str) -> Result<ExecOutput, BoxError> {
         let cmd = vec!["sh".to_string(), "-c".to_string(), script.to_string()];
         let mut result = self._container.exec(ExecCommand::new(cmd)).await?;
         let stdout = result.stdout_to_vec().await?;
-        Ok(String::from_utf8_lossy(&stdout).into_owned())
+        let stderr = result.stderr_to_vec().await?;
+        Ok(ExecOutput {
+            exit_code: result.exit_code().await?,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        })
+    }
+}
+
+struct ExecOutput {
+    exit_code: Option<i64>,
+    stdout: String,
+    stderr: String,
+}
+
+impl ExecOutput {
+    fn combined(&self) -> String {
+        match (self.stdout.trim().is_empty(), self.stderr.trim().is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => self.stdout.clone(),
+            (true, false) => self.stderr.clone(),
+            (false, false) => format!("{}\n{}", self.stdout, self.stderr),
+        }
     }
 }

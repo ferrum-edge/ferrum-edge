@@ -1711,3 +1711,235 @@ async fn approval_cache_key_includes_provider() {
 
     server.verify().await;
 }
+
+// ---------------------------------------------------------------------------
+// Post-transform re-checks (on_final_request_body / on_final_response_body)
+// ---------------------------------------------------------------------------
+
+/// A `request_transformer`-style body rewrite after `before_proxy` that exposes
+/// a denied tool definition must be caught on the final backend-visible body.
+#[tokio::test]
+async fn final_request_body_recheck_denies_transform_injected_definition() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "github.create_pr": { "action": "allow" } },
+        "inspect": { "request_tool_definitions": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    let allowed =
+        json!({ "tools": [{ "type": "function", "function": { "name": "github.create_pr" } }] })
+            .to_string();
+    ctx.metadata.insert("request_body".to_string(), allowed);
+    let mut headers = json_headers();
+    // before_proxy clears the allowed body and records its hash.
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // A later transform rewrites the body to expose a denied tool.
+    let injected =
+        json!({ "tools": [{ "type": "function", "function": { "name": "kubectl.apply" } }] })
+            .to_string();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, injected.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// The final request-body re-check catches a transform that rewrites an allowed
+/// MCP `tools/call` into a denied one.
+#[tokio::test]
+async fn final_request_body_recheck_denies_transform_injected_mcp_call() {
+    let plugin = make(json!({
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    let headers = json_headers();
+    let injected = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "kubectl.apply", "arguments": { "manifest": "kind: Pod" } }
+    })
+    .to_string();
+    // before_proxy never governed this body (no recorded hash); the final hook
+    // still fails closed on the denied call.
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, injected.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// When the final body is byte-identical to what `before_proxy` governed, the
+/// re-check must NOT invoke the approval webhook a second time, even with the
+/// approval cache disabled (the skip is hash-based, not cache-based).
+#[tokio::test]
+async fn final_request_body_recheck_skips_unchanged_body_no_second_webhook() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "deploy", "arguments": { "env": "prod" } }
+    })
+    .to_string();
+    ctx.metadata
+        .insert("request_body".to_string(), body.clone());
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await); // webhook #1
+
+    // Same final body → hash matches → no second webhook.
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+    );
+    server.verify().await;
+}
+
+/// A `response_transformer`-style injection after `on_response_body` must be
+/// caught on the final client-visible body.
+#[tokio::test]
+async fn final_response_body_recheck_denies_transform_injected_tool_call() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    // Clean backend response with no tool calls: governed, hash recorded.
+    let clean = json!({
+        "id": "chatcmpl-1", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }]
+    })
+    .to_string()
+    .into_bytes();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .await,
+    );
+
+    // A later transform injects a denied tool call.
+    let injected = response_with_tool_call("kubectl.apply", "{\"manifest\":\"kind: Pod\"}");
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &injected)
+            .await,
+        Some(502),
+    );
+}
+
+/// The final response-body re-check must not re-invoke the approval webhook when
+/// the client-visible body is unchanged from what `on_response_body` governed.
+#[tokio::test]
+async fn final_response_body_recheck_skips_unchanged_body_no_second_webhook() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    ); // webhook #1
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    ); // hash match → skip
+    server.verify().await;
+}
+
+/// A response a later transform (e.g. the compression plugin) made opaque must
+/// be skipped, not falsely rejected: the plaintext backend body was already
+/// governed in `on_response_body`.
+#[tokio::test]
+async fn final_response_body_recheck_skips_opaque_transformed_body() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    let clean = json!({
+        "id": "x", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }]
+    })
+    .to_string()
+    .into_bytes();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .await,
+    );
+    // A gzip-compressed (non-JSON) final body: opaque, must not fail closed.
+    let opaque = vec![0x1f, 0x8b, 0x08, 0x00, 0x01, 0x02, 0x03, 0x04];
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &opaque)
+            .await,
+    );
+}
+
+/// Approval cache keys must be unambiguous: two distinct (name, args) pairs that
+/// differ only by where a `U+0001` byte falls must NOT share a cached decision.
+#[tokio::test]
+async fn approval_cache_key_is_unambiguous_across_delimiter_collisions() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(2) // distinct inputs → two webhook calls, never one cached hit
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "default_action": "require_approval",
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 300 }
+    }));
+
+    // (name="report", args="b\u{1}c") and (name="report\u{1}b", args="c") collide
+    // under a flat `name\u{1}args` join but are genuinely different calls.
+    let a = response_with_tool_call("report", "b\u{1}c");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &a)
+            .await,
+    );
+
+    let b = response_with_tool_call("report\u{1}b", "c");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &b)
+            .await,
+    );
+
+    server.verify().await;
+}

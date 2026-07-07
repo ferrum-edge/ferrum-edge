@@ -780,27 +780,42 @@ impl MeshRuntimeConfig {
         if !settings.udp_capture_enabled {
             return None;
         }
-        // Only the two captured-and-relayed topologies emit the listener: Ambient
-        // (datagram over HBONE :15008) and Sidecar (datagram over mesh-mTLS
-        // :15006). For ANY OTHER topology with the flag on, emit a loud ONE-TIME
-        // warning and DO NOT emit the listener — capturing UDP we cannot relay
-        // would black-hole it; leaving it un-captured lets it pass through.
+        // This helper emits ONLY the CURRENT-netns UDP capture listener, which is
+        // correct for SIDECAR: the injected sidecar shares the pod netns where the
+        // injector installed the TPROXY rules, so a listener bound here receives
+        // the captured datagrams.
+        //
+        // AMBIENT relays captured UDP too, but its proxy runs OUTSIDE the pod
+        // netns, so a host-netns listener would receive nothing (the host-netns
+        // iptables fallback emits no UDP TPROXY rules). Ambient UDP source-capture
+        // instead rides the per-pod-netns producer (`NetnsUdpCaptureManager`,
+        // #2013), started separately at mesh startup — it binds the capture socket
+        // and installs the TPROXY rules INSIDE each enrolled pod's netns. So Ambient
+        // emits NO listener here (a second, inert host-netns listener on the same
+        // port would be misleading and receive no pod traffic).
+        //
+        // Any OTHER topology has no UDP relay at all: warn ONCE and capture
+        // nothing — UDP passes through un-captured rather than being black-holed.
         // `listener_plan()` is called many times (serving, predicates, tests), so
         // the warn is gated behind a `Once` to avoid log spam.
-        if !matches!(self.topology, MeshTopology::Ambient | MeshTopology::Sidecar) {
-            static UDP_RELAY_UNSUPPORTED_WARN: std::sync::Once = std::sync::Once::new();
-            UDP_RELAY_UNSUPPORTED_WARN.call_once(|| {
-                warn!(
-                    topology = ?self.topology,
-                    "FERRUM_MESH_CAPTURE_UDP_ENABLED is set but UDP egress is only supported on \
-                     the Ambient (datagram-over-HBONE over :15008) and Sidecar \
-                     (datagram-over-mesh-mTLS over :15006) topologies. This topology has no UDP \
-                     relay, so the UDP capture listener is NOT emitted — UDP egress passes \
-                     through un-captured rather than being captured and dropped. Disable the flag \
-                     to silence this warning."
-                );
-            });
-            return None;
+        match self.topology {
+            MeshTopology::Sidecar => {}
+            MeshTopology::Ambient => return None,
+            _ => {
+                static UDP_RELAY_UNSUPPORTED_WARN: std::sync::Once = std::sync::Once::new();
+                UDP_RELAY_UNSUPPORTED_WARN.call_once(|| {
+                    warn!(
+                        topology = ?self.topology,
+                        "FERRUM_MESH_CAPTURE_UDP_ENABLED is set but UDP egress is only supported on \
+                         the Ambient (per-pod-netns producer, datagram-over-HBONE over :15008) and \
+                         Sidecar (current-netns listener, datagram-over-mesh-mTLS over :15006) \
+                         topologies. This topology has no UDP relay, so no UDP capture is emitted — \
+                         UDP egress passes through un-captured rather than being captured and \
+                         dropped. Disable the flag to silence this warning."
+                    );
+                });
+                return None;
+            }
         }
         // Bind the capture port on the DUAL-STACK IPv6 WILDCARD (`[::]`), not the
         // configured outbound IP (codex r1 P2) and not a family-following v4/v6
@@ -9218,6 +9233,125 @@ async fn serve_mesh_runtime(
             }));
         }
     }
+
+    // Ambient per-pod-netns UDP capture producer (#2013). Ambient's proxy runs
+    // OUTSIDE the workload pods' network namespaces, so a host-netns UDP capture
+    // listener would receive nothing (the host-netns iptables fallback emits no
+    // UDP TPROXY rules). When UDP capture is enabled, start a manager that — for
+    // each pod the node-agent enrolls in the registry — installs the UDP TPROXY
+    // rules and binds a transparent capture socket INSIDE that pod's netns, then
+    // runs the shared capture/egress loop (with a pod-netns reply-socket factory).
+    // Sidecar keeps its current-netns `PlaintextUdpCapture` listener; any other
+    // topology captures no UDP. Linux-only; a clear warning is emitted elsewhere.
+    if runtime.topology == MeshTopology::Ambient {
+        // Fail closed on a malformed UDP setting (codex): the operator explicitly
+        // enabled UDP capture, so a typo must not silently start the mesh with the
+        // producer disabled and pod UDP egress bypassing the mesh.
+        let settings = crate::capture::udp_capture_settings_from_env().map_err(|e| {
+            anyhow::anyhow!("invalid UDP capture settings for the Ambient UDP producer: {e}")
+        })?;
+        if settings.udp_capture_enabled {
+            if !cfg!(target_os = "linux") {
+                warn!(
+                    "Ambient UDP capture is enabled but the per-pod-netns producer is Linux-only; \
+                     not starting it (UDP egress passes through un-captured)"
+                );
+            } else {
+                // Fail closed on a malformed capture config (codex): an invalid
+                // include/exclude CIDR, port list, or FERRUM_MESH_IP6TABLES_ENABLED
+                // value must abort startup, not silently disable the datapath.
+                let mut capture_config =
+                    crate::capture::CaptureConfig::from_env().map_err(|e| {
+                        anyhow::anyhow!(
+                            "Ambient UDP capture is enabled but the capture config is invalid: {e}"
+                        )
+                    })?;
+                // Producer posture: UDP enabled, POD netns (never host-netns — the
+                // producer installs rules INSIDE each pod netns), on the resolved
+                // capture port/mark. The include/exclude scope is node-level (from
+                // the proxy's `FERRUM_MESH_CAPTURE_*` env); per-pod
+                // `includeOutboundPorts` annotation scoping is a documented
+                // follow-up (it would ride the registry).
+                capture_config.udp_capture_enabled = true;
+                capture_config.host_netns = false;
+                capture_config.udp_outbound_port = settings.udp_outbound_port;
+                capture_config.tproxy_mark = settings.tproxy_mark;
+                // The sidecar default excludes (15001/15006/15008/15020) only make
+                // sense when a proxy is co-located in the pod netns. Ambient's
+                // producer runs inside workload pod netns with no sidecar, so an
+                // implicit exclude would let app UDP to those service ports bypass
+                // capture/authz. Explicit operator excludes are preserved.
+                capture_config.clear_implicit_exclude_ports();
+                // NO proxy-UID owner-match self-exclusion. That RETURN exists to
+                // skip the co-located SIDECAR's own egress; in Ambient the proxy is
+                // OUTSIDE the pod netns, so the only egress in the pod netns is the
+                // app's — exactly what we capture. Keeping the default UID (1337)
+                // would fail OPEN for a pod app that happened to run as 1337. The
+                // anti-loop mark RETURN + `! --dst-type LOCAL` scope still bound the
+                // OUTPUT-mark loop without an owner match, and the proxy's own relay
+                // egress never traverses the pod netns anyway.
+                capture_config.proxy_uid = None;
+                // Preflight the in-netns tooling NOW — after the config is built —
+                // so it can ALSO require `ip6tables` when IPv6 UDP capture is set to
+                // `required` with IPv6 CIDRs (the per-pod script would otherwise
+                // FATALLY preflight `ip6tables` and fail every setup forever on an
+                // image that lacks it). A distroless runtime image has no
+                // `sh`/`ip`/`iptables` at all; fail closed with a clear message
+                // instead of retrying forever with nothing captured (codex).
+                crate::proxy::netns_udp_capture::preflight_capture_tools(
+                    capture_config.udp_ipv6_capture_required(),
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
+                let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+                    env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+                ));
+                let backend = crate::proxy::netns_udp_capture::ProxyNetnsUdpBackend::new(
+                    Arc::new(proxy_state.clone()),
+                    capture_config,
+                    settings.udp_outbound_port,
+                    env_config.udp_max_sessions,
+                    env_config.udp_cleanup_interval_seconds,
+                    env_config.udp_recvmmsg_batch_size,
+                    env_config.pool_shard_amount,
+                    shutdown_tx.subscribe(),
+                );
+                let manager = crate::proxy::netns_udp_capture::NetnsUdpCaptureManager::new(
+                    settings.udp_outbound_port,
+                    source,
+                    backend,
+                    std::time::Duration::from_secs(2),
+                );
+                let manager_shutdown = shutdown_tx.subscribe();
+                info!(
+                    registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+                    capture_port = settings.udp_outbound_port,
+                    "Ambient per-pod-netns UDP capture producer enabled"
+                );
+                mesh_background_handles.push(tokio::spawn(async move {
+                    manager.run(manager_shutdown).await;
+                }));
+            }
+        } else if cfg!(target_os = "linux") {
+            let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+                env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+            ));
+            let backend = crate::proxy::netns_udp_capture::ProxyNetnsUdpCleanupBackend::new(true);
+            let manager = crate::proxy::netns_udp_capture::NetnsUdpCleanupManager::new(
+                source,
+                backend,
+                std::time::Duration::from_secs(2),
+            );
+            let manager_shutdown = shutdown_tx.subscribe();
+            info!(
+                registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+                "Ambient UDP capture disabled; stale per-pod-netns UDP cleanup manager enabled"
+            );
+            mesh_background_handles.push(tokio::spawn(async move {
+                manager.run(manager_shutdown).await;
+            }));
+        }
+    }
+
     if let Some(ref slice) = initial_applied_mesh_slice {
         mesh_state.record_applied_slice(slice);
     }
@@ -20704,9 +20838,13 @@ mod tests {
     }
 
     #[test]
-    fn mesh_runtime_listener_plan_ambient_emits_udp_capture_when_enabled() {
-        // Ambient relays captured UDP (Stage 4 egress), so with the capture flag
-        // on it MUST emit the PlaintextUdpCapture listener (dual-stack `[::]`).
+    fn mesh_runtime_listener_plan_ambient_omits_host_udp_capture_listener() {
+        // Ambient relays captured UDP, but its proxy runs OUTSIDE the pod netns,
+        // so a CURRENT-netns (host) capture listener would receive nothing.
+        // Ambient UDP source-capture rides the per-pod-netns producer
+        // (`NetnsUdpCaptureManager`, #2013), started separately — so the listener
+        // plan must NOT contain a host-netns PlaintextUdpCapture listener (a second,
+        // inert listener on the same port would be misleading).
         with_mesh_env(
             &[
                 ("FERRUM_MODE", "mesh"),
@@ -20724,11 +20862,11 @@ mod tests {
                     MeshRuntimeConfig::from_env_config(&env).expect("mesh runtime config");
                 let plan = runtime.listener_plan();
                 assert!(
-                    plan.iter().any(|listener| {
-                        listener.kind == MeshListenerKind::PlaintextUdpCapture
-                            && listener.direction == MeshTrafficDirection::Outbound
-                    }),
-                    "Ambient must emit the UDP capture listener when capture is enabled"
+                    !plan
+                        .iter()
+                        .any(|listener| listener.kind == MeshListenerKind::PlaintextUdpCapture),
+                    "Ambient must NOT emit a host-netns UDP capture listener; it uses the \
+                     per-pod-netns producer instead"
                 );
             },
         );
