@@ -29,6 +29,15 @@ fn json_headers() -> HashMap<String, String> {
     headers
 }
 
+/// A request context shaped like the JSON POSTs this plugin governs.
+fn json_post_ctx() -> RequestContext {
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx
+}
+
 /// A buffered OpenAI chat-completion response carrying a single tool call.
 /// `arguments` is the JSON-encoded arguments *string*, as OpenAI emits.
 fn response_with_tool_call(name: &str, arguments: &str) -> Vec<u8> {
@@ -504,8 +513,7 @@ async fn denies_request_exposing_disallowed_tool_definition() {
         "tools": { "github.create_pr": { "action": "allow" } },
         "inspect": { "request_tool_definitions": true, "response_tool_calls": false }
     }));
-    let mut ctx = create_test_context();
-    ctx.method = "POST".to_string();
+    let mut ctx = json_post_ctx();
     ctx.metadata.insert(
         "request_body".to_string(),
         json!({
@@ -530,8 +538,7 @@ async fn allows_request_exposing_only_permitted_tools() {
         "tools": { "github.create_pr": { "action": "allow" } },
         "inspect": { "request_tool_definitions": true, "response_tool_calls": false }
     }));
-    let mut ctx = create_test_context();
-    ctx.method = "POST".to_string();
+    let mut ctx = json_post_ctx();
     ctx.metadata.insert(
         "request_body".to_string(),
         json!({ "tools": [{ "type": "function", "function": { "name": "github.create_pr" } }] })
@@ -551,8 +558,7 @@ async fn denies_mcp_tools_call_for_denied_tool() {
         "tools": { "kubectl.apply": { "action": "deny" } },
         "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
     }));
-    let mut ctx = create_test_context();
-    ctx.method = "POST".to_string();
+    let mut ctx = json_post_ctx();
     ctx.metadata.insert(
         "request_body".to_string(),
         json!({
@@ -844,4 +850,476 @@ async fn streaming_inspector_only_for_event_stream_2xx() {
             .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
             .is_some()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Fail-closed request-body inspection (encoded / oversized / unparseable)
+// ---------------------------------------------------------------------------
+
+fn mcp_config(mode: &str) -> Value {
+    json!({
+        "mode": mode,
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    })
+}
+
+#[tokio::test]
+async fn enforce_rejects_content_encoded_request_body() {
+    // Request decompression runs in later body-transform hooks, so an encoded
+    // body is opaque here: enforce mode must not forward it ungoverned.
+    let plugin = make(mcp_config("enforce"));
+    let mut ctx = json_post_ctx();
+    ctx.headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "64".to_string());
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("deny")
+    );
+}
+
+#[tokio::test]
+async fn dry_run_forwards_content_encoded_request_body() {
+    let plugin = make(mcp_config("dry_run"));
+    let mut ctx = json_post_ctx();
+    ctx.headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "64".to_string());
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+#[tokio::test]
+async fn enforce_rejects_oversized_request_body() {
+    let plugin = make(mcp_config("enforce"));
+    let mut ctx = json_post_ctx();
+    // A syntactically valid JSON body padded past the 4 MiB parse limit.
+    let body = format!("{{\"pad\":\"{}\"}}", "x".repeat(4 * 1024 * 1024));
+    ctx.metadata.insert(
+        "request_body_size_bytes".to_string(),
+        body.len().to_string(),
+    );
+    ctx.metadata.insert("request_body".to_string(), body);
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+}
+
+#[tokio::test]
+async fn enforce_rejects_unparseable_json_request_body() {
+    let plugin = make(mcp_config("enforce"));
+    let mut ctx = json_post_ctx();
+    ctx.metadata
+        .insert("request_body".to_string(), "not-json{{{".to_string());
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+}
+
+#[tokio::test]
+async fn enforce_rejects_non_utf8_request_body() {
+    // A non-UTF-8 (binary) body never reaches the `request_body` metadata slot;
+    // only its size does. JSON must be UTF-8, so this is uninspectable.
+    let plugin = make(mcp_config("enforce"));
+    let mut ctx = json_post_ctx();
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "12".to_string());
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+}
+
+#[tokio::test]
+async fn non_json_posts_are_not_rejected() {
+    // The fail-closed rules are scoped to the JSON POSTs this plugin governs.
+    let plugin = make(mcp_config("enforce"));
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "text/plain".to_string());
+    ctx.headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "64".to_string());
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+// ---------------------------------------------------------------------------
+// JSON-RPC batch envelopes
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn denies_mcp_tools_call_inside_json_rpc_batch() {
+    let plugin = make(mcp_config("enforce"));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!([
+            { "jsonrpc": "2.0", "id": 1, "method": "tools/list" },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "kubectl.apply", "arguments": { "manifest": "kind: Pod" } }
+            }
+        ])
+        .to_string(),
+    );
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+}
+
+#[tokio::test]
+async fn allows_json_rpc_batch_without_governed_calls() {
+    let plugin = make(mcp_config("enforce"));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!([{ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }]).to_string(),
+    );
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+}
+
+// ---------------------------------------------------------------------------
+// Streaming dispatch + JSON-fallback buffering
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stream_true_request_forces_reqwest_dispatch() {
+    let plugin = make(streaming_config(
+        json!({ "x": { "action": "allow" } }),
+        "deny",
+    ));
+    let mut headers = HashMap::new();
+
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({ "model": "gpt-4o", "stream": true, "messages": [] }).to_string(),
+    );
+    assert!(
+        !plugin.forces_reqwest_dispatch(&ctx),
+        "no marker before before_proxy runs"
+    );
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        plugin.forces_reqwest_dispatch(&ctx),
+        "a detected stream:true body must pin the reqwest dispatch path"
+    );
+
+    // A non-streaming body never leaves the fast path.
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({ "model": "gpt-4o", "messages": [] }).to_string(),
+    );
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(!plugin.forces_reqwest_dispatch(&ctx));
+}
+
+#[tokio::test]
+async fn uninspectable_body_conservatively_forces_reqwest_when_streaming_only() {
+    // Streaming-only configs never reject, but an uninspectable body may hide
+    // `stream: true`, so the request must stay on the inspectable path.
+    let plugin = make(streaming_config(
+        json!({ "x": { "action": "allow" } }),
+        "deny",
+    ));
+    let mut ctx = json_post_ctx();
+    ctx.headers
+        .insert("content-encoding".to_string(), "br".to_string());
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "64".to_string());
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(plugin.forces_reqwest_dispatch(&ctx));
+}
+
+#[test]
+fn streaming_marked_requests_still_buffer_json_fallbacks() {
+    // An earlier plugin's `ai_request_streaming` marker (or an SSE Accept
+    // header) must not opt the response out of buffering pre-header: the
+    // backend may answer with plain JSON tool_calls. Content-type refinement
+    // releases only genuine event streams back to the stream path.
+    let plugin = make(json!({ "tools": { "kubectl.apply": { "action": "deny" } } }));
+
+    let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ai_request_streaming".to_string(), "true".to_string());
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+    assert!(plugin.should_buffer_response_body(&ctx));
+
+    let response_headers = HashMap::new();
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &response_headers
+    ));
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("application/json"),
+        200,
+        &response_headers
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Oversized buffered responses
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn enforce_rejects_oversized_json_response() {
+    let plugin = make(json!({ "tools": { "kubectl.apply": { "action": "deny" } } }));
+    let mut ctx = create_test_context();
+    let body = vec![b'x'; 4 * 1024 * 1024 + 1];
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
+async fn dry_run_forwards_oversized_json_response() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "tools": { "kubectl.apply": { "action": "deny" } }
+    }));
+    let mut ctx = create_test_context();
+    let body = vec![b'x'; 4 * 1024 * 1024 + 1];
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-choice streaming (per-choice finish tracking)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn streaming_governs_second_choice_tool_calls_after_first_choice_finishes() {
+    // n=2 streaming: choice 0 finishes an ALLOWED call first; choice 1 then
+    // streams a DENIED call. Finalizing on the first finish_reason would let
+    // choice 1's deltas vanish ungoverned — they must still be evaluated.
+    let plugin = make(streaming_config(
+        json!({ "safe_tool": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"safe_tool\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":1,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c2\",\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+
+    assert!(terminated, "choice 1's denied call must cut the stream");
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("safe_tool"),
+        "choice 0's allowed call should have been released: {text}"
+    );
+    assert!(!text.contains("danger"), "denied call leaked: {text}");
+    assert!(
+        text.contains("ai_tool_governor_tool_blocked"),
+        "no terminal error event: {text}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_multi_choice_releases_when_all_choices_allowed() {
+    let plugin = make(streaming_config(
+        json!({ "safe_tool": { "action": "allow" }, "other_tool": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    // Interleaved n=2 deltas; choice 0 finishes before choice 1's call arrives.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"safe_tool\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":1,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c2\",\"function\":{\"name\":\"other_tool\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let bytes = body.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(
+        !terminated,
+        "all-allowed multi-choice stream must not be cut"
+    );
+    assert_eq!(out, bytes, "every frame must be delivered");
+}
+
+// ---------------------------------------------------------------------------
+// Streaming hold cap
+// ---------------------------------------------------------------------------
+
+/// One ~1MiB SSE tool-call delta frame (arguments fragment only, no finish).
+fn huge_tool_call_frame() -> Vec<u8> {
+    let args = "A".repeat(1024 * 1024);
+    let frame = json!({
+        "choices": [{
+            "index": 0,
+            "delta": { "tool_calls": [{ "index": 0, "function": { "name": "held_tool", "arguments": args } }] }
+        }]
+    });
+    let mut event = b"data: ".to_vec();
+    event.extend_from_slice(frame.to_string().as_bytes());
+    event.extend_from_slice(b"\n\n");
+    event
+}
+
+#[tokio::test]
+async fn streaming_hold_cap_terminates_in_enforce_mode() {
+    let plugin = make(streaming_config(
+        json!({ "held_tool": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    // Never-finishing tool-call deltas: held bytes must not grow unboundedly.
+    let frame = huge_tool_call_frame();
+    let mut out = Vec::new();
+    let mut terminated = false;
+    for _ in 0..6 {
+        match inspector.on_chunk(&frame).await {
+            ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
+            ResponseStreamAction::Terminate(bytes) => {
+                if let Some(bytes) = bytes {
+                    out.extend_from_slice(&bytes);
+                }
+                terminated = true;
+                break;
+            }
+        }
+    }
+    assert!(terminated, "exceeding the hold cap must cut the stream");
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("AAAA"), "held frames leaked: {text}");
+    assert!(
+        text.contains("ai_tool_governor_tool_blocked"),
+        "no terminal error event: {text}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_hold_cap_releases_uninspected_in_dry_run() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "held_tool": { "action": "allow" } },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    let frame = huge_tool_call_frame();
+    let mut out = Vec::new();
+    let mut terminated = false;
+    for _ in 0..6 {
+        match inspector.on_chunk(&frame).await {
+            ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
+            ResponseStreamAction::Terminate(bytes) => {
+                if let Some(bytes) = bytes {
+                    out.extend_from_slice(&bytes);
+                }
+                terminated = true;
+                break;
+            }
+        }
+    }
+    assert!(!terminated, "dry-run must never disrupt traffic");
+    assert_eq!(
+        out.len(),
+        frame.len() * 6,
+        "dry-run must release all bytes once the cap is exceeded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Approval cache keying
+// ---------------------------------------------------------------------------
+
+/// Like `response_with_tool_call` but with an Anthropic-shaped `usage`, so
+/// `detect_response_provider` reports a different provider.
+fn anthropic_shaped_response_with_tool_call(name: &str, arguments: &str) -> Vec<u8> {
+    json!({
+        "id": "chatcmpl-2",
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [{
+                    "id": "call_2",
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    })
+    .to_string()
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn approval_cache_key_includes_provider() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(2) // same tool+args from two providers → two webhook calls
+        .mount(&server)
+        .await;
+
+    let plugin = make(approval_config(&format!("{}/approve", server.uri())));
+
+    let mut ctx = create_test_context();
+    let openai = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &openai)
+            .await,
+    );
+
+    let mut ctx = create_test_context();
+    let anthropic = anthropic_shaped_response_with_tool_call("deploy", "{\"env\":\"prod\"}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &anthropic)
+            .await,
+    );
+
+    server.verify().await;
 }

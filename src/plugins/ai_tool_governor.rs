@@ -28,7 +28,11 @@
 //! `dry_run`. In `mode: dry_run` the plugin evaluates and emits metadata but
 //! never rejects. In `mode: enforce` it fails closed when a configured policy
 //! or the approval endpoint cannot be evaluated, unless the approval
-//! `fail_on_error` says `warn`/`allow`.
+//! `fail_on_error` says `warn`/`allow`. Enforce mode also fails closed on
+//! governed bodies it cannot inspect: `Content-Encoding`d, oversized
+//! (> [`MAX_PARSE_BYTES`]), non-UTF-8, or unparseable JSON request bodies when
+//! request inspection is on; oversized JSON response bodies; and streaming
+//! holds past [`MAX_STREAM_HOLD_BYTES`].
 //!
 //! Non-goals (MVP): it does not execute tools, manage MCP sessions, replace
 //! `mcp_gateway`/A2A routing, or implement an approval UI.
@@ -65,10 +69,26 @@ const DEFAULT_APPROVAL_TIMEOUT_MS: u64 = 1500;
 /// Default approval cache TTL.
 const DEFAULT_APPROVAL_CACHE_TTL_S: u64 = 300;
 /// Upper bound on the body size this plugin will parse for tool calls, so an
-/// oversized (already-buffered) body cannot spend unbounded CPU in serde. Bodies
-/// past this are forwarded uninspected (buffered path) — the request/response
-/// size-limiting plugins are the real backstop.
+/// oversized (already-buffered) body cannot spend unbounded CPU in serde. In
+/// `enforce` mode a governed body past this limit is REJECTED (fail closed —
+/// padding a request/response past the parse limit must not smuggle a governed
+/// call past policy); in `dry_run` it is forwarded uninspected.
 const MAX_PARSE_BYTES: usize = 4 * 1024 * 1024;
+/// Upper bound on bytes the streaming inspector may retain (held tool-call
+/// frames plus the partial-event carry buffer). A backend that streams
+/// never-finishing tool-call deltas cannot grow gateway memory past this: on
+/// overflow the stream is terminated in `enforce` mode (fail closed) or
+/// released uninspected in `dry_run` (never disrupt traffic).
+const MAX_STREAM_HOLD_BYTES: usize = MAX_PARSE_BYTES;
+/// Upper bound on cached approval decisions. At capacity, expired entries are
+/// purged; if the cache is still full of live decisions, new decisions are
+/// simply not cached (costing an extra webhook call later, never memory).
+const MAX_APPROVAL_CACHE_ENTRIES: usize = 4096;
+/// Request-path metadata marker: this plugin detected `"stream": true` in the
+/// request body (or could not rule it out for an uninspectable body), so the
+/// response must stay on the reqwest dispatch path where the SSE stream
+/// inspector is wired.
+const STREAM_REQUESTED_KEY: &str = "ai_tool_governor.stream_requested";
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -215,7 +235,9 @@ struct GovernorEngine {
     observability: ObservabilityConfig,
     http_client: PluginHttpClient,
     /// Approval decisions keyed by SHA-256 of the canonical policy input
-    /// (`consumer|proxy|model|tool|raw_args`), value is `(allowed, expiry)`.
+    /// (`consumer|proxy|model|provider|tool|raw_args` — every field the webhook
+    /// receives that can change its decision), value is `(allowed, expiry)`.
+    /// Bounded by [`MAX_APPROVAL_CACHE_ENTRIES`].
     approval_cache: DashMap<String, (bool, Instant)>,
 }
 
@@ -593,27 +615,43 @@ impl GovernorEngine {
         input: &ApprovalInput<'_>,
     ) -> Result<(bool, Option<String>), String> {
         let cache_key = sha256_hex(&format!(
-            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+            "{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
             input.corr.consumer.as_deref().unwrap_or(""),
             input.corr.proxy.as_deref().unwrap_or(""),
             input.corr.model.as_deref().unwrap_or(""),
+            // Provider is sent to the webhook and can change its decision, so
+            // an approval for one provider must never be reused for another.
+            input.corr.provider.as_deref().unwrap_or(""),
             input.name,
             input.raw_args,
         ));
 
         if let Some(entry) = self.approval_cache.get(&cache_key) {
             let (allowed, expiry) = *entry.value();
+            drop(entry);
             if expiry > Instant::now() {
                 // Cached decision — no fresh approval id.
                 return Ok((allowed, None));
             }
+            // Expired: remove eagerly so stale keys do not accumulate.
+            self.approval_cache.remove(&cache_key);
         }
 
         let (allowed, approval_id) = self.call_approval(approval, input).await?;
 
         if approval.cache_ttl > Duration::ZERO {
-            self.approval_cache
-                .insert(cache_key, (allowed, Instant::now() + approval.cache_ttl));
+            if self.approval_cache.len() >= MAX_APPROVAL_CACHE_ENTRIES {
+                // At capacity: purge expired entries. Argument-varying clients
+                // cannot grow this map for the process lifetime.
+                let now = Instant::now();
+                self.approval_cache.retain(|_, (_, expiry)| *expiry > now);
+            }
+            if self.approval_cache.len() < MAX_APPROVAL_CACHE_ENTRIES {
+                self.approval_cache
+                    .insert(cache_key, (allowed, Instant::now() + approval.cache_ttl));
+            }
+            // Still full of live decisions: skip caching (fail safe — only
+            // costs an extra webhook call later) rather than grow unbounded.
         }
         Ok((allowed, approval_id))
     }
@@ -936,8 +974,74 @@ impl AiToolGovernor {
         }
     }
 
+    /// Reject a request/response body this plugin is configured to govern but
+    /// cannot inspect (encoded, oversized, non-UTF-8, or unparseable). Only
+    /// called in `enforce` mode — forwarding an uninspectable governed body
+    /// would let padding/encoding smuggle a denied call past policy.
+    fn reject_uninspectable(
+        &self,
+        ctx: &mut RequestContext,
+        surface: &str,
+        reason: &str,
+    ) -> PluginResult {
+        if self.engine.observability.emit_metadata {
+            let m = &mut ctx.metadata;
+            m.insert("ai_tool_governor.enabled".to_string(), "true".to_string());
+            m.insert(
+                "ai_tool_governor.mode".to_string(),
+                self.engine.mode.as_str().to_string(),
+            );
+            m.insert("ai_tool_governor.decision".to_string(), "deny".to_string());
+        }
+        PluginResult::Reject {
+            status_code: self.engine.response.deny_status_code,
+            body: format!(
+                r#"{{"error":"ai_tool_governor: {} cannot be inspected","decision":"deny","detail":"{}"}}"#,
+                escape_json_string(surface),
+                escape_json_string(reason),
+            ),
+            headers: HashMap::new(),
+        }
+    }
+
     /// Governs a decoded request body's MCP/A2A tool calls and tool definitions.
     async fn govern_request(&self, ctx: &mut RequestContext, json: &Value) -> PluginResult {
+        // JSON-RPC batch envelope (`[{"method":"tools/call",...}, ...]`): govern
+        // every batched MCP/A2A call so batching cannot bypass the same policy
+        // the backend will execute per entry.
+        if let Some(entries) = json.as_array() {
+            if !self.inspect.mcp_tool_calls && !self.inspect.a2a_methods {
+                return PluginResult::Continue;
+            }
+            let mut calls = Vec::new();
+            for entry in entries {
+                if self.inspect.mcp_tool_calls
+                    && let Some(call) = extract_mcp_tool_call(entry)
+                {
+                    calls.push(call);
+                    continue;
+                }
+                if self.inspect.a2a_methods
+                    && let Some(call) = extract_a2a_method(entry)
+                {
+                    calls.push(call);
+                }
+            }
+            if calls.is_empty() {
+                return PluginResult::Continue;
+            }
+            let corr = self.correlation(ctx, None, None);
+            let batch = self
+                .engine
+                .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, false)
+                .await;
+            self.write_metadata(ctx, &batch);
+            if batch.enforce_blocks {
+                return self.reject(&batch);
+            }
+            return PluginResult::Continue;
+        }
+
         let corr = self.correlation(ctx, request_model(json), None);
 
         // 1. Client tool definitions exposed to the model.
@@ -1089,11 +1193,17 @@ impl Plugin for AiToolGovernor {
     // --- Request path -----------------------------------------------------
 
     fn requires_request_body_before_before_proxy(&self) -> bool {
-        self.enabled && self.inspect.any_request()
+        // Streaming inspection also needs the request body in `before_proxy`
+        // to detect `"stream": true` and pin the response onto the reqwest
+        // dispatch path where the SSE inspector is wired.
+        self.enabled && (self.inspect.any_request() || self.inspect.streaming_response_tool_calls)
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        if !self.enabled || !self.inspect.any_request() || ctx.method != "POST" {
+        if !self.enabled
+            || !(self.inspect.any_request() || self.inspect.streaming_response_tool_calls)
+            || ctx.method != "POST"
+        {
             return false;
         }
         ctx.headers
@@ -1106,19 +1216,87 @@ impl Plugin for AiToolGovernor {
         ctx: &mut RequestContext,
         _headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.enabled || !self.inspect.any_request() {
+        if !self.enabled {
             return PluginResult::Continue;
         }
-        let Some(body) = ctx.metadata.get("request_body") else {
-            return PluginResult::Continue;
-        };
-        if body.is_empty() || body.len() > MAX_PARSE_BYTES {
+        let governs_request = self.inspect.any_request();
+        let detects_streaming = self.inspect.streaming_response_tool_calls;
+        if !governs_request && !detects_streaming {
             return PluginResult::Continue;
         }
-        let Ok(json) = serde_json::from_str::<Value>(body) else {
+        // Mirror `should_buffer_request_body`: only JSON POST bodies are in scope.
+        if ctx.method != "POST"
+            || !ctx
+                .headers
+                .get("content-type")
+                .is_some_and(|ct| is_json_content_type(ct))
+        {
+            return PluginResult::Continue;
+        }
+
+        // Bodies this plugin is configured to govern but cannot inspect fail
+        // CLOSED in enforce mode. Request decompression runs in later
+        // body-transform hooks, so a `Content-Encoding`d body here is opaque; an
+        // oversized or unparseable body is equally opaque. In dry-run (or a
+        // streaming-only config) the request is forwarded, but conservatively
+        // marked for the inspectable dispatch path since a `"stream": true`
+        // flag inside it cannot be ruled out.
+        let enforce_request = governs_request && self.engine.mode == Mode::Enforce;
+        let mut uninspectable: Option<&'static str> = None;
+
+        if ctx
+            .headers
+            .get("content-encoding")
+            .map(|enc| enc.trim())
+            .is_some_and(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"))
+        {
+            uninspectable = Some("request body has a content-encoding that cannot be inspected");
+        }
+
+        let body_size: usize = ctx
+            .metadata
+            .get("request_body_size_bytes")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let body = ctx.metadata.get("request_body");
+
+        if uninspectable.is_none() {
+            if body_size == 0 && body.is_none_or(|b| b.is_empty()) {
+                // Empty body: nothing to govern.
+                return PluginResult::Continue;
+            }
+            if body_size > MAX_PARSE_BYTES || body.is_some_and(|b| b.len() > MAX_PARSE_BYTES) {
+                uninspectable = Some("request body exceeds the inspectable size limit");
+            }
+        }
+
+        let json = match uninspectable {
+            Some(_) => None,
+            // `request_body` metadata is absent for a non-UTF-8 (binary) body:
+            // JSON must be UTF-8, so that is uninspectable too.
+            None => body.and_then(|b| serde_json::from_str::<Value>(b).ok()),
+        };
+        let Some(json) = json else {
+            let reason = uninspectable
+                .unwrap_or("request body is not parseable JSON despite a JSON content-type");
+            if enforce_request {
+                return self.reject_uninspectable(ctx, "request body", reason);
+            }
+            if detects_streaming {
+                ctx.metadata
+                    .insert(STREAM_REQUESTED_KEY.to_string(), "true".to_string());
+            }
             return PluginResult::Continue;
         };
-        self.govern_request(ctx, &json).await
+
+        if detects_streaming && json.get("stream").and_then(Value::as_bool) == Some(true) {
+            ctx.metadata
+                .insert(STREAM_REQUESTED_KEY.to_string(), "true".to_string());
+        }
+        if governs_request {
+            return self.govern_request(ctx, &json).await;
+        }
+        PluginResult::Continue
     }
 
     // --- Buffered response path -------------------------------------------
@@ -1127,11 +1305,18 @@ impl Plugin for AiToolGovernor {
         self.enabled && self.inspect.response_tool_calls
     }
 
-    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        self.enabled
-            && self.inspect.response_tool_calls
-            && !is_sse_request(ctx)
-            && ctx.metadata.get("ai_request_streaming").map(String::as_str) != Some("true")
+    /// Buffer by default — even for requests marked streaming (`Accept:
+    /// text/event-stream`, a shared `ai_request_streaming` marker set by an
+    /// earlier plugin, or this plugin's own `stream: true` marker). The
+    /// pre-header decision cannot see the response content-type, and a backend
+    /// may answer a `stream: true` request with plain JSON
+    /// `choices[].message.tool_calls[]`; opting out here would skip
+    /// `on_response_body` entirely and bypass enforce-mode policy.
+    /// `should_buffer_response_body_for_content_type` downgrades ONLY a genuine
+    /// event stream back to the streaming path (where the SSE inspector
+    /// attaches when `streaming_response_tool_calls` is enabled).
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+        self.enabled && self.inspect.response_tool_calls
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1172,7 +1357,19 @@ impl Plugin for AiToolGovernor {
         if !is_json_content_type(content_type) {
             return PluginResult::Continue;
         }
-        if body.is_empty() || body.len() > MAX_PARSE_BYTES {
+        if body.is_empty() {
+            return PluginResult::Continue;
+        }
+        if body.len() > MAX_PARSE_BYTES {
+            // A padded response must not smuggle governed tool calls past the
+            // parse limit: fail closed in enforce mode.
+            if self.engine.mode == Mode::Enforce {
+                return self.reject_uninspectable(
+                    ctx,
+                    "response body",
+                    "response body exceeds the inspectable size limit",
+                );
+            }
             return PluginResult::Continue;
         }
         let Ok(json) = serde_json::from_slice::<Value>(body) else {
@@ -1239,10 +1436,17 @@ impl Plugin for AiToolGovernor {
     }
 
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
+        // The stream inspector is only wired on the reqwest streaming path, so
+        // any request that may produce an inspected SSE response must dispatch
+        // via reqwest: an SSE `Accept` header, a shared streaming marker from
+        // an earlier plugin, or this plugin's own request-body detection of
+        // `"stream": true` (set in `before_proxy`) — the latter catches a
+        // plain POST to a direct H2/H3 backend that answers with SSE.
         self.enabled
             && self.inspect.streaming_response_tool_calls
             && (is_sse_request(ctx)
-                || ctx.metadata.get("ai_request_streaming").map(String::as_str) == Some("true"))
+                || ctx.metadata.get("ai_request_streaming").map(String::as_str) == Some("true")
+                || ctx.metadata.get(STREAM_REQUESTED_KEY).map(String::as_str) == Some("true"))
     }
 
     fn response_stream_inspector(
@@ -1341,8 +1545,14 @@ impl StreamingToolCallAccumulator {
         &mut self.calls[pos].1
     }
 
-    fn is_empty(&self) -> bool {
-        self.calls.iter().all(|(_, c)| c.name.is_empty())
+    /// Whether any delta has been accumulated for this choice index.
+    fn has_choice(&self, choice: usize) -> bool {
+        self.calls.iter().any(|((c, _), _)| *c == choice)
+    }
+
+    /// Whether every choice that produced tool-call deltas is in `finished`.
+    fn choices_finished(&self, finished: &std::collections::HashSet<usize>) -> bool {
+        self.calls.iter().all(|((c, _), _)| finished.contains(c))
     }
 
     fn build_calls(&self) -> Vec<ToolCall> {
@@ -1379,7 +1589,13 @@ struct ToolCallStreamInspector {
     held: Vec<u8>,
     accumulator: StreamingToolCallAccumulator,
     saw_tool_calls: bool,
-    decided: bool,
+    /// Choice indices that reported a non-null `finish_reason` while holding
+    /// tool-call deltas. Only choices already present in the accumulator are
+    /// tracked, so this set is bounded by the held-bytes cap.
+    finished_choices: std::collections::HashSet<usize>,
+    /// Set in dry-run mode when the hold cap overflowed: forward everything
+    /// uninspected instead of disrupting traffic.
+    bypassed: bool,
     terminated: bool,
 }
 
@@ -1397,20 +1613,64 @@ impl ToolCallStreamInspector {
             held: Vec::new(),
             accumulator: StreamingToolCallAccumulator::default(),
             saw_tool_calls: false,
-            decided: false,
+            finished_choices: std::collections::HashSet::new(),
+            bypassed: false,
             terminated: false,
         }
     }
 
-    /// Evaluate accumulated tool calls at a completion boundary. On release,
-    /// appends the held raw bytes to `out`. Idempotent once decided.
+    /// Record which choices this frame finishes. Only choices that actually
+    /// hold tool-call deltas are tracked — a hostile stream of synthetic
+    /// finish frames for unrelated choice indices cannot grow the set.
+    fn record_finished_choices(&mut self, frame: &Value) {
+        let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
+            return;
+        };
+        for (cpos, choice) in choices.iter().enumerate() {
+            if !choice.get("finish_reason").is_some_and(|r| !r.is_null()) {
+                continue;
+            }
+            let cidx = choice
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|v| usize::try_from(v).ok())
+                .unwrap_or(cpos);
+            if self.accumulator.has_choice(cidx) {
+                self.finished_choices.insert(cidx);
+            }
+        }
+    }
+
+    /// Whether the accumulated batch is complete: every choice that produced
+    /// tool-call deltas has reported a `finish_reason`. With `n > 1` streamed
+    /// choices, finalizing on the FIRST finish would drop (and leave
+    /// ungoverned) tool-call deltas another choice streams afterwards.
+    fn batch_complete(&self) -> bool {
+        self.saw_tool_calls && self.accumulator.choices_finished(&self.finished_choices)
+    }
+
+    /// Reset per-batch state after a release so any later tool-call deltas
+    /// form a new, independently governed batch instead of vanishing.
+    fn reset_batch(&mut self) {
+        self.accumulator = StreamingToolCallAccumulator::default();
+        self.finished_choices.clear();
+        self.saw_tool_calls = false;
+    }
+
+    /// Evaluate the accumulated tool calls at a completion boundary. On
+    /// release, appends the held raw bytes to `out` and resets batch state.
     async fn finalize(&mut self, out: &mut Vec<u8>) -> Finalize {
-        if self.decided || !self.saw_tool_calls || self.accumulator.is_empty() {
-            self.decided = true;
+        if !self.saw_tool_calls {
             return Finalize::Released;
         }
-        self.decided = true;
         let calls = self.accumulator.build_calls();
+        if calls.is_empty() {
+            // Held frames whose deltas never produced a tool name cannot be
+            // policy-checked: drop them (never release ungovernable bytes).
+            self.held.clear();
+            self.reset_batch();
+            return Finalize::Released;
+        }
         let batch = self
             .engine
             .govern_calls(&self.corr, &calls, &self.plugin_http_call_ns, true)
@@ -1429,6 +1689,7 @@ impl ToolCallStreamInspector {
         } else {
             out.extend_from_slice(&self.held);
             self.held.clear();
+            self.reset_batch();
             Finalize::Released
         }
     }
@@ -1457,6 +1718,9 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
         if self.terminated {
             return ResponseStreamAction::Forward(Bytes::new());
         }
+        if self.bypassed {
+            return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
+        }
         self.carry.extend_from_slice(chunk);
         let mut out: Vec<u8> = Vec::new();
 
@@ -1470,10 +1734,12 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                         self.accumulator.push_frame(&frame);
                         self.held.extend_from_slice(&event);
                     }
-                    // A `finish_reason` (or a combined tool-call+finish frame)
-                    // signals the calls are complete: evaluate, then release the
-                    // held frames before forwarding this event.
-                    if frame_has_finish(&frame)
+                    self.record_finished_choices(&frame);
+                    // Evaluate once every choice holding tool calls has
+                    // finished, then release the held frames before forwarding
+                    // this event. Later tool-call deltas start a new batch
+                    // governed at its own completion boundary.
+                    if self.batch_complete()
                         && let Finalize::Blocked = self.finalize(&mut out).await
                     {
                         return self.terminate(out);
@@ -1495,11 +1761,34 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
             }
         }
 
+        // Cap retained bytes (held tool-call frames + partial-event carry): an
+        // upstream streaming never-finishing tool-call deltas (or an
+        // event-terminator-free byte stream) must not grow gateway memory
+        // unboundedly. Enforce mode fails closed; dry-run releases everything
+        // uninspected rather than disrupting traffic.
+        if self.held.len() + self.carry.len() > MAX_STREAM_HOLD_BYTES {
+            warn!(
+                target: "ai_tool_governor",
+                held_bytes = self.held.len(),
+                carry_bytes = self.carry.len(),
+                mode = self.engine.mode.as_str(),
+                "streaming tool-call hold exceeded cap"
+            );
+            if self.engine.mode == Mode::Enforce {
+                self.held.clear();
+                return self.terminate(out);
+            }
+            out.append(&mut self.held);
+            out.append(&mut self.carry);
+            self.reset_batch();
+            self.bypassed = true;
+        }
+
         ResponseStreamAction::Forward(Bytes::from(out))
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
-        if self.terminated {
+        if self.terminated || self.bypassed {
             return ResponseStreamAction::Forward(Bytes::new());
         }
         let mut out: Vec<u8> = Vec::new();
@@ -1598,17 +1887,6 @@ fn frame_has_tool_calls(frame: &Value) -> bool {
                     .and_then(Value::as_array)
                     .is_some_and(|tcs| !tcs.is_empty())
             })
-        })
-}
-
-fn frame_has_finish(frame: &Value) -> bool {
-    frame
-        .get("choices")
-        .and_then(Value::as_array)
-        .is_some_and(|choices| {
-            choices
-                .iter()
-                .any(|choice| choice.get("finish_reason").is_some_and(|r| !r.is_null()))
         })
 }
 
