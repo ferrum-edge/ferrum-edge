@@ -3313,7 +3313,7 @@ Controlled AI payload capture for compliance review, incident response, customer
 
 **Not a security boundary by itself.** `ai_transcript_audit` observes and redacts — it does not enforce. Combine it with `ai_prompt_shield`, `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in `ai_semantic_firewall`. It reads the guardrail/model/token metadata those plugins publish into `ctx.metadata` and folds it into each record.
 
-**Placement.** Priority `2924` (`AI_TRANSCRIPT_AUDIT`): before `ai_prompt_shield` (2925), `ai_semantic_firewall` (2968), and `ai_request_guard` (2975) so guardrail-rejected prompts can still be staged for `always_capture_on_guardrail`; final request-body refresh runs after downstream redaction/transforms for traffic that continues. It remains before `ai_semantic_cache` (2980) / `ai_federation` (2985) so cache hits and federated requests remain observable. HTTP-family only (`HTTP_ONLY_PROTOCOLS`); gRPC payload capture is future work.
+**Placement.** Priority `2924` (`AI_TRANSCRIPT_AUDIT`): before `ai_prompt_shield` (2925), `ai_semantic_firewall` (2968), and `ai_request_guard` (2975) so guardrail-rejected prompts can still be staged for `always_capture_on_guardrail`; final request-body refresh runs after downstream redaction/transforms for traffic that continues. It remains before `ai_semantic_cache` (2980) / `ai_stream_router` (2984) / `ai_federation` (4060) so cache hits, streamed requests, and federated requests remain observable. HTTP-family only (`HTTP_ONLY_PROTOCOLS`); gRPC payload capture is future work.
 
 **Capture modes** (`mode`):
 
@@ -4215,7 +4215,7 @@ config:
 
 ### AI Plugin Composition Example
 
-A typical AI gateway proxy combining all eight AI plugins with `ai_federation` for multi-provider routing:
+A typical AI gateway proxy combining the AI plugins with `ai_federation` for multi-provider routing:
 
 ```yaml
 # Proxy config — ai_federation handles provider routing, so backend_host is unused

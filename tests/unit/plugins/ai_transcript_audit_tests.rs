@@ -12,8 +12,9 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::ai_transcript_audit::AiTranscriptAudit;
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
 use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
-    ResponseStreamAction, ResponseStreamInspector, chain_response_stream_inspectors, priority,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
+    RequestContext, ResponseStreamAction, ResponseStreamInspector,
+    chain_response_stream_inspectors, plugin_failure_policy, priority,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use serde_json::{Value, json};
@@ -155,6 +156,10 @@ async fn name_priority_and_protocols() {
     assert_eq!(plugin.priority(), priority::AI_TRANSCRIPT_AUDIT);
     assert_eq!(plugin.priority(), 2924);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert_eq!(
+        plugin_failure_policy("ai_transcript_audit"),
+        Some(PluginFailurePolicy::FailClosed)
+    );
     assert_eq!(
         plugin.warmup_hostnames(),
         vec!["audit.example.com".to_string()]
@@ -357,6 +362,30 @@ async fn non_ai_json_is_not_a_candidate() {
         Some("false")
     );
     assert!(!ctx.metadata.contains_key("ai_transcript_audit.record_id"));
+}
+
+#[tokio::test]
+async fn non_candidate_json_does_not_request_response_buffering() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.metadata
+        .insert("request_body".to_string(), r#"{"order_id":42}"#.to_string());
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("false")
+    );
+    assert!(
+        !plugin.should_buffer_response_body(&ctx),
+        "explicit candidate=false must suppress the JSON fallback"
+    );
 }
 
 #[tokio::test]
@@ -613,6 +642,49 @@ async fn non_json_buffered_response_does_not_export_body_or_hash() {
 }
 
 #[tokio::test]
+async fn buffered_sse_response_capture_uses_streaming_policy() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "redacted_body",
+                "capture": { "streaming_response": true },
+                "redaction": { "builtins": ["email"] }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let response_headers = content_type_headers("text/event-stream");
+    let body = br#"data: {"choices":[{"delta":{"content":"email jane.doe@example.com"}}]}
+
+data: [DONE]
+
+"#;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &response_headers, body)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let excerpt = records[0]["response_body"]
+        .as_str()
+        .expect("buffered SSE response body captured");
+    assert!(!excerpt.contains("jane.doe@example.com"), "{excerpt}");
+    assert!(excerpt.contains("[REDACTED"), "{excerpt}");
+    assert!(records[0]["response_hash"].is_string());
+    assert!(
+        ctx.metadata
+            .contains_key("ai_transcript_audit.response_hash")
+    );
+}
+
+#[tokio::test]
 async fn metadata_only_emits_no_body() {
     let records = capture_roundtrip(
         json!({ "mode": "metadata_only" }),
@@ -746,6 +818,34 @@ async fn sampling_rate_zero_captures_non_empty_guardrail_metadata() {
 }
 
 #[tokio::test]
+async fn sampling_rate_zero_captures_reject_guardrail_markers() {
+    for (key, value) in [
+        ("ai_shield_rejected", "ssn"),
+        ("ai_response_guard_rejected", "email"),
+    ] {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let config = config_with_sink(
+            &endpoint,
+            json!({ "sampling": { "rate": 0.0, "always_capture_on_guardrail": true } }),
+        );
+        let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+        let mut ctx = make_ctx();
+        let headers = json_headers();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        ctx.metadata.insert(key.to_string(), value.to_string());
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1, "expected guardrail capture for {key}");
+        assert_eq!(records[0]["capture_reason"], "guardrail");
+    }
+}
+
+#[tokio::test]
 async fn sampling_rate_zero_captures_scoped_semantic_firewall_metadata() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
@@ -855,6 +955,48 @@ async fn before_proxy_stages_candidate_from_prebuffered_body() {
     );
     // Response buffering refinement sees the candidate.
     assert!(plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn streaming_capture_marks_json_shape_before_transform_classification() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.metadata
+        .insert("request_body".to_string(), r#"{"order_id":42}"#.to_string());
+    let mut headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("false")
+    );
+    assert!(
+        plugin.forces_reqwest_dispatch(&ctx),
+        "stream marker must be available before dispatch decisions in case a later request transform creates an AI body"
+    );
+    assert!(
+        !plugin.should_buffer_response_body(&ctx),
+        "non-candidate JSON should still avoid buffered-response capture"
+    );
+
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(ctx.metadata.contains_key("ai_transcript_audit.record_id"));
 }
 
 #[tokio::test]
@@ -1091,6 +1233,37 @@ async fn error_sse_response_is_teed_when_error_capture_enabled() {
         no_error_capture
             .response_stream_inspector(&ctx2, 500, Some("text/event-stream"))
             .is_none()
+    );
+}
+
+#[tokio::test]
+async fn stream_inspector_without_body_drive_does_not_emit_pending_record() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let _inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    plugin
+        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(0))
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let received = server.received_requests().await.unwrap_or_default();
+    assert!(
+        received.is_empty(),
+        "an inspector that never handled body bytes must not leave an emit-ready pending stream"
     );
 }
 
@@ -1404,6 +1577,43 @@ async fn sink_recovers_after_transient_outage_with_reject_policy() {
         recovered,
         "sink never recovered after the outage cleared — fail-closed rejection is permanent"
     );
+}
+
+#[tokio::test]
+async fn permanent_collector_4xx_does_not_poison_reject_policy_sink() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let config = json!({
+        "sink": {
+            "type": "http",
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "on_sink_error": "reject"
+        }
+    });
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    let headers = json_headers();
+
+    for _ in 0..10 {
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        let result = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "permanent collector 4xx should be discarded, not treated as a sink outage"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 #[tokio::test]

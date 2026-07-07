@@ -816,6 +816,8 @@ impl Plugin for AiPromptShield {
                     "ai_prompt_shield: PII detected (types: {:?}), rejecting request",
                     detected
                 );
+                ctx.metadata
+                    .insert("ai_shield_rejected".to_string(), detected.join(","));
                 PluginResult::Reject {
                     status_code: 400,
                     body: serde_json::json!({
@@ -893,6 +895,8 @@ impl Plugin for AiPromptShield {
                             "ai_prompt_shield: PII detected (types: {:?}) could not be fully redacted, rejecting request",
                             detected
                         );
+                        ctx.metadata
+                            .insert("ai_shield_rejected".to_string(), detected.join(","));
                         PluginResult::Reject {
                             status_code: 400,
                             body: serde_json::json!({
@@ -913,6 +917,8 @@ impl Plugin for AiPromptShield {
                             "ai_prompt_shield: PII detected (types: {:?}) but redaction produced no change, rejecting request",
                             detected
                         );
+                        ctx.metadata
+                            .insert("ai_shield_rejected".to_string(), detected.join(","));
                         PluginResult::Reject {
                             status_code: 400,
                             body: serde_json::json!({

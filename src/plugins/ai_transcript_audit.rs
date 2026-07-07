@@ -11,7 +11,7 @@
 //! Runs at priority `AI_TRANSCRIPT_AUDIT` (2924): before reject-capable AI
 //! guardrails so blocked prompts can still be staged for
 //! `always_capture_on_guardrail`, and before `ai_semantic_cache` (2980) /
-//! `ai_federation` (2985) so cache hits and federated requests are still
+//! `ai_federation` (4060) so cache hits and federated requests are still
 //! observable. The audit candidate is staged in `before_proxy` over the
 //! prebuffered request body (so terminate-and-respond plugins downstream cannot
 //! consume the transaction unaudited, and so the proxy's response buffering /
@@ -675,10 +675,7 @@ impl AiTranscriptAudit {
             }
         };
         if stream_wanted {
-            ctx.metadata
-                .insert(MD_STREAM_MARKER.to_string(), "true".to_string());
-            ctx.metadata
-                .insert(self.stream_marker_key(), "true".to_string());
+            self.mark_stream_capture(ctx);
         }
 
         let request_model = parsed.as_ref().and_then(extract_model);
@@ -745,6 +742,13 @@ impl AiTranscriptAudit {
 
     fn stream_marker_key(&self) -> String {
         format!("{MD_STREAM_MARKER}.{:p}", self)
+    }
+
+    fn mark_stream_capture(&self, ctx: &mut RequestContext) {
+        ctx.metadata
+            .insert(MD_STREAM_MARKER.to_string(), "true".to_string());
+        ctx.metadata
+            .insert(self.stream_marker_key(), "true".to_string());
     }
 
     fn envelope_from_ctx(&self, ctx: &RequestContext, status: u16) -> EnvelopeOwned {
@@ -986,6 +990,9 @@ impl Plugin for AiTranscriptAudit {
         if !candidate_shape {
             return PluginResult::Continue;
         }
+        if self.capture.streaming == StreamingCapture::On {
+            self.mark_stream_capture(ctx);
+        }
         // The prebuffered body is stored as UTF-8 metadata; JSON is UTF-8 by
         // definition, so a missing entry means the body was not prebuffered on
         // this path (or is not valid JSON anyway) — leave classification to
@@ -1043,13 +1050,20 @@ impl Plugin for AiTranscriptAudit {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        self.capture.response
-            && (flag(&ctx.metadata, MD_CANDIDATE)
-                || (ctx.method == "POST"
+        if !self.capture.response {
+            return false;
+        }
+        match ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
+            Some("true") => true,
+            Some("false") => false,
+            _ => {
+                ctx.method == "POST"
                     && ctx
                         .headers
                         .get("content-type")
-                        .is_some_and(|content_type| is_json_content_type(content_type))))
+                        .is_some_and(|content_type| is_json_content_type(content_type))
+            }
+        }
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1101,15 +1115,8 @@ impl Plugin for AiTranscriptAudit {
             ctx.metadata.insert("request_body".to_string(), body);
         }
 
-        let captures_response_body = response_body_capture_allowed(response_headers);
-        let (response_hash, response_excerpt, response_truncated) = if captures_response_body {
-            let response_hash = sha256_hex(body);
-            let (response_excerpt, response_truncated) =
-                self.shape_body(body, self.limits.max_response_bytes);
-            (Some(response_hash), response_excerpt, response_truncated)
-        } else {
-            (None, None, false)
-        };
+        let captures_response_body = response_body_capture_allowed(self.capture, response_headers);
+        let response_hash = captures_response_body.then(|| sha256_hex(body));
 
         let staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let sample_hit = staging
@@ -1133,6 +1140,11 @@ impl Plugin for AiTranscriptAudit {
                 .insert(MD_SINK_STATUS.to_string(), "skipped".to_string());
             return PluginResult::Continue;
         }
+        let (response_excerpt, response_truncated) = if captures_response_body {
+            self.shape_body(body, self.limits.max_response_bytes)
+        } else {
+            (None, false)
+        };
         // Fail-closed stance while the sink is unhealthy: the client request
         // is rejected, but the record is still built and enqueued below. The
         // background flush of those queued records is the recovery probe — a
@@ -1209,17 +1221,17 @@ impl Plugin for AiTranscriptAudit {
             captured: Mutex::new(None),
             downstream_terminated: AtomicBool::new(false),
         });
-        self.pending_streams
-            .insert(record_id.clone(), Arc::clone(&slot));
-
         Some(Box::new(AuditStreamInspector {
+            record_id,
             slot,
+            pending_streams: Arc::clone(&self.pending_streams),
             redactor: Arc::clone(&self.redactor),
             mode: self.mode,
             max_bytes: self.limits.max_stream_capture_bytes,
             accumulated: Vec::new(),
             hasher: Sha256::new(),
             truncated: false,
+            registered: false,
         }))
     }
 
@@ -1329,18 +1341,32 @@ impl Plugin for AiTranscriptAudit {
 /// Tees streaming (SSE) response bytes into a bounded accumulator while
 /// forwarding every chunk unchanged, and hashes the full stream.
 struct AuditStreamInspector {
+    record_id: String,
     slot: Arc<StreamSlot>,
+    pending_streams: Arc<DashMap<String, Arc<StreamSlot>>>,
     redactor: Arc<PiiRedactor>,
     mode: AuditMode,
     max_bytes: usize,
     accumulated: Vec<u8>,
     hasher: Sha256,
     truncated: bool,
+    registered: bool,
+}
+
+impl AuditStreamInspector {
+    fn ensure_registered(&mut self) {
+        if !self.registered {
+            self.pending_streams
+                .insert(self.record_id.clone(), Arc::clone(&self.slot));
+            self.registered = true;
+        }
+    }
 }
 
 #[async_trait]
 impl ResponseStreamInspector for AuditStreamInspector {
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        self.ensure_registered();
         self.hasher.update(chunk);
         if self.accumulated.len() < self.max_bytes {
             let remaining = self.max_bytes - self.accumulated.len();
@@ -1357,6 +1383,7 @@ impl ResponseStreamInspector for AuditStreamInspector {
     }
 
     async fn on_end(&mut self) -> ResponseStreamAction {
+        self.ensure_registered();
         let digest = std::mem::replace(&mut self.hasher, Sha256::new()).finalize();
         let response_hash = hex::encode(digest);
         // A cap-truncated redacted stream can cut through an unbounded secret or
@@ -1379,6 +1406,7 @@ impl ResponseStreamInspector for AuditStreamInspector {
     }
 
     fn on_downstream_terminated(&mut self) {
+        self.ensure_registered();
         self.slot
             .downstream_terminated
             .store(true, Ordering::Relaxed);
@@ -1408,17 +1436,7 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<()
         .execute(request, "ai_transcript_audit")
         .await;
     let result = match response {
-        Ok(resp) => {
-            let status = resp.status();
-            let handled = handle_http_batch_response("ai_transcript_audit", entry_count, Ok(resp));
-            if status.is_success() {
-                handled
-            } else {
-                Err(format!(
-                    "ai_transcript_audit collector returned non-success status {status}"
-                ))
-            }
-        }
+        Ok(resp) => handle_http_batch_response("ai_transcript_audit", entry_count, Ok(resp)),
         Err(err) => handle_http_batch_response("ai_transcript_audit", entry_count, Err(err)),
     };
     if result.is_ok() {
@@ -1551,11 +1569,17 @@ fn redact_sse_json_frames(redactor: &PiiRedactor, raw: &[u8]) -> Option<String> 
     changed.then(|| redactor.redact(&out))
 }
 
-fn response_body_capture_allowed(response_headers: &HashMap<String, String>) -> bool {
+fn response_body_capture_allowed(
+    capture: CaptureConfig,
+    response_headers: &HashMap<String, String>,
+) -> bool {
     response_headers
         .get("content-type")
         .is_some_and(|content_type| {
-            is_json_content_type(content_type) && !is_framed_grpc(content_type)
+            !is_framed_grpc(content_type)
+                && (is_json_content_type(content_type)
+                    || (capture.streaming != StreamingCapture::Off
+                        && is_event_stream(content_type)))
         })
 }
 
@@ -1602,7 +1626,9 @@ fn guardrail_fired(metadata: &HashMap<String, String>) -> bool {
         "ai_semantic_firewall_response_blocked",
         "ai_semantic_firewall_streaming_rejected",
         "ai_response_guard_detected",
+        "ai_response_guard_rejected",
         "ai_response_guard_redacted",
+        "ai_shield_rejected",
         "ai_shield_redacted",
     ];
     if FIRED_TRUE_KEYS.iter().any(|key| {
