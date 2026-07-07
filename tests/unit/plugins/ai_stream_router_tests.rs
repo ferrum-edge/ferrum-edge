@@ -1,6 +1,7 @@
 //! Unit tests for the `ai_stream_router` plugin.
 
-use ferrum_edge::config::types::BackendScheme;
+use super::plugin_utils::create_test_proxy;
+use ferrum_edge::config::types::{BackendScheme, BackendTlsConfig};
 use ferrum_edge::plugins::ai_federation::AiFederation;
 use ferrum_edge::plugins::ai_stream_router::AiStreamRouter;
 use ferrum_edge::plugins::{
@@ -9,6 +10,7 @@ use ferrum_edge::plugins::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -820,6 +822,31 @@ async fn test_anthropic_sse_robust_to_chunk_splits() {
     assert!(split.trim_end().ends_with("data: [DONE]"));
 }
 
+#[tokio::test]
+async fn test_buffered_anthropic_sse_is_normalized_too() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let buffered = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            ANTHROPIC_SSE.as_bytes(),
+            Some("text/event-stream"),
+            &HashMap::new(),
+        )
+        .await
+        .expect("buffered Anthropic SSE should be normalized");
+    let buffered = String::from_utf8(buffered).unwrap();
+    let streamed = run_normalizer(4096).await;
+
+    assert_eq!(strip_created(&buffered), strip_created(&streamed));
+    assert!(buffered.contains("chat.completion.chunk"));
+    assert!(buffered.trim_end().ends_with("data: [DONE]"));
+}
+
 // ---------------------------------------------------------------------------
 // Claim-time markers, header hygiene, endpoint URL handling
 // ---------------------------------------------------------------------------
@@ -951,6 +978,31 @@ async fn test_endpoint_query_merged_with_client_query() {
 }
 
 #[tokio::test]
+async fn test_endpoint_query_omits_previously_stripped_client_credentials() {
+    let plugin = build(azure_style_config());
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    ctx.set_raw_query_string("foo=bar&access_token=secret".to_string());
+    ctx.metadata.insert(
+        "auth.strip_query_param.access_token".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.route_override_path.as_deref(),
+        Some("/openai/deployments/gpt/chat/completions?api-version=2024-02-01&foo=bar")
+    );
+    assert!(
+        !ctx.route_override_path
+            .as_deref()
+            .unwrap()
+            .contains("secret"),
+        "query credentials marked for strip must not be folded into the provider override path"
+    );
+}
+
+#[tokio::test]
 async fn test_plain_endpoint_keeps_client_query_forwarding_untouched() {
     let plugin = build(openai_and_anthropic_config());
     let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
@@ -1023,8 +1075,8 @@ async fn test_backend_tls_default_and_inherit() {
     plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(ctx.route_override_resolved_tls.is_some());
 
-    // inherit_backend_tls: true leaves the proxy's own resolved backend TLS
-    // (custom CA / SNI / mTLS) in force by NOT overriding it.
+    // inherit_backend_tls: true carries the proxy's own resolved backend TLS
+    // (custom CA / SNI / mTLS), including TLS projected from an upstream.
     let cfg = json!({
         "providers": [{
             "name": "internal",
@@ -1037,6 +1089,18 @@ async fn test_backend_tls_default_and_inherit() {
     });
     let plugin2 = build(cfg);
     let mut ctx2 = post_ctx(&body);
+    let inherited_tls = BackendTlsConfig {
+        client_cert_path: Some("/certs/client.pem".to_string()),
+        client_key_path: Some("/certs/client.key".to_string()),
+        server_ca_cert_path: Some("/certs/ca.pem".to_string()),
+        verify_server_cert: true,
+        sni: Some("llm.internal.example.com".to_string()),
+        san_allow_list: vec!["llm.internal.example.com".to_string()],
+        san_allow_list_key_digest: Some("digest".to_string()),
+    };
+    let mut proxy = create_test_proxy();
+    proxy.resolved_tls = inherited_tls.clone();
+    ctx2.matched_proxy = Some(Arc::new(proxy));
     let mut headers2 = json_headers();
     plugin2.before_proxy(&mut ctx2, &mut headers2).await;
     assert_eq!(
@@ -1045,10 +1109,7 @@ async fn test_backend_tls_default_and_inherit() {
             .map(String::as_str),
         Some("true")
     );
-    assert!(
-        ctx2.route_override_resolved_tls.is_none(),
-        "inherit_backend_tls must not clobber the proxy's resolved backend TLS"
-    );
+    assert_eq!(ctx2.route_override_resolved_tls, Some(inherited_tls));
 }
 
 // ---------------------------------------------------------------------------

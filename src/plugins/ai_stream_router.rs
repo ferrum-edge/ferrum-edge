@@ -43,6 +43,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
+use percent_encoding::percent_decode_str;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
@@ -1005,10 +1006,11 @@ impl Plugin for AiStreamRouter {
             let client_query = ctx
                 .raw_query_string()
                 .filter(|q| !q.is_empty())
-                .map(str::to_string);
+                .map(|q| query_after_strip_markers(ctx, q))
+                .filter(|q| !q.is_empty());
             if let Some(client_query) = client_query {
                 backend_path.push('&');
-                backend_path.push_str(&client_query);
+                backend_path.push_str(client_query.as_str());
                 for pair in client_query.split('&').filter(|p| !p.is_empty()) {
                     let name = pair.split_once('=').map_or(pair, |(name, _)| name);
                     ctx.metadata.insert(
@@ -1030,11 +1032,18 @@ impl Plugin for AiStreamRouter {
         ctx.route_override_path_is_absolute = true;
         ctx.route_override_authority = Some(provider.authority.clone());
         // Default: public providers verify against the system trust store.
-        // `inherit_backend_tls: true` leaves the override unset so the proxy's
-        // own resolved backend TLS (custom CA / SNI policy / backend mTLS
-        // client cert) applies to an internal openai_compatible endpoint.
-        if provider.scheme == BackendScheme::Https && !provider.inherit_backend_tls {
-            ctx.route_override_resolved_tls = Some(BackendTlsConfig::default_verify());
+        // `inherit_backend_tls: true` carries the current proxy's resolved
+        // backend TLS (custom CA / SNI policy / backend mTLS client cert) to
+        // internal openai_compatible endpoints, including TLS inherited from an
+        // upstream selected before this provider override.
+        if provider.scheme == BackendScheme::Https {
+            ctx.route_override_resolved_tls = if provider.inherit_backend_tls {
+                ctx.matched_proxy
+                    .as_ref()
+                    .map(|proxy| proxy.resolved_tls.clone())
+            } else {
+                Some(BackendTlsConfig::default_verify())
+            };
         }
 
         // --- Rewrite headers: strip client credentials, insert provider auth. ---
@@ -1168,6 +1177,30 @@ impl Plugin for AiStreamRouter {
             .unwrap_or_else(|| "unknown".to_string());
         Some(Box::new(AnthropicSseNormalizer::new(model)))
     }
+
+    async fn transform_response_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        if !self.response_stream_hooks {
+            return None;
+        }
+        if ctx.metadata.get(META_NORMALIZED).map(String::as_str) != Some("true") {
+            return None;
+        }
+        if !content_type.is_some_and(is_event_stream_content_type) {
+            return None;
+        }
+        let model = ctx
+            .metadata
+            .get(META_MODEL)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+        normalize_anthropic_sse_buffered(model, body).await
+    }
 }
 
 /// Strip client-supplied credential headers so they never leak to the provider.
@@ -1193,6 +1226,33 @@ fn strip_client_credentials(headers: &mut HashMap<String, String>) {
         let lk = k.to_ascii_lowercase();
         !CREDENTIAL_HEADERS.contains(&lk.as_str())
     });
+}
+
+fn query_after_strip_markers(ctx: &RequestContext, query: &str) -> String {
+    let strip_names: HashSet<&str> = ctx
+        .metadata
+        .keys()
+        .filter_map(|key| {
+            key.strip_prefix(super::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX)
+        })
+        .collect();
+    if strip_names.is_empty() {
+        return query.to_string();
+    }
+
+    let mut stripped = String::with_capacity(query.len());
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        let decoded_name = percent_decode_str(raw_name).decode_utf8_lossy();
+        if strip_names.contains(raw_name) || strip_names.contains(decoded_name.as_ref()) {
+            continue;
+        }
+        if !stripped.is_empty() {
+            stripped.push('&');
+        }
+        stripped.push_str(pair);
+    }
+    stripped
 }
 
 /// Cap a user-controlled model string before echoing it in an error message.
@@ -1488,6 +1548,27 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
         self.finish(&mut out);
         ResponseStreamAction::Forward(Bytes::from(out.into_bytes()))
     }
+}
+
+async fn normalize_anthropic_sse_buffered(model: String, body: &[u8]) -> Option<Vec<u8>> {
+    let mut normalizer = AnthropicSseNormalizer::new(model);
+    let mut out = Vec::new();
+    match normalizer.on_chunk(body).await {
+        ResponseStreamAction::Forward(bytes) => out.extend_from_slice(&bytes),
+        ResponseStreamAction::Terminate(bytes) => {
+            if let Some(bytes) = bytes {
+                out.extend_from_slice(&bytes);
+            }
+            return Some(out);
+        }
+    }
+    match normalizer.on_end().await {
+        ResponseStreamAction::Forward(bytes) | ResponseStreamAction::Terminate(Some(bytes)) => {
+            out.extend_from_slice(&bytes)
+        }
+        ResponseStreamAction::Terminate(None) => {}
+    }
+    Some(out)
 }
 
 fn map_stop_reason(reason: Option<&str>) -> &'static str {
