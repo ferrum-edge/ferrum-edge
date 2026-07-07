@@ -1583,6 +1583,13 @@ impl Plugin for MeshRouteDispatch {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        if ctx
+            .metadata
+            .get("ai_stream_router_claimed")
+            .is_some_and(|value| value == "true")
+        {
+            return PluginResult::Continue;
+        }
         for rule in &self.config.rules {
             if rule_matches(rule, ctx, headers) {
                 // Per-rule redirect (Istio `http[].redirect`): answer the

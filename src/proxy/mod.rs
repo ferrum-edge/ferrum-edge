@@ -46,6 +46,7 @@ mod mesh_tcp_inbound;
 pub mod mesh_udp_capture;
 pub mod mesh_udp_frame;
 pub mod netns_capture;
+pub mod netns_udp_capture;
 pub mod proxy_protocol;
 pub mod sni;
 pub mod stream_error;
@@ -14344,6 +14345,9 @@ async fn handle_proxy_request_inner(
         if let Some(custom_id) = ctx.backend_consumer_custom_id() {
             headers.insert("x-consumer-custom-id".to_string(), custom_id.to_string());
         }
+    } else if ctx.suppresses_backend_consumer_identity_headers() {
+        let headers = owned_proxy_headers.get_or_insert_with(|| ctx.headers.clone());
+        sanitize_reserved_consumer_identity_headers(headers);
     }
     // Egress baggage strip — operator-configured key prefixes are removed
     // from the outbound `baggage` header. Default empty list is a no-op.

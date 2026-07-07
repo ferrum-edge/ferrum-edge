@@ -4,7 +4,7 @@
 //! of 11 supported AI providers and normalizes responses back to OpenAI format.
 //!
 //! Uses the "terminate and respond" pattern: runs in `before_proxy` at priority
-//! 2985, makes its own HTTP call to the matched AI provider via a per-provider
+//! 4060, makes its own HTTP call to the matched AI provider via a per-provider
 //! `reqwest::Client`, and returns `PluginResult::RejectBinary` with the
 //! normalized response. The normal proxy dispatch is skipped entirely.
 //! Streaming Chat Completions are intentionally unsupported by this buffered
@@ -23,7 +23,7 @@
 //!
 //! Works with the full AI plugin chain on the same proxy:
 //! ```text
-//! ai_prompt_shield (2925) → ai_request_guard (2975) → ai_federation (2985)
+//! ai_prompt_shield (2925) → ai_request_guard (2975) → ai_prompt_compressor (4055) → ai_federation (4060)
 //!                                                        ↓ writes token metadata
 //! ai_rate_limiter after_proxy (applies_after_proxy_on_reject=true)
 //!                                                        ↓
@@ -2717,6 +2717,25 @@ impl Plugin for AiFederation {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Coordinate with `ai_stream_router` (priority 2984, runs first). When it
+        // claims a streaming request, or explicitly passes one through because
+        // the operator disabled fail-closed missing/unmatched-model behavior,
+        // `ai_federation` must not re-inspect or reject that same `stream:true`
+        // request.
+        if ctx
+            .metadata
+            .get("ai_stream_router_claimed")
+            .map(String::as_str)
+            == Some("true")
+            || ctx
+                .metadata
+                .get("ai_stream_router_pass_through")
+                .map(String::as_str)
+                == Some("true")
+        {
+            return PluginResult::Continue;
+        }
+
         // Only handle POST requests with JSON content-type
         if ctx.method != "POST" {
             return PluginResult::Continue;
