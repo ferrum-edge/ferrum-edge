@@ -465,6 +465,48 @@ async fn request_capture_redacts_decoded_json_string_escapes() {
 }
 
 #[tokio::test]
+async fn request_capture_redacts_json_keys_and_numeric_scalars() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "redacted_body",
+                "redaction": {
+                    "builtins": [],
+                    "custom_patterns": [
+                        { "name": "email", "regex": "jane@example\\.com" },
+                        { "name": "digits", "regex": "123456789" }
+                    ]
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            br#"{"model":"gpt-4o","messages":[],"jane@example.com":"key","ssn":123456789}"#,
+        )
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let request_body = records[0]["request_body"].as_str().unwrap();
+    assert!(!request_body.contains("jane@example.com"), "{request_body}");
+    assert!(!request_body.contains("123456789"), "{request_body}");
+    assert!(request_body.contains("[REDACTED:email"), "{request_body}");
+    assert!(request_body.contains("[REDACTED:digits"), "{request_body}");
+}
+
+#[tokio::test]
 async fn response_capture_redacts_pii() {
     let records = capture_roundtrip(
         json!({ "mode": "redacted_body", "redaction": { "builtins": ["email"] } }),
@@ -610,6 +652,32 @@ async fn sampling_rate_zero_captures_non_empty_guardrail_metadata() {
     ctx.metadata.insert(
         "ai_response_guard_detected".to_string(),
         "ssn,email".to_string(),
+    );
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["capture_reason"], "guardrail");
+}
+
+#[tokio::test]
+async fn sampling_rate_zero_captures_scoped_semantic_firewall_metadata() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let config = config_with_sink(
+        &endpoint,
+        json!({ "sampling": { "rate": 0.0, "always_capture_on_guardrail": true } }),
+    );
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    ctx.metadata.insert(
+        "ai_semantic_firewall.response.decision".to_string(),
+        "warn".to_string(),
     );
     plugin
         .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
@@ -941,6 +1009,46 @@ async fn stream_capture_tail_guard_prevents_boundary_leak() {
         "raw SSN prefix leaked at the stream capture boundary: {excerpt}"
     );
     assert_eq!(records[0]["response_body_truncated"], true);
+}
+
+#[tokio::test]
+async fn stream_capture_redacts_decoded_sse_json_frames() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "redacted_body",
+                "capture": { "streaming_response": true }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let stream = br#"data: {"choices":[{"delta":{"content":"ssn 123\u002d45\u002d6789"}}]}
+
+data: [DONE]
+
+"#;
+    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let excerpt = records[0]["response_body"].as_str().unwrap_or_default();
+    assert!(!excerpt.contains("123-45-6789"), "{excerpt}");
+    assert!(!excerpt.contains("123\\u002d45"), "{excerpt}");
+    assert!(excerpt.contains("[REDACTED"), "{excerpt}");
 }
 
 #[tokio::test]

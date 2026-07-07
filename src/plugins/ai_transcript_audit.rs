@@ -574,7 +574,7 @@ impl AiTranscriptAudit {
             rate_limiter: Arc::new(RecordsPerMinute::new(sampling.max_records_per_minute)),
             sink_healthy,
             active,
-            staging_ttl: Duration::from_secs(60),
+            staging_ttl: Duration::from_secs(60 * 60),
         })
     }
 
@@ -681,6 +681,8 @@ impl AiTranscriptAudit {
         if stream_wanted {
             ctx.metadata
                 .insert(MD_STREAM_MARKER.to_string(), "true".to_string());
+            ctx.metadata
+                .insert(self.stream_marker_key(), "true".to_string());
         }
 
         let request_model = parsed.as_ref().and_then(extract_model);
@@ -743,6 +745,10 @@ impl AiTranscriptAudit {
         }
         ctx.metadata
             .insert(MD_REQUEST_HASH.to_string(), request_hash);
+    }
+
+    fn stream_marker_key(&self) -> String {
+        format!("{MD_STREAM_MARKER}.{:p}", self)
     }
 
     fn envelope_from_ctx(&self, ctx: &RequestContext, status: u16) -> EnvelopeOwned {
@@ -1013,15 +1019,12 @@ impl Plugin for AiTranscriptAudit {
         if !self.active {
             return PluginResult::Continue;
         }
-        match ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
-            // Staged in `before_proxy`: request transforms may have changed
-            // the body since, so refresh the captured hash/excerpt with the
-            // final backend-visible bytes.
-            Some("true") => {
-                self.refresh_staged_request(ctx, body);
-                return PluginResult::Continue;
-            }
-            _ => {}
+        // Staged in `before_proxy`: request transforms may have changed the
+        // body since, so refresh the captured hash/excerpt with the final
+        // backend-visible bytes.
+        if let Some("true") = ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
+            self.refresh_staged_request(ctx, body);
+            return PluginResult::Continue;
         }
         // Fallback for paths where the body was not available before
         // `before_proxy` (e.g. non-UTF-8 metadata skip above).
@@ -1044,17 +1047,23 @@ impl Plugin for AiTranscriptAudit {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        self.capture.response && flag(&ctx.metadata, MD_CANDIDATE)
+        self.capture.response
+            && (flag(&ctx.metadata, MD_CANDIDATE)
+                || (ctx.method == "POST"
+                    && ctx
+                        .headers
+                        .get("content-type")
+                        .is_some_and(|content_type| is_json_content_type(content_type))))
     }
 
     fn should_buffer_response_body_for_content_type(
         &self,
-        ctx: &RequestContext,
+        _ctx: &RequestContext,
         content_type: Option<&str>,
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        if !self.capture.response || !flag(&ctx.metadata, MD_CANDIDATE) {
+        if !self.capture.response {
             return false;
         }
         // Buffer JSON AI responses here; SSE goes down the streaming inspector
@@ -1062,6 +1071,22 @@ impl Plugin for AiTranscriptAudit {
         content_type.is_some_and(|content_type| {
             is_json_content_type(content_type) && !is_framed_grpc(content_type)
         })
+    }
+
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if !self.active || !flag(&ctx.metadata, MD_CANDIDATE) {
+            return PluginResult::Continue;
+        }
+        if let Some(body) = ctx.metadata.remove("request_body") {
+            self.refresh_staged_request(ctx, body.as_bytes());
+            ctx.metadata.insert("request_body".to_string(), body);
+        }
+        PluginResult::Continue
     }
 
     async fn on_final_response_body(
@@ -1150,7 +1175,8 @@ impl Plugin for AiTranscriptAudit {
     }
 
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
-        self.capture.streaming != StreamingCapture::Off && flag(&ctx.metadata, MD_STREAM_MARKER)
+        self.capture.streaming != StreamingCapture::Off
+            && flag(&ctx.metadata, &self.stream_marker_key())
     }
 
     fn response_stream_inspector(
@@ -1168,7 +1194,7 @@ impl Plugin for AiTranscriptAudit {
             || (self.sampling.always_on_error && response_status >= 400);
         if self.capture.streaming == StreamingCapture::Off
             || !status_eligible
-            || !flag(&ctx.metadata, MD_STREAM_MARKER)
+            || !flag(&ctx.metadata, &self.stream_marker_key())
         {
             return None;
         }
@@ -1267,7 +1293,9 @@ impl Plugin for AiTranscriptAudit {
         };
 
         let sample_hit = staging.sample_hit;
-        let errored = summary.response_status_code >= 400;
+        let errored = summary.response_status_code >= 400
+            || (summary.response_streamed
+                && (!summary.body_completed || summary.body_error_class.is_some()));
         let (emit, reason) =
             self.emit_decision(sample_hit, guardrail_fired(&summary.metadata), errored);
         if !emit {
@@ -1363,15 +1391,28 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<()
             ),
         }
     }
-    let result = handle_http_batch_response(
-        "ai_transcript_audit",
-        entry_count,
-        cfg.http_client
-            .execute(request, "ai_transcript_audit")
-            .await,
-    );
+    let response = cfg
+        .http_client
+        .execute(request, "ai_transcript_audit")
+        .await;
+    let result = match response {
+        Ok(resp) => {
+            let status = resp.status();
+            let handled = handle_http_batch_response("ai_transcript_audit", entry_count, Ok(resp));
+            if status.is_success() {
+                handled
+            } else {
+                Err(format!(
+                    "ai_transcript_audit collector returned non-success status {status}"
+                ))
+            }
+        }
+        Err(err) => handle_http_batch_response("ai_transcript_audit", entry_count, Err(err)),
+    };
     if result.is_ok() {
         cfg.sink_healthy.store(true, Ordering::Relaxed);
+    } else {
+        cfg.sink_healthy.store(false, Ordering::Relaxed);
     }
     result
 }
@@ -1426,6 +1467,8 @@ fn redact_body_decoded_json_strings(redactor: &PiiRedactor, raw: &[u8]) -> Strin
         redact_json_value_strings(redactor, &mut json);
         serde_json::to_string(&json)
             .unwrap_or_else(|_| redactor.redact(&String::from_utf8_lossy(raw)))
+    } else if let Some(redacted_sse) = redact_sse_json_frames(redactor, raw) {
+        redacted_sse
     } else {
         redactor.redact(&String::from_utf8_lossy(raw))
     }
@@ -1436,18 +1479,63 @@ fn redact_json_value_strings(redactor: &PiiRedactor, value: &mut Value) {
         Value::String(text) => {
             *text = redactor.redact(text);
         }
+        Value::Number(number) => {
+            let raw = number.to_string();
+            let redacted = redactor.redact(&raw);
+            if redacted != raw {
+                *value = Value::String(redacted);
+            }
+        }
         Value::Array(values) => {
             for value in values {
                 redact_json_value_strings(redactor, value);
             }
         }
         Value::Object(map) => {
-            for value in map.values_mut() {
-                redact_json_value_strings(redactor, value);
+            let entries = std::mem::take(map);
+            for (key, mut value) in entries {
+                redact_json_value_strings(redactor, &mut value);
+                map.insert(redactor.redact(&key), value);
             }
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        Value::Null | Value::Bool(_) => {}
     }
+}
+
+fn redact_sse_json_frames(redactor: &PiiRedactor, raw: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(raw).ok()?;
+    if !text.lines().any(|line| line.starts_with("data:")) {
+        return None;
+    }
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let (line_no_newline, newline) = match line.strip_suffix('\n') {
+            Some(stripped) => (stripped.strip_suffix('\r').unwrap_or(stripped), "\n"),
+            None => (line, ""),
+        };
+        if let Some(rest) = line_no_newline
+            .strip_prefix("data: ")
+            .or_else(|| line_no_newline.strip_prefix("data:"))
+        {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty()
+                && trimmed != "[DONE]"
+                && let Ok(mut json) = serde_json::from_str::<Value>(trimmed)
+            {
+                redact_json_value_strings(redactor, &mut json);
+                if let Ok(serialized) = serde_json::to_string(&json) {
+                    out.push_str("data: ");
+                    out.push_str(&serialized);
+                    out.push_str(newline);
+                    changed = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+    }
+    changed.then_some(out)
 }
 
 /// Truncate `text` to at most `max_bytes` without splitting a UTF-8 code point.
@@ -1496,10 +1584,11 @@ fn guardrail_fired(metadata: &HashMap<String, String>) -> bool {
         "ai_response_guard_redacted",
         "ai_shield_redacted",
     ];
-    if FIRED_TRUE_KEYS
-        .iter()
-        .any(|key| metadata.get(*key).is_some_and(fired_metadata_value))
-    {
+    if FIRED_TRUE_KEYS.iter().any(|key| {
+        metadata
+            .get(*key)
+            .is_some_and(|value| fired_metadata_value(value))
+    }) {
         return true;
     }
     for key in [
@@ -1507,7 +1596,10 @@ fn guardrail_fired(metadata: &HashMap<String, String>) -> bool {
         "ai_response_guard_warning",
         "ai_request_guard.uninspectable_body",
     ] {
-        if metadata.get(key).is_some_and(fired_metadata_value) {
+        if metadata
+            .get(key)
+            .is_some_and(|value| fired_metadata_value(value))
+        {
             return true;
         }
     }
@@ -1519,10 +1611,25 @@ fn guardrail_fired(metadata: &HashMap<String, String>) -> bool {
     {
         return true;
     }
+    for key in [
+        "ai_semantic_firewall.request.decision",
+        "ai_semantic_firewall.request.action",
+        "ai_semantic_firewall.request.would_action",
+        "ai_semantic_firewall.response.decision",
+        "ai_semantic_firewall.response.action",
+        "ai_semantic_firewall.response.would_action",
+    ] {
+        if let Some(value) = metadata.get(key)
+            && !value.is_empty()
+            && !value.eq_ignore_ascii_case("allow")
+        {
+            return true;
+        }
+    }
     false
 }
 
-fn fired_metadata_value(value: &String) -> bool {
+fn fired_metadata_value(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty() && !value.eq_ignore_ascii_case("false")
 }
