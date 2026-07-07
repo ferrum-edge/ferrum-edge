@@ -53,7 +53,7 @@ use url::Url;
 
 use sha2::{Digest, Sha256};
 
-use super::utils::ai_providers::detect_response_provider;
+use super::utils::ai_providers::{detect_response_provider, detect_sse_provider};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::json_escape::escape_json_string;
 use super::utils::sse::{encode_sse_error_event, is_sse_request};
@@ -70,6 +70,9 @@ const DEFAULT_REDACTION_PLACEHOLDER: &str = "[REDACTED_TOOL_ARG:{name}]";
 const DEFAULT_APPROVAL_TIMEOUT_MS: u64 = 1500;
 /// Default approval cache TTL.
 const DEFAULT_APPROVAL_CACHE_TTL_S: u64 = 300;
+/// Maximum approval cache TTL. Larger values risk overflowing `Instant`
+/// arithmetic on some platforms and keep stale approvals alive too long.
+const MAX_APPROVAL_CACHE_TTL_S: u64 = 30 * 24 * 60 * 60;
 /// Upper bound on the body size this plugin will parse for tool calls, so an
 /// oversized (already-buffered) body cannot spend unbounded CPU in serde. In
 /// `enforce` mode a governed body past this limit is REJECTED (fail closed —
@@ -428,11 +431,19 @@ impl GovernorEngine {
         (outcome, true, policy.risk)
     }
 
-    /// Whether exposing a tool *definition* (name only, no arguments) is denied.
-    fn definition_denied(&self, name: &str) -> bool {
+    /// Whether exposing a tool *definition* (name only, no arguments) is
+    /// blocked. `require_approval` cannot be resolved for a bare definition
+    /// because there are no concrete arguments to send to the approval webhook.
+    fn definition_blocked(&self, name: &str) -> bool {
         match self.tools.get(name) {
-            Some(policy) => policy.action == ToolAction::Deny,
-            None => self.default_action == DefaultAction::Deny,
+            Some(policy) => matches!(
+                policy.action,
+                ToolAction::Deny | ToolAction::RequireApproval
+            ),
+            None => matches!(
+                self.default_action,
+                DefaultAction::Deny | DefaultAction::RequireApproval
+            ),
         }
     }
 
@@ -448,6 +459,16 @@ impl GovernorEngine {
         streaming: bool,
     ) -> BatchDecision {
         let mut per_call = Vec::with_capacity(calls.len());
+        let skip_approvals = self.mode == Mode::Enforce
+            && calls.iter().any(|call| {
+                let (outcome, _, _) =
+                    self.evaluate(&call.name, &call.raw_args, call.parsed_args.as_ref());
+                match outcome {
+                    PolicyOutcome::Deny(_) => true,
+                    PolicyOutcome::Redact(patterns) => streaming && !patterns.is_empty(),
+                    _ => false,
+                }
+            });
 
         for call in calls {
             let (outcome, matched, risk) =
@@ -494,8 +515,19 @@ impl GovernorEngine {
                     }
                 }
                 PolicyOutcome::RequireApproval => {
-                    self.resolve_require_approval(corr, call, &arguments_hash, risk, ns, &mut cd)
+                    if skip_approvals {
+                        cd.label = "require_approval";
+                    } else {
+                        self.resolve_require_approval(
+                            corr,
+                            call,
+                            &arguments_hash,
+                            risk,
+                            ns,
+                            &mut cd,
+                        )
                         .await;
+                    }
                 }
             }
 
@@ -650,9 +682,10 @@ impl GovernorEngine {
                 let now = Instant::now();
                 self.approval_cache.retain(|_, (_, expiry)| *expiry > now);
             }
-            if self.approval_cache.len() < MAX_APPROVAL_CACHE_ENTRIES {
-                self.approval_cache
-                    .insert(cache_key, (allowed, Instant::now() + approval.cache_ttl));
+            if self.approval_cache.len() < MAX_APPROVAL_CACHE_ENTRIES
+                && let Some(expiry) = Instant::now().checked_add(approval.cache_ttl)
+            {
+                self.approval_cache.insert(cache_key, (allowed, expiry));
             }
             // Still full of live decisions: skip caching (fail safe — only
             // costs an extra webhook call later) rather than grow unbounded.
@@ -1090,7 +1123,7 @@ impl AiToolGovernor {
         if self.inspect.request_tool_definitions {
             let denied: Vec<String> = extract_request_tool_definitions(json)
                 .into_iter()
-                .filter(|name| self.engine.definition_denied(name))
+                .filter(|name| self.engine.definition_blocked(name))
                 .collect();
             if !denied.is_empty() {
                 self.write_definition_metadata(ctx, &denied);
@@ -1404,16 +1437,6 @@ impl Plugin for AiToolGovernor {
         if body.is_empty() {
             return PluginResult::Continue;
         }
-        if has_non_identity_content_encoding(response_headers) {
-            if self.engine.mode == Mode::Enforce {
-                return self.reject_uninspectable(
-                    ctx,
-                    "response body",
-                    "response body has a content-encoding that cannot be inspected",
-                );
-            }
-            return PluginResult::Continue;
-        }
         if body.len() > MAX_PARSE_BYTES {
             // A padded response must not smuggle governed tool calls past the
             // parse limit: fail closed in enforce mode.
@@ -1426,8 +1449,20 @@ impl Plugin for AiToolGovernor {
             }
             return PluginResult::Continue;
         }
-        let Ok(json) = serde_json::from_slice::<Value>(body) else {
-            return PluginResult::Continue;
+        let json = match serde_json::from_slice::<Value>(body) {
+            Ok(json) => json,
+            Err(_) => {
+                if has_non_identity_content_encoding(response_headers)
+                    && self.engine.mode == Mode::Enforce
+                {
+                    return self.reject_uninspectable(
+                        ctx,
+                        "response body",
+                        "response body has a content-encoding that cannot be inspected",
+                    );
+                }
+                return PluginResult::Continue;
+            }
         };
 
         let calls = extract_response_tool_calls(&json);
@@ -1466,7 +1501,11 @@ impl Plugin for AiToolGovernor {
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        if !self.enabled || !self.needs_response_transform {
+        if !self.enabled
+            || !self.needs_response_transform
+            || self.engine.mode == Mode::DryRun
+            || !self.inspect.response_tool_calls
+        {
             return None;
         }
         match content_type {
@@ -1728,7 +1767,7 @@ impl ToolCallStreamInspector {
             self.corr.model = Some(model.to_string());
         }
         if self.corr.provider.is_none()
-            && let Some(provider) = detect_response_provider(frame)
+            && let Some(provider) = detect_sse_provider(frame)
         {
             self.corr.provider = Some(provider.as_str().to_string());
         }
@@ -2349,6 +2388,11 @@ fn parse_approval(
                 .to_string()
         })?,
     };
+    if cache_ttl_seconds > MAX_APPROVAL_CACHE_TTL_S {
+        return Err(format!(
+            "ai_tool_governor: 'approval.cache_ttl_seconds' must be <= {MAX_APPROVAL_CACHE_TTL_S}"
+        ));
+    }
 
     let fail_on_error = match obj.get("fail_on_error").and_then(Value::as_str) {
         None | Some("reject") => FailOnError::Reject,

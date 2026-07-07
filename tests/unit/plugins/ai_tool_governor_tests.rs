@@ -203,6 +203,20 @@ fn rejects_non_http_approval_endpoint() {
 }
 
 #[test]
+fn rejects_excessive_approval_cache_ttl() {
+    let err = try_make(json!({
+        "tools": { "x": { "action": "require_approval" } },
+        "approval": {
+            "endpoint_url": "https://approve.example.com/x",
+            "cache_ttl_seconds": u64::MAX
+        }
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("approval.cache_ttl_seconds"), "{err}");
+}
+
+#[test]
 fn rejects_no_inspection_surface() {
     let err = try_make(json!({
         "tools": { "x": { "action": "deny" } },
@@ -573,6 +587,50 @@ async fn redacts_non_string_response_arguments_before_forwarding() {
 }
 
 #[tokio::test]
+async fn dry_run_does_not_mutate_response_arguments() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        }
+    }));
+
+    let body = response_with_tool_call("filesystem.write", "{\"token\":\"sk-DRYRUNSECRET123\"}");
+    assert!(
+        plugin
+            .transform_response_body(&body, Some("application/json"), &json_headers())
+            .await
+            .is_none(),
+        "dry-run must not mutate the delivered response body"
+    );
+}
+
+#[tokio::test]
+async fn response_transform_respects_response_tool_calls_toggle() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+
+    let body = response_with_tool_call("filesystem.write", "{\"token\":\"sk-TOGGLESECRET123\"}");
+    assert!(
+        plugin
+            .transform_response_body(&body, Some("application/json"), &json_headers())
+            .await
+            .is_none(),
+        "response transform must be disabled when response_tool_calls=false"
+    );
+}
+
+#[tokio::test]
 async fn arguments_hashes_do_not_contain_raw_arguments() {
     let plugin = make(json!({ "tools": { "github.create_pr": { "action": "allow" } } }));
     let mut ctx = create_test_context();
@@ -621,6 +679,38 @@ async fn denies_request_exposing_disallowed_tool_definition() {
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(502));
+}
+
+#[tokio::test]
+async fn blocks_request_exposing_approval_required_tool_definition() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()) },
+        "inspect": { "request_tool_definitions": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "model": "gpt-4o",
+            "messages": [],
+            "tools": [
+                { "type": "function", "function": { "name": "deploy" } }
+            ]
+        })
+        .to_string(),
+    );
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -759,6 +849,48 @@ async fn approval_cache_avoids_second_webhook() {
         );
     }
     // Explicit verification (also runs on drop).
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn batch_denial_skips_approval_webhook() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": {
+            "deploy": { "action": "require_approval" },
+            "kubectl.apply": { "action": "deny" }
+        },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()) },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!([
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "deploy", "arguments": { "env": "prod" } }
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "kubectl.apply", "arguments": { "manifest": "kind: Pod" } }
+            }
+        ])
+        .to_string(),
+    );
+    let mut headers = HashMap::new();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
     server.verify().await;
 }
 
@@ -1002,6 +1134,56 @@ async fn streaming_approval_cache_key_includes_streamed_model() {
             "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
         });
         let body = format!("data: {tool_frame}\n\ndata: {finish_frame}\n\ndata: [DONE]\n\n");
+        let (_out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+        assert!(!terminated);
+    }
+
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn streaming_approval_cache_key_includes_sse_provider() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 300 },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+
+    for provider_prelude in [
+        json!({ "type": "message_start", "message": { "id": "msg_1" }, "model": "same-model" }),
+        json!({ "object": "chat.completion.chunk", "model": "same-model" }),
+    ] {
+        let ctx = create_test_context();
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        let tool_frame = json!({
+            "model": "same-model",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": { "name": "deploy", "arguments": "{\"env\":\"prod\"}" }
+                    }]
+                }
+            }]
+        });
+        let finish_frame = json!({
+            "model": "same-model",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
+        });
+        let body = format!(
+            "data: {provider_prelude}\n\ndata: {tool_frame}\n\ndata: {finish_frame}\n\ndata: [DONE]\n\n"
+        );
         let (_out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
         assert!(!terminated);
     }
@@ -1284,15 +1466,28 @@ async fn dry_run_forwards_oversized_json_response() {
 }
 
 #[tokio::test]
-async fn enforce_rejects_content_encoded_json_response() {
-    let plugin = make(json!({ "tools": { "kubectl.apply": { "action": "deny" } } }));
+async fn gateway_added_content_encoding_header_does_not_make_plain_json_uninspectable() {
+    let plugin = make(json!({ "tools": { "kubectl.apply": { "action": "allow" } } }));
     let mut ctx = create_test_context();
     let mut headers = json_headers();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
     let body = response_with_tool_call("kubectl.apply", "{}");
-    assert_reject(
+    assert_continue(
         plugin
             .on_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+    );
+}
+
+#[tokio::test]
+async fn enforce_rejects_opaque_content_encoded_json_response() {
+    let plugin = make(json!({ "tools": { "kubectl.apply": { "action": "deny" } } }));
+    let mut ctx = create_test_context();
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &headers, b"not-json-gzip-bytes")
             .await,
         Some(502),
     );
