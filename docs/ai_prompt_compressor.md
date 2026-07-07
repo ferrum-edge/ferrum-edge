@@ -153,6 +153,21 @@ on the request context, which flow into transaction summaries:
 - **Only `messages[].content` and the legacy `prompt` are compressed.** Other
   prompt-carrying shapes (embeddings `input`, Anthropic top-level `system`) are
   deliberately left intact.
+- **Negations keep their complement.** Negation words (including curly-quote
+  contractions such as `don’t`) and the word immediately after them are always
+  kept, so a surviving "not" cannot re-bind to a later clause. Longer negated
+  phrases can still lose trailing qualifiers — prefer `preserve_tag` around
+  meaning-critical instructions.
+- **English/space-delimited text is assumed.** Scoring tokenizes on ASCII
+  whitespace, so unsegmented scripts (CJK, Thai) inside a message form one
+  oversized token that may be kept or dropped wholesale. Do not enable
+  compression for roles that routinely carry such content.
+- **Pasted structured data is scored as prose.** JSON/YAML/CSV embedded in a
+  message (outside code fences) can lose digitless keys and values. Wrap such
+  payloads in a fenced code block or a `preserve_tag` span.
+- **`preserve_tag` markers never reach the provider.** Markers are stripped
+  even when the content is below `min_content_tokens` or compression yields no
+  reduction.
 
 ## Testing
 

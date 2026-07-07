@@ -676,3 +676,76 @@ async fn preserve_tag_keeps_internal_whitespace_exactly() {
         "markers must be stripped: {compressed:?}"
     );
 }
+
+#[tokio::test]
+async fn curly_apostrophe_negations_preserved() {
+    // U+2019 apostrophes are the norm in text pasted from iOS/Word/LLM output;
+    // "don\u{2019}t" must be classified as a negation, not a droppable word.
+    let plugin = compressor(5, 0.3);
+    let content = "The deployment automation assistant manages many long running \
+         production maintenance workflows across several regional clusters every \
+         single day and please don\u{2019}t delete the archived customer log files \
+         because the compliance retention audit team still needs them available \
+         for the quarterly regulatory review process next month."
+        .to_string();
+    let body = chat_body("user", &content);
+    let out = transform(&plugin, &body).await.expect("should compress");
+    let compressed = first_message_content(&out);
+
+    assert!(
+        compressed.contains("don\u{2019}t"),
+        "curly-apostrophe negation must be kept: {compressed:?}"
+    );
+}
+
+#[tokio::test]
+async fn word_following_negation_preserved() {
+    // The negated complement must survive with its negation, otherwise a kept
+    // "not" re-binds to the following clause and inverts its meaning.
+    let plugin = compressor(5, 0.3);
+    let content = "The migration assistant coordinates several complicated multi \
+         region database replication schedules throughout every operational \
+         maintenance window and the standby cluster is not disposable because the \
+         disaster recovery certification depends on continuous verified replica \
+         availability during the annual failover compliance exercise period."
+        .to_string();
+    let body = chat_body("user", &content);
+    let out = transform(&plugin, &body).await.expect("should compress");
+    let compressed = first_message_content(&out);
+
+    assert!(
+        compressed.contains("not disposable"),
+        "word following a kept negation must be kept: {compressed:?}"
+    );
+}
+
+#[tokio::test]
+async fn preserve_markers_stripped_when_compression_does_not_apply() {
+    // Below the token floor, compression is skipped — but gateway-internal
+    // preserve markers must still never leak to the provider.
+    let plugin = AiPromptCompressor::new(&json!({
+        "preserve_tag": "keep",
+        "min_content_tokens": 200,
+        "target_ratio": 0.4,
+    }))
+    .unwrap();
+    let content = "Short prompt with a <keep>protected span</keep> inside.";
+    let body = chat_body("user", content);
+    let out = transform(&plugin, &body)
+        .await
+        .expect("markers must be stripped");
+    let compressed = first_message_content(&out);
+
+    assert!(
+        compressed.contains("protected span"),
+        "span text must survive: {compressed:?}"
+    );
+    assert!(
+        !compressed.contains("<keep>") && !compressed.contains("</keep>"),
+        "markers must be stripped even without compression: {compressed:?}"
+    );
+    assert_eq!(
+        compressed, "Short prompt with a protected span inside.",
+        "only the markers may be removed"
+    );
+}

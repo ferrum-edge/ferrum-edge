@@ -294,7 +294,9 @@ impl AiPromptCompressor {
     fn compress_text(&self, text: &str) -> Option<(String, usize, usize)> {
         let original_tokens = estimate_tokens(text);
         if original_tokens < self.min_content_tokens {
-            return None;
+            // Too short to compress, but preserve-tag markers must still be
+            // stripped — they are gateway-internal and never reach providers.
+            return self.strip_markers_only(text, original_tokens);
         }
         let compressed = match &self.preserve_tags {
             Some(tags) => self.compress_with_preserve(text, tags),
@@ -304,8 +306,41 @@ impl AiPromptCompressor {
         if compressed_tokens < original_tokens {
             Some((compressed, original_tokens, compressed_tokens))
         } else {
-            None
+            self.strip_markers_only(text, original_tokens)
         }
+    }
+
+    /// When `preserve_tag` is configured and the text contains markers but
+    /// compression does not apply (too short, or no token reduction), the
+    /// markers are still removed so they never leak upstream.
+    fn strip_markers_only(
+        &self,
+        text: &str,
+        original_tokens: usize,
+    ) -> Option<(String, usize, usize)> {
+        let (open, close) = self.preserve_tags.as_ref()?;
+        if !text.contains(open.as_str()) && !text.contains(close.as_str()) {
+            return None;
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        loop {
+            let next = match (rest.find(open.as_str()), rest.find(close.as_str())) {
+                (Some(a), Some(b)) if a <= b => Some((a, open.len())),
+                (Some(_), Some(b)) => Some((b, close.len())),
+                (Some(a), None) => Some((a, open.len())),
+                (None, Some(b)) => Some((b, close.len())),
+                (None, None) => None,
+            };
+            let Some((pos, len)) = next else {
+                out.push_str(rest);
+                break;
+            };
+            out.push_str(&rest[..pos]);
+            rest = &rest[pos + len..];
+        }
+        let stripped_tokens = estimate_tokens(&out);
+        Some((out, original_tokens, stripped_tokens))
     }
 
     /// Compress a string that may contain `preserve_tag` spans. Text outside the
@@ -618,11 +653,17 @@ fn statistical_compress(text: &str, ratio: f32) -> String {
     let mut keep = vec![false; tokens.len()];
     let mut scored: Vec<(usize, f32)> = Vec::with_capacity(word_count);
     let mut critical_count = 0usize;
+    // A kept negation whose complement is dropped re-binds to the following
+    // clause ("It is not urgent. Delete logs" => "not Delete logs"), so the
+    // candidate word immediately after a negation is critical too.
+    let mut force_next = false;
     for &i in &word_indices {
         let token = &tokens[i];
-        if is_negation(&token.core_lower) {
+        let negation = is_negation(&token.core_lower);
+        if negation || force_next {
             keep[i] = true;
             critical_count += 1;
+            force_next = negation;
             continue;
         }
         scored.push((i, word_score(token, &freq)));
@@ -750,7 +791,7 @@ fn tokenize(text: &str) -> Vec<Token<'_>> {
         } else {
             tokens.push(Token {
                 text: unit,
-                core_lower: core.to_lowercase(),
+                core_lower: normalize_apostrophes(core.to_lowercase()),
                 verbatim: false,
                 leading_newline: had_newline,
             });
@@ -900,6 +941,18 @@ fn is_stopword(word: &str) -> bool {
             | "you"
             | "your"
     )
+}
+
+/// Fold typographic apostrophes (U+2019, U+02BC) to ASCII `'` so contractions
+/// pasted from word processors and phones ("don’t", "can’t") are recognized by
+/// `is_negation` and the stop-word tables instead of being scored as ordinary
+/// droppable words.
+fn normalize_apostrophes(word: String) -> String {
+    if word.contains(['\u{2019}', '\u{02bc}']) {
+        word.replace(['\u{2019}', '\u{02bc}'], "'")
+    } else {
+        word
+    }
 }
 
 /// Negations and their contractions — always kept to preserve meaning.
