@@ -5235,6 +5235,533 @@ async fn functional_mesh_ambient_cross_cluster_egress_rejects_untrusted_client()
     );
 }
 
+// ── Cross-cluster WebSocket (Ambient HBONE) ──────────────────────────────────
+//
+// The WebSocket counterpart of the Ambient cross-cluster keystone (issue #2010):
+// the WS upgrade rides the SAME per-pod cross-cluster HBONE byte tunnel the HTTP
+// path proved (dial the remote east-west gateway with the destination service
+// FQDN as the outer-TLS SNI + trust-domain-only verification; inner CONNECT
+// `:authority` = the destination pod addr:app-port), with an inner HTTP/1.1
+// WebSocket handshake spoken THROUGH the tunnel to C's transparent HBONE relay.
+// Only the backend + driving request differ from the HTTP driver, so the
+// three-gateway Ambient setup is factored into one fixture helper.
+
+/// A running Ambient cross-cluster east-west fixture (client A Ambient →
+/// east-west B SNI-passthrough → dest C Ambient, two trust domains, federated
+/// bundle) — the Ambient counterpart of [`SidecarCrossClusterFixture`].
+struct AmbientCrossClusterFixture {
+    child_a: Child,
+    child_b: Child,
+    child_c: Child,
+    cp_a: MeshCpHandle,
+    cp_b: MeshCpHandle,
+    cp_c: MeshCpHandle,
+    temp_a: TempDir,
+    temp_b: TempDir,
+    temp_c: TempDir,
+    a_outbound_port: u16,
+}
+
+impl AmbientCrossClusterFixture {
+    fn logs(&self) -> String {
+        format!(
+            "--- gateway A (client) ---\n{}\n--- gateway B (east-west) ---\n{}\n\
+             --- gateway C (dest) ---\n{}",
+            captured_output(&self.temp_a),
+            captured_output(&self.temp_b),
+            captured_output(&self.temp_c),
+        )
+    }
+
+    async fn shutdown(mut self) {
+        kill_child(&mut self.child_a);
+        kill_child(&mut self.child_b);
+        kill_child(&mut self.child_c);
+        self.cp_a.shutdown().await;
+        self.cp_b.shutdown().await;
+        self.cp_c.shutdown().await;
+    }
+}
+
+/// Start the three-gateway Ambient cross-cluster fixture for one attempt, or
+/// return `None` (after cleaning up) on any bind failure. `backend_port` is C's
+/// already-spawned app backend (its HBONE relay open-relay guard admits the
+/// loopback workload addr:port), so HTTP / WebSocket share this topology.
+async fn try_start_ambient_cross_cluster_fixture(
+    attempt: u32,
+    client_trusted: bool,
+    backend_port: u16,
+) -> Option<AmbientCrossClusterFixture> {
+    let a_spiffe = "spiffe://cluster.local/ns/ferrum/sa/client-app";
+    let c_spiffe = "spiffe://cluster-b.local/ns/ferrum/sa/svc-c";
+    let b_spiffe = "spiffe://cluster-b.local/ns/ferrum/sa/ew-gateway";
+    let trust_label = if client_trusted {
+        "trusted"
+    } else {
+        "untrusted"
+    };
+    let node_a = format!("functional-mesh-amb-xc-ws-{trust_label}-a-{attempt}");
+    let node_b = format!("functional-mesh-amb-xc-ws-{trust_label}-b-{attempt}");
+    let node_c = format!("functional-mesh-amb-xc-ws-{trust_label}-c-{attempt}");
+    let temp_a = TempDir::new().ok()?;
+    let temp_b = TempDir::new().ok()?;
+    let temp_c = TempDir::new().ok()?;
+
+    let (c_svid, b_ca) = mint_cross_cluster_svid(temp_c.path(), "gateway-c", c_spiffe);
+    let b_ca_pem = b_ca.0.clone();
+    let b_svid =
+        mint_cross_cluster_svid_under(temp_b.path(), "gateway-b", b_spiffe, &b_ca_pem, &b_ca.1);
+    let (a_svid, a_ca_pem) = {
+        let (svid, ca) = mint_cross_cluster_svid(temp_a.path(), "gateway-a", a_spiffe);
+        (svid, ca.0)
+    };
+    let a_ca_for_c_federation = if client_trusted {
+        a_ca_pem.clone()
+    } else {
+        mint_cross_cluster_svid(
+            temp_c.path(),
+            "throwaway-a",
+            "spiffe://cluster.local/ns/ferrum/sa/nobody",
+        )
+        .1
+        .0
+    };
+    let b_ca_for_a_federation = if client_trusted {
+        b_ca_pem.clone()
+    } else {
+        mint_cross_cluster_svid(
+            temp_a.path(),
+            "throwaway-b",
+            "spiffe://cluster-b.local/ns/ferrum/sa/nobody",
+        )
+        .1
+        .0
+    };
+
+    let ports_a = reserve_mesh_ports().await;
+    let ports_b = reserve_mesh_ports().await;
+    let ports_c = reserve_mesh_ports().await;
+    let a_outbound_port = ports_a.outbound;
+    let b_east_west_port = ports_b.east_west;
+    let c_hbone_port = ports_c.hbone;
+
+    let cp_c = start_static_mesh_cp(cross_cluster_ambient_dest_slice(
+        &node_c,
+        c_spiffe,
+        backend_port,
+        &b_ca_pem,
+        &a_ca_for_c_federation,
+    ))
+    .await;
+    let cp_b = start_static_mesh_cp(cross_cluster_ambient_east_west_slice(
+        &node_b,
+        c_spiffe,
+        c_hbone_port,
+    ))
+    .await;
+    let cp_a = start_static_mesh_cp(cross_cluster_ambient_client_slice(
+        &node_a,
+        c_spiffe,
+        backend_port,
+        b_east_west_port,
+        &a_ca_pem,
+        &b_ca_for_a_federation,
+    ))
+    .await;
+
+    // Gateway C (dest, Ambient): HBONE relay → the app backend.
+    let mut child_c = spawn_mesh_gateway(
+        &temp_c,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_c.addr,
+            ports: ports_c,
+            node_id: &node_c,
+            config_protocol: "native",
+            topology: "ambient",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", c_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", c_svid.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", c_svid.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    temp_c
+                        .path()
+                        .join("gateway-c-bundle.pem")
+                        .to_str()
+                        .expect("bundle path utf8")
+                        .to_string(),
+                ),
+            ],
+        },
+    );
+    if !wait_for_tcp_port(c_hbone_port, STARTUP_TIMEOUT).await {
+        kill_child(&mut child_c);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+        cp_c.shutdown().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        return None;
+    }
+
+    // Gateway B (east-west): SNI passthrough → C's HBONE listener.
+    let mut child_b = spawn_mesh_gateway(
+        &temp_b,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_b.addr,
+            ports: ports_b,
+            node_id: &node_b,
+            config_protocol: "native",
+            topology: "east_west_gateway",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", b_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", b_svid.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", b_svid.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    temp_b
+                        .path()
+                        .join("gateway-b-bundle.pem")
+                        .to_str()
+                        .expect("bundle path utf8")
+                        .to_string(),
+                ),
+            ],
+        },
+    );
+    if !wait_for_tcp_port(b_east_west_port, STARTUP_TIMEOUT).await {
+        kill_child(&mut child_b);
+        kill_child(&mut child_c);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+        cp_c.shutdown().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        return None;
+    }
+
+    // Gateway A (client, Ambient): outbound capture → cross-cluster HBONE egress.
+    let mut child_a = spawn_mesh_gateway(
+        &temp_a,
+        MeshGatewaySpawnOptions {
+            cp_addr: cp_a.addr,
+            ports: ports_a,
+            node_id: &node_a,
+            config_protocol: "native",
+            topology: "ambient",
+            waypoint_name: None,
+            env_overrides: vec![
+                ("FERRUM_MESH_PRODUCTION_MODE", "true".to_string()),
+                ("FERRUM_LOG_LEVEL", "debug".to_string()),
+                ("FERRUM_POOL_WARMUP_ENABLED", "false".to_string()),
+                ("FERRUM_MESH_WORKLOAD_SPIFFE_ID", a_spiffe.to_string()),
+                ("FERRUM_GATEWAY_SVID_CERT_PATH", a_svid.cert_path.clone()),
+                ("FERRUM_GATEWAY_SVID_KEY_PATH", a_svid.key_path.clone()),
+                (
+                    "FERRUM_GATEWAY_SVID_TRUST_BUNDLE_PATH",
+                    temp_a
+                        .path()
+                        .join("gateway-a-bundle.pem")
+                        .to_str()
+                        .expect("bundle path utf8")
+                        .to_string(),
+                ),
+            ],
+        },
+    );
+    if !wait_for_tcp_port(a_outbound_port, STARTUP_TIMEOUT).await {
+        kill_child(&mut child_a);
+        kill_child(&mut child_b);
+        kill_child(&mut child_c);
+        cp_a.shutdown().await;
+        cp_b.shutdown().await;
+        cp_c.shutdown().await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        return None;
+    }
+
+    Some(AmbientCrossClusterFixture {
+        child_a,
+        child_b,
+        child_c,
+        cp_a,
+        cp_b,
+        cp_c,
+        temp_a,
+        temp_b,
+        temp_c,
+        a_outbound_port,
+    })
+}
+
+/// Drive one captured WebSocket upgrade from Ambient client gateway A across the
+/// east-west gateway B to the WS echo backend behind Ambient dest gateway C.
+/// Returns `Ok((reply, logs))` on a completed roundtrip; `Err` when the upgrade
+/// never completes (the expected fail-closed outcome for an untrusted A).
+async fn drive_ambient_cross_cluster_ws_egress(
+    client_trusted: bool,
+) -> Result<(String, String), String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let backend_port = start_websocket_echo_backend().await;
+        let Some(fixture) =
+            try_start_ambient_cross_cluster_fixture(attempt, client_trusted, backend_port).await
+        else {
+            last_failure = format!("attempt {attempt}: ambient cross-cluster fixture never bound");
+            continue;
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let last: Result<String, String> = loop {
+            let observed = mesh_websocket_echo_roundtrip(
+                fixture.a_outbound_port,
+                "svc-c.ferrum.svc.cluster.local",
+                "mesh-amb-xc-ws-hello",
+            )
+            .await;
+            if let Ok(ref reply) = observed
+                && reply.contains("backend-ws:mesh-amb-xc-ws-hello")
+            {
+                break observed;
+            }
+            if Instant::now() >= deadline {
+                break observed;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        let logs = fixture.logs();
+        fixture.shutdown().await;
+        return match last {
+            Ok(reply) => Ok((reply, logs)),
+            Err(e) => Err(format!("{e}\n{logs}")),
+        };
+    }
+
+    Err(format!(
+        "ambient cross-cluster WS gateways never bound their listeners after {RETRY_ATTEMPTS} \
+         attempts\n{last_failure}"
+    ))
+}
+
+/// Cross-cluster WebSocket keystone (Ambient HBONE, issue #2010): a WebSocket
+/// upgrade captured at Ambient client gateway A reaches the WS echo backend
+/// behind Ambient dest gateway C THROUGH east-west gateway B, over the per-pod
+/// cross-cluster HBONE byte tunnel (dial the remote east-west gateway with the
+/// destination service FQDN as the outer-TLS SNI + trust-domain-only
+/// verification; inner CONNECT `:authority` = the destination pod addr:app-port)
+/// with an inner HTTP/1.1 WebSocket handshake spoken THROUGH the tunnel to C's
+/// transparent HBONE relay. Proves Ambient cross-cluster WS rides the SAME
+/// secured transport as the HTTP path.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_cross_cluster_ws_routes_a_to_c_over_east_west() {
+    let (reply, logs) = drive_ambient_cross_cluster_ws_egress(true)
+        .await
+        .expect("ambient cross-cluster websocket egress drive");
+    assert!(
+        reply.contains("backend-ws:mesh-amb-xc-ws-hello"),
+        "the WebSocket frame must traverse A's cross-cluster HBONE byte-tunnel egress through the \
+         east-west gateway to C's WS backend and echo back; reply: {reply:?}\n{logs}"
+    );
+}
+
+/// Cross-cluster WebSocket negative (Ambient HBONE, issue #2010): an untrusted
+/// gateway A must not reach C's WS backend. The cross-cluster HBONE dial
+/// underpinning the byte tunnel fails SVID verification (A rejects C's server
+/// SVID; C's HBONE listener rejects A's client cert), so the upgrade fails
+/// closed — never a plaintext / wrong-SNI dial, never a backend frame.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_cross_cluster_ws_rejects_untrusted_client() {
+    if let Ok((reply, logs)) = drive_ambient_cross_cluster_ws_egress(false).await {
+        assert!(
+            !reply.contains("backend-ws:"),
+            "an untrusted gateway's cross-cluster Ambient WebSocket egress must fail closed, not \
+             echo a backend frame: {reply:?}\n{logs}"
+        );
+    }
+}
+
+/// Cross-cluster Ambient WS egress driver that drives a NON-ROOT request path
+/// (`/ws/echo?room=42`) against a path-capturing WS echo backend, then returns
+/// the echoed reply (which embeds the path the backend actually observed).
+/// Mirrors [`drive_ambient_cross_cluster_ws_egress`] but with the path-echo
+/// backend so the test can assert the client `:path` is preserved through the
+/// cross-cluster HBONE byte tunnel (issue #2010 codex Finding 1).
+async fn drive_ambient_cross_cluster_ws_path_egress() -> Result<(String, String), String> {
+    ensure_gateway_built().map_err(|e| format!("gateway build: {e}"))?;
+
+    const CLIENT_PATH: &str = "/ws/echo?room=42";
+    let mut last_failure = String::new();
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let backend_port = start_websocket_path_echo_backend().await;
+        let Some(fixture) =
+            try_start_ambient_cross_cluster_fixture(attempt, true, backend_port).await
+        else {
+            last_failure = format!("attempt {attempt}: ambient cross-cluster fixture never bound");
+            continue;
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let last: Result<String, String> = loop {
+            let observed = mesh_websocket_echo_roundtrip_path(
+                fixture.a_outbound_port,
+                "svc-c.ferrum.svc.cluster.local",
+                CLIENT_PATH,
+                "mesh-amb-xc-ws-path-hello",
+            )
+            .await;
+            if let Ok(ref reply) = observed
+                && reply.contains("mesh-amb-xc-ws-path-hello")
+            {
+                break observed;
+            }
+            if Instant::now() >= deadline {
+                break observed;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+
+        let logs = fixture.logs();
+        fixture.shutdown().await;
+        return match last {
+            Ok(reply) => Ok((reply, logs)),
+            Err(e) => Err(format!("{e}\n{logs}")),
+        };
+    }
+
+    Err(format!(
+        "ambient cross-cluster WS path gateways never bound their listeners after \
+         {RETRY_ATTEMPTS} attempts\n{last_failure}"
+    ))
+}
+
+/// Cross-cluster WebSocket PATH-PRESERVATION regression (Ambient HBONE, issue
+/// #2010 codex Finding 1): a WebSocket upgrade to a non-root path
+/// (`/ws/echo?room=42`) must reach C's backend on THAT EXACT path — not `/`.
+/// Before the fix, the caller derived `path_and_query` by parsing a backend URL
+/// whose authority was the cross-cluster scoped synthetic `mesh-xc-hbone|...`
+/// host; that authority is not a valid URI, so the parse failed and the path
+/// silently collapsed to `/`, upgrading every cross-cluster WS endpoint against
+/// the root. The fix rewrites the authority to the real pod addr
+/// (`mesh.hbone_authority_host`) before parsing (mirroring `proxy_to_backend_hbone`),
+/// so the client path survives. The path-echo backend echoes the path it
+/// observed, so this asserts the exact non-root path arrived.
+#[ignore]
+#[tokio::test]
+async fn functional_mesh_ambient_cross_cluster_ws_preserves_request_path() {
+    let (reply, logs) = drive_ambient_cross_cluster_ws_path_egress()
+        .await
+        .expect("ambient cross-cluster websocket path-preservation egress drive");
+    // The echoed reply is `backend-ws-path:<observed_path>:<text>`; the observed
+    // path MUST be the full non-root client target, proving it was not collapsed
+    // to `/` by the synthetic-host URL parse failure.
+    assert!(
+        reply.contains("backend-ws-path:/ws/echo?room=42:mesh-amb-xc-ws-path-hello"),
+        "the cross-cluster Ambient WS upgrade must reach the backend on the exact client path \
+         `/ws/echo?room=42` (not `/`); reply: {reply:?}\n{logs}"
+    );
+    // Guard against a false pass if the path ever silently degrades to root.
+    assert!(
+        !reply.contains("backend-ws-path:/:"),
+        "the cross-cluster Ambient WS path must not collapse to `/`; reply: {reply:?}\n{logs}"
+    );
+}
+
+/// Cross-cluster WebSocket HOST-FALLBACK regression (Ambient HBONE, issue #2010
+/// codex round 2): with a route that does NOT preserve the client Host
+/// (`preserve_host_header == false`, as ordinary gateway/SD proxies use) — or a
+/// client that sends no Host at all — the inner WebSocket handshake `Host` must
+/// fall back to the REAL destination pod addr (`app_host`, from
+/// `mesh.hbone_authority_host`), NOT to `target.host`.
+///
+/// For a cross-cluster target `target.host` is the scoped synthetic
+/// `mesh-xc-hbone|...` identity, which is not a valid URI authority, so a
+/// `target.host` fallback would build `ws://mesh-xc-hbone|...` and
+/// `into_client_request()` would ABORT the upgrade AFTER the HBONE tunnel is
+/// already established. The fix carries `app_host` into that fallback (mirroring
+/// `proxy_to_backend_hbone`, whose backend Host is `app_host` when the client
+/// Host is not preserved), so the WS URI stays valid and the upgrade completes.
+///
+/// This asserts the exact selection performed at the inner-request build site in
+/// `connect_mesh_websocket_backend` via the shared `hbone_ws_inner_host` helper.
+/// It is a focused-logic regression rather than a full A→B→C e2e because mesh
+/// materialization hardwires the outbound egress route to
+/// `preserve_host_header = true` (and outbound routing requires the Host), so no
+/// mesh fixture can drive the `preserve_host_header == false` branch end-to-end;
+/// the helper is the single source of the Host used by both the WS byte-tunnel
+/// handshake and the parallel `proxy_to_backend_hbone` relay. Mirrors the
+/// `functional_mesh_ambient_cross_cluster_ws_*` fixture's cross-cluster shape
+/// (synthetic `mesh-xc-hbone|...` host + real pod `app_host`). CI-validated
+/// (not run locally under this change).
+#[test]
+fn functional_mesh_ambient_cross_cluster_ws_host_fallback_uses_app_host() {
+    use ferrum_edge::proxy::hbone_pool::hbone_ws_inner_host;
+
+    // Cross-cluster shape: `target.host` is the scoped synthetic identity that is
+    // NOT a valid URI authority; `app_host` is the real remote pod addr the dest
+    // relay dials (what `mesh.hbone_authority_host` carries in production).
+    let synthetic_target_host = "mesh-xc-hbone|10.9.9.9|15443|10.244.5.5";
+    let app_host = "10.244.5.5";
+    let port = 8080u16;
+
+    // preserve_host_header == false + a present client Host ⇒ fallback to
+    // `app_host` (the fixed behavior), never the synthetic `target.host`.
+    let inner = hbone_ws_inner_host(
+        Some("svc-c.ferrum.svc.cluster.local"),
+        false,
+        app_host,
+        port,
+    );
+    assert_eq!(
+        inner, "10.244.5.5:8080",
+        "with preserve_host_header=false the cross-cluster WS inner Host must be the real pod \
+         app_host, so `ws://{inner}` is a valid upgrade URI"
+    );
+    assert!(
+        !inner.contains(synthetic_target_host),
+        "the cross-cluster WS inner Host must never fall back to the synthetic `target.host` \
+         (`{synthetic_target_host}`), which is an invalid WS URI authority"
+    );
+
+    // No client Host (client omitted it) ⇒ same `app_host` fallback regardless of
+    // preserve_host_header, so the upgrade URI is still valid.
+    assert_eq!(
+        hbone_ws_inner_host(None, true, app_host, port),
+        "10.244.5.5:8080",
+        "an absent client Host must fall back to the real pod app_host"
+    );
+    assert_eq!(
+        hbone_ws_inner_host(Some(""), true, app_host, port),
+        "10.244.5.5:8080",
+        "an empty client Host must fall back to the real pod app_host"
+    );
+
+    // preserve_host_header == true + a real client Host ⇒ the client Host rides
+    // through unchanged (the existing preserved-Host path, unregressed).
+    assert_eq!(
+        hbone_ws_inner_host(Some("svc-c.ferrum.svc.cluster.local"), true, app_host, port),
+        "svc-c.ferrum.svc.cluster.local",
+        "a preserved non-empty client Host must ride through unchanged"
+    );
+
+    // IN-CLUSTER invariant: `app_host == target.host` (no authority-host tag), so
+    // the fallback is byte-identical to the pre-fix `target.host` behavior.
+    let in_cluster_host = "orders.default.svc.cluster.local";
+    assert_eq!(
+        hbone_ws_inner_host(None, false, in_cluster_host, port),
+        "orders.default.svc.cluster.local:8080",
+        "in-cluster targets (app_host == target.host) keep the prior fallback byte-for-byte"
+    );
+}
+
 // ── Localized file config source (`FERRUM_MESH_CONFIG_PROTOCOL=file`) ────────
 
 /// JSON mesh document equivalent of `inbound_authz_slice`: the same routing +
@@ -5636,6 +6163,84 @@ async fn start_websocket_echo_backend() -> u16 {
     port
 }
 
+/// Start a WebSocket echo server that captures the inner upgrade's request
+/// **path+query** (via `accept_hdr_async`) and echoes it back in-band as
+/// `backend-ws-path:<path_and_query>:<text>`. Used to prove the cross-cluster
+/// Ambient WS egress PRESERVES the client `:path` through the HBONE byte tunnel
+/// (issue #2010 codex Finding 1): before the fix, the synthetic
+/// `mesh-xc-hbone|...` authority made the caller's URL fail to parse and the
+/// path silently collapsed to `/`. The captured path lets the client assert the
+/// exact non-root path arrived at the backend.
+// The `accept_hdr_async` callback returns tungstenite's large `ErrorResponse`
+// in its `Err` arm — the same accepted shape as `functional_websocket_test.rs`.
+#[allow(clippy::result_large_err)]
+async fn start_websocket_path_echo_backend() -> u16 {
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::{Arc, Mutex};
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind websocket path-echo backend");
+    let port = listener
+        .local_addr()
+        .expect("websocket path-echo backend addr")
+        .port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((sock, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                // Capture the inner HTTP/1.1 upgrade request target the relay
+                // forwarded. `accept_hdr_async`'s callback sees the raw request,
+                // so record its path+query for the client to assert on.
+                let observed_path = Arc::new(Mutex::new(String::from("<none>")));
+                let observed_path_cb = Arc::clone(&observed_path);
+                let callback = move |req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                                     resp: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    let pq = req
+                        .uri()
+                        .path_and_query()
+                        .map(|pq| pq.as_str().to_string())
+                        .unwrap_or_else(|| req.uri().path().to_string());
+                    if let Ok(mut slot) = observed_path_cb.lock() {
+                        *slot = pq;
+                    }
+                    Ok(resp)
+                };
+                let Ok(mut ws) = tokio_tungstenite::accept_hdr_async(sock, callback).await else {
+                    return;
+                };
+                use tokio_tungstenite::tungstenite::Message;
+                let path_snapshot = observed_path
+                    .lock()
+                    .map(|slot| slot.clone())
+                    .unwrap_or_else(|_| String::from("<lock-poisoned>"));
+                while let Some(Ok(msg)) = ws.next().await {
+                    let send_result = match msg {
+                        Message::Text(text) => {
+                            ws.send(Message::Text(
+                                format!("backend-ws-path:{path_snapshot}:{text}").into(),
+                            ))
+                            .await
+                        }
+                        Message::Binary(bytes) => ws.send(Message::Binary(bytes)).await,
+                        Message::Ping(payload) => ws.send(Message::Pong(payload)).await,
+                        Message::Close(_) => {
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        _ => Ok(()),
+                    };
+                    if send_result.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
 /// Open a plaintext HTTP/1.1 WebSocket upgrade to gateway A's outbound capture
 /// listener (the same channel `plaintext_http_get` uses), send one text frame,
 /// and return the echoed reply. The `Host` selects A's `mesh.mtls` egress route
@@ -5645,6 +6250,18 @@ async fn start_websocket_echo_backend() -> u16 {
 async fn mesh_websocket_echo_roundtrip(
     port: u16,
     host: &str,
+    payload: &str,
+) -> Result<String, String> {
+    mesh_websocket_echo_roundtrip_path(port, host, "/", payload).await
+}
+
+/// Same as [`mesh_websocket_echo_roundtrip`] but drives an arbitrary request
+/// `path` (e.g. `/ws/echo?room=x`) instead of `/`, so a test can assert the
+/// client `:path`+query is preserved end-to-end across a mesh WS egress.
+async fn mesh_websocket_echo_roundtrip_path(
+    port: u16,
+    host: &str,
+    path: &str,
     payload: &str,
 ) -> Result<String, String> {
     use futures_util::{SinkExt, StreamExt};
@@ -5661,7 +6278,7 @@ async fn mesh_websocket_echo_roundtrip(
 
     // Build the upgrade request with the egress-route Host (tungstenite would
     // otherwise key the Host off the raw 127.0.0.1 address and miss the route).
-    let mut request = format!("ws://{host}/")
+    let mut request = format!("ws://{host}{path}")
         .into_client_request()
         .map_err(|e| format!("build ws request: {e}"))?;
     request.headers_mut().insert(
