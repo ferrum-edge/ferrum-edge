@@ -1330,22 +1330,64 @@ impl RequestContext {
     /// `X-Consumer-Username`. This prefers the gateway Consumer username, then
     /// a plugin-provided display/header identity, then the raw external auth
     /// identity.
+    ///
+    /// Returns `None` when a plugin set the shared
+    /// [`SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY`] marker (e.g.
+    /// `ai_stream_router` routing to a third-party AI provider), so every
+    /// backend-dispatch injection site (H1/H2, gRPC, WebSocket, native H3, H3
+    /// WebSocket) skips the identity headers without leaking internal user
+    /// identifiers to the external destination. The authenticated principal
+    /// itself stays resolved — `effective_identity()` is unaffected, so rate
+    /// limiting, logging, and policy plugins keep working.
     pub fn backend_consumer_username(&self) -> Option<&str> {
-        self.identified_consumer
+        let username = self
+            .identified_consumer
             .as_ref()
             .map(|consumer| consumer.username.as_str())
             .or(self.authenticated_identity_header.as_deref())
-            .or(self.authenticated_identity.as_deref())
+            .or(self.authenticated_identity.as_deref())?;
+        if self.suppresses_backend_consumer_identity_headers() {
+            return None;
+        }
+        Some(username)
     }
 
     /// Return the Consumer custom ID to forward to the backend, if a gateway
-    /// Consumer was resolved.
+    /// Consumer was resolved. Suppressed together with
+    /// [`Self::backend_consumer_username`] — see that method's contract.
     pub fn backend_consumer_custom_id(&self) -> Option<&str> {
-        self.identified_consumer
+        let custom_id = self
+            .identified_consumer
             .as_ref()
-            .and_then(|consumer| consumer.custom_id.as_deref())
+            .and_then(|consumer| consumer.custom_id.as_deref())?;
+        if self.suppresses_backend_consumer_identity_headers() {
+            return None;
+        }
+        Some(custom_id)
+    }
+
+    /// Whether a plugin opted this request out of gateway consumer-identity
+    /// header injection (`x-consumer-username` / `x-consumer-custom-id`).
+    /// Checked only after a principal resolved, so unauthenticated requests
+    /// pay no extra metadata lookup.
+    fn suppresses_backend_consumer_identity_headers(&self) -> bool {
+        self.metadata
+            .get(SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY)
+            .map(String::as_str)
+            == Some("true")
     }
 }
+
+/// Shared metadata key a plugin sets to `"true"` to suppress gateway
+/// consumer-identity header injection (`x-consumer-username` /
+/// `x-consumer-custom-id`) toward the backend for this request. Used by
+/// plugins that reroute a request to an external third party (e.g.
+/// `ai_stream_router` provider overrides) where internal user identifiers
+/// must not leak. All injection sites consume this via
+/// [`RequestContext::backend_consumer_username`] /
+/// [`RequestContext::backend_consumer_custom_id`].
+pub const SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY: &str =
+    "suppress_backend_consumer_identity_headers";
 
 /// Separator used when materializing repeated request header field lines.
 ///

@@ -68,6 +68,9 @@ const META_PROVIDER_TYPE: &str = "ai_stream_router.provider_type";
 const META_MODEL: &str = "ai_stream_router.model";
 const META_NORMALIZED: &str = "ai_stream_router.normalized_response_stream";
 const META_FALLBACK_ATTEMPTS: &str = "ai_stream_router.fallback_attempts";
+/// Shared marker (same contract as `ai_prompt_shield` / `ai_semantic_firewall`)
+/// telling response plugins the request asked for a streaming response.
+const META_STREAMING_SHARED: &str = "ai_request_streaming";
 
 // ---------------------------------------------------------------------------
 // Provider types
@@ -132,11 +135,14 @@ struct StreamProvider {
     scheme: BackendScheme,
     host: String,
     port: u16,
-    /// Absolute backend path (includes leading `/`). May contain a literal
-    /// `{model}` placeholder for future Gemini-style path routing.
+    /// Absolute backend path (includes leading `/`, no query). May contain a
+    /// literal `{model}` placeholder for future Gemini-style path routing.
     path: String,
+    /// Endpoint query string (no leading `?`), e.g. Azure-style
+    /// `api-version=...`. Merged with the client's own query at claim time.
+    endpoint_query: Option<String>,
     /// `Host` header / SNI authority (`host` when the port is the scheme
-    /// default, otherwise `host:port`).
+    /// default, otherwise `host:port`; IPv6 literals are bracketed).
     authority: String,
     priority: u32,
     model_patterns: Vec<String>,
@@ -144,6 +150,11 @@ struct StreamProvider {
     /// Anthropic API version header value.
     anthropic_version: String,
     path_has_model_placeholder: bool,
+    /// Keep the proxy's own resolved backend TLS (custom CA / SNI / mTLS
+    /// client cert) for this HTTPS provider instead of resetting it to
+    /// default public-CA verification. For internal `openai_compatible`
+    /// endpoints behind private PKI.
+    inherit_backend_tls: bool,
 }
 
 impl StreamProvider {
@@ -299,6 +310,8 @@ impl AiStreamRouter {
                 .unwrap_or("2023-06-01")
                 .to_string();
 
+            let inherit_backend_tls = optional_bool(pv, "inherit_backend_tls")?.unwrap_or(false);
+
             providers.push(StreamProvider {
                 name,
                 provider_type,
@@ -306,12 +319,14 @@ impl AiStreamRouter {
                 host: parsed.host,
                 port: parsed.port,
                 path: parsed.path,
+                endpoint_query: parsed.query,
                 authority: parsed.authority,
                 priority,
                 model_patterns,
                 auth,
                 anthropic_version,
                 path_has_model_placeholder: parsed.has_model_placeholder,
+                inherit_backend_tls,
             });
         }
 
@@ -413,6 +428,10 @@ struct ParsedEndpoint {
     host: String,
     port: u16,
     path: String,
+    /// Endpoint query string (no leading `?`), kept separate from `path` so
+    /// the request-time router can merge it with the client's own query
+    /// instead of producing a second `?` in the forwarded URL.
+    query: Option<String>,
     authority: String,
     has_model_placeholder: bool,
 }
@@ -455,10 +474,10 @@ fn parse_endpoint(
         }
     };
 
-    let host = match parsed.host() {
-        Some(Host::Domain(h)) if !h.is_empty() => h.to_string(),
-        Some(Host::Ipv4(h)) => h.to_string(),
-        Some(Host::Ipv6(h)) => h.to_string(),
+    let (host, host_is_ipv6) = match parsed.host() {
+        Some(Host::Domain(h)) if !h.is_empty() => (h.to_string(), false),
+        Some(Host::Ipv4(h)) => (h.to_string(), false),
+        Some(Host::Ipv6(h)) => (h.to_string(), true),
         _ => {
             return Err(format!(
                 "ai_stream_router: provider '{provider_name}' endpoint '{endpoint}' has no host"
@@ -481,21 +500,31 @@ fn parse_endpoint(
     };
     let port = parsed.port().unwrap_or(default_port);
 
-    // Rebuild the path (+query) and restore the `{model}` placeholder.
+    // Rebuild the path and restore the `{model}` placeholder. The endpoint
+    // query (Azure-style `api-version=...`) is kept SEPARATE so request-time
+    // routing can merge it with the client's own query — folding it into the
+    // path would make the dispatch layer append the client query with a
+    // second `?`.
     let mut path = parsed.path().to_string();
-    if let Some(query) = parsed.query() {
-        path.push('?');
-        path.push_str(query);
-    }
     if path.is_empty() {
         path.push('/');
     }
     let path = path.replace("__FERRUM_MODEL__", "{model}");
+    let query = parsed
+        .query()
+        .filter(|q| !q.is_empty())
+        .map(|q| q.replace("__FERRUM_MODEL__", "{model}"));
 
-    let authority = if parsed.port().is_some() && port != default_port {
-        format!("{host}:{port}")
-    } else {
-        host.clone()
+    // An IPv6 literal must be bracketed in the authority / `Host` header
+    // (`[2001:db8::1]:8443`); `Host::Ipv6::to_string()` yields the bare form.
+    let authority = match (
+        host_is_ipv6,
+        parsed.port().is_some() && port != default_port,
+    ) {
+        (true, true) => format!("[{host}]:{port}"),
+        (true, false) => format!("[{host}]"),
+        (false, true) => format!("{host}:{port}"),
+        (false, false) => host.clone(),
     };
 
     Ok(ParsedEndpoint {
@@ -503,6 +532,7 @@ fn parse_endpoint(
         host,
         port,
         path,
+        query,
         authority,
         has_model_placeholder,
     })
@@ -951,11 +981,46 @@ impl Plugin for AiStreamRouter {
             );
         }
 
-        let backend_path = if provider.path_has_model_placeholder {
+        let mut backend_path = if provider.path_has_model_placeholder {
             provider.path.replace("{model}", &model)
         } else {
             provider.path.clone()
         };
+
+        // Merge an endpoint-configured query (Azure-style `api-version=...`)
+        // with the client's own query. The dispatch layer appends the
+        // (post-strip) client query with `?`, so when the endpoint carries its
+        // own query we fold BOTH into the override path joined by `&` and mark
+        // every client parameter for strip — otherwise the forwarded URL would
+        // contain a second `?`. Endpoints without a query keep the normal
+        // client-query forwarding untouched.
+        if let Some(endpoint_query) = provider.endpoint_query.as_deref() {
+            let endpoint_query = if provider.path_has_model_placeholder {
+                endpoint_query.replace("{model}", &model)
+            } else {
+                endpoint_query.to_string()
+            };
+            backend_path.push('?');
+            backend_path.push_str(&endpoint_query);
+            let client_query = ctx
+                .raw_query_string()
+                .filter(|q| !q.is_empty())
+                .map(str::to_string);
+            if let Some(client_query) = client_query {
+                backend_path.push('&');
+                backend_path.push_str(&client_query);
+                for pair in client_query.split('&').filter(|p| !p.is_empty()) {
+                    let name = pair.split_once('=').map_or(pair, |(name, _)| name);
+                    ctx.metadata.insert(
+                        format!(
+                            "{}{name}",
+                            super::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX
+                        ),
+                        "true".to_string(),
+                    );
+                }
+            }
+        }
 
         // --- Rewrite the routing decision (no internal HTTP call). ---
         ctx.route_override_backend_scheme = Some(provider.scheme);
@@ -964,7 +1029,11 @@ impl Plugin for AiStreamRouter {
         ctx.route_override_path = Some(backend_path);
         ctx.route_override_path_is_absolute = true;
         ctx.route_override_authority = Some(provider.authority.clone());
-        if provider.scheme == BackendScheme::Https {
+        // Default: public providers verify against the system trust store.
+        // `inherit_backend_tls: true` leaves the override unset so the proxy's
+        // own resolved backend TLS (custom CA / SNI policy / backend mTLS
+        // client cert) applies to an internal openai_compatible endpoint.
+        if provider.scheme == BackendScheme::Https && !provider.inherit_backend_tls {
             ctx.route_override_resolved_tls = Some(BackendTlsConfig::default_verify());
         }
 
@@ -997,6 +1066,20 @@ impl Plugin for AiStreamRouter {
             .insert(META_CLAIMED.to_string(), "true".to_string());
         ctx.metadata
             .insert(META_CLAIMED_COORD.to_string(), "true".to_string());
+        // Shared marker: the request asked for a streaming response. Response
+        // plugins (e.g. `ai_response_guard`) use it to stay on the streaming
+        // path even when the client did not send `Accept: text/event-stream`;
+        // without it the provider SSE would be buffered until completion.
+        ctx.metadata
+            .insert(META_STREAMING_SHARED.to_string(), "true".to_string());
+        // The provider is a third party: the proxy must not append the
+        // gateway-asserted `x-consumer-*` identity headers after the
+        // credential strip below (see the suppression contract on
+        // `RequestContext::backend_consumer_username`).
+        ctx.metadata.insert(
+            super::SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY.to_string(),
+            "true".to_string(),
+        );
         ctx.metadata
             .insert(META_PROVIDER.to_string(), provider.name.clone());
         ctx.metadata.insert(
@@ -1088,9 +1171,17 @@ impl Plugin for AiStreamRouter {
 }
 
 /// Strip client-supplied credential headers so they never leak to the provider.
+///
+/// Unlike `ai_federation` (which builds a fresh provider request), this
+/// route-override path forwards the client's own header map, so
+/// session-bearing headers (`cookie`, `proxy-authorization`) must be stripped
+/// alongside the API-key/auth headers or browser/application session
+/// credentials would reach the third-party provider.
 fn strip_client_credentials(headers: &mut HashMap<String, String>) {
     const CREDENTIAL_HEADERS: &[&str] = &[
         "authorization",
+        "proxy-authorization",
+        "cookie",
         "x-api-key",
         "api-key",
         "x-goog-api-key",
@@ -1127,6 +1218,15 @@ fn is_valid_url_model_component(model: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Anthropic SSE → OpenAI chat.completion.chunk SSE normalizer
 // ---------------------------------------------------------------------------
+
+/// Upper bound on bytes buffered in `carry` while waiting for one SSE event's
+/// blank-line boundary. Real Anthropic events are a few KiB (text/tool-arg
+/// deltas are chunked small); a provider that streams an enormous or
+/// never-terminated event would otherwise accumulate unbounded memory while
+/// producing no downstream bytes (especially with the response-size limit
+/// disabled). Overflow fails safe: emit an SSE error event + `[DONE]` and
+/// terminate the stream.
+const MAX_SSE_EVENT_CARRY_BYTES: usize = 1024 * 1024;
 
 /// Stateful, per-response inspector that transcodes Anthropic Messages API SSE
 /// events into OpenAI `chat.completion.chunk` SSE. Robust to chunk splits: raw
@@ -1347,6 +1447,24 @@ impl ResponseStreamInspector for AnthropicSseNormalizer {
         self.carry.extend_from_slice(chunk);
         let mut out = String::new();
         self.drain(&mut out);
+        // Per-event bound: after draining every complete event, whatever is
+        // left is one partial event. If it exceeds the cap the provider is
+        // streaming a pathological/never-terminated event — fail safe by
+        // ending the OpenAI stream with an error event instead of buffering
+        // without bound.
+        if self.carry.len() > MAX_SSE_EVENT_CARRY_BYTES {
+            self.carry.clear();
+            self.carry.shrink_to_fit();
+            let err = json!({
+                "error": {
+                    "message": "upstream provider sent an oversized SSE event; stream terminated",
+                    "type": "upstream_error",
+                }
+            });
+            out.push_str(&format!("data: {err}\n\n"));
+            self.finish(&mut out);
+            return ResponseStreamAction::Terminate(Some(Bytes::from(out.into_bytes())));
+        }
         ResponseStreamAction::Forward(Bytes::from(out.into_bytes()))
     }
 

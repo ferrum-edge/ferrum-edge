@@ -821,6 +821,286 @@ async fn test_anthropic_sse_robust_to_chunk_splits() {
 }
 
 // ---------------------------------------------------------------------------
+// Claim-time markers, header hygiene, endpoint URL handling
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_claim_sets_shared_streaming_marker() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata.get("ai_request_streaming").map(String::as_str),
+        Some("true"),
+        "claimed stream:true requests must set the shared streaming marker for response plugins"
+    );
+
+    // Unclaimed (non-streaming) requests must NOT set it.
+    let non_streaming = json!({"model": "gpt-4o", "messages": []});
+    let mut ctx2 = post_ctx(&non_streaming);
+    let mut headers2 = json_headers();
+    plugin.before_proxy(&mut ctx2, &mut headers2).await;
+    assert!(!ctx2.metadata.contains_key("ai_request_streaming"));
+}
+
+#[tokio::test]
+async fn test_claim_suppresses_consumer_identity_header_injection() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    // Simulate an auth plugin having resolved a principal earlier.
+    ctx.authenticated_identity = Some("internal-alice".to_string());
+    assert_eq!(ctx.backend_consumer_username(), Some("internal-alice"));
+
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert_eq!(
+        ctx.metadata
+            .get("suppress_backend_consumer_identity_headers")
+            .map(String::as_str),
+        Some("true")
+    );
+    // The proxy's injection sites read these accessors — both must go dark so
+    // x-consumer-* never reaches the third-party provider.
+    assert_eq!(
+        ctx.backend_consumer_username(),
+        None,
+        "identity header injection must be suppressed for provider-routed requests"
+    );
+    assert_eq!(ctx.backend_consumer_custom_id(), None);
+    // The principal itself stays resolved for rate limiting / logging.
+    assert_eq!(ctx.effective_identity(), Some("internal-alice"));
+}
+
+#[tokio::test]
+async fn test_cookie_and_proxy_authorization_stripped() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    headers.insert("cookie".to_string(), "session=SECRET".to_string());
+    headers.insert("proxy-authorization".to_string(), "Basic AAAA".to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        !headers.contains_key("cookie"),
+        "session cookie leaked to provider"
+    );
+    assert!(!headers.contains_key("proxy-authorization"));
+}
+
+fn azure_style_config() -> Value {
+    json!({
+        "providers": [{
+            "name": "azure",
+            "provider_type": "openai_compatible",
+            "endpoint": "https://azure.example.com/openai/deployments/gpt/chat/completions?api-version=2024-02-01",
+            "api_key": "sk-azure",
+            "model_patterns": ["gpt-*"]
+        }]
+    })
+}
+
+#[tokio::test]
+async fn test_endpoint_query_preserved_without_client_query() {
+    let plugin = build(azure_style_config());
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.route_override_path.as_deref(),
+        Some("/openai/deployments/gpt/chat/completions?api-version=2024-02-01")
+    );
+    // No client query → nothing to strip.
+    assert!(
+        !ctx.metadata
+            .keys()
+            .any(|k| k.starts_with("auth.strip_query_param."))
+    );
+}
+
+#[tokio::test]
+async fn test_endpoint_query_merged_with_client_query() {
+    let plugin = build(azure_style_config());
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    ctx.set_raw_query_string("foo=bar&baz=1".to_string());
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    // Endpoint query first, client query appended with '&' — never a second '?'.
+    assert_eq!(
+        ctx.route_override_path.as_deref(),
+        Some("/openai/deployments/gpt/chat/completions?api-version=2024-02-01&foo=bar&baz=1")
+    );
+    // Every client param is marked consumed so dispatch does not re-append it.
+    assert_eq!(
+        ctx.metadata
+            .get("auth.strip_query_param.foo")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("auth.strip_query_param.baz")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn test_plain_endpoint_keeps_client_query_forwarding_untouched() {
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    ctx.set_raw_query_string("foo=bar".to_string());
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    // No endpoint query → the dispatch path appends the client query normally.
+    assert_eq!(
+        ctx.route_override_path.as_deref(),
+        Some("/v1/chat/completions")
+    );
+    assert!(
+        !ctx.metadata
+            .keys()
+            .any(|k| k.starts_with("auth.strip_query_param."))
+    );
+}
+
+#[tokio::test]
+async fn test_ipv6_endpoint_authority_is_bracketed() {
+    let cfg = json!({
+        "providers": [{
+            "name": "local6",
+            "provider_type": "openai_compatible",
+            "endpoint": "https://[::1]:8443/v1/chat/completions",
+            "api_key": "sk-local",
+            "model_patterns": ["gpt-*"]
+        }]
+    });
+    let plugin = build(cfg);
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    // Backend host stays bare (the URL builder brackets it); authority/Host
+    // must be bracketed.
+    assert_eq!(ctx.route_override_backend_host.as_deref(), Some("::1"));
+    assert_eq!(ctx.route_override_backend_port, Some(8443));
+    assert_eq!(ctx.route_override_authority.as_deref(), Some("[::1]:8443"));
+    assert_eq!(headers.get("host").map(String::as_str), Some("[::1]:8443"));
+}
+
+#[tokio::test]
+async fn test_ipv6_endpoint_default_port_authority() {
+    let cfg = json!({
+        "providers": [{
+            "name": "local6",
+            "provider_type": "openai_compatible",
+            "endpoint": "https://[::1]/v1/chat/completions",
+            "api_key": "sk-local",
+            "model_patterns": ["gpt-*"]
+        }]
+    });
+    let plugin = build(cfg);
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(ctx.route_override_authority.as_deref(), Some("[::1]"));
+}
+
+#[tokio::test]
+async fn test_backend_tls_default_and_inherit() {
+    // Default: HTTPS providers get default public-CA verification.
+    let plugin = build(openai_and_anthropic_config());
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(ctx.route_override_resolved_tls.is_some());
+
+    // inherit_backend_tls: true leaves the proxy's own resolved backend TLS
+    // (custom CA / SNI / mTLS) in force by NOT overriding it.
+    let cfg = json!({
+        "providers": [{
+            "name": "internal",
+            "provider_type": "openai_compatible",
+            "endpoint": "https://llm.internal.example.com/v1/chat/completions",
+            "api_key": "sk-internal",
+            "model_patterns": ["gpt-*"],
+            "inherit_backend_tls": true
+        }]
+    });
+    let plugin2 = build(cfg);
+    let mut ctx2 = post_ctx(&body);
+    let mut headers2 = json_headers();
+    plugin2.before_proxy(&mut ctx2, &mut headers2).await;
+    assert_eq!(
+        ctx2.metadata
+            .get("ai_stream_router.claimed")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        ctx2.route_override_resolved_tls.is_none(),
+        "inherit_backend_tls must not clobber the proxy's resolved backend TLS"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Normalizer carry bound
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_normalizer_terminates_on_oversized_sse_event() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut inspector: Box<dyn ResponseStreamInspector> = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .unwrap();
+
+    // One giant never-terminated event: no blank-line boundary ever arrives.
+    let filler = vec![b'a'; 64 * 1024];
+    let mut terminated = None;
+    // 1 MiB cap / 64 KiB chunks → must terminate well within 20 chunks.
+    for i in 0..20 {
+        match inspector.on_chunk(&filler).await {
+            ResponseStreamAction::Forward(bytes) => {
+                assert!(
+                    bytes.is_empty(),
+                    "no complete event exists; nothing should be forwarded (chunk {i})"
+                );
+            }
+            ResponseStreamAction::Terminate(bytes) => {
+                terminated = Some(bytes);
+                break;
+            }
+        }
+    }
+    let final_bytes = terminated
+        .expect("oversized unterminated SSE event must terminate the stream")
+        .expect("termination must carry a client-facing SSE error payload");
+    let text = String::from_utf8(final_bytes.to_vec()).unwrap();
+    assert!(text.contains("upstream_error"), "{text}");
+    assert!(text.contains("oversized"), "{text}");
+    assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+
+    // After termination the inspector is inert.
+    let after = inspector.on_chunk(b"data: {}\n\n").await;
+    match after {
+        ResponseStreamAction::Forward(bytes) => assert!(bytes.is_empty()),
+        ResponseStreamAction::Terminate(_) => panic!("must not terminate twice"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Composition with ai_federation
 // ---------------------------------------------------------------------------
 
