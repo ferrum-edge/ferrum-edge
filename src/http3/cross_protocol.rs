@@ -528,10 +528,13 @@ where
     // `apply_request_body_plugins`.
     let prebuffered_body = match prebuffered_body {
         Some(body) if !plugins.is_empty() => {
-            // Context-aware variant so body transforms that depend on
+            // Use the context-aware variant so body transforms that depend on
             // `before_proxy` decisions in `ctx.metadata` (e.g.
-            // `ai_stream_router`'s provider-specific translation) run on the
-            // H3 bridge exactly as they do on the H1/H2 dispatch path.
+            // `ai_stream_router`'s provider-specific translation) and
+            // method-sensitive body plugins (e.g. `ai_prompt_compressor`, which
+            // gates on the real request method) run on the H3 bridge exactly as
+            // they do on the H1/H2 dispatch path. This bridge path has no
+            // `:method` pseudo-header for the no-context hook to consult.
             let transformed = crate::proxy::apply_request_body_plugins_with_context(
                 plugins,
                 Some(&mut *ctx),

@@ -3592,6 +3592,16 @@ async fn handle_h3_request(
         && capabilities.has(crate::plugin_cache::PluginCapabilities::MODIFIES_REQUEST_BODY)
     {
         let content_type = proxy_headers.get("content-type").map(|s| s.as_str());
+        // Expose the request method as a `:method` pseudo-header so
+        // method-sensitive plugins that only override the plain
+        // `transform_request_body` (e.g. `ai_prompt_compressor` skips non-POST
+        // bodies) can still gate on it through the default context-aware
+        // delegation. This mirrors the gRPC path's hook-only header map and is
+        // never forwarded to the backend (dispatch uses `proxy_headers`).
+        let mut hook_headers = proxy_headers.clone();
+        hook_headers
+            .entry(":method".to_string())
+            .or_insert_with(|| method.clone());
         let mut current = body_data;
         for plugin in plugins.iter() {
             // Use the context-aware hook (which falls back to the plain
@@ -3606,7 +3616,7 @@ async fn handle_h3_request(
                         &mut ctx,
                         &current,
                         content_type,
-                        &proxy_headers,
+                        &hook_headers,
                     )
                     .await
             {

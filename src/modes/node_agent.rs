@@ -282,7 +282,32 @@ impl NodeAgentConfig {
         {
             capture_config.include_cidrs.push("::/0".to_string());
         }
-        let node_waypoint_pod_registry_dir = if node_waypoint_in_netns {
+        // Publish the per-pod registry (uid → cgroup) when EITHER the NodeWaypoint
+        // TCP in-netns capture path needs it (the historical consumer) OR an
+        // Ambient UDP capture producer will consume it (`FERRUM_MESH_CAPTURE_UDP_
+        // ENABLED`, #2013): Ambient's mesh proxy runs the `NetnsUdpCaptureManager`
+        // over this same registry to open per-pod-netns UDP capture. The registry
+        // is a generic per-pod map; publishing it does NOT change eBPF/redirect
+        // behavior — that stays gated on `node_waypoint_in_netns` via the capture
+        // contract, so a plain Ambient (LocalPod) deployment gets the registry for
+        // the UDP producer WITHOUT the NodeWaypoint ipv6-deny / connect4-deferral
+        // posture. The UDP gate is `udp_capture_enabled` ALONE (NOT anded with
+        // `outbound_capture_enabled`): the Ambient UDP producer binds its own
+        // `FERRUM_MESH_CAPTURE_UDP_PORT` inside each pod netns and does not use the
+        // TCP `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` listener at all, so a port-0
+        // outbound listener (which clears `outbound_capture_enabled` for the TCP
+        // connect4/connect6 redirect path) MUST NOT suppress UDP registry
+        // publication — doing so would leave the producer polling an empty
+        // directory while pod UDP egress bypasses capture/authz (fail-open, #2013
+        // codex). The UDP producer installs its pod-netns rules on its own polling
+        // loop AFTER this registry entry appears; the enrollment→rules-installed
+        // window (during which pod UDP is not yet captured) is a known fail-open
+        // gap that needs a producer→node-agent readiness handshake + a fail-closed
+        // default posture to close, tracked as a live-verified follow-up (#2013 —
+        // there is no `.ready`-marker mirror because Ambient UDP has no default
+        // redirect to refuse against, unlike the NodeWaypoint TCP connect-hook path).
+        let should_publish_registry = node_waypoint_in_netns || capture_config.udp_capture_enabled;
+        let node_waypoint_pod_registry_dir = if should_publish_registry {
             Some(std::path::PathBuf::from(
                 &env_config.mesh_node_waypoint_pod_registry_dir,
             ))
@@ -438,6 +463,51 @@ pub async fn run(
 
     let cni_config = CniListenerConfig::from_env_config(&env_config);
 
+    // Fail closed when Ambient UDP capture needs the per-pod registry but the
+    // node would take the iptables `handle_fallback()` path (#2013). The
+    // `NetnsUdpCaptureManager` producer on the mesh proxy polls the per-pod
+    // registry (`node_waypoint_pod_registry_dir`) as its ONLY source of enrolled
+    // pods, and that registry is populated exclusively by the eBPF-backed pod
+    // watcher (`run_with_backend` → `handle_kube_pod_applied` → `publish_pod_
+    // registry`). `handle_fallback()` only applies host-netns iptables and never
+    // runs the pod watcher, so it would leave the producer polling an empty
+    // directory while pod UDP egress bypasses capture/authz entirely — a silent
+    // fail-open. Host-netns iptables also cannot install pod-netns UDP TPROXY
+    // rules at all (the `addrtype --dst-type LOCAL` direction split is
+    // pod-netns-only; see `handle_fallback_with`). Refuse startup with an
+    // actionable error rather than run in a state where `FERRUM_MESH_CAPTURE_UDP_
+    // ENABLED=true` silently captures nothing, mirroring `create_backend`'s
+    // refusal to no-op when eBPF is unavailable.
+    if ambient_udp_registry_requires_ebpf(
+        probe.supports_ebpf(),
+        config.capture_config.udp_capture_enabled,
+        config.node_waypoint_pod_registry_dir.is_some(),
+    ) {
+        metrics.set_topology_degraded(probe.degradation_reason().unwrap_or("unknown"));
+        metrics.set_capture_state(NODE_AGENT_CAPTURE_STATE_UNAVAILABLE);
+        let _ = shutdown_tx.send(true);
+        for handle in admin_handles {
+            if let Err(err) = handle.await {
+                warn!(error = %err, "Node agent admin listener task failed");
+            }
+        }
+        anyhow::bail!(
+            "Ambient UDP capture is enabled (FERRUM_MESH_CAPTURE_UDP_ENABLED=true) but this node \
+             cannot run eBPF capture (kernel_release={}, cgroup_v2={}, bpf_fs={}, reason={}), so the \
+             node-agent would fall back to host-netns iptables — which never runs the pod watcher \
+             that publishes the per-pod registry the mesh proxy's UDP capture producer polls, and \
+             cannot install pod-netns UDP TPROXY rules from the host netns. Continuing would leave \
+             pod UDP egress uncaptured and unauthorized (fail-open). Remediation: upgrade this node \
+             to kernel >= 5.7 with cgroup v2 + bpffs mounted (use the -ebpf image variant), or \
+             disable Ambient UDP capture on this node (FERRUM_MESH_CAPTURE_UDP_ENABLED=false). \
+             FERRUM_NODE_AGENT_FALLBACK_MODE=iptables does not support Ambient UDP capture.",
+            probe.kernel_release,
+            probe.cgroup_v2_available,
+            probe.bpf_fs_available,
+            probe.degradation_reason().unwrap_or("unknown"),
+        );
+    }
+
     let result = if !probe.supports_ebpf() {
         handle_fallback(
             &config,
@@ -469,6 +539,30 @@ pub async fn run(
     }
 
     result
+}
+
+/// Pure predicate: does this node need to refuse startup because Ambient UDP
+/// capture depends on the per-pod registry, but the node cannot run the eBPF
+/// pod watcher that populates it?
+///
+/// Returns `true` when ALL hold:
+/// - `supports_ebpf` is `false` (the node would take the `handle_fallback()`
+///   iptables path, which never runs the pod watcher / `publish_pod_registry`),
+/// - `udp_capture_enabled` is `true` (the Ambient `NetnsUdpCaptureManager`
+///   producer will poll the per-pod registry as its source of enrolled pods), and
+/// - `registry_dir_configured` is `true` (a registry directory is actually set,
+///   so the producer has somewhere to poll).
+///
+/// When `true`, the node-agent must fail startup rather than silently run in a
+/// state where pod UDP egress bypasses capture/authz (fail-open, #2013). This is
+/// split out as a pure function so the fail-closed decision is unit-testable
+/// without the Linux-gated capture path.
+fn ambient_udp_registry_requires_ebpf(
+    supports_ebpf: bool,
+    udp_capture_enabled: bool,
+    registry_dir_configured: bool,
+) -> bool {
+    !supports_ebpf && udp_capture_enabled && registry_dir_configured
 }
 
 async fn start_node_agent_admin_listeners(
@@ -4155,9 +4249,10 @@ fn ip6tables_best_effort_wrapped_udp_command(cmd: &str) -> String {
 }
 
 fn ip6tables_best_effort_wrapped_command_for_table(cmd: &str, table: &str) -> String {
-    format!(
-        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n    {cmd}\n  else\n    echo \"ip6tables {table} table unavailable; skipping IPv6 mesh capture rules\"\n  fi\nelse\n  echo \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
-    )
+    // Shared with the Ambient per-pod-netns UDP producer's teardown so the probe
+    // shape can never drift between the node-agent fallback cleanup and the
+    // producer (`IptablesPlan::udp_teardown_script`).
+    crate::capture::ip6tables_probe_guard(cmd, table)
 }
 
 /// Execute a list of shell commands (iptables/ip6tables setup or cleanup)
@@ -4535,6 +4630,133 @@ mod tests {
     }
 
     #[test]
+    fn from_env_config_publishes_registry_for_ambient_udp_capture() {
+        // #2013: a plain Ambient (LocalPod) node-agent with UDP capture enabled
+        // must publish the per-pod registry so the mesh proxy's per-pod-netns UDP
+        // producer can discover enrolled pods — WITHOUT taking on the NodeWaypoint
+        // ipv6-deny / connect4-deferral posture (which stays gated on
+        // `node_waypoint_in_netns`).
+        let local_pod = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
+            ..EnvConfig::default()
+        };
+        with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_NAME", "node-udp"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+            ],
+            || {
+                let config = NodeAgentConfig::from_env_config(&local_pod)
+                    .expect("node-agent config should parse");
+                assert!(
+                    config.node_waypoint_pod_registry_dir.is_some(),
+                    "Ambient/LocalPod + UDP capture must publish the per-pod registry (#2013)"
+                );
+                assert!(
+                    !config.capture_contract.ipv6_outbound_deny,
+                    "the UDP producer must not flip the NodeWaypoint ipv6-deny posture"
+                );
+                assert!(
+                    !config
+                        .capture_config
+                        .include_cidrs
+                        .iter()
+                        .any(|cidr| cidr == "::/0"),
+                    "the UDP producer must not force the NodeWaypoint ::/0 include"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_config_publishes_udp_registry_when_tcp_outbound_disabled() {
+        // #2013 (codex): a port-0 FERRUM_MESH_OUTBOUND_LISTEN_ADDR clears
+        // `outbound_capture_enabled` for the TCP connect4/connect6 redirect path,
+        // but the Ambient UDP producer binds its OWN FERRUM_MESH_CAPTURE_UDP_PORT
+        // inside each pod netns and does not use the TCP outbound listener at all.
+        // The registry MUST still be published so the producer can discover pods —
+        // otherwise it polls an empty directory while pod UDP egress bypasses
+        // capture/authz (fail-open). This pins the gate to `udp_capture_enabled`
+        // ALONE, not anded with `outbound_capture_enabled`.
+        let local_pod = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
+            ..EnvConfig::default()
+        };
+        with_env_vars(
+            &[
+                ("FERRUM_NODE_AGENT_NODE_NAME", "node-udp-no-tcp"),
+                ("FERRUM_MESH_CAPTURE_UDP_ENABLED", "true"),
+                ("FERRUM_MESH_OUTBOUND_LISTEN_ADDR", "127.0.0.1:0"),
+            ],
+            || {
+                let config = NodeAgentConfig::from_env_config(&local_pod)
+                    .expect("node-agent config should parse");
+                assert!(
+                    !config.capture_config.outbound_capture_enabled,
+                    "port-0 outbound listener must clear the TCP outbound-capture flag"
+                );
+                assert!(
+                    config.node_waypoint_pod_registry_dir.is_some(),
+                    "UDP capture must publish the registry even when TCP outbound is \
+                     disabled (port 0) — the producer is independent of the TCP \
+                     listener (#2013)"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_config_no_registry_for_local_pod_without_udp() {
+        // A plain LocalPod with no UDP capture stays registry-free (no consumer).
+        let local_pod = EnvConfig {
+            node_agent_proxy_mode: NodeAgentProxyMode::LocalPod,
+            ..EnvConfig::default()
+        };
+        with_env_vars(&[("FERRUM_NODE_AGENT_NODE_NAME", "node-x")], || {
+            let config = NodeAgentConfig::from_env_config(&local_pod)
+                .expect("node-agent config should parse");
+            assert!(
+                config.node_waypoint_pod_registry_dir.is_none(),
+                "LocalPod without UDP capture must not publish a registry"
+            );
+        });
+    }
+
+    #[test]
+    fn ambient_udp_registry_requires_ebpf_fails_closed_on_iptables_fallback() {
+        // Ambient UDP capture enabled + a configured registry + a node that
+        // cannot run eBPF (would take the iptables `handle_fallback()` path) must
+        // refuse startup: `handle_fallback()` never runs the pod watcher that
+        // populates the registry, so the UDP producer would poll an empty
+        // directory while pod UDP egress bypasses capture (fail-open, #2013).
+        assert!(
+            ambient_udp_registry_requires_ebpf(false, true, true),
+            "no eBPF + UDP capture + configured registry must fail closed"
+        );
+
+        // eBPF-capable nodes run `run_with_backend`, which publishes the
+        // registry via the pod watcher — no need to refuse.
+        assert!(
+            !ambient_udp_registry_requires_ebpf(true, true, true),
+            "eBPF-capable node publishes the registry; must not refuse"
+        );
+
+        // No UDP capture means no producer polling the registry, so the iptables
+        // fallback is fine (TCP capture is handled separately).
+        assert!(
+            !ambient_udp_registry_requires_ebpf(false, false, true),
+            "no UDP capture must not refuse the iptables fallback"
+        );
+
+        // Without a configured registry directory there is nothing for the
+        // producer to poll, so there is no fail-open to guard against here.
+        assert!(
+            !ambient_udp_registry_requires_ebpf(false, true, false),
+            "no registry configured means no registry-dependent producer to protect"
+        );
+    }
+
+    #[test]
     fn from_env_config_preserves_explicit_ipv6_include_for_node_waypoint() {
         let waypoint = EnvConfig {
             node_agent_proxy_mode: NodeAgentProxyMode::NodeWaypoint,
@@ -4684,6 +4906,7 @@ mod tests {
                 include_outbound_ports: Vec::new(),
                 exclude_cidrs: vec!["10.0.0.1/32".to_string()],
                 exclude_ports: vec![15020],
+                exclude_ports_explicit: true,
                 exclude_inbound_ports: Vec::new(),
                 ip6tables_mode: Ip6TablesMode::Auto,
                 udp_capture_enabled: false,

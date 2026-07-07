@@ -237,9 +237,14 @@ nodeAgent:
   # than silently dropping all inbound to enrolled pods. Leave empty only for
   # non-NodeWaypoint proxy modes.
   trustedKubeletProbeSourceIps: ""
-  # Shared host-path directory used only when proxyMode=node_waypoint. The
-  # node-agent publishes one file per enrolled pod here, and the ambient
-  # NodeWaypoint proxy consumes it to open per-pod in-netns capture listeners.
+  # Shared host-path directory for the per-pod (uid -> cgroup) registry the
+  # node-agent publishes. Consumed by (a) the ambient NodeWaypoint proxy to open
+  # per-pod in-netns TCP capture listeners (proxyMode=node_waypoint), and (b) the
+  # ambient per-pod-netns UDP capture producer (#2013) when the ambient topology
+  # has UDP capture enabled (set ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true;
+  # the chart then mounts this dir into both DaemonSets and grants the ambient
+  # proxy the setns/NET_ADMIN capabilities it needs to install the in-netns UDP
+  # TPROXY rules).
   podRegistryDir: /run/ferrum/node-waypoint-pods
   cgroupRoot: /sys/fs/cgroup
   bpfFsPath: /sys/fs/bpf

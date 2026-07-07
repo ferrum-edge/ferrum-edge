@@ -332,6 +332,7 @@ Nine plugins for AI and agent gateway use cases — cost visibility, budget enfo
 - **`ai_request_guard`** — Enforce model whitelists, token limits, and request policy
 - **`ai_rate_limiter`** — Enforce token budgets with pre-request reservation and response reconciliation (supports centralized Redis mode; compatible with any RESP-protocol server: Redis, Valkey, DragonflyDB, KeyDB, Garnet)
 - **`ai_prompt_shield`** — Scan for PII and reject, redact, or warn
+- **`ai_prompt_compressor`** — Shorten LLM prompts to cut token usage/cost with a model-free statistical filter (no external models or services); preserves code, URLs, numbers, identifiers, and negations
 - **`ai_semantic_firewall`** — Semantic prompt/response firewall for prompt injection, jailbreaks, data exfiltration intent, tool abuse, and topic allow/deny policy
 - **`ai_semantic_cache`** — LLM response caching with normalized exact-match keys, optional embedding-based semantic similarity, and local or Redis exact-response storage
 - **`ai_response_guard`** — Output-side content guardrails: PII detection, blocked phrases, response format validation

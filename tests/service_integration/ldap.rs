@@ -15,14 +15,17 @@
 //! OpenLDAP boots (and thus wall-clock) low.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use ferrum_edge::ConsumerIndex;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, create_plugin};
+use ldap3::{LdapConnAsync, Scope, SearchEntry};
 use serde_json::json;
+use serial_test::serial;
 
 use crate::common::containers::{
-    LDAP_ADMIN_DN, LDAP_ADMIN_PASSWORD, OpenLdapContainer, fail_in_ci_else_skip,
-    start_openldap_container,
+    BoxError, LDAP_ADMIN_DN, LDAP_ADMIN_PASSWORD, LDAP_BASE_DN, OpenLdapContainer,
+    fail_in_ci_else_skip, start_openldap_container,
 };
 
 /// Test directory: two people and a `groupOfNames` (`admins`) that contains
@@ -72,7 +75,76 @@ async fn ldap_ready(test: &str) -> Option<OpenLdapContainer> {
         .seed_ldif(SEED_LDIF)
         .await
         .expect("seed OpenLDAP directory");
+    wait_for_seeded_directory(&container)
+        .await
+        .expect("seeded OpenLDAP directory should be visible through mapped port");
     Some(container)
+}
+
+async fn wait_for_seeded_directory(container: &OpenLdapContainer) -> Result<(), BoxError> {
+    let mut last = String::new();
+    for _ in 0..40 {
+        match seeded_directory_visible(&container.url).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last = err.to_string();
+                tokio::time::sleep(Duration::from_millis(750)).await;
+            }
+        }
+    }
+    Err(format!("OpenLDAP seed was not visible through mapped port: {last}").into())
+}
+
+async fn seeded_directory_visible(ldap_url: &str) -> Result<(), BoxError> {
+    let (conn, mut ldap) = LdapConnAsync::new(ldap_url).await?;
+    ldap3::drive!(conn);
+    ldap.with_timeout(Duration::from_secs(5));
+
+    ldap.simple_bind(LDAP_ADMIN_DN, LDAP_ADMIN_PASSWORD)
+        .await?
+        .success()?;
+
+    let people_base = format!("ou=people,{LDAP_BASE_DN}");
+    let (people, _result) = ldap
+        .search(
+            &people_base,
+            Scope::Subtree,
+            "(uid=alice)",
+            Vec::<&str>::new(),
+        )
+        .await?
+        .success()?;
+    if people.len() != 1 {
+        return Err(format!("expected one seeded alice entry, got {}", people.len()).into());
+    }
+
+    let alice = SearchEntry::construct(people.into_iter().next().ok_or("missing alice entry")?);
+    if alice.dn != format!("uid=alice,{people_base}") {
+        return Err(format!("unexpected alice DN {}", alice.dn).into());
+    }
+
+    let groups_base = format!("ou=groups,{LDAP_BASE_DN}");
+    let (groups, _result) = ldap
+        .search(
+            &groups_base,
+            Scope::Subtree,
+            "(member=uid=alice,ou=people,dc=example,dc=org)",
+            vec!["cn"],
+        )
+        .await?
+        .success()?;
+    let has_admins_group = groups.into_iter().any(|entry| {
+        SearchEntry::construct(entry)
+            .attrs
+            .get("cn")
+            .is_some_and(|values| values.iter().any(|value| value == "admins"))
+    });
+    if !has_admins_group {
+        return Err("expected seeded admins group containing alice".into());
+    }
+
+    let _ = ldap.unbind().await;
+    Ok(())
 }
 
 fn ldap_plugin(config: serde_json::Value) -> Arc<dyn Plugin> {
@@ -112,6 +184,7 @@ async fn authenticate(plugin: &Arc<dyn Plugin>, user: &str, pass: &str) -> Optio
 }
 
 #[tokio::test]
+#[serial]
 async fn ldap_direct_bind_validates_credentials() {
     let Some(ldap) = ldap_ready("ldap_direct_bind_validates_credentials").await else {
         return;
@@ -145,6 +218,7 @@ async fn ldap_direct_bind_validates_credentials() {
 }
 
 #[tokio::test]
+#[serial]
 async fn ldap_search_then_bind_validates_credentials() {
     let Some(ldap) = ldap_ready("ldap_search_then_bind_validates_credentials").await else {
         return;
@@ -181,6 +255,7 @@ async fn ldap_search_then_bind_validates_credentials() {
 }
 
 #[tokio::test]
+#[serial]
 async fn ldap_group_membership_is_enforced() {
     let Some(ldap) = ldap_ready("ldap_group_membership_is_enforced").await else {
         return;

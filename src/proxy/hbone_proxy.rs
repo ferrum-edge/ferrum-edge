@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -46,6 +46,12 @@ struct HboneConnectError {
     message: String,
     target_url: Option<String>,
     resolved_ip: Option<String>,
+}
+
+struct HboneUdpSocketOpenError {
+    phase: &'static str,
+    body: &'static [u8],
+    message: String,
 }
 
 pub(super) fn tag_request_metadata(ctx: &mut RequestContext) {
@@ -1040,19 +1046,15 @@ pub(super) async fn handle_hbone_udp_request(
         }
     };
 
-    let bind_addr = match dest_addr {
-        SocketAddr::V4(_) => "0.0.0.0:0",
-        SocketAddr::V6(_) => "[::]:0",
-    };
-    let socket = match tokio::net::UdpSocket::bind(bind_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(proxy_id = %proxy.id, error = %e, "HBONE UDP local socket bind failed");
+    let socket = match open_hbone_udp_relay_socket(state, dest_addr).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            warn!(proxy_id = %proxy.id, error = %error.message, "HBONE UDP local socket open failed");
             let reject = finalize_reject_response_with_after_proxy_hooks(
                 plugins,
                 ctx,
                 StatusCode::BAD_GATEWAY,
-                br#"{"error":"HBONE UDP local socket bind failed"}"#,
+                error.body,
                 HashMap::new(),
                 false,
             )
@@ -1062,7 +1064,7 @@ pub(super) async fn handle_hbone_udp_request(
                 ctx,
                 reject.http_status.as_u16(),
                 start_time,
-                "hbone_udp_bind",
+                error.phase,
                 plugin_execution_ns,
             )
             .await;
@@ -1070,29 +1072,6 @@ pub(super) async fn handle_hbone_udp_request(
             return build_response_from_normalized_reject(reject);
         }
     };
-    if let Err(e) = socket.connect(dest_addr).await {
-        warn!(proxy_id = %proxy.id, error = %e, "HBONE UDP local socket connect failed");
-        let reject = finalize_reject_response_with_after_proxy_hooks(
-            plugins,
-            ctx,
-            StatusCode::BAD_GATEWAY,
-            br#"{"error":"HBONE UDP local socket connect failed"}"#,
-            HashMap::new(),
-            false,
-        )
-        .await;
-        log_rejected_request(
-            plugins,
-            ctx,
-            reject.http_status.as_u16(),
-            start_time,
-            "hbone_udp_connect",
-            plugin_execution_ns,
-        )
-        .await;
-        record_request(state, reject.http_status.as_u16());
-        return build_response_from_normalized_reject(reject);
-    }
 
     let backend_elapsed = backend_start.elapsed();
 
@@ -1223,6 +1202,141 @@ async fn resolve_local_udp_dest(
             )
         })?;
     Ok(SocketAddr::new(ip, port))
+}
+
+async fn open_hbone_udp_relay_socket(
+    state: &ProxyState,
+    dest_addr: SocketAddr,
+) -> Result<tokio::net::UdpSocket, HboneUdpSocketOpenError> {
+    if let Some(std_socket) = maybe_bind_pod_netns_udp_relay_socket(state, dest_addr)? {
+        return tokio::net::UdpSocket::from_std(std_socket).map_err(|e| HboneUdpSocketOpenError {
+            phase: "hbone_udp_bind",
+            body: br#"{"error":"HBONE UDP pod-netns socket adoption failed"}"#,
+            message: e.to_string(),
+        });
+    }
+
+    let bind_addr = match dest_addr {
+        SocketAddr::V4(_) => "0.0.0.0:0",
+        SocketAddr::V6(_) => "[::]:0",
+    };
+    let socket =
+        tokio::net::UdpSocket::bind(bind_addr)
+            .await
+            .map_err(|e| HboneUdpSocketOpenError {
+                phase: "hbone_udp_bind",
+                body: br#"{"error":"HBONE UDP local socket bind failed"}"#,
+                message: e.to_string(),
+            })?;
+    socket
+        .connect(dest_addr)
+        .await
+        .map_err(|e| HboneUdpSocketOpenError {
+            phase: "hbone_udp_connect",
+            body: br#"{"error":"HBONE UDP local socket connect failed"}"#,
+            message: e.to_string(),
+        })?;
+    Ok(socket)
+}
+
+#[cfg(target_os = "linux")]
+fn maybe_bind_pod_netns_udp_relay_socket(
+    state: &ProxyState,
+    dest_addr: SocketAddr,
+) -> Result<Option<std::net::UdpSocket>, HboneUdpSocketOpenError> {
+    let Some(target) = registered_pod_target_for_udp_destination(
+        &state.env_config.mesh_node_waypoint_pod_registry_dir,
+        dest_addr.ip(),
+    ) else {
+        return Ok(None);
+    };
+
+    bind_pod_netns_udp_relay_socket(&target, dest_addr)
+        .map(Some)
+        .map_err(|e| HboneUdpSocketOpenError {
+            phase: "hbone_udp_connect",
+            body: br#"{"error":"HBONE UDP pod-netns local socket failed"}"#,
+            message: e,
+        })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn maybe_bind_pod_netns_udp_relay_socket(
+    _state: &ProxyState,
+    _dest_addr: SocketAddr,
+) -> Result<Option<std::net::UdpSocket>, HboneUdpSocketOpenError> {
+    Ok(None)
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn registered_pod_target_for_udp_destination(
+    registry_dir: &str,
+    dest_ip: IpAddr,
+) -> Option<super::netns_capture::PodCaptureTarget> {
+    use super::netns_capture::PodCaptureSource;
+
+    if dest_ip.is_loopback() {
+        return None;
+    }
+
+    let source = super::netns_capture::DirectoryCaptureSource::new(registry_dir);
+    source
+        .list_targets()
+        .into_iter()
+        .find(|target| match dest_ip {
+            IpAddr::V4(ip) => target.source_ips.ipv4 == Some(ip),
+            IpAddr::V6(ip) => target.source_ips.ipv6 == Some(ip),
+        })
+}
+
+#[cfg(target_os = "linux")]
+fn bind_pod_netns_udp_relay_socket(
+    target: &super::netns_capture::PodCaptureTarget,
+    dest_addr: SocketAddr,
+) -> Result<std::net::UdpSocket, String> {
+    let expected_netns = super::netns_capture::netns_inode_for_cgroup(&target.cgroup_path)
+        .map_err(|e| format!("resolve destination pod netns: {e}"))?;
+    let netns = super::netns_capture::open_pod_netns_handle(&target.cgroup_path)
+        .map_err(|e| format!("open destination pod netns: {e}"))?;
+    let opened_netns = netns
+        .metadata()
+        .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
+        .map_err(|e| format!("stat destination pod netns: {e}"))?;
+    if opened_netns != expected_netns {
+        return Err(format!(
+            "destination pod netns changed between registry scan and socket open \
+             (expected {expected_netns}, opened {opened_netns})"
+        ));
+    }
+    let host_netns =
+        super::netns_capture::host_netns_inode().map_err(|e| format!("stat host netns: {e}"))?;
+    if opened_netns == host_netns {
+        return Err(
+            "destination registry target resolves to the host/proxy netns; refusing host-netns UDP relay"
+                .to_string(),
+        );
+    }
+
+    super::netns_capture::run_in_netns(&netns, move || {
+        let domain = match dest_addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+        let socket =
+            socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        let bind_addr = match dest_addr {
+            SocketAddr::V4(_) => "0.0.0.0:0"
+                .parse::<SocketAddr>()
+                .map_err(io::Error::other)?,
+            SocketAddr::V6(_) => "[::]:0".parse::<SocketAddr>().map_err(io::Error::other)?,
+        };
+        socket.bind(&bind_addr.into())?;
+        socket.connect(&dest_addr.into())?;
+        Ok(socket.into())
+    })
+    .map_err(|e| format!("bind/connect destination pod-netns UDP socket: {e}"))
 }
 
 /// Fallback write deadline for a single framed app→tunnel `write_all` in
@@ -1418,6 +1532,7 @@ mod tests {
     use super::{
         build_hbone_relay_summary, hbone_relay_body_outcome,
         inbound_hbone_relay_effective_destination_allowed,
+        registered_pod_target_for_udp_destination,
     };
     use crate::config::types::{Proxy, UpstreamTarget};
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
@@ -1507,6 +1622,51 @@ mod tests {
             Some(&target("127.0.0.1", 9999)),
             Some(&mesh)
         ));
+    }
+
+    #[test]
+    fn udp_relay_registry_lookup_matches_destination_pod_ip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pod-a"),
+            "/sys/fs/cgroup/pod-a\nipv4=10.0.0.5\nipv6=fd00::5\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("pod-b"),
+            "/sys/fs/cgroup/pod-b\nipv4=10.0.0.6\n",
+        )
+        .unwrap();
+
+        let v4 = registered_pod_target_for_udp_destination(
+            dir.path().to_str().unwrap(),
+            "10.0.0.5".parse().unwrap(),
+        )
+        .expect("v4 pod target");
+        assert_eq!(v4.pod_uid, "pod-a");
+
+        let v6 = registered_pod_target_for_udp_destination(
+            dir.path().to_str().unwrap(),
+            "fd00::5".parse().unwrap(),
+        )
+        .expect("v6 pod target");
+        assert_eq!(v6.pod_uid, "pod-a");
+
+        assert!(
+            registered_pod_target_for_udp_destination(
+                dir.path().to_str().unwrap(),
+                "127.0.0.1".parse().unwrap(),
+            )
+            .is_none(),
+            "loopback relay destinations must stay in the current netns"
+        );
+        assert!(
+            registered_pod_target_for_udp_destination(
+                dir.path().to_str().unwrap(),
+                "10.0.0.7".parse().unwrap(),
+            )
+            .is_none()
+        );
     }
 
     #[test]

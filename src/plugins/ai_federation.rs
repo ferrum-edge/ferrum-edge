@@ -4,7 +4,7 @@
 //! of 11 supported AI providers and normalizes responses back to OpenAI format.
 //!
 //! Uses the "terminate and respond" pattern: runs in `before_proxy` at priority
-//! 2985, makes its own HTTP call to the matched AI provider via a per-provider
+//! 4060, makes its own HTTP call to the matched AI provider via a per-provider
 //! `reqwest::Client`, and returns `PluginResult::RejectBinary` with the
 //! normalized response. The normal proxy dispatch is skipped entirely.
 //! Streaming Chat Completions are intentionally unsupported by this buffered
@@ -23,7 +23,7 @@
 //!
 //! Works with the full AI plugin chain on the same proxy:
 //! ```text
-//! ai_prompt_shield (2925) → ai_request_guard (2975) → ai_federation (2985)
+//! ai_prompt_shield (2925) → ai_request_guard (2975) → ai_prompt_compressor (4055) → ai_federation (4060)
 //!                                                        ↓ writes token metadata
 //! ai_rate_limiter after_proxy (applies_after_proxy_on_reject=true)
 //!                                                        ↓

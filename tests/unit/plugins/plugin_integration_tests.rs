@@ -225,6 +225,7 @@ async fn test_all_plugins_available() {
         "ai_request_guard",
         "ai_rate_limiter",
         "ai_prompt_shield",
+        "ai_prompt_compressor",
         "ai_response_guard",
         "ai_semantic_cache",
         "ai_semantic_firewall",
