@@ -64,6 +64,8 @@ const META_ENABLED: &str = "ai_stream_router.enabled";
 const META_CLAIMED: &str = "ai_stream_router.claimed";
 /// Coordination key read by `ai_federation` to skip an already-claimed request.
 const META_CLAIMED_COORD: &str = "ai_stream_router_claimed";
+/// Coordination key for explicit router pass-through of streaming requests.
+const META_PASSTHROUGH_COORD: &str = "ai_stream_router_pass_through";
 const META_PROVIDER: &str = "ai_stream_router.provider";
 const META_PROVIDER_TYPE: &str = "ai_stream_router.provider_type";
 const META_MODEL: &str = "ai_stream_router.model";
@@ -949,6 +951,8 @@ impl Plugin for AiStreamRouter {
                         Some("missing_model"),
                     );
                 }
+                ctx.metadata
+                    .insert(META_PASSTHROUGH_COORD.to_string(), "true".to_string());
                 return PluginResult::Continue;
             }
         };
@@ -967,6 +971,8 @@ impl Plugin for AiStreamRouter {
                     Some("model_not_found"),
                 );
             }
+            ctx.metadata
+                .insert(META_PASSTHROUGH_COORD.to_string(), "true".to_string());
             return PluginResult::Continue;
         };
 
@@ -1003,24 +1009,21 @@ impl Plugin for AiStreamRouter {
             };
             backend_path.push('?');
             backend_path.push_str(&endpoint_query);
-            let client_query = ctx
+            let endpoint_query_names = decoded_query_names(&endpoint_query);
+            let raw_client_query = ctx
                 .raw_query_string()
                 .filter(|q| !q.is_empty())
-                .map(|q| query_after_strip_markers(ctx, q))
+                .map(str::to_string);
+            let client_query = raw_client_query
+                .as_deref()
+                .map(|q| query_after_strip_markers(ctx, q, &endpoint_query_names))
                 .filter(|q| !q.is_empty());
             if let Some(client_query) = client_query {
                 backend_path.push('&');
                 backend_path.push_str(client_query.as_str());
-                for pair in client_query.split('&').filter(|p| !p.is_empty()) {
-                    let name = pair.split_once('=').map_or(pair, |(name, _)| name);
-                    ctx.metadata.insert(
-                        format!(
-                            "{}{name}",
-                            super::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX
-                        ),
-                        "true".to_string(),
-                    );
-                }
+            }
+            if let Some(raw_client_query) = raw_client_query {
+                mark_client_query_params_consumed(ctx, &raw_client_query);
             }
         }
 
@@ -1219,6 +1222,8 @@ fn strip_client_credentials(headers: &mut HashMap<String, String>) {
         "api-key",
         "x-goog-api-key",
         "anthropic-version",
+        "openai-organization",
+        "openai-project",
     ];
     // Header keys in the map are already lowercased by the proxy, but match
     // case-insensitively to be safe against any future change.
@@ -1228,7 +1233,20 @@ fn strip_client_credentials(headers: &mut HashMap<String, String>) {
     });
 }
 
-fn query_after_strip_markers(ctx: &RequestContext, query: &str) -> String {
+fn decoded_query_names(query: &str) -> HashSet<String> {
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|pair| pair.split_once('=').map_or(pair, |(name, _)| name))
+        .map(|name| percent_decode_str(name).decode_utf8_lossy().into_owned())
+        .collect()
+}
+
+fn query_after_strip_markers(
+    ctx: &RequestContext,
+    query: &str,
+    endpoint_query_names: &HashSet<String>,
+) -> String {
     let strip_names: HashSet<&str> = ctx
         .metadata
         .keys()
@@ -1236,7 +1254,7 @@ fn query_after_strip_markers(ctx: &RequestContext, query: &str) -> String {
             key.strip_prefix(super::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX)
         })
         .collect();
-    if strip_names.is_empty() {
+    if strip_names.is_empty() && endpoint_query_names.is_empty() {
         return query.to_string();
     }
 
@@ -1244,7 +1262,10 @@ fn query_after_strip_markers(ctx: &RequestContext, query: &str) -> String {
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
         let decoded_name = percent_decode_str(raw_name).decode_utf8_lossy();
-        if strip_names.contains(raw_name) || strip_names.contains(decoded_name.as_ref()) {
+        if strip_names.contains(raw_name)
+            || strip_names.contains(decoded_name.as_ref())
+            || endpoint_query_names.contains(decoded_name.as_ref())
+        {
             continue;
         }
         if !stripped.is_empty() {
@@ -1253,6 +1274,19 @@ fn query_after_strip_markers(ctx: &RequestContext, query: &str) -> String {
         stripped.push_str(pair);
     }
     stripped
+}
+
+fn mark_client_query_params_consumed(ctx: &mut RequestContext, query: &str) {
+    for pair in query.split('&').filter(|p| !p.is_empty()) {
+        let raw_name = pair.split_once('=').map_or(pair, |(name, _)| name);
+        ctx.metadata.insert(
+            format!(
+                "{}{raw_name}",
+                super::utils::token_extract::STRIP_QUERY_PARAM_METADATA_PREFIX
+            ),
+            "true".to_string(),
+        );
+    }
 }
 
 /// Cap a user-controlled model string before echoing it in an error message.

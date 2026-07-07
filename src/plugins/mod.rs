@@ -1370,7 +1370,7 @@ impl RequestContext {
     /// header injection (`x-consumer-username` / `x-consumer-custom-id`).
     /// Checked only after a principal resolved, so unauthenticated requests
     /// pay no extra metadata lookup.
-    fn suppresses_backend_consumer_identity_headers(&self) -> bool {
+    pub(crate) fn suppresses_backend_consumer_identity_headers(&self) -> bool {
         self.metadata
             .get(SUPPRESS_CONSUMER_IDENTITY_HEADERS_KEY)
             .map(String::as_str)

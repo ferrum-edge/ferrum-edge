@@ -2718,16 +2718,20 @@ impl Plugin for AiFederation {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         // Coordinate with `ai_stream_router` (priority 2984, runs first). When it
-        // claims a streaming request it rewrites the route to a provider and sets
-        // `ai_stream_router_claimed = true`; `ai_federation` must not re-inspect
-        // or reject that request (its terminate-and-respond path rejects
-        // `"stream": true` with 501). `ai_stream_router` owns the streaming path;
-        // `ai_federation` owns the non-streaming path, so the two compose.
+        // claims a streaming request, or explicitly passes one through because
+        // the operator disabled fail-closed missing/unmatched-model behavior,
+        // `ai_federation` must not re-inspect or reject that same `stream:true`
+        // request.
         if ctx
             .metadata
             .get("ai_stream_router_claimed")
             .map(String::as_str)
             == Some("true")
+            || ctx
+                .metadata
+                .get("ai_stream_router_pass_through")
+                .map(String::as_str)
+                == Some("true")
         {
             return PluginResult::Continue;
         }

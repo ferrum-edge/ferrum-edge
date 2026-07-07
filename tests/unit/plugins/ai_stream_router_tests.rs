@@ -338,6 +338,12 @@ async fn test_streaming_missing_model_continues_when_opted_out() {
     let mut headers = json_headers();
     let res = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(res, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router_pass_through")
+            .map(String::as_str),
+        Some("true")
+    );
 }
 
 #[tokio::test]
@@ -360,6 +366,12 @@ async fn test_no_matching_provider_continues_when_opted_out() {
     let mut headers = json_headers();
     let res = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(res, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_stream_router_pass_through")
+            .map(String::as_str),
+        Some("true")
+    );
 }
 
 #[tokio::test]
@@ -492,6 +504,11 @@ async fn test_client_credentials_are_not_leaked() {
         "Bearer CLIENT-SECRET".to_string(),
     );
     headers.insert("x-api-key".to_string(), "CLIENT-KEY".to_string());
+    headers.insert(
+        "openai-organization".to_string(),
+        "org-attacker".to_string(),
+    );
+    headers.insert("openai-project".to_string(), "proj-attacker".to_string());
 
     let res = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(res, PluginResult::Continue));
@@ -513,6 +530,8 @@ async fn test_client_credentials_are_not_leaked() {
         headers.get("anthropic-version").map(String::as_str),
         Some("2023-06-01")
     );
+    assert!(!headers.contains_key("openai-organization"));
+    assert!(!headers.contains_key("openai-project"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,6 +1022,32 @@ async fn test_endpoint_query_omits_previously_stripped_client_credentials() {
 }
 
 #[tokio::test]
+async fn test_endpoint_query_drops_client_duplicate_provider_params() {
+    let plugin = build(azure_style_config());
+    let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&body);
+    ctx.set_raw_query_string("api-version=preview&foo=bar".to_string());
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.route_override_path.as_deref(),
+        Some("/openai/deployments/gpt/chat/completions?api-version=2024-02-01&foo=bar")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("auth.strip_query_param.api-version")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("auth.strip_query_param.foo")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
 async fn test_plain_endpoint_keeps_client_query_forwarding_untouched() {
     let plugin = build(openai_and_anthropic_config());
     let body = json!({"model": "gpt-4o", "stream": true, "messages": []});
@@ -1202,6 +1247,23 @@ async fn test_ai_federation_defers_to_claimed_stream_router_request() {
     assert!(
         matches!(res, PluginResult::Continue),
         "ai_federation should defer to ai_stream_router"
+    );
+}
+
+#[tokio::test]
+async fn test_ai_federation_defers_to_stream_router_pass_through() {
+    let fed = ai_federation_openai();
+    let body = json!({"model": "gpt-unknown", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+    let mut ctx = post_ctx(&body);
+    ctx.metadata.insert(
+        "ai_stream_router_pass_through".to_string(),
+        "true".to_string(),
+    );
+    let mut headers = json_headers();
+    let res = fed.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(res, PluginResult::Continue),
+        "ai_federation should defer to explicit ai_stream_router pass-through"
     );
 }
 
