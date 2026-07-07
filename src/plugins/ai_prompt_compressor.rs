@@ -678,10 +678,10 @@ fn statistical_compress(text: &str, ratio: f32) -> String {
     }
 
     // Every token is verbatim (all code/URLs/numbers/identifiers) — there is
-    // nothing to score or drop, so keep them all rather than panicking on
-    // `clamp(1, 0)`. Both request-path hooks reach here, so this must not abort.
+    // nothing to score or drop. Return the original text so protected layouts
+    // keep their exact whitespace.
     if word_count == 0 {
-        return reconstruct(&tokens, &keep);
+        return text.to_string();
     }
 
     // Keep at least one word; criticals count toward the budget.

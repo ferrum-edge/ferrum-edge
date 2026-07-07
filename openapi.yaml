@@ -14734,6 +14734,7 @@ components:
           type: array
           items:
             type: string
+            pattern: '\S'
           default: [user]
           minItems: 1
           description: "Message roles whose content is compressed (case-insensitive). Defaults to user only so system instructions are preserved; add 'system'/'assistant'/'tool' to compress those too. When 'user' is included, the legacy top-level `prompt` field is also compressed."
@@ -14756,6 +14757,8 @@ components:
           description: "Skip compression when the request body exceeds this size."
         preserve_tag:
           type: string
+          minLength: 1
+          pattern: '^[A-Za-z0-9_-]+$'
           description: "Optional marker name. Text wrapped in <TAG>...</TAG> is copied through verbatim (the markers themselves are stripped), letting operators protect must-keep spans. Name may contain ASCII letters, digits, '-', and '_'."
 
     AiResponseGuardConfig:
