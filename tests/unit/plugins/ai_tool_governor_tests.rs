@@ -1943,3 +1943,308 @@ async fn approval_cache_key_is_unambiguous_across_delimiter_collisions() {
 
     server.verify().await;
 }
+
+/// Enforce mode fails closed when a later transform leaves the final request
+/// body encoded (opaque), oversized, or unparseable.
+#[tokio::test]
+async fn final_request_body_recheck_enforce_rejects_uninspectable_bodies() {
+    let plugin = make(json!({
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+
+    // Content-encoding the governor cannot decode.
+    let mut ctx = json_post_ctx();
+    let mut encoded_headers = json_headers();
+    encoded_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &encoded_headers, b"\x1f\x8b\x08rest")
+            .await,
+        Some(502),
+    );
+
+    // Oversized body over the parse limit.
+    let mut ctx = json_post_ctx();
+    let oversized = vec![b'x'; 4 * 1024 * 1024 + 1];
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), &oversized)
+            .await,
+        Some(502),
+    );
+
+    // Non-JSON despite a JSON content-type.
+    let mut ctx = json_post_ctx();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), b"not json at all")
+            .await,
+        Some(502),
+    );
+}
+
+/// Dry-run mode forwards an uninspectable final body instead of rejecting.
+#[tokio::test]
+async fn final_request_body_recheck_dry_run_forwards_uninspectable() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    let mut encoded_headers = json_headers();
+    encoded_headers.insert("content-encoding".to_string(), "br".to_string());
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &encoded_headers, b"opaque")
+            .await,
+    );
+}
+
+/// The request re-check ignores requests it does not govern: no request
+/// inspection surface, a non-POST method, a non-JSON content type, or an empty
+/// body all forward untouched.
+#[tokio::test]
+async fn final_request_body_recheck_ignores_out_of_scope_requests() {
+    // No request inspection surface configured.
+    let response_only = make(json!({
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "request_tool_definitions": false, "response_tool_calls": true }
+    }));
+    let mut ctx = json_post_ctx();
+    assert_continue(
+        response_only
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), b"{}")
+            .await,
+    );
+
+    let plugin = make(json!({
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+
+    // Non-POST method.
+    let mut ctx = json_post_ctx();
+    ctx.method = "GET".to_string();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), b"{}")
+            .await,
+    );
+
+    // Non-JSON content type.
+    let mut ctx = json_post_ctx();
+    let mut text_headers = HashMap::new();
+    text_headers.insert("content-type".to_string(), "text/plain".to_string());
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &text_headers, b"hello")
+            .await,
+    );
+
+    // Empty body.
+    let mut ctx = json_post_ctx();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), b"")
+            .await,
+    );
+}
+
+/// A transform that rewrites the response but leaves the tool call permitted is
+/// forwarded by the final response-body re-check.
+#[tokio::test]
+async fn final_response_body_recheck_allows_permitted_transformed_call() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    let clean = json!({
+        "id": "x", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }]
+    })
+    .to_string()
+    .into_bytes();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .await,
+    );
+    // Transform injects a PERMITTED tool call: still forwarded.
+    let permitted = response_with_tool_call("report.read", "{\"id\":1}");
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &permitted)
+            .await,
+    );
+}
+
+/// The response re-check ignores responses out of scope: disabled response
+/// inspection, non-2xx status, non-JSON content type, empty bodies, and
+/// oversized bodies all forward untouched.
+#[tokio::test]
+async fn final_response_body_recheck_ignores_out_of_scope_responses() {
+    // Response inspection disabled.
+    let req_only = make(json!({
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = create_test_context();
+    let denied = response_with_tool_call("kubectl.apply", "{}");
+    assert_continue(
+        req_only
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &denied)
+            .await,
+    );
+
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+
+    // Non-2xx status.
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 500, &json_headers(), &denied)
+            .await,
+    );
+
+    // Non-JSON content type.
+    let mut ctx = create_test_context();
+    let mut html = HashMap::new();
+    html.insert("content-type".to_string(), "text/html".to_string());
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &html, &denied)
+            .await,
+    );
+
+    // Empty body.
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), b"")
+            .await,
+    );
+
+    // Oversized body: on_response_body already fail-closes the plaintext backend
+    // body, so an oversized final body is skipped here rather than re-rejected.
+    let mut ctx = create_test_context();
+    let oversized = vec![b'x'; 4 * 1024 * 1024 + 1];
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &oversized)
+            .await,
+    );
+}
+
+/// Capability flags gate the buffering and post-transform hooks by inspection
+/// surface.
+#[test]
+fn post_transform_capability_flags_track_inspection_surfaces() {
+    let req = make(json!({
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    assert!(req.requires_request_body_buffering());
+    assert!(req.needs_final_request_body_context());
+
+    let resp_only = make(json!({
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "request_tool_definitions": false, "response_tool_calls": true }
+    }));
+    assert!(!resp_only.requires_request_body_buffering());
+    assert!(!resp_only.needs_final_request_body_context());
+    assert!(resp_only.requires_response_body_buffering());
+}
+
+/// Protocol support and approval-endpoint warmup surfaces.
+#[test]
+fn capabilities_and_warmup_hostnames() {
+    let plain = make(json!({
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    assert!(!plain.supported_protocols().is_empty());
+    assert!(plain.warmup_hostnames().is_empty());
+
+    let with_approval = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": "https://approvals.example.com/approve" },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    assert!(
+        with_approval
+            .warmup_hostnames()
+            .iter()
+            .any(|h| h.contains("approvals.example.com"))
+    );
+}
+
+/// An A2A JSON-RPC method governed by a `deny` policy is rejected on the request.
+#[tokio::test]
+async fn a2a_method_deny_rejects() {
+    let plugin = make(json!({
+        "tools": { "message/send": { "action": "deny" } },
+        "inspect": { "a2a_methods": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": { "foo": "bar" } })
+            .to_string(),
+    );
+    let mut headers = json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+}
+
+/// A per-tool `dry_run` action forwards the call while recording an `allow`
+/// observational decision even when the plugin mode is `enforce`.
+#[tokio::test]
+async fn per_tool_dry_run_action_allows_and_labels() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "dry_run" } }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("report.read", "{}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("allow")
+    );
+}
+
+/// Per-tool risk levels surface in aggregate decision metadata.
+#[tokio::test]
+async fn tool_risk_levels_surface_in_metadata() {
+    for (risk, tool) in [("critical", "danger"), ("medium", "warn")] {
+        let plugin = make(json!({
+            "default_action": "deny",
+            "tools": { tool: { "action": "deny", "risk": risk } }
+        }));
+        let mut ctx = create_test_context();
+        let body = response_with_tool_call(tool, "{}");
+        assert_reject(
+            plugin
+                .on_response_body(&mut ctx, 200, &json_headers(), &body)
+                .await,
+            Some(502),
+        );
+        assert_eq!(
+            ctx.metadata
+                .get("ai_tool_governor.risk")
+                .map(String::as_str),
+            Some(risk)
+        );
+    }
+}
