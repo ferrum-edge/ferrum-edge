@@ -1447,6 +1447,11 @@ pub trait ResponseStreamInspector: Send {
     async fn on_end(&mut self) -> ResponseStreamAction {
         ResponseStreamAction::Forward(bytes::Bytes::new())
     }
+
+    /// Called on inspectors that already saw bytes when a later inspector cuts
+    /// the chain. Earlier inspectors can use this to discard pre-cut state that
+    /// no longer represents the client-visible stream.
+    fn on_downstream_terminated(&mut self) {}
 }
 
 /// Compose the stream inspectors of several plugins into one, so a response with
@@ -1480,15 +1485,18 @@ struct ChainedResponseStreamInspector {
 impl ResponseStreamInspector for ChainedResponseStreamInspector {
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
         let mut buf = bytes::Bytes::copy_from_slice(chunk);
-        for inspector in &mut self.inspectors {
+        for index in 0..self.inspectors.len() {
             if buf.is_empty() {
                 // An upstream inspector is holding this window; nothing yet for
                 // the rest of the chain to see.
                 return ResponseStreamAction::Forward(bytes::Bytes::new());
             }
-            match inspector.on_chunk(&buf).await {
+            match self.inspectors[index].on_chunk(&buf).await {
                 ResponseStreamAction::Forward(out) => buf = out,
-                terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                terminate @ ResponseStreamAction::Terminate(_) => {
+                    self.notify_prior_downstream_terminated(index);
+                    return terminate;
+                }
             }
         }
         ResponseStreamAction::Forward(buf)
@@ -1498,21 +1506,35 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
         // Flush each inspector in order; bytes flushed by inspector *i* are fed to
         // inspector *i+1* as a final chunk before *i+1* is itself flushed.
         let mut carry = bytes::Bytes::new();
-        for inspector in &mut self.inspectors {
+        for index in 0..self.inspectors.len() {
             let mut released = bytes::BytesMut::new();
             if !carry.is_empty() {
-                match inspector.on_chunk(&carry).await {
+                match self.inspectors[index].on_chunk(&carry).await {
                     ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
-                    terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                    terminate @ ResponseStreamAction::Terminate(_) => {
+                        self.notify_prior_downstream_terminated(index);
+                        return terminate;
+                    }
                 }
             }
-            match inspector.on_end().await {
+            match self.inspectors[index].on_end().await {
                 ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
-                terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                terminate @ ResponseStreamAction::Terminate(_) => {
+                    self.notify_prior_downstream_terminated(index);
+                    return terminate;
+                }
             }
             carry = released.freeze();
         }
         ResponseStreamAction::Forward(carry)
+    }
+}
+
+impl ChainedResponseStreamInspector {
+    fn notify_prior_downstream_terminated(&mut self, index: usize) {
+        for inspector in &mut self.inspectors[..index] {
+            inspector.on_downstream_terminated();
+        }
     }
 }
 

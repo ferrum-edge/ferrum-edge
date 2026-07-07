@@ -50,6 +50,7 @@ use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, TransactionSummary,
 };
+use crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY;
 
 /// Schema version stamped onto every emitted record.
 const RECORD_VERSION: u32 = 1;
@@ -58,15 +59,6 @@ const RECORD_VERSION: u32 = 1;
 /// request that never reached the `log` hook). The common path removes staging
 /// at emit/log time, so this only guards pathological cases.
 const STAGING_SWEEP_THRESHOLD: usize = 512;
-
-/// Bytes dropped from the tail of a cap-truncated stream capture before
-/// redaction. A sensitive value split at the `max_stream_capture_bytes`
-/// boundary would otherwise leak its raw prefix (the truncated fragment no
-/// longer matches the full pattern). 256 bytes comfortably covers every
-/// built-in PII pattern's maximum match length (emails are <= 254 bytes by
-/// spec; SSN/credit-card/phone/IBAN are far shorter). Buffered bodies do not
-/// need this — they redact over the full payload before capping.
-const STREAM_REDACTION_TAIL_GUARD_BYTES: usize = 256;
 
 // Metadata keys written into `ctx.metadata` (small strings only — never bodies).
 // These flow into the transaction log via the summary metadata.
@@ -192,6 +184,10 @@ struct StreamSlot {
     /// `None` on abnormal termination, which the terminated hook treats as a
     /// truncated, body-omitted capture.
     captured: Mutex<Option<StreamCaptured>>,
+    /// Set when a later stream inspector terminates after this inspector already
+    /// saw backend bytes. In that case our captured body/hash no longer represent
+    /// the final client-visible stream, so the terminated hook omits them.
+    downstream_terminated: AtomicBool,
 }
 
 /// A single exported audit record.
@@ -1073,22 +1069,6 @@ impl Plugin for AiTranscriptAudit {
         })
     }
 
-    async fn after_proxy(
-        &self,
-        ctx: &mut RequestContext,
-        _response_status: u16,
-        _response_headers: &mut HashMap<String, String>,
-    ) -> PluginResult {
-        if !self.active || !flag(&ctx.metadata, MD_CANDIDATE) {
-            return PluginResult::Continue;
-        }
-        if let Some(body) = ctx.metadata.remove("request_body") {
-            self.refresh_staged_request(ctx, body.as_bytes());
-            ctx.metadata.insert("request_body".to_string(), body);
-        }
-        PluginResult::Continue
-    }
-
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,
@@ -1107,9 +1087,29 @@ impl Plugin for AiTranscriptAudit {
             return PluginResult::Continue;
         }
 
-        let response_hash = sha256_hex(body);
-        let (response_excerpt, response_truncated) =
-            self.shape_body(body, self.limits.max_response_bytes);
+        // On synthetic short-circuits, downstream `before_proxy` plugins may
+        // have updated `ctx.metadata["request_body"]` and then returned a
+        // synthetic 2xx before the final request-body hook could run. Refresh
+        // from that live metadata before consuming staging. Do not do this on
+        // the normal backend path: there, the final-body hook already saw the
+        // backend-visible bytes and the carried `request_body` metadata may be
+        // the intentionally preserved pre-transform body.
+        if flag(&ctx.metadata, SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY)
+            && let Some(body) = ctx.metadata.remove("request_body")
+        {
+            self.refresh_staged_request(ctx, body.as_bytes());
+            ctx.metadata.insert("request_body".to_string(), body);
+        }
+
+        let captures_response_body = response_body_capture_allowed(response_headers);
+        let (response_hash, response_excerpt, response_truncated) = if captures_response_body {
+            let response_hash = sha256_hex(body);
+            let (response_excerpt, response_truncated) =
+                self.shape_body(body, self.limits.max_response_bytes);
+            (Some(response_hash), response_excerpt, response_truncated)
+        } else {
+            (None, None, false)
+        };
 
         let staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let sample_hit = staging
@@ -1122,8 +1122,10 @@ impl Plugin for AiTranscriptAudit {
             response_status >= 400,
         );
 
-        ctx.metadata
-            .insert(MD_RESPONSE_HASH.to_string(), response_hash.clone());
+        if let Some(response_hash) = response_hash.as_ref() {
+            ctx.metadata
+                .insert(MD_RESPONSE_HASH.to_string(), response_hash.clone());
+        }
         ctx.metadata.insert(MD_SAMPLED.to_string(), bool_str(emit));
 
         if !emit {
@@ -1148,7 +1150,7 @@ impl Plugin for AiTranscriptAudit {
             staging.as_ref(),
             response_excerpt,
             response_truncated,
-            Some(response_hash),
+            response_hash,
             emit,
             reason,
             Some(response_headers),
@@ -1205,6 +1207,7 @@ impl Plugin for AiTranscriptAudit {
 
         let slot = Arc::new(StreamSlot {
             captured: Mutex::new(None),
+            downstream_terminated: AtomicBool::new(false),
         });
         self.pending_streams
             .insert(record_id.clone(), Arc::clone(&slot));
@@ -1235,6 +1238,7 @@ impl Plugin for AiTranscriptAudit {
         let Some((_, slot)) = self.pending_streams.remove(&record_id) else {
             return; // not a stream we teed
         };
+        let downstream_terminated = slot.downstream_terminated.load(Ordering::Relaxed);
         let captured = slot.captured.lock().ok().and_then(|mut guard| guard.take());
         let staging = self.staging.remove(&record_id).map(|(_, value)| value);
 
@@ -1243,21 +1247,25 @@ impl Plugin for AiTranscriptAudit {
             .map(|staging| staging.sample_hit)
             .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
         let errored = response_status >= 400 || !outcome.body_completed;
-        let (emit, reason) =
-            self.emit_decision(sample_hit, guardrail_fired(&ctx.metadata), errored);
+        let guardrail = guardrail_fired(&ctx.metadata) || downstream_terminated;
+        let (emit, reason) = self.emit_decision(sample_hit, guardrail, errored);
         if !emit {
             return;
         }
 
         // A response already being streamed cannot be rejected, so the
         // fail-closed sink stance only applies to buffered responses.
-        let (excerpt, truncated, hash) = match captured {
-            Some(captured) => (
-                captured.response_excerpt,
-                captured.response_truncated,
-                Some(captured.response_hash),
-            ),
-            None => (None, true, None), // abnormal end: on_end never ran
+        let (excerpt, truncated, hash) = if downstream_terminated {
+            (None, true, None)
+        } else {
+            match captured {
+                Some(captured) => (
+                    captured.response_excerpt,
+                    captured.response_truncated,
+                    Some(captured.response_hash),
+                ),
+                None => (None, true, None), // abnormal end: on_end never ran
+            }
         };
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
@@ -1351,20 +1359,15 @@ impl ResponseStreamInspector for AuditStreamInspector {
     async fn on_end(&mut self) -> ResponseStreamAction {
         let digest = std::mem::replace(&mut self.hasher, Sha256::new()).finalize();
         let response_hash = hex::encode(digest);
-        // Unlike buffered bodies (which redact over the full payload before
-        // capping), a cap-truncated stream accumulator inherently cuts
-        // mid-payload; drop a pattern-sized tail before redaction so a value
-        // split at the capture boundary cannot leak its raw prefix.
-        let capture: &[u8] = if self.truncated && self.mode.redacts_body() {
-            let keep = self
-                .accumulated
-                .len()
-                .saturating_sub(STREAM_REDACTION_TAIL_GUARD_BYTES);
-            &self.accumulated[..keep]
+        // A cap-truncated redacted stream can cut through an unbounded secret or
+        // a custom pattern, leaving only a raw prefix that no regex can match.
+        // Omit the excerpt rather than exporting a boundary fragment. Full-body
+        // mode is the explicit raw-capture opt-in and still returns the cap.
+        let (response_excerpt, _) = if self.truncated && self.mode.redacts_body() {
+            (None, true)
         } else {
-            &self.accumulated
+            shape_bytes(self.mode, &self.redactor, &self.accumulated, self.max_bytes)
         };
-        let (response_excerpt, _) = shape_bytes(self.mode, &self.redactor, capture, self.max_bytes);
         if let Ok(mut guard) = self.slot.captured.lock() {
             *guard = Some(StreamCaptured {
                 response_excerpt,
@@ -1373,6 +1376,15 @@ impl ResponseStreamInspector for AuditStreamInspector {
             });
         }
         ResponseStreamAction::Forward(Bytes::new())
+    }
+
+    fn on_downstream_terminated(&mut self) {
+        self.slot
+            .downstream_terminated
+            .store(true, Ordering::Relaxed);
+        if let Ok(mut guard) = self.slot.captured.lock() {
+            *guard = None;
+        }
     }
 }
 
@@ -1466,6 +1478,7 @@ fn redact_body_decoded_json_strings(redactor: &PiiRedactor, raw: &[u8]) -> Strin
     if let Ok(mut json) = serde_json::from_slice::<Value>(raw) {
         redact_json_value_strings(redactor, &mut json);
         serde_json::to_string(&json)
+            .map(|serialized| redactor.redact(&serialized))
             .unwrap_or_else(|_| redactor.redact(&String::from_utf8_lossy(raw)))
     } else if let Some(redacted_sse) = redact_sse_json_frames(redactor, raw) {
         redacted_sse
@@ -1526,7 +1539,7 @@ fn redact_sse_json_frames(redactor: &PiiRedactor, raw: &[u8]) -> Option<String> 
                 redact_json_value_strings(redactor, &mut json);
                 if let Ok(serialized) = serde_json::to_string(&json) {
                     out.push_str("data: ");
-                    out.push_str(&serialized);
+                    out.push_str(&redactor.redact(&serialized));
                     out.push_str(newline);
                     changed = true;
                     continue;
@@ -1535,7 +1548,15 @@ fn redact_sse_json_frames(redactor: &PiiRedactor, raw: &[u8]) -> Option<String> 
         }
         out.push_str(line);
     }
-    changed.then_some(out)
+    changed.then(|| redactor.redact(&out))
+}
+
+fn response_body_capture_allowed(response_headers: &HashMap<String, String>) -> bool {
+    response_headers
+        .get("content-type")
+        .is_some_and(|content_type| {
+            is_json_content_type(content_type) && !is_framed_grpc(content_type)
+        })
 }
 
 /// Truncate `text` to at most `max_bytes` without splitting a UTF-8 code point.

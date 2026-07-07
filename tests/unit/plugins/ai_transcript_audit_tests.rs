@@ -4,13 +4,16 @@
 //! directly. Record-content tests point the HTTP sink at a `wiremock` server
 //! and assert on the captured batch (matching the `ai_federation` test style).
 
+use async_trait::async_trait;
+use bytes::Bytes;
 use ferrum_edge::config::types::DEFAULT_NAMESPACE;
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::ai_transcript_audit::AiTranscriptAudit;
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
 use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
+    ResponseStreamAction, ResponseStreamInspector, chain_response_stream_inspectors, priority,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use serde_json::{Value, json};
@@ -50,6 +53,12 @@ fn loopback_http_client() -> PluginHttpClient {
 fn json_headers() -> HashMap<String, String> {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
+    headers
+}
+
+fn content_type_headers(content_type: &str) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), content_type.to_string());
     headers
 }
 
@@ -507,6 +516,48 @@ async fn request_capture_redacts_json_keys_and_numeric_scalars() {
 }
 
 #[tokio::test]
+async fn request_capture_applies_custom_redactor_to_serialized_json_payload() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "redacted_body",
+                "redaction": {
+                    "builtins": [],
+                    "custom_patterns": [
+                        { "name": "context", "regex": "\"content\":\"context-secret\"" }
+                    ]
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":"context-secret"}]}"#,
+        )
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let request_body = records[0]["request_body"].as_str().unwrap();
+    assert!(
+        !request_body.contains("context-secret"),
+        "context-dependent custom redactor did not see full JSON payload: {request_body}"
+    );
+    assert!(request_body.contains("[REDACTED:context"), "{request_body}");
+}
+
+#[tokio::test]
 async fn response_capture_redacts_pii() {
     let records = capture_roundtrip(
         json!({ "mode": "redacted_body", "redaction": { "builtins": ["email"] } }),
@@ -526,6 +577,39 @@ async fn response_capture_redacts_pii() {
         "expected placeholder: {response_body}"
     );
     assert!(records[0]["response_hash"].is_string());
+}
+
+#[tokio::test]
+async fn non_json_buffered_response_does_not_export_body_or_hash() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({ "mode": "redacted_body" })),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let request_headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &request_headers, ai_request_body())
+        .await;
+    let response_headers = content_type_headers("text/html");
+    plugin
+        .on_final_response_body(
+            &mut ctx,
+            200,
+            &response_headers,
+            b"<html>not an AI JSON response</html>",
+        )
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert!(records[0].get("response_body").is_none());
+    assert!(records[0].get("response_hash").is_none());
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_transcript_audit.response_hash")
+    );
 }
 
 #[tokio::test]
@@ -823,6 +907,87 @@ async fn final_body_hook_refreshes_staged_capture_after_transforms() {
     assert!(excerpt.contains("transformed"), "got: {excerpt}");
 }
 
+#[tokio::test]
+async fn backend_path_after_proxy_does_not_revert_final_request_capture_from_stale_metadata() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        std::str::from_utf8(ai_request_body()).unwrap().to_string(),
+    );
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+
+    let final_body =
+        br#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"backend-visible"}]}"#;
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, final_body)
+        .await;
+    // The real proxy preserves the original request_body metadata across the
+    // final-body context swap. A stale after_proxy refresh must not overwrite the
+    // final backend-visible capture.
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        std::str::from_utf8(ai_request_body()).unwrap().to_string(),
+    );
+    let mut response_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, 200, &mut response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["model"], "gpt-4o-mini");
+    let excerpt = records[0]["request_body"].as_str().expect("request body");
+    assert!(excerpt.contains("backend-visible"), "got: {excerpt}");
+}
+
+#[tokio::test]
+async fn synthetic_response_refreshes_live_request_metadata_before_emitting() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        std::str::from_utf8(ai_request_body()).unwrap().to_string(),
+    );
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        r#"{"model":"gpt-4o-mini","messages":[{"role":"user","content":"synthetic-visible"}]}"#
+            .to_string(),
+    );
+    ctx.metadata.insert(
+        "ferrum:synthetic_short_circuit".to_string(),
+        "true".to_string(),
+    );
+
+    let headers = json_headers();
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["model"], "gpt-4o-mini");
+    let excerpt = records[0]["request_body"].as_str().expect("request body");
+    assert!(excerpt.contains("synthetic-visible"), "got: {excerpt}");
+}
+
 // ---------------------------------------------------------------------------
 // Streaming capture policy
 // ---------------------------------------------------------------------------
@@ -927,6 +1092,67 @@ async fn error_sse_response_is_teed_when_error_capture_enabled() {
             .response_stream_inspector(&ctx2, 500, Some("text/event-stream"))
             .is_none()
     );
+}
+
+struct TerminateOnEnd;
+
+#[async_trait]
+impl ResponseStreamInspector for TerminateOnEnd {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        ResponseStreamAction::Terminate(Some(Bytes::from_static(b"data: blocked\n\n")))
+    }
+}
+
+#[tokio::test]
+async fn downstream_stream_cut_omits_pre_cut_capture_and_forces_guardrail_sample() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "capture": { "streaming_response": true },
+                "sampling": { "rate": 0.0, "always_capture_on_guardrail": true }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let audit = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("audit inspector");
+    let mut chain = chain_response_stream_inspectors(vec![audit, Box::new(TerminateOnEnd)])
+        .expect("chained inspector");
+    let stream = b"data: {\"choices\":[{\"delta\":{\"content\":\"secret backend bytes\"}}]}\n\n";
+    assert!(matches!(
+        chain.on_chunk(stream).await,
+        ResponseStreamAction::Forward(_)
+    ));
+    assert!(matches!(
+        chain.on_end().await,
+        ResponseStreamAction::Terminate(_)
+    ));
+
+    plugin
+        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["capture_reason"], "guardrail");
+    assert!(
+        records[0].get("response_body").is_none(),
+        "pre-cut backend bytes must not be exported as client-visible stream data"
+    );
+    assert!(records[0].get("response_hash").is_none());
+    assert_eq!(records[0]["response_body_truncated"], true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1035,6 +1261,8 @@ async fn stream_capture_redacts_decoded_sse_json_frames() {
         .expect("inspector");
     let stream = br#"data: {"choices":[{"delta":{"content":"ssn 123\u002d45\u002d6789"}}]}
 
+data: provider-error jane.doe@example.com
+
 data: [DONE]
 
 "#;
@@ -1048,6 +1276,7 @@ data: [DONE]
     let excerpt = records[0]["response_body"].as_str().unwrap_or_default();
     assert!(!excerpt.contains("123-45-6789"), "{excerpt}");
     assert!(!excerpt.contains("123\\u002d45"), "{excerpt}");
+    assert!(!excerpt.contains("jane.doe@example.com"), "{excerpt}");
     assert!(excerpt.contains("[REDACTED"), "{excerpt}");
 }
 
