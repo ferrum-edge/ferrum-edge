@@ -9074,6 +9074,12 @@ async fn serve_mesh_runtime(
                 capture_config.host_netns = false;
                 capture_config.udp_outbound_port = settings.udp_outbound_port;
                 capture_config.tproxy_mark = settings.tproxy_mark;
+                // The sidecar default excludes (15001/15006/15008/15020) only make
+                // sense when a proxy is co-located in the pod netns. Ambient's
+                // producer runs inside workload pod netns with no sidecar, so an
+                // implicit exclude would let app UDP to those service ports bypass
+                // capture/authz. Explicit operator excludes are preserved.
+                capture_config.clear_implicit_exclude_ports();
                 // NO proxy-UID owner-match self-exclusion. That RETURN exists to
                 // skip the co-located SIDECAR's own egress; in Ambient the proxy is
                 // OUTSIDE the pod netns, so the only egress in the pod netns is the
@@ -9123,6 +9129,24 @@ async fn serve_mesh_runtime(
                     manager.run(manager_shutdown).await;
                 }));
             }
+        } else if cfg!(target_os = "linux") {
+            let source = Arc::new(crate::proxy::netns_capture::DirectoryCaptureSource::new(
+                env_config.mesh_node_waypoint_pod_registry_dir.clone(),
+            ));
+            let backend = crate::proxy::netns_udp_capture::ProxyNetnsUdpCleanupBackend::new(true);
+            let manager = crate::proxy::netns_udp_capture::NetnsUdpCleanupManager::new(
+                source,
+                backend,
+                std::time::Duration::from_secs(2),
+            );
+            let manager_shutdown = shutdown_tx.subscribe();
+            info!(
+                registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
+                "Ambient UDP capture disabled; stale per-pod-netns UDP cleanup manager enabled"
+            );
+            mesh_background_handles.push(tokio::spawn(async move {
+                manager.run(manager_shutdown).await;
+            }));
         }
     }
 

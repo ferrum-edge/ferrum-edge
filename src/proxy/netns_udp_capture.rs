@@ -110,6 +110,15 @@ pub trait NetnsUdpBackend: Send + Sync + 'static {
     ) -> Option<OpenedUdpCapture>;
 }
 
+/// Best-effort cleanup backend used when Ambient UDP capture is disabled. It
+/// removes stale Ferrum UDP TPROXY state from pod netns without opening sockets or
+/// installing rules.
+pub trait NetnsUdpCleanupBackend: Send + Sync + 'static {
+    fn netns_key(&self, target: &PodCaptureTarget) -> Result<u64, String>;
+
+    fn cleanup_udp_capture(&self, target: &PodCaptureTarget, expected_netns: u64) -> bool;
+}
+
 /// One active pod-netns UDP producer, keyed in the manager by netns inode.
 struct ActiveUdpCapture {
     handle: OpenedUdpCapture,
@@ -402,6 +411,131 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
     }
 }
 
+/// Reconciles enrolled pod netns and runs the UDP teardown exactly once per live
+/// netns. This is used when Ambient UDP capture is disabled so a pod that was
+/// left with stale `FERRUM_MESH_UDP_*` rules by a prior crashed/killed enabled
+/// proxy is cleaned without requiring UDP capture to be re-enabled.
+pub struct NetnsUdpCleanupManager<B: NetnsUdpCleanupBackend> {
+    source: Arc<dyn PodCaptureSource>,
+    backend: B,
+    poll_interval: Duration,
+    cleaned_netns: HashSet<u64>,
+    last_registry_uids: HashSet<String>,
+    unresolved_reasons: HashMap<String, String>,
+}
+
+impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
+    pub fn new(source: Arc<dyn PodCaptureSource>, backend: B, poll_interval: Duration) -> Self {
+        Self {
+            source,
+            backend,
+            poll_interval,
+            cleaned_netns: HashSet::new(),
+            last_registry_uids: HashSet::new(),
+            unresolved_reasons: HashMap::new(),
+        }
+    }
+
+    pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
+        info!(
+            poll_secs = self.poll_interval.as_secs_f64(),
+            "Ambient UDP disabled stale-rule cleanup manager started"
+        );
+        loop {
+            self.cleanup_once();
+            tokio::select! {
+                _ = tokio::time::sleep(self.poll_interval) => {}
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn cleanup_once(&mut self) -> usize {
+        let targets = self.source.list_targets();
+        let registry_uids: HashSet<String> = targets.iter().map(|t| t.pod_uid.clone()).collect();
+        if registry_uids != self.last_registry_uids {
+            info!(
+                target_count = registry_uids.len(),
+                pod_uids = ?registry_uids,
+                "Ambient UDP disabled cleanup registry changed"
+            );
+            self.last_registry_uids = registry_uids;
+        }
+
+        let mut desired: HashMap<u64, &PodCaptureTarget> = HashMap::new();
+        let mut unresolved_uids = HashSet::new();
+        for target in &targets {
+            match self.backend.netns_key(target) {
+                Ok(netns) => {
+                    if self.unresolved_reasons.remove(&target.pod_uid).is_some() {
+                        info!(
+                            pod_uid = %target.pod_uid,
+                            cgroup = %target.cgroup_path,
+                            netns_inode = netns,
+                            "Ambient UDP disabled cleanup: pod netns resolved after retry"
+                        );
+                    }
+                    desired.entry(netns).or_insert(target);
+                }
+                Err(error) => {
+                    unresolved_uids.insert(target.pod_uid.clone());
+                    let previous = self
+                        .unresolved_reasons
+                        .insert(target.pod_uid.clone(), error.clone());
+                    if previous.as_deref() == Some(error.as_str()) {
+                        debug!(
+                            pod_uid = %target.pod_uid,
+                            cgroup = %target.cgroup_path,
+                            %error,
+                            "Ambient UDP disabled cleanup: pod netns still not resolvable; will retry"
+                        );
+                    } else {
+                        warn!(
+                            pod_uid = %target.pod_uid,
+                            cgroup = %target.cgroup_path,
+                            %error,
+                            "Ambient UDP disabled cleanup: pod netns not resolvable; will retry"
+                        );
+                    }
+                }
+            }
+        }
+        self.unresolved_reasons
+            .retain(|uid, _| unresolved_uids.contains(uid));
+
+        let desired_netns: HashSet<u64> = desired.keys().copied().collect();
+        self.cleaned_netns
+            .retain(|netns| desired_netns.contains(netns));
+
+        let mut cleaned = 0;
+        for (netns, target) in desired {
+            if self.cleaned_netns.contains(&netns) {
+                continue;
+            }
+            if self.backend.cleanup_udp_capture(target, netns) {
+                self.cleaned_netns.insert(netns);
+                cleaned += 1;
+                info!(
+                    netns_inode = netns,
+                    pod_uid = %target.pod_uid,
+                    "Ambient UDP disabled cleanup: stale pod-netns UDP rules removed"
+                );
+            } else {
+                warn!(
+                    netns_inode = netns,
+                    pod_uid = %target.pod_uid,
+                    "Ambient UDP disabled cleanup failed; will retry"
+                );
+            }
+        }
+        cleaned
+    }
+}
+
 /// Preflight the external tools the Ambient UDP producer needs — a shell plus
 /// `ip` + `iptables` (and `ip6tables` when IPv6 UDP capture is REQUIRED) — before
 /// starting the manager. The producer runs `sh -c` scripts that call
@@ -417,11 +551,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
 /// Non-`cfg`-gated so the `cfg!(target_os = "linux")` runtime gate at the call
 /// site compiles on every platform; it only runs on Linux.
 pub(crate) fn preflight_capture_tools(require_ip6tables: bool) -> Result<(), String> {
-    let mut probe =
-        String::from("command -v ip >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1");
-    if require_ip6tables {
-        probe.push_str(" && command -v ip6tables >/dev/null 2>&1");
-    }
+    let probe = preflight_capture_tools_probe(require_ip6tables);
     let output = std::process::Command::new("sh")
         .arg("-c")
         .arg(&probe)
@@ -436,9 +566,10 @@ pub(crate) fn preflight_capture_tools(require_ip6tables: bool) -> Result<(), Str
         })?;
     if !output.status.success() {
         let tools = if require_ip6tables {
-            "`ip`, `iptables`, and `ip6tables` (IPv6 UDP capture is set to `required`)"
+            "`ip`, `iptables` with the mangle table, and `ip6tables` with the mangle table \
+             (IPv6 UDP capture is set to `required`)"
         } else {
-            "`ip` and/or `iptables`"
+            "`ip` and/or `iptables` with the mangle table"
         };
         return Err(format!(
             "Ambient UDP capture is enabled but {tools} are not available in the runtime image; \
@@ -450,6 +581,21 @@ pub(crate) fn preflight_capture_tools(require_ip6tables: bool) -> Result<(), Str
     Ok(())
 }
 
+fn preflight_capture_tools_probe(require_ip6tables: bool) -> String {
+    let wait = crate::capture::XTABLES_LOCK_WAIT_SECONDS;
+    let mut probe = format!(
+        "command -v ip >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1 && \
+         iptables -t mangle -w {wait} -L >/dev/null 2>&1"
+    );
+    if require_ip6tables {
+        probe.push_str(&format!(
+            " && command -v ip6tables >/dev/null 2>&1 && \
+             ip6tables -t mangle -w {wait} -L >/dev/null 2>&1"
+        ));
+    }
+    probe
+}
+
 /// Production backend: resolves each pod's netns from its cgroup, installs the
 /// UDP TPROXY rules + binds the transparent capture socket INSIDE that netns, and
 /// runs the shared capture loop with a pod-netns reply-socket factory.
@@ -457,7 +603,7 @@ pub struct ProxyNetnsUdpBackend {
     state: Arc<super::ProxyState>,
     capture_config: crate::capture::CaptureConfig,
     capture_port: u16,
-    max_sessions: usize,
+    session_limiter: Arc<super::mesh_udp_capture::MeshUdpSessionLimiter>,
     cleanup_interval_seconds: u64,
     recvmmsg_batch_size: usize,
     session_shard_amount: usize,
@@ -480,12 +626,124 @@ impl ProxyNetnsUdpBackend {
             state,
             capture_config,
             capture_port,
-            max_sessions,
+            session_limiter: Arc::new(super::mesh_udp_capture::MeshUdpSessionLimiter::new(
+                max_sessions,
+            )),
             cleanup_interval_seconds,
             recvmmsg_batch_size,
             session_shard_amount,
             global_shutdown,
         }
+    }
+}
+
+/// Production disabled-mode cleanup backend: resolve each enrolled pod netns and
+/// run the exact Ferrum UDP teardown there. No sockets are opened and no setup
+/// rules are installed.
+pub struct ProxyNetnsUdpCleanupBackend {
+    include_v6: bool,
+}
+
+impl ProxyNetnsUdpCleanupBackend {
+    pub fn new(include_v6: bool) -> Self {
+        Self { include_v6 }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
+    fn netns_key(&self, target: &PodCaptureTarget) -> Result<u64, String> {
+        super::netns_capture::netns_inode_for_cgroup(&target.cgroup_path).map_err(|e| e.to_string())
+    }
+
+    fn cleanup_udp_capture(&self, target: &PodCaptureTarget, expected_netns: u64) -> bool {
+        let netns = match super::netns_capture::open_pod_netns_handle(&target.cgroup_path) {
+            Ok(file) => file,
+            Err(error) => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    cgroup = %target.cgroup_path,
+                    %error,
+                    "Ambient UDP disabled cleanup: could not open pod netns handle"
+                );
+                return false;
+            }
+        };
+        let opened_netns = match netns
+            .metadata()
+            .map(|m| std::os::unix::fs::MetadataExt::ino(&m))
+        {
+            Ok(inode) => inode,
+            Err(error) => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    cgroup = %target.cgroup_path,
+                    %error,
+                    "Ambient UDP disabled cleanup: could not read opened pod netns identity"
+                );
+                return false;
+            }
+        };
+        if opened_netns != expected_netns {
+            warn!(
+                pod_uid = %target.pod_uid,
+                cgroup = %target.cgroup_path,
+                reconciled_netns_inode = expected_netns,
+                opened_netns_inode = opened_netns,
+                "Ambient UDP disabled cleanup: pod netns changed between reconcile and cleanup"
+            );
+            return false;
+        }
+        match super::netns_capture::host_netns_inode() {
+            Ok(host_ino) if opened_netns == host_ino => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    cgroup = %target.cgroup_path,
+                    netns_inode = opened_netns,
+                    "Ambient UDP disabled cleanup: target resolves to the host/proxy netns; \
+                     refusing to run pod UDP teardown in the node namespace"
+                );
+                return false;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    cgroup = %target.cgroup_path,
+                    %error,
+                    "Ambient UDP disabled cleanup: could not compare pod vs host netns identity"
+                );
+                return false;
+            }
+        }
+
+        let teardown_script = crate::capture::IptablesPlan::udp_teardown_script(self.include_v6);
+        match super::netns_capture::run_in_netns(&netns, move || run_shell_script(&teardown_script))
+        {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    netns_inode = opened_netns,
+                    %error,
+                    "Ambient UDP disabled cleanup: pod-netns UDP teardown failed"
+                );
+                false
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl NetnsUdpCleanupBackend for ProxyNetnsUdpCleanupBackend {
+    fn netns_key(&self, _target: &PodCaptureTarget) -> Result<u64, String> {
+        let _ = self.include_v6;
+        Err("Ambient UDP disabled cleanup is Linux-only".to_string())
+    }
+
+    fn cleanup_udp_capture(&self, _target: &PodCaptureTarget, _expected_netns: u64) -> bool {
+        let _ = self.include_v6;
+        false
     }
 }
 
@@ -660,10 +918,10 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         );
         let runtime = super::mesh_udp_capture::MeshUdpCaptureRuntime {
             state: self.state.clone(),
-            max_sessions: self.max_sessions,
             cleanup_interval_seconds: self.cleanup_interval_seconds,
             recvmmsg_batch_size: self.recvmmsg_batch_size,
             session_shard_amount: self.session_shard_amount,
+            session_limiter: self.session_limiter.clone(),
             reply_socket_factory,
         };
 
@@ -722,7 +980,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             &self.state,
             &self.capture_config,
             self.capture_port,
-            self.max_sessions,
+            &self.session_limiter,
             self.cleanup_interval_seconds,
             self.recvmmsg_batch_size,
             self.session_shard_amount,
@@ -908,6 +1166,38 @@ mod tests {
         }
     }
 
+    impl NetnsUdpCleanupBackend for MockBackend {
+        fn netns_key(&self, target: &PodCaptureTarget) -> Result<u64, String> {
+            match self
+                .netns_by_cgroup
+                .lock()
+                .unwrap()
+                .get(&target.cgroup_path)
+            {
+                Some(Some(netns)) => Ok(*netns),
+                _ => Err(format!("netns unresolved for {}", target.cgroup_path)),
+            }
+        }
+
+        fn cleanup_udp_capture(&self, target: &PodCaptureTarget, expected_netns: u64) -> bool {
+            let netns = *self
+                .netns_by_cgroup
+                .lock()
+                .unwrap()
+                .get(&target.cgroup_path)
+                .unwrap();
+            let Some(netns) = netns else {
+                return false;
+            };
+            if netns != expected_netns || self.fail_open.lock().unwrap().contains(&netns) {
+                return false;
+            }
+            self.closed.lock().unwrap().push(netns);
+            self.events.lock().unwrap().push(Event::TornDown(netns));
+            true
+        }
+    }
+
     struct StaticSource(Mutex<Vec<PodCaptureTarget>>);
     impl PodCaptureSource for StaticSource {
         fn list_targets(&self) -> Vec<PodCaptureTarget> {
@@ -937,6 +1227,13 @@ mod tests {
         backend: MockBackend,
     ) -> NetnsUdpCaptureManager<MockBackend> {
         NetnsUdpCaptureManager::new(15011, source, backend, Duration::from_secs(2))
+    }
+
+    fn cleanup_manager(
+        source: Arc<StaticSource>,
+        backend: MockBackend,
+    ) -> NetnsUdpCleanupManager<MockBackend> {
+        NetnsUdpCleanupManager::new(source, backend, Duration::from_secs(2))
     }
 
     #[tokio::test]
@@ -1148,6 +1445,62 @@ mod tests {
             *closed.lock().unwrap(),
             vec![100],
             "shutdown must drain the pending teardown of a closed-but-not-reopened producer"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_cleanup_reaps_each_netns_once_and_dedupes_shared_netns() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![
+            target("pod-a", "/cg/a"),
+            target("pod-b", "/cg/b"),
+            target("pod-c", "/cg/c"),
+        ])));
+        let backend = MockBackend::new(&[
+            ("/cg/a", Some(100)),
+            ("/cg/b", Some(100)),
+            ("/cg/c", Some(200)),
+        ]);
+        let cleaned = backend.closed.clone();
+        let mut mgr = cleanup_manager(source, backend);
+
+        assert_eq!(mgr.cleanup_once(), 2);
+        let mut got = cleaned.lock().unwrap().clone();
+        got.sort_unstable();
+        assert_eq!(got, vec![100, 200], "cleanup runs once per netns");
+
+        assert_eq!(mgr.cleanup_once(), 0, "already-cleaned netns are skipped");
+        let mut got = cleaned.lock().unwrap().clone();
+        got.sort_unstable();
+        assert_eq!(got, vec![100, 200]);
+    }
+
+    #[tokio::test]
+    async fn disabled_cleanup_retries_failed_netns_cleanup() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        backend.set_fail_open(100, true);
+        let cleaned = backend.closed.clone();
+        let mut mgr = cleanup_manager(source, backend);
+
+        assert_eq!(mgr.cleanup_once(), 0);
+        assert!(cleaned.lock().unwrap().is_empty());
+
+        mgr.backend.set_fail_open(100, false);
+        assert_eq!(mgr.cleanup_once(), 1);
+        assert_eq!(*cleaned.lock().unwrap(), vec![100]);
+    }
+
+    #[test]
+    fn preflight_probe_checks_required_ip6tables_mangle_table() {
+        let probe = preflight_capture_tools_probe(true);
+        assert!(probe.contains("command -v ip6tables"));
+        assert!(
+            probe.contains("ip6tables -t mangle"),
+            "IPv6 UDP preflight must probe the mangle table, not only the binary: {probe}"
+        );
+        assert!(
+            !probe.contains("ip6tables -t nat"),
+            "UDP preflight must not probe the nat table: {probe}"
         );
     }
 }

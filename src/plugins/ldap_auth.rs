@@ -436,7 +436,11 @@ impl LdapAuth {
                 .replace("{username}", &escape_filter_value(username));
 
             let (rs, _result) = ldap
-                .search(search_base, Scope::Subtree, &filter, vec!["dn"])
+                // The DN is part of every LDAP search result, not a regular
+                // attribute. Request no attributes; `SearchEntry::dn` still
+                // carries the bind target and avoids servers rejecting a
+                // pseudo-attribute request for "dn".
+                .search(search_base, Scope::Subtree, &filter, Vec::<&str>::new())
                 .await
                 .map_err(|e| AuthError::Backend(format!("ldap_auth: user search failed: {e}")))?
                 .success()

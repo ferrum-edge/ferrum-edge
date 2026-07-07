@@ -41,6 +41,53 @@ use std::net::SocketAddr as StdSocketAddr;
 
 use tokio::sync::watch;
 
+/// Process-local admission counter for captured UDP sessions.
+///
+/// Sidecar has one current-netns UDP producer, so its limiter is listener-local.
+/// Ambient starts one producer per pod netns; those producers must share a single
+/// limiter so `FERRUM_UDP_MAX_SESSIONS` remains a node-wide cap instead of being
+/// multiplied by the number of enrolled pods.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct MeshUdpSessionLimiter {
+    max_sessions: usize,
+    active_sessions: std::sync::atomic::AtomicU64,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl MeshUdpSessionLimiter {
+    pub(crate) fn new(max_sessions: usize) -> Self {
+        Self {
+            max_sessions,
+            active_sessions: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn try_reserve(&self) -> bool {
+        let prev = self
+            .active_sessions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if prev >= self.max_sessions as u64 {
+            self.active_sessions
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    fn release(&self, count: u64) {
+        if count > 0 {
+            self.active_sessions
+                .fetch_sub(count, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    fn active_count(&self) -> u64 {
+        self.active_sessions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 /// Configuration for the mesh UDP capture listener.
 pub struct MeshUdpCaptureConfig {
     /// Address+port to bind. The port is the Stage-2 TPROXY listener port
@@ -287,10 +334,10 @@ pub(crate) fn bind_mesh_udp_capture_socket(
 #[cfg(target_os = "linux")]
 pub(crate) struct MeshUdpCaptureRuntime {
     pub state: std::sync::Arc<super::ProxyState>,
-    pub max_sessions: usize,
     pub cleanup_interval_seconds: u64,
     pub recvmmsg_batch_size: usize,
     pub session_shard_amount: usize,
+    pub session_limiter: std::sync::Arc<MeshUdpSessionLimiter>,
     /// Builds each session's transparent reply socket in the SAME netns as the
     /// capture socket (current-netns for Sidecar, pod-netns for Ambient).
     pub reply_socket_factory: std::sync::Arc<dyn ReplySocketFactory>,
@@ -326,10 +373,10 @@ pub async fn start_mesh_udp_capture_listener(
         v6_origdst,
         MeshUdpCaptureRuntime {
             state,
-            max_sessions,
             cleanup_interval_seconds,
             recvmmsg_batch_size,
             session_shard_amount,
+            session_limiter: std::sync::Arc::new(MeshUdpSessionLimiter::new(max_sessions)),
             reply_socket_factory: std::sync::Arc::new(CurrentNetnsReplySocketFactory),
         },
         shutdown,
@@ -361,15 +408,14 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
 ) -> Result<(), anyhow::Error> {
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU64;
     use tracing::{info, warn};
 
     let MeshUdpCaptureRuntime {
         state,
-        max_sessions,
         cleanup_interval_seconds,
         recvmmsg_batch_size,
         session_shard_amount,
+        session_limiter,
         reply_socket_factory,
     } = runtime;
     let frontend_socket = Arc::new(frontend_socket);
@@ -382,14 +428,6 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
             ahash::RandomState::default(),
             session_shard_amount,
         ));
-    // Cheap atomic session count for the per-datagram cap check. The spoofed-
-    // source flood path hits a map miss for every new (client, orig-dst), so the
-    // cap MUST NOT call `DashMap::len()` there (it walks/locks every shard —
-    // exactly what the cap defends against). Mirror the plain UDP proxy's
-    // `active_sessions` atomic: bumped on insert, decremented as the idle sweep
-    // reaps (codex r3 P2).
-    let active_sessions = Arc::new(AtomicU64::new(0));
-
     if let Some(tx) = started_tx {
         let _ = tx.send(());
     }
@@ -406,7 +444,7 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
     // expiry, simplified (no backend leg / plugins in Stage 3).
     spawn_capture_session_cleanup(
         sessions.clone(),
-        active_sessions.clone(),
+        session_limiter.clone(),
         shutdown.clone(),
         cleanup_interval_seconds,
     );
@@ -466,12 +504,11 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                                         for chunk in data.chunks(seg as usize) {
                                             handle_captured_datagram(
                                                 &sessions,
-                                                &active_sessions,
+                                                &session_limiter,
                                                 &state,
                                                 client,
                                                 orig_dst,
                                                 chunk,
-                                                max_sessions,
                                                 &reply_socket_factory,
                                             );
                                         }
@@ -479,12 +516,11 @@ pub(crate) async fn run_mesh_udp_capture_on_socket(
                                     _ => {
                                         handle_captured_datagram(
                                             &sessions,
-                                            &active_sessions,
+                                            &session_limiter,
                                             &state,
                                             client,
                                             orig_dst,
                                             data,
-                                            max_sessions,
                                             &reply_socket_factory,
                                         );
                                     }
@@ -622,12 +658,11 @@ fn handle_captured_datagram(
     sessions: &std::sync::Arc<
         dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
     >,
-    active_sessions: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    session_limiter: &std::sync::Arc<MeshUdpSessionLimiter>,
     state: &std::sync::Arc<super::ProxyState>,
     client: SocketAddr,
     orig_dst: Option<SocketAddr>,
     data: &[u8],
-    max_sessions: usize,
     reply_factory: &std::sync::Arc<dyn ReplySocketFactory>,
 ) -> bool {
     use tracing::debug;
@@ -680,14 +715,7 @@ fn handle_captured_datagram(
         Some(entry)
     };
 
-    match admit_or_refresh_session(
-        sessions,
-        active_sessions,
-        key,
-        data,
-        max_sessions,
-        resolve_entry,
-    ) {
+    match admit_or_refresh_session(sessions, session_limiter, key, data, resolve_entry) {
         SessionAdmission::Refreshed => true,
         SessionAdmission::Admitted {
             entry,
@@ -711,7 +739,7 @@ fn handle_captured_datagram(
             spawn_udp_egress_session(
                 state.clone(),
                 sessions.clone(),
-                active_sessions.clone(),
+                session_limiter.clone(),
                 key,
                 session_id,
                 entry,
@@ -770,10 +798,9 @@ enum SessionAdmission {
 #[cfg(target_os = "linux")]
 fn admit_or_refresh_session<F>(
     sessions: &dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
-    active_sessions: &std::sync::atomic::AtomicU64,
+    session_limiter: &MeshUdpSessionLimiter,
     key: CaptureSessionKey,
     data: &[u8],
-    max_sessions: usize,
     resolve_entry: F,
 ) -> SessionAdmission
 where
@@ -810,9 +837,7 @@ where
             };
 
             // Reserve a slot atomically; hand it back and shed if over the cap.
-            let prev = active_sessions.fetch_add(1, Ordering::Relaxed);
-            if prev >= max_sessions as u64 {
-                active_sessions.fetch_sub(1, Ordering::Relaxed);
+            if !session_limiter.try_reserve() {
                 debug!(
                     client = %key.client,
                     orig_dst = %key.orig_dst,
@@ -920,7 +945,7 @@ fn spawn_udp_egress_session(
     sessions: std::sync::Arc<
         dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
     >,
-    active_sessions: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    session_limiter: std::sync::Arc<MeshUdpSessionLimiter>,
     key: CaptureSessionKey,
     session_id: u64,
     entry: std::sync::Arc<crate::router_cache::MeshTcpEgressEntry>,
@@ -947,7 +972,7 @@ fn spawn_udp_egress_session(
         // backstop for sessions whose task is still alive but quiescent).
         //
         // CONDITIONAL removal (codex r1 P2): see [`remove_session_if_owned`].
-        remove_session_if_owned(&sessions, &active_sessions, &key, session_id);
+        remove_session_if_owned(&sessions, &session_limiter, &key, session_id);
     });
 }
 
@@ -965,7 +990,7 @@ fn spawn_udp_egress_session(
 #[cfg(target_os = "linux")]
 fn remove_session_if_owned(
     sessions: &dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
-    active_sessions: &std::sync::atomic::AtomicU64,
+    session_limiter: &MeshUdpSessionLimiter,
     key: &CaptureSessionKey,
     session_id: u64,
 ) {
@@ -975,7 +1000,7 @@ fn remove_session_if_owned(
         .remove_if(key, |_, session| session.session_id == session_id)
         .is_some()
     {
-        active_sessions.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        session_limiter.release(1);
     }
 }
 
@@ -1483,7 +1508,7 @@ fn spawn_capture_session_cleanup(
     sessions: std::sync::Arc<
         dashmap::DashMap<CaptureSessionKey, CaptureSession, ahash::RandomState>,
     >,
-    active_sessions: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    session_limiter: std::sync::Arc<MeshUdpSessionLimiter>,
     mut shutdown: watch::Receiver<bool>,
     cleanup_interval_seconds: u64,
 ) {
@@ -1523,9 +1548,7 @@ fn spawn_capture_session_cleanup(
                         }
                         keep
                     });
-                    if reaped > 0 {
-                        active_sessions.fetch_sub(reaped, Ordering::Relaxed);
-                    }
+                    session_limiter.release(reaped);
                 }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
@@ -1732,24 +1755,23 @@ listen_port: 15011
         // A captured datagram whose orig-dst matches no mesh UDP destination is
         // dropped: no session, no slot consumed (fail closed).
         let sessions = new_sessions(0);
-        let active = std::sync::atomic::AtomicU64::new(0);
+        let limiter = MeshUdpSessionLimiter::new(1000);
         let outcome = admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.5:40000", "1.1.1.1:53"),
             b"q",
-            1000,
             unroutable,
         );
         assert!(matches!(outcome, SessionAdmission::Dropped));
         assert_eq!(sessions.len(), 0);
-        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(limiter.active_count(), 0);
     }
 
     #[test]
     fn session_keyed_by_client_and_origdst() {
         let sessions = new_sessions(0);
-        let active = std::sync::atomic::AtomicU64::new(0);
+        let limiter = MeshUdpSessionLimiter::new(1000);
         // Hold the receivers so refreshes' channel sends don't fail (irrelevant
         // to the keying assertions, but keeps the sessions' channels open).
         let mut keepalive = Vec::new();
@@ -1758,10 +1780,9 @@ listen_port: 15011
         for dst in ["10.96.0.10:53", "10.96.0.11:53"] {
             match admit_or_refresh_session(
                 &sessions,
-                &active,
+                &limiter,
                 key("10.0.0.5:40000", dst),
                 b"x",
-                1000,
                 routable,
             ) {
                 SessionAdmission::Admitted { rx, .. } => keepalive.push(rx),
@@ -1774,10 +1795,9 @@ listen_port: 15011
         // session.
         let outcome = admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.5:40000", "10.96.0.10:53"),
             b"x",
-            1000,
             routable,
         );
         assert!(matches!(outcome, SessionAdmission::Refreshed));
@@ -1786,10 +1806,9 @@ listen_port: 15011
         // A different client to the same dst is a distinct session.
         match admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.6:50000", "10.96.0.10:53"),
             b"x",
-            1000,
             routable,
         ) {
             SessionAdmission::Admitted { rx, .. } => keepalive.push(rx),
@@ -1804,13 +1823,12 @@ listen_port: 15011
         // the DashMap (`len()`) while an entry guard is held — a plain return
         // here is the proof it no longer nests map ops under a guard.
         let sessions = new_sessions(0);
-        let active = std::sync::atomic::AtomicU64::new(0);
+        let limiter = MeshUdpSessionLimiter::new(64);
         let outcome = admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.5:40000", "10.96.0.10:53"),
             b"x",
-            64,
             routable,
         );
         assert!(matches!(outcome, SessionAdmission::Admitted { .. }));
@@ -1820,15 +1838,14 @@ listen_port: 15011
     #[test]
     fn session_cap_sheds_new_flows_but_serves_existing() {
         let sessions = new_sessions(0);
-        let active = std::sync::atomic::AtomicU64::new(0);
+        let limiter = MeshUdpSessionLimiter::new(1);
 
         // Cap of 1: first new flow admitted.
         let first = admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.5:40000", "10.96.0.10:53"),
             b"x",
-            1,
             routable,
         );
         let _rx = match first {
@@ -1840,10 +1857,9 @@ listen_port: 15011
         // Second NEW flow is shed at the cap.
         let second = admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.6:40000", "10.96.0.10:53"),
             b"x",
-            1,
             routable,
         );
         assert!(matches!(second, SessionAdmission::Dropped));
@@ -1852,14 +1868,48 @@ listen_port: 15011
         // The already-admitted flow is still served (refresh), even at the cap.
         let refreshed = admit_or_refresh_session(
             &sessions,
-            &active,
+            &limiter,
             key("10.0.0.5:40000", "10.96.0.10:53"),
             b"x",
-            1,
             routable,
         );
         assert!(matches!(refreshed, SessionAdmission::Refreshed));
         assert_eq!(sessions.len(), 1);
+    }
+
+    #[test]
+    fn shared_limiter_caps_sessions_across_producers() {
+        // Ambient runs one capture loop per pod netns, each with its own session
+        // map. The limiter is the shared node-wide cap: a flow admitted by one
+        // producer must consume the only slot and shed a new flow in another.
+        let producer_a = new_sessions(0);
+        let producer_b = new_sessions(0);
+        let limiter = MeshUdpSessionLimiter::new(1);
+
+        let first = admit_or_refresh_session(
+            &producer_a,
+            &limiter,
+            key("10.0.0.5:40000", "10.96.0.10:53"),
+            b"x",
+            routable,
+        );
+        let _rx = match first {
+            SessionAdmission::Admitted { rx, .. } => rx,
+            other => panic!("expected Admitted, got {}", admission_name(&other)),
+        };
+
+        let second = admit_or_refresh_session(
+            &producer_b,
+            &limiter,
+            key("10.0.0.6:40000", "10.96.0.10:53"),
+            b"x",
+            routable,
+        );
+
+        assert!(matches!(second, SessionAdmission::Dropped));
+        assert_eq!(producer_a.len(), 1);
+        assert_eq!(producer_b.len(), 0);
+        assert_eq!(limiter.active_count(), 1);
     }
 
     #[test]
@@ -1925,20 +1975,20 @@ listen_port: 15011
         // must stamp DISTINCT session_ids, so a teardown carrying the old token
         // can be told apart from the replacement.
         let sessions = new_sessions(0);
-        let active = std::sync::atomic::AtomicU64::new(0);
+        let limiter = MeshUdpSessionLimiter::new(1000);
         let k = key("10.0.0.5:40000", "10.96.0.10:53");
 
         let (first_id, _rx1) =
-            match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+            match admit_or_refresh_session(&sessions, &limiter, k, b"x", routable) {
                 SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
                 other => panic!("expected Admitted, got {}", admission_name(&other)),
             };
         // Simulate the idle sweep reaping the first session.
         sessions.remove(&k);
-        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        limiter.release(1);
 
         let (second_id, _rx2) =
-            match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+            match admit_or_refresh_session(&sessions, &limiter, k, b"x", routable) {
                 SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
                 other => panic!("expected Admitted, got {}", admission_name(&other)),
             };
@@ -1952,44 +2002,43 @@ listen_port: 15011
         // session that reused the same (client, orig-dst) key, and must NOT
         // decrement the cap counter for it.
         let sessions = new_sessions(0);
-        let active = std::sync::atomic::AtomicU64::new(0);
+        let limiter = MeshUdpSessionLimiter::new(1000);
         let k = key("10.0.0.5:40000", "10.96.0.10:53");
 
         // Admit the original (session_id A), then simulate the idle sweep
         // reaping it (drop entry + decrement), exactly as the sweep would.
-        let old_id = match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
+        let old_id = match admit_or_refresh_session(&sessions, &limiter, k, b"x", routable) {
             SessionAdmission::Admitted { session_id, .. } => session_id,
             other => panic!("expected Admitted, got {}", admission_name(&other)),
         };
         sessions.remove(&k);
-        active.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        limiter.release(1);
+        assert_eq!(limiter.active_count(), 0);
 
         // A new datagram on the same key admits a REPLACEMENT (session_id B).
-        let (new_id, _rx) =
-            match admit_or_refresh_session(&sessions, &active, k, b"x", 1000, routable) {
-                SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
-                other => panic!("expected Admitted, got {}", admission_name(&other)),
-            };
+        let (new_id, _rx) = match admit_or_refresh_session(&sessions, &limiter, k, b"x", routable) {
+            SessionAdmission::Admitted { session_id, rx, .. } => (session_id, rx),
+            other => panic!("expected Admitted, got {}", admission_name(&other)),
+        };
         assert_ne!(old_id, new_id);
         assert_eq!(sessions.len(), 1);
-        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(limiter.active_count(), 1);
 
         // The OLD task finally runs its teardown with the stale token: it must be
         // a no-op (replacement survives, counter unchanged).
-        remove_session_if_owned(&sessions, &active, &k, old_id);
+        remove_session_if_owned(&sessions, &limiter, &k, old_id);
         assert_eq!(sessions.len(), 1, "replacement session must survive");
         assert_eq!(
-            active.load(std::sync::atomic::Ordering::Relaxed),
+            limiter.active_count(),
             1,
             "cap counter must not be decremented for the replacement"
         );
 
         // The replacement's OWN teardown (matching token) removes it and frees
         // the slot.
-        remove_session_if_owned(&sessions, &active, &k, new_id);
+        remove_session_if_owned(&sessions, &limiter, &k, new_id);
         assert_eq!(sessions.len(), 0);
-        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(limiter.active_count(), 0);
     }
 
     #[test]

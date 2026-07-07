@@ -193,6 +193,11 @@ pub struct CaptureConfig {
     pub include_outbound_ports: Vec<u16>,
     pub exclude_cidrs: Vec<String>,
     pub exclude_ports: Vec<u16>,
+    /// True when `exclude_ports` came from operator configuration rather than the
+    /// implicit sidecar defaults. Ambient per-pod UDP capture runs inside workload
+    /// netns with no co-located sidecar, so it must drop the implicit sidecar port
+    /// excludes while preserving explicit operator exclusions.
+    pub exclude_ports_explicit: bool,
     /// TCP destination ports excluded from the inbound capture chain. Each
     /// listed port emits a `RETURN` rule placed BEFORE the inbound REDIRECT,
     /// so traffic to the port bypasses the mesh sidecar entirely.
@@ -277,6 +282,7 @@ impl CaptureConfig {
             include_outbound_ports: Vec::new(),
             exclude_cidrs: Vec::new(),
             exclude_ports: Vec::new(),
+            exclude_ports_explicit: false,
             exclude_inbound_ports: Vec::new(),
             ip6tables_mode: Ip6TablesMode::Auto,
             udp_capture_enabled: false,
@@ -308,9 +314,10 @@ impl CaptureConfig {
         if !exclude_cidrs.is_empty() {
             validate_cidr_list(&exclude_cidrs)?;
         }
+        let exclude_ports_raw = resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_PORTS");
+        let exclude_ports_explicit = exclude_ports_raw.is_some();
         let exclude_ports = parse_port_list(
-            &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_PORTS")
-                .unwrap_or_else(|| "15001,15006,15008,15020".to_string()),
+            &exclude_ports_raw.unwrap_or_else(|| "15001,15006,15008,15020".to_string()),
         )?;
         let exclude_inbound_ports = parse_port_list(
             &resolve_ferrum_var("FERRUM_MESH_CAPTURE_EXCLUDE_INBOUND_PORTS").unwrap_or_default(),
@@ -336,6 +343,7 @@ impl CaptureConfig {
             include_outbound_ports: Vec::new(),
             exclude_cidrs,
             exclude_ports,
+            exclude_ports_explicit,
             exclude_inbound_ports,
             ip6tables_mode,
             udp_capture_enabled,
@@ -353,6 +361,13 @@ impl CaptureConfig {
     pub fn ensure_exclude_port(&mut self, port: u16) {
         if !self.exclude_ports.contains(&port) {
             self.exclude_ports.push(port);
+        }
+        self.exclude_ports_explicit = true;
+    }
+
+    pub fn clear_implicit_exclude_ports(&mut self) {
+        if !self.exclude_ports_explicit {
+            self.exclude_ports.clear();
         }
     }
 }
@@ -676,6 +691,7 @@ impl IptablesPlan {
     /// (the latter via `udp_tproxy_commands_for_family`'s host-netns
     /// suppression, preserving the "no host-netns UDP rules" invariant even
     /// though the producer never runs in host netns).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn udp_only_for_config(config: &CaptureConfig) -> Self {
         if !config.udp_capture_enabled {
             return Self {
@@ -869,6 +885,7 @@ impl IptablesPlan {
     /// live), NOT `nat` — a host with `mangle` but no `nat` table must still run
     /// the UDP v6 rules. Empty (`""`) when UDP capture is off, `host_netns` is
     /// set, or no family emitted rules.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn udp_setup_script(config: &CaptureConfig) -> String {
         let plan = Self::udp_only_for_config(config);
         if plan.v4_commands.is_empty() && plan.v6_commands.is_empty() {
@@ -894,6 +911,7 @@ impl IptablesPlan {
     /// teardown. The raw `ip`/`ip -6` routing teardown is emitted unconditionally
     /// (it does not depend on `ip6tables`); only the `ip6tables`-TABLE teardown is
     /// guarded behind an `ip6tables` (`mangle`) availability probe.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn udp_teardown_script(include_v6: bool) -> String {
         let v4 = Self::udp_teardown_split();
         let mut chunks: Vec<String> = Vec::new();
@@ -1734,6 +1752,7 @@ fn iptables_script(
 /// A host with `mangle` support but no `nat` table must still run the UDP v6
 /// rules — probing `nat` would wrongly skip them. Used by
 /// [`IptablesPlan::udp_setup_script`] for the Ambient per-pod-netns producer.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn udp_iptables_script(
     v4_commands: &[String],
     v6_commands: &[String],
@@ -1787,6 +1806,7 @@ pub(crate) fn ip6tables_probe_guard(cmd: &str, table: &str) -> String {
 /// CIDRs to that family exactly like [`commands_for_family`] before delegating
 /// to the shared `udp_tproxy_commands_for_family`. This is what keeps the
 /// Ambient producer's UDP rules byte-identical to the injector's UDP rules.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn udp_only_commands_for_family(config: &CaptureConfig, family: CidrFamily) -> Vec<String> {
     let binary = match family {
         CidrFamily::V4 => "iptables",
@@ -2784,6 +2804,28 @@ mod tests {
             let config = CaptureConfig::from_env().expect("config");
             assert!(config.exclude_inbound_ports.is_empty());
             assert_eq!(config.ip6tables_mode, Ip6TablesMode::Auto);
+        });
+    }
+
+    #[test]
+    fn from_env_marks_default_exclude_ports_as_implicit() {
+        with_capture_env(&[], || {
+            let mut config = CaptureConfig::from_env().expect("config");
+            assert_eq!(config.exclude_ports, vec![15001, 15006, 15008, 15020]);
+            assert!(!config.exclude_ports_explicit);
+            config.clear_implicit_exclude_ports();
+            assert!(config.exclude_ports.is_empty());
+        });
+    }
+
+    #[test]
+    fn from_env_preserves_explicit_exclude_ports_for_ambient_udp() {
+        with_capture_env(&[("FERRUM_MESH_CAPTURE_EXCLUDE_PORTS", "53,123")], || {
+            let mut config = CaptureConfig::from_env().expect("config");
+            assert_eq!(config.exclude_ports, vec![53, 123]);
+            assert!(config.exclude_ports_explicit);
+            config.clear_implicit_exclude_ports();
+            assert_eq!(config.exclude_ports, vec![53, 123]);
         });
     }
 
