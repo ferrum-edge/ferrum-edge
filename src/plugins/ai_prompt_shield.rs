@@ -851,7 +851,7 @@ impl Plugin for AiPromptShield {
                 // `ctx.metadata["request_body"]`. Downstream `before_proxy`
                 // plugins read the buffered body from that metadata key
                 // and act on its contents — most importantly,
-                // `ai_federation` (priority 2985) consumes the body as-is
+                // `ai_federation` (priority 4060) consumes the body as-is
                 // to dispatch a direct provider request and then returns
                 // `RejectBinary`. `RejectBinary` short-circuits the
                 // backend dispatch path entirely, so

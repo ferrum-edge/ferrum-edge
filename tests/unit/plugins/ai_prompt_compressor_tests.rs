@@ -80,6 +80,14 @@ fn plugin_metadata_matches_registration() {
     let plugin = AiPromptCompressor::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "ai_prompt_compressor");
     assert_eq!(plugin.priority(), priority::AI_PROMPT_COMPRESSOR);
+    assert!(
+        plugin.priority() > priority::COMPRESSION,
+        "request decompression must run before prompt compression"
+    );
+    assert!(
+        plugin.priority() < priority::AI_FEDERATION,
+        "federated direct dispatch must see plaintext prompt compression metadata"
+    );
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(plugin.modifies_request_body());
     assert!(plugin.requires_request_body_buffering());
@@ -110,6 +118,8 @@ fn invalid_configs_rejected() {
         json!({"max_scan_bytes": 0}),
         json!({"max_scan_bytes": "1024"}),
         json!({"preserve_tag": ""}),
+        json!({"preserve_tag": " keep"}),
+        json!({"preserve_tag": "keep "}),
         json!({"preserve_tag": "bad tag"}),
         json!({"preserve_tag": "no/slash"}),
     ] {
@@ -532,6 +542,28 @@ async fn urls_wrapped_in_punctuation_are_preserved() {
     assert!(
         compressed.contains("https://example.com/ref/two"),
         "angle-bracketed URL must be preserved: {compressed:?}"
+    );
+}
+
+#[tokio::test]
+async fn mixed_case_url_schemes_are_preserved() {
+    let plugin = compressor(5, 0.3);
+    let content = "Please read the cited references very carefully before answering \
+         because they contain the authoritative details, for example \
+         HTTPS://example.com/ref/one and also <HtTp://example.com/ref/two> which \
+         must both survive even under an aggressive compression ratio setting."
+        .to_string();
+    let body = chat_body("user", &content);
+    let out = transform(&plugin, &body).await.expect("should compress");
+    let compressed = first_message_content(&out);
+
+    assert!(
+        compressed.contains("HTTPS://example.com/ref/one"),
+        "uppercase URL scheme must be preserved: {compressed:?}"
+    );
+    assert!(
+        compressed.contains("HtTp://example.com/ref/two"),
+        "mixed-case wrapped URL scheme must be preserved: {compressed:?}"
     );
 }
 

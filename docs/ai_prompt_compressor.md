@@ -6,8 +6,7 @@ rewrites the prompt-bearing fields of an OpenAI-shaped chat/completions request
 body, replacing long content strings with shorter, statistically filtered
 versions before the request is forwarded upstream.
 
-- **Priority:** `2983` (Admission band, right after `ai_semantic_cache` and just
-  before `ai_federation`).
+- **Priority:** `4055` (Response band, immediately after `compression`).
 - **Protocols:** HTTP only. Native gRPC wire frames are not compressed.
 - **Hooks:** `before_proxy`, `transform_request_body`.
 - **Failure policy:** `KeepLastKnownGood` — a bad config is rejected at
@@ -108,30 +107,34 @@ compressing the surrounding instructions and context.
 
 ## Ordering and interactions
 
-The priority (`2983`) places the compressor **after** the AI security and policy
-plugins so they inspect the original, uncompressed prompt:
+The priority (`4055`) places the compressor **after** the AI security and policy
+plugins and after `compression` request decompression:
 
 - `ai_prompt_shield` (2925), `ai_semantic_firewall` (2968), and
   `ai_request_guard` (2975) see the original content — compression never blinds
   PII detection, prompt-injection detection, or request validation.
 - `ai_semantic_cache` (2980) computes its cache key from the original prompt, so
   cache hit rates are unaffected.
-- `ai_federation` (2985) runs **after** the compressor. The compressor rewrites
-  `ctx.metadata["request_body"]` in `before_proxy`, so when federation dispatches
-  directly to a provider it forwards the compressed prompt.
+- `compression` (4050) can decode opt-in gzip/brotli request bodies before the
+  compressor rewrites the standard backend-dispatch body.
 
 On the standard backend-dispatch path, `transform_request_body` produces the
 compressed bytes actually sent upstream (this hook, not the metadata copy, is
 authoritative for the wire and is the only hook the HTTP/3 cross-protocol path
-invokes). Compression is deterministic, so both paths agree.
+invokes). For already-plaintext JSON uploads, `before_proxy` also rewrites
+`ctx.metadata["request_body"]` so direct dispatchers that consume that metadata
+can forward the compressed prompt. Compressed client uploads cannot be compressed
+for direct `ai_federation` dispatch because federation returns before
+request-body transforms run; use the standard backend-dispatch path for that
+combination.
 
 If `ai_prompt_shield` is redacting, the compressor operates on the already
 redacted text, so redaction is preserved and then compressed.
 
 ## Observability
 
-When compression reduces the token estimate, the plugin records log-safe counters
-on the request context, which flow into transaction summaries:
+When compression rewrites a field, the plugin records log-safe counters on the
+request context, which flow into transaction summaries:
 
 - `ai_prompt_compressor.original_tokens`
 - `ai_prompt_compressor.compressed_tokens`

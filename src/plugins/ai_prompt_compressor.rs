@@ -35,9 +35,8 @@
 //!
 //! * `before_proxy` compresses the buffered body and rewrites
 //!   `ctx.metadata["request_body"]` so any later `before_proxy` consumer that
-//!   dispatches directly from that metadata (notably `ai_federation`, priority
-//!   2985) sends the compressed prompt. It also records `ai_prompt_compressor.*`
-//!   observability metadata.
+//!   dispatches directly from that metadata sends the compressed prompt. It also
+//!   records `ai_prompt_compressor.*` observability metadata.
 //! * `transform_request_body` (and its context-aware variant) re-derive the
 //!   compressed body for the wire on the standard backend-dispatch path — this
 //!   hook, not the metadata copy, produces the bytes actually sent upstream.
@@ -88,7 +87,7 @@ struct CompressionStats {
 
 impl CompressionStats {
     fn changed(&self) -> bool {
-        self.fields_compressed > 0 && self.compressed_tokens < self.original_tokens
+        self.fields_compressed > 0
     }
 }
 
@@ -154,7 +153,13 @@ impl AiPromptCompressor {
 
         let preserve_tags = match optional_string(config, "preserve_tag")? {
             Some(tag) => {
-                let tag = tag.trim();
+                if tag.trim() != tag {
+                    return Err(
+                        "ai_prompt_compressor: 'preserve_tag' must not contain leading or \
+                         trailing whitespace"
+                            .to_string(),
+                    );
+                }
                 if tag.is_empty()
                     || !tag
                         .chars()
@@ -776,7 +781,7 @@ fn tokenize(text: &str) -> Vec<Token<'_>> {
             continue;
         }
         // URL: keep intact so paths/query strings are never mangled.
-        if rest.starts_with("http://") || rest.starts_with("https://") {
+        if starts_with_http_url(rest) {
             let end = scan_to_whitespace(bytes, start);
             push_verbatim(&mut tokens, &text[start..end], had_newline);
             i = end;
@@ -828,7 +833,22 @@ fn push_verbatim<'a>(tokens: &mut Vec<Token<'a>>, text: &'a str, leading_newline
 /// True when `s` embeds an `http(s)://` URL, including when it is wrapped in
 /// punctuation such as `(https://…)` or `<https://…>`.
 fn contains_url(s: &str) -> bool {
-    s.contains("http://") || s.contains("https://")
+    s.as_bytes()
+        .windows(b"http://".len())
+        .any(|window| window.eq_ignore_ascii_case(b"http://"))
+        || s.as_bytes()
+            .windows(b"https://".len())
+            .any(|window| window.eq_ignore_ascii_case(b"https://"))
+}
+
+fn starts_with_http_url(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes
+        .get(..b"http://".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"http://"))
+        || bytes
+            .get(..b"https://".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"https://"))
 }
 
 /// A word whose form should never be split or dropped: contains a digit, is an
