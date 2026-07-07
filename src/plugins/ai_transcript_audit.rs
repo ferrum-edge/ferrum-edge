@@ -8,15 +8,16 @@
 //! queue. Unless the operator opts into a fail-closed policy (`on_buffer_full`
 //! /`on_sink_error` = `reject`) the plugin never blocks or rejects traffic.
 //!
-//! Runs at priority `AI_TRANSCRIPT_AUDIT` (2979): after `ai_request_guard`
-//! (2975) so request-guard defaults/transforms are visible, and before
-//! `ai_semantic_cache` (2980) / `ai_federation` (2985) so cache hits and
-//! federated requests are still observable. The audit candidate is staged in
-//! `before_proxy` over the prebuffered request body (so terminate-and-respond
-//! plugins downstream cannot consume the transaction unaudited, and so the
-//! proxy's response buffering / dispatch decisions can see the candidate
-//! markers), then refreshed with the final backend-visible body in
-//! `on_final_request_body_with_context` after request transforms ran.
+//! Runs at priority `AI_TRANSCRIPT_AUDIT` (2924): before reject-capable AI
+//! guardrails so blocked prompts can still be staged for
+//! `always_capture_on_guardrail`, and before `ai_semantic_cache` (2980) /
+//! `ai_federation` (2985) so cache hits and federated requests are still
+//! observable. The audit candidate is staged in `before_proxy` over the
+//! prebuffered request body (so terminate-and-respond plugins downstream cannot
+//! consume the transaction unaudited, and so the proxy's response buffering /
+//! dispatch decisions can see the candidate markers), then refreshed with the
+//! final backend-visible body in `on_final_request_body_with_context` after
+//! request redaction/transforms ran.
 //!
 //! This plugin is **not** a security boundary on its own — it observes and
 //! redacts, it does not enforce. Pair it with `ai_prompt_shield`,
@@ -169,6 +170,7 @@ struct PrivacyConfig {
 /// body — only the redacted/capped excerpt (bounded by `max_request_bytes`).
 struct AuditStaging {
     captured_at: Instant,
+    sample_hit: bool,
     request_excerpt: Option<String>,
     request_truncated: bool,
     request_hash: Option<String>,
@@ -629,19 +631,27 @@ impl AiTranscriptAudit {
     /// content-type.
     fn stage_candidate(&self, ctx: &mut RequestContext, body: &[u8]) {
         if body.is_empty() {
-            ctx.metadata
-                .insert(MD_CANDIDATE.to_string(), "false".to_string());
+            if !flag(&ctx.metadata, MD_CANDIDATE) {
+                ctx.metadata
+                    .insert(MD_CANDIDATE.to_string(), "false".to_string());
+            }
             return;
         }
         let parsed: Option<Value> = serde_json::from_slice(body).ok();
         let is_ai = parsed.as_ref().is_some_and(json_looks_like_ai_request);
         if !is_ai {
-            ctx.metadata
-                .insert(MD_CANDIDATE.to_string(), "false".to_string());
+            if !flag(&ctx.metadata, MD_CANDIDATE) {
+                ctx.metadata
+                    .insert(MD_CANDIDATE.to_string(), "false".to_string());
+            }
             return;
         }
 
-        let record_id = uuid::Uuid::new_v4().to_string();
+        let record_id = ctx
+            .metadata
+            .get(MD_RECORD_ID)
+            .cloned()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
         let request_hash = sha256_hex(body);
 
@@ -690,6 +700,7 @@ impl AiTranscriptAudit {
             record_id,
             AuditStaging {
                 captured_at: Instant::now(),
+                sample_hit,
                 request_excerpt,
                 request_truncated,
                 request_hash: Some(request_hash),
@@ -961,14 +972,13 @@ impl Plugin for AiTranscriptAudit {
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
-        _headers: &mut HashMap<String, String>,
+        headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.active || ctx.metadata.contains_key(MD_CANDIDATE) {
+        if !self.active {
             return PluginResult::Continue;
         }
         let candidate_shape = ctx.method == "POST"
-            && ctx
-                .headers
+            && headers
                 .get("content-type")
                 .is_some_and(|content_type| is_json_content_type(content_type));
         if !candidate_shape {
@@ -1004,16 +1014,14 @@ impl Plugin for AiTranscriptAudit {
             return PluginResult::Continue;
         }
         match ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
-            // Already classified as a non-candidate in `before_proxy`.
-            Some("false") => return PluginResult::Continue,
             // Staged in `before_proxy`: request transforms may have changed
             // the body since, so refresh the captured hash/excerpt with the
             // final backend-visible bytes.
-            Some(_) => {
+            Some("true") => {
                 self.refresh_staged_request(ctx, body);
                 return PluginResult::Continue;
             }
-            None => {}
+            _ => {}
         }
         // Fallback for paths where the body was not available before
         // `before_proxy` (e.g. non-UTF-8 metadata skip above).
@@ -1078,7 +1086,11 @@ impl Plugin for AiTranscriptAudit {
         let (response_excerpt, response_truncated) =
             self.shape_body(body, self.limits.max_response_bytes);
 
-        let sample_hit = flag(&ctx.metadata, MD_SAMPLE_HIT);
+        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
+        let sample_hit = staging
+            .as_ref()
+            .map(|staging| staging.sample_hit)
+            .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
         let (emit, reason) = self.emit_decision(
             sample_hit,
             guardrail_fired(&ctx.metadata),
@@ -1089,7 +1101,6 @@ impl Plugin for AiTranscriptAudit {
             .insert(MD_RESPONSE_HASH.to_string(), response_hash.clone());
         ctx.metadata.insert(MD_SAMPLED.to_string(), bool_str(emit));
 
-        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
         if !emit {
             ctx.metadata
                 .insert(MD_SINK_STATUS.to_string(), "skipped".to_string());
@@ -1201,7 +1212,10 @@ impl Plugin for AiTranscriptAudit {
         let captured = slot.captured.lock().ok().and_then(|mut guard| guard.take());
         let staging = self.staging.remove(&record_id).map(|(_, value)| value);
 
-        let sample_hit = flag(&ctx.metadata, MD_SAMPLE_HIT);
+        let sample_hit = staging
+            .as_ref()
+            .map(|staging| staging.sample_hit)
+            .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
         let errored = response_status >= 400 || !outcome.body_completed;
         let (emit, reason) =
             self.emit_decision(sample_hit, guardrail_fired(&ctx.metadata), errored);
@@ -1252,7 +1266,7 @@ impl Plugin for AiTranscriptAudit {
             return;
         };
 
-        let sample_hit = flag(&summary.metadata, MD_SAMPLE_HIT);
+        let sample_hit = staging.sample_hit;
         let errored = summary.response_status_code >= 400;
         let (emit, reason) =
             self.emit_decision(sample_hit, guardrail_fired(&summary.metadata), errored);
@@ -1394,7 +1408,7 @@ fn shape_bytes(
     }
     let mut truncated = raw.len() > max_bytes;
     let shaped = if mode.redacts_body() {
-        redactor.redact(&String::from_utf8_lossy(raw))
+        redact_body_decoded_json_strings(redactor, raw)
     } else {
         String::from_utf8_lossy(&raw[..raw.len().min(max_bytes)]).into_owned()
     };
@@ -1405,6 +1419,35 @@ fn shape_bytes(
         shaped
     };
     (Some(shaped), truncated)
+}
+
+fn redact_body_decoded_json_strings(redactor: &PiiRedactor, raw: &[u8]) -> String {
+    if let Ok(mut json) = serde_json::from_slice::<Value>(raw) {
+        redact_json_value_strings(redactor, &mut json);
+        serde_json::to_string(&json)
+            .unwrap_or_else(|_| redactor.redact(&String::from_utf8_lossy(raw)))
+    } else {
+        redactor.redact(&String::from_utf8_lossy(raw))
+    }
+}
+
+fn redact_json_value_strings(redactor: &PiiRedactor, value: &mut Value) {
+    match value {
+        Value::String(text) => {
+            *text = redactor.redact(text);
+        }
+        Value::Array(values) => {
+            for value in values {
+                redact_json_value_strings(redactor, value);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                redact_json_value_strings(redactor, value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 /// Truncate `text` to at most `max_bytes` without splitting a UTF-8 code point.
@@ -1455,7 +1498,7 @@ fn guardrail_fired(metadata: &HashMap<String, String>) -> bool {
     ];
     if FIRED_TRUE_KEYS
         .iter()
-        .any(|key| metadata.get(*key).is_some_and(|value| value == "true"))
+        .any(|key| metadata.get(*key).is_some_and(fired_metadata_value))
     {
         return true;
     }
@@ -1464,7 +1507,7 @@ fn guardrail_fired(metadata: &HashMap<String, String>) -> bool {
         "ai_response_guard_warning",
         "ai_request_guard.uninspectable_body",
     ] {
-        if metadata.get(key).is_some_and(|value| !value.is_empty()) {
+        if metadata.get(key).is_some_and(fired_metadata_value) {
             return true;
         }
     }
@@ -1477,6 +1520,11 @@ fn guardrail_fired(metadata: &HashMap<String, String>) -> bool {
         return true;
     }
     false
+}
+
+fn fired_metadata_value(value: &String) -> bool {
+    let value = value.trim();
+    !value.is_empty() && !value.eq_ignore_ascii_case("false")
 }
 
 fn is_guardrail_key(key: &str) -> bool {

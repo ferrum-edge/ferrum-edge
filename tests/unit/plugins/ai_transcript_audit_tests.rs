@@ -10,8 +10,7 @@ use ferrum_edge::dns::{DnsCache, DnsConfig};
 use ferrum_edge::plugins::ai_transcript_audit::AiTranscriptAudit;
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
 use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
-    ResponseStreamInspector, priority,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
 };
 use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use serde_json::{Value, json};
@@ -145,7 +144,7 @@ async fn name_priority_and_protocols() {
     .unwrap();
     assert_eq!(plugin.name(), "ai_transcript_audit");
     assert_eq!(plugin.priority(), priority::AI_TRANSCRIPT_AUDIT);
-    assert_eq!(plugin.priority(), 2979);
+    assert_eq!(plugin.priority(), 2924);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert_eq!(
         plugin.warmup_hostnames(),
@@ -351,6 +350,61 @@ async fn non_ai_json_is_not_a_candidate() {
     assert!(!ctx.metadata.contains_key("ai_transcript_audit.record_id"));
 }
 
+#[tokio::test]
+async fn before_proxy_reads_live_header_argument() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.headers.clear();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8(ai_request_body().to_vec()).unwrap(),
+    );
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn final_request_body_rechecks_after_non_candidate_pretransform_body() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.metadata
+        .insert("request_body".to_string(), r#"{"order_id":42}"#.to_string());
+    let mut proxy_headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("false")
+    );
+
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(ctx.metadata.contains_key("ai_transcript_audit.record_id"));
+}
+
 // ---------------------------------------------------------------------------
 // Record content (via wiremock sink)
 // ---------------------------------------------------------------------------
@@ -377,6 +431,37 @@ async fn request_capture_redacts_pii() {
     assert_eq!(records[0]["mode"], "redacted_body");
     assert_eq!(records[0]["model"], "gpt-4o");
     assert!(records[0]["request_hash"].is_string());
+}
+
+#[tokio::test]
+async fn request_capture_redacts_decoded_json_string_escapes() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({ "mode": "redacted_body" })),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(
+            &mut ctx,
+            &headers,
+            br#"{"model":"gpt-4o","messages":[{"role":"user","content":"my ssn is 123\u002d45\u002d6789"}]}"#,
+        )
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let request_body = records[0]["request_body"].as_str().unwrap();
+    assert!(
+        !request_body.contains("123-45-6789") && !request_body.contains("123\\u002d45"),
+        "escaped SSN was not redacted after JSON decoding: {request_body}"
+    );
+    assert!(request_body.contains("[REDACTED"));
 }
 
 #[tokio::test]
@@ -505,6 +590,32 @@ async fn sampling_rate_zero_still_captures_on_guardrail() {
         1,
         "guardrail should force capture despite rate 0"
     );
+    assert_eq!(records[0]["capture_reason"], "guardrail");
+}
+
+#[tokio::test]
+async fn sampling_rate_zero_captures_non_empty_guardrail_metadata() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let config = config_with_sink(
+        &endpoint,
+        json!({ "sampling": { "rate": 0.0, "always_capture_on_guardrail": true } }),
+    );
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    ctx.metadata.insert(
+        "ai_response_guard_detected".to_string(),
+        "ssn,email".to_string(),
+    );
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
     assert_eq!(records[0]["capture_reason"], "guardrail");
 }
 

@@ -2141,6 +2141,11 @@ pub mod priority {
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
+    /// Runs before reject-capable AI guardrails so blocked prompts can still be
+    /// staged for `always_capture_on_guardrail`, while final request-body hooks
+    /// refresh the capture after downstream redaction/transforms when traffic
+    /// continues.
+    pub const AI_TRANSCRIPT_AUDIT: u16 = 2924;
     pub const AI_PROMPT_SHIELD: u16 = 2925;
     pub const WAF: u16 = 2930;
     pub const FAULT_INJECTION: u16 = 2940;
@@ -2148,10 +2153,6 @@ pub mod priority {
     pub const OPENAPI_VALIDATOR: u16 = 2960;
     pub const AI_SEMANTIC_FIREWALL: u16 = 2968;
     pub const AI_REQUEST_GUARD: u16 = 2975;
-    /// Runs after `ai_request_guard` (request-guard defaults/transforms are
-    /// visible) and before `ai_semantic_cache` / `ai_federation` (cache hits and
-    /// federated requests remain observable).
-    pub const AI_TRANSCRIPT_AUDIT: u16 = 2979;
     pub const AI_SEMANTIC_CACHE: u16 = 2980;
     pub const AI_FEDERATION: u16 = 2985;
     /// `mcp_gateway`: parses MCP JSON-RPC bodies and applies MCP-aware route
