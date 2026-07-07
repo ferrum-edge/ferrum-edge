@@ -1000,6 +1000,8 @@ impl RequestContext {
         let backend_port_changed = self
             .route_override_backend_port
             .is_some_and(|port| proxy.backend_port != port);
+        let dns_override_changed =
+            direct_backend_override && backend_host_changed && proxy.dns_override.is_some();
 
         let upstream_tls_override = if upstream_id_changed {
             self.route_override_upstream_id
@@ -1092,6 +1094,7 @@ impl RequestContext {
             && !backend_host_changed
             && !backend_scheme_changed
             && !backend_port_changed
+            && !dns_override_changed
             && !resolved_tls_changed
             && !dispatch_port_overrides_changed
             && !dispatch_port_override_fallback_changed
@@ -1123,6 +1126,9 @@ impl RequestContext {
         }
         if let Some(port) = self.route_override_backend_port {
             overridden.backend_port = port;
+        }
+        if dns_override_changed {
+            overridden.dns_override = None;
         }
         if let Some(resolved_tls) = resolved_tls_override {
             overridden.resolved_tls = resolved_tls;
@@ -3911,6 +3917,29 @@ mod tests {
         assert!(
             result.dispatch_port_override_fallback.is_none(),
             "a direct-backend override must clear the SD fallback"
+        );
+    }
+
+    #[test]
+    fn direct_backend_override_clears_inherited_dns_override_when_host_changes() {
+        let mut proxy: Proxy = serde_json::from_value(json!({
+            "backend_host": "stable.svc",
+            "backend_port": 8080,
+        }))
+        .expect("minimal proxy should deserialize");
+        proxy.dns_override = Some("192.0.2.10".to_string());
+
+        let mut ctx =
+            RequestContext::new("127.0.0.1".to_string(), "GET".to_string(), "/".to_string());
+        ctx.route_override_backend_host = Some("api.openai.com".to_string());
+        ctx.route_override_backend_port = Some(443);
+
+        let result = ctx.apply_route_overrides_with_upstreams(Arc::new(proxy), &HashMap::new());
+        assert_eq!(result.backend_host, "api.openai.com");
+        assert_eq!(result.backend_port, 443);
+        assert!(
+            result.dns_override.is_none(),
+            "a direct-backend host override must not inherit the original proxy dns_override"
         );
     }
 

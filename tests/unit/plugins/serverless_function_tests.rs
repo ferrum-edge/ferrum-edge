@@ -1023,6 +1023,37 @@ fn test_forward_headers_lowercase() {
     assert_eq!(plugin.name(), "serverless_function");
 }
 
+#[tokio::test]
+async fn test_skips_ai_stream_router_claimed_provider_requests() {
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": "https://example.com/func",
+            "forward_headers": ["Authorization"]
+        }),
+        default_client(),
+    )
+    .unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ai_stream_router_claimed".to_string(), "true".to_string());
+    let mut headers = HashMap::new();
+    headers.insert(
+        "authorization".to_string(),
+        "Bearer PROVIDER-SECRET".to_string(),
+    );
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !ctx.metadata.contains_key("serverless_function_error"),
+        "claimed provider traffic must not invoke the external function hook"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Environment variable fallback
 //

@@ -953,6 +953,8 @@ impl Plugin for AiStreamRouter {
                 }
                 ctx.metadata
                     .insert(META_PASSTHROUGH_COORD.to_string(), "true".to_string());
+                ctx.metadata
+                    .insert(META_STREAMING_SHARED.to_string(), "true".to_string());
                 return PluginResult::Continue;
             }
         };
@@ -973,6 +975,8 @@ impl Plugin for AiStreamRouter {
             }
             ctx.metadata
                 .insert(META_PASSTHROUGH_COORD.to_string(), "true".to_string());
+            ctx.metadata
+                .insert(META_STREAMING_SHARED.to_string(), "true".to_string());
             return PluginResult::Continue;
         };
 
@@ -1222,6 +1226,8 @@ fn strip_client_credentials(headers: &mut HashMap<String, String>) {
         "api-key",
         "x-goog-api-key",
         "anthropic-version",
+        "anthropic-beta",
+        "openai-beta",
         "openai-organization",
         "openai-project",
     ];

@@ -344,6 +344,10 @@ async fn test_streaming_missing_model_continues_when_opted_out() {
             .map(String::as_str),
         Some("true")
     );
+    assert_eq!(
+        ctx.metadata.get("ai_request_streaming").map(String::as_str),
+        Some("true")
+    );
 }
 
 #[tokio::test]
@@ -370,6 +374,10 @@ async fn test_no_matching_provider_continues_when_opted_out() {
         ctx.metadata
             .get("ai_stream_router_pass_through")
             .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_request_streaming").map(String::as_str),
         Some("true")
     );
 }
@@ -509,6 +517,8 @@ async fn test_client_credentials_are_not_leaked() {
         "org-attacker".to_string(),
     );
     headers.insert("openai-project".to_string(), "proj-attacker".to_string());
+    headers.insert("openai-beta".to_string(), "assistants=v2".to_string());
+    headers.insert("anthropic-beta".to_string(), "tools-2024-04-04".to_string());
 
     let res = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(res, PluginResult::Continue));
@@ -532,6 +542,8 @@ async fn test_client_credentials_are_not_leaked() {
     );
     assert!(!headers.contains_key("openai-organization"));
     assert!(!headers.contains_key("openai-project"));
+    assert!(!headers.contains_key("openai-beta"));
+    assert!(!headers.contains_key("anthropic-beta"));
 }
 
 // ---------------------------------------------------------------------------
