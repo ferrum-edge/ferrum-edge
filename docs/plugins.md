@@ -3321,6 +3321,57 @@ Universal AI gateway that routes requests in OpenAI Chat Completions format to a
 
 **Response guardrails still apply.** Successful synthetic responses returned by `ai_federation` are passed through the normal buffered response-side hooks before reaching the client. This means response-side `ai_semantic_firewall`, `ai_response_guard`, response body transforms, and final-response hooks inspect the normalized provider body. `ai_federation` still writes token metadata directly, and `ai_rate_limiter` records those tokens through its rejection-path `after_proxy` hook.
 
+**Token metering and strict-metering configuration.** `ai_federation`
+(`before_proxy` priority `2985`) runs *before* `ai_rate_limiter`
+(`after_proxy`-band priority `4200`) in the default order. On a successful
+provider call it writes `ai_total_tokens` / `ai_prompt_tokens` /
+`ai_completion_tokens` (plus `ai_federation_provider` / `ai_federation_status`)
+into request metadata, and `ai_rate_limiter` charges those tokens post-hoc via
+its rejection-path `after_proxy` hook. This has two consequences you must plan
+for in production:
+
+- **Usage-less federated 2xx are not charged in default order.** Because
+  `ai_rate_limiter`'s `before_proxy` never runs for a federated request (the
+  request is terminated by `ai_federation` first), there is no pre-reservation
+  and no AI-request marker. Only *metered* federation responses — those where
+  the provider returned a `usage` block that `ai_federation` translated into the
+  metadata above — are charged. A provider/response that omits usage is neither
+  charged nor rejected by the `on_unmetered_response` policy.
+- **No up-front reservation in default order.** With no pre-reservation, a burst
+  of concurrent federated requests can overshoot the window before any charge
+  lands (post-hoc reconciliation still corrects the total).
+
+To meter federated traffic **strictly** — pre-reserve every federated request
+and apply the `on_unmetered_response` policy (`charge_estimate` / `reject` /
+`warn`) to usage-less 2xx responses — set a `priority_override` **below `2985`**
+on the `ai_rate_limiter` instance so it runs *ahead* of `ai_federation`. It then
+pre-reserves an estimate, sets the AI-request marker, and reconciles against the
+provider's original status recorded in `ai_federation_status`:
+
+```yaml
+# Strict federated-token metering: ai_rate_limiter pre-reserves ahead of ai_federation.
+plugin_name: ai_rate_limiter
+config:
+  token_limit: 500000
+  window_seconds: 3600
+  limit_by: consumer
+  on_unmetered_response: reject   # federated 2xx without provider usage → 502
+priority_override: 2900           # < 2985 so before_proxy runs before ai_federation
+```
+
+**Provider usage-metadata expectations.** Metering accuracy depends on the
+provider returning a usage object that `ai_federation` / `ai_rate_limiter` can
+read: OpenAI-shaped `usage.{prompt,completion,total}_tokens`, Anthropic
+`usage.{input,output}_tokens`, Google/Gemini
+`usageMetadata.{prompt,candidates,total}TokenCount`, Bedrock Converse
+`usage.{input,output,total}Tokens`, and Cohere v2 `usage.tokens.{input,output}`.
+When usage is absent, the request falls to `on_unmetered_response` (only when a
+pre-reservation exists — see the strict-metering recipe above and the detailed
+`ai_rate_limiter` notes below). For streamed clients that are metered directly
+by `ai_rate_limiter` (not via `ai_federation`, which rejects streaming — see
+above), configure OpenAI-compatible callers with `stream_options.include_usage:
+true` so a final usage signal is emitted.
+
 **Synthetic-path hook ordering (known divergence).** On the synthetic short-circuit path (any plugin-generated 2xx surfaced via `RejectBinary`, including `ai_federation` / `ai_semantic_cache` / `response_mock` bodies) the response-**body** hooks (`on_response_body`, body transforms, `on_final_response_body`) run **before** the `after_proxy` reject hooks, whereas on the normal backend path `after_proxy` runs **before** the body transforms. This is a deliberate trade-off: the body hooks may *replace* the response when a guardrail rejects the synthetic body, so `after_proxy` must run exactly once and last — over the final response — to preserve one-shot response state (e.g. an `oidc_relying_party` rotated session cookie or a `response_transformer` route override) that would otherwise be consumed against a discarded synthetic 2xx. The consequence is that a body transform which depends on a header/metadata mutation made by an `after_proxy` hook (for example `response_transformer` rewriting `Content-Type` before its JSON body rules) can behave differently on a synthetic 2xx than on an equivalent backend 2xx. If you need such a transform applied identically, drive it from `before_proxy`/body-side configuration rather than from `after_proxy` header mutations on the synthetic path.
 
 **Multimodal content is explicit.** OpenAI Chat Completions content arrays may contain text plus non-text parts such as `image_url`. Provider configs accept `multimodal_mode`:

@@ -8132,7 +8132,39 @@ async fn handle_websocket_request_authenticated(
         // mesh path and the direct path forward the identical path+query. Default
         // to `/` if the URL somehow carries none (Extended CONNECT / inner H1
         // both require a leading `/`).
-        let ws_path_and_query: std::borrow::Cow<'_, str> = current_backend_url
+        //
+        // For a CROSS-CLUSTER Ambient HBONE target `current_backend_url`'s
+        // authority is the SCOPED SYNTHETIC identity (`mesh-xc-hbone|...`, with `|`
+        // separators) — NOT a valid URI authority — so the parse below would fail
+        // and silently collapse a real `/ws?room=1` to `/`. Mirror
+        // `proxy_to_backend_hbone`: swap the synthetic authority for the real
+        // `app_host` (the `mesh.hbone_authority_host` CONNECT authority) FIRST so
+        // the URI parses and the client path is preserved through the tunnel. Only
+        // `path_and_query` is read out (the host is dropped — the inner CONNECT
+        // already targets the pod), so the rewritten authority is parse-only.
+        // In-cluster targets have no synthetic host, so this is a byte-identical
+        // no-op for them (the branch is gated on `target_hbone_cross_cluster`).
+        let ws_backend_url_for_parse: std::borrow::Cow<'_, str> = match current_target.as_deref() {
+            Some(target)
+                if matches!(&ws_mesh_egress, Some(MeshWsEgress::AmbientHbone))
+                    && hbone_pool::target_hbone_cross_cluster(target) =>
+            {
+                match hbone_pool::target_hbone_authority_host(target) {
+                    Ok(app_host) => std::borrow::Cow::Owned(rewrite_backend_url_authority_host(
+                        &current_backend_url,
+                        &target.host,
+                        app_host,
+                    )),
+                    // A malformed cross-cluster target (missing/invalid
+                    // `mesh.hbone_authority_host`) fails CLOSED in the dial branch
+                    // below with a typed pre-wire error; leave the URL as-is so the
+                    // parse falls back to `/` and the branch surfaces the reject.
+                    Err(_) => std::borrow::Cow::Borrowed(current_backend_url.as_str()),
+                }
+            }
+            _ => std::borrow::Cow::Borrowed(current_backend_url.as_str()),
+        };
+        let ws_path_and_query: std::borrow::Cow<'_, str> = ws_backend_url_for_parse
             .parse::<hyper::Uri>()
             .ok()
             .and_then(|uri| uri.path_and_query().map(|pq| pq.as_str().to_string()))
@@ -8151,6 +8183,14 @@ async fn handle_websocket_request_authenticated(
                     state.max_websocket_frame_size_bytes,
                     state.websocket_write_buffer_size,
                     ws_idle_tracker.clone(),
+                    // Preserve the original authenticated mesh peer's identity into
+                    // the Ambient HBONE baggage (Finding B / issue #2010 codex):
+                    // for a WS request forwarded from an authenticated source
+                    // workload, `ctx.peer_spiffe_id` is stamped as the asserted
+                    // source so the remote AuthorizationPolicy / telemetry see the
+                    // source workload, not the gateway SVID. `None` on an
+                    // unauthenticated client → gateway SVID (HTTP-path parity).
+                    ctx.peer_spiffe_id.as_ref(),
                 )
                 .await
                 .map(|handshake| WsBackendHandshake::Mesh(Box::new(handshake))),
@@ -8448,6 +8488,54 @@ async fn handle_websocket_request_authenticated(
         }
     };
 
+    // A successful CROSS-CLUSTER Ambient HBONE WS dial leaves `current_target.host`
+    // and `current_backend_url` holding the SCOPED SYNTHETIC `mesh-xc-hbone|...`
+    // authority (only the earlier `ws_backend_url_for_parse` rewrite recovered
+    // `path_and_query`). The success path below reuses `current_backend_url` for
+    // the transaction / disconnect `backend_target` and `current_target.host` for
+    // `websocket_dns_resolution_host` — so without a fixup the session logs an
+    // invalid backend URL and tries to DNS-resolve a non-DNS synthetic name.
+    // Recompute a DISPLAY/RESOLVE target from the REAL dial `app_host`
+    // (`mesh.hbone_authority_host`) for this branch only; in-cluster / Sidecar /
+    // direct paths keep `current_backend_url` / `current_target.host` byte-for-byte
+    // (issue #2010 codex Finding C). Gated on the FINAL rotated `current_target`.
+    let ws_final_mesh_egress = current_target.as_deref().and_then(websocket_mesh_egress);
+    let (ws_display_backend_url, ws_resolve_host_override): (
+        std::borrow::Cow<'_, str>,
+        Option<&str>,
+    ) = match current_target.as_deref() {
+        Some(target)
+            if matches!(&ws_final_mesh_egress, Some(MeshWsEgress::AmbientHbone))
+                && hbone_pool::target_hbone_cross_cluster(target) =>
+        {
+            match hbone_pool::target_hbone_authority_host(target) {
+                // `app_host` is the real pod addr:app-port the tunnel dialed;
+                // swap it into the URL authority (path/query preserved) and use
+                // it as the DNS-resolve host. The dial succeeded, so the tag is
+                // present and non-synthetic here.
+                Ok(app_host) => (
+                    std::borrow::Cow::Owned(rewrite_backend_url_authority_host(
+                        &current_backend_url,
+                        &target.host,
+                        app_host,
+                    )),
+                    Some(app_host),
+                ),
+                // Unreachable on a successful dial (the pre-wire guard rejects a
+                // missing/invalid authority host before dialing), but stay
+                // fail-safe: fall back to the existing values rather than panic.
+                Err(_) => (
+                    std::borrow::Cow::Borrowed(current_backend_url.as_str()),
+                    None,
+                ),
+            }
+        }
+        _ => (
+            std::borrow::Cow::Borrowed(current_backend_url.as_str()),
+            None,
+        ),
+    };
+
     // Backend handshake succeeded — record the success so the breaker sees a
     // healthy outcome and, when this request was admitted as a HALF_OPEN
     // probe, the probe slot is released and the breaker can close. Without
@@ -8489,8 +8577,12 @@ async fn handle_websocket_request_authenticated(
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 
     // Resolve backend IP from DNS cache for WebSocket tx log. Use the
-    // effective LB target when present, not the proxy's static backend_host.
-    let ws_resolve_host = websocket_dns_resolution_host(&proxy, current_target.as_deref());
+    // effective LB target when present, not the proxy's static backend_host. For a
+    // cross-cluster Ambient WS session `ws_resolve_host_override` carries the real
+    // pod `app_host` so we don't try to resolve the synthetic `mesh-xc-hbone|...`
+    // name (Finding C); it is `None` on every other path → the normal target host.
+    let ws_resolve_host = ws_resolve_host_override
+        .unwrap_or_else(|| websocket_dns_resolution_host(&proxy, current_target.as_deref()));
     let ws_resolved_ip = state
         .dns_cache
         .resolve(
@@ -8520,7 +8612,10 @@ async fn handle_websocket_request_authenticated(
         request_path: original_request_path.clone(),
         proxy_id: Some(proxy.id.clone()),
         proxy_name: proxy.name.clone(),
-        backend_target: Some(strip_query_params(&current_backend_url).to_string()),
+        // `ws_display_backend_url` == `current_backend_url` on every path except a
+        // cross-cluster Ambient WS session, where it carries the real pod authority
+        // instead of the synthetic `mesh-xc-hbone|...` key (Finding C).
+        backend_target: Some(strip_query_params(&ws_display_backend_url).to_string()),
         backend_resolved_ip: ws_resolved_ip,
         response_status_code: ws_status_code,
         latency_total_ms: total_ms,
@@ -8664,7 +8759,10 @@ async fn handle_websocket_request_authenticated(
         namespace: proxy.namespace.clone(),
         proxy_name: proxy.name.clone(),
         client_ip: ctx.client_ip.clone(),
-        backend_target: strip_query_params(&current_backend_url).to_string(),
+        // Real pod authority for a cross-cluster Ambient WS session, else the
+        // unchanged `current_backend_url` (Finding C) — so the disconnect log
+        // records a valid backend URL, not the synthetic `mesh-xc-hbone|...` key.
+        backend_target: strip_query_params(&ws_display_backend_url).to_string(),
         listen_port,
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
@@ -9423,10 +9521,18 @@ enum MeshWsEgress {
 /// fail-closed contract, but the SVID/capability check is deferred to the dial
 /// because returning `None` here would route to the plaintext path.
 fn websocket_mesh_egress(target: &UpstreamTarget) -> Option<MeshWsEgress> {
-    if mesh_mtls_pool::target_mesh_mtls_enabled(target) {
-        Some(MeshWsEgress::SidecarMtls)
-    } else if hbone_pool::target_hbone_enabled(target) {
+    // HBONE is checked FIRST so a corrupted target carrying BOTH transport tags
+    // (`mesh.hbone` + `mesh.mtls`) resolves to the Ambient branch, mirroring the
+    // gRPC classifier's HBONE-wins precedence (`classify_grpc_mesh_dispatch`).
+    // Without this, `mesh_mtls` won and a mixed-tag CROSS-CLUSTER target would be
+    // dispatched over mesh-mTLS — bypassing the fail-closed cross-cluster HBONE
+    // WebSocket refusal; the Ambient branch instead fails such a target closed
+    // (issue #2010 codex). Legitimate targets carry exactly one transport tag, so
+    // this only re-routes corrupted shapes.
+    if hbone_pool::target_hbone_enabled(target) {
         Some(MeshWsEgress::AmbientHbone)
+    } else if mesh_mtls_pool::target_mesh_mtls_enabled(target) {
+        Some(MeshWsEgress::SidecarMtls)
     } else {
         None
     }
@@ -9489,6 +9595,14 @@ async fn connect_mesh_websocket_backend(
     max_websocket_frame_size_bytes: usize,
     websocket_write_buffer_size: usize,
     idle_tracker: Option<Arc<WsIdleTracker>>,
+    // The ASSERTED source identity to stamp into the Ambient HBONE baggage — the
+    // request's `ctx.peer_spiffe_id` (the original authenticated mesh workload) so
+    // the destination's AuthorizationPolicy / telemetry see the source workload,
+    // not the gateway SVID. Consumed ONLY by the `AmbientHbone` branch (the
+    // Sidecar mesh-mTLS WS transport carries no source-identity baggage — the mTLS
+    // client cert authenticates the gateway; see `MeshMtlsConnectionPool`). `None`
+    // falls back to the gateway SVID, mirroring the HTTP HBONE path.
+    source_identity: Option<&crate::identity::SpiffeId>,
 ) -> Result<MeshBackendWsHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let mut ws_config = WebSocketConfig::default();
     ws_config.max_frame_size = Some(max_websocket_frame_size_bytes);
@@ -9548,22 +9662,32 @@ async fn connect_mesh_websocket_backend(
             };
             let forwarded_headers: &[(String, String)] =
                 forwarded_headers_owned.as_deref().unwrap_or(client_headers);
-            // Cross-cluster WebSocket egress is NOT yet supported (HTTP-first;
-            // tracked as a follow-up with Ambient HBONE cross-cluster). A
-            // cross-cluster target carries NO `mesh.spiffe_id`, so
-            // `target_mesh_mtls_expected_peer` below FAILS CLOSED — the WS upgrade
-            // errors cleanly (no plaintext, no panic). Warn so the failure is
-            // diagnosable rather than a bare missing-pin error.
-            if mesh_mtls_pool::target_mesh_mtls_cross_cluster(target) {
-                warn!(
-                    proxy_id = %proxy.id,
-                    target_host = %target.host,
-                    "Cross-cluster WebSocket egress is not yet supported; the upgrade will fail \
-                     closed (no cross-cluster SNI override / trust-domain scope on the WS path). \
-                     Tracked as a follow-up with Ambient HBONE cross-cluster."
-                );
-            }
-            let expected_peer = mesh_mtls_pool::target_mesh_mtls_expected_peer(target)?;
+            // Resolve the mesh-mTLS dial plan (issue #2010), shared with the
+            // HTTP/gRPC path (`proxy_to_backend_mesh_mtls`):
+            //   * IN-CLUSTER: pin the destination workload SPIFFE, SNI = dial
+            //     host, no trust-domain scope.
+            //   * CROSS-CLUSTER east-west: NO pinned pod SPIFFE
+            //     (`expected_peer = None`), verification scoped to the remote
+            //     `mesh.trust_domain`, and the ClientHello SNI OVERRIDDEN to the
+            //     destination service FQDN (`mesh.eastwest_sni`) so the remote
+            //     gateway's SNI passthrough routes to the destination sidecar's
+            //     `:15006` Extended-CONNECT listener.
+            // A missing pinned identity (in-cluster) or a malformed cross-cluster
+            // target (missing SNI / trust domain) FAILS THE UPGRADE CLOSED here —
+            // never a plaintext / wrong-SNI dial of a mesh destination.
+            let dial_plan = match mesh_mtls_pool::MeshMtlsDialPlan::resolve(target) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    warn!(
+                        proxy_id = %proxy.id,
+                        target_host = %target.host,
+                        error = %err,
+                        "Refusing sidecar mesh-mTLS WebSocket egress: unresolved dial plan; \
+                         failing the upgrade closed (no plaintext / wrong-SNI fallback)"
+                    );
+                    return Err(Box::new(err));
+                }
+            };
             let mtls_port = mesh_mtls_pool::target_mesh_mtls_port(target);
             let ws_tunnel = state
                 .mesh_mtls_pool
@@ -9575,7 +9699,9 @@ async fn connect_mesh_websocket_backend(
                     mtls_port,
                     &authority,
                     path_and_query,
-                    &expected_peer,
+                    dial_plan.expected_peer.as_ref(),
+                    dial_plan.expected_trust_domain.as_ref(),
+                    dial_plan.sni_override,
                     forwarded_headers,
                 )
                 .await?;
@@ -9597,41 +9723,113 @@ async fn connect_mesh_websocket_backend(
             })
         }
         MeshWsEgress::AmbientHbone => {
-            // Cross-cluster Ambient WebSocket egress is NOT yet supported
-            // (HTTP-first; tracked as a follow-up like the deferred Sidecar WS
-            // cross-cluster path). A cross-cluster HBONE target carries NO
-            // `mesh.spiffe_id` (so `target_expected_peer_spiffe` returns
-            // `Ok(None)` rather than erroring) and the bare-byte-tunnel WS path
-            // has no SNI-override / trust-domain-scope plumbing — dialing it would
-            // hit the gateway with the WRONG (dial-host) SNI. FAIL CLOSED here so
-            // the upgrade errors cleanly (no plaintext, no wrong-SNI dial) and is
-            // diagnosable, mirroring the Sidecar WS cross-cluster guard.
-            if hbone_pool::target_hbone_cross_cluster(target) {
+            // Resolve the HBONE byte-tunnel dial (issue #2010), mirroring
+            // `proxy_to_backend_hbone`'s cross-cluster branch so the WS and HTTP
+            // HBONE paths cannot drift:
+            //   * IN-CLUSTER: pin the destination pod SPIFFE, dial the pod addr,
+            //     no SNI/trust-domain override; the inner CONNECT `:authority` is
+            //     the pod addr:port.
+            //   * CROSS-CLUSTER east-west (`mesh.cross_cluster`): dial the REMOTE
+            //     gateway (`mesh.hbone_dial_host`) with the ClientHello SNI
+            //     OVERRIDDEN to the destination service FQDN (`mesh.eastwest_sni`)
+            //     and TRUST-DOMAIN-ONLY verification (`mesh.trust_domain`, no
+            //     pinned pod SPIFFE); the inner CONNECT `:authority` is the REAL
+            //     pod addr (`mesh.hbone_authority_host`, since `target.host` is a
+            //     scoped synthetic identity) the dest relay byte-copies to.
+            // A malformed cross-cluster target (missing SNI / trust domain) FAILS
+            // THE UPGRADE CLOSED here — never a plaintext / wrong-SNI dial.
+            let hbone_port = hbone_pool::target_hbone_port(target);
+            let dial_host = hbone_pool::target_hbone_dial_host(target)?;
+            // The inner CONNECT `:authority` host: the `mesh.hbone_authority_host`
+            // tag for a cross-cluster target, else `target.host` in-cluster (the
+            // tag is absent → returns `target.host`, byte-identical to before).
+            let app_host = hbone_pool::target_hbone_authority_host(target)?;
+            // FAIL CLOSED PRE-WIRE for a corrupted cross-cluster target that omits
+            // `mesh.hbone_authority_host`: `target_hbone_authority_host` would then
+            // fall back to `target.host` = the SCOPED SYNTHETIC `mesh-xc-hbone|...`
+            // key (not a dialable authority). Without this guard the branch would
+            // establish the east-west TLS/H2 connection first and only fail LATER
+            // while building the HBONE CONNECT to the synthetic authority — a
+            // dial-then-fail that violates the fail-closed invariant. Require the
+            // real authority host BEFORE any dial (issue #2010 codex), typed so
+            // `classify_boxed_setup_error` recognizes it as PRE-WIRE
+            // (`ConnectionPoolError`) — mirrors the missing-SNI / missing-trust-
+            // domain rejects below. A present-but-empty tag already fails closed as
+            // `InvalidAuthorityHostTag` inside `target_hbone_authority_host`.
+            if hbone_pool::target_hbone_cross_cluster(target)
+                && !target
+                    .tags
+                    .contains_key(hbone_pool::HBONE_AUTHORITY_HOST_TAG)
+            {
                 warn!(
                     proxy_id = %proxy.id,
                     target_host = %target.host,
-                    "Cross-cluster Ambient WebSocket egress is not yet supported; failing the \
-                     upgrade closed (no cross-cluster SNI override / trust-domain scope on the \
-                     HBONE WS byte-tunnel path). Tracked as a follow-up."
+                    "Refusing cross-cluster Ambient WebSocket egress: missing \
+                     mesh.hbone_authority_host (fail closed, never dial to the \
+                     synthetic identity as CONNECT authority)"
                 );
-                return Err("cross-cluster Ambient WebSocket egress is not supported".into());
+                return Err(Box::new(
+                    hbone_pool::HbonePoolError::MissingCrossClusterAuthorityHost,
+                ));
             }
-            let expected_peer = hbone_pool::target_expected_peer_spiffe(target)?;
-            let hbone_port = hbone_pool::target_hbone_port(target);
-            let dial_host = hbone_pool::target_hbone_dial_host(target)?;
-            // Bare HBONE byte tunnel to the destination workload's app addr:port
-            // (the CONNECT `:authority` the relay byte-copies to) — NOT an
-            // Extended CONNECT (see this fn's doc comment + `get_ws_byte_tunnel`).
+            // The two cross-cluster fail-closed branches return a TYPED
+            // `HbonePoolError` (not a boxed string) so `classify_boxed_setup_error`
+            // → `classify_typed_chain` downcasts it to a PRE-WIRE class
+            // (`ConnectionPoolError`) via `error_class()`. That keeps a metadata
+            // reject retry-eligible under `retry_on_connect_failure` and recorded
+            // as a mesh SETUP failure — not charged to the backend / circuit
+            // breaker as a post-wire request failure (issue #2010 codex). Mirrors
+            // the Sidecar `MeshMtlsDialError::MissingCrossCluster*` pattern.
+            let (expected_peer, expected_trust_domain, sni_override) =
+                if hbone_pool::target_hbone_cross_cluster(target) {
+                    let sni = hbone_pool::target_hbone_eastwest_sni(target).ok_or_else(|| {
+                        warn!(
+                            proxy_id = %proxy.id,
+                            target_host = %target.host,
+                            "Refusing cross-cluster Ambient WebSocket egress: missing/empty \
+                             mesh.eastwest_sni (fail closed, never dial the gateway IP as SNI)"
+                        );
+                        hbone_pool::HbonePoolError::MissingCrossClusterSni
+                    })?;
+                    let td = hbone_pool::target_hbone_cross_cluster_trust_domain(target)
+                        .ok_or_else(|| {
+                            warn!(
+                                proxy_id = %proxy.id,
+                                target_host = %target.host,
+                                "Refusing cross-cluster Ambient WebSocket egress: missing/empty/\
+                                 unparseable mesh.trust_domain (fail closed, never any-federated)"
+                            );
+                            hbone_pool::HbonePoolError::MissingCrossClusterTrustDomain
+                        })?;
+                    (None, Some(td), Some(sni))
+                } else {
+                    (hbone_pool::target_expected_peer_spiffe(target)?, None, None)
+                };
+            // Bare HBONE byte tunnel to the CONNECT `:authority` (the pod app
+            // addr:port the relay byte-copies to) — NOT an Extended CONNECT (see
+            // `get_ws_byte_tunnel`). For cross-cluster the outer TLS dials the
+            // gateway with the SNI override + trust-domain scope resolved above.
             let tunnel = state
                 .hbone_pool
                 .get_ws_byte_tunnel(
                     proxy,
                     dial_host,
                     hbone_port,
-                    &target.host,
+                    app_host,
                     target.port,
                     target.dispatch_policy_port(),
                     expected_peer.as_ref(),
+                    expected_trust_domain.as_ref(),
+                    sni_override,
+                    // Preserve the ASSERTED source identity: a WS request from an
+                    // authenticated mesh peer stamps the ORIGINAL workload SPIFFE
+                    // into the HBONE baggage (mirroring `proxy_to_backend_hbone`'s
+                    // `source_identity_ctx.and_then(|ctx| ctx.peer_spiffe_id...)`),
+                    // so the destination's AuthorizationPolicy / telemetry see the
+                    // source workload, not the gateway's own SVID. `None` (ambient
+                    // egress from an unauthenticated client) falls back to the
+                    // gateway SVID inside `get_ws_byte_tunnel` (issue #2010 codex).
+                    source_identity,
                 )
                 .await?;
 
@@ -9643,10 +9841,23 @@ async fn connect_mesh_websocket_backend(
             // Host over the relay); `path_and_query` is the preserved client
             // `:path`. The relay forwards these plaintext bytes to the loopback
             // app, which completes the upgrade.
-            let inner_host = match client_host {
-                Some(host) if proxy.preserve_host_header && !host.is_empty() => host.to_string(),
-                _ => hbone_pool::authority_for_host_port(&target.host, target.port),
-            };
+            //
+            // The non-preserved Host fallback uses `app_host` (the real pod
+            // addr from `mesh.hbone_authority_host`), NOT `target.host`: for a
+            // cross-cluster target `target.host` is the scoped synthetic
+            // `mesh-xc-hbone|...` identity, so `ws://{target.host}...` is an
+            // invalid WS URI that `into_client_request()` would REJECT after the
+            // tunnel is already established. In-cluster `app_host == target.host`
+            // (the tag is absent), so this stays byte-identical there. Mirrors
+            // `proxy_to_backend_hbone`, whose backend Host header is
+            // `authority_for_host_port(app_host, target.port)` when the client
+            // Host is not preserved (issue #2010 codex).
+            let inner_host = hbone_pool::hbone_ws_inner_host(
+                client_host,
+                proxy.preserve_host_header,
+                app_host,
+                target.port,
+            );
             let ws_url = format!("ws://{inner_host}{path_and_query}");
             let mut ws_request = ws_url.into_client_request()?;
             // Force the routing Host the destination app matches on (the URL
@@ -9674,8 +9885,10 @@ async fn connect_mesh_websocket_backend(
             // `HbonePoolError` downcast.
             let connect_timeout =
                 std::time::Duration::from_millis(proxy.backend_connect_timeout_ms);
-            let handshake_authority =
-                hbone_pool::authority_for_host_port(&target.host, target.port);
+            // Use `app_host` (real pod addr) for the error surface too — for a
+            // cross-cluster target `target.host` is the synthetic identity, not
+            // a dialable authority; in-cluster this is byte-identical.
+            let handshake_authority = hbone_pool::authority_for_host_port(app_host, target.port);
             let (stream, response) = match tokio::time::timeout(
                 connect_timeout,
                 client_async_with_config(
@@ -14424,9 +14637,14 @@ async fn handle_proxy_request_inner(
         if let Some(target) = upstream_target.as_deref() {
             let refusal = match grpc_proxy::classify_grpc_mesh_dispatch(target) {
                 grpc_proxy::GrpcMeshDispatch::Direct => None,
-                grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => {
-                    Some("gRPC over cross-cluster east-west routing is not supported")
-                }
+                grpc_proxy::GrpcMeshDispatch::RefuseCrossCluster => Some(
+                    "gRPC over cross-cluster Ambient HBONE east-west routing is not supported \
+                     (HBONE inner protocol cannot carry gRPC trailers)",
+                ),
+                grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterMalformed => Some(
+                    "gRPC over cross-cluster east-west routing requires a destination SNI \
+                     override and a remote trust domain",
+                ),
                 grpc_proxy::GrpcMeshDispatch::RefuseCrossClusterNoTransport => {
                     Some("gRPC over cross-cluster east-west routing requires a mesh transport tag")
                 }
@@ -14434,7 +14652,11 @@ async fn handle_proxy_request_inner(
                     "gRPC over the Ambient HBONE mesh transport is not supported \
                      (HBONE inner protocol cannot carry gRPC trailers)",
                 ),
-                grpc_proxy::GrpcMeshDispatch::MeshMtls => {
+                // `MeshMtlsCrossCluster` normally falls through to the generic
+                // mesh-mTLS path (its east-west branch) like `MeshMtls`; both are
+                // refused defensively here in case they reach this branch.
+                grpc_proxy::GrpcMeshDispatch::MeshMtls
+                | grpc_proxy::GrpcMeshDispatch::MeshMtlsCrossCluster => {
                     Some("gRPC to a sidecar mesh mTLS target cannot be dialed directly")
                 }
             };
@@ -15160,7 +15382,8 @@ async fn handle_proxy_request_inner(
                 // and this loop dials `GrpcConnectionPool` directly — a rotation
                 // onto a mesh-tagged target (mixed mesh/non-mesh upstream) must
                 // fail closed, never direct-dial past the secured transport.
-                // `MeshMtls` also refuses here: the generic mesh-mTLS path
+                // `MeshMtls` / `MeshMtlsCrossCluster` also refuse here (any
+                // non-`Direct` classification does): the generic mesh-mTLS path
                 // cannot dispatch retries (`!has_retry` gate), so there is no
                 // transport to switch to mid-loop. No circuit-breaker probe
                 // slot is held for the new target yet (the breaker is checked
@@ -16545,6 +16768,25 @@ async fn handle_proxy_request_inner(
                 }
 
                 record_request(&state, 200); // gRPC errors use HTTP 200
+                // A gRPC-Web request must receive a gRPC-Web-shaped response even
+                // for a gateway-generated backend error: the terminal status has
+                // to ride in a gRPC-Web trailer frame under the gRPC-Web
+                // content-type, never a raw `application/grpc` trailers-only
+                // response the browser client cannot read. The mesh-retry-refusal
+                // (above) and backend-admission-rejection paths are already
+                // gRPC-Web aware; this backend-exchange-error arm was the last one
+                // that fell through to raw `application/grpc`, which is exactly the
+                // intermittent `200 + application/grpc` a gRPC-Web caller saw when
+                // a backend read/connect blipped under load (issue #2041).
+                if let Some(content_type) = grpc_web_response_content_type {
+                    return Ok(build_grpc_web_error_response(content_type, grpc_code, msg));
+                }
+                if grpc_request_is_web_translated
+                    && let Some(response) =
+                        build_translated_grpc_web_error_response(&ctx, grpc_code, msg)
+                {
+                    return Ok(response);
+                }
                 return Ok(grpc_proxy::build_grpc_error_response(grpc_code, msg));
             }
         }
@@ -22488,96 +22730,88 @@ async fn proxy_to_backend_mesh_mtls(
     //   SNI resolves to).
     // - In-cluster (default): the pinned destination identity is mandatory —
     //   missing or corrupt fails closed before any dial — and no SNI override.
-    let cross_cluster = mesh_mtls_pool::target_mesh_mtls_cross_cluster(target);
-    let expected_peer = if cross_cluster {
-        None
-    } else {
-        match mesh_mtls_pool::target_mesh_mtls_expected_peer(target) {
-            Ok(peer) => Some(peer),
-            Err(err) => {
-                error!(
-                    proxy_id = %proxy.id,
-                    target_host = %target.host,
-                    error = %err,
-                    "Refusing sidecar mTLS dispatch: unusable pinned peer identity"
-                );
-                return (
-                    hbone_pool_error_response(state, proxy, &err, resolved_ip),
-                    None,
-                    None,
-                );
-            }
+    // Resolve the peer-verification + SNI plan ONCE, shared with the WebSocket
+    // egress path via `MeshMtlsDialPlan` so the in-cluster-pinned vs
+    // cross-cluster (east-west) split cannot drift between the two transports:
+    //   * IN-CLUSTER: the pinned destination identity is mandatory — missing or
+    //     corrupt fails closed before any dial — and no SNI override.
+    //   * CROSS-CLUSTER (`mesh.cross_cluster`): the dial host is the REMOTE
+    //     east-west gateway, which SNI-passes the opaque TLS to an LB-picked
+    //     destination workload the client cannot name. Verification is
+    //     TRUST-DOMAIN-ONLY (`expected_peer = None`; the destination SVID must
+    //     still chain to the remote/federated trust domain — never unverified)
+    //     scoped to `mesh.trust_domain`, and the ClientHello SNI is OVERRIDDEN to
+    //     the destination service FQDN (`mesh.eastwest_sni`). A missing SNI or
+    //     trust domain FAILS CLOSED (502) — never a fallback to the gateway
+    //     address as SNI or any-federated verification.
+    let mesh_mtls_pool::MeshMtlsDialPlan {
+        cross_cluster,
+        expected_peer,
+        expected_trust_domain,
+        sni_override,
+    } = match mesh_mtls_pool::MeshMtlsDialPlan::resolve(target) {
+        Ok(plan) => plan,
+        Err(mesh_mtls_pool::MeshMtlsDialError::PinnedPeer(err)) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                error = %err,
+                "Refusing sidecar mTLS dispatch: unusable pinned peer identity"
+            );
+            return (
+                hbone_pool_error_response(state, proxy, &err, resolved_ip),
+                None,
+                None,
+            );
         }
-    };
-    let sni_override = if cross_cluster {
-        match mesh_mtls_pool::target_mesh_mtls_eastwest_sni(target) {
-            Some(sni) => Some(sni),
-            None => {
-                error!(
-                    proxy_id = %proxy.id,
-                    target_host = %target.host,
-                    "Refusing cross-cluster sidecar mTLS dispatch: missing or empty \
-                     mesh.eastwest_sni tag (fail closed, never dial the gateway IP as SNI)"
-                );
-                return (
-                    retry::BackendResponse {
-                        status_code: 502,
-                        body: ResponseBody::Buffered(
-                            r#"{"error":"Cross-cluster mTLS target missing SNI"}"#
-                                .as_bytes()
-                                .to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: true,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ConnectionPoolError),
-                    },
-                    None,
-                    None,
-                );
-            }
+        Err(mesh_mtls_pool::MeshMtlsDialError::MissingCrossClusterSni) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                "Refusing cross-cluster sidecar mTLS dispatch: missing or empty \
+                 mesh.eastwest_sni tag (fail closed, never dial the gateway IP as SNI)"
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Cross-cluster mTLS target missing SNI"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                },
+                None,
+                None,
+            );
         }
-    } else {
-        None
-    };
-    // Cross-cluster verification is SCOPED to the TARGET's remote trust domain
-    // (`mesh.trust_domain`): the SNI-passthrough gateway LB-picks the destination
-    // workload, so a pod SPIFFE cannot be pinned, but the server SVID MUST be in
-    // exactly the remote trust domain (and chain to a federated bundle) — a
-    // federated cert from a DIFFERENT trust domain is rejected. A cross-cluster
-    // target with a missing/empty/unparseable `mesh.trust_domain` FAILS CLOSED
-    // (502) — it NEVER falls back to any-federated verification. The in-cluster
-    // pinned path passes `None` (the pinned peer already constrains the domain).
-    let expected_trust_domain = if cross_cluster {
-        match mesh_mtls_pool::target_mesh_mtls_cross_cluster_trust_domain(target) {
-            Some(td) => Some(td),
-            None => {
-                error!(
-                    proxy_id = %proxy.id,
-                    target_host = %target.host,
-                    "Refusing cross-cluster sidecar mTLS dispatch: missing, empty, or unparseable \
-                     mesh.trust_domain tag (fail closed, never any-federated verification)"
-                );
-                return (
-                    retry::BackendResponse {
-                        status_code: 502,
-                        body: ResponseBody::Buffered(
-                            r#"{"error":"Cross-cluster mTLS target missing trust domain"}"#
-                                .as_bytes()
-                                .to_vec(),
-                        ),
-                        headers: HashMap::new(),
-                        connection_error: true,
-                        backend_resolved_ip: resolved_ip,
-                        error_class: Some(retry::ErrorClass::ConnectionPoolError),
-                    },
-                    None,
-                    None,
-                );
-            }
+        Err(mesh_mtls_pool::MeshMtlsDialError::MissingCrossClusterTrustDomain) => {
+            error!(
+                proxy_id = %proxy.id,
+                target_host = %target.host,
+                "Refusing cross-cluster sidecar mTLS dispatch: missing, empty, or unparseable \
+                 mesh.trust_domain tag (fail closed, never any-federated verification)"
+            );
+            return (
+                retry::BackendResponse {
+                    status_code: 502,
+                    body: ResponseBody::Buffered(
+                        r#"{"error":"Cross-cluster mTLS target missing trust domain"}"#
+                            .as_bytes()
+                            .to_vec(),
+                    ),
+                    headers: HashMap::new(),
+                    connection_error: true,
+                    backend_resolved_ip: resolved_ip,
+                    error_class: Some(retry::ErrorClass::ConnectionPoolError),
+                },
+                None,
+                None,
+            );
         }
-    } else {
-        None
     };
 
     debug!(

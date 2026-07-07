@@ -228,6 +228,139 @@ pub fn target_mesh_mtls_expected_peer(target: &UpstreamTarget) -> Result<SpiffeI
     })
 }
 
+/// Why a [`MeshMtlsDialPlan`] could not be resolved for a target. Each variant
+/// is a FAIL-CLOSED condition — dispatch must never fall back to a plaintext /
+/// wrong-SNI dial for a mesh-tagged target.
+#[derive(Debug)]
+pub enum MeshMtlsDialError {
+    /// In-cluster (pinned-peer) target with a missing / invalid `mesh.spiffe_id`
+    /// tag. Carries the underlying [`HbonePoolError`] so callers keep the exact
+    /// error mapping (`error_class`, response shaping) they had inline.
+    PinnedPeer(HbonePoolError),
+    /// Cross-cluster east-west target with a missing / empty `mesh.eastwest_sni`
+    /// tag — the destination-FQDN SNI the remote gateway's passthrough routes on
+    /// is mandatory (never dial the gateway IP as SNI).
+    MissingCrossClusterSni,
+    /// Cross-cluster east-west target with a missing / empty / unparseable
+    /// `mesh.trust_domain` tag — the remote trust domain verification is scoped
+    /// to is mandatory (never fall back to any-federated verification).
+    MissingCrossClusterTrustDomain,
+}
+
+impl std::fmt::Display for MeshMtlsDialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MeshMtlsDialError::PinnedPeer(err) => {
+                write!(f, "unusable pinned sidecar mesh-mTLS peer identity: {err}")
+            }
+            MeshMtlsDialError::MissingCrossClusterSni => f.write_str(
+                "cross-cluster sidecar mesh-mTLS target missing mesh.eastwest_sni \
+                 (fail closed, never dial the gateway address as SNI)",
+            ),
+            MeshMtlsDialError::MissingCrossClusterTrustDomain => f.write_str(
+                "cross-cluster sidecar mesh-mTLS target missing mesh.trust_domain \
+                 (fail closed, never any-federated verification)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MeshMtlsDialError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            MeshMtlsDialError::PinnedPeer(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl MeshMtlsDialError {
+    /// PRE-WIRE error class for a dial-plan resolution failure — no backend dial
+    /// happened, so this is a gateway-side (connect-phase) failure that stays
+    /// neutral to backend/circuit-breaker health and is retryable onto another
+    /// target. The WebSocket egress path boxes this error, and
+    /// `retry::classify_boxed_setup_error` recognizes it via
+    /// [`retry::classify_typed_chain`] so a metadata reject is not charged to the
+    /// backend as post-wire (issue #2010 codex). `PinnedPeer` delegates to the
+    /// wrapped [`HbonePoolError`] (which the same walk would reach via `source`,
+    /// but delegating keeps one mapping); the missing-SNI / trust-domain variants
+    /// map to `ConnectionPoolError`, exactly like the HTTP mesh-mTLS path returns
+    /// for these cases.
+    pub fn error_class(&self) -> crate::retry::ErrorClass {
+        match self {
+            MeshMtlsDialError::PinnedPeer(err) => err.error_class(),
+            MeshMtlsDialError::MissingCrossClusterSni
+            | MeshMtlsDialError::MissingCrossClusterTrustDomain => {
+                crate::retry::ErrorClass::ConnectionPoolError
+            }
+        }
+    }
+}
+
+/// Resolved peer-verification + SNI parameters for a Sidecar mesh-mTLS dial,
+/// derived ONCE from a target's mesh tags and shared by every mesh-mTLS dispatch
+/// surface — HTTP/gRPC (`proxy_to_backend_mesh_mtls`) and WebSocket
+/// (`open_ws_connect_tunnel`) — so the in-cluster-pinned vs cross-cluster
+/// (east-west) split cannot drift between paths (issue #2010).
+///
+/// The two shapes:
+/// - **In-cluster** (default): the destination workload identity is PINNED from
+///   `mesh.spiffe_id` (mandatory; absent/corrupt fails closed) and the SNI is
+///   the dial host (no override, no trust-domain scope).
+/// - **Cross-cluster** (`mesh.cross_cluster`): the SNI-passthrough east-west
+///   gateway LB-picks the destination workload, so NO pod SPIFFE is pinned
+///   (`expected_peer = None`); verification is scoped to the remote
+///   `mesh.trust_domain` and the ClientHello SNI is overridden to the
+///   destination service FQDN (`mesh.eastwest_sni`). Both are mandatory —
+///   a missing one fails closed.
+#[derive(Debug)]
+pub struct MeshMtlsDialPlan<'a> {
+    /// Whether this is a cross-cluster east-west dial.
+    pub cross_cluster: bool,
+    /// Pinned destination workload identity (in-cluster) or `None`
+    /// (cross-cluster: the gateway LB-picks the workload).
+    pub expected_peer: Option<SpiffeId>,
+    /// Remote trust domain verification is scoped to (cross-cluster only);
+    /// `None` in-cluster (the pinned peer already constrains the domain).
+    pub expected_trust_domain: Option<TrustDomain>,
+    /// ClientHello SNI override = the destination service FQDN (cross-cluster
+    /// only); `None` in-cluster (SNI = the dial host). Borrowed from the target
+    /// tag to avoid a per-dispatch allocation.
+    pub sni_override: Option<&'a str>,
+}
+
+impl<'a> MeshMtlsDialPlan<'a> {
+    /// Resolve the dial plan for `target`, or a fail-closed [`MeshMtlsDialError`].
+    /// Callers map the error to their own protocol-appropriate refusal (a 502 on
+    /// the HTTP path, a boxed error that fails the WebSocket upgrade closed) —
+    /// never a plaintext fallback.
+    pub fn resolve(target: &'a UpstreamTarget) -> Result<Self, MeshMtlsDialError> {
+        if target_mesh_mtls_cross_cluster(target) {
+            // Cross-cluster: SNI override THEN trust domain, both mandatory (same
+            // order the HTTP dispatch path checked them inline).
+            let sni_override = target_mesh_mtls_eastwest_sni(target)
+                .ok_or(MeshMtlsDialError::MissingCrossClusterSni)?;
+            let trust_domain = target_mesh_mtls_cross_cluster_trust_domain(target)
+                .ok_or(MeshMtlsDialError::MissingCrossClusterTrustDomain)?;
+            Ok(Self {
+                cross_cluster: true,
+                expected_peer: None,
+                expected_trust_domain: Some(trust_domain),
+                sni_override: Some(sni_override),
+            })
+        } else {
+            let expected_peer =
+                target_mesh_mtls_expected_peer(target).map_err(MeshMtlsDialError::PinnedPeer)?;
+            Ok(Self {
+                cross_cluster: false,
+                expected_peer: Some(expected_peer),
+                expected_trust_domain: None,
+                sni_override: None,
+            })
+        }
+    }
+}
+
 /// Upper bound on retired-generation records kept while waiting for their
 /// drain timers. With `FERRUM_MESH_SVID_ROTATION_DRAIN_SECONDS=0` no drain
 /// task ever consumes the records, so the registry must be capped or a
@@ -783,8 +916,14 @@ impl MeshMtlsConnectionPool {
     /// listener (`auto`, advertises `SETTINGS_ENABLE_CONNECT_PROTOCOL`) treats it
     /// as a client-originated WebSocket upgrade and bridges it to the local app.
     /// The mTLS client certificate authenticates this gateway (no baggage,
-    /// `marker = None`). Fail-closed: a missing gateway SVID errors before the
-    /// dial, the dial PINS `expected_peer`, and a peer that never negotiated
+    /// `marker = None`). Peer verification follows the caller's resolved
+    /// [`MeshMtlsDialPlan`]: an IN-CLUSTER dial pins `expected_peer =
+    /// Some(id)` with no SNI override; a CROSS-CLUSTER east-west dial passes
+    /// `expected_peer = None` + `expected_trust_domain = Some(td)` +
+    /// `sni_override = Some(dest_fqdn)` so the ClientHello SNI names the
+    /// destination service (the remote gateway's passthrough routes on it) and
+    /// verification is trust-domain-scoped (issue #2010). Fail-closed: a missing
+    /// gateway SVID errors before the dial, and a peer that never negotiated
     /// Extended CONNECT errors before any stream is opened.
     #[allow(clippy::too_many_arguments)]
     pub async fn open_ws_connect_tunnel(
@@ -796,7 +935,9 @@ impl MeshMtlsConnectionPool {
         mtls_port: u16,
         authority: &str,
         path_and_query: &str,
-        expected_peer: &SpiffeId,
+        expected_peer: Option<&SpiffeId>,
+        expected_trust_domain: Option<&TrustDomain>,
+        sni_override: Option<&str>,
         ws_handshake_headers: &[(String, String)],
     ) -> Result<H2WsConnectTunnel, HbonePoolError> {
         // Fail closed when no gateway SVID is loaded — never dial a mesh peer
@@ -818,11 +959,13 @@ impl MeshMtlsConnectionPool {
             proxy,
             dial_host,
             mtls_port,
-            Some(expected_peer),
-            // In-cluster pinned-peer WebSocket CONNECT tunnel: no cross-cluster
-            // trust-domain scope / SNI override.
-            None,
-            None,
+            // In-cluster: `Some(peer)` pins the workload identity, no SNI/TD
+            // override. Cross-cluster: `None` peer + trust-domain scope + SNI
+            // override to the destination service FQDN (the plan the caller
+            // resolved via `MeshMtlsDialPlan`).
+            expected_peer,
+            expected_trust_domain,
+            sni_override,
             &pool_config,
             keepalive_override,
             None,
@@ -1451,6 +1594,124 @@ mod tests {
         ]);
         assert!(target_mesh_mtls_cross_cluster(&empty_sni));
         assert_eq!(target_mesh_mtls_eastwest_sni(&empty_sni), None);
+    }
+
+    // ── Shared mesh-mTLS dial plan (issue #2010) ────────────────────────────
+    //
+    // `MeshMtlsDialPlan::resolve` is the single source of truth the HTTP/gRPC
+    // dispatch (`proxy_to_backend_mesh_mtls`) and the WebSocket egress path
+    // (`open_ws_connect_tunnel`) both consult, so the in-cluster-pinned vs
+    // cross-cluster (east-west trust-domain-only + SNI-override) split cannot
+    // drift between transports.
+
+    #[test]
+    fn dial_plan_in_cluster_pins_peer_no_override() {
+        let target = target_with_tags(&[
+            (MESH_MTLS_TARGET_TAG, "true"),
+            (
+                MESH_SPIFFE_ID_TAG,
+                "spiffe://cluster.local/ns/default/sa/reviews",
+            ),
+        ]);
+        let plan = MeshMtlsDialPlan::resolve(&target).expect("in-cluster dial plan resolves");
+        assert!(!plan.cross_cluster);
+        assert_eq!(
+            plan.expected_peer.as_ref().map(|p| p.as_str()),
+            Some("spiffe://cluster.local/ns/default/sa/reviews"),
+            "in-cluster dial pins the destination workload identity"
+        );
+        assert!(
+            plan.expected_trust_domain.is_none(),
+            "in-cluster verification is constrained by the pinned peer, not a trust-domain scope"
+        );
+        assert_eq!(
+            plan.sni_override, None,
+            "in-cluster SNI is the dial host, never overridden"
+        );
+    }
+
+    #[test]
+    fn dial_plan_in_cluster_missing_pin_fails_closed() {
+        let target = target_with_tags(&[(MESH_MTLS_TARGET_TAG, "true")]);
+        match MeshMtlsDialPlan::resolve(&target) {
+            Err(MeshMtlsDialError::PinnedPeer(HbonePoolError::InvalidPeerSpiffeTag { .. })) => {}
+            other => panic!("missing pinned identity must fail closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dial_plan_cross_cluster_wellformed_uses_trust_domain_and_sni_override() {
+        let target = target_with_tags(&[
+            (MESH_MTLS_TARGET_TAG, "true"),
+            (MESH_CROSS_CLUSTER_TAG, "true"),
+            (MESH_EASTWEST_SNI_TAG, "svc-c.ferrum.svc.cluster.local"),
+            (MESH_TRUST_DOMAIN_TAG, "cluster-b.local"),
+        ]);
+        let plan = MeshMtlsDialPlan::resolve(&target).expect("cross-cluster dial plan resolves");
+        assert!(plan.cross_cluster);
+        assert!(
+            plan.expected_peer.is_none(),
+            "cross-cluster east-west LB-picks the destination; no pod SPIFFE is pinned"
+        );
+        assert_eq!(
+            plan.expected_trust_domain.as_ref().map(|td| td.as_str()),
+            Some("cluster-b.local"),
+            "verification is scoped to the remote trust domain"
+        );
+        assert_eq!(
+            plan.sni_override,
+            Some("svc-c.ferrum.svc.cluster.local"),
+            "the ClientHello SNI is overridden to the destination service FQDN"
+        );
+    }
+
+    #[test]
+    fn dial_plan_cross_cluster_missing_metadata_fails_closed() {
+        // Missing SNI (SNI checked first).
+        let no_sni = target_with_tags(&[
+            (MESH_MTLS_TARGET_TAG, "true"),
+            (MESH_CROSS_CLUSTER_TAG, "true"),
+            (MESH_TRUST_DOMAIN_TAG, "cluster-b.local"),
+        ]);
+        assert!(matches!(
+            MeshMtlsDialPlan::resolve(&no_sni),
+            Err(MeshMtlsDialError::MissingCrossClusterSni)
+        ));
+
+        // Empty SNI is treated as absent — never dial the gateway address as SNI.
+        let empty_sni = target_with_tags(&[
+            (MESH_MTLS_TARGET_TAG, "true"),
+            (MESH_CROSS_CLUSTER_TAG, "true"),
+            (MESH_EASTWEST_SNI_TAG, ""),
+            (MESH_TRUST_DOMAIN_TAG, "cluster-b.local"),
+        ]);
+        assert!(matches!(
+            MeshMtlsDialPlan::resolve(&empty_sni),
+            Err(MeshMtlsDialError::MissingCrossClusterSni)
+        ));
+
+        // SNI present, trust domain missing.
+        let no_td = target_with_tags(&[
+            (MESH_MTLS_TARGET_TAG, "true"),
+            (MESH_CROSS_CLUSTER_TAG, "true"),
+            (MESH_EASTWEST_SNI_TAG, "svc-c.ferrum.svc.cluster.local"),
+        ]);
+        assert!(matches!(
+            MeshMtlsDialPlan::resolve(&no_td),
+            Err(MeshMtlsDialError::MissingCrossClusterTrustDomain)
+        ));
+
+        // Unparseable trust domain is treated as absent (fail closed).
+        let bad_td = target_with_tags(&[
+            (MESH_MTLS_TARGET_TAG, "true"),
+            (MESH_CROSS_CLUSTER_TAG, "true"),
+            (MESH_EASTWEST_SNI_TAG, "svc-c.ferrum.svc.cluster.local"),
+            (MESH_TRUST_DOMAIN_TAG, "not a trust domain"),
+        ]);
+        assert!(matches!(
+            MeshMtlsDialPlan::resolve(&bad_td),
+            Err(MeshMtlsDialError::MissingCrossClusterTrustDomain)
+        ));
     }
 
     #[tokio::test]

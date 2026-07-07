@@ -1039,6 +1039,65 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
     (addr, handle)
 }
 
+/// gRPC backend that returns response HEADERS + one DATA frame, then ERRORS the
+/// response body before any TRAILERS frame (no `grpc-status`). hyper resets the
+/// response stream (RST_STREAM), so the gateway's buffered gRPC collection hits
+/// a frame-read error mid-collection with no terminal status anywhere.
+///
+/// This forces, deterministically, the exact gateway backend-exchange failure
+/// that issue #2041 hit intermittently under CI load ("stream completion
+/// observed before the trailers were flushed"), which the gateway renders
+/// through its gRPC backend-error arm.
+async fn start_grpc_backend_that_errors_after_data_frame()
+-> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let _ = stream.set_nodelay(true);
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let builder = Http2ServerBuilder::new(TokioExecutor::new());
+
+                let service = service_fn(move |_req: Request<Incoming>| async move {
+                    // One DATA frame, then a body error → hyper RST_STREAMs the
+                    // response before any TRAILERS frame, so the gateway sees a
+                    // frame-read error with no grpc-status collected.
+                    let frames: Vec<Result<Frame<Bytes>, std::io::Error>> = vec![
+                        Ok(Frame::data(Bytes::from_static(b"grpc-payload"))),
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "backend reset before trailers",
+                        )),
+                    ];
+                    let body = StreamBody::new(tokio_stream::iter(frames));
+
+                    let response = Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .body(body)
+                        .unwrap();
+                    Ok::<_, hyper::Error>(response)
+                });
+
+                let _ = builder.serve_connection(io, service).await;
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, handle)
+}
+
 /// Buffered gRPC writeback reconciliation:
 /// - a trailer key removed by a response hook (response_transformer `remove`)
 ///   must NOT be forwarded in the wire trailers;
@@ -1217,6 +1276,137 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
+    // The backend exchange can very rarely blip under heavy parallel CI load (a
+    // mid-response reset before the trailers reach the gateway). With the #2041
+    // fix that now surfaces — correctly — as a gRPC-Web UNAVAILABLE error rather
+    // than the success transform under test here, so retry a bounded number of
+    // times to keep this success-path assertion deterministic. A genuine
+    // transform regression fails on EVERY attempt (never embeds grpc-status: 0),
+    // so the retry cannot mask one. The gateway-error SHAPE for the blip is
+    // covered separately by `grpc_web_gateway_backend_error_is_grpc_web_shaped`.
+    let mut succeeded = false;
+    let mut status = 0u16;
+    let mut content_type: Option<String> = None;
+    let mut had_grpc_status_header = true;
+    let mut body_bytes: Vec<u8> = Vec::new();
+    let mut saw_native_trailers = false;
+
+    for _attempt in 0..5 {
+        let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+        let _ = stream.set_nodelay(true);
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        // Binary-mode gRPC-Web request: a single empty gRPC DATA frame
+        // (flag 0x00 + 4-byte zero length) so framing is valid end-to-end.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/grpc/my.Service/Unary")
+            .header("content-type", "application/grpc-web+proto")
+            .body(Full::new(Bytes::from_static(&[0u8, 0, 0, 0, 0])))
+            .unwrap();
+
+        let response = sender.send_request(req).await.expect("request send failed");
+        status = response.status().as_u16();
+        content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        had_grpc_status_header = response.headers().get("grpc-status").is_some();
+
+        body_bytes = Vec::new();
+        saw_native_trailers = false;
+        let mut body = response.into_body();
+        while let Some(frame_result) = body.frame().await {
+            let frame = frame_result.expect("response frame");
+            if let Some(data) = frame.data_ref() {
+                body_bytes.extend_from_slice(data);
+            }
+            if frame.is_trailers() {
+                saw_native_trailers = true;
+            }
+        }
+
+        // A successful backend exchange embeds the backend's true grpc-status: 0.
+        if body_bytes
+            .windows(b"grpc-status: 0".len())
+            .any(|w| w == b"grpc-status: 0")
+        {
+            succeeded = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert!(
+        succeeded,
+        "backend exchange never succeeded within retries \
+         (last content-type {content_type:?}, {} body bytes)",
+        body_bytes.len()
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        content_type.as_deref(),
+        Some("application/grpc-web+proto"),
+        "response content-type must be rewritten to the gRPC-Web variant"
+    );
+    assert!(
+        !had_grpc_status_header,
+        "terminal status must ride in the gRPC-Web body trailer frame, \
+         not the initial headers"
+    );
+    assert!(
+        !saw_native_trailers,
+        "gRPC-Web transformed responses must not emit native H2 trailers \
+         (status is already embedded as a gRPC-Web trailer frame in the body)"
+    );
+    // The appended gRPC-Web trailer frame is flagged 0x80.
+    assert!(
+        body_bytes.contains(&0x80),
+        "gRPC-Web body must contain a trailer frame (flag 0x80)"
+    );
+}
+
+/// #2041 regression: when the backend exchange FAILS gateway-side for a
+/// gRPC-Web request (here the backend resets mid-response, before any
+/// `grpc-status` trailer), the gateway must still emit a gRPC-Web-SHAPED error —
+/// `content-type: application/grpc-web+proto` with the terminal status in a
+/// gRPC-Web trailer frame in the body — NOT a raw `application/grpc`
+/// trailers-only response a browser client cannot read. Before the fix the
+/// gateway's gRPC backend-error arm returned `200 + application/grpc`, bypassing
+/// the `grpc_web` response transform; that was the intermittent `application/grpc`
+/// a gRPC-Web caller observed under CI load, reproduced here deterministically.
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_gateway_backend_error_is_grpc_web_shaped() {
+    let (backend_addr, _backend_handle) = start_grpc_backend_that_errors_after_data_frame().await;
+
+    let mut proxy = create_grpc_proxy("grpc-web-backend-error", "/grpc", backend_addr.port());
+    proxy.response_body_mode = ResponseBodyMode::Buffer;
+    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
+        plugin_config_id: "grpc-web-bridge".to_string(),
+    }];
+    let plugin = PluginConfig {
+        id: "grpc-web-bridge".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "grpc_web".to_string(),
+        enabled: true,
+        config: serde_json::json!({}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("grpc-web-backend-error".to_string()),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
     let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
     let _ = stream.set_nodelay(true);
     let io = TokioIo::new(stream);
@@ -1227,8 +1417,6 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
         let _ = conn.await;
     });
 
-    // Binary-mode gRPC-Web request: a single empty gRPC DATA frame
-    // (flag 0x00 + 4-byte zero length) so framing is valid end-to-end.
     let req = Request::builder()
         .method("POST")
         .uri("/grpc/my.Service/Unary")
@@ -1237,50 +1425,38 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
         .unwrap();
 
     let response = sender.send_request(req).await.expect("request send failed");
+
+    // gRPC errors ride HTTP 200.
     assert_eq!(response.status(), 200);
+    // The regression assertion: a gateway gRPC error for a gRPC-Web request must
+    // be rendered in the gRPC-Web content-type, not the raw backend value.
     assert_eq!(
         response
             .headers()
             .get("content-type")
             .and_then(|v| v.to_str().ok()),
         Some("application/grpc-web+proto"),
-        "response content-type must be rewritten to the gRPC-Web variant"
-    );
-    assert!(
-        response.headers().get("grpc-status").is_none(),
-        "terminal status must ride in the gRPC-Web body trailer frame, \
-         not the initial headers"
+        "a gateway gRPC error for a gRPC-Web request must use the gRPC-Web content-type, \
+         not raw application/grpc"
     );
 
-    let mut body_bytes: Vec<u8> = Vec::new();
-    let mut saw_native_trailers = false;
-    let mut body = response.into_body();
-    while let Some(frame_result) = body.frame().await {
-        let frame = frame_result.expect("response frame");
-        if let Some(data) = frame.data_ref() {
-            body_bytes.extend_from_slice(data);
-        }
-        if frame.is_trailers() {
-            saw_native_trailers = true;
-        }
-    }
-
-    assert!(
-        !saw_native_trailers,
-        "gRPC-Web transformed responses must not emit native H2 trailers \
-         (status is already embedded as a gRPC-Web trailer frame in the body)"
-    );
-    assert!(
-        body_bytes
-            .windows(b"grpc-status: 0".len())
-            .any(|w| w == b"grpc-status: 0"),
-        "gRPC-Web body must embed the backend's true trailing grpc-status \
-         in the appended trailer frame"
-    );
-    // The appended gRPC-Web trailer frame is flagged 0x80.
+    let body_bytes = response
+        .into_body()
+        .collect()
+        .await
+        .map(|c| c.to_bytes().to_vec())
+        .unwrap_or_default();
+    // The terminal status rides in a gRPC-Web trailer frame (flag 0x80) in the body.
     assert!(
         body_bytes.contains(&0x80),
-        "gRPC-Web body must contain a trailer frame (flag 0x80)"
+        "gRPC-Web error body must contain a trailer frame (flag 0x80)"
+    );
+    // UNAVAILABLE (14) is the gateway's gRPC status for a failed backend exchange.
+    assert!(
+        body_bytes
+            .windows(b"grpc-status: 14".len())
+            .any(|w| w == b"grpc-status: 14"),
+        "gRPC-Web error body must embed the gateway's grpc-status: 14 (UNAVAILABLE)"
     );
 }
 
