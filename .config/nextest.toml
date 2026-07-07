@@ -14,12 +14,14 @@
 #
 # Both families pass in isolation and when the shard is run serially, so this is
 # a test-harness resource-contention artifact (N independent gateways racing on
-# one box), NOT a single-gateway production race — throttling HTTP/3 test
-# concurrency removes the trigger without masking a product bug. This mirrors the
+# one box), NOT a single-gateway production race. The override below gives every
+# HTTP/3 test the whole nextest worker pool (`threads-required =
+# "num-test-threads"`) while also keeping the group at `max-threads = 1`, so no
+# other functional test runs beside the active QUIC gateway. This mirrors the
 # `data-plane` functional shard's `nextest_jobs: 1` serialization for its
 # exclusive-port races (see `.github/workflows/ci.yml`), but is surgical: only
-# HTTP/3 tests are serialized, so the rest of the `protocols` shard keeps running
-# fully parallel and the CI-time cost is limited to the few dozen H3 tests.
+# HTTP/3 tests are exclusive, so non-H3 protocol tests still run fully parallel
+# with each other.
 #
 # Scope note: most HTTP/3 tests are named with either `h3` or `http3`
 # (`scripted_backend_h3_tests`, `functional_h3_*`, `functional_protocol_h3_*`, the
@@ -54,3 +56,4 @@ http3-serial = { max-threads = 1 }
 [[profile.default.overrides]]
 filter = 'test(/h3/) or test(/http3/) or test(/capability/)'
 test-group = 'http3-serial'
+threads-required = "num-test-threads"
