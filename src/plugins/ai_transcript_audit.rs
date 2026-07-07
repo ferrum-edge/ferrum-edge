@@ -11,7 +11,12 @@
 //! Runs at priority `AI_TRANSCRIPT_AUDIT` (2979): after `ai_request_guard`
 //! (2975) so request-guard defaults/transforms are visible, and before
 //! `ai_semantic_cache` (2980) / `ai_federation` (2985) so cache hits and
-//! federated requests are still observable.
+//! federated requests are still observable. The audit candidate is staged in
+//! `before_proxy` over the prebuffered request body (so terminate-and-respond
+//! plugins downstream cannot consume the transaction unaudited, and so the
+//! proxy's response buffering / dispatch decisions can see the candidate
+//! markers), then refreshed with the final backend-visible body in
+//! `on_final_request_body_with_context` after request transforms ran.
 //!
 //! This plugin is **not** a security boundary on its own — it observes and
 //! redacts, it does not enforce. Pair it with `ai_prompt_shield`,
@@ -52,6 +57,15 @@ const RECORD_VERSION: u32 = 1;
 /// request that never reached the `log` hook). The common path removes staging
 /// at emit/log time, so this only guards pathological cases.
 const STAGING_SWEEP_THRESHOLD: usize = 512;
+
+/// Bytes dropped from the tail of a cap-truncated stream capture before
+/// redaction. A sensitive value split at the `max_stream_capture_bytes`
+/// boundary would otherwise leak its raw prefix (the truncated fragment no
+/// longer matches the full pattern). 256 bytes comfortably covers every
+/// built-in PII pattern's maximum match length (emails are <= 254 bytes by
+/// spec; SSN/credit-card/phone/IBAN are far shorter). Buffered bodies do not
+/// need this — they redact over the full payload before capping.
+const STREAM_REDACTION_TAIL_GUARD_BYTES: usize = 256;
 
 // Metadata keys written into `ctx.metadata` (small strings only — never bodies).
 // These flow into the transaction log via the summary metadata.
@@ -391,14 +405,36 @@ impl AiTranscriptAudit {
         let builtins = cfg_string_array(redaction_obj, "builtins", "redaction")?
             .unwrap_or_else(default_builtins);
         let custom = parse_custom_patterns(redaction_obj)?;
+        if mode == AuditMode::RedactedBody && builtins.is_empty() && custom.is_empty() {
+            // An explicitly emptied pattern set would make `redacted_body` a
+            // silent pass-through while the records still claim redaction —
+            // unredacted capture must go through the `full_body` opt-in.
+            return Err(
+                "ai_transcript_audit: mode 'redacted_body' with 'redaction.builtins: []' and no \
+                 'redaction.custom_patterns' would capture unredacted payloads; configure at \
+                 least one pattern, or use mode 'full_body' with 'allow_full_body: true' for \
+                 deliberate raw capture"
+                    .to_string(),
+            );
+        }
         let placeholder =
             cfg_str(redaction_obj, "placeholder", "redaction")?.unwrap_or("[REDACTED:{type}]");
         let hash_redacted = cfg_bool(redaction_obj, "hash_redacted_values", true, "redaction")?;
+        let hash_secret = cfg_str(redaction_obj, "hash_secret", "redaction")?;
+        if let Some(secret) = hash_secret
+            && secret.len() < 16
+        {
+            return Err(
+                "ai_transcript_audit: 'redaction.hash_secret' must be at least 16 characters"
+                    .to_string(),
+            );
+        }
         let redactor = PiiRedactor::from_config(
             &builtins,
             &custom,
             placeholder,
             hash_redacted,
+            hash_secret,
             "ai_transcript_audit",
         )?;
 
@@ -583,6 +619,119 @@ impl AiTranscriptAudit {
 
     fn shape_body(&self, raw: &[u8], max_bytes: usize) -> (Option<String>, bool) {
         shape_bytes(self.mode, &self.redactor, raw, max_bytes)
+    }
+
+    /// Classify `body` and stage the audit candidate: writes the
+    /// `ai_transcript_audit.*` request-side metadata and inserts the staging
+    /// entry keyed by the new `record_id`. `body` is the request body as
+    /// currently known (pre-transform in `before_proxy`, final in the
+    /// final-body hook fallback); callers have already checked the JSON
+    /// content-type.
+    fn stage_candidate(&self, ctx: &mut RequestContext, body: &[u8]) {
+        if body.is_empty() {
+            ctx.metadata
+                .insert(MD_CANDIDATE.to_string(), "false".to_string());
+            return;
+        }
+        let parsed: Option<Value> = serde_json::from_slice(body).ok();
+        let is_ai = parsed.as_ref().is_some_and(json_looks_like_ai_request);
+        if !is_ai {
+            ctx.metadata
+                .insert(MD_CANDIDATE.to_string(), "false".to_string());
+            return;
+        }
+
+        let record_id = uuid::Uuid::new_v4().to_string();
+        let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
+        let request_hash = sha256_hex(body);
+
+        ctx.metadata
+            .insert(MD_RECORD_ID.to_string(), record_id.clone());
+        ctx.metadata
+            .insert(MD_CANDIDATE.to_string(), "true".to_string());
+        ctx.metadata
+            .insert(MD_SAMPLE_HIT.to_string(), bool_str(sample_hit));
+        ctx.metadata
+            .insert(MD_REQUEST_HASH.to_string(), request_hash.clone());
+
+        // Force the response onto the stream-inspection path when streaming
+        // capture applies to this request. In `sampled` mode, only requests
+        // that won the sampling roll — or that a request-side guardrail
+        // already flagged — are teed; response-side guardrail hits and error
+        // statuses on un-sampled requests still emit records via the `log`
+        // fallback, just without a response body/hash (teeing every stream
+        // "just in case" would defeat sampled capture entirely).
+        let stream_wanted = match self.capture.streaming {
+            StreamingCapture::Off => false,
+            StreamingCapture::On => true,
+            StreamingCapture::Sampled => {
+                sample_hit || (self.sampling.always_on_guardrail && guardrail_fired(&ctx.metadata))
+            }
+        };
+        if stream_wanted {
+            ctx.metadata
+                .insert(MD_STREAM_MARKER.to_string(), "true".to_string());
+        }
+
+        let request_model = parsed.as_ref().and_then(extract_model);
+        let tool_names = if self.capture.tool_calls {
+            parsed.as_ref().map(extract_tool_names).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let (request_excerpt, request_truncated) = if self.capture.request {
+            self.shape_body(body, self.limits.max_request_bytes)
+        } else {
+            (None, false)
+        };
+
+        self.sweep_staging();
+        self.staging.insert(
+            record_id,
+            AuditStaging {
+                captured_at: Instant::now(),
+                request_excerpt,
+                request_truncated,
+                request_hash: Some(request_hash),
+                request_model,
+                tool_names,
+            },
+        );
+    }
+
+    /// Refresh an already-staged candidate with the FINAL backend-visible
+    /// request body (request transforms run after `before_proxy`, where the
+    /// candidate was staged). No-op when the body is unchanged, so the common
+    /// no-transform path costs one SHA-256 pass.
+    fn refresh_staged_request(&self, ctx: &mut RequestContext, body: &[u8]) {
+        let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
+            return;
+        };
+        let request_hash = sha256_hex(body);
+        if ctx
+            .metadata
+            .get(MD_REQUEST_HASH)
+            .is_some_and(|existing| *existing == request_hash)
+        {
+            return;
+        }
+        let parsed: Option<Value> = serde_json::from_slice(body).ok();
+        if let Some(mut staged) = self.staging.get_mut(&record_id) {
+            let (request_excerpt, request_truncated) = if self.capture.request {
+                self.shape_body(body, self.limits.max_request_bytes)
+            } else {
+                (None, false)
+            };
+            staged.request_excerpt = request_excerpt;
+            staged.request_truncated = request_truncated;
+            staged.request_hash = Some(request_hash.clone());
+            staged.request_model = parsed.as_ref().and_then(extract_model);
+            if self.capture.tool_calls {
+                staged.tool_names = parsed.as_ref().map(extract_tool_names).unwrap_or_default();
+            }
+        }
+        ctx.metadata
+            .insert(MD_REQUEST_HASH.to_string(), request_hash);
     }
 
     fn envelope_from_ctx(&self, ctx: &RequestContext, status: u16) -> EnvelopeOwned {
@@ -787,6 +936,19 @@ impl Plugin for AiTranscriptAudit {
         self.active
     }
 
+    /// The request body must be prebuffered before `before_proxy` so the
+    /// candidate is staged **before**:
+    /// - `before_proxy` terminators (`ai_federation`, `ai_semantic_cache`
+    ///   hits) consume it and short-circuit — their transactions must still
+    ///   be audited via the response/log hooks;
+    /// - the proxy's response stream-vs-buffer decision runs (it reads
+    ///   `ai_transcript_audit.candidate` via `should_buffer_response_body`);
+    /// - `forces_reqwest_dispatch` is evaluated ahead of backend dispatch (it
+    ///   reads the stream marker written during staging).
+    fn requires_request_body_before_before_proxy(&self) -> bool {
+        self.active
+    }
+
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         self.active
             && ctx.method == "POST"
@@ -794,6 +956,42 @@ impl Plugin for AiTranscriptAudit {
                 .headers
                 .get("content-type")
                 .is_some_and(|content_type| is_json_content_type(content_type))
+    }
+
+    async fn before_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if !self.active || ctx.metadata.contains_key(MD_CANDIDATE) {
+            return PluginResult::Continue;
+        }
+        let candidate_shape = ctx.method == "POST"
+            && ctx
+                .headers
+                .get("content-type")
+                .is_some_and(|content_type| is_json_content_type(content_type));
+        if !candidate_shape {
+            return PluginResult::Continue;
+        }
+        // The prebuffered body is stored as UTF-8 metadata; JSON is UTF-8 by
+        // definition, so a missing entry means the body was not prebuffered on
+        // this path (or is not valid JSON anyway) — leave classification to
+        // the final-body hook fallback. `remove`/re-insert avoids cloning the
+        // full body just to satisfy the borrow checker.
+        let Some(body) = ctx.metadata.remove("request_body") else {
+            return PluginResult::Continue;
+        };
+        self.stage_candidate(ctx, body.as_bytes());
+        ctx.metadata.insert("request_body".to_string(), body);
+        PluginResult::Continue
+    }
+
+    /// The proxy only routes the context-aware final-body hook to plugins that
+    /// advertise it; without this the context-free default would run instead
+    /// and no metadata/staging would ever be written on the H1/H2 path.
+    fn needs_final_request_body_context(&self) -> bool {
+        self.active
     }
 
     async fn on_final_request_body_with_context(
@@ -805,74 +1003,29 @@ impl Plugin for AiTranscriptAudit {
         if !self.active {
             return PluginResult::Continue;
         }
+        match ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
+            // Already classified as a non-candidate in `before_proxy`.
+            Some("false") => return PluginResult::Continue,
+            // Staged in `before_proxy`: request transforms may have changed
+            // the body since, so refresh the captured hash/excerpt with the
+            // final backend-visible bytes.
+            Some(_) => {
+                self.refresh_staged_request(ctx, body);
+                return PluginResult::Continue;
+            }
+            None => {}
+        }
+        // Fallback for paths where the body was not available before
+        // `before_proxy` (e.g. non-UTF-8 metadata skip above).
         let is_json = headers
             .get("content-type")
             .is_some_and(|content_type| is_json_content_type(content_type));
-        if !is_json || body.is_empty() {
+        if !is_json {
             ctx.metadata
                 .insert(MD_CANDIDATE.to_string(), "false".to_string());
             return PluginResult::Continue;
         }
-        let parsed: Option<Value> = serde_json::from_slice(body).ok();
-        let is_ai = parsed.as_ref().is_some_and(json_looks_like_ai_request);
-        if !is_ai {
-            ctx.metadata
-                .insert(MD_CANDIDATE.to_string(), "false".to_string());
-            return PluginResult::Continue;
-        }
-
-        let record_id = uuid::Uuid::new_v4().to_string();
-        let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
-        let request_hash = sha256_hex(body);
-
-        ctx.metadata
-            .insert(MD_RECORD_ID.to_string(), record_id.clone());
-        ctx.metadata
-            .insert(MD_CANDIDATE.to_string(), "true".to_string());
-        ctx.metadata
-            .insert(MD_SAMPLE_HIT.to_string(), bool_str(sample_hit));
-        ctx.metadata
-            .insert(MD_REQUEST_HASH.to_string(), request_hash.clone());
-
-        // Force the response onto the stream-inspection path when streaming
-        // capture might apply to this request.
-        let stream_wanted = match self.capture.streaming {
-            StreamingCapture::Off => false,
-            StreamingCapture::On => true,
-            StreamingCapture::Sampled => {
-                sample_hit || self.sampling.always_on_guardrail || self.sampling.always_on_error
-            }
-        };
-        if stream_wanted {
-            ctx.metadata
-                .insert(MD_STREAM_MARKER.to_string(), "true".to_string());
-        }
-
-        let request_model = parsed.as_ref().and_then(extract_model);
-        let tool_names = if self.capture.tool_calls {
-            parsed.as_ref().map(extract_tool_names).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let (request_excerpt, request_truncated) = if self.capture.request {
-            self.shape_body(body, self.limits.max_request_bytes)
-        } else {
-            (None, false)
-        };
-
-        self.sweep_staging();
-        self.staging.insert(
-            record_id,
-            AuditStaging {
-                captured_at: Instant::now(),
-                request_excerpt,
-                request_truncated,
-                request_hash: Some(request_hash),
-                request_model,
-                tool_names,
-            },
-        );
-
+        self.stage_candidate(ctx, body);
         PluginResult::Continue
     }
 
@@ -942,13 +1095,14 @@ impl Plugin for AiTranscriptAudit {
                 .insert(MD_SINK_STATUS.to_string(), "skipped".to_string());
             return PluginResult::Continue;
         }
-        if self.on_sink_error == SinkErrorPolicy::Reject
-            && !self.sink_healthy.load(Ordering::Relaxed)
-        {
-            ctx.metadata
-                .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
-            return reject_audit_unavailable();
-        }
+        // Fail-closed stance while the sink is unhealthy: the client request
+        // is rejected, but the record is still built and enqueued below. The
+        // background flush of those queued records is the recovery probe — a
+        // successful batch send flips `sink_healthy` back to true. Without
+        // this, one transient sink outage would reject audited traffic
+        // forever (nothing would ever enqueue, so nothing could ever flush).
+        let sink_unhealthy_reject = self.on_sink_error == SinkErrorPolicy::Reject
+            && !self.sink_healthy.load(Ordering::Relaxed);
 
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
@@ -963,23 +1117,19 @@ impl Plugin for AiTranscriptAudit {
             reason,
             Some(response_headers),
         );
-        match self.enqueue(record) {
-            SinkOutcome::Queued => {
-                ctx.metadata
-                    .insert(MD_SINK_STATUS.to_string(), "queued".to_string());
-                PluginResult::Continue
-            }
-            SinkOutcome::Dropped => {
-                ctx.metadata
-                    .insert(MD_SINK_STATUS.to_string(), "dropped".to_string());
-                PluginResult::Continue
-            }
-            SinkOutcome::Rejected => {
-                ctx.metadata
-                    .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
-                reject_audit_unavailable()
-            }
+        let status = match self.enqueue(record) {
+            SinkOutcome::Queued => "queued",
+            SinkOutcome::Dropped => "dropped",
+            SinkOutcome::Rejected => "rejected",
+        };
+        if sink_unhealthy_reject || status == "rejected" {
+            ctx.metadata
+                .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+            return reject_audit_unavailable();
         }
+        ctx.metadata
+            .insert(MD_SINK_STATUS.to_string(), status.to_string());
+        PluginResult::Continue
     }
 
     // ---- streaming (SSE) response capture ----
@@ -998,8 +1148,15 @@ impl Plugin for AiTranscriptAudit {
         response_status: u16,
         content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
+        // 2xx SSE is the normal capture path. Non-2xx SSE is teed too when
+        // `always_capture_on_error` is set — error transactions are exactly
+        // where operators asked for response evidence, and skipping the
+        // inspector here would leave the log fallback with request-side data
+        // only. (3xx SSE stays untouched: no error trigger, not a completion.)
+        let status_eligible = (200..300).contains(&response_status)
+            || (self.sampling.always_on_error && response_status >= 400);
         if self.capture.streaming == StreamingCapture::Off
-            || !(200..300).contains(&response_status)
+            || !status_eligible
             || !flag(&ctx.metadata, MD_STREAM_MARKER)
         {
             return None;
@@ -1152,8 +1309,20 @@ impl ResponseStreamInspector for AuditStreamInspector {
     async fn on_end(&mut self) -> ResponseStreamAction {
         let digest = std::mem::replace(&mut self.hasher, Sha256::new()).finalize();
         let response_hash = hex::encode(digest);
-        let (response_excerpt, _) =
-            shape_bytes(self.mode, &self.redactor, &self.accumulated, self.max_bytes);
+        // Unlike buffered bodies (which redact over the full payload before
+        // capping), a cap-truncated stream accumulator inherently cuts
+        // mid-payload; drop a pattern-sized tail before redaction so a value
+        // split at the capture boundary cannot leak its raw prefix.
+        let capture: &[u8] = if self.truncated && self.mode.redacts_body() {
+            let keep = self
+                .accumulated
+                .len()
+                .saturating_sub(STREAM_REDACTION_TAIL_GUARD_BYTES);
+            &self.accumulated[..keep]
+        } else {
+            &self.accumulated
+        };
+        let (response_excerpt, _) = shape_bytes(self.mode, &self.redactor, capture, self.max_bytes);
         if let Ok(mut guard) = self.slot.captured.lock() {
             *guard = Some(StreamCaptured {
                 response_excerpt,
@@ -1206,8 +1375,14 @@ fn reject_audit_unavailable() -> PluginResult {
     }
 }
 
-/// Cap `raw` to `max_bytes`, then (for `redacted_body`) redact PII. Returns the
-/// shaped excerpt (or `None` for non-body modes) and whether it was truncated.
+/// Shape a captured payload into an excerpt. Returns the shaped excerpt (or
+/// `None` for non-body modes) and whether it was truncated.
+///
+/// Ordering matters for `redacted_body`: redaction runs over the FULL buffered
+/// payload first and the redacted text is capped afterwards, so a sensitive
+/// value straddling the `max_bytes` boundary can never leak as an unmatched
+/// raw prefix. (`full_body` deliberately captures raw excerpts, so it caps
+/// first and skips the extra scan.)
 fn shape_bytes(
     mode: AuditMode,
     redactor: &PiiRedactor,
@@ -1217,15 +1392,32 @@ fn shape_bytes(
     if !mode.captures_body() {
         return (None, false);
     }
-    let truncated = raw.len() > max_bytes;
-    let capped = &raw[..raw.len().min(max_bytes)];
-    let text = String::from_utf8_lossy(capped);
+    let mut truncated = raw.len() > max_bytes;
     let shaped = if mode.redacts_body() {
-        redactor.redact(&text)
+        redactor.redact(&String::from_utf8_lossy(raw))
     } else {
-        text.into_owned()
+        String::from_utf8_lossy(&raw[..raw.len().min(max_bytes)]).into_owned()
+    };
+    let shaped = if shaped.len() > max_bytes {
+        truncated = true;
+        truncate_on_char_boundary(shaped, max_bytes)
+    } else {
+        shaped
     };
     (Some(shaped), truncated)
+}
+
+/// Truncate `text` to at most `max_bytes` without splitting a UTF-8 code point.
+fn truncate_on_char_boundary(mut text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
+    text
 }
 
 fn consumer_name(ctx: &RequestContext) -> Option<String> {

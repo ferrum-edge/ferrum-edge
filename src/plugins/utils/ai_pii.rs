@@ -11,7 +11,12 @@
 //! plugins keep their existing detection/redaction state machines and only
 //! source their pattern strings from [`builtin_pii_pattern`].
 
+use hmac::{Hmac, KeyInit, Mac};
 use regex::{Regex, RegexSet};
+use ring::rand::SecureRandom;
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Built-in PII pattern definitions shared by the AI plugins.
 ///
@@ -46,24 +51,37 @@ struct CompiledPattern {
 /// A compiled set of PII patterns plus a redaction policy.
 ///
 /// Redaction replaces every match with a placeholder. When `hash_values` is set
-/// the placeholder embeds a stable SHA-256 prefix of the matched substring
-/// (`[REDACTED:<type>:<sha256-prefix>]`) so identical values stay correlatable
-/// across records without the raw value ever being stored.
+/// the placeholder embeds a **keyed** HMAC-SHA256 prefix of the matched
+/// substring (`[REDACTED:<type>:<hmac-prefix>]`) so identical values stay
+/// correlatable across records without the raw value ever being stored. The
+/// digest is keyed because most built-in PII value spaces (SSNs, US phone
+/// numbers, credit cards) are small enough to brute-force offline from an
+/// unsalted hash: with `hash_secret` the key is operator-provided (hashes are
+/// stable fleet-wide); without it a per-process random key is generated, so
+/// hashes correlate only within one process lifetime but can never be
+/// dictionary-attacked by whoever holds the exported records.
 pub struct PiiRedactor {
     patterns: Vec<CompiledPattern>,
     detection_set: RegexSet,
     hash_values: bool,
+    /// Pre-keyed HMAC template, cloned per match (keying an HMAC is the
+    /// expensive part; cloning the initialized state is cheap).
+    hash_mac: HmacSha256,
 }
 
 impl PiiRedactor {
     /// Build a redactor from built-in pattern names and custom `(name, regex)`
     /// pairs. Unknown built-ins and regexes that fail to compile are hard
     /// errors, prefixed with `plugin_name`.
+    ///
+    /// `hash_secret` keys the redacted-value digest. `None` generates a
+    /// per-process random key (see the type-level docs for the trade-off).
     pub fn from_config(
         builtins: &[String],
         custom: &[(String, String)],
         placeholder_template: &str,
         hash_values: bool,
+        hash_secret: Option<&str>,
         plugin_name: &str,
     ) -> Result<Self, String> {
         let mut patterns = Vec::with_capacity(builtins.len() + custom.len());
@@ -104,10 +122,29 @@ impl PiiRedactor {
                 format!("{plugin_name}: failed to build redaction detection set: {error}")
             })?;
 
+        let key: Vec<u8> = match hash_secret {
+            Some(secret) => secret.as_bytes().to_vec(),
+            None => {
+                let mut key = vec![0u8; 32];
+                ring::rand::SystemRandom::new()
+                    .fill(&mut key)
+                    .map_err(|_| {
+                        format!("{plugin_name}: failed to generate a random redaction hash key")
+                    })?;
+                key
+            }
+        };
+        let hash_mac = HmacSha256::new_from_slice(&key).map_err(|_| {
+            // HMAC-SHA256 accepts keys of any length, so this is unreachable in
+            // practice; surface it as a config error rather than panic.
+            format!("{plugin_name}: failed to initialize the redaction hash key")
+        })?;
+
         Ok(Self {
             patterns,
             detection_set,
             hash_values,
+            hash_mac,
         })
     }
 
@@ -127,11 +164,14 @@ impl PiiRedactor {
                 .regex
                 .replace_all(&result, |caps: &regex::Captures| {
                     if hash_values {
-                        // Never emit the raw matched value — only a stable hash
-                        // prefix so identical secrets remain correlatable.
+                        // Never emit the raw matched value — only a keyed-hash
+                        // prefix so identical secrets remain correlatable
+                        // without being brute-forceable offline.
+                        let mut mac = self.hash_mac.clone();
+                        mac.update(caps[0].as_bytes());
                         format!(
                             "[REDACTED:{name}:{}]",
-                            sha256_hex_prefix(caps[0].as_bytes(), 12)
+                            hex_prefix(&mac.finalize().into_bytes(), 12)
                         )
                     } else {
                         placeholder.to_string()
@@ -145,11 +185,9 @@ impl PiiRedactor {
     }
 }
 
-/// Lowercase hex of the first `hex_chars` characters of the SHA-256 of `bytes`.
-fn sha256_hex_prefix(bytes: &[u8], hex_chars: usize) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut hex = hex::encode(digest);
+/// Lowercase hex of the first `hex_chars` characters of `bytes`.
+fn hex_prefix(bytes: &[u8], hex_chars: usize) -> String {
+    let mut hex = hex::encode(bytes);
     hex.truncate(hex_chars);
     hex
 }

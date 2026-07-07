@@ -77,6 +77,7 @@ const PLUGIN_NAMES_UNDER_TEST: &[&str] = &[
     "ai_response_guard",
     "ai_semantic_cache",
     "ai_semantic_firewall",
+    "ai_transcript_audit",
     "ai_federation",
     "mcp_gateway",
     "a2a_gateway",
@@ -1535,6 +1536,9 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
                 "endpoint": "http://127.0.0.1:9/v1/embeddings",
                 "request_timeout_ms": 100
             }
+        }),
+        "ai_transcript_audit" => json!({
+            "sink": {"endpoint_url": "http://localhost:9200/audit"}
         }),
         "ai_federation" => {
             json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})

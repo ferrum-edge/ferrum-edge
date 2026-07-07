@@ -14096,7 +14096,7 @@ components:
               default: true
             streaming_response:
               default: false
-              description: "Capture SSE response excerpts. false | true | 'sampled'. When enabled for a candidate request the response is forced onto the stream-inspection path."
+              description: "Capture SSE response excerpts. false | true | 'sampled'. true forces every candidate request's response onto the stream-inspection path. 'sampled' tees only requests that win the sampling.rate roll (or that a request-side guardrail already flagged when always_capture_on_guardrail is set); error responses and response-side guardrail hits on un-sampled streaming requests still emit records via the log fallback, but without a response body/hash — teeing every stream to cover those late triggers would defeat sampled capture."
               oneOf:
                 - type: boolean
                 - type: string
@@ -14131,6 +14131,7 @@ components:
               description: "Records-per-minute cap (0 = unlimited). Over the cap, records are dropped (never reject traffic)."
         redaction:
           type: object
+          description: "PII redaction policy for captured excerpts. In mode=redacted_body the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would capture unredacted payloads without the full_body opt-in)."
           properties:
             builtins:
               type: array
@@ -14155,7 +14156,11 @@ components:
             hash_redacted_values:
               type: boolean
               default: true
-              description: "Replace matches with [REDACTED:<type>:<sha256-prefix>] so identical values stay correlatable without storing the raw value."
+              description: "Replace matches with [REDACTED:<type>:<hmac-prefix>] so identical values stay correlatable without storing the raw value. The digest is a keyed HMAC-SHA256 (see hash_secret), never a plain hash — most PII value spaces are small enough to brute-force offline from an unsalted digest."
+            hash_secret:
+              type: string
+              minLength: 16
+              description: "Optional key for the redacted-value HMAC. When set (min 16 chars), hashed placeholders are stable across gateway instances and restarts, so values correlate fleet-wide. When omitted, each process generates a random key at startup: placeholders still correlate within one process lifetime but never across restarts/instances, and can never be dictionary-attacked from exported records. Treat like any other secret — do not log or export it."
         limits:
           type: object
           properties:
@@ -14214,7 +14219,7 @@ components:
               type: string
               enum: [warn, reject]
               default: warn
-              description: "warn: log and drop on permanent sink failure. reject: fail buffered-response requests 503 while the sink is unhealthy (transient/transport failures)."
+              description: "warn: log and drop on permanent sink failure. reject: fail buffered-response requests 503 while the sink is unhealthy (transient/transport failures). Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
         privacy:
           type: object
           properties:

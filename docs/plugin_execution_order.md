@@ -306,7 +306,7 @@ Given all built-in plugins enabled, the execution order is:
 | 40 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, on_final_response_body |
 | 41 | `ai_semantic_firewall` | 2968 | before_proxy, on_response_body |
 | 42 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 43 | `ai_transcript_audit` | 2979 | on_final_request_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated, log |
+| 43 | `ai_transcript_audit` | 2979 | before_proxy, on_final_request_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated, log |
 | 44 | `ai_semantic_cache` | 2980 | before_proxy, after_proxy, on_final_response_body |
 | 45 | `ai_federation` | 2985 | before_proxy |
 | 46 | `mcp_gateway` | 2992 | before_proxy, transform_request_body |
