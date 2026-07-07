@@ -78,6 +78,7 @@ const PLUGIN_NAMES_UNDER_TEST: &[&str] = &[
     "ai_semantic_cache",
     "ai_semantic_firewall",
     "ai_federation",
+    "ai_stream_router",
     "mcp_gateway",
     "a2a_gateway",
     "ws_message_size_limiting",
@@ -1539,6 +1540,15 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         "ai_federation" => {
             json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})
         }
+        "ai_stream_router" => json!({
+            "providers": [{
+                "name": "test",
+                "provider_type": "openai",
+                "endpoint": "https://api.openai.com/v1/chat/completions",
+                "api_key": "sk-test",
+                "model_patterns": ["gpt-*"]
+            }]
+        }),
         "mcp_gateway" => json!({
             "mode": "transparent_proxy",
             "endpoint": {"path": "/mcp"},
