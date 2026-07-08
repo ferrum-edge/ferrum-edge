@@ -14100,7 +14100,7 @@ components:
           type: string
           enum: [metadata_only, redacted_body, full_body, hash_only]
           default: redacted_body
-          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256 (a mostly-predictable payload around one secret would make an unkeyed digest an offline brute-force oracle)."
+          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts — SSE captures whose frames are all parseable OpenAI chat.completion.chunk frames export a reassembled per-choice completion-text excerpt (annotated sse_reassembled) so PII split across streaming deltas cannot evade per-frame redaction; other SSE shapes keep the per-frame-redacted raw frames. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256 (a mostly-predictable payload around one secret would make an unkeyed digest an offline brute-force oracle)."
         allow_full_body:
           type: boolean
           default: false
@@ -14152,7 +14152,7 @@ components:
               description: "Records-per-minute cap (0 = unlimited). Over the cap, records are dropped (never reject traffic)."
         redaction:
           type: object
-          description: "PII redaction policy for captured excerpts. In mode=redacted_body the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would capture unredacted payloads without the full_body opt-in)."
+          description: "PII redaction policy for captured excerpts. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt)."
           properties:
             builtins:
               type: array
@@ -14240,7 +14240,7 @@ components:
               type: string
               enum: [warn, reject]
               default: warn
-              description: "warn: log and drop on permanent sink failure. reject: fail buffered-response requests 503 while the sink is unhealthy (transient/transport failures). Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
+              description: "warn: log and drop on permanent sink failure. reject: fail buffered-response requests 503 while the sink is unhealthy. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
         privacy:
           type: object
           properties:

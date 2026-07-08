@@ -158,9 +158,13 @@ async fn name_priority_and_protocols() {
     assert_eq!(plugin.priority(), priority::AI_TRANSCRIPT_AUDIT);
     assert_eq!(plugin.priority(), 2924);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    // Registration matches the observability sink family (http/tcp/udp_logging,
+    // prometheus_metrics): a construction failure omits the plugin rather than
+    // rejecting startup/reload. Runtime fail-closed capture is the explicit
+    // on_sink_error/on_buffer_full=reject config, not registration policy.
     assert_eq!(
         plugin_failure_policy("ai_transcript_audit"),
-        Some(PluginFailurePolicy::FailClosed)
+        Some(PluginFailurePolicy::OptionalFailOpen)
     );
     assert_eq!(
         plugin.warmup_hostnames(),
@@ -1490,14 +1494,19 @@ async fn empty_redaction_pattern_set_rejected_in_redacted_mode() {
     let err = AiTranscriptAudit::new(&config, loopback_http_client())
         .err()
         .expect("expected config rejection");
-    assert!(err.contains("unredacted payloads"), "got: {err}");
-
-    // Non-body modes never emit excerpts, so an empty pattern set is fine.
-    let metadata_only = config_with_sink(
-        "https://audit.example.com/x",
-        json!({ "mode": "metadata_only", "redaction": { "builtins": [] } }),
+    assert!(
+        err.contains("unredacted request-derived data"),
+        "got: {err}"
     );
-    assert!(AiTranscriptAudit::new(&metadata_only, loopback_http_client()).is_ok());
+
+    // hash_only exports no request-derived strings (envelope + keyed hashes
+    // only), so an empty pattern set is fine there. metadata_only is covered
+    // by metadata_only_empty_redaction_patterns_rejected.
+    let hash_only = config_with_sink(
+        "https://audit.example.com/x",
+        json!({ "mode": "hash_only", "redaction": { "builtins": [] } }),
+    );
+    assert!(AiTranscriptAudit::new(&hash_only, loopback_http_client()).is_ok());
 }
 
 #[tokio::test]
@@ -1513,8 +1522,9 @@ async fn hash_secret_keys_the_redacted_value_digest() {
     assert!(err.contains("hash_secret"), "got: {err}");
 
     // Same secret => stable placeholders; different secret => different
-    // digests; no secret => per-process random key (still not the unsalted
-    // SHA-256 an offline attacker could brute-force).
+    // digests; no secret => process-wide random key shared by every redactor
+    // built without a secret (correlatable within the process, still not the
+    // unsalted SHA-256 an offline attacker could brute-force).
     let builtins = vec!["ssn".to_string()];
     let make = |secret: Option<&str>| {
         PiiRedactor::from_config(&builtins, &[], "[REDACTED:{type}]", true, secret, "test")
@@ -1528,7 +1538,16 @@ async fn hash_secret_keys_the_redacted_value_digest() {
     let text = "ssn 123-45-6789";
     assert_eq!(keyed_a.redact(text), keyed_b.redact(text));
     assert_ne!(keyed_a.redact(text), keyed_other.redact(text));
-    assert_ne!(random_a.redact(text), random_b.redact(text));
+    assert_eq!(
+        random_a.redact(text),
+        random_b.redact(text),
+        "fallback-keyed placeholders must correlate across constructions in one process"
+    );
+    assert_ne!(
+        keyed_a.redact(text),
+        random_a.redact(text),
+        "the fallback key must not collide with an operator-provided secret"
+    );
     for output in [keyed_a.redact(text), random_a.redact(text)] {
         assert!(!output.contains("123-45-6789"), "got: {output}");
         assert!(output.contains("[REDACTED:ssn:"), "got: {output}");
@@ -1607,42 +1626,11 @@ async fn sink_recovers_after_transient_outage_with_reject_policy() {
     );
 }
 
-#[tokio::test]
-async fn permanent_collector_4xx_does_not_poison_reject_policy_sink() {
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(401))
-        .mount(&server)
-        .await;
-    let endpoint = format!("{}/ingest", server.uri());
-    let config = json!({
-        "sink": {
-            "type": "http",
-            "endpoint_url": endpoint,
-            "batch_size": 1,
-            "flush_interval_ms": 100,
-            "max_retries": 0,
-            "on_sink_error": "reject"
-        }
-    });
-    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
-    let headers = json_headers();
-
-    for _ in 0..10 {
-        let mut ctx = make_ctx();
-        plugin
-            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
-            .await;
-        let result = plugin
-            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
-            .await;
-        assert!(
-            matches!(result, PluginResult::Continue),
-            "permanent collector 4xx should be discarded, not treated as a sink outage"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-}
+// NOTE (review round 6): the former `permanent_collector_4xx_does_not_poison_
+// reject_policy_sink` test asserted that a non-retryable collector 4xx keeps
+// the sink healthy — the exact silent-record-loss hole the round-6 review
+// flagged. Superseded by `non_retryable_sink_4xx_marks_sink_unhealthy_under_
+// reject` and `sink_2xx_after_4xx_restores_health` below.
 
 #[tokio::test]
 async fn harvests_guardrail_and_token_metadata() {
@@ -2421,22 +2409,58 @@ async fn body_hashes_are_keyed_hmac_not_plain_sha256() {
 }
 
 #[tokio::test]
-async fn body_hashes_without_secret_use_per_process_random_key() {
-    // No hash_secret: each plugin instance derives its own random key, so the
-    // same body hashes differently across instances — proving the digest is
-    // keyed rather than a stable public SHA-256.
+async fn body_hashes_without_secret_use_process_wide_random_key() {
+    // No hash_secret: the fallback key is a PROCESS-WIDE random key shared by
+    // every redactor built without a secret (config reloads, multiple
+    // instances), so the same body hashes identically across instances — the
+    // documented "correlatable within one process lifetime" guarantee — while
+    // still never being a stable public SHA-256.
     let resp_body: &[u8] = br#"{"ok":true}"#;
     let first = capture_roundtrip(json!({}), resp_body).await;
     let second = capture_roundtrip(json!({}), resp_body).await;
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
-    assert_ne!(
+    assert_eq!(
         first[0]["request_hash"], second[0]["request_hash"],
-        "per-process random key must produce instance-local hashes"
+        "fallback-keyed hashes must correlate across instances within one process"
     );
     use sha2::Digest;
     let plain_request = hex::encode(sha2::Sha256::digest(ai_request_body()));
-    assert_ne!(first[0]["request_hash"], json!(plain_request));
+    assert_ne!(
+        first[0]["request_hash"],
+        json!(plain_request),
+        "fallback-keyed hash must not be an unkeyed SHA-256 oracle"
+    );
+}
+
+#[tokio::test]
+async fn pii_redactor_fallback_key_is_shared_across_constructions() {
+    // Direct check on the shared utility: two separately-constructed redactors
+    // without a hash_secret (a config reload) must produce identical keyed
+    // hashes and identical hashed placeholders.
+    let make = || {
+        PiiRedactor::from_config(
+            &["ssn".to_string()],
+            &[],
+            "[REDACTED:{type}]",
+            true,
+            None,
+            "test",
+        )
+        .expect("valid redactor")
+    };
+    let first = make();
+    let second = make();
+    assert_eq!(
+        first.keyed_hash_hex(b"payload"),
+        second.keyed_hash_hex(b"payload"),
+        "process-wide fallback key must survive redactor reconstruction"
+    );
+    assert_eq!(
+        first.redact("ssn 123-45-6789"),
+        second.redact("ssn 123-45-6789"),
+        "hashed placeholders must stay correlatable across reconstructions"
+    );
 }
 
 #[tokio::test]
@@ -2673,5 +2697,363 @@ async fn request_guardrail_after_staging_tees_unsampled_stream() {
         no_override
             .response_stream_inspector(&ctx2, 200, Some("text/event-stream"))
             .is_none()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review round 6: content-type re-pin gate, non-retryable sink 4xx health,
+// SSE delta reassembly, metadata_only empty-redactor, staged sampled flag,
+// deferred sink_status
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stream_true_request_is_not_re_pinned_by_content_type_hook() {
+    // `should_buffer_response_body_for_content_type` also runs when the proxy
+    // re-evaluates buffer-vs-stream for a released response. It must honor the
+    // same per-request `stream: true` opt-out as `should_buffer_response_body`,
+    // or a co-located plugin's released non-SSE JSON stream response gets
+    // re-pinned to the buffered path.
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let headers = json_headers();
+    let mut ctx = make_ctx();
+    let stream_body =
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, stream_body)
+        .await;
+    assert!(
+        !plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            200,
+            &headers,
+        ),
+        "stream:true request must never be re-pinned to buffered by the content-type hook"
+    );
+
+    // A non-stream candidate still buffers a JSON response via this hook.
+    let mut ctx2 = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx2, &headers, ai_request_body())
+        .await;
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx2,
+        Some("application/json"),
+        200,
+        &headers,
+    ));
+}
+
+#[tokio::test]
+async fn non_retryable_sink_4xx_marks_sink_unhealthy_under_reject() {
+    // A collector returning a non-retryable non-2xx (e.g. 401 from an expired
+    // token) passes through the shared batch helper as Ok (batch discarded, no
+    // retry) — but every record was lost, so under on_sink_error=reject the
+    // sink must go unhealthy and subsequent buffered-response requests must be
+    // rejected rather than flow unaudited.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let config = json!({
+        "sink": {
+            "type": "http",
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "on_sink_error": "reject"
+        }
+    });
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    let headers = json_headers();
+    let mut saw_reject = false;
+    for _ in 0..100 {
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        let result = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        if matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ) {
+            assert_eq!(
+                ctx.metadata
+                    .get("ai_transcript_audit.sink_status")
+                    .map(String::as_str),
+                Some("rejected")
+            );
+            saw_reject = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        saw_reject,
+        "a 401-discarding collector must flip the sink unhealthy and reject audited traffic"
+    );
+}
+
+#[tokio::test]
+async fn sink_2xx_after_4xx_restores_health() {
+    // Recovery stays on the probe model: once the collector answers 2xx again,
+    // the flushed probe records flip sink_healthy back and rejects stop.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(403))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let config = json!({
+        "sink": {
+            "type": "http",
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "on_sink_error": "reject"
+        }
+    });
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    let headers = json_headers();
+    let mut saw_reject = false;
+    let mut recovered = false;
+    for _ in 0..100 {
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        let result = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        match result {
+            PluginResult::Reject { .. } => saw_reject = true,
+            PluginResult::Continue if saw_reject => {
+                recovered = true;
+                break;
+            }
+            _ => {}
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        saw_reject,
+        "the initial 403 must reject at least one request"
+    );
+    assert!(
+        recovered,
+        "a successful batch send must restore sink health and stop the rejects"
+    );
+}
+
+#[tokio::test]
+async fn sse_pii_split_across_deltas_is_redacted_in_reassembled_excerpt() {
+    // PII split across `delta.content` fragments evades per-frame regexes; in
+    // redacted_body mode the exported excerpt must be the redaction of the
+    // REASSEMBLED per-choice completion text.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    // The SSN 123-45-6789 is split so no single frame matches the regex.
+    let chunks: [&[u8]; 4] = [
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"your ssn is 123-\"}}]}\n\n",
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"45-67\"}}]}\n\n",
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"89 ok\"}}]}\n\n",
+        b"data: [DONE]\n\n",
+    ];
+    let mut total = 0u64;
+    for chunk in chunks {
+        let _ = inspector.on_chunk(chunk).await;
+        total += chunk.len() as u64;
+    }
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(total))
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let excerpt = records[0]["response_body"].as_str().expect("excerpt");
+    assert!(
+        !excerpt.contains("123-45-6789") && !excerpt.contains("45-67"),
+        "split-delta SSN must not survive reassembled redaction: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("[REDACTED:ssn:"),
+        "reassembled excerpt must carry the redaction placeholder: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("sse_reassembled"),
+        "SSE excerpt must be annotated as reassembled completion text: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("your ssn is"),
+        "non-PII completion text must survive reassembly: {excerpt}"
+    );
+}
+
+#[tokio::test]
+async fn non_openai_sse_capture_keeps_per_frame_redacted_fallback() {
+    // Frames that are not uniformly parseable OpenAI chunks keep the raw
+    // per-frame-redacted excerpt (documented residual): whole-frame PII is
+    // still redacted, and the frames are exported as captured.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    // Anthropic-style event frames: no object=chat.completion.chunk.
+    let chunk: &[u8] =
+        b"data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"ssn 123-45-6789\"}}\n\n";
+    let _ = inspector.on_chunk(chunk).await;
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(chunk.len() as u64))
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let excerpt = records[0]["response_body"].as_str().expect("excerpt");
+    assert!(
+        !excerpt.contains("sse_reassembled"),
+        "non-OpenAI frames must not claim reassembly: {excerpt}"
+    );
+    assert!(
+        !excerpt.contains("123-45-6789"),
+        "whole-frame PII must still be redacted per-frame: {excerpt}"
+    );
+    assert!(excerpt.contains("content_block_delta"), "got: {excerpt}");
+}
+
+#[tokio::test]
+async fn metadata_only_empty_redaction_patterns_rejected() {
+    // metadata_only still exports the request-derived model/tool_names through
+    // the redactor, so an explicitly emptied pattern set is rejected there too.
+    // hash_only exports no request-derived strings and stays exempt.
+    let base = json!({
+        "mode": "metadata_only",
+        "redaction": { "builtins": [] }
+    });
+    let err = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", base),
+        loopback_http_client(),
+    )
+    .err()
+    .expect("metadata_only with an empty pattern set must be rejected");
+    assert!(err.contains("metadata_only"), "got: {err}");
+    assert!(err.contains("full_body"), "got: {err}");
+
+    let hash_only = json!({
+        "mode": "hash_only",
+        "redaction": { "builtins": [] }
+    });
+    assert!(
+        AiTranscriptAudit::new(
+            &config_with_sink("https://audit.example.com/x", hash_only),
+            loopback_http_client(),
+        )
+        .is_ok(),
+        "hash_only exports no request-derived strings; empty patterns stay allowed"
+    );
+}
+
+#[tokio::test]
+async fn sampled_flag_is_written_at_staging_for_streamed_and_request_only() {
+    // The roll is known at staging: request-only configs and streamed
+    // responses (which never reach the buffered response hook) must still
+    // carry the documented `sampled` transaction-log field.
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    // rate defaults to 1.0, so the roll always wins.
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sampled")
+            .map(String::as_str),
+        Some("true"),
+        "sampled must be stamped at staging, not only on the buffered response path"
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_transcript_audit.sampled"),
+        ctx.metadata.get("ai_transcript_audit.sample_hit"),
+        "at staging the sampled flag is exactly the roll"
+    );
+}
+
+#[tokio::test]
+async fn unsampled_buffered_retention_stamps_deferred_sink_status() {
+    // rate 0, buffered 2xx, no overrides: staging is retained for a possible
+    // later-validator error emission via the log fallback, so the stamped
+    // sink_status must be the non-terminal `deferred`, not a terminal
+    // `skipped` that would lie if the fallback later emits.
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "sampling": { "rate": 0.0 } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("deferred")
     );
 }

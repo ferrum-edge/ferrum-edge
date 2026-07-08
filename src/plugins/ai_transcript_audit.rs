@@ -418,17 +418,25 @@ impl AiTranscriptAudit {
         let builtins = cfg_string_array(redaction_obj, "builtins", "redaction")?
             .unwrap_or_else(default_builtins);
         let custom = parse_custom_patterns(redaction_obj)?;
-        if mode == AuditMode::RedactedBody && builtins.is_empty() && custom.is_empty() {
-            // An explicitly emptied pattern set would make `redacted_body` a
+        if matches!(mode, AuditMode::RedactedBody | AuditMode::MetadataOnly)
+            && builtins.is_empty()
+            && custom.is_empty()
+        {
+            // An explicitly emptied pattern set would make the redactor a
             // silent pass-through while the records still claim redaction —
-            // unredacted capture must go through the `full_body` opt-in.
-            return Err(
-                "ai_transcript_audit: mode 'redacted_body' with 'redaction.builtins: []' and no \
-                 'redaction.custom_patterns' would capture unredacted payloads; configure at \
-                 least one pattern, or use mode 'full_body' with 'allow_full_body: true' for \
-                 deliberate raw capture"
-                    .to_string(),
-            );
+            // unredacted capture must go through the `full_body` opt-in. This
+            // covers every mode that exports request-derived strings through
+            // the redactor: `redacted_body` (body excerpts + `model`/
+            // `tool_names`) and `metadata_only` (`model`/`tool_names`).
+            // `hash_only` exports no request-derived strings (envelope +
+            // keyed hashes only), so it is exempt.
+            return Err(format!(
+                "ai_transcript_audit: mode '{}' with 'redaction.builtins: []' and no \
+                 'redaction.custom_patterns' would export unredacted request-derived data; \
+                 configure at least one pattern, or use mode 'full_body' with \
+                 'allow_full_body: true' for deliberate raw capture",
+                mode.as_str()
+            ));
         }
         let placeholder =
             cfg_str(redaction_obj, "placeholder", "redaction")?.unwrap_or("[REDACTED:{type}]");
@@ -676,6 +684,13 @@ impl AiTranscriptAudit {
             .insert(MD_CANDIDATE.to_string(), "true".to_string());
         ctx.metadata
             .insert(MD_SAMPLE_HIT.to_string(), bool_str(sample_hit));
+        // `sampled` carries the sampling ROLL (matching the exported record's
+        // `sampled` field), which is fully known here at staging time — write
+        // it now so request-only configs and streamed responses (which never
+        // reach the buffered response hook) still log it. The buffered path
+        // re-confirms the same value.
+        ctx.metadata
+            .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
         ctx.metadata
             .insert(MD_REQUEST_HASH.to_string(), request_hash.clone());
         // `stream: true` means an SSE response is expected; record it so the
@@ -1221,12 +1236,23 @@ impl Plugin for AiTranscriptAudit {
 
     fn should_buffer_response_body_for_content_type(
         &self,
-        _ctx: &RequestContext,
+        ctx: &RequestContext,
         content_type: Option<&str>,
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
         if !self.capture.response {
+            return false;
+        }
+        // Mirror `should_buffer_response_body`'s per-request `stream: true`
+        // opt-out. This hook also runs when the proxy re-evaluates
+        // buffer-vs-stream for a released response
+        // (`refine_stream_response_for_content_type`); without the same gate,
+        // a co-located plugin's released non-SSE JSON stream response would be
+        // re-pinned to the buffered path — defeating the never-buffer-
+        // `stream: true` decision and risking the buffered-size-cap failure it
+        // exists to avoid.
+        if flag(&ctx.metadata, MD_STREAM_REQUEST) {
             return false;
         }
         // Buffer JSON AI responses here; SSE goes down the streaming inspector
@@ -1311,8 +1337,14 @@ impl Plugin for AiTranscriptAudit {
             // re-evaluates `always_capture_on_error` against the final
             // client-visible status and is the only path that can emit that
             // plugin-generated error. Discarding staging here would drop it.
+            // The stamped status is deliberately non-terminal: `log()` runs
+            // after the summary metadata was captured and cannot rewrite it,
+            // so a terminal "skipped" would lie whenever the fallback later
+            // emits. `deferred` = no record was emitted at response time, but
+            // one may still be emitted via the log fallback — correlate by
+            // `record_id` against the collector.
             ctx.metadata
-                .insert(MD_SINK_STATUS.to_string(), "skipped".to_string());
+                .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
             return PluginResult::Continue;
         }
         // A response hook is emitting now, so consume the staging entry to keep
@@ -1650,16 +1682,25 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<()
         .http_client
         .execute(request, "ai_transcript_audit")
         .await;
-    let result = match response {
-        Ok(resp) => handle_http_batch_response("ai_transcript_audit", entry_count, Ok(resp)),
-        Err(err) => handle_http_batch_response("ai_transcript_audit", entry_count, Err(err)),
-    };
-    if result.is_ok() {
-        cfg.sink_healthy.store(true, Ordering::Relaxed);
-    } else {
-        cfg.sink_healthy.store(false, Ordering::Relaxed);
+    // Sink health is derived from the raw collector response, NOT from the
+    // shared `handle_http_batch_response` result: that helper treats a
+    // non-retryable non-2xx (401/403/413, e.g. an expired ${AUDIT_TOKEN}) as a
+    // discarded-but-Ok batch so the other logging sinks do not retry it, but
+    // for this plugin every record in that batch was silently lost — under
+    // `on_sink_error: reject` the sink must go unhealthy so audited traffic
+    // stops flowing unaudited. Recovery keeps the existing probe model: the
+    // next successful batch send flips `sink_healthy` back to true.
+    match response {
+        Ok(resp) => {
+            cfg.sink_healthy
+                .store(resp.status().is_success(), Ordering::Relaxed);
+            handle_http_batch_response("ai_transcript_audit", entry_count, Ok(resp))
+        }
+        Err(err) => {
+            cfg.sink_healthy.store(false, Ordering::Relaxed);
+            handle_http_batch_response("ai_transcript_audit", entry_count, Err(err))
+        }
     }
-    result
 }
 
 // ---- free helpers ----
@@ -1713,11 +1754,86 @@ fn redact_body_decoded_json_strings(redactor: &PiiRedactor, raw: &[u8]) -> Strin
         serde_json::to_string(&json)
             .map(|serialized| redactor.redact(&serialized))
             .unwrap_or_else(|_| redactor.redact(&String::from_utf8_lossy(raw)))
+    } else if let Some(mut reassembled) = reassemble_openai_sse_deltas(raw) {
+        // OpenAI-chunk SSE capture: per-frame redaction would miss PII split
+        // across `delta.content` fragments (each frame carries an unmatched
+        // piece), so the exported excerpt is the redaction of the REASSEMBLED
+        // per-choice completion text, not the raw frames.
+        redact_json_value_strings(redactor, &mut reassembled);
+        serde_json::to_string(&reassembled)
+            .map(|serialized| redactor.redact(&serialized))
+            .unwrap_or_else(|_| redactor.redact(&String::from_utf8_lossy(raw)))
     } else if let Some(redacted_sse) = redact_sse_json_frames(redactor, raw) {
         redacted_sse
     } else {
         redactor.redact(&String::from_utf8_lossy(raw))
     }
+}
+
+/// Reassemble captured OpenAI `chat.completion.chunk` SSE frames into
+/// per-choice completion text (`choices[].delta.content`, keyed by choice
+/// `index`, concatenated in frame order), so redaction runs over the full
+/// completion instead of per-frame fragments a split PII value would evade.
+///
+/// Returns the annotated excerpt object
+/// `{"sse_reassembled": true, "object": "chat.completion.chunk",
+///   "completion_text": {"<choice index>": "<text>"}}`, or `None` when the
+/// frames are not uniformly parseable OpenAI chunks (or carry no
+/// `delta.content` at all) — callers then fall back to per-frame redaction of
+/// the raw frames.
+fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
+    let text = std::str::from_utf8(raw).ok()?;
+    let mut per_choice: BTreeMap<u64, String> = BTreeMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = rest.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        // Every data frame must be a parseable OpenAI chunk; anything else
+        // (Anthropic events, provider-specific shapes, partial/corrupt JSON)
+        // keeps the raw-frame fallback rather than exporting a lossy guess.
+        let frame: Value = serde_json::from_str(payload).ok()?;
+        if frame.get("object").and_then(Value::as_str) != Some("chat.completion.chunk") {
+            return None;
+        }
+        let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
+            continue;
+        };
+        for choice in choices {
+            let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
+            if let Some(content) = choice
+                .get("delta")
+                .and_then(|delta| delta.get("content"))
+                .and_then(Value::as_str)
+            {
+                per_choice.entry(index).or_default().push_str(content);
+            }
+        }
+    }
+    if per_choice.is_empty() {
+        // Valid chunks but no text deltas (e.g. a tool-call-only stream):
+        // reassembly would export an empty excerpt and drop the tool-call
+        // frames, so keep the per-frame capture.
+        return None;
+    }
+    let mut completion_text = serde_json::Map::with_capacity(per_choice.len());
+    for (index, content) in per_choice {
+        completion_text.insert(index.to_string(), Value::String(content));
+    }
+    let mut annotated = serde_json::Map::with_capacity(3);
+    annotated.insert("sse_reassembled".to_string(), Value::Bool(true));
+    annotated.insert(
+        "object".to_string(),
+        Value::String("chat.completion.chunk".to_string()),
+    );
+    annotated.insert(
+        "completion_text".to_string(),
+        Value::Object(completion_text),
+    );
+    Some(Value::Object(annotated))
 }
 
 fn redact_json_value_strings(redactor: &PiiRedactor, value: &mut Value) {

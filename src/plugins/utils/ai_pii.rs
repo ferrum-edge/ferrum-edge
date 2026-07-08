@@ -11,12 +11,35 @@
 //! plugins keep their existing detection/redaction state machines and only
 //! source their pattern strings from [`builtin_pii_pattern`].
 
+use std::sync::OnceLock;
+
 use hmac::{Hmac, KeyInit, Mac};
 use regex::{Regex, RegexSet};
 use ring::rand::SecureRandom;
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
+
+/// Process-wide random HMAC key used when no `hash_secret` is configured.
+///
+/// Generated once per process and shared by every [`PiiRedactor`] built
+/// without a secret, so the documented "hashes correlate within one process
+/// lifetime" guarantee holds across config reloads and multiple plugin
+/// instances — a per-construction key would silently break correlation on
+/// every reload. Never logged or exported.
+fn fallback_hmac_key(plugin_name: &str) -> Result<&'static [u8; 32], String> {
+    static FALLBACK_KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    if let Some(key) = FALLBACK_KEY.get() {
+        return Ok(key);
+    }
+    let mut key = [0u8; 32];
+    ring::rand::SystemRandom::new()
+        .fill(&mut key)
+        .map_err(|_| format!("{plugin_name}: failed to generate a random redaction hash key"))?;
+    // Two concurrent constructions may both generate; `get_or_init` makes one
+    // winner and both callers use the stored key.
+    Ok(FALLBACK_KEY.get_or_init(|| key))
+}
 
 /// Built-in PII pattern definitions shared by the AI plugins.
 ///
@@ -57,9 +80,11 @@ struct CompiledPattern {
 /// digest is keyed because most built-in PII value spaces (SSNs, US phone
 /// numbers, credit cards) are small enough to brute-force offline from an
 /// unsalted hash: with `hash_secret` the key is operator-provided (hashes are
-/// stable fleet-wide); without it a per-process random key is generated, so
-/// hashes correlate only within one process lifetime but can never be
-/// dictionary-attacked by whoever holds the exported records.
+/// stable fleet-wide); without it a process-wide random key is used (see
+/// [`fallback_hmac_key`] — shared by every redactor built without a secret,
+/// across config reloads and plugin instances), so hashes correlate within one
+/// process lifetime but can never be dictionary-attacked by whoever holds the
+/// exported records.
 pub struct PiiRedactor {
     patterns: Vec<CompiledPattern>,
     detection_set: RegexSet,
@@ -122,19 +147,11 @@ impl PiiRedactor {
                 format!("{plugin_name}: failed to build redaction detection set: {error}")
             })?;
 
-        let key: Vec<u8> = match hash_secret {
-            Some(secret) => secret.as_bytes().to_vec(),
-            None => {
-                let mut key = vec![0u8; 32];
-                ring::rand::SystemRandom::new()
-                    .fill(&mut key)
-                    .map_err(|_| {
-                        format!("{plugin_name}: failed to generate a random redaction hash key")
-                    })?;
-                key
-            }
+        let key: &[u8] = match hash_secret {
+            Some(secret) => secret.as_bytes(),
+            None => fallback_hmac_key(plugin_name)?,
         };
-        let hash_mac = HmacSha256::new_from_slice(&key).map_err(|_| {
+        let hash_mac = HmacSha256::new_from_slice(key).map_err(|_| {
             // HMAC-SHA256 accepts keys of any length, so this is unreachable in
             // practice; surface it as a config error rather than panic.
             format!("{plugin_name}: failed to initialize the redaction hash key")
