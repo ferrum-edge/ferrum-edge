@@ -184,9 +184,16 @@ struct StreamSlot {
     /// `None` on abnormal termination, which the terminated hook treats as a
     /// truncated, body-omitted capture.
     captured: Mutex<Option<StreamCaptured>>,
-    /// Set when a later stream inspector terminates after this inspector already
-    /// saw backend bytes. In that case our captured body/hash no longer represent
-    /// the final client-visible stream, so the terminated hook omits them.
+    /// Set when a later stream inspector *cuts* the stream (`Terminate`) after
+    /// this inspector already accumulated backend bytes. A downstream cut means
+    /// the client received a truncated/blocked stream, so the prefix we captured
+    /// was never fully delivered — the terminated hook omits the body/hash and
+    /// treats the cut as a guardrail signal. A downstream inspector that merely
+    /// *reformats* chunks without cutting is deliberately NOT flagged: this
+    /// plugin captures the backend/provider-emitted transcript (the ground truth
+    /// of what the model returned), not a gateway's post-transform rewrite, so a
+    /// complete provider stream stays a valid record even when a downstream
+    /// normalizer (e.g. `ai_stream_router`) rewrites the client-visible bytes.
     downstream_terminated: AtomicBool,
 }
 
@@ -1055,6 +1062,17 @@ impl Plugin for AiTranscriptAudit {
         }
         match ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
             Some("true") => true,
+            // `before_proxy` classified the pre-transform body as non-AI. This
+            // decision is locked in before `on_final_request_body_with_context`
+            // could re-stage a candidate that a later request-body transformer
+            // (ordered after priority 2924) turned into an AI payload, so such a
+            // request's *buffered* response body is not captured. That is a
+            // deliberate tradeoff: buffering every JSON POST response instead
+            // would re-introduce the over-buffering of ordinary non-AI traffic a
+            // prior review flagged. The transaction is still audited request-side
+            // via the `log` fallback, and streaming capture is unaffected —
+            // `streaming = true` marks every JSON-shaped POST for stream
+            // inspection in `before_proxy` regardless of AI classification.
             Some("false") => false,
             _ => {
                 ctx.method == "POST"
@@ -1090,7 +1108,18 @@ impl Plugin for AiTranscriptAudit {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.capture.response {
+        // `capture.response` gates buffered *JSON* responses. A buffered SSE body
+        // can still reach this hook when streaming capture is enabled but the
+        // proxy (or another plugin) buffered the event stream instead of
+        // streaming it — the streaming inspector never ran, so this is the only
+        // path left to attach the response transcript. Honor the streaming
+        // policy (`response_body_capture_allowed` already permits SSE) even when
+        // buffered JSON capture is off.
+        let buffered_sse_capture = self.capture.streaming != StreamingCapture::Off
+            && response_headers
+                .get("content-type")
+                .is_some_and(|content_type| is_event_stream(content_type));
+        if !self.capture.response && !buffered_sse_capture {
             return PluginResult::Continue;
         }
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
@@ -1199,13 +1228,16 @@ impl Plugin for AiTranscriptAudit {
         response_status: u16,
         content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
-        // 2xx SSE is the normal capture path. Non-2xx SSE is teed too when
-        // `always_capture_on_error` is set — error transactions are exactly
-        // where operators asked for response evidence, and skipping the
-        // inspector here would leave the log fallback with request-side data
+        // 2xx SSE is the normal capture path. A non-2xx SSE is teed too when the
+        // record will emit anyway — either `always_capture_on_error` is set, or
+        // the request won the sampling roll (`emit_decision` emits on `sampled`
+        // regardless of status). Error transactions are exactly where operators
+        // asked for response evidence, and skipping the inspector for a record
+        // that still emits would leave the `log` fallback with request-side data
         // only. (3xx SSE stays untouched: no error trigger, not a completion.)
         let status_eligible = (200..300).contains(&response_status)
-            || (self.sampling.always_on_error && response_status >= 400);
+            || (response_status >= 400
+                && (self.sampling.always_on_error || flag(&ctx.metadata, MD_SAMPLE_HIT)));
         if self.capture.streaming == StreamingCapture::Off
             || !status_eligible
             || !flag(&ctx.metadata, &self.stream_marker_key())
@@ -1322,6 +1354,15 @@ impl Plugin for AiTranscriptAudit {
             return;
         }
         let envelope = self.envelope_from_summary(summary);
+        // Response body/hash are `None` here: `TransactionSummary` carries no
+        // body, and this fallback is the only emission path for a transaction
+        // whose response never reached a response-body hook — notably a
+        // `before_proxy` short-circuit that returns a non-2xx `RejectBinary`
+        // (e.g. `ai_federation` surfacing a provider 4xx/5xx error), since the
+        // synthetic response-body hooks only run for 2xx short-circuits. The
+        // record still captures the request side plus status and guardrail
+        // metadata; capturing those provider error bodies too would need a
+        // body-carrying reject hook in the proxy core, out of scope here.
         let record = self.build_record(
             &record_id,
             envelope,
