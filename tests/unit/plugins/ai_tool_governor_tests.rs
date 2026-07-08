@@ -1513,8 +1513,13 @@ fn streaming_marked_requests_still_buffer_json_fallbacks() {
     // An earlier plugin's `ai_request_streaming` marker (or an SSE Accept
     // header) must not opt the response out of buffering pre-header: the
     // backend may answer with plain JSON tool_calls. Content-type refinement
-    // releases only genuine event streams back to the stream path.
-    let plugin = make(json!({ "tools": { "kubectl.apply": { "action": "deny" } } }));
+    // releases only genuine event streams — and only when streaming inspection
+    // is enabled so a live inspector will govern them — back to the stream
+    // path.
+    let plugin = make(json!({
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "response_tool_calls": true, "streaming_response_tool_calls": true }
+    }));
 
     let mut ctx = create_test_context();
     ctx.metadata
@@ -3242,9 +3247,11 @@ fn content_type_hook_keeps_ambiguous_labels_buffered() {
     assert!(buffered(Some("text/html")));
     assert!(buffered(Some("text/plain")));
     assert!(buffered(None));
-    // Genuine SSE stays on the streaming path (stream inspector or
-    // buffered-SSE governance own it).
-    assert!(!buffered(Some("text/event-stream")));
+    // With streaming inspection DISABLED no live SSE inspector exists, so an
+    // SSE label stays buffered too: buffered-SSE governance handles real SSE
+    // and the JSON-shape fallback catches Chat Completions JSON a transform
+    // relabeled `text/event-stream`.
+    assert!(buffered(Some("text/event-stream")));
     // Framed gRPC / gRPC-Web wire frames are owned by other machinery.
     assert!(!buffered(Some("application/grpc")));
     assert!(!buffered(Some("application/grpc+proto")));
@@ -3298,6 +3305,8 @@ fn content_type_hook_keeps_ambiguous_labels_buffered() {
         200,
         &response_headers
     ));
+    // With streaming inspection ENABLED, a genuine SSE label is released to
+    // the streaming path where the live inspector attaches and governs it.
     assert!(
         !streaming_only.should_buffer_response_body_for_content_type(
             &streaming_ctx,
@@ -4154,5 +4163,357 @@ async fn final_request_body_refreshes_stream_model_for_approval() {
     );
     let (_out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
     assert!(!terminated, "approved call must not cut the stream");
+    server.verify().await;
+}
+
+// ---------------------------------------------------------------------------
+// Round 11 review fixes: encoded buffered SSE, undecodable relabeled encoded
+// bodies, mislabeled JSON under an SSE label, keepalive-prefixed SSE, buffered
+// SSE approval identity/correlation
+// ---------------------------------------------------------------------------
+
+fn sse_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    headers
+}
+
+/// An SSE-labeled buffered body carrying `Content-Encoding: gzip` must be
+/// DECODED before buffered-SSE governance: feeding compressed bytes into the
+/// extractor would find zero calls and record the compressed hash, letting the
+/// final re-check hash-skip denied deltas.
+#[tokio::test]
+async fn buffered_sse_gzip_encoded_denied_call_is_caught() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut headers = sse_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &headers,
+                &gzip(SSE_DENIED_TOOL_BODY.as_bytes()),
+            )
+            .await,
+        Some(502),
+    );
+
+    // Allowed calls decode and forward.
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &headers,
+                &gzip(SSE_ALLOWED_TOOL_BODY.as_bytes()),
+            )
+            .await,
+    );
+}
+
+/// An SSE-labeled buffered body with an encoding the governor cannot decode
+/// fails closed in enforce mode and forwards in dry-run (round-8 undecodable
+/// semantics).
+#[tokio::test]
+async fn buffered_sse_undecodable_encoding_fails_closed_enforce_only() {
+    let mut headers = sse_headers();
+    headers.insert("content-encoding".to_string(), "zstd".to_string());
+    let opaque = b"\x28\xb5\x2f\xfdopaque-zstd-bytes";
+
+    let enforce = make(json!({
+        "default_action": "deny",
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = create_test_context();
+    assert_reject(
+        enforce
+            .on_response_body(&mut ctx, 200, &headers, opaque)
+            .await,
+        Some(502),
+    );
+
+    let dry_run = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(
+        dry_run
+            .on_response_body(&mut ctx, 200, &headers, opaque)
+            .await,
+    );
+}
+
+/// Final re-check: an encoded governed 2xx that cannot be decoded for
+/// inspection fails closed in enforce mode even when its `Content-Type` was
+/// relabeled away from JSON (header-time buffering already treated that label
+/// as governable) — and forwards in dry-run. Framed gRPC stays out of scope,
+/// and a successfully-decoded non-JSON-shaped body still forwards.
+#[tokio::test]
+async fn final_response_undecodable_encoded_relabeled_body_fails_closed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+
+    // Unsupported encoding + relabeled content type.
+    let mut zstd_headers = HashMap::new();
+    zstd_headers.insert("content-type".to_string(), "text/plain".to_string());
+    zstd_headers.insert("content-encoding".to_string(), "zstd".to_string());
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &zstd_headers, b"\x28\xb5\x2f\xfdopaque")
+            .await,
+        Some(502),
+    );
+
+    // Corrupt gzip with a MISSING content type.
+    let mut gz_headers = HashMap::new();
+    gz_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &gz_headers, b"\x1f\x8b\x08corrupt")
+            .await,
+        Some(502),
+    );
+
+    // Framed gRPC wire frames are out of this plugin's scope even when encoded.
+    let mut grpc_headers = HashMap::new();
+    grpc_headers.insert("content-type".to_string(), "application/grpc".to_string());
+    grpc_headers.insert("content-encoding".to_string(), "zstd".to_string());
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &grpc_headers, b"\x28\xb5\x2f\xfdframe")
+            .await,
+    );
+
+    // A successfully-decoded non-JSON-shaped body still forwards.
+    let mut html_headers = HashMap::new();
+    html_headers.insert("content-type".to_string(), "text/html".to_string());
+    html_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &html_headers, &gzip(b"<html>ok</html>"))
+            .await,
+    );
+
+    // Dry-run forwards the undecodable body instead of rejecting.
+    let dry_run = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(
+        dry_run
+            .on_final_response_body(&mut ctx, 200, &zstd_headers, b"\x28\xb5\x2f\xfdopaque")
+            .await,
+    );
+}
+
+/// With streaming inspection DISABLED (no inspector will attach), an SSE label
+/// stays buffered and a Chat Completions JSON body relabeled
+/// `text/event-stream` is caught by the JSON-shape fallback instead of
+/// streaming past `on_response_body` ungoverned.
+#[tokio::test]
+async fn sse_labeled_json_body_with_streaming_disabled_is_buffered_and_governed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+
+    // Fix: the SSE label is no longer released when no inspector exists.
+    let ctx = create_test_context();
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &HashMap::new()
+    ));
+
+    let denied = response_with_tool_call("kubectl.apply", "{}");
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers(), &denied)
+            .await,
+        Some(502),
+    );
+
+    let allowed = response_with_tool_call("report.read", "{}");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers(), &allowed)
+            .await,
+    );
+}
+
+/// With streaming inspection ENABLED and the inspector attached, a JSON-shaped
+/// stream (mislabeled Chat Completions JSON under an SSE label) is held and
+/// governed at end-of-stream: a denied call is never leaked, an allowed body
+/// is released byte-for-byte.
+#[tokio::test]
+async fn streaming_inspector_governs_json_shaped_stream() {
+    let plugin = make(streaming_config(
+        json!({ "report.read": { "action": "allow" } }),
+        "deny",
+    ));
+
+    // Denied: split the JSON body across chunks; nothing may be forwarded.
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let denied = response_with_tool_call("kubectl.apply", "{\"target\":\"prod\"}");
+    let (first, rest) = denied.split_at(denied.len() / 2);
+    let (out, terminated) = drive_stream(&mut inspector, &[first, rest]).await;
+    assert!(terminated, "denied JSON-shaped stream must be cut");
+    let out_str = String::from_utf8_lossy(&out);
+    assert!(
+        !out_str.contains("kubectl.apply"),
+        "denied call leaked: {out_str}"
+    );
+
+    // Allowed: the held body is released unchanged at end-of-stream.
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let allowed = response_with_tool_call("report.read", "{}");
+    let (first, rest) = allowed.split_at(allowed.len() / 2);
+    let (out, terminated) = drive_stream(&mut inspector, &[first, rest]).await;
+    assert!(!terminated, "allowed JSON-shaped stream must not be cut");
+    assert_eq!(out, allowed, "allowed body must be released unchanged");
+}
+
+/// A `: ping` keepalive/comment prefix is a standard SSE prelude: the shape
+/// fallback must still classify the body as SSE and govern its tool calls.
+#[tokio::test]
+async fn keepalive_prefixed_sse_body_is_governed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let no_ct: HashMap<String, String> = HashMap::new();
+
+    let denied = format!(": ping\n\n{SSE_DENIED_TOOL_BODY}");
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &no_ct, denied.as_bytes())
+            .await,
+        Some(502),
+    );
+
+    let allowed = format!(": ping\n\n{SSE_ALLOWED_TOOL_BODY}");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &no_ct, allowed.as_bytes())
+            .await,
+    );
+}
+
+/// A benign post-approval transform of a buffered SSE body (an appended
+/// keepalive comment: hash changes, call identities do not) must NOT re-fire
+/// the approval webhook for the unchanged approved call — with
+/// `cache_ttl_seconds: 0` a re-fire could deny a one-shot approval.
+#[tokio::test]
+async fn buffered_sse_benign_transform_does_not_refire_approval() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+
+    let body = concat!(
+        "data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"deploy\",\"arguments\":\"{\\\"env\\\":\\\"prod\\\"}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+            .await,
+    ); // webhook #1 (approved)
+
+    // A later transform appends only a keepalive comment; the governed call
+    // identities are unchanged, so the final re-check must skip one-for-one.
+    let transformed = format!("{body}: keepalive\n\n");
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &sse_headers(), transformed.as_bytes())
+            .await,
+    );
+    server.verify().await;
+}
+
+/// Buffered-SSE approval correlation extracts the model the SSE FRAMES report
+/// when request metadata is absent (parity with the live inspector), so a
+/// decision for one model is never reused for another and the webhook payload
+/// carries the served model.
+#[tokio::test]
+async fn buffered_sse_frame_model_keys_distinct_approvals() {
+    let server = MockServer::start().await;
+    for model in ["gpt-4o", "gpt-5"] {
+        Mock::given(method("POST"))
+            .and(path("/approve"))
+            .and(body_string_contains(format!("\"model\":\"{model}\"")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 300 },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+
+    for model in ["gpt-4o", "gpt-5"] {
+        let frame = json!({
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": { "name": "deploy", "arguments": "{\"env\":\"prod\"}" }
+                    }]
+                }
+            }]
+        });
+        let body = format!("data: {frame}\n\ndata: [DONE]\n\n");
+        // No stream-model metadata: the frame-reported model must be used.
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+                .await,
+        );
+    }
     server.verify().await;
 }

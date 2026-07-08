@@ -56,8 +56,18 @@
 //! response redaction transform already ran), so a `redact_args` match there
 //! fails closed instead of forwarding the secret. On a governed request,
 //! ambiguously labeled 2xx responses (missing or non-JSON `Content-Type`,
-//! except genuine SSE and framed gRPC) stay buffered for inspection rather
-//! than being released to the streaming path — deliberate FailClosed posture.
+//! except framed gRPC) stay buffered for inspection rather than being
+//! released to the streaming path — deliberate FailClosed posture. A
+//! `text/event-stream` label is released to the streaming path ONLY when
+//! streaming inspection is enabled (a live SSE inspector will attach);
+//! otherwise it stays buffered so buffered-SSE governance covers real SSE and
+//! the JSON-shape fallback catches Chat Completions JSON a transform
+//! relabeled as SSE. Buffered SSE bodies that carry a `Content-Encoding` are
+//! DECODED first (the same gzip/br decode as the final re-check) so the
+//! governed hash and extracted calls always reflect the plaintext frames; an
+//! encoded governed 2xx that cannot be decoded for inspection (unsupported
+//! encoding, corrupt bytes, or decoded output past the cap) fails closed in
+//! enforce mode regardless of how its `Content-Type` was relabeled.
 //!
 //! Non-goals (MVP): it does not execute tools, manage MCP sessions, replace
 //! `mcp_gateway`/A2A routing, or implement an approval UI.
@@ -1383,12 +1393,12 @@ impl AiToolGovernor {
     /// is not available here — the redaction transform already ran — so a
     /// `redact_args` match fails closed (`redaction_unavailable = true`).
     async fn govern_final_response(&self, ctx: &mut RequestContext, json: &Value) -> PluginResult {
-        let (mut calls, ungovernable) = extract_response_tool_calls(json);
+        let (calls, ungovernable) = extract_response_tool_calls(json);
         // Parity with the streaming finalizer and the buffered-SSE path: an
         // entry the extractor cannot policy-check (a missing or non-string
         // name) fails closed in enforce mode and forwards in dry-run.
         if ungovernable {
-            return self.uninspectable_final_response(
+            return self.uninspectable_governed_response(
                 ctx,
                 "response contains a tool call that cannot be policy-checked (missing or non-string name)",
             );
@@ -1415,50 +1425,58 @@ impl AiToolGovernor {
         // unchanged siblings — no second approval webhook, and this plugin's
         // own `[REDACTED_TOOL_ARG:<name>]` redacted form (re-recorded after
         // redaction) is not re-matched as a blocked pattern.
+        let identities: Vec<String> = calls
+            .iter()
+            .map(|call| call_identity_hash(&corr, call))
+            .collect();
         let mut remaining = governed_call_counts(ctx);
-        if !remaining.is_empty() {
-            calls.retain(
-                |call| match remaining.get_mut(&call_identity_hash(&corr, call)) {
-                    Some(count) if *count > 0 => {
-                        *count -= 1;
-                        false
-                    }
-                    _ => true,
-                },
-            );
+        let mut to_govern: Vec<ToolCall> = Vec::new();
+        for (call, identity) in calls.into_iter().zip(identities.iter()) {
+            match remaining.get_mut(identity) {
+                Some(count) if *count > 0 => *count -= 1,
+                _ => to_govern.push(call),
+            }
         }
-        if calls.is_empty() {
-            return PluginResult::Continue;
+        if !to_govern.is_empty() {
+            let batch = self
+                .engine
+                .govern_calls(&corr, &to_govern, &ctx.plugin_http_call_ns, true)
+                .await;
+            self.write_metadata(ctx, &batch);
+            if batch.enforce_blocks {
+                debug!(
+                    target: "ai_tool_governor",
+                    decision = batch.overall_label,
+                    "rejecting response after transforms: {}",
+                    batch.deny_reason.as_deref().unwrap_or("blocked")
+                );
+                return self.reject(&batch);
+            }
         }
-        let batch = self
-            .engine
-            .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, true)
-            .await;
-        self.write_metadata(ctx, &batch);
-        if batch.enforce_blocks {
-            debug!(
-                target: "ai_tool_governor",
-                decision = batch.overall_label,
-                "rejecting response after transforms: {}",
-                batch.deny_reason.as_deref().unwrap_or("blocked")
-            );
-            return self.reject(&batch);
-        }
+        // Re-record the full identity multiset (skipped + freshly cleared) so
+        // a later re-check of this same call set — this path also runs from
+        // `on_response_body` for a decoded mislabeled-JSON body — skips
+        // one-for-one instead of re-firing approval webhooks.
+        record_governed_identities(ctx, &identities);
         PluginResult::Continue
     }
 
     /// Govern a fully-buffered `text/event-stream` response body. Reached when
-    /// the stream inspector did not attach — another buffering plugin or a
-    /// content-type-rewrite guard kept the SSE response on the buffered path —
-    /// so its accumulated tool calls are governed rather than forwarded
-    /// uninspected. Redaction is impossible on a buffered SSE body, so a
-    /// `redact_args` match fails closed (`redaction_unavailable = true`).
+    /// the stream inspector did not attach — streaming inspection is disabled
+    /// (this plugin then keeps SSE labels buffered), or another buffering
+    /// plugin / content-type-rewrite guard kept the SSE response on the
+    /// buffered path — so its accumulated tool calls are governed rather than
+    /// forwarded uninspected. Callers must pass DECODED bytes when the
+    /// response carried a `Content-Encoding` (the recorded hash must match the
+    /// decoded-hash comparison in the final re-check). Redaction is impossible
+    /// on a buffered SSE body, so a `redact_args` match fails closed
+    /// (`redaction_unavailable = true`).
     async fn govern_buffered_sse(&self, ctx: &mut RequestContext, body: &[u8]) -> PluginResult {
-        if !self.inspect.streaming_response_tool_calls || body.is_empty() {
+        if !self.inspect.any_buffered_response() || body.is_empty() {
             return PluginResult::Continue;
         }
         if body.len() > MAX_PARSE_BYTES {
-            return self.uninspectable_final_response(
+            return self.uninspectable_governed_response(
                 ctx,
                 "streamed response body exceeds the inspectable size limit",
             );
@@ -1472,40 +1490,75 @@ impl AiToolGovernor {
             GOVERNED_RESPONSE_HASH_KEY.to_string(),
             sha256_hex_bytes(body),
         );
-        let (calls, ungovernable) = extract_sse_tool_calls(body);
+        let extracted = extract_sse_tool_calls(body);
         // Mirror the live streaming finalizer: a buffered SSE tool call that
         // cannot be policy-checked (missing `function.name` or non-string
         // `function.arguments`) is ungovernable. Fail closed in enforce, forward
         // in dry-run.
-        if ungovernable {
-            return self.uninspectable_final_response(
+        if extracted.ungovernable {
+            return self.uninspectable_governed_response(
                 ctx,
                 "streamed response body contains an ungovernable tool call",
             );
         }
-        if calls.is_empty() {
+        if extracted.calls.is_empty() {
             return PluginResult::Continue;
         }
-        // SSE frames are not a single JSON body to shape-detect, so use the
-        // provider/model metadata a federation/streaming plugin recorded.
-        let provider = federation_provider(ctx);
-        let model = ctx.metadata.get(STREAM_MODEL_KEY).cloned();
+        // Correlation precedence mirrors the live inspector: the model a
+        // routing plugin / the request body recorded first, then the
+        // model/provider the SSE frames themselves report — so approval
+        // webhook and cache keys carry the served model/provider even when
+        // request metadata is absent, and a decision made for one
+        // model/provider is never reused for another.
+        let provider = federation_provider(ctx).or(extracted.provider);
+        let model = ctx
+            .metadata
+            .get(STREAM_MODEL_KEY)
+            .or_else(|| ctx.metadata.get("ai_model"))
+            .cloned()
+            .or(extracted.model);
         let corr = self.correlation(ctx, model, provider.as_deref());
-        let batch = self
-            .engine
-            .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, true)
-            .await;
-        self.write_metadata(ctx, &batch);
-        if batch.enforce_blocks {
-            return self.reject(&batch);
+        // Skip calls a previous pass already governed, consuming the recorded
+        // identities as a MULTISET (same semantics as the buffered-JSON final
+        // re-check): a later benign transform — an appended keepalive comment,
+        // a relabel, a reserialization — changes the body hash but not the
+        // call identities, so an unchanged approved call is not re-sent to the
+        // approval webhook (which a one-shot approval service or
+        // `cache_ttl_seconds: 0` would deny).
+        let identities: Vec<String> = extracted
+            .calls
+            .iter()
+            .map(|call| call_identity_hash(&corr, call))
+            .collect();
+        let mut remaining = governed_call_counts(ctx);
+        let mut to_govern: Vec<ToolCall> = Vec::new();
+        for (call, identity) in extracted.calls.into_iter().zip(identities.iter()) {
+            match remaining.get_mut(identity) {
+                Some(count) if *count > 0 => *count -= 1,
+                _ => to_govern.push(call),
+            }
         }
+        if !to_govern.is_empty() {
+            let batch = self
+                .engine
+                .govern_calls(&corr, &to_govern, &ctx.plugin_http_call_ns, true)
+                .await;
+            self.write_metadata(ctx, &batch);
+            if batch.enforce_blocks {
+                return self.reject(&batch);
+            }
+        }
+        // Record the full identity multiset (skipped + freshly cleared) so the
+        // final re-check skips unchanged calls one-for-one while a transform
+        // that injects, duplicates, or rewrites a call is still re-evaluated.
+        record_governed_identities(ctx, &identities);
         PluginResult::Continue
     }
 
-    /// A final response body that cannot be inspected (an unsupported or
-    /// undecodable content-encoding, or an oversized body a transform produced):
-    /// fail closed in enforce mode, forward in dry-run.
-    fn uninspectable_final_response(
+    /// A governed response body that cannot be inspected (an unsupported or
+    /// undecodable content-encoding, an ungovernable call, or an oversized
+    /// body): fail closed in enforce mode, forward in dry-run.
+    fn uninspectable_governed_response(
         &self,
         ctx: &mut RequestContext,
         reason: &'static str,
@@ -1815,10 +1868,10 @@ impl Plugin for AiToolGovernor {
     /// may answer a `stream: true` request with plain JSON
     /// `choices[].message.tool_calls[]`; opting out here would skip
     /// `on_response_body` entirely and bypass enforce-mode policy.
-    /// `should_buffer_response_body_for_content_type` downgrades ONLY a genuine
-    /// event stream (where the SSE inspector attaches when
-    /// `streaming_response_tool_calls` is enabled) and framed gRPC/gRPC-Web
-    /// back to the streaming path.
+    /// `should_buffer_response_body_for_content_type` downgrades ONLY an event
+    /// stream that the live SSE inspector will actually govern
+    /// (`streaming_response_tool_calls` enabled) and framed gRPC/gRPC-Web back
+    /// to the streaming path.
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // Buffer for explicit response inspection, or — for a streaming-only
         // config — only when the request was streaming (to catch its SSE-JSON
@@ -1844,13 +1897,26 @@ impl Plugin for AiToolGovernor {
         // every plugin declines the content type, so declining `text/html`,
         // `text/plain`, or a missing `Content-Type` here would let a mislabeled
         // Chat Completions JSON body containing a denied tool call stream to
-        // the client uninspected. Only two labels are released back to the
-        // streaming path: a genuine `text/event-stream` (the SSE stream
-        // inspector / buffered-SSE governance own that path) and framed
-        // gRPC/gRPC-Web (length-prefixed wire frames owned by the gRPC
-        // machinery, out of this plugin's scope).
+        // the client uninspected. Framed gRPC/gRPC-Web (length-prefixed wire
+        // frames owned by the gRPC machinery) is always released — out of this
+        // plugin's scope. A `text/event-stream` label is released ONLY when
+        // streaming inspection is enabled, so a live SSE inspector will
+        // actually attach and govern it; with streaming inspection disabled
+        // there is no inspector, and releasing the label would let real SSE
+        // tool-call deltas — or a Chat Completions JSON body a transform
+        // relabeled `text/event-stream` — stream past governance entirely.
+        // Kept buffered, buffered-SSE governance handles real SSE and the
+        // JSON-shape fallback catches the mislabeled JSON.
         match content_type {
-            Some(ct) => !is_event_stream_content_type(ct) && !is_framed_grpc_content_type(ct),
+            Some(ct) => {
+                if is_framed_grpc_content_type(ct) {
+                    return false;
+                }
+                if is_event_stream_content_type(ct) {
+                    return !self.inspect.streaming_response_tool_calls;
+                }
+                true
+            }
             None => true,
         }
     }
@@ -1873,18 +1939,68 @@ impl Plugin for AiToolGovernor {
         }
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         // A buffered `text/event-stream` body means the stream inspector never
-        // attached (another plugin/guard kept it buffered): govern the SSE tool
-        // calls here rather than forwarding them uninspected. The label is not
-        // trustworthy either — an upstream can omit `text/event-stream`, and a
-        // `response_transformer` header rule can relabel it (e.g. `text/plain`)
-        // while leaving the SSE frames intact — so an SSE-SHAPED body (see
-        // `looks_like_sse`) is routed through buffered-SSE governance
-        // regardless of the header — even a `application/json` relabel: an
-        // SSE-shaped body can never parse as JSON, so the JSON path below could
-        // only forward it uninspected. Encoded bodies never look like SSE and
-        // are handled by the content-encoding fail-closed path below.
-        if is_event_stream_content_type(content_type) || looks_like_sse(body) {
+        // attached (streaming inspection disabled, or another plugin/guard
+        // kept it buffered): govern the SSE tool calls here rather than
+        // forwarding them uninspected. Routing is by SHAPE first, label
+        // second — the label is not trustworthy: an upstream can omit
+        // `text/event-stream`, and a `response_transformer` header rule can
+        // relabel it (e.g. `text/plain`) while leaving the SSE frames intact.
+        // An SSE-SHAPED body (see `looks_like_sse`) is routed through
+        // buffered-SSE governance regardless of the header — even an
+        // `application/json` relabel: an SSE-shaped body can never parse as
+        // JSON, so the JSON path below could only forward it uninspected.
+        if looks_like_sse(body) {
             return self.govern_buffered_sse(ctx, body).await;
+        }
+        if is_event_stream_content_type(content_type) {
+            // SSE-labeled but not SSE-shaped plaintext.
+            if let Some(encoding) = content_encoding_value(response_headers) {
+                // An SSE label with a `Content-Encoding`: DECODE FIRST (the
+                // same gzip/br decode the final re-check uses) and govern the
+                // decoded bytes. Feeding compressed bytes into the SSE
+                // extractor would find zero calls and record the COMPRESSED
+                // hash, letting the final re-check hash-skip denied deltas.
+                // An undecodable/unsupported encoding or decoded output past
+                // the cap fails closed in enforce mode, forwards in dry-run
+                // (round-8 undecodable semantics).
+                let Some(decoded) = decompress_within_limit(encoding, body) else {
+                    return self.uninspectable_governed_response(
+                        ctx,
+                        "response body has a content-encoding that cannot be inspected",
+                    );
+                };
+                if looks_like_json(&decoded) {
+                    // Mislabeled Chat Completions JSON under an SSE label,
+                    // encoded: govern the decoded JSON. Redaction is
+                    // impossible here (the redaction transform sees the
+                    // still-encoded bytes), so this rides the
+                    // redact-unavailable final-response path; the decoded hash
+                    // is recorded so an unchanged final body is not
+                    // re-governed.
+                    if !self.governs_buffered_json(ctx) {
+                        return PluginResult::Continue;
+                    }
+                    ctx.metadata.insert(
+                        GOVERNED_RESPONSE_HASH_KEY.to_string(),
+                        sha256_hex_bytes(&decoded),
+                    );
+                    let Some(json) = parse_json_within_limit(&decoded) else {
+                        return self.uninspectable_governed_response(
+                            ctx,
+                            "response body could not be inspected after decoding",
+                        );
+                    };
+                    return self.govern_final_response(ctx, &json).await;
+                }
+                return self.govern_buffered_sse(ctx, &decoded).await;
+            }
+            if !looks_like_json(body) {
+                return self.govern_buffered_sse(ctx, body).await;
+            }
+            // SSE-labeled but JSON-SHAPED: mislabeled Chat Completions JSON —
+            // fall through to the JSON path below (the round-8 content-type
+            // refinement keeps this label buffered when no live inspector
+            // attaches, precisely so this body cannot bypass governance).
         }
         // A `response_transformer` header rule runs in `after_proxy` before this
         // hook and can remove/relabel `Content-Type: application/json` while
@@ -2104,15 +2220,19 @@ impl Plugin for AiToolGovernor {
         let json_ct = is_json_content_type(content_type);
 
         // Buffered-SSE parity for the final re-check (mirrors
-        // `on_response_body`): a transform can rewrite an SSE body (hash
-        // changed above) or strip/relabel its content type, so an SSE-labeled
-        // or SSE-SHAPED unencoded final body is re-governed through the
-        // buffered-SSE path — with the same fail-closed semantics
-        // (ungovernable calls, redact-unavailable). Encoded bytes never look
-        // like SSE; the content-encoding branch below applies the same check
-        // to the DECODED bytes.
+        // `on_response_body`), shape first then label: a transform can rewrite
+        // an SSE body (hash changed above) or strip/relabel its content type,
+        // so an SSE-SHAPED unencoded final body — or an SSE-LABELED one that
+        // is not JSON-shaped — is re-governed through the buffered-SSE path
+        // with the same fail-closed semantics (ungovernable calls,
+        // redact-unavailable). An SSE-labeled JSON-SHAPED body is mislabeled
+        // Chat Completions JSON and falls through to the JSON re-check below
+        // instead of bypassing it. Encoded bytes never look like SSE; the
+        // content-encoding branch below applies the same checks to the
+        // DECODED bytes.
         if content_encoding_value(response_headers).is_none()
-            && (is_event_stream_content_type(content_type) || looks_like_sse(body))
+            && (looks_like_sse(body)
+                || (is_event_stream_content_type(content_type) && !looks_like_json(body)))
         {
             return self.govern_buffered_sse(ctx, body).await;
         }
@@ -2135,22 +2255,25 @@ impl Plugin for AiToolGovernor {
         // re-check entirely and forward an injected-then-compressed denied
         // call uninspected.
         if let Some(encoding) = content_encoding_value(response_headers) {
-            let governed_earlier = ctx.metadata.contains_key(GOVERNED_RESPONSE_HASH_KEY);
             let Some(decoded) = decompress_within_limit(encoding, body) else {
-                // Unsupported/undecodable encoding, or decoded output past the
-                // parse limit: cannot verify a later transform did not inject a
-                // governed call. Fail closed when the response plausibly needs
-                // the re-check — labeled JSON, or a body this plugin governed
-                // earlier (relabeling must not downgrade fail-closed to
-                // forward). An unencodable body that was never governed and is
-                // not labeled JSON is out of scope.
-                if json_ct || governed_earlier {
-                    return self.uninspectable_final_response(
-                        ctx,
-                        "response body has a content-encoding that cannot be inspected",
-                    );
+                // Unsupported/undecodable encoding (`deflate`/`zstd`, corrupt
+                // gzip/br), or decoded output past the parse limit: cannot
+                // verify a later transform did not inject a governed call.
+                // Header-time buffering already treated every
+                // non-framed-gRPC label (JSON, SSE, `text/plain`, missing,
+                // relabeled) as governable on this route, so the same posture
+                // applies here: fail closed in enforce mode, forward in
+                // dry-run — a relabel must not downgrade an uninspectable
+                // encoded body from fail-closed to forward. Only framed
+                // gRPC/gRPC-Web wire frames, which this plugin never buffers
+                // or governs, remain out of scope.
+                if is_framed_grpc_content_type(content_type) {
+                    return PluginResult::Continue;
                 }
-                return PluginResult::Continue;
+                return self.uninspectable_governed_response(
+                    ctx,
+                    "response body has a content-encoding that cannot be inspected",
+                );
             };
             // Compression-only rewrite of an already-governed body: the decoded
             // bytes match the hash `on_response_body` recorded, so skip to avoid
@@ -2161,8 +2284,12 @@ impl Plugin for AiToolGovernor {
             }
             // Buffered-SSE parity on the DECODED bytes: a compressed SSE body
             // (the `compression` plugin compresses `text/*` too) must be
-            // re-governed, not skipped by the JSON-shape gate below.
-            if is_event_stream_content_type(content_type) || looks_like_sse(&decoded) {
+            // re-governed, not skipped by the JSON-shape gate below — while an
+            // SSE-labeled body that decodes to JSON-shaped bytes is mislabeled
+            // Chat Completions JSON and takes the JSON re-check instead.
+            if looks_like_sse(&decoded)
+                || (is_event_stream_content_type(content_type) && !looks_like_json(&decoded))
+            {
                 return self.govern_buffered_sse(ctx, &decoded).await;
             }
             // Content-type / JSON-shape gates against the DECODED bytes.
@@ -2172,7 +2299,7 @@ impl Plugin for AiToolGovernor {
             let Some(json) = parse_json_within_limit(&decoded) else {
                 // Decoded but oversized or not parseable JSON: cannot verify a
                 // transform did not inject a governed call.
-                return self.uninspectable_final_response(
+                return self.uninspectable_governed_response(
                     ctx,
                     "response body could not be inspected after decoding",
                 );
@@ -2190,7 +2317,7 @@ impl Plugin for AiToolGovernor {
             // A later transform grew the (hash-changed) plaintext body past the
             // inspectable limit: fail closed like the `on_response_body` path so
             // padding cannot smuggle a denied tool call past enforce policy.
-            return self.uninspectable_final_response(
+            return self.uninspectable_governed_response(
                 ctx,
                 "response body exceeds the inspectable size limit after transforms",
             );
@@ -2459,6 +2586,23 @@ enum Finalize {
     Blocked,
 }
 
+/// Body shape of an inspected stream, sniffed from the FIRST non-whitespace
+/// byte only (ordinary SSE latency is untouched — no per-chunk re-scan). A
+/// `text/event-stream`-labeled response can actually be a Chat Completions
+/// JSON body a `response_transformer` relabeled: forwarding those bytes as
+/// ordinary non-SSE trailing data would deliver a denied `tool_calls[]`
+/// ungoverned, so a JSON-shaped stream (`{`/`[`) is held in full and governed
+/// at end-of-stream like a buffered JSON body.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamBodyShape {
+    /// Nothing but whitespace received so far.
+    Unknown,
+    /// Not JSON-shaped: the normal SSE framing path.
+    Sse,
+    /// JSON-shaped: hold the whole body, govern at end-of-stream.
+    Json,
+}
+
 /// Per-response streaming inspector. Holds tool-call SSE frames until the call
 /// is complete and cleared by policy/approval, then releases them — or cuts the
 /// stream with an SSE error event, never leaking the held frames.
@@ -2485,6 +2629,8 @@ struct ToolCallStreamInspector {
     /// uninspected instead of disrupting traffic.
     bypassed: bool,
     terminated: bool,
+    /// Sniffed body shape (see [`StreamBodyShape`]).
+    shape: StreamBodyShape,
 }
 
 impl ToolCallStreamInspector {
@@ -2504,6 +2650,7 @@ impl ToolCallStreamInspector {
             finished_choices: std::collections::HashSet::new(),
             bypassed: false,
             terminated: false,
+            shape: StreamBodyShape::Unknown,
         }
     }
 
@@ -2630,6 +2777,80 @@ impl ToolCallStreamInspector {
             ResponseStreamAction::Terminate(Some(Bytes::from(out)))
         }
     }
+
+    /// A JSON-shaped stream: hold the accumulating body (never forward a
+    /// prefix — releasing bytes before the body can be parsed would leak a
+    /// denied call), bounded by the same hold cap as the SSE path.
+    fn hold_json_body(&mut self) -> ResponseStreamAction {
+        if self.carry.len() > MAX_STREAM_HOLD_BYTES {
+            warn!(
+                target: "ai_tool_governor",
+                held_bytes = self.carry.len(),
+                mode = self.engine.mode.as_str(),
+                "JSON-shaped stream hold exceeded cap"
+            );
+            if self.engine.mode == Mode::Enforce {
+                self.carry.clear();
+                return self.terminate(Vec::new());
+            }
+            self.bypassed = true;
+            return ResponseStreamAction::Forward(Bytes::from(std::mem::take(&mut self.carry)));
+        }
+        ResponseStreamAction::Forward(Bytes::new())
+    }
+
+    /// Govern a fully-held JSON-shaped stream at end-of-stream, mirroring the
+    /// buffered JSON path: extract `choices[].message.tool_calls[]` /
+    /// `function_call`, fail closed on ungovernable entries and blocked calls
+    /// (redaction is impossible on a stream), and release the body bytes
+    /// unchanged when policy clears them. An unparseable JSON-shaped body is
+    /// released, mirroring the buffered path's treatment of unparseable
+    /// JSON-shaped plaintext within the size cap.
+    async fn finalize_json_body(&mut self) -> ResponseStreamAction {
+        let body = std::mem::take(&mut self.carry);
+        let Ok(json) = serde_json::from_slice::<Value>(&body) else {
+            return ResponseStreamAction::Forward(Bytes::from(body));
+        };
+        let (calls, ungovernable) = extract_response_tool_calls(&json);
+        if ungovernable {
+            if self.engine.mode == Mode::Enforce {
+                warn!(
+                    target: "ai_tool_governor",
+                    "JSON-shaped stream contains an ungovernable tool call; cutting stream"
+                );
+                return self.terminate(Vec::new());
+            }
+            return ResponseStreamAction::Forward(Bytes::from(body));
+        }
+        if calls.is_empty() {
+            return ResponseStreamAction::Forward(Bytes::from(body));
+        }
+        // Same fill-if-absent correlation the SSE frame path uses, sourced
+        // from the JSON body itself.
+        if self.corr.model.is_none() {
+            self.corr.model = json
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+        if self.corr.provider.is_none() {
+            self.corr.provider = detect_response_provider(&json).map(|p| p.as_str().to_string());
+        }
+        let batch = self
+            .engine
+            .govern_calls(&self.corr, &calls, &self.plugin_http_call_ns, true)
+            .await;
+        if batch.enforce_blocks {
+            warn!(
+                target: "ai_tool_governor",
+                decision = batch.overall_label,
+                "JSON-shaped stream tool call blocked; cutting stream: {}",
+                batch.deny_reason.as_deref().unwrap_or("blocked")
+            );
+            return self.terminate(Vec::new());
+        }
+        ResponseStreamAction::Forward(Bytes::from(body))
+    }
 }
 
 #[async_trait]
@@ -2642,6 +2863,26 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
             return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
         }
         self.carry.extend_from_slice(chunk);
+        // Sniff the body shape once, from the first non-whitespace byte: a
+        // JSON-shaped stream (mislabeled Chat Completions JSON under an SSE
+        // label) must not be forwarded as ordinary non-SSE trailing data —
+        // hold it and govern at end-of-stream like a buffered JSON body.
+        if self.shape == StreamBodyShape::Unknown
+            && let Some(first) = self
+                .carry
+                .iter()
+                .copied()
+                .find(|b| !b.is_ascii_whitespace())
+        {
+            self.shape = if matches!(first, b'{' | b'[') {
+                StreamBodyShape::Json
+            } else {
+                StreamBodyShape::Sse
+            };
+        }
+        if self.shape == StreamBodyShape::Json {
+            return self.hold_json_body();
+        }
         let mut out: Vec<u8> = Vec::new();
 
         while let Some(end) = next_event_end(&self.carry) {
@@ -2729,6 +2970,9 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
     async fn on_end(&mut self) -> ResponseStreamAction {
         if self.terminated || self.bypassed {
             return ResponseStreamAction::Forward(Bytes::new());
+        }
+        if self.shape == StreamBodyShape::Json {
+            return self.finalize_json_body().await;
         }
         let mut out: Vec<u8> = Vec::new();
         let mut trailing: Vec<u8> = Vec::new();
@@ -2841,24 +3085,60 @@ fn frame_has_tool_calls(frame: &Value) -> bool {
 // Extraction helpers
 // ---------------------------------------------------------------------------
 
+/// Tool calls (plus frame-derived correlation context) extracted from a
+/// fully-buffered SSE body.
+struct BufferedSseExtract {
+    calls: Vec<ToolCall>,
+    /// A call that cannot be policy-checked was present (missing
+    /// `function.name` / non-string `function.arguments`) — the mirror of the
+    /// live streaming finalizer's ungovernable state.
+    ungovernable: bool,
+    /// First `model` a data frame reported, mirroring the live inspector's
+    /// `record_frame_context` — approval webhook/cache keys must carry the
+    /// served model even when request metadata is absent.
+    model: Option<String>,
+    /// First provider detected from a frame's shape (same mirror).
+    provider: Option<String>,
+}
+
 /// Accumulate the complete OpenAI tool calls from a fully-buffered SSE body.
-/// Used when an `text/event-stream` response is delivered on the buffered path
-/// (another buffering plugin or a content-type-rewrite guard kept it buffered)
-/// instead of through the streaming inspector, so its tool calls are still
-/// governed rather than forwarded uninspected.
-fn extract_sse_tool_calls(body: &[u8]) -> (Vec<ToolCall>, bool) {
+/// Used when a `text/event-stream` response is delivered on the buffered path
+/// (streaming inspection disabled, another buffering plugin, or a
+/// content-type-rewrite guard kept it buffered) instead of through the
+/// streaming inspector, so its tool calls are still governed rather than
+/// forwarded uninspected.
+fn extract_sse_tool_calls(body: &[u8]) -> BufferedSseExtract {
+    let mut extract = BufferedSseExtract {
+        calls: Vec::new(),
+        ungovernable: false,
+        model: None,
+        provider: None,
+    };
     let Ok(text) = std::str::from_utf8(body) else {
         // Non-UTF-8 SSE bytes: nothing extractable, and not a governable tool
         // call — treat as no calls rather than ungovernable.
-        return (Vec::new(), false);
+        return extract;
     };
     let mut acc = StreamingToolCallAccumulator::default();
     let mut event: Vec<&str> = Vec::new();
-    let flush = |event: &mut Vec<&str>, acc: &mut StreamingToolCallAccumulator| {
+    let flush = |event: &mut Vec<&str>,
+                 acc: &mut StreamingToolCallAccumulator,
+                 model: &mut Option<String>,
+                 provider: &mut Option<String>| {
         if event.is_empty() {
             return;
         }
         if let SseEvent::Frame(frame) = classify_event(event.join("\n").as_bytes()) {
+            if model.is_none()
+                && let Some(m) = frame.get("model").and_then(Value::as_str)
+            {
+                *model = Some(m.to_string());
+            }
+            if provider.is_none()
+                && let Some(p) = detect_sse_provider(&frame)
+            {
+                *provider = Some(p.as_str().to_string());
+            }
             acc.push_frame(&frame);
         }
         event.clear();
@@ -2866,15 +3146,27 @@ fn extract_sse_tool_calls(body: &[u8]) -> (Vec<ToolCall>, bool) {
     for raw in text.lines() {
         // SSE events are separated by a blank line.
         if raw.strip_suffix('\r').unwrap_or(raw).is_empty() {
-            flush(&mut event, &mut acc);
+            flush(
+                &mut event,
+                &mut acc,
+                &mut extract.model,
+                &mut extract.provider,
+            );
         } else {
             event.push(raw);
         }
     }
-    flush(&mut event, &mut acc);
+    flush(
+        &mut event,
+        &mut acc,
+        &mut extract.model,
+        &mut extract.provider,
+    );
     // Surface the ungovernable state (missing name / non-string args) so the
     // buffered path can fail closed exactly like the live streaming finalizer.
-    (acc.build_calls(), acc.has_ungovernable_call())
+    extract.calls = acc.build_calls();
+    extract.ungovernable = acc.has_ungovernable_call();
+    extract
 }
 
 fn tool_call_from(name: &str, args: Option<&Value>) -> ToolCall {
@@ -3164,13 +3456,15 @@ fn looks_like_json(body: &[u8]) -> bool {
 
 /// Whether a body is shaped like a Server-Sent Events stream: after an optional
 /// UTF-8 BOM and leading whitespace/blank lines, the first non-empty line
-/// starts with an SSE field prefix (`data:`, `event:`, `id:`, or `retry:`).
-/// The SSE-shape counterpart of [`looks_like_json`]: an upstream that omits
-/// `Content-Type: text/event-stream` (or a `response_transformer` header rule
-/// that relabels it, e.g. to `text/plain`) must not route a buffered SSE body
-/// with governed tool-call deltas past `govern_buffered_sse` uninspected. An
-/// SSE body can never look like JSON (and vice versa), so the two shape checks
-/// are disjoint.
+/// starts with an SSE field prefix (`data:`, `event:`, `id:`, or `retry:`) or
+/// is a `:`-comment line (keepalive pings like `: ping` are a standard SSE
+/// prelude and must not let a keepalive-prefixed stream bypass the shape
+/// fallback). The SSE-shape counterpart of [`looks_like_json`]: an upstream
+/// that omits `Content-Type: text/event-stream` (or a `response_transformer`
+/// header rule that relabels it, e.g. to `text/plain`) must not route a
+/// buffered SSE body with governed tool-call deltas past `govern_buffered_sse`
+/// uninspected. An SSE body can never look like JSON (and vice versa), so the
+/// two shape checks are disjoint.
 fn looks_like_sse(body: &[u8]) -> bool {
     let body = body
         .strip_prefix(b"\xEF\xBB\xBF".as_slice())
@@ -3185,6 +3479,7 @@ fn looks_like_sse(body: &[u8]) -> bool {
         b"event:".as_slice(),
         b"id:".as_slice(),
         b"retry:".as_slice(),
+        b":".as_slice(),
     ]
     .iter()
     .any(|prefix| rest.starts_with(prefix))
@@ -3215,15 +3510,24 @@ fn call_identity_hash(corr: &CorrelationMeta, call: &ToolCall) -> String {
 /// COUNTS — multiset semantics) onto the request context so the final re-check
 /// can consume them one-for-one.
 fn record_governed_calls(ctx: &mut RequestContext, corr: &CorrelationMeta, calls: &[ToolCall]) {
-    if calls.is_empty() {
+    let identities: Vec<String> = calls
+        .iter()
+        .map(|call| call_identity_hash(corr, call))
+        .collect();
+    record_governed_identities(ctx, &identities);
+}
+
+/// Record pre-computed governed-call identity hashes (multiset counts) onto
+/// the request context, replacing any previous record.
+fn record_governed_identities(ctx: &mut RequestContext, identities: &[String]) {
+    if identities.is_empty() {
         return;
     }
-    let mut counts: Vec<(String, usize)> = Vec::new();
-    for call in calls {
-        let hash = call_identity_hash(corr, call);
-        match counts.iter_mut().find(|(h, _)| *h == hash) {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for hash in identities {
+        match counts.iter_mut().find(|(h, _)| *h == hash.as_str()) {
             Some(entry) => entry.1 += 1,
-            None => counts.push((hash, 1)),
+            None => counts.push((hash.as_str(), 1)),
         }
     }
     let serialized = counts

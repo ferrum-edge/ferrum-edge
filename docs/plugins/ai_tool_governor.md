@@ -53,8 +53,13 @@ bypass streaming inspection by targeting a direct HTTP/2 or native HTTP/3
 backend; the narrow proxy-core edge cases where a response can still stream on
 an uninspected arm are described under [Limitations (MVP)](#limitations-mvp).
 Requests marked streaming still buffer a plain-JSON fallback
-response so `tool_calls` in it are governed (only a genuine
-`text/event-stream` response is released back to the stream path).
+response so `tool_calls` in it are governed (a `text/event-stream` response
+is released back to the stream path only when streaming inspection is enabled
+and a live inspector will govern it). The inspector also sniffs the stream's
+body shape from its first non-whitespace byte: a JSON-shaped stream (a Chat
+Completions JSON body a transform relabeled `text/event-stream`) is held in
+full and governed at end-of-stream like a buffered JSON body — a denied call
+is never forwarded, an allowed body is released unchanged.
 
 **Response buffering on governed requests:** when this plugin governs response
 tool calls for a request, a 2xx response with a **missing or non-JSON
@@ -62,15 +67,22 @@ tool calls for a request, a 2xx response with a **missing or non-JSON
 chain can relabel `Content-Type` while the body is still Chat Completions
 JSON, so ambiguous labels are treated fail-closed and run through the
 JSON-shape fallback. A buffered body that is **SSE-shaped** (its first
-non-empty line starts with `data:`/`event:`/`id:`/`retry:`) is routed through
-buffered-SSE governance regardless of its label, so an upstream that omits
+non-empty line starts with `data:`/`event:`/`id:`/`retry:`, or is a
+`:`-comment keepalive line like `: ping`) is routed through buffered-SSE
+governance regardless of its label, so an upstream that omits
 `text/event-stream` — or a transform that relabels it — cannot deliver
-tool-call deltas uninspected. Only two response labels are released back to
-the streaming path: a genuine `text/event-stream` (governed by the SSE stream
-inspector, or by buffered-SSE governance if another plugin keeps it buffered)
-and framed gRPC / gRPC-Web content types (owned by the gRPC machinery, out of
-this plugin's scope). Operators should expect mislabeled or unlabeled
-responses on governed routes to be delivered buffered rather than streamed.
+tool-call deltas uninspected; conversely, an SSE-**labeled** body that is
+actually JSON-shaped is governed through the buffered-JSON path. A buffered
+SSE-labeled body that carries a `Content-Encoding` is **decoded first**
+(gzip/br, the same decode as the final re-check) and the decoded frames are
+governed. Response labels released back to the streaming path: framed gRPC /
+gRPC-Web content types (owned by the gRPC machinery, out of this plugin's
+scope) always, and `text/event-stream` **only when streaming inspection is
+enabled** so the live SSE inspector will attach — with streaming inspection
+disabled, SSE stays buffered and is governed by buffered-SSE governance (or
+the JSON-shape fallback if the label was lying). Operators should expect
+mislabeled or unlabeled responses on governed routes to be delivered buffered
+rather than streamed.
 
 ## Fail-closed handling of uninspectable bodies
 
@@ -90,6 +102,15 @@ forwarded ungoverned:
   is keyed by name), or a `tool_calls` value that is present but not an array.
   A `null` `tool_calls`/`function_call` is OpenAI's normal content-only shape
   and is fine.
+- **Encoded response bodies**: a governed buffered 2xx that carries a
+  `Content-Encoding` the plugin cannot decode for inspection — an unsupported
+  encoding (`deflate`, `zstd`, …), corrupt `gzip`/`br` bytes, or decoded
+  output past the **4 MiB** cap — fails closed. This applies to a
+  JSON-labeled backend response, an SSE-labeled encoded body, and the
+  post-transform final re-check **regardless of how a transform relabeled the
+  `Content-Type`** (only framed gRPC / gRPC-Web, which the plugin never
+  buffers or governs, is out of scope). Decodable `gzip`/`br` bodies are
+  decompressed and the decoded bytes governed normally.
 - **Streaming path**: held tool-call frames plus the partial-event carry are
   capped at **4 MiB**; past that the stream is cut with the terminal SSE error
   event.
@@ -175,7 +196,10 @@ config:
 correlation, consumer/proxy/model/provider, tool name, arguments hash, and risk.
 Identical calls reuse the cached decision for `cache_ttl_seconds`; the cache
 key covers consumer, proxy, model, **provider**, tool name, and arguments (every
-field the webhook receives that can change its decision), and the cache is
+field the webhook receives that can change its decision). For streamed and
+buffered-SSE responses the model/provider come from request/routing metadata
+or, when absent, from the SSE frames themselves — a decision made for one
+model is never reused for another. The cache is
 bounded at 4096 entries — at capacity expired entries are purged and new
 decisions are simply not cached. When the endpoint is unreachable,
 `fail_on_error: reject` blocks the call (`warn`/`allow` fail open).
