@@ -2248,3 +2248,242 @@ async fn tool_risk_levels_surface_in_metadata() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round 2 review fixes: buffering, redaction fail-closed, opaque decompress
+// ---------------------------------------------------------------------------
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).expect("gzip write");
+    encoder.finish().expect("gzip finish")
+}
+
+fn gzip_headers() -> HashMap<String, String> {
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers
+}
+
+fn response_tool_call_model(name: &str, arguments: &str, model: Option<&str>) -> Vec<u8> {
+    let mut obj = json!({
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": name, "arguments": arguments }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+    });
+    if let Some(m) = model {
+        obj["model"] = json!(m);
+    }
+    obj.to_string().into_bytes()
+}
+
+/// An absent correlation field (`null`) and an explicit empty string must hash
+/// to different approval cache keys — the webhook may decide differently.
+#[tokio::test]
+async fn approval_cache_key_distinguishes_absent_vs_empty_fields() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(2) // absent model vs empty-string model = distinct approvals
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "default_action": "require_approval",
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 300 }
+    }));
+
+    // Same tool + args, but model absent (None) then explicitly empty ("").
+    let absent = response_tool_call_model("deploy", "{}", None);
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &absent)
+            .await,
+    );
+
+    let empty = response_tool_call_model("deploy", "{}", Some(""));
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &empty)
+            .await,
+    );
+
+    server.verify().await;
+}
+
+/// A streaming-only config must still advertise request AND response body
+/// buffering so the proxy buffers the JSON body for `before_proxy` streaming
+/// detection and for governing an SSE JSON fallback.
+#[test]
+fn streaming_only_config_advertises_buffering() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    assert!(plugin.requires_request_body_buffering());
+    assert!(plugin.requires_response_body_buffering());
+    assert!(plugin.should_buffer_response_body(&create_test_context()));
+}
+
+/// When a `stream: true` request's backend returns a plain JSON Chat Completions
+/// body instead of SSE, the streaming-only config governs that fallback and
+/// denies a disallowed tool call.
+#[tokio::test]
+async fn streaming_only_governs_json_fallback_response() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = create_test_context();
+    let denied = response_with_tool_call("kubectl.apply", "{}");
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &denied)
+            .await,
+        Some(502),
+    );
+}
+
+/// An MCP/A2A request whose arguments match a `redact_args` policy fails closed
+/// in enforce mode — there is no request-body transform to redact them.
+#[tokio::test]
+async fn request_redact_args_match_fails_closed() {
+    let plugin = make(json!({
+        "tools": { "search": { "action": "redact_args", "blocked_arg_patterns": [{ "name": "sk", "regex": "sk-[a-z0-9]+" }] } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "search", "arguments": { "q": "token sk-abc123" } }
+        })
+        .to_string(),
+    );
+    let mut headers = json_headers();
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+    // The plugin's own metadata must not echo the raw secret (the seeded
+    // `request_body` legitimately still holds it — that is the test's input).
+    for (key, value) in &ctx.metadata {
+        if key.starts_with("ai_tool_governor.") {
+            assert!(
+                !value.contains("sk-abc123"),
+                "governor metadata {key:?} leaked secret"
+            );
+        }
+    }
+}
+
+/// A `redact_args` match introduced into the FINAL response body (after the
+/// redaction transform already ran) fails closed — it cannot be redacted here.
+#[tokio::test]
+async fn final_response_redact_args_match_fails_closed() {
+    let plugin = make(json!({
+        "tools": { "search": { "action": "redact_args", "blocked_arg_patterns": [{ "name": "sk", "regex": "sk-[a-z0-9]+" }] } }
+    }));
+    let mut ctx = create_test_context();
+    // Clean backend body governed first (records hash).
+    let clean = json!({
+        "id": "x", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }]
+    })
+    .to_string()
+    .into_bytes();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .await,
+    );
+
+    // A transform injects a redact_args call carrying an unredacted secret.
+    let injected = response_with_tool_call("search", "{\"q\":\"sk-deadbeef\"}");
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &injected)
+            .await,
+        Some(502),
+    );
+    assert_no_metadata_contains(&ctx, "sk-deadbeef");
+}
+
+/// A denied tool call injected by a transform and then gzip-compressed by the
+/// compression plugin must be decompressed and fail closed in the final re-check.
+#[tokio::test]
+async fn final_response_decompresses_and_denies_injected_compressed_call() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    let clean = json!({
+        "id": "x", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }]
+    })
+    .to_string()
+    .into_bytes();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .await,
+    );
+
+    let injected = response_with_tool_call("kubectl.apply", "{\"manifest\":\"kind: Pod\"}");
+    let compressed = gzip(&injected);
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &gzip_headers(), &compressed)
+            .await,
+        Some(502),
+    );
+}
+
+/// A legitimately gzip-compressed final body with only permitted tool calls is
+/// decompressed, found clean, and forwarded — no false rejection.
+#[tokio::test]
+async fn final_response_allows_legit_compressed_body() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    let clean = json!({
+        "id": "x", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }]
+    })
+    .to_string()
+    .into_bytes();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .await,
+    );
+
+    let permitted = response_with_tool_call("report.read", "{\"id\":1}");
+    let compressed = gzip(&permitted);
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &gzip_headers(), &compressed)
+            .await,
+    );
+}

@@ -40,10 +40,13 @@
 //! (3000) and `response_transformer` (4000) run body rules afterward. An unchanged
 //! body (matched by hash) is not governed twice; a body a later transform rewrote
 //! into a denied `tools/call`, a disallowed `tools[]` definition, or an injected
-//! `choices[].message.tool_calls[]` is fail-closed before dispatch/delivery. The
-//! response re-check is scoped to still-inspectable bodies: when a later transform
-//! (e.g. the `compression` plugin) encodes the response, the plaintext backend
-//! body was already governed in `on_response_body`.
+//! `choices[].message.tool_calls[]` is fail-closed before dispatch/delivery. When
+//! a later transform (e.g. the `compression` plugin) encoded the final response,
+//! the re-check decompresses the gateway's own `gzip`/`br` encoding and inspects
+//! that, so an injected-then-compressed tool call cannot slip through. Redaction
+//! is unavailable on these re-check paths (no request-body transform, and the
+//! response redaction transform already ran), so a `redact_args` match there
+//! fails closed instead of forwarding the secret.
 //!
 //! Non-goals (MVP): it does not execute tools, manage MCP sessions, replace
 //! `mcp_gateway`/A2A routing, or implement an approval UI.
@@ -197,6 +200,15 @@ struct InspectConfig {
 impl InspectConfig {
     fn any_request(self) -> bool {
         self.request_tool_definitions || self.mcp_tool_calls || self.a2a_methods
+    }
+
+    /// True when a buffered (non-SSE) response body must be governed. This
+    /// includes streaming inspection, because a `stream: true` request whose
+    /// backend answers with a plain `application/json` Chat Completions body
+    /// (an SSE fallback) is delivered on the buffered path, not the stream
+    /// inspector, and must still be screened.
+    fn any_buffered_response(self) -> bool {
+        self.response_tool_calls || self.streaming_response_tool_calls
     }
 }
 
@@ -466,16 +478,19 @@ impl GovernorEngine {
         }
     }
 
-    /// Govern a batch of concrete tool calls. `streaming` treats a matched
-    /// `redact_args` pattern as a block (fail closed): surgical redaction of
-    /// split-JSON tool arguments mid-stream is out of MVP scope, so the safe
-    /// behavior is to cut the stream rather than forward an unredacted secret.
+    /// Govern a batch of concrete tool calls. `redaction_unavailable` treats a
+    /// matched `redact_args` pattern as a block (fail closed): on paths that
+    /// cannot rewrite the arguments in place — mid-stream SSE deltas, the
+    /// request body (no request-body transform), and the post-transform final
+    /// response re-check — the safe behavior is to reject rather than forward an
+    /// unredacted secret. Only the buffered response path (which has a
+    /// `transform_response_body` redaction hook) passes `false`.
     async fn govern_calls(
         &self,
         corr: &CorrelationMeta,
         calls: &[ToolCall],
         ns: &AtomicU64,
-        streaming: bool,
+        redaction_unavailable: bool,
     ) -> BatchDecision {
         let mut per_call = Vec::with_capacity(calls.len());
         let skip_approvals = self.mode == Mode::Enforce
@@ -484,7 +499,9 @@ impl GovernorEngine {
                     self.evaluate(&call.name, &call.raw_args, call.parsed_args.as_ref());
                 match outcome {
                     PolicyOutcome::Deny(_) => true,
-                    PolicyOutcome::Redact(patterns) => streaming && !patterns.is_empty(),
+                    PolicyOutcome::Redact(patterns) => {
+                        redaction_unavailable && !patterns.is_empty()
+                    }
                     _ => false,
                 }
             });
@@ -521,11 +538,11 @@ impl GovernorEngine {
                     cd.reason = Some(reason);
                 }
                 PolicyOutcome::Redact(patterns) => {
-                    if streaming && !patterns.is_empty() {
+                    if redaction_unavailable && !patterns.is_empty() {
                         cd.label = "deny";
                         cd.blocks = true;
                         cd.reason = Some(format!(
-                            "tool '{}' redact_args is not supported for streaming tool calls (failing closed)",
+                            "tool '{}' matched a redact_args policy on a path where arguments cannot be redacted in place (failing closed)",
                             call.name
                         ));
                     } else {
@@ -679,10 +696,14 @@ impl GovernorEngine {
         // another. `Value::to_string` is infallible, so no fallback key is needed.
         let cache_key = sha256_hex(
             &json!([
-                input.corr.consumer.as_deref().unwrap_or(""),
-                input.corr.proxy.as_deref().unwrap_or(""),
-                input.corr.model.as_deref().unwrap_or(""),
-                input.corr.provider.as_deref().unwrap_or(""),
+                // Serialize the Options directly so an absent field (`null`) and
+                // an explicitly-empty one (`""`) hash distinctly — the webhook
+                // omits absent fields and can decide differently for each, so a
+                // cached decision must not be shared across the two.
+                input.corr.consumer.as_deref(),
+                input.corr.proxy.as_deref(),
+                input.corr.model.as_deref(),
+                input.corr.provider.as_deref(),
                 input.name,
                 input.raw_args,
             ])
@@ -1133,9 +1154,12 @@ impl AiToolGovernor {
                 return PluginResult::Continue;
             }
             let corr = self.correlation(ctx, None, None);
+            // Request path: no `transform_request_body` hook exists to rewrite
+            // arguments, so a `redact_args` match fails closed instead of
+            // forwarding the secret to the backend.
             let batch = self
                 .engine
-                .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, false)
+                .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, true)
                 .await;
             self.write_metadata(ctx, &batch);
             if batch.enforce_blocks {
@@ -1177,7 +1201,7 @@ impl AiToolGovernor {
         {
             let batch = self
                 .engine
-                .govern_calls(&corr, &[call], &ctx.plugin_http_call_ns, false)
+                .govern_calls(&corr, &[call], &ctx.plugin_http_call_ns, true)
                 .await;
             self.write_metadata(ctx, &batch);
             if batch.enforce_blocks {
@@ -1191,7 +1215,7 @@ impl AiToolGovernor {
         {
             let batch = self
                 .engine
-                .govern_calls(&corr, &[call], &ctx.plugin_http_call_ns, false)
+                .govern_calls(&corr, &[call], &ctx.plugin_http_call_ns, true)
                 .await;
             self.write_metadata(ctx, &batch);
             if batch.enforce_blocks {
@@ -1271,6 +1295,51 @@ impl AiToolGovernor {
             function["arguments"] = Value::String(redacted);
         }
         changed
+    }
+
+    /// Govern the tool calls in a FINAL (post-transform) response body. Redaction
+    /// is not available here — the redaction transform already ran — so a
+    /// `redact_args` match fails closed (`redaction_unavailable = true`).
+    async fn govern_final_response(&self, ctx: &mut RequestContext, json: &Value) -> PluginResult {
+        let calls = extract_response_tool_calls(json);
+        if calls.is_empty() {
+            return PluginResult::Continue;
+        }
+        let provider = detect_response_provider(json).map(|p| p.as_str());
+        let model = json
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let corr = self.correlation(ctx, model, provider);
+        let batch = self
+            .engine
+            .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, true)
+            .await;
+        self.write_metadata(ctx, &batch);
+        if batch.enforce_blocks {
+            debug!(
+                target: "ai_tool_governor",
+                decision = batch.overall_label,
+                "rejecting response after transforms: {}",
+                batch.deny_reason.as_deref().unwrap_or("blocked")
+            );
+            return self.reject(&batch);
+        }
+        PluginResult::Continue
+    }
+
+    /// A final response body that cannot be inspected (an unsupported or
+    /// undecodable content-encoding after transforms): fail closed in enforce
+    /// mode, forward in dry-run.
+    fn uninspectable_final_response(&self, ctx: &mut RequestContext) -> PluginResult {
+        if self.engine.mode == Mode::Enforce {
+            return self.reject_uninspectable(
+                ctx,
+                "response body",
+                "response body has a content-encoding that cannot be inspected",
+            );
+        }
+        PluginResult::Continue
     }
 }
 
@@ -1417,7 +1486,13 @@ impl Plugin for AiToolGovernor {
     // --- Final backend-visible request body (post-transform re-check) ------
 
     fn requires_request_body_buffering(&self) -> bool {
-        self.enabled && self.inspect.any_request()
+        // `requires_request_body_before_before_proxy` (used for streaming
+        // detection) is gated by this flag in the proxy, so it must also be true
+        // when only streaming inspection is enabled — otherwise a `stream: true`
+        // JSON POST without an `Accept: text/event-stream` header is never
+        // buffered, `before_proxy` cannot set the reqwest-pinning marker, and the
+        // SSE tool-call inspector is bypassed.
+        self.enabled && (self.inspect.any_request() || self.inspect.streaming_response_tool_calls)
     }
 
     fn needs_final_request_body_context(&self) -> bool {
@@ -1507,7 +1582,7 @@ impl Plugin for AiToolGovernor {
     // --- Buffered response path -------------------------------------------
 
     fn requires_response_body_buffering(&self) -> bool {
-        self.enabled && self.inspect.response_tool_calls
+        self.enabled && self.inspect.any_buffered_response()
     }
 
     /// Buffer by default — even for requests marked streaming (`Accept:
@@ -1521,7 +1596,7 @@ impl Plugin for AiToolGovernor {
     /// event stream back to the streaming path (where the SSE inspector
     /// attaches when `streaming_response_tool_calls` is enabled).
     fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
-        self.enabled && self.inspect.response_tool_calls
+        self.enabled && self.inspect.any_buffered_response()
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1549,7 +1624,10 @@ impl Plugin for AiToolGovernor {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.enabled || !self.inspect.response_tool_calls {
+        // `any_buffered_response()` also covers a streaming-only config whose
+        // backend returned a plain JSON body instead of SSE (the SSE fallback):
+        // that body is delivered on the buffered path and must still be governed.
+        if !self.enabled || !self.inspect.any_buffered_response() {
             return PluginResult::Continue;
         }
         if !(200..300).contains(&response_status) {
@@ -1639,7 +1717,7 @@ impl Plugin for AiToolGovernor {
         if !self.enabled
             || !self.needs_response_transform
             || self.engine.mode == Mode::DryRun
-            || !self.inspect.response_tool_calls
+            || !self.inspect.any_buffered_response()
         {
             return None;
         }
@@ -1663,11 +1741,12 @@ impl Plugin for AiToolGovernor {
     /// (4000) and other `transform_response_body` hooks run afterward and can add
     /// or rewrite JSON fields — injecting a denied `choices[].message.tool_calls[]`
     /// into a response the governor already cleared. This hook re-evaluates the
-    /// still-inspectable final body so such an injection is fail-closed before
-    /// delivery. When a later transform makes the body opaque (for example the
-    /// `compression` plugin encodes it), the plaintext backend body was already
-    /// governed in `on_response_body`, so the opaque final body is skipped rather
-    /// than falsely rejected.
+    /// final body so such an injection is fail-closed before delivery. When a
+    /// later transform (e.g. the `compression` plugin) encoded the body, it is
+    /// decompressed with the gateway's own encoding and re-checked, so an
+    /// injected-then-compressed tool call cannot slip through. Redaction is no
+    /// longer possible on this path (the redaction transform already ran), so a
+    /// `redact_args` match here fails closed rather than forwarding the secret.
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,
@@ -1675,7 +1754,7 @@ impl Plugin for AiToolGovernor {
         response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.enabled || !self.inspect.response_tool_calls {
+        if !self.enabled || !self.inspect.any_buffered_response() {
             return PluginResult::Continue;
         }
         if !(200..300).contains(&response_status) {
@@ -1697,45 +1776,28 @@ impl Plugin for AiToolGovernor {
             return PluginResult::Continue;
         }
 
-        // Oversized or non-parseable FINAL body: `on_response_body` already
-        // fail-closed a genuinely uninspectable backend body in enforce mode
-        // before delivery, so an opaque body here is a later transform of an
-        // already-governed plaintext body — do not re-reject.
-        if body.len() > MAX_PARSE_BYTES {
-            return PluginResult::Continue;
-        }
-        let Ok(json) = serde_json::from_slice::<Value>(body) else {
+        // Parse the final body directly; if a later transform encoded it,
+        // decompress with the gateway's own content-encoding and parse that.
+        let json = if let Some(json) = parse_json_within_limit(body) {
+            json
+        } else if let Some(decoded) = content_encoding_value(response_headers)
+            .and_then(|enc| decompress_within_limit(enc, body))
+        {
+            match parse_json_within_limit(&decoded) {
+                Some(json) => json,
+                None => return self.uninspectable_final_response(ctx),
+            }
+        } else if has_non_identity_content_encoding(response_headers) {
+            // Encoded with an unsupported/undecodable content-encoding: cannot
+            // verify a later transform did not inject a governed call.
+            return self.uninspectable_final_response(ctx);
+        } else {
+            // Plaintext but unparseable / oversized: `on_response_body` already
+            // fail-closed a genuinely uninspectable backend body before delivery.
             return PluginResult::Continue;
         };
 
-        let calls = extract_response_tool_calls(&json);
-        if calls.is_empty() {
-            return PluginResult::Continue;
-        }
-
-        let provider = detect_response_provider(&json).map(|p| p.as_str());
-        let model = json
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let corr = self.correlation(ctx, model, provider);
-
-        let batch = self
-            .engine
-            .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, false)
-            .await;
-        self.write_metadata(ctx, &batch);
-
-        if batch.enforce_blocks {
-            debug!(
-                target: "ai_tool_governor",
-                decision = batch.overall_label,
-                "rejecting response after transforms: {}",
-                batch.deny_reason.as_deref().unwrap_or("blocked")
-            );
-            return self.reject(&batch);
-        }
-        PluginResult::Continue
+        self.govern_final_response(ctx, &json).await
     }
 
     // --- Streaming response path ------------------------------------------
@@ -2330,9 +2392,49 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
 }
 
 fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
+    content_encoding_value(headers).is_some()
+}
+
+/// The non-identity `Content-Encoding` header value, trimmed, or `None` when
+/// absent/empty/`identity`.
+fn content_encoding_value(headers: &HashMap<String, String>) -> Option<&str> {
     header_value(headers, "content-encoding")
         .map(str::trim)
-        .is_some_and(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"))
+        .filter(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"))
+}
+
+/// Parse `body` as JSON only when it is within the inspectable size limit.
+fn parse_json_within_limit(body: &[u8]) -> Option<Value> {
+    if body.is_empty() || body.len() > MAX_PARSE_BYTES {
+        return None;
+    }
+    serde_json::from_slice(body).ok()
+}
+
+/// Decompress a gateway-encoded response body (the same `gzip`/`br` encodings
+/// the `compression` plugin produces), bounded by [`MAX_PARSE_BYTES`] so a
+/// decompression bomb cannot blow up memory. Returns `None` for unsupported
+/// encodings, decode errors, or output past the limit.
+fn decompress_within_limit(encoding: &str, data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    // A single encoding token only (the compression plugin emits exactly one).
+    let mut out = Vec::new();
+    let limit = MAX_PARSE_BYTES as u64;
+    match encoding.trim().to_ascii_lowercase().as_str() {
+        "gzip" | "x-gzip" => {
+            let mut reader = flate2::read::MultiGzDecoder::new(data).take(limit + 1);
+            reader.read_to_end(&mut out).ok()?;
+        }
+        "br" => {
+            let mut reader = brotli::Decompressor::new(data, 4096).take(limit + 1);
+            reader.read_to_end(&mut out).ok()?;
+        }
+        _ => return None,
+    }
+    if out.len() as u64 > limit {
+        return None;
+    }
+    Some(out)
 }
 
 fn redacted_approval_url(parsed: &Url) -> String {
