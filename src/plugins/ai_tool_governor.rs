@@ -1481,6 +1481,19 @@ impl AiToolGovernor {
                 "streamed response body exceeds the inspectable size limit",
             );
         }
+        // Opaque parity with the live inspector: SSE-labeled bytes that are
+        // not valid UTF-8 (opaque/binary — e.g. compressed bytes whose
+        // `Content-Encoding` header a transform stripped) cannot be parsed
+        // for SSE frames at all. Extraction would find zero calls and
+        // `calls.is_empty()` would forward a denied delta hiding inside even
+        // under `default_action: deny`, so surface it as ungovernable
+        // instead: fail closed in enforce, forward in dry-run.
+        if std::str::from_utf8(body).is_err() {
+            return self.uninspectable_governed_response(
+                ctx,
+                "streamed response body is not valid UTF-8 and cannot be inspected",
+            );
+        }
         // Record the hash of the SSE body governed here so the post-transform
         // `on_final_response_body` re-check (which routes SSE-labeled/shaped
         // bodies back through this path) can skip an unchanged body instead of
@@ -2044,16 +2057,55 @@ impl Plugin for AiToolGovernor {
         let json = match serde_json::from_slice::<Value>(body) {
             Ok(json) => json,
             Err(_) => {
-                if has_non_identity_content_encoding(response_headers)
-                    && self.engine.mode == Mode::Enforce
-                {
-                    return self.reject_uninspectable(
+                // A JSON-labeled body that does not parse as plaintext but
+                // carries a `Content-Encoding` is usually a perfectly valid
+                // compressed Chat Completions response (an upstream that
+                // gzips its JSON): DECODE FIRST — the same gzip/br decode the
+                // SSE branch above and the final re-check use — and govern
+                // the DECODED bytes. Fail closed only when decoding actually
+                // fails (unsupported/corrupt encoding, or output past the
+                // cap); rejecting before the decode attempt would 502
+                // legitimate compressed responses.
+                let Some(encoding) = content_encoding_value(response_headers) else {
+                    // Unencoded but unparseable despite the JSON label/shape:
+                    // no governable calls can be extracted from it and it was
+                    // never encoded, so forward (long-standing plaintext
+                    // semantics).
+                    return PluginResult::Continue;
+                };
+                let Some(decoded) = decompress_within_limit(encoding, body) else {
+                    return self.uninspectable_governed_response(
                         ctx,
-                        "response body",
                         "response body has a content-encoding that cannot be inspected",
                     );
+                };
+                // Decoded SSE frames under a JSON (or relabeled) header:
+                // buffered-SSE governance on the decoded bytes, mirroring the
+                // final re-check's decoded-shape routing (it records the
+                // decoded hash itself).
+                if looks_like_sse(&decoded) {
+                    return self.govern_buffered_sse(ctx, &decoded).await;
                 }
-                return PluginResult::Continue;
+                // Record the DECODED hash: the final re-check compares its
+                // own decode against this, so a compression-only final body
+                // is hash-skipped instead of re-governed (no duplicate
+                // approval webhook).
+                ctx.metadata.insert(
+                    GOVERNED_RESPONSE_HASH_KEY.to_string(),
+                    sha256_hex_bytes(&decoded),
+                );
+                let Some(json) = parse_json_within_limit(&decoded) else {
+                    return self.uninspectable_governed_response(
+                        ctx,
+                        "response body could not be inspected after decoding",
+                    );
+                };
+                // The in-place redaction transform sees the still-encoded
+                // bytes and cannot rewrite them, so a decoded-governed
+                // encoded body rides the redaction-unavailable final-response
+                // path: a `redact_args` match fails closed (round-11
+                // semantics) instead of forwarding the matched secret.
+                return self.govern_final_response(ctx, &json).await;
             }
         };
 
@@ -2611,8 +2663,9 @@ enum Finalize {
 /// releases it unchanged.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StreamBodyShape {
-    /// Too few bytes to classify yet (whitespace, a partial BOM, or a partial
-    /// SSE field name): hold until the shape resolves.
+    /// Too few bytes to classify yet (whitespace, a partial BOM, or a
+    /// still-incomplete first line that could yet become a valid SSE field
+    /// line): hold until the shape resolves.
     Unknown,
     /// SSE-shaped: the normal SSE framing path.
     Sse,
@@ -2634,14 +2687,22 @@ enum StreamSniff {
     Opaque,
 }
 
-/// Sniff the body shape from the leading bytes. Real SSE always begins with an
-/// ASCII field or comment line (`data:`, `event:`, `id:`, `retry:`, or a `:`
-/// comment) after an optional UTF-8 BOM and leading whitespace, so leading
-/// bytes matching none of those — and not opening a JSON object/array — can
-/// never yield a governable SSE event. Treating them as [`StreamSniff::Sse`]
-/// would parse every "event" as `NoData` and forward a compressed stream's
-/// denied tool calls ungoverned; they are classified [`StreamSniff::Opaque`]
-/// and held instead.
+/// Sniff the body shape from the leading bytes. Real SSE always begins with a
+/// syntactically valid field or comment line after an optional UTF-8 BOM and
+/// leading whitespace: printable text with a `:` field separator before the
+/// first line ends. The SSE spec ignores unknown field names, so legitimate
+/// providers open streams with extension/heartbeat lines like `ping: 1` — a
+/// fixed `data:`/`event:`/`id:`/`retry:`/`:` whitelist would misclassify
+/// those streams as opaque and cut them at EOF in enforce mode. Leading bytes
+/// that are binary (gzip magic, control bytes) or a COMPLETE first line with
+/// no `:` separator — and not opening a JSON object/array — can never yield a
+/// governable SSE event: treating them as [`StreamSniff::Sse`] would parse
+/// every "event" as `NoData` and forward a compressed stream's denied tool
+/// calls ungoverned, so they are classified [`StreamSniff::Opaque`] and held.
+/// (Accepted consequence: colon-containing plaintext under an SSE label is
+/// parsed as SSE — no `data:` frames, forwarded — the pre-round-12 behavior
+/// for that shape; fail-closed opaque treatment is reserved for
+/// binary/non-text starts.)
 fn sniff_stream_shape(buf: &[u8]) -> StreamSniff {
     const BOM: &[u8] = b"\xEF\xBB\xBF";
     // The buffer so far is a (possibly empty) prefix of the BOM: wait.
@@ -2656,26 +2717,23 @@ fn sniff_stream_shape(buf: &[u8]) -> StreamSniff {
     if matches!(rest[0], b'{' | b'[') {
         return StreamSniff::Json;
     }
-    let mut partial_prefix = false;
-    for prefix in [
-        b"data:".as_slice(),
-        b"event:".as_slice(),
-        b"id:".as_slice(),
-        b"retry:".as_slice(),
-        b":".as_slice(),
-    ] {
-        if rest.starts_with(prefix) {
-            return StreamSniff::Sse;
-        }
-        if prefix.starts_with(rest) {
-            partial_prefix = true;
+    for &b in rest {
+        match b {
+            // A field separator before the first line ends: a syntactically
+            // valid SSE field/comment line.
+            b':' => return StreamSniff::Sse,
+            // The first line completed without a `:` — not an SSE field line.
+            b'\r' | b'\n' => return StreamSniff::Opaque,
+            // Control/binary byte (gzip magic 0x1f, NUL, escape codes): never
+            // SSE text. `\t` (0x09) is legal inside field names/values.
+            0x00..=0x08 | 0x0B..=0x1F | 0x7F => return StreamSniff::Opaque,
+            _ => {}
         }
     }
-    if partial_prefix {
-        StreamSniff::Inconclusive
-    } else {
-        StreamSniff::Opaque
-    }
+    // Still inside a printable first line with no `:` yet: wait for more
+    // bytes. An unresolved shape keeps holding the body, bounded by the same
+    // hold cap as every held shape.
+    StreamSniff::Inconclusive
 }
 
 /// Per-response streaming inspector. Holds tool-call SSE frames until the call
@@ -3054,10 +3112,11 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 }
                 return ResponseStreamAction::Forward(Bytes::from(std::mem::take(&mut self.carry)));
             }
-            // An Unknown shape at end-of-stream is a handful of bytes that
-            // never resolved (whitespace / a partial SSE field name) — no
-            // governable call can be inside; the SSE flush below forwards
-            // them unchanged.
+            // An Unknown shape at end-of-stream is bytes that never resolved:
+            // whitespace, a partial BOM, or a colon-less printable first line
+            // fragment (no `:` and no line terminator — so no `data:` line,
+            // and therefore no governable call, can be inside); the SSE flush
+            // below forwards them unchanged.
             StreamBodyShape::Sse | StreamBodyShape::Unknown => {}
         }
         let mut out: Vec<u8> = Vec::new();
@@ -3311,8 +3370,10 @@ impl BufferedSseBatches {
 fn extract_sse_tool_calls(body: &[u8]) -> BufferedSseExtract {
     let mut batches = BufferedSseBatches::new();
     let Ok(text) = std::str::from_utf8(body) else {
-        // Non-UTF-8 SSE bytes: nothing extractable, and not a governable tool
-        // call — treat as no calls rather than ungovernable.
+        // Non-UTF-8 SSE bytes: nothing extractable. `govern_buffered_sse`
+        // pre-screens these and fails closed BEFORE extraction (opaque
+        // parity with the live inspector); this fallback only keeps
+        // extraction itself total.
         return batches.extract;
     };
     let mut event: Vec<&str> = Vec::new();
@@ -3623,34 +3684,40 @@ fn looks_like_json(body: &[u8]) -> bool {
 }
 
 /// Whether a body is shaped like a Server-Sent Events stream: after an optional
-/// UTF-8 BOM and leading whitespace/blank lines, the first non-empty line
-/// starts with an SSE field prefix (`data:`, `event:`, `id:`, or `retry:`) or
-/// is a `:`-comment line (keepalive pings like `: ping` are a standard SSE
-/// prelude and must not let a keepalive-prefixed stream bypass the shape
-/// fallback). The SSE-shape counterpart of [`looks_like_json`]: an upstream
-/// that omits `Content-Type: text/event-stream` (or a `response_transformer`
-/// header rule that relabels it, e.g. to `text/plain`) must not route a
-/// buffered SSE body with governed tool-call deltas past `govern_buffered_sse`
-/// uninspected. An SSE body can never look like JSON (and vice versa), so the
-/// two shape checks are disjoint.
+/// UTF-8 BOM and leading whitespace/blank lines, the first non-empty line is a
+/// syntactically valid SSE field or comment line — printable text with a `:`
+/// field separator (the same widened check as [`sniff_stream_shape`], so live
+/// and buffered classification agree: the SSE spec ignores unknown field
+/// names, and legitimate extension/heartbeat preludes like `ping: 1` or the
+/// standard `: ping` keepalive comment must not bypass the shape fallback).
+/// The SSE-shape counterpart of [`looks_like_json`]: an upstream that omits
+/// `Content-Type: text/event-stream` (or a `response_transformer` header rule
+/// that relabels it, e.g. to `text/plain`) must not route a buffered SSE body
+/// with governed tool-call deltas past `govern_buffered_sse` uninspected. A
+/// JSON-opening body (`{`/`[`) is explicitly NOT SSE-shaped, so the two shape
+/// checks stay disjoint; binary/control-byte starts and colon-less first
+/// lines are not SSE-shaped either.
 fn looks_like_sse(body: &[u8]) -> bool {
     let body = body
         .strip_prefix(b"\xEF\xBB\xBF".as_slice())
         .unwrap_or(body);
-    let start = body
-        .iter()
-        .position(|b| !b.is_ascii_whitespace())
-        .unwrap_or(body.len());
+    let Some(start) = body.iter().position(|b| !b.is_ascii_whitespace()) else {
+        return false;
+    };
     let rest = &body[start..];
-    [
-        b"data:".as_slice(),
-        b"event:".as_slice(),
-        b"id:".as_slice(),
-        b"retry:".as_slice(),
-        b":".as_slice(),
-    ]
-    .iter()
-    .any(|prefix| rest.starts_with(prefix))
+    if matches!(rest[0], b'{' | b'[') {
+        return false;
+    }
+    for &b in rest {
+        match b {
+            b':' => return true,
+            b'\r' | b'\n' => return false,
+            0x00..=0x08 | 0x0B..=0x1F | 0x7F => return false,
+            _ => {}
+        }
+    }
+    // The whole body is one colon-less printable line: no SSE framing.
+    false
 }
 
 /// Unambiguous identity hash of a governed tool call, used to skip

@@ -60,10 +60,14 @@ body shape from its leading bytes: a JSON-shaped stream (a Chat
 Completions JSON body a transform relabeled `text/event-stream`) is held in
 full and governed at end-of-stream like a buffered JSON body — a denied call
 is never forwarded, an allowed body is released unchanged. A stream whose
-leading bytes are **neither SSE-shaped nor JSON-shaped** (real SSE always
-starts with ASCII field/comment lines; compressed or binary output does not)
-is uninspectable: it is held in full, cut at end-of-stream in enforce mode,
-and released unchanged in dry-run.
+leading bytes are **neither SSE-shaped nor JSON-shaped** is uninspectable: it
+is held in full, cut at end-of-stream in enforce mode, and released unchanged
+in dry-run. "SSE-shaped" accepts any syntactically valid SSE field or comment
+line — printable text with a `:` separator in the first line — since the SSE
+spec ignores unknown field names and legitimate providers open streams with
+extension/heartbeat lines like `ping: 1`; opaque treatment is reserved for
+genuinely binary starts (gzip magic, control bytes) and a complete first line
+with no `:` separator.
 
 **Response buffering on governed requests:** when this plugin governs response
 tool calls for a request, a 2xx response with a **missing or non-JSON
@@ -71,8 +75,9 @@ tool calls for a request, a 2xx response with a **missing or non-JSON
 chain can relabel `Content-Type` while the body is still Chat Completions
 JSON, so ambiguous labels are treated fail-closed and run through the
 JSON-shape fallback. A buffered body that is **SSE-shaped** (its first
-non-empty line starts with `data:`/`event:`/`id:`/`retry:`, or is a
-`:`-comment keepalive line like `: ping`) is routed through buffered-SSE
+non-empty line is a syntactically valid SSE field or comment line — printable
+text with a `:` separator, e.g. `data: …`, a `: ping` keepalive comment, or
+an extension field like `ping: 1`) is routed through buffered-SSE
 governance regardless of its label, so an upstream that omits
 `text/event-stream` — or a transform that relabels it — cannot deliver
 tool-call deltas uninspected; conversely, an SSE-**labeled** body that is
@@ -110,7 +115,11 @@ forwarded ungoverned:
   cannot be policy-checked — a missing or non-string `function.name` (policy
   is keyed by name), or a `tool_calls` value that is present but not an array.
   A `null` `tool_calls`/`function_call` is OpenAI's normal content-only shape
-  and is fine.
+  and is fine. An SSE-labeled buffered body whose bytes are **not valid
+  UTF-8** (opaque/binary without a `Content-Encoding` header — e.g. a
+  transform stripped the header from compressed bytes) cannot be parsed for
+  SSE frames at all and fails closed, matching the live inspector's opaque
+  handling.
 - **Encoded response bodies**: a governed buffered 2xx that carries a
   `Content-Encoding` the plugin cannot decode for inspection — an unsupported
   encoding (`deflate`, `zstd`, …), corrupt `gzip`/`br` bytes, or decoded
@@ -123,8 +132,11 @@ forwarded ungoverned:
 - **Streaming path**: held tool-call frames plus the partial-event carry are
   capped at **4 MiB**; past that the stream is cut with the terminal SSE error
   event. A stream whose leading bytes are neither SSE-shaped nor JSON-shaped
-  (opaque/binary — e.g. compressed bytes whose `Content-Encoding` header a
-  transform stripped) is held in full and cut at end-of-stream.
+  (opaque = binary/undecodable only — gzip magic or control bytes, e.g.
+  compressed bytes whose `Content-Encoding` header a transform stripped, or a
+  complete first line with no `:` separator — never a valid SSE stream that
+  merely opens with an unknown field name) is held in full and cut at
+  end-of-stream.
 
 In `mode: dry_run` these bodies are forwarded uninspected (and a stream past
 the hold cap is released uninspected) — dry-run never disrupts traffic.

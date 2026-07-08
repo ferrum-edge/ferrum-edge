@@ -4769,3 +4769,270 @@ async fn bom_prefixed_sse_denied_call_is_caught_on_both_paths() {
             .await,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 13 review fixes: decode-first for encoded buffered JSON, buffered
+// invalid-UTF-8 SSE fails closed, unknown-field SSE preludes are not opaque
+// ---------------------------------------------------------------------------
+
+/// A perfectly valid upstream-compressed `application/json` Chat Completions
+/// response must be DECODED and governed, not rejected as uninspectable
+/// before the decode is even tried: allowed calls forward, denied calls
+/// reject, dry-run forwards.
+#[tokio::test]
+async fn buffered_json_gzip_encoded_body_is_decoded_and_governed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+
+    // Allowed call: decoded, governed, forwarded — no false 502.
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &headers,
+                &gzip(&response_with_tool_call("report.read", "{}")),
+            )
+            .await,
+    );
+
+    // Denied call inside the compressed body still rejects.
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &headers,
+                &gzip(&response_with_tool_call("kubectl.apply", "{}")),
+            )
+            .await,
+        Some(502),
+    );
+
+    // Dry-run is unaffected either way.
+    let dry_run = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(
+        dry_run
+            .on_response_body(
+                &mut ctx,
+                200,
+                &headers,
+                &gzip(&response_with_tool_call("kubectl.apply", "{}")),
+            )
+            .await,
+    );
+}
+
+/// The decoded-governed encoded JSON body records the DECODED hash, so the
+/// final re-check's own decode hash-skips the unchanged body instead of
+/// re-firing the approval webhook (a one-shot approval service could deny the
+/// duplicate and turn an approved response into a 502).
+#[tokio::test]
+async fn buffered_json_gzip_encoded_governed_hash_skips_final_recheck() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 }
+    }));
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let compressed = gzip(&response_with_tool_call("deploy", "{\"env\":\"prod\"}"));
+
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &headers, &compressed)
+            .await,
+    ); // webhook #1 (approved)
+
+    // Unchanged compressed body at the final re-check: decoded hash matches
+    // the one recorded by the decode-first governance pass — skipped.
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &compressed)
+            .await,
+    );
+    server.verify().await;
+}
+
+/// An encoded body cannot be rewritten by the in-place redaction transform
+/// (it sees the still-encoded bytes), so a `redact_args` match inside a
+/// decoded-governed gzip'd JSON body keeps the redaction-unavailable
+/// fail-closed semantics rather than forwarding the matched secret.
+#[tokio::test]
+async fn buffered_json_gzip_encoded_redact_args_match_fails_closed() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        }
+    }));
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let body = response_with_tool_call("filesystem.write", "{\"token\":\"sk-GZSECRET1\"}");
+
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &headers, &gzip(&body))
+            .await,
+        Some(502),
+    );
+    assert_no_metadata_contains(&ctx, "sk-GZSECRET1");
+}
+
+/// An SSE-labeled buffered body WITHOUT a `Content-Encoding` whose bytes are
+/// invalid UTF-8 (opaque/binary — e.g. a transform stripped the encoding
+/// header) is ungovernable: zero extractable frames must not slide past
+/// `default_action: deny` as `calls.is_empty()`. Fail closed in enforce,
+/// forward in dry-run (opaque parity with the live inspector).
+#[tokio::test]
+async fn buffered_sse_labeled_invalid_utf8_fails_closed_enforce_only() {
+    // Compressed-looking bytes with no encoding header: not valid UTF-8.
+    let opaque = b"\x1f\x8b\x08\x00binary-without-encoding-header\xff\xfe";
+
+    let enforce = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_reject(
+        enforce
+            .on_response_body(&mut ctx, 200, &sse_headers(), opaque)
+            .await,
+        Some(502),
+    );
+
+    let dry_run = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(
+        dry_run
+            .on_response_body(&mut ctx, 200, &sse_headers(), opaque)
+            .await,
+    );
+}
+
+/// A legit SSE stream opening with an extension/heartbeat field line
+/// (`ping: 1`) is valid SSE per spec (unknown field names are ignored) and
+/// must be governed as SSE — not misclassified opaque, held in full, and
+/// terminated at EOF: denied tool calls are still cut (with the live prelude
+/// already forwarded), allowed streams pass through byte-for-byte.
+#[tokio::test]
+async fn ping_field_prefixed_sse_stream_is_governed_not_opaque() {
+    let plugin = make(streaming_config(
+        json!({ "report.read": { "action": "allow" } }),
+        "deny",
+    ));
+
+    // Denied call after the ping prelude: governed (cut at the batch, prelude
+    // forwarded live — an opaque hold would have swallowed it).
+    let denied = format!("ping: 1\n\n{SSE_DENIED_TOOL_BODY}");
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[denied.as_bytes()]).await;
+    assert!(terminated, "denied call must still cut the stream");
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("ping: 1"),
+        "SSE prelude must be forwarded live, not opaque-held: {text}"
+    );
+    assert!(
+        !text.contains("kubectl.apply"),
+        "denied call leaked: {text}"
+    );
+
+    // Allowed call: the whole stream (prelude included) passes through.
+    let allowed = format!("ping: 1\n\n{SSE_ALLOWED_TOOL_BODY}");
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[allowed.as_bytes()]).await;
+    assert!(!terminated, "allowed ping-prefixed stream must not be cut");
+    assert_eq!(
+        out,
+        allowed.as_bytes(),
+        "stream must pass through unchanged"
+    );
+}
+
+/// The widened SSE-shape check still treats genuinely binary starts (control
+/// bytes) and a complete colon-less first line as opaque: held in full and
+/// cut at end-of-stream in enforce mode.
+#[tokio::test]
+async fn binary_and_colonless_starts_remain_opaque_cut() {
+    for body in [
+        // Control-byte start (e.g. a raw binary/compressed stream).
+        format!("\x01\x02binary{SSE_DENIED_TOOL_BODY}").into_bytes(),
+        // A complete first line with no `:` separator is not an SSE field line.
+        format!("not an sse field line\n{SSE_DENIED_TOOL_BODY}").into_bytes(),
+    ] {
+        let plugin = make(streaming_config(
+            json!({ "report.read": { "action": "allow" } }),
+            "deny",
+        ));
+        let ctx = create_test_context();
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        let (out, terminated) = drive_stream(&mut inspector, &[&body]).await;
+        assert!(terminated, "opaque stream must be cut in enforce mode");
+        let text = String::from_utf8_lossy(&out);
+        assert!(!text.contains("kubectl.apply"), "held bytes leaked: {text}");
+    }
+}
+
+/// `looks_like_sse` (the buffered fallback) agrees with the widened live
+/// sniff: an unlabeled buffered SSE body opening with a `ping: 1` extension
+/// field is still routed through buffered-SSE governance.
+#[tokio::test]
+async fn ping_field_prefixed_unlabeled_buffered_sse_is_governed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let no_ct: HashMap<String, String> = HashMap::new();
+
+    let denied = format!("ping: 1\n\n{SSE_DENIED_TOOL_BODY}");
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &no_ct, denied.as_bytes())
+            .await,
+        Some(502),
+    );
+
+    let allowed = format!("ping: 1\n\n{SSE_ALLOWED_TOOL_BODY}");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &no_ct, allowed.as_bytes())
+            .await,
+    );
+}
