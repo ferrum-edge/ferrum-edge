@@ -1139,7 +1139,8 @@ impl Plugin for AiTranscriptAudit {
         // the common SSE success case. The marker is derived from the
         // pre-transform body because this decision is made before request-body
         // transforms run; a later transformer that rewrites `stream` cannot be
-        // reflected here (same ordering limit as the AI-candidate classification).
+        // reflected here (same ordering limit as the AI-candidate
+        // classification; proxy-core follow-up: issue #2055).
         if flag(&ctx.metadata, MD_STREAM_REQUEST) {
             return false;
         }
@@ -1260,7 +1261,13 @@ impl Plugin for AiTranscriptAudit {
             return PluginResult::Continue;
         }
         // A response hook is emitting now, so consume the staging entry to keep
-        // the `log` fallback from emitting a duplicate.
+        // the `log` fallback from emitting a duplicate. Accepted limitation: a
+        // later same-phase validator (2950/2960) that replaces the response
+        // AFTER this emit leaves the exported record with the backend
+        // status/body; the transaction log carries the client-visible status
+        // plus `record_id` for correlation. No hook exists that has the final
+        // status, the body, and fail-closed rejection at once — proxy-core
+        // follow-up: issue #2056.
         let staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let (response_excerpt, response_truncated) = if captures_response_body {
             self.shape_body(body, self.limits.max_response_bytes)
