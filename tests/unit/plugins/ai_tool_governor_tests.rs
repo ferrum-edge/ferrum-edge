@@ -2936,3 +2936,115 @@ async fn redaction_placeholder_not_reflagged_on_final() {
             .await,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 6 review fixes: buffered-SSE ungovernable, header relabeling, placeholder
+// ---------------------------------------------------------------------------
+
+/// A buffered SSE tool call that cannot be policy-checked (missing name) fails
+/// closed, like the live streaming path.
+#[tokio::test]
+async fn buffered_sse_ungovernable_call_fails_closed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut sse_headers = HashMap::new();
+    sse_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,",
+        "\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers, body.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// A request whose `Content-Type` was stripped by a transform is still governed
+/// when the body is JSON-shaped.
+#[tokio::test]
+async fn final_request_governs_json_body_despite_removed_content_type() {
+    let plugin = make(json!({
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    let headers = HashMap::new(); // Content-Type removed by a transform.
+    let body = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "kubectl.apply", "arguments": { "manifest": "kind: Pod" } }
+    })
+    .to_string();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// A response whose `Content-Type` was relabeled to non-JSON is still governed
+/// when the body is JSON-shaped Chat Completions.
+#[tokio::test]
+async fn response_governs_json_body_despite_relabeled_content_type() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    let body = response_with_tool_call("kubectl.apply", "{}");
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &headers, &body)
+            .await,
+        Some(502),
+    );
+}
+
+/// A later transform that only adds an unrelated field (changing the body hash)
+/// must not re-flag an already-redacted call as a blocked-pattern match.
+#[tokio::test]
+async fn later_transform_does_not_reflag_redacted_call() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": "token" }]
+            }
+        }
+    }));
+    let body = response_with_tool_call("filesystem.write", "{\"data\":\"my token here\"}");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    let redacted = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/json"),
+            &json_headers(),
+        )
+        .await
+        .expect("redacted body");
+    // A later response_transformer adds an unrelated field, changing the body
+    // hash but leaving the redacted call unchanged.
+    let mut val: Value = serde_json::from_slice(&redacted).unwrap();
+    val["ferrum_extra"] = json!("added-by-response-transformer");
+    let later = serde_json::to_vec(&val).unwrap();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &later)
+            .await,
+    );
+}

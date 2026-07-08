@@ -117,6 +117,13 @@ const STREAM_MODEL_KEY: &str = "ai_tool_governor.stream_model";
 /// rewrote is re-evaluated against the same policy.
 const GOVERNED_REQUEST_HASH_KEY: &str = "ai_tool_governor.governed_request_hash";
 const GOVERNED_RESPONSE_HASH_KEY: &str = "ai_tool_governor.governed_response_hash";
+/// Comma-separated identity hashes (`sha256([name, args])`) of the response tool
+/// calls this plugin already governed/redacted. The post-transform final
+/// re-check skips these so it does not re-call an approval webhook for an
+/// unchanged call, or re-match this plugin's own `[REDACTED_TOOL_ARG:<name>]`
+/// placeholder as a blocked pattern, while still evaluating calls a later
+/// transform injected or changed.
+const GOVERNED_CALL_HASHES_KEY: &str = "ai_tool_governor.governed_call_hashes";
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -1333,7 +1340,13 @@ impl AiToolGovernor {
     /// is not available here — the redaction transform already ran — so a
     /// `redact_args` match fails closed (`redaction_unavailable = true`).
     async fn govern_final_response(&self, ctx: &mut RequestContext, json: &Value) -> PluginResult {
-        let calls = extract_response_tool_calls(json);
+        let mut calls = extract_response_tool_calls(json);
+        // Skip calls this plugin already governed/redacted (unchanged args): a
+        // later transform that only touched an unrelated field must not cause a
+        // second approval webhook for an unchanged sibling, nor re-match this
+        // plugin's own redaction placeholder. Calls a later transform injected or
+        // changed have different args and are still evaluated.
+        calls.retain(|call| !call_already_governed(ctx, call));
         if calls.is_empty() {
             return PluginResult::Continue;
         }
@@ -1376,7 +1389,17 @@ impl AiToolGovernor {
                 "streamed response body exceeds the inspectable size limit",
             );
         }
-        let calls = extract_sse_tool_calls(body);
+        let (calls, ungovernable) = extract_sse_tool_calls(body);
+        // Mirror the live streaming finalizer: a buffered SSE tool call that
+        // cannot be policy-checked (missing `function.name` or non-string
+        // `function.arguments`) is ungovernable. Fail closed in enforce, forward
+        // in dry-run.
+        if ungovernable {
+            return self.uninspectable_final_response(
+                ctx,
+                "streamed response body contains an ungovernable tool call",
+            );
+        }
         if calls.is_empty() {
             return PluginResult::Continue;
         }
@@ -1591,15 +1614,22 @@ impl Plugin for AiToolGovernor {
         if !governs_request && !detects_streaming {
             return PluginResult::Continue;
         }
-        // Only JSON POST bodies are in scope (mirror `should_buffer_request_body`).
-        if ctx.method != "POST"
-            || !header_value(headers, "content-type").is_some_and(is_json_content_type)
-        {
+        if ctx.method != "POST" {
             return PluginResult::Continue;
         }
         // An empty body has nothing to detect or govern (it is not
         // "uninspectable" in the fail-closed sense).
         if body.is_empty() {
+            return PluginResult::Continue;
+        }
+        // Only JSON bodies are in scope (mirror `should_buffer_request_body`). A
+        // `request_transformer` can strip/relabel `Content-Type` while still
+        // applying JSON body rules, so also inspect a JSON-shaped body — otherwise
+        // a request initially governed as safe JSON could be transformed into a
+        // denied MCP/A2A `tools/call` with the header removed and skip this
+        // re-check.
+        let json_ct = header_value(headers, "content-type").is_some_and(is_json_content_type);
+        if !json_ct && !looks_like_json(body) {
             return PluginResult::Continue;
         }
 
@@ -1625,7 +1655,7 @@ impl Plugin for AiToolGovernor {
             if is_stream {
                 ctx.metadata
                     .insert(STREAM_REQUESTED_KEY.to_string(), "true".to_string());
-                if let Some(model) = json.as_ref().and_then(|j| request_model(j)) {
+                if let Some(model) = json.as_ref().and_then(request_model) {
                     ctx.metadata.insert(STREAM_MODEL_KEY.to_string(), model);
                 }
             }
@@ -1645,8 +1675,12 @@ impl Plugin for AiToolGovernor {
         // A still-encoded / oversized / unparseable final body cannot be
         // inspected: fail closed in enforce mode so a transform (or a body
         // `before_proxy` could not read) cannot smuggle a denied call past policy.
+        // Only fail closed for a request this plugin actually governs — a JSON
+        // content type or one `before_proxy` already governed — so a non-JSON
+        // request another plugin merely buffered is not rejected here.
         let Some(json) = json else {
-            if self.engine.mode == Mode::Enforce {
+            let was_governed = ctx.metadata.contains_key(GOVERNED_REQUEST_HASH_KEY);
+            if self.engine.mode == Mode::Enforce && (json_ct || was_governed) {
                 return self.reject_uninspectable(
                     ctx,
                     "request body",
@@ -1725,7 +1759,11 @@ impl Plugin for AiToolGovernor {
         if is_event_stream_content_type(content_type) {
             return self.govern_buffered_sse(ctx, body).await;
         }
-        if !is_json_content_type(content_type) {
+        // A `response_transformer` header rule runs in `after_proxy` before this
+        // hook and can remove/relabel `Content-Type: application/json` while
+        // leaving the Chat Completions JSON intact, so also inspect a JSON-shaped
+        // body even when the header no longer says JSON.
+        if !is_json_content_type(content_type) && !looks_like_json(body) {
             return PluginResult::Continue;
         }
         // A streaming-only config governs a buffered JSON body only for a
@@ -1801,6 +1839,10 @@ impl Plugin for AiToolGovernor {
             );
             return self.reject(&batch);
         }
+        // Record the governed calls so the final re-check skips them (unless a
+        // later transform changes their args). Redaction updates this set to the
+        // redacted args below.
+        record_governed_calls(ctx, &calls);
         PluginResult::Continue
     }
 
@@ -1832,16 +1874,17 @@ impl Plugin for AiToolGovernor {
         if self.redact_response(&mut json) {
             let rewritten = serde_json::to_vec(&json).ok()?;
             // Record the redacted body's hash so `on_final_response_body` treats
-            // this plugin's own redaction as already-governed and skips it. Not
-            // doing so would re-run `govern_final_response` over the redacted
-            // body, which (a) re-calls the approval webhook for an unchanged
-            // `require_approval` sibling call (a 502 with `cache_ttl_seconds: 0`
-            // or a one-shot approval service) and (b) can re-match the
-            // `[REDACTED_TOOL_ARG:<name>]` placeholder as a blocked pattern.
+            // this plugin's own redaction as already-governed and skips it when
+            // no later transform runs. Also re-record the redacted calls' identity
+            // hashes so that even if a later transform changes the body hash, the
+            // final re-check skips these already-redacted calls (avoids re-calling
+            // an approval webhook for an unchanged sibling and re-matching the
+            // `[REDACTED_TOOL_ARG:<name>]` placeholder as a blocked pattern).
             ctx.metadata.insert(
                 GOVERNED_RESPONSE_HASH_KEY.to_string(),
                 sha256_hex_bytes(&rewritten),
             );
+            record_governed_calls(ctx, &extract_response_tool_calls(&json));
             return Some(rewritten);
         }
         None
@@ -1873,7 +1916,10 @@ impl Plugin for AiToolGovernor {
             return PluginResult::Continue;
         }
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
-        if !is_json_content_type(content_type) {
+        // Header relabeling must not disable the re-check: inspect a JSON-shaped
+        // body even when a transform rewrote the content type (mirrors
+        // `on_response_body`).
+        if !is_json_content_type(content_type) && !looks_like_json(body) {
             return PluginResult::Continue;
         }
         // Mirror `on_response_body`: a streaming-only config re-checks a buffered
@@ -1974,6 +2020,20 @@ impl Plugin for AiToolGovernor {
     /// require the governor to understand each provider's native tool events or
     /// to run after normalization). Reordering is not an option here: 2978 is
     /// deliberately before semantic cache/federation on the request path.
+    ///
+    /// DISPATCH LIMITATION (shared with `ai_semantic_firewall`'s `inspect`): the
+    /// SSE inspector is wired only on the reqwest `ResponseBody::Streaming` arm,
+    /// not `StreamingH2`/`StreamingH3`. `forces_reqwest_dispatch` excludes native
+    /// H3, and direct-H2/HBONE are excluded because the inspected request forces
+    /// request-body buffering. Two residual gaps therefore exist and are tracked
+    /// as a proxy-core follow-up (they need the dispatch layer to route ALL
+    /// inspected-streaming requests through reqwest, or inspectors attached to
+    /// the StreamingH2/H3 arms): (1) a `request_transformer` that adds
+    /// `"stream": true` for a backend already classified H3-capable can dispatch
+    /// via native H3 before the final-body re-detection pins reqwest; (2) a
+    /// bodyless SSE request (e.g. GET with `Accept: text/event-stream`) is not
+    /// buffered, so a direct-H2 backend can answer `StreamingH2` uninspected.
+    /// Buffered responses and reqwest-path SSE remain governed.
     fn response_stream_inspector(
         &self,
         ctx: &RequestContext,
@@ -2486,9 +2546,11 @@ fn frame_has_tool_calls(frame: &Value) -> bool {
 /// (another buffering plugin or a content-type-rewrite guard kept it buffered)
 /// instead of through the streaming inspector, so its tool calls are still
 /// governed rather than forwarded uninspected.
-fn extract_sse_tool_calls(body: &[u8]) -> Vec<ToolCall> {
+fn extract_sse_tool_calls(body: &[u8]) -> (Vec<ToolCall>, bool) {
     let Ok(text) = std::str::from_utf8(body) else {
-        return Vec::new();
+        // Non-UTF-8 SSE bytes: nothing extractable, and not a governable tool
+        // call — treat as no calls rather than ungovernable.
+        return (Vec::new(), false);
     };
     let mut acc = StreamingToolCallAccumulator::default();
     let mut event: Vec<&str> = Vec::new();
@@ -2510,7 +2572,9 @@ fn extract_sse_tool_calls(body: &[u8]) -> Vec<ToolCall> {
         }
     }
     flush(&mut event, &mut acc);
-    acc.build_calls()
+    // Surface the ungovernable state (missing name / non-string args) so the
+    // buffered path can fail closed exactly like the live streaming finalizer.
+    (acc.build_calls(), acc.has_ungovernable_call())
 }
 
 fn tool_call_from(name: &str, args: Option<&Value>) -> ToolCall {
@@ -2727,6 +2791,48 @@ fn truncate_str(s: &str, max_bytes: usize) -> &str {
 
 fn sha256_hex(input: &str) -> String {
     sha256_hex_bytes(input.as_bytes())
+}
+
+/// Whether a body's first non-whitespace byte starts a JSON object/array. Used
+/// so a `request_transformer`/`response_transformer` that removes or rewrites the
+/// `Content-Type` header cannot disable governance while leaving the JSON body
+/// intact — a JSON-shaped body is still inspected. Bounds the extra parse to
+/// bodies that actually look like JSON.
+fn looks_like_json(body: &[u8]) -> bool {
+    matches!(
+        body.iter().copied().find(|b| !b.is_ascii_whitespace()),
+        Some(b'{') | Some(b'[')
+    )
+}
+
+/// Unambiguous identity hash of a tool call (name + raw arguments), used to skip
+/// already-governed/redacted calls in the post-transform final re-check.
+fn call_identity_hash(call: &ToolCall) -> String {
+    sha256_hex(&json!([call.name.as_str(), call.raw_args.as_str()]).to_string())
+}
+
+/// Record the identity hashes of governed response tool calls onto the request
+/// context so the final re-check can skip them.
+fn record_governed_calls(ctx: &mut RequestContext, calls: &[ToolCall]) {
+    if calls.is_empty() {
+        return;
+    }
+    let hashes = calls
+        .iter()
+        .map(call_identity_hash)
+        .collect::<Vec<_>>()
+        .join(",");
+    ctx.metadata
+        .insert(GOVERNED_CALL_HASHES_KEY.to_string(), hashes);
+}
+
+/// Whether a tool call was already governed/redacted (its identity hash is in
+/// `GOVERNED_CALL_HASHES_KEY`).
+fn call_already_governed(ctx: &RequestContext, call: &ToolCall) -> bool {
+    let hash = call_identity_hash(call);
+    ctx.metadata
+        .get(GOVERNED_CALL_HASHES_KEY)
+        .is_some_and(|recorded| recorded.split(',').any(|h| h == hash))
 }
 
 fn sha256_hex_bytes(input: &[u8]) -> String {
