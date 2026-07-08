@@ -2749,6 +2749,56 @@ async fn stream_true_request_is_not_re_pinned_by_content_type_hook() {
 }
 
 #[tokio::test]
+async fn non_candidate_json_is_not_re_pinned_by_content_type_hook() {
+    // Review round 7: a non-AI JSON POST is classified `candidate=false`; its
+    // (possibly large) ordinary JSON response must not be re-pinned to the
+    // buffered path by the content-type re-evaluation — `on_final_response_body`
+    // would ignore it anyway. The hook must mirror `should_buffer_response_body`'s
+    // full per-request decision, including the candidate tri-state.
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let headers = json_headers();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, br#"{"order_id":42,"total":9.99}"#)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("false")
+    );
+    assert!(
+        !plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("application/json"),
+            200,
+            &headers,
+        ),
+        "candidate=false must suppress content-type re-pinning of non-AI JSON responses"
+    );
+    // The two buffering hooks must agree on the classified non-AI request.
+    assert!(!plugin.should_buffer_response_body(&ctx));
+
+    // With no candidate marker at all (request never went through staging),
+    // both hooks fall back to the same POST + JSON-request heuristic.
+    let unstaged = make_ctx();
+    assert!(plugin.should_buffer_response_body(&unstaged));
+    assert!(
+        plugin.should_buffer_response_body_for_content_type(
+            &unstaged,
+            Some("application/json"),
+            200,
+            &headers,
+        ),
+        "hooks must never disagree for an unstaged request"
+    );
+}
+
+#[tokio::test]
 async fn non_retryable_sink_4xx_marks_sink_unhealthy_under_reject() {
     // A collector returning a non-retryable non-2xx (e.g. 401 from an expired
     // token) passes through the shared batch helper as Ok (batch discarded, no

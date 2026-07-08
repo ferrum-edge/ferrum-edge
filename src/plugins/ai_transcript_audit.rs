@@ -1026,6 +1026,59 @@ impl AiTranscriptAudit {
             headers,
         }
     }
+
+    /// Shared per-request buffered-capture predicate used by both
+    /// `should_buffer_response_body` and
+    /// `should_buffer_response_body_for_content_type` so the initial
+    /// buffer-vs-stream decision and the proxy's later content-type
+    /// re-evaluation (`refine_stream_response_for_content_type`) can never
+    /// disagree about whether this request's response is worth buffering.
+    fn buffered_response_capture_wanted(&self, ctx: &RequestContext) -> bool {
+        if !self.capture.response {
+            return false;
+        }
+        // A `stream: true` request expects an SSE response; do not buffer it —
+        // buffering holds the stream until EOF, and under retry the
+        // buffered->stream content-type downgrade is disabled, so an oversized
+        // stream would be capped at `max_response_body_size_bytes` and fail
+        // rather than stream. Streaming capture still tees it via the response
+        // stream inspector when enabled. Tradeoff (deliberate): a provider that
+        // answers a `stream: true` request with a non-SSE JSON 4xx/5xx error is
+        // then streamed too, so its body is not buffered-captured — the log
+        // fallback still records the request side, status, and error reason.
+        // Forcing a buffer to catch that body would risk the failure above for
+        // the common SSE success case. The marker is derived from the
+        // pre-transform body because this decision is made before request-body
+        // transforms run; a later transformer that rewrites `stream` cannot be
+        // reflected here (same ordering limit as the AI-candidate
+        // classification; proxy-core follow-up: issue #2055).
+        if flag(&ctx.metadata, MD_STREAM_REQUEST) {
+            return false;
+        }
+        match ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
+            Some("true") => true,
+            // `before_proxy` classified the pre-transform body as non-AI. This
+            // decision is locked in before `on_final_request_body_with_context`
+            // could re-stage a candidate that a later request-body transformer
+            // (ordered after priority 2924) turned into an AI payload, so such a
+            // request's *buffered* response body is not captured. That is a
+            // deliberate tradeoff: buffering every JSON POST response instead
+            // would re-introduce the over-buffering of ordinary non-AI traffic a
+            // prior review flagged. The stream marker has the same pre-transform
+            // limit: only bodies that classified as AI at staging time are
+            // marked for stream inspection (proxy-core follow-up: issue #2055).
+            // The transaction is still audited request-side via the `log`
+            // fallback.
+            Some("false") => false,
+            _ => {
+                ctx.method == "POST"
+                    && ctx
+                        .headers
+                        .get("content-type")
+                        .is_some_and(|content_type| is_json_content_type(content_type))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1188,50 +1241,7 @@ impl Plugin for AiTranscriptAudit {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        if !self.capture.response {
-            return false;
-        }
-        // A `stream: true` request expects an SSE response; do not buffer it —
-        // buffering holds the stream until EOF, and under retry the
-        // buffered->stream content-type downgrade is disabled, so an oversized
-        // stream would be capped at `max_response_body_size_bytes` and fail
-        // rather than stream. Streaming capture still tees it via the response
-        // stream inspector when enabled. Tradeoff (deliberate): a provider that
-        // answers a `stream: true` request with a non-SSE JSON 4xx/5xx error is
-        // then streamed too, so its body is not buffered-captured — the log
-        // fallback still records the request side, status, and error reason.
-        // Forcing a buffer to catch that body would risk the failure above for
-        // the common SSE success case. The marker is derived from the
-        // pre-transform body because this decision is made before request-body
-        // transforms run; a later transformer that rewrites `stream` cannot be
-        // reflected here (same ordering limit as the AI-candidate
-        // classification; proxy-core follow-up: issue #2055).
-        if flag(&ctx.metadata, MD_STREAM_REQUEST) {
-            return false;
-        }
-        match ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
-            Some("true") => true,
-            // `before_proxy` classified the pre-transform body as non-AI. This
-            // decision is locked in before `on_final_request_body_with_context`
-            // could re-stage a candidate that a later request-body transformer
-            // (ordered after priority 2924) turned into an AI payload, so such a
-            // request's *buffered* response body is not captured. That is a
-            // deliberate tradeoff: buffering every JSON POST response instead
-            // would re-introduce the over-buffering of ordinary non-AI traffic a
-            // prior review flagged. The stream marker has the same pre-transform
-            // limit: only bodies that classified as AI at staging time are
-            // marked for stream inspection (proxy-core follow-up: issue #2055).
-            // The transaction is still audited request-side via the `log`
-            // fallback.
-            Some("false") => false,
-            _ => {
-                ctx.method == "POST"
-                    && ctx
-                        .headers
-                        .get("content-type")
-                        .is_some_and(|content_type| is_json_content_type(content_type))
-            }
-        }
+        self.buffered_response_capture_wanted(ctx)
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1241,18 +1251,16 @@ impl Plugin for AiTranscriptAudit {
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        if !self.capture.response {
-            return false;
-        }
-        // Mirror `should_buffer_response_body`'s per-request `stream: true`
-        // opt-out. This hook also runs when the proxy re-evaluates
-        // buffer-vs-stream for a released response
-        // (`refine_stream_response_for_content_type`); without the same gate,
-        // a co-located plugin's released non-SSE JSON stream response would be
-        // re-pinned to the buffered path — defeating the never-buffer-
-        // `stream: true` decision and risking the buffered-size-cap failure it
-        // exists to avoid.
-        if flag(&ctx.metadata, MD_STREAM_REQUEST) {
+        // Mirror the full per-request decision `should_buffer_response_body`
+        // makes (`stream: true` opt-out AND the AI-candidate tri-state). This
+        // hook also runs when the proxy re-evaluates buffer-vs-stream for a
+        // released response (`refine_stream_response_for_content_type`);
+        // without the same gates, a co-located plugin's released non-AI (or
+        // `stream: true`) JSON response would be re-pinned to the buffered
+        // path even though `on_final_response_body` would ignore it —
+        // needlessly buffering ordinary JSON traffic and risking the global
+        // response-size-cap failure the opt-outs exist to avoid.
+        if !self.buffered_response_capture_wanted(ctx) {
             return false;
         }
         // Buffer JSON AI responses here; SSE goes down the streaming inspector
