@@ -2026,7 +2026,7 @@ impl Plugin for AiToolGovernor {
     /// not `StreamingH2`/`StreamingH3`. `forces_reqwest_dispatch` excludes native
     /// H3, and direct-H2/HBONE are excluded because the inspected request forces
     /// request-body buffering. Two residual gaps therefore exist and are tracked
-    /// as a proxy-core follow-up (they need the dispatch layer to route ALL
+    /// as a proxy-core follow-up, issue #2055 (they need the dispatch layer to route ALL
     /// inspected-streaming requests through reqwest, or inspectors attached to
     /// the StreamingH2/H3 arms): (1) a `request_transformer` that adds
     /// `"stream": true` for a backend already classified H3-capable can dispatch

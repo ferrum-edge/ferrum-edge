@@ -210,3 +210,15 @@ approval webhook only when `approval.include_prompt_excerpt: true`.
   on a shared proxy would break unrelated routes.
 - The plugin governs tool calls; it does not execute tools, manage MCP sessions,
   or replace `mcp_gateway`/A2A routing.
+- Streaming inspection rides the proxy's reqwest dispatch arm (the same
+  mechanism `ai_semantic_firewall` uses): governed streaming requests are pinned
+  to it via `forces_reqwest_dispatch`, but a response streamed on the direct
+  HTTP/2 or native HTTP/3 arm is not inspected. Two proxy-core gaps remain:
+  a `request_transformer` that **adds** `stream: true` after the dispatch
+  decision on an HTTP/3-classified backend, and a request that stages no JSON
+  body whose backend nevertheless answers with tool-call SSE. Neither is
+  client-controllable against real AI providers — a client-sent `stream: true`
+  JSON POST is detected and pinned, and OpenAI/Anthropic/Gemini-shaped backends
+  do not emit tool-call streams for bodyless requests. Buffered responses and
+  reqwest-arm SSE are always governed. Shared proxy-core follow-up:
+  [#2055](https://github.com/ferrum-edge/ferrum-edge/issues/2055).
