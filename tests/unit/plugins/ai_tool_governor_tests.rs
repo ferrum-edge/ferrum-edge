@@ -3728,3 +3728,431 @@ async fn streaming_approval_uses_stream_router_provider_name() {
 
     server.verify().await;
 }
+
+// ---------------------------------------------------------------------------
+// Round 10 review fixes: SSE shape fallback, held-batch ordering, cache cap
+// race, unnamed buffered calls, final-body model refresh
+// ---------------------------------------------------------------------------
+
+const SSE_DENIED_TOOL_BODY: &str = concat!(
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+    "\"function\":{\"name\":\"kubectl.apply\",\"arguments\":\"{}\"}}]}}]}\n\n",
+    "data: [DONE]\n\n"
+);
+
+const SSE_ALLOWED_TOOL_BODY: &str = concat!(
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+    "\"function\":{\"name\":\"report.read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+    "data: [DONE]\n\n"
+);
+
+/// A buffered SSE body whose `Content-Type: text/event-stream` was OMITTED by
+/// the upstream must still be governed: the body is SSE-shaped (`data:` first
+/// line), not JSON-shaped, so without the shape fallback it would forward a
+/// denied tool call uninspected.
+#[tokio::test]
+async fn buffered_sse_without_content_type_is_governed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+
+    let no_ct: HashMap<String, String> = HashMap::new();
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &no_ct, SSE_DENIED_TOOL_BODY.as_bytes())
+            .await,
+        Some(502),
+    );
+
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &no_ct, SSE_ALLOWED_TOOL_BODY.as_bytes())
+            .await,
+    );
+}
+
+/// A `response_transformer` header rule that RELABELS `text/event-stream`
+/// (e.g. to `text/plain`) must not skip buffered-SSE governance; the same
+/// shape fallback applies on the final re-check.
+#[tokio::test]
+async fn buffered_sse_with_relabeled_content_type_is_governed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": true }
+    }));
+    let mut plain_headers = HashMap::new();
+    plain_headers.insert("content-type".to_string(), "text/plain".to_string());
+
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &plain_headers,
+                SSE_DENIED_TOOL_BODY.as_bytes(),
+            )
+            .await,
+        Some(502),
+    );
+
+    // Final re-check parity: a transform that rewrote the body into SSE (or
+    // relabeled a governed SSE body) is re-governed on the final path too.
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &plain_headers,
+                SSE_DENIED_TOOL_BODY.as_bytes(),
+            )
+            .await,
+        Some(502),
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &plain_headers,
+                SSE_ALLOWED_TOOL_BODY.as_bytes(),
+            )
+            .await,
+    );
+
+    // A BOM/whitespace prefix must not defeat the shape detection.
+    let mut bom_body = b"\xEF\xBB\xBF\n".to_vec();
+    bom_body.extend_from_slice(SSE_DENIED_TOOL_BODY.as_bytes());
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &plain_headers, &bom_body)
+            .await,
+        Some(502),
+    );
+}
+
+/// While a governed tool-call batch is HELD, later non-tool frames (another
+/// choice's content) must be held too: an allowed multi-choice stream is
+/// delivered in original arrival order, never reordered around the released
+/// tool frames.
+#[tokio::test]
+async fn streaming_holds_non_tool_frames_behind_pending_batch_and_releases_in_order() {
+    let plugin = make(streaming_config(
+        json!({ "get_weather": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    let tool_frame = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}}]}}]}\n\n"
+    );
+    let content_after =
+        "data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"OTHER-CHOICE-TEXT\"}}]}\n\n";
+    let finish_frame =
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n";
+    let done = "data: [DONE]\n\n";
+
+    // First chunk: tool frame + trailing content frame. Nothing may be
+    // forwarded yet — the content frame arrived while the batch was pending.
+    let first = format!("{tool_frame}{content_after}");
+    let forwarded = match inspector.on_chunk(first.as_bytes()).await {
+        ResponseStreamAction::Forward(bytes) => bytes,
+        ResponseStreamAction::Terminate(_) => panic!("allowed batch must not terminate"),
+    };
+    assert!(
+        forwarded.is_empty(),
+        "content after a pending tool-call batch must be held, got: {}",
+        String::from_utf8_lossy(&forwarded)
+    );
+
+    // Finish frame completes the batch: everything releases in arrival order.
+    let rest = format!("{finish_frame}{done}");
+    let (out, terminated) = drive_stream(&mut inspector, &[rest.as_bytes()]).await;
+    assert!(!terminated);
+    let mut full = forwarded.to_vec();
+    full.extend_from_slice(&out);
+    let expected = format!("{tool_frame}{content_after}{finish_frame}{done}");
+    assert_eq!(
+        String::from_utf8_lossy(&full),
+        expected,
+        "release must restore original arrival order"
+    );
+}
+
+/// On a DENY, content frames that arrived after the held tool-call batch must
+/// not leak ahead of (or after) the terminal error event.
+#[tokio::test]
+async fn streaming_denied_batch_does_not_leak_held_after_content() {
+    let plugin = make(streaming_config(json!({}), "deny"));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"BEFORE-TOOLS\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"AFTER-TOOLS-LEAK\"}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(terminated, "denied batch must cut the stream");
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("BEFORE-TOOLS"),
+        "pre-batch content should have streamed: {text}"
+    );
+    assert!(
+        !text.contains("AFTER-TOOLS-LEAK"),
+        "content held behind a denied batch leaked: {text}"
+    );
+    assert!(!text.contains("danger"), "held tool frame leaked: {text}");
+    assert!(
+        text.contains("ai_tool_governor_tool_blocked"),
+        "no terminal error event: {text}"
+    );
+}
+
+/// The approval-cache entry cap must hold under CONCURRENT inserts: the
+/// capacity check + eviction + insert path is serialized, so racing approval
+/// resolutions cannot push the map past `MAX_APPROVAL_CACHE_ENTRIES`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn approval_cache_cap_holds_under_concurrent_inserts() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .mount(&server)
+        .await;
+
+    let plugin = std::sync::Arc::new(make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": {
+            "endpoint_url": format!("{}/approve", server.uri()),
+            "cache_ttl_seconds": 300
+        },
+        "inspect": { "response_tool_calls": true }
+    })));
+
+    let max = AiToolGovernor::approval_cache_max_entries();
+    let tasks = 16usize;
+    // Enough distinct argument sets across all tasks to overshoot the cap.
+    let per_task = max / tasks + 8;
+    let mut handles = Vec::new();
+    for task in 0..tasks {
+        let plugin = std::sync::Arc::clone(&plugin);
+        handles.push(tokio::spawn(async move {
+            for i in 0..per_task {
+                let args = format!("{{\"n\":{}}}", task * per_task + i);
+                let body = response_with_tool_call("deploy", &args);
+                let mut ctx = create_test_context();
+                assert_continue(
+                    plugin
+                        .on_response_body(&mut ctx, 200, &json_headers(), &body)
+                        .await,
+                );
+            }
+        }));
+    }
+    for handle in handles {
+        handle.await.expect("insert task");
+    }
+
+    let len = plugin.approval_cache_len();
+    assert!(
+        len <= max,
+        "approval cache exceeded its cap under concurrent inserts: {len} > {max}"
+    );
+    assert_eq!(
+        len, max,
+        "cache should be exactly full after overshooting the cap with live entries"
+    );
+}
+
+/// A buffered `tool_calls[]` whose entries ALL lack `function.name` must not
+/// slide past policy as "no calls": enforce mode fails closed even under
+/// `default_action: deny` with an empty extract.
+#[tokio::test]
+async fn buffered_all_unnamed_tool_calls_fail_closed_in_enforce() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "inspect": { "response_tool_calls": true }
+    }));
+    let body = json!({
+        "choices": [{
+            "message": {
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "arguments": "{\"cmd\":\"rm -rf /\"}" }
+                }]
+            }
+        }]
+    })
+    .to_string()
+    .into_bytes();
+
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+
+    // Final re-check parity: a transform that injects the unnamed call after
+    // `on_response_body` cleared the original body fails closed too.
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+/// The same all-unnamed shape is forwarded in dry-run — observation must not
+/// disrupt traffic (streaming parity).
+#[tokio::test]
+async fn buffered_all_unnamed_tool_calls_forward_in_dry_run() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "inspect": { "response_tool_calls": true }
+    }));
+    let body = json!({
+        "choices": [{
+            "message": {
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": { "arguments": "{}" }
+                }]
+            }
+        }]
+    })
+    .to_string()
+    .into_bytes();
+
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+}
+
+/// A `null` `tool_calls` / `function_call` is OpenAI's documented content-only
+/// shape and must NOT trip the ungovernable fail-closed path.
+#[tokio::test]
+async fn buffered_null_tool_calls_are_not_ungovernable() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "inspect": { "response_tool_calls": true }
+    }));
+    let body = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "hello",
+                "tool_calls": Value::Null,
+                "function_call": Value::Null
+            }
+        }]
+    })
+    .to_string()
+    .into_bytes();
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+}
+
+/// A `request_transformer` that changes `model` after `before_proxy` marked the
+/// request streaming must refresh the recorded stream model: the stream
+/// inspector seeds correlation from it, and the approval webhook must key on
+/// the BACKEND-VISIBLE model, not the stale pre-transform one.
+#[tokio::test]
+async fn final_request_body_refreshes_stream_model_for_approval() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .and(body_string_contains("\"model\":\"model-b\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()) },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({ "stream": true, "model": "model-a", "messages": [] }).to_string(),
+    );
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.stream_model")
+            .map(String::as_str),
+        Some("model-a"),
+        "before_proxy records the original model"
+    );
+
+    // The transformer changed the model; the request is ALREADY marked
+    // streaming, and the final-body re-check must still refresh the model.
+    let final_body = json!({ "stream": true, "model": "model-b", "messages": [] }).to_string();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), final_body.as_bytes())
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.stream_model")
+            .map(String::as_str),
+        Some("model-b"),
+        "final request body must refresh the stream model"
+    );
+
+    // The stream inspector's approval call keys on the refreshed model even
+    // though the SSE frames carry no model of their own.
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"deploy\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (_out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(!terminated, "approved call must not cut the stream");
+    server.verify().await;
+}

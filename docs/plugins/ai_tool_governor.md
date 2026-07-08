@@ -39,10 +39,14 @@ For **streaming**, tool-call SSE frames are **held** (not forwarded) until the
 call is complete and cleared by policy/approval, then the held frames are
 released; on a block the stream is **cut with a terminal SSE error event** and
 the held frames are dropped — the disallowed call never reaches the client.
-Ordinary content/role deltas stream through live. With multi-choice (`n > 1`)
-streams, a batch is finalized only once **every** choice holding tool calls has
-reported a `finish_reason` (or the stream ends), and later tool-call deltas
-form a new, independently governed batch. The plugin detects `"stream": true`
+Ordinary content/role deltas stream through live **until a tool-call batch
+opens**; once a batch is pending, ALL subsequent events (other choices'
+content, keepalives) are held too and released in original arrival order when
+the batch clears — so an allowed multi-choice stream is never reordered, and a
+denied one cannot leak content that arrived after the held call. With
+multi-choice (`n > 1`) streams, a batch is finalized only once **every** choice
+holding tool calls has reported a `finish_reason` (or the stream ends), and
+later tool-call deltas form a new, independently governed batch. The plugin detects `"stream": true`
 in JSON POST bodies and pins those requests onto the reqwest dispatch path
 where the SSE inspector is wired, so a client-sent streaming request cannot
 bypass streaming inspection by targeting a direct HTTP/2 or native HTTP/3
@@ -57,8 +61,12 @@ tool calls for a request, a 2xx response with a **missing or non-JSON
 `Content-Type`** is **buffered and inspected**, not streamed — a transform
 chain can relabel `Content-Type` while the body is still Chat Completions
 JSON, so ambiguous labels are treated fail-closed and run through the
-JSON-shape fallback. Only two response labels are released back to the
-streaming path: a genuine `text/event-stream` (governed by the SSE stream
+JSON-shape fallback. A buffered body that is **SSE-shaped** (its first
+non-empty line starts with `data:`/`event:`/`id:`/`retry:`) is routed through
+buffered-SSE governance regardless of its label, so an upstream that omits
+`text/event-stream` — or a transform that relabels it — cannot deliver
+tool-call deltas uninspected. Only two response labels are released back to
+the streaming path: a genuine `text/event-stream` (governed by the SSE stream
 inspector, or by buffered-SSE governance if another plugin keeps it buffered)
 and framed gRPC / gRPC-Web content types (owned by the gRPC machinery, out of
 this plugin's scope). Operators should expect mislabeled or unlabeled
@@ -77,7 +85,11 @@ forwarded ungoverned:
   content-type.
 - **Response path** (when `response_tool_calls` is enabled): a 2xx JSON
   response body larger than **4 MiB** (padding must not smuggle tool calls
-  past the parse limit).
+  past the parse limit), and a `tool_calls[]` / `function_call` entry that
+  cannot be policy-checked — a missing or non-string `function.name` (policy
+  is keyed by name), or a `tool_calls` value that is present but not an array.
+  A `null` `tool_calls`/`function_call` is OpenAI's normal content-only shape
+  and is fine.
 - **Streaming path**: held tool-call frames plus the partial-event carry are
   capped at **4 MiB**; past that the stream is cut with the terminal SSE error
   event.
@@ -217,8 +229,10 @@ approval webhook only when `approval.include_prompt_excerpt: true`.
 - Streaming `redact_args` fails closed (cuts the stream) rather than redacting
   split-JSON arguments mid-flight.
 - Held streaming tool-call frames are released together at each batch's
-  completion boundary (all tool-call-holding choices finished); content deltas
-  stream through live in the meantime.
+  completion boundary (all tool-call-holding choices finished); while a batch
+  is pending, other choices' content deltas are held behind it (ordering and
+  no-leak-on-deny take precedence over latency for the rare
+  multi-choice-with-tools stream).
 - Request-path governance is scoped to JSON `POST` bodies (the shape OpenAI,
   MCP, and A2A traffic uses). Framed gRPC / gRPC-Web requests — including the
   `application/grpc+json` / `application/grpc-web+json` variants, whose bodies

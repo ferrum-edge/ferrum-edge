@@ -301,6 +301,14 @@ struct GovernorEngine {
     /// receives that can change its decision), value is `(allowed, expiry)`.
     /// Bounded by [`MAX_APPROVAL_CACHE_ENTRIES`].
     approval_cache: DashMap<String, (bool, Instant)>,
+    /// Serializes the approval-cache INSERT path (capacity check + eviction +
+    /// insert) so concurrent approval resolutions cannot each observe
+    /// `len() < MAX_APPROVAL_CACHE_ENTRIES` and race the map past the cap.
+    /// Reads stay lock-free on the `DashMap`. A mutex is acceptable here: this
+    /// guards the approval-webhook resolution path (an outbound HTTP call just
+    /// completed), NOT the per-request proxy hot path, so the hot-path
+    /// no-locks invariant does not apply.
+    approval_cache_insert_lock: std::sync::Mutex<()>,
 }
 
 /// A concrete tool call to evaluate (name + arguments).
@@ -757,13 +765,28 @@ impl GovernorEngine {
         let (allowed, approval_id) = self.call_approval(approval, input).await?;
 
         if approval.cache_ttl > Duration::ZERO {
+            // Serialize capacity check + eviction + insert behind a mutex:
+            // check-then-insert on the bare DashMap is racy (N concurrent
+            // resolutions can each observe `len() < MAX` and push the map past
+            // the cap). This is the approval-webhook path — an outbound HTTP
+            // call just completed — not the per-request proxy hot path, so a
+            // mutex on the insert side is acceptable; cache READS above remain
+            // lock-free. A poisoned lock (a panic while held) just falls
+            // through to the same bounded insert logic.
+            let _insert_guard = self
+                .approval_cache_insert_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if self.approval_cache.len() >= MAX_APPROVAL_CACHE_ENTRIES {
                 // At capacity: purge expired entries. Argument-varying clients
                 // cannot grow this map for the process lifetime.
                 let now = Instant::now();
                 self.approval_cache.retain(|_, (_, expiry)| *expiry > now);
             }
-            if self.approval_cache.len() < MAX_APPROVAL_CACHE_ENTRIES
+            // Replacing an existing key never grows the map, so allow it even
+            // at capacity; only NEW keys are capped.
+            if (self.approval_cache.len() < MAX_APPROVAL_CACHE_ENTRIES
+                || self.approval_cache.contains_key(&cache_key))
                 && let Some(expiry) = Instant::now().checked_add(approval.cache_ttl)
             {
                 self.approval_cache.insert(cache_key, (allowed, expiry));
@@ -897,6 +920,7 @@ impl AiToolGovernor {
                 },
                 http_client,
                 approval_cache: DashMap::new(),
+                approval_cache_insert_lock: std::sync::Mutex::new(()),
             };
             return Ok(Self {
                 enabled: false,
@@ -999,6 +1023,7 @@ impl AiToolGovernor {
             observability,
             http_client,
             approval_cache: DashMap::new(),
+            approval_cache_insert_lock: std::sync::Mutex::new(()),
         };
 
         Ok(Self {
@@ -1358,7 +1383,16 @@ impl AiToolGovernor {
     /// is not available here — the redaction transform already ran — so a
     /// `redact_args` match fails closed (`redaction_unavailable = true`).
     async fn govern_final_response(&self, ctx: &mut RequestContext, json: &Value) -> PluginResult {
-        let mut calls = extract_response_tool_calls(json);
+        let (mut calls, ungovernable) = extract_response_tool_calls(json);
+        // Parity with the streaming finalizer and the buffered-SSE path: an
+        // entry the extractor cannot policy-check (a missing or non-string
+        // name) fails closed in enforce mode and forwards in dry-run.
+        if ungovernable {
+            return self.uninspectable_final_response(
+                ctx,
+                "response contains a tool call that cannot be policy-checked (missing or non-string name)",
+            );
+        }
         if calls.is_empty() {
             return PluginResult::Continue;
         }
@@ -1429,6 +1463,15 @@ impl AiToolGovernor {
                 "streamed response body exceeds the inspectable size limit",
             );
         }
+        // Record the hash of the SSE body governed here so the post-transform
+        // `on_final_response_body` re-check (which routes SSE-labeled/shaped
+        // bodies back through this path) can skip an unchanged body instead of
+        // re-governing it — for `require_approval` policies that would mean a
+        // duplicate approval webhook call.
+        ctx.metadata.insert(
+            GOVERNED_RESPONSE_HASH_KEY.to_string(),
+            sha256_hex_bytes(body),
+        );
         let (calls, ungovernable) = extract_sse_tool_calls(body);
         // Mirror the live streaming finalizer: a buffered SSE tool call that
         // cannot be policy-checked (missing `function.name` or non-string
@@ -1693,18 +1736,35 @@ impl Plugin for AiToolGovernor {
         // marker to pin the reqwest path where the SSE inspector is wired. An
         // uninspectable final body cannot rule out `stream: true`, so mark it
         // conservatively — reqwest dispatch is always valid.
-        if detects_streaming
-            && ctx.metadata.get(STREAM_REQUESTED_KEY).map(String::as_str) != Some("true")
-        {
+        if detects_streaming {
+            let already_marked =
+                ctx.metadata.get(STREAM_REQUESTED_KEY).map(String::as_str) == Some("true");
             let is_stream = match &json {
                 Some(json) => json.get("stream").and_then(Value::as_bool) == Some(true),
                 None => true,
             };
-            if is_stream {
+            if is_stream && !already_marked {
                 ctx.metadata
                     .insert(STREAM_REQUESTED_KEY.to_string(), "true".to_string());
-                if let Some(model) = json.as_ref().and_then(request_model) {
-                    ctx.metadata.insert(STREAM_MODEL_KEY.to_string(), model);
+            }
+            // Refresh the recorded model from the FINAL backend-visible body —
+            // even when `before_proxy` already marked the request streaming: a
+            // `request_transformer` can change `model` after the initial
+            // detection, the stream inspector seeds its correlation from this
+            // key (and ignores SSE-frame models once correlation is `Some`),
+            // and approval webhooks/cache must key on the model the backend
+            // actually serves. When an inspectable final body no longer
+            // carries a model, drop the stale key so the inspector falls back
+            // to the `model` reported in the SSE frames; an uninspectable
+            // final body leaves the last-known value in place.
+            if (is_stream || already_marked) && json.is_some() {
+                match json.as_ref().and_then(request_model) {
+                    Some(model) => {
+                        ctx.metadata.insert(STREAM_MODEL_KEY.to_string(), model);
+                    }
+                    None => {
+                        ctx.metadata.remove(STREAM_MODEL_KEY);
+                    }
                 }
             }
         }
@@ -1814,8 +1874,16 @@ impl Plugin for AiToolGovernor {
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         // A buffered `text/event-stream` body means the stream inspector never
         // attached (another plugin/guard kept it buffered): govern the SSE tool
-        // calls here rather than forwarding them uninspected.
-        if is_event_stream_content_type(content_type) {
+        // calls here rather than forwarding them uninspected. The label is not
+        // trustworthy either — an upstream can omit `text/event-stream`, and a
+        // `response_transformer` header rule can relabel it (e.g. `text/plain`)
+        // while leaving the SSE frames intact — so an SSE-SHAPED body (see
+        // `looks_like_sse`) is routed through buffered-SSE governance
+        // regardless of the header — even a `application/json` relabel: an
+        // SSE-shaped body can never parse as JSON, so the JSON path below could
+        // only forward it uninspected. Encoded bodies never look like SSE and
+        // are handled by the content-encoding fail-closed path below.
+        if is_event_stream_content_type(content_type) || looks_like_sse(body) {
             return self.govern_buffered_sse(ctx, body).await;
         }
         // A `response_transformer` header rule runs in `after_proxy` before this
@@ -1871,7 +1939,22 @@ impl Plugin for AiToolGovernor {
             sha256_hex_bytes(body),
         );
 
-        let calls = extract_response_tool_calls(&json);
+        let (calls, ungovernable) = extract_response_tool_calls(&json);
+        // Streaming parity: an ungovernable `tool_calls[]` entry (a missing
+        // or non-string `function.name`) must not slide past policy
+        // because the extractor dropped it — with all entries unnamed,
+        // `calls.is_empty()` would Continue even under `default_action: deny`.
+        // Fail closed in enforce mode, forward in dry-run.
+        if ungovernable {
+            if self.engine.mode == Mode::Enforce {
+                return self.reject_uninspectable(
+                    ctx,
+                    "response body",
+                    "response contains a tool call that cannot be policy-checked (missing or non-string name)",
+                );
+            }
+            return PluginResult::Continue;
+        }
         if calls.is_empty() {
             return PluginResult::Continue;
         }
@@ -1969,7 +2052,7 @@ impl Plugin for AiToolGovernor {
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let corr = self.correlation(ctx, model, provider.as_deref());
-            record_governed_calls(ctx, &corr, &extract_response_tool_calls(&json));
+            record_governed_calls(ctx, &corr, &extract_response_tool_calls(&json).0);
             return Some(rewritten);
         }
         None
@@ -2020,6 +2103,20 @@ impl Plugin for AiToolGovernor {
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         let json_ct = is_json_content_type(content_type);
 
+        // Buffered-SSE parity for the final re-check (mirrors
+        // `on_response_body`): a transform can rewrite an SSE body (hash
+        // changed above) or strip/relabel its content type, so an SSE-labeled
+        // or SSE-SHAPED unencoded final body is re-governed through the
+        // buffered-SSE path — with the same fail-closed semantics
+        // (ungovernable calls, redact-unavailable). Encoded bytes never look
+        // like SSE; the content-encoding branch below applies the same check
+        // to the DECODED bytes.
+        if content_encoding_value(response_headers).is_none()
+            && (is_event_stream_content_type(content_type) || looks_like_sse(body))
+        {
+            return self.govern_buffered_sse(ctx, body).await;
+        }
+
         // Plaintext parse first: covers unencoded bodies and a spurious
         // `Content-Encoding` header a header rule added without encoding the
         // bytes. Header relabeling must not disable the re-check, so a
@@ -2061,6 +2158,12 @@ impl Plugin for AiToolGovernor {
             // could deny, turning an allowed response into a 502).
             if ctx.metadata.get(GOVERNED_RESPONSE_HASH_KEY) == Some(&sha256_hex_bytes(&decoded)) {
                 return PluginResult::Continue;
+            }
+            // Buffered-SSE parity on the DECODED bytes: a compressed SSE body
+            // (the `compression` plugin compresses `text/*` too) must be
+            // re-governed, not skipped by the JSON-shape gate below.
+            if is_event_stream_content_type(content_type) || looks_like_sse(&decoded) {
+                return self.govern_buffered_sse(ctx, &decoded).await;
             }
             // Content-type / JSON-shape gates against the DECODED bytes.
             if !json_ct && !looks_like_json(&decoded) {
@@ -2171,6 +2274,20 @@ impl Plugin for AiToolGovernor {
             corr,
             Arc::clone(&ctx.plugin_http_call_ns),
         )))
+    }
+}
+
+/// Test-only observability — exposed for unit tests (the approval cache is
+/// otherwise unobservable from outside the plugin).
+#[doc(hidden)]
+#[allow(dead_code)] // used only by tests/, dead code in the bin target
+impl AiToolGovernor {
+    pub fn approval_cache_len(&self) -> usize {
+        self.engine.approval_cache.len()
+    }
+
+    pub fn approval_cache_max_entries() -> usize {
+        MAX_APPROVAL_CACHE_ENTRIES
     }
 }
 
@@ -2351,7 +2468,12 @@ struct ToolCallStreamInspector {
     plugin_http_call_ns: Arc<AtomicU64>,
     /// Raw bytes received but not yet a complete SSE event.
     carry: Vec<u8>,
-    /// Raw bytes of held (un-released) tool-call events, in order.
+    /// Raw bytes of held (un-released) events, in arrival order. Contains the
+    /// pending batch's tool-call frames AND every event received after the
+    /// batch opened (content frames of other choices, keepalives, comments):
+    /// releasing only tool frames would reorder an allowed multi-choice
+    /// stream, and forwarding non-tool events live would leak content that
+    /// arrived after a subsequently-denied tool call.
     held: Vec<u8>,
     accumulator: StreamingToolCallAccumulator,
     saw_tool_calls: bool,
@@ -2527,23 +2649,35 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
             match classify_event(&event) {
                 SseEvent::Frame(frame) => {
                     self.record_frame_context(&frame);
-                    let has_tool_calls = frame_has_tool_calls(&frame);
-                    if has_tool_calls {
+                    if frame_has_tool_calls(&frame) {
                         self.saw_tool_calls = true;
                         self.accumulator.push_frame(&frame);
+                    }
+                    // Once a governed batch is pending, hold EVERY subsequent
+                    // event (not just tool-call frames) in arrival order: with
+                    // multi-choice streams another choice can emit content
+                    // frames before the tool-call choice's finish frame, and
+                    // forwarding those live would deliver an allowed stream out
+                    // of order — or leak post-tool-call content ahead of the
+                    // terminal error on a deny. Release restores the original
+                    // order; deny drops everything held. The added latency for
+                    // the rare multi-choice-with-tools case is the accepted
+                    // cost of ordering correctness and no-leak.
+                    let batch_pending = self.saw_tool_calls;
+                    if batch_pending {
                         self.held.extend_from_slice(&event);
                     }
                     self.record_finished_choices(&frame);
                     // Evaluate once every choice holding tool calls has
-                    // finished, then release the held frames before forwarding
-                    // this event. Later tool-call deltas start a new batch
-                    // governed at its own completion boundary.
+                    // finished, then release the held frames (this event
+                    // included, in order). Later tool-call deltas start a new
+                    // batch governed at its own completion boundary.
                     if self.batch_complete()
                         && let Finalize::Blocked = self.finalize(&mut out).await
                     {
                         return self.terminate(out);
                     }
-                    if !has_tool_calls {
+                    if !batch_pending {
                         out.extend_from_slice(&event);
                     }
                 }
@@ -2554,8 +2688,14 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                     out.extend_from_slice(&event);
                 }
                 SseEvent::OtherData | SseEvent::NoData => {
-                    // Comments, keepalives, non-JSON data: no tool calls, forward live.
-                    out.extend_from_slice(&event);
+                    if self.saw_tool_calls {
+                        // A governed batch is pending: hold to preserve
+                        // arrival order (and never leak past a deny).
+                        self.held.extend_from_slice(&event);
+                    } else {
+                        // Comments, keepalives, non-JSON data: forward live.
+                        out.extend_from_slice(&event);
+                    }
                 }
             }
         }
@@ -2752,31 +2892,63 @@ fn tool_call_from(name: &str, args: Option<&Value>) -> ToolCall {
 
 /// Extract `choices[].message.tool_calls[]` and legacy
 /// `choices[].message.function_call` from a buffered response.
-fn extract_response_tool_calls(json: &Value) -> Vec<ToolCall> {
+///
+/// Returns `(calls, ungovernable)`, bringing the buffered path to parity with
+/// [`extract_sse_tool_calls`] / the streaming accumulator: an entry that
+/// cannot be policy-checked — a missing or non-string `function.name` (or a
+/// `tool_calls` container that is not an array) — must be SURFACED rather
+/// than silently dropped, or an all-unnamed `tool_calls[]` would yield
+/// `calls.is_empty()` and slide past even `default_action: deny`. Callers
+/// fail closed in enforce mode and forward in dry-run, exactly like the
+/// streaming finalizer. Two deliberate divergences from streaming:
+/// - Non-string `function.arguments` are GOVERNABLE here: the buffered value
+///   is fully available, so `tool_call_from` evaluates (and the redaction
+///   transform rewrites) the concrete JSON — unlike streaming, where
+///   non-string argument deltas are never accumulated and thus uncheckable.
+/// - A `null` `tool_calls` / `function_call` is the documented "no calls"
+///   shape (OpenAI emits it on content-only responses), NOT ungovernable.
+fn extract_response_tool_calls(json: &Value) -> (Vec<ToolCall>, bool) {
     let mut out = Vec::new();
+    let mut ungovernable = false;
     let Some(choices) = json.get("choices").and_then(Value::as_array) else {
-        return out;
+        return (out, false);
     };
     for choice in choices {
         let Some(message) = choice.get("message") else {
             continue;
         };
-        if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-            for tc in tool_calls {
-                if let Some(function) = tc.get("function")
-                    && let Some(name) = function.get("name").and_then(Value::as_str)
-                {
-                    out.push(tool_call_from(name, function.get("arguments")));
+        match message.get("tool_calls") {
+            Some(Value::Array(tool_calls)) => {
+                for tc in tool_calls {
+                    let function = tc.get("function");
+                    match function.and_then(|f| f.get("name")).and_then(Value::as_str) {
+                        Some(name) => {
+                            out.push(tool_call_from(
+                                name,
+                                function.and_then(|f| f.get("arguments")),
+                            ));
+                        }
+                        // Arguments/id without a checkable `function.name`:
+                        // policy is keyed by name, so this call cannot be
+                        // evaluated and must not vanish from the batch.
+                        None => ungovernable = true,
+                    }
                 }
             }
+            // Absent or explicitly-null: no tool calls for this choice.
+            None | Some(Value::Null) => {}
+            // `tool_calls` present but not an array: not a checkable shape.
+            Some(_) => ungovernable = true,
         }
-        if let Some(function_call) = message.get("function_call")
-            && let Some(name) = function_call.get("name").and_then(Value::as_str)
-        {
-            out.push(tool_call_from(name, function_call.get("arguments")));
+        match message.get("function_call") {
+            Some(Value::Null) | None => {}
+            Some(function_call) => match function_call.get("name").and_then(Value::as_str) {
+                Some(name) => out.push(tool_call_from(name, function_call.get("arguments"))),
+                None => ungovernable = true,
+            },
         }
     }
-    out
+    (out, ungovernable)
 }
 
 /// Extract tool definition names from a request's `tools[]` / `functions[]`.
@@ -2988,6 +3160,34 @@ fn looks_like_json(body: &[u8]) -> bool {
         body.iter().copied().find(|b| !b.is_ascii_whitespace()),
         Some(b'{') | Some(b'[')
     )
+}
+
+/// Whether a body is shaped like a Server-Sent Events stream: after an optional
+/// UTF-8 BOM and leading whitespace/blank lines, the first non-empty line
+/// starts with an SSE field prefix (`data:`, `event:`, `id:`, or `retry:`).
+/// The SSE-shape counterpart of [`looks_like_json`]: an upstream that omits
+/// `Content-Type: text/event-stream` (or a `response_transformer` header rule
+/// that relabels it, e.g. to `text/plain`) must not route a buffered SSE body
+/// with governed tool-call deltas past `govern_buffered_sse` uninspected. An
+/// SSE body can never look like JSON (and vice versa), so the two shape checks
+/// are disjoint.
+fn looks_like_sse(body: &[u8]) -> bool {
+    let body = body
+        .strip_prefix(b"\xEF\xBB\xBF".as_slice())
+        .unwrap_or(body);
+    let start = body
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(body.len());
+    let rest = &body[start..];
+    [
+        b"data:".as_slice(),
+        b"event:".as_slice(),
+        b"id:".as_slice(),
+        b"retry:".as_slice(),
+    ]
+    .iter()
+    .any(|prefix| rest.starts_with(prefix))
 }
 
 /// Unambiguous identity hash of a governed tool call, used to skip
