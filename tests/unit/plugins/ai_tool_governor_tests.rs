@@ -10,7 +10,7 @@ use ferrum_edge::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
@@ -2130,14 +2130,15 @@ async fn final_response_body_recheck_ignores_out_of_scope_responses() {
             .await,
     );
 
-    // Oversized body: on_response_body already fail-closes the plaintext backend
-    // body, so an oversized final body is skipped here rather than re-rejected.
+    // Oversized final body (a transform grew it past the parse limit): fail
+    // closed in enforce mode so padding cannot smuggle a denied call.
     let mut ctx = create_test_context();
     let oversized = vec![b'x'; 4 * 1024 * 1024 + 1];
-    assert_continue(
+    assert_reject(
         plugin
             .on_final_response_body(&mut ctx, 200, &json_headers(), &oversized)
             .await,
+        Some(502),
     );
 }
 
@@ -2484,6 +2485,161 @@ async fn final_response_allows_legit_compressed_body() {
     assert_continue(
         plugin
             .on_final_response_body(&mut ctx, 200, &gzip_headers(), &compressed)
+            .await,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round 3 review fixes: dry_run, federation provider, decompress skip, SSE
+// ---------------------------------------------------------------------------
+
+/// A per-tool `dry_run` action forwards (observes) even when an argument check
+/// like `max_arg_bytes` would otherwise deny, in enforce mode.
+#[tokio::test]
+async fn per_tool_dry_run_forwards_despite_failing_arg_checks() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "big": { "action": "dry_run", "max_arg_bytes": 4 } }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("big", "{\"x\":\"way past the four byte limit\"}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("allow")
+    );
+}
+
+/// Approval uses the real serving provider recorded by `ai_federation` in
+/// metadata, not the OpenAI shape of the normalized body.
+#[tokio::test]
+async fn approval_prefers_federation_provider_metadata() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .and(body_string_contains("\"provider\":\"anthropic\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "default_action": "require_approval",
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()) }
+    }));
+    let mut ctx = create_test_context();
+    // ai_federation normalized an Anthropic response to OpenAI shape.
+    ctx.metadata
+        .insert("ai_provider".to_string(), "anthropic".to_string());
+    let body = response_with_tool_call("deploy", "{}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    server.verify().await;
+}
+
+/// A compression-only rewrite of an already-governed body decodes to identical
+/// bytes, so the final re-check skips it and does not fire a second approval.
+#[tokio::test]
+async fn compression_only_final_body_skips_duplicate_approval() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    ); // webhook #1
+    // compression compressed the SAME governed body → decode matches hash → skip.
+    let compressed = gzip(&body);
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &gzip_headers(), &compressed)
+            .await,
+    );
+    server.verify().await;
+}
+
+/// A denied final body grown past the parse limit by a transform fails closed.
+#[tokio::test]
+async fn oversized_final_response_after_transform_fails_closed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    let clean = json!({
+        "id": "x", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }]
+    })
+    .to_string()
+    .into_bytes();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .await,
+    );
+    let oversized = vec![b'x'; 4 * 1024 * 1024 + 1];
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &oversized)
+            .await,
+        Some(502),
+    );
+}
+
+/// A `text/event-stream` response kept on the buffered path (stream inspector
+/// did not attach) is still governed: a denied tool call is rejected, an
+/// allowed one forwards.
+#[tokio::test]
+async fn buffered_sse_response_is_governed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut sse_headers = HashMap::new();
+    sse_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+
+    let denied = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"kubectl.apply\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers, denied.as_bytes())
+            .await,
+        Some(502),
+    );
+
+    let allowed = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"report.read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers, allowed.as_bytes())
             .await,
     );
 }

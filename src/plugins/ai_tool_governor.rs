@@ -382,6 +382,15 @@ impl GovernorEngine {
             );
         }
 
+        // Per-tool dry-run forwards while only recording the observational
+        // decision, so it must short-circuit BEFORE the enforcing argument
+        // checks below — otherwise a dry-run tool with `max_arg_bytes` /
+        // `required_args` / `json_schema` / `blocked_arg_patterns` would still
+        // reject in enforce mode instead of letting operators observe safely.
+        if policy.action == ToolAction::DryRun {
+            return (PolicyOutcome::DryRun, true, policy.risk);
+        }
+
         if let Some(max) = policy.max_arg_bytes
             && raw_args.len() > max
         {
@@ -999,6 +1008,21 @@ impl AiToolGovernor {
         }
     }
 
+    /// Resolve the serving provider for a buffered response. `ai_federation`
+    /// normalizes provider-native responses to OpenAI shape while recording the
+    /// real provider in metadata, so prefer that over body-shape detection —
+    /// otherwise an Anthropic/Gemini response reports `openai` and a
+    /// provider-specific approval decision (or cache entry) is made for the
+    /// wrong provider.
+    fn resolve_response_provider(&self, ctx: &RequestContext, json: &Value) -> Option<String> {
+        ctx.metadata
+            .get("ai_provider")
+            .or_else(|| ctx.metadata.get("ai_federation_provider"))
+            .filter(|p| !p.is_empty())
+            .cloned()
+            .or_else(|| detect_response_provider(json).map(|p| p.as_str().to_string()))
+    }
+
     /// Write aggregate decision metadata onto the request context.
     fn write_metadata(&self, ctx: &mut RequestContext, batch: &BatchDecision) {
         let obs = self.engine.observability;
@@ -1305,12 +1329,12 @@ impl AiToolGovernor {
         if calls.is_empty() {
             return PluginResult::Continue;
         }
-        let provider = detect_response_provider(json).map(|p| p.as_str());
+        let provider = self.resolve_response_provider(ctx, json);
         let model = json
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let corr = self.correlation(ctx, model, provider);
+        let corr = self.correlation(ctx, model, provider.as_deref());
         let batch = self
             .engine
             .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, true)
@@ -1328,16 +1352,57 @@ impl AiToolGovernor {
         PluginResult::Continue
     }
 
-    /// A final response body that cannot be inspected (an unsupported or
-    /// undecodable content-encoding after transforms): fail closed in enforce
-    /// mode, forward in dry-run.
-    fn uninspectable_final_response(&self, ctx: &mut RequestContext) -> PluginResult {
-        if self.engine.mode == Mode::Enforce {
-            return self.reject_uninspectable(
+    /// Govern a fully-buffered `text/event-stream` response body. Reached when
+    /// the stream inspector did not attach — another buffering plugin or a
+    /// content-type-rewrite guard kept the SSE response on the buffered path —
+    /// so its accumulated tool calls are governed rather than forwarded
+    /// uninspected. Redaction is impossible on a buffered SSE body, so a
+    /// `redact_args` match fails closed (`redaction_unavailable = true`).
+    async fn govern_buffered_sse(&self, ctx: &mut RequestContext, body: &[u8]) -> PluginResult {
+        if !self.inspect.streaming_response_tool_calls || body.is_empty() {
+            return PluginResult::Continue;
+        }
+        if body.len() > MAX_PARSE_BYTES {
+            return self.uninspectable_final_response(
                 ctx,
-                "response body",
-                "response body has a content-encoding that cannot be inspected",
+                "streamed response body exceeds the inspectable size limit",
             );
+        }
+        let calls = extract_sse_tool_calls(body);
+        if calls.is_empty() {
+            return PluginResult::Continue;
+        }
+        // SSE frames are not a single JSON body to shape-detect, so use the
+        // provider/model metadata a federation/streaming plugin recorded.
+        let provider = ctx
+            .metadata
+            .get("ai_provider")
+            .or_else(|| ctx.metadata.get("ai_federation_provider"))
+            .filter(|p| !p.is_empty())
+            .cloned();
+        let model = ctx.metadata.get(STREAM_MODEL_KEY).cloned();
+        let corr = self.correlation(ctx, model, provider.as_deref());
+        let batch = self
+            .engine
+            .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, true)
+            .await;
+        self.write_metadata(ctx, &batch);
+        if batch.enforce_blocks {
+            return self.reject(&batch);
+        }
+        PluginResult::Continue
+    }
+
+    /// A final response body that cannot be inspected (an unsupported or
+    /// undecodable content-encoding, or an oversized body a transform produced):
+    /// fail closed in enforce mode, forward in dry-run.
+    fn uninspectable_final_response(
+        &self,
+        ctx: &mut RequestContext,
+        reason: &'static str,
+    ) -> PluginResult {
+        if self.engine.mode == Mode::Enforce {
+            return self.reject_uninspectable(ctx, "response body", reason);
         }
         PluginResult::Continue
     }
@@ -1634,6 +1699,12 @@ impl Plugin for AiToolGovernor {
             return PluginResult::Continue;
         }
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
+        // A buffered `text/event-stream` body means the stream inspector never
+        // attached (another plugin/guard kept it buffered): govern the SSE tool
+        // calls here rather than forwarding them uninspected.
+        if is_event_stream_content_type(content_type) {
+            return self.govern_buffered_sse(ctx, body).await;
+        }
         if !is_json_content_type(content_type) {
             return PluginResult::Continue;
         }
@@ -1683,12 +1754,12 @@ impl Plugin for AiToolGovernor {
             return PluginResult::Continue;
         }
 
-        let provider = detect_response_provider(&json).map(|p| p.as_str());
+        let provider = self.resolve_response_provider(ctx, &json);
         let model = json
             .get("model")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let corr = self.correlation(ctx, model, provider);
+        let corr = self.correlation(ctx, model, provider.as_deref());
 
         let batch = self
             .engine
@@ -1783,17 +1854,42 @@ impl Plugin for AiToolGovernor {
         } else if let Some(decoded) = content_encoding_value(response_headers)
             .and_then(|enc| decompress_within_limit(enc, body))
         {
+            // Compression-only rewrite of an already-governed body: the decoded
+            // bytes match the hash `on_response_body` recorded, so skip to avoid
+            // a duplicate approval webhook (which a one-shot approval service
+            // could deny, turning an allowed response into a 502).
+            if ctx.metadata.get(GOVERNED_RESPONSE_HASH_KEY) == Some(&sha256_hex_bytes(&decoded)) {
+                return PluginResult::Continue;
+            }
             match parse_json_within_limit(&decoded) {
                 Some(json) => json,
-                None => return self.uninspectable_final_response(ctx),
+                // Decoded but oversized or not JSON: cannot verify a transform
+                // did not inject a governed call.
+                None => {
+                    return self.uninspectable_final_response(
+                        ctx,
+                        "response body could not be inspected after decoding",
+                    );
+                }
             }
         } else if has_non_identity_content_encoding(response_headers) {
             // Encoded with an unsupported/undecodable content-encoding: cannot
             // verify a later transform did not inject a governed call.
-            return self.uninspectable_final_response(ctx);
+            return self.uninspectable_final_response(
+                ctx,
+                "response body has a content-encoding that cannot be inspected",
+            );
+        } else if body.len() > MAX_PARSE_BYTES {
+            // A later transform grew the (hash-changed) plaintext body past the
+            // inspectable limit: fail closed like the `on_response_body` path so
+            // padding cannot smuggle a denied tool call past enforce policy.
+            return self.uninspectable_final_response(
+                ctx,
+                "response body exceeds the inspectable size limit after transforms",
+            );
         } else {
-            // Plaintext but unparseable / oversized: `on_response_body` already
-            // fail-closed a genuinely uninspectable backend body before delivery.
+            // Plaintext but not JSON: `on_response_body` already governed the
+            // original backend body.
             return PluginResult::Continue;
         };
 
@@ -1820,6 +1916,18 @@ impl Plugin for AiToolGovernor {
                 || ctx.metadata.get(STREAM_REQUESTED_KEY).map(String::as_str) == Some("true"))
     }
 
+    /// The streaming inspector accumulates OpenAI-shaped SSE
+    /// `choices[].delta.tool_calls`. LIMITATION: `ai_stream_router` (2984)
+    /// normalizes provider-native streaming (e.g. Anthropic `tool_use` /
+    /// `input_json_delta`) into OpenAI chunks in a stream inspector that runs
+    /// AFTER this one (2978 < 2984), so on those routes the governor sees only
+    /// raw provider frames it does not recognize as tool calls. Deterministic
+    /// mid-stream tool governance therefore covers OpenAI-native SSE; buffered
+    /// (non-streaming) responses are governed for every provider, and
+    /// provider-native streaming governance is tracked as a follow-up (it would
+    /// require the governor to understand each provider's native tool events or
+    /// to run after normalization). Reordering is not an option here: 2978 is
+    /// deliberately before semantic cache/federation on the request path.
     fn response_stream_inspector(
         &self,
         ctx: &RequestContext,
@@ -2289,6 +2397,38 @@ fn frame_has_tool_calls(frame: &Value) -> bool {
 // ---------------------------------------------------------------------------
 // Extraction helpers
 // ---------------------------------------------------------------------------
+
+/// Accumulate the complete OpenAI tool calls from a fully-buffered SSE body.
+/// Used when an `text/event-stream` response is delivered on the buffered path
+/// (another buffering plugin or a content-type-rewrite guard kept it buffered)
+/// instead of through the streaming inspector, so its tool calls are still
+/// governed rather than forwarded uninspected.
+fn extract_sse_tool_calls(body: &[u8]) -> Vec<ToolCall> {
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Vec::new();
+    };
+    let mut acc = StreamingToolCallAccumulator::default();
+    let mut event: Vec<&str> = Vec::new();
+    let flush = |event: &mut Vec<&str>, acc: &mut StreamingToolCallAccumulator| {
+        if event.is_empty() {
+            return;
+        }
+        if let SseEvent::Frame(frame) = classify_event(event.join("\n").as_bytes()) {
+            acc.push_frame(&frame);
+        }
+        event.clear();
+    };
+    for raw in text.lines() {
+        // SSE events are separated by a blank line.
+        if raw.strip_suffix('\r').unwrap_or(raw).is_empty() {
+            flush(&mut event, &mut acc);
+        } else {
+            event.push(raw);
+        }
+    }
+    flush(&mut event, &mut acc);
+    acc.build_calls()
+}
 
 fn tool_call_from(name: &str, args: Option<&Value>) -> ToolCall {
     let (raw_args, parsed_args) = match args {
