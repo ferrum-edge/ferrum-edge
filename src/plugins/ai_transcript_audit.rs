@@ -818,6 +818,11 @@ impl AiTranscriptAudit {
 
     fn harvest_metadata(&self, metadata: &HashMap<String, String>) -> Harvest {
         let mut harvest = Harvest::default();
+        // `ai_federation` publishes both `ai_provider` (the provider type) and
+        // `ai_federation_provider` (the configured federation name). Resolve them
+        // with a fixed precedence after the scan so the exported `provider` field
+        // does not flip with HashMap iteration order.
+        let mut federation_provider: Option<String> = None;
         for (key, value) in metadata {
             if key.starts_with("ai_transcript_audit.") {
                 continue;
@@ -833,11 +838,8 @@ impl AiTranscriptAudit {
             };
             match key.as_str() {
                 "ai_model" => harvest.model = Some(value.clone()),
-                "ai_provider" | "ai_federation_provider" => {
-                    if harvest.provider.is_none() {
-                        harvest.provider = Some(value.clone());
-                    }
-                }
+                "ai_provider" => harvest.provider = Some(value.clone()),
+                "ai_federation_provider" => federation_provider = Some(value.clone()),
                 "ai_total_tokens"
                 | "ai_prompt_tokens"
                 | "ai_completion_tokens"
@@ -853,6 +855,11 @@ impl AiTranscriptAudit {
                     }
                 }
             }
+        }
+        // `ai_provider` wins; fall back to the federation name only when no
+        // provider type was published.
+        if harvest.provider.is_none() {
+            harvest.provider = federation_provider;
         }
         harvest
     }
@@ -1147,9 +1154,10 @@ impl Plugin for AiTranscriptAudit {
         let captures_response_body = response_body_capture_allowed(self.capture, response_headers);
         let response_hash = captures_response_body.then(|| sha256_hex(body));
 
-        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
-        let sample_hit = staging
-            .as_ref()
+        // Peek (do not consume) the staging entry to make the emit decision.
+        let sample_hit = self
+            .staging
+            .get(&record_id)
             .map(|staging| staging.sample_hit)
             .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
         let (emit, reason) = self.emit_decision(
@@ -1165,10 +1173,19 @@ impl Plugin for AiTranscriptAudit {
         ctx.metadata.insert(MD_SAMPLED.to_string(), bool_str(emit));
 
         if !emit {
+            // Leave the staging entry in place. A later same-phase validator
+            // (`body_validator` 2950, `openapi_validator` 2960) can still turn
+            // this response into a 4xx/5xx after us; the `log` fallback then
+            // re-evaluates `always_capture_on_error` against the final
+            // client-visible status and is the only path that can emit that
+            // plugin-generated error. Discarding staging here would drop it.
             ctx.metadata
                 .insert(MD_SINK_STATUS.to_string(), "skipped".to_string());
             return PluginResult::Continue;
         }
+        // A response hook is emitting now, so consume the staging entry to keep
+        // the `log` fallback from emitting a duplicate.
+        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let (response_excerpt, response_truncated) = if captures_response_body {
             self.shape_body(body, self.limits.max_response_bytes)
         } else {
@@ -1192,7 +1209,7 @@ impl Plugin for AiTranscriptAudit {
             response_excerpt,
             response_truncated,
             response_hash,
-            emit,
+            sample_hit,
             reason,
             Some(response_headers),
         );
@@ -1228,18 +1245,7 @@ impl Plugin for AiTranscriptAudit {
         response_status: u16,
         content_type: Option<&str>,
     ) -> Option<Box<dyn ResponseStreamInspector>> {
-        // 2xx SSE is the normal capture path. A non-2xx SSE is teed too when the
-        // record will emit anyway — either `always_capture_on_error` is set, or
-        // the request won the sampling roll (`emit_decision` emits on `sampled`
-        // regardless of status). Error transactions are exactly where operators
-        // asked for response evidence, and skipping the inspector for a record
-        // that still emits would leave the `log` fallback with request-side data
-        // only. (3xx SSE stays untouched: no error trigger, not a completion.)
-        let status_eligible = (200..300).contains(&response_status)
-            || (response_status >= 400
-                && (self.sampling.always_on_error || flag(&ctx.metadata, MD_SAMPLE_HIT)));
         if self.capture.streaming == StreamingCapture::Off
-            || !status_eligible
             || !flag(&ctx.metadata, &self.stream_marker_key())
         {
             return None;
@@ -1248,6 +1254,27 @@ impl Plugin for AiTranscriptAudit {
             return None;
         }
         let record_id = ctx.metadata.get(MD_RECORD_ID)?.clone();
+        // Read THIS instance's staged sampling roll, not the shared
+        // `ai_transcript_audit.sample_hit` metadata key: a second instance of the
+        // plugin can overwrite that key with its own roll, and each instance keys
+        // its own `staging` map by the shared record id.
+        let sample_hit = self
+            .staging
+            .get(&record_id)
+            .map(|staging| staging.sample_hit)
+            .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
+        // 2xx SSE is the normal capture path. A non-2xx SSE is teed too when the
+        // record will emit anyway — either `always_capture_on_error` is set, or
+        // this request won the sampling roll (`emit_decision` emits on `sampled`
+        // regardless of status). Error transactions are exactly where operators
+        // asked for response evidence, and skipping the inspector for a record
+        // that still emits would leave the `log` fallback with request-side data
+        // only. (3xx SSE stays untouched: no error trigger, not a completion.)
+        let status_eligible = (200..300).contains(&response_status)
+            || (response_status >= 400 && (self.sampling.always_on_error || sample_hit));
+        if !status_eligible {
+            return None;
+        }
 
         let slot = Arc::new(StreamSlot {
             captured: Mutex::new(None),
@@ -1320,7 +1347,7 @@ impl Plugin for AiTranscriptAudit {
             excerpt,
             truncated,
             hash,
-            emit,
+            sample_hit,
             reason,
             None,
         );
@@ -1371,7 +1398,7 @@ impl Plugin for AiTranscriptAudit {
             None,
             false,
             None,
-            emit,
+            sample_hit,
             reason,
             None,
         );

@@ -2041,3 +2041,155 @@ async fn log_fallback_emits_from_summary_envelope() {
     // The log fallback has no response-body access.
     assert!(records[0].get("response_body").is_none());
 }
+
+// ---------------------------------------------------------------------------
+// Review round 2: staging retention, provider precedence, sampled field,
+// per-instance stream sampling
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn unsampled_response_later_turned_error_is_captured_via_log() {
+    // rate 0, backend 2xx: `on_final_response_body` does not emit but must KEEP
+    // the staging entry, so a later validator that turns the response into a 5xx
+    // is still captured by `always_capture_on_error` via the log fallback.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({ "sampling": { "rate": 0.0 } })),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    // Unsampled 2xx at the audit hook: not emitted, staging retained.
+    let result = plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    // A later final-response validator rejected the response: the summary is 5xx.
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 500;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status_code"], 500);
+    assert_eq!(records[0]["capture_reason"], "error");
+    // The sampling roll was false; only the error override forced the capture.
+    assert_eq!(records[0]["sampled"], false);
+}
+
+#[tokio::test]
+async fn provider_prefers_ai_provider_over_federation_name() {
+    // `ai_federation` publishes both keys; the exported provider must be
+    // deterministic (the provider type), not HashMap-iteration-order dependent.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    ctx.metadata.insert(
+        "ai_federation_provider".to_string(),
+        "prod-route".to_string(),
+    );
+    ctx.metadata
+        .insert("ai_provider".to_string(), "anthropic".to_string());
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["provider"], "anthropic");
+}
+
+#[tokio::test]
+async fn sampled_field_reflects_roll_not_emit_on_guardrail_capture() {
+    // rate 0 but a guardrail fires: the record is emitted (capture_reason
+    // guardrail) yet its `sampled` field reflects the (false) sampling roll.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "sampling": { "rate": 0.0, "always_capture_on_guardrail": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    ctx.metadata
+        .insert("ai_shield_rejected".to_string(), "true".to_string());
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["capture_reason"], "guardrail");
+    assert_eq!(records[0]["sampled"], false);
+}
+
+#[tokio::test]
+async fn stream_sampling_reads_instance_staging_not_shared_metadata() {
+    // Two coexisting instances share the record id; the second overwrites the
+    // shared `sample_hit` metadata with its own roll. Instance A must still tee
+    // its sampled error stream by reading its own staged roll.
+    let cfg = |rate: f64| {
+        config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "capture": { "streaming_response": true },
+                "sampling": { "always_capture_on_error": false, "rate": rate }
+            }),
+        )
+    };
+    let instance_a = AiTranscriptAudit::new(&cfg(1.0), loopback_http_client()).unwrap();
+    let instance_b = AiTranscriptAudit::new(&cfg(0.0), loopback_http_client()).unwrap();
+    let mut ctx = make_ctx();
+    let body_str = std::str::from_utf8(ai_request_body()).unwrap();
+    let mut headers = ctx.headers.clone();
+    // Instance A stages first (rate 1.0 -> sample_hit true).
+    ctx.metadata
+        .insert("request_body".to_string(), body_str.to_string());
+    instance_a.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sample_hit")
+            .map(String::as_str),
+        Some("true")
+    );
+    // Instance B stages next (rate 0.0) and overwrites the shared sample_hit.
+    instance_b.before_proxy(&mut ctx, &mut headers).await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sample_hit")
+            .map(String::as_str),
+        Some("false")
+    );
+    // A must still tee its sampled 5xx SSE, reading its own staged roll.
+    assert!(
+        instance_a
+            .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
+            .is_some(),
+        "instance A must tee its sampled error stream despite B overwriting shared sample_hit"
+    );
+    // B (un-sampled, error capture off) does not tee.
+    assert!(
+        instance_b
+            .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
+            .is_none()
+    );
+}
