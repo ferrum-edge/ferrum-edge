@@ -75,12 +75,21 @@ Per tool (`tools.<name>.action`): `allow`, `deny`, `redact_args`,
 `require_approval`, `dry_run`. `default_action` (`allow` / `deny` /
 `require_approval`) applies to any tool without an explicit entry.
 
-Argument checks apply to every non-deny action: `max_arg_bytes`,
-`required_args`, `json_schema`, and `blocked_arg_patterns`. A blocked-pattern
-match denies under `allow`/`require_approval`/`dry_run`, and is **redacted**
-under `redact_args` (buffered path). In the **streaming** path a `redact_args`
-match fails closed (cuts the stream), since mid-stream surgical redaction of
-split-JSON arguments is out of MVP scope.
+Argument checks (`max_arg_bytes`, `required_args`, `json_schema`,
+`blocked_arg_patterns`) apply to the `allow`, `require_approval`, and
+`redact_args` actions. A blocked-pattern match denies under
+`allow`/`require_approval`, and is **redacted** under `redact_args` (buffered
+path). On paths where arguments cannot be redacted in place — the **streaming**
+path, the **request** body (no request-body transform), and the post-transform
+**final response** re-check — a `redact_args` match fails closed rather than
+forwarding an unredacted secret.
+
+A per-tool **`dry_run`** action is purely observational: it forwards the call
+and records the decision, and is evaluated **before** the argument checks
+above, so it never rejects — even for oversized args, a failing schema, or a
+blocked pattern. Use it to measure what a stricter action *would* do before
+enforcing. (This differs from global `mode: dry_run`, which makes every action
+observational.)
 
 ## Examples
 

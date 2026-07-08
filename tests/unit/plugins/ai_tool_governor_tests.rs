@@ -534,7 +534,12 @@ async fn redacts_matched_args_and_never_leaks_secret_in_metadata() {
 
     // The transform rewrites the secret out of the delivered body.
     let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &json_headers())
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/json"),
+            &json_headers(),
+        )
         .await
         .expect("body is rewritten");
     let text = String::from_utf8(transformed).unwrap();
@@ -578,7 +583,12 @@ async fn redacts_non_string_response_arguments_before_forwarding() {
             .await,
     );
     let transformed = plugin
-        .transform_response_body(&body, Some("application/json"), &json_headers())
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/json"),
+            &json_headers(),
+        )
         .await
         .expect("structured arguments are redacted");
     let text = String::from_utf8(transformed).unwrap();
@@ -599,9 +609,15 @@ async fn dry_run_does_not_mutate_response_arguments() {
     }));
 
     let body = response_with_tool_call("filesystem.write", "{\"token\":\"sk-DRYRUNSECRET123\"}");
+    let mut ctx = create_test_context();
     assert!(
         plugin
-            .transform_response_body(&body, Some("application/json"), &json_headers())
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers()
+            )
             .await
             .is_none(),
         "dry-run must not mutate the delivered response body"
@@ -621,9 +637,15 @@ async fn response_transform_respects_response_tool_calls_toggle() {
     }));
 
     let body = response_with_tool_call("filesystem.write", "{\"token\":\"sk-TOGGLESECRET123\"}");
+    let mut ctx = create_test_context();
     assert!(
         plugin
-            .transform_response_body(&body, Some("application/json"), &json_headers())
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers()
+            )
             .await
             .is_none(),
         "response transform must be disabled when response_tool_calls=false"
@@ -2342,7 +2364,14 @@ fn streaming_only_config_advertises_buffering() {
     }));
     assert!(plugin.requires_request_body_buffering());
     assert!(plugin.requires_response_body_buffering());
-    assert!(plugin.should_buffer_response_body(&create_test_context()));
+    // Per-request: buffer only a streaming request's response (its SSE-JSON
+    // fallback), not an ordinary non-streaming response.
+    let mut streaming = create_test_context();
+    streaming
+        .metadata
+        .insert("ai_request_streaming".to_string(), "true".to_string());
+    assert!(plugin.should_buffer_response_body(&streaming));
+    assert!(!plugin.should_buffer_response_body(&create_test_context()));
 }
 
 /// When a `stream: true` request's backend returns a plain JSON Chat Completions
@@ -2355,13 +2384,26 @@ async fn streaming_only_governs_json_fallback_response() {
         "tools": { "report.read": { "action": "allow" } },
         "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
     }));
-    let mut ctx = create_test_context();
     let denied = response_with_tool_call("kubectl.apply", "{}");
+
+    // Streaming request (SSE fallback to JSON): the fallback is governed.
+    let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ai_request_streaming".to_string(), "true".to_string());
     assert_reject(
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &denied)
             .await,
         Some(502),
+    );
+
+    // Non-streaming request: buffered response inspection is disabled, so the
+    // ordinary JSON response is not governed.
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &denied)
+            .await,
     );
 }
 
@@ -2642,4 +2684,84 @@ async fn buffered_sse_response_is_governed() {
             .on_response_body(&mut ctx, 200, &sse_headers, allowed.as_bytes())
             .await,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round 4 review fixes: provider name, streaming unnamed frames
+// ---------------------------------------------------------------------------
+
+/// Approval prefers the unique `ai_federation_provider` name over the coarse
+/// `ai_provider` type, so two providers of the same type do not share a
+/// decision.
+#[tokio::test]
+async fn approval_uses_unique_federation_provider_name() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .and(body_string_contains("\"provider\":\"anthropic-secondary\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "default_action": "require_approval",
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()) }
+    }));
+    let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ai_provider".to_string(), "anthropic".to_string());
+    ctx.metadata.insert(
+        "ai_federation_provider".to_string(),
+        "anthropic-secondary".to_string(),
+    );
+    let body = response_with_tool_call("deploy", "{}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    server.verify().await;
+}
+
+const SSE_UNNAMED_TOOL_FRAMES: &str = concat!(
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,",
+    "\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
+    "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n"
+);
+
+/// Streamed tool-call frames that never carry a `function.name` cannot be
+/// governed; enforce mode cuts the stream rather than forwarding them.
+#[tokio::test]
+async fn streaming_unnamed_tool_frames_fail_closed_in_enforce() {
+    let plugin = make(streaming_config(json!({}), "deny"));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (_out, terminated) =
+        drive_stream(&mut inspector, &[SSE_UNNAMED_TOOL_FRAMES.as_bytes()]).await;
+    assert!(
+        terminated,
+        "ungovernable tool-call frames must cut the stream in enforce mode"
+    );
+}
+
+/// In dry-run the same ungovernable frames are released unchanged — dry-run
+/// never disrupts traffic.
+#[tokio::test]
+async fn streaming_unnamed_tool_frames_released_in_dry_run() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let bytes = SSE_UNNAMED_TOOL_FRAMES.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(!terminated, "dry-run must not cut the stream");
+    assert_eq!(out, bytes, "dry-run must release the held frames unchanged");
 }

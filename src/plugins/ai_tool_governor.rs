@@ -1013,14 +1013,22 @@ impl AiToolGovernor {
     /// real provider in metadata, so prefer that over body-shape detection —
     /// otherwise an Anthropic/Gemini response reports `openai` and a
     /// provider-specific approval decision (or cache entry) is made for the
-    /// wrong provider.
+    /// wrong provider. `ai_federation_provider` (the unique configured provider
+    /// name) is preferred over `ai_provider` (the coarse provider type) so two
+    /// providers of the same type do not share an approval decision.
     fn resolve_response_provider(&self, ctx: &RequestContext, json: &Value) -> Option<String> {
-        ctx.metadata
-            .get("ai_provider")
-            .or_else(|| ctx.metadata.get("ai_federation_provider"))
-            .filter(|p| !p.is_empty())
-            .cloned()
+        federation_provider(ctx)
             .or_else(|| detect_response_provider(json).map(|p| p.as_str().to_string()))
+    }
+
+    /// Whether a buffered (non-SSE) JSON response body should be governed for
+    /// this request. Explicit `response_tool_calls` always governs; a
+    /// streaming-only config governs the JSON body ONLY when the request was
+    /// itself streaming (the SSE fallback), so a normal non-streaming response
+    /// is not inspected/rejected when buffered response inspection was disabled.
+    fn governs_buffered_json(&self, ctx: &RequestContext) -> bool {
+        self.inspect.response_tool_calls
+            || (self.inspect.streaming_response_tool_calls && request_is_streaming(ctx))
     }
 
     /// Write aggregate decision metadata onto the request context.
@@ -1374,12 +1382,7 @@ impl AiToolGovernor {
         }
         // SSE frames are not a single JSON body to shape-detect, so use the
         // provider/model metadata a federation/streaming plugin recorded.
-        let provider = ctx
-            .metadata
-            .get("ai_provider")
-            .or_else(|| ctx.metadata.get("ai_federation_provider"))
-            .filter(|p| !p.is_empty())
-            .cloned();
+        let provider = federation_provider(ctx);
         let model = ctx.metadata.get(STREAM_MODEL_KEY).cloned();
         let corr = self.correlation(ctx, model, provider.as_deref());
         let batch = self
@@ -1660,8 +1663,12 @@ impl Plugin for AiToolGovernor {
     /// `should_buffer_response_body_for_content_type` downgrades ONLY a genuine
     /// event stream back to the streaming path (where the SSE inspector
     /// attaches when `streaming_response_tool_calls` is enabled).
-    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
-        self.enabled && self.inspect.any_buffered_response()
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        // Buffer for explicit response inspection, or — for a streaming-only
+        // config — only when the request was streaming (to catch its SSE-JSON
+        // fallback). A non-streaming response under a streaming-only config is
+        // not buffered/governed.
+        self.enabled && self.governs_buffered_json(ctx)
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1706,6 +1713,11 @@ impl Plugin for AiToolGovernor {
             return self.govern_buffered_sse(ctx, body).await;
         }
         if !is_json_content_type(content_type) {
+            return PluginResult::Continue;
+        }
+        // A streaming-only config governs a buffered JSON body only for a
+        // streaming request's SSE fallback, never an ordinary JSON response.
+        if !self.governs_buffered_json(ctx) {
             return PluginResult::Continue;
         }
         if body.is_empty() {
@@ -1779,16 +1791,20 @@ impl Plugin for AiToolGovernor {
         PluginResult::Continue
     }
 
-    async fn transform_response_body(
+    async fn transform_response_body_with_context(
         &self,
+        ctx: &mut RequestContext,
         body: &[u8],
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
+        // Context-aware so the redaction path is gated the same way as the
+        // governance path: a streaming-only config redacts a JSON body only for
+        // a streaming request's SSE fallback, not an ordinary JSON response.
         if !self.enabled
             || !self.needs_response_transform
             || self.engine.mode == Mode::DryRun
-            || !self.inspect.any_buffered_response()
+            || !self.governs_buffered_json(ctx)
         {
             return None;
         }
@@ -1833,6 +1849,11 @@ impl Plugin for AiToolGovernor {
         }
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         if !is_json_content_type(content_type) {
+            return PluginResult::Continue;
+        }
+        // Mirror `on_response_body`: a streaming-only config re-checks a buffered
+        // JSON body only for a streaming request's SSE fallback.
+        if !self.governs_buffered_json(ctx) {
             return PluginResult::Continue;
         }
         if body.is_empty() {
@@ -1948,12 +1969,8 @@ impl Plugin for AiToolGovernor {
             .get(STREAM_MODEL_KEY)
             .or_else(|| ctx.metadata.get("ai_model"))
             .cloned();
-        let provider = ctx
-            .metadata
-            .get("ai_provider")
-            .or_else(|| ctx.metadata.get("ai_federation_provider"))
-            .map(String::as_str);
-        let corr = self.correlation(ctx, model, provider);
+        let provider = federation_provider(ctx);
+        let corr = self.correlation(ctx, model, provider.as_deref());
         Some(Box::new(ToolCallStreamInspector::new(
             Arc::clone(&self.engine),
             corr,
@@ -2167,8 +2184,18 @@ impl ToolCallStreamInspector {
         }
         let calls = self.accumulator.build_calls();
         if calls.is_empty() {
-            // Held frames whose deltas never produced a tool name cannot be
-            // policy-checked: drop them (never release ungovernable bytes).
+            // Held frames carried tool-call deltas but never produced a tool
+            // name (malformed or an unrecognized provider variant), so they
+            // cannot be policy-checked. Enforce mode fails closed (cut the
+            // stream) rather than forwarding ungovernable tool-call bytes;
+            // dry-run releases them unchanged so observation never disrupts
+            // traffic. Silently dropping them (the previous behavior) is wrong
+            // for both modes.
+            if self.engine.mode == Mode::Enforce {
+                self.held.clear();
+                return Finalize::Blocked;
+            }
+            out.extend_from_slice(&self.held);
             self.held.clear();
             self.reset_batch();
             return Finalize::Released;
@@ -2533,6 +2560,29 @@ fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<
 
 fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool {
     content_encoding_value(headers).is_some()
+}
+
+/// Whether the request was marked as streaming: an `Accept: text/event-stream`
+/// header, a shared `ai_request_streaming` marker from an earlier plugin, or
+/// this plugin's own `stream: true` request-body detection (set in
+/// `before_proxy`). Used to scope streaming-only buffered inspection to the SSE
+/// fallback of a streaming request rather than every JSON response.
+fn request_is_streaming(ctx: &RequestContext) -> bool {
+    is_sse_request(ctx)
+        || ctx.metadata.get("ai_request_streaming").map(String::as_str) == Some("true")
+        || ctx.metadata.get(STREAM_REQUESTED_KEY).map(String::as_str) == Some("true")
+}
+
+/// The serving-provider name recorded by `ai_federation`. Prefer the unique
+/// configured provider name (`ai_federation_provider`) over the coarse provider
+/// type (`ai_provider`), so two providers of the same type/model/proxy are not
+/// conflated into one approval decision or cache entry.
+fn federation_provider(ctx: &RequestContext) -> Option<String> {
+    ctx.metadata
+        .get("ai_federation_provider")
+        .or_else(|| ctx.metadata.get("ai_provider"))
+        .filter(|p| !p.is_empty())
+        .cloned()
 }
 
 /// The non-identity `Content-Encoding` header value, trimmed, or `None` when
