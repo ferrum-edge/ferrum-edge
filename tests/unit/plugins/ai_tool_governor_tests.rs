@@ -484,11 +484,24 @@ async fn non_json_and_non_2xx_are_ignored() {
             .await,
     );
 
-    // Non-JSON content-type: not inspected.
+    // Non-JSON content-type with a genuinely non-JSON body: not inspected.
     let mut html = HashMap::new();
     html.insert("content-type".to_string(), "text/html".to_string());
     let mut ctx = create_test_context();
-    assert_continue(plugin.on_response_body(&mut ctx, 200, &html, &body).await);
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &html, b"<html>hi</html>")
+            .await,
+    );
+
+    // A non-JSON content-type does NOT skip a JSON-shaped body: a header rule
+    // that strips/relabels `Content-Type` must not disable governance of the
+    // intact Chat Completions JSON underneath.
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin.on_response_body(&mut ctx, 200, &html, &body).await,
+        Some(502),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +607,78 @@ async fn redacts_non_string_response_arguments_before_forwarding() {
     let text = String::from_utf8(transformed).unwrap();
     assert!(!text.contains("STRUCTUREDSECRET"), "secret leaked: {text}");
     assert!(text.contains("[REDACTED_TOOL_ARG:secret]"), "{text}");
+}
+
+/// A header transform that strips/relabels `Content-Type` away from JSON must
+/// not skip the redaction transform for a body this plugin already governed as
+/// JSON-shaped — otherwise the matched argument is forwarded unredacted while
+/// the final re-check skips the unchanged governed hash.
+#[tokio::test]
+async fn relabeled_json_shaped_response_is_still_redacted_by_transform() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        }
+    }));
+
+    let body = response_with_tool_call(
+        "filesystem.write",
+        "{\"path\":\"/workspace/a\",\"token\":\"sk-RELABELEDSECRET123\"}",
+    );
+    let mut html = HashMap::new();
+    html.insert("content-type".to_string(), "text/html".to_string());
+    let mut ctx = create_test_context();
+
+    // The relabeled body is still governed via the JSON-shaped fallback and
+    // records the redact decision.
+    assert_continue(plugin.on_response_body(&mut ctx, 200, &html, &body).await);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.redacted_tools")
+            .map(String::as_str),
+        Some("filesystem.write")
+    );
+
+    // The redaction transform must also apply despite the non-JSON label.
+    let transformed = plugin
+        .transform_response_body_with_context(&mut ctx, &body, Some("text/html"), &html)
+        .await
+        .expect("relabeled governed body is rewritten");
+    let text = String::from_utf8(transformed.clone()).unwrap();
+    assert!(!text.contains("RELABELEDSECRET"), "secret leaked: {text}");
+    assert!(text.contains("[REDACTED_TOOL_ARG:secret]"), "{text}");
+
+    // The governed hash now tracks the redacted body (as on the JSON-labeled
+    // path), so the final re-check treats the plugin's own redaction as
+    // already governed and forwards it untouched.
+    let redacted_hash: String = <sha2::Sha256 as sha2::Digest>::digest(&transformed)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.governed_response_hash")
+            .map(String::as_str),
+        Some(redacted_hash.as_str())
+    );
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &html, &transformed)
+            .await,
+    );
+
+    // A non-JSON body that was never governed as JSON-shaped stays untouched:
+    // the fallback keys off this plugin's own governed-response marker.
+    let mut fresh = create_test_context();
+    assert!(
+        plugin
+            .transform_response_body_with_context(&mut fresh, &body, Some("text/html"), &html)
+            .await
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -2134,14 +2219,24 @@ async fn final_response_body_recheck_ignores_out_of_scope_responses() {
             .await,
     );
 
-    // Non-JSON content type.
+    // Non-JSON content type with a genuinely non-JSON body.
     let mut ctx = create_test_context();
     let mut html = HashMap::new();
     html.insert("content-type".to_string(), "text/html".to_string());
     assert_continue(
         plugin
+            .on_final_response_body(&mut ctx, 200, &html, b"<html>hi</html>")
+            .await,
+    );
+
+    // A relabeled content type does NOT skip a JSON-shaped final body: a header
+    // transform must not disable the re-check of an injected denied call.
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
             .on_final_response_body(&mut ctx, 200, &html, &denied)
             .await,
+        Some(502),
     );
 
     // Empty body.

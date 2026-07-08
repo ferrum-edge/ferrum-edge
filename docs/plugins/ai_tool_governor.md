@@ -14,10 +14,11 @@ decision is a deterministic function of the request/response bytes plus the
 approval endpoint's answer.
 
 - **Priority:** `2978` (Admission band) — after `ai_request_guard` (2975), before
-  `ai_semantic_cache` (2980) and `ai_federation` (2985), so disallowed tool
-  schemas are screened before caching or federation routing. Set
+  `ai_semantic_cache` (2980) and `ai_federation` (4060, Response band), so
+  disallowed tool schemas are screened before caching or federation routing. Set
   `priority_override` (e.g. `2994`, just after `a2a_gateway`) if you want to
-  consume MCP/A2A metadata emitted by `mcp_gateway`/`a2a_gateway` first.
+  consume MCP/A2A metadata emitted by `mcp_gateway`/`a2a_gateway` first — that
+  still runs well before `ai_federation`.
 - **Protocols:** HTTP family (HTTP/1.1, HTTP/2, HTTP/3). Raw WebSocket frame
   tools are out of scope for the MVP.
 - **Failure policy:** `FailClosed`.
@@ -42,9 +43,12 @@ Ordinary content/role deltas stream through live. With multi-choice (`n > 1`)
 streams, a batch is finalized only once **every** choice holding tool calls has
 reported a `finish_reason` (or the stream ends), and later tool-call deltas
 form a new, independently governed batch. The plugin detects `"stream": true`
-in JSON POST bodies and pins those requests onto the dispatch path where the
-SSE inspector is wired, so a direct HTTP/2/3 backend cannot bypass streaming
-inspection; requests marked streaming still buffer a plain-JSON fallback
+in JSON POST bodies and pins those requests onto the reqwest dispatch path
+where the SSE inspector is wired, so a client-sent streaming request cannot
+bypass streaming inspection by targeting a direct HTTP/2 or native HTTP/3
+backend; the narrow proxy-core edge cases where a response can still stream on
+an uninspected arm are described under [Limitations (MVP)](#limitations-mvp).
+Requests marked streaming still buffer a plain-JSON fallback
 response so `tool_calls` in it are governed (only a genuine
 `text/event-stream` response is released back to the stream path).
 

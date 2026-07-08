@@ -1863,9 +1863,18 @@ impl Plugin for AiToolGovernor {
         {
             return None;
         }
-        match content_type {
-            Some(ct) if is_json_content_type(ct) => {}
-            _ => return None,
+        // Mirror the `looks_like_json` fallback in `on_response_body`: a header
+        // rule can strip/relabel `Content-Type: application/json` before this
+        // transform runs while leaving the governed JSON intact. If this plugin
+        // already governed the body as JSON-shaped (governed-response hash
+        // recorded), redaction must still rewrite it — returning `None` here
+        // would forward the matched argument unredacted, and the final re-check
+        // would skip the unchanged governed hash.
+        let json_ct = content_type.is_some_and(is_json_content_type);
+        let governed_json_shaped =
+            ctx.metadata.contains_key(GOVERNED_RESPONSE_HASH_KEY) && looks_like_json(body);
+        if !json_ct && !governed_json_shaped {
+            return None;
         }
         if body.is_empty() || body.len() > MAX_PARSE_BYTES {
             return None;
