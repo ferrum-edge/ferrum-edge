@@ -902,6 +902,36 @@ impl IptablesPlan {
         )
     }
 
+    /// Build a fail-closed UDP egress guard for the Ambient per-pod-netns
+    /// producer. This is installed only when the producer cannot bind its
+    /// transparent socket (for example because a workload pre-bound the capture
+    /// port). It reuses the normal UDP teardown path and its OUTPUT_MARK chain so
+    /// the next successful producer setup flushes/replaces it. The guard blocks
+    /// pod-originated UDP that would otherwise bypass mesh UDP authorization
+    /// while preserving configured outbound UDP excludes.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn udp_fail_closed_script(config: &CaptureConfig) -> String {
+        let v4_commands = udp_fail_closed_commands_for_family("iptables", config, CidrFamily::V4);
+        let v6_enabled = config.ip6tables_mode != Ip6TablesMode::Disabled;
+        let v6_has_cidrs = config
+            .include_cidrs
+            .iter()
+            .chain(config.exclude_cidrs.iter())
+            .any(|cidr| cidr_family(cidr) == Some(CidrFamily::V6));
+        let v6_commands = if v6_enabled && v6_has_cidrs {
+            udp_fail_closed_commands_for_family("ip6tables", config, CidrFamily::V6)
+        } else {
+            Vec::new()
+        };
+        if v4_commands.is_empty() && v6_commands.is_empty() {
+            return String::new();
+        }
+        format!(
+            "set -e\n{}",
+            udp_iptables_script(&v4_commands, &v6_commands, config.ip6tables_mode, true,)
+        )
+    }
+
     /// The UDP-only teardown script the Ambient producer runs INSIDE a pod netns
     /// on pod removal, config change, install failure, or shutdown. Reuses the
     /// EXACT Ferrum-owned UDP teardown ([`Self::udp_teardown_split`] /
@@ -1150,6 +1180,56 @@ fn commands_for_family(
             true,
         ));
     }
+    commands
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn udp_fail_closed_commands_for_family(
+    binary: &str,
+    config: &CaptureConfig,
+    family: CidrFamily,
+) -> Vec<String> {
+    if !config.udp_capture_enabled || config.host_netns {
+        return Vec::new();
+    }
+    let exclude_cidrs: Vec<&str> = config
+        .exclude_cidrs
+        .iter()
+        .filter(|cidr| cidr_family(cidr) == Some(family))
+        .map(String::as_str)
+        .collect();
+    let mut commands = vec![
+        idempotent_new_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTPUT_MARK"),
+        flush_chain(binary, "mangle", "FERRUM_MESH_UDP_OUTPUT_MARK"),
+    ];
+    for cidr in exclude_cidrs {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "FERRUM_MESH_UDP_OUTPUT_MARK",
+            &format!("-p udp -d {cidr} -j RETURN"),
+        ));
+    }
+    for port in &config.exclude_ports {
+        commands.push(idempotent_append(
+            binary,
+            "mangle",
+            "FERRUM_MESH_UDP_OUTPUT_MARK",
+            &format!("-p udp --dport {port} -j RETURN"),
+        ));
+    }
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "FERRUM_MESH_UDP_OUTPUT_MARK",
+        "-p udp -j DROP",
+    ));
+    commands.push(idempotent_append(
+        binary,
+        "mangle",
+        "OUTPUT",
+        "-p udp -j FERRUM_MESH_UDP_OUTPUT_MARK",
+    ));
     commands
 }
 
@@ -2014,6 +2094,24 @@ mod tests {
                 .iter()
                 .any(|cmd| cmd.contains("--to-ports 15001"))
         );
+    }
+
+    #[test]
+    fn udp_fail_closed_script_drops_udp_after_exclusions() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.udp_capture_enabled = true;
+        config.exclude_cidrs = vec!["10.0.0.0/8".to_string()];
+        config.exclude_ports = vec![53];
+
+        let script = IptablesPlan::udp_fail_closed_script(&config);
+
+        assert!(script.starts_with("set -e\n"));
+        assert!(script.contains("-N FERRUM_MESH_UDP_OUTPUT_MARK"));
+        assert!(script.contains("-F FERRUM_MESH_UDP_OUTPUT_MARK"));
+        assert!(script.contains("-p udp -d 10.0.0.0/8 -j RETURN"));
+        assert!(script.contains("-p udp --dport 53 -j RETURN"));
+        assert!(script.contains("-p udp -j DROP"));
+        assert!(script.contains("OUTPUT -p udp -j FERRUM_MESH_UDP_OUTPUT_MARK"));
     }
 
     #[test]

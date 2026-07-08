@@ -773,6 +773,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         }
         let include_v6 = self.capture_config.ip6tables_mode != Ip6TablesMode::Disabled;
         let teardown_script = IptablesPlan::udp_teardown_script(include_v6);
+        let fail_closed_script = IptablesPlan::udp_fail_closed_script(&self.capture_config);
 
         // Stable netns handle for the whole capture lifetime (survives PID exit).
         let netns = match super::netns_capture::open_pod_netns_handle(&target.cgroup_path) {
@@ -878,13 +879,26 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         );
         let setup_for_thread = setup_script;
         let teardown_pre = teardown_script.clone();
+        let fail_closed_for_thread = fail_closed_script;
         let bind_result = super::netns_capture::run_in_netns(netns.as_ref(), move || {
             // Reap any stale UDP rules from a prior crashed producer first.
             let _ = run_shell_script(&teardown_pre);
             let (socket, bound_addr, v4_origdst, v6_origdst) =
-                super::mesh_udp_capture::bind_mesh_udp_capture_socket(bind_addr)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-            run_shell_script(&setup_for_thread)?;
+                match super::mesh_udp_capture::bind_mesh_udp_capture_socket(bind_addr) {
+                    Ok(bound) => bound,
+                    Err(error) => {
+                        // A workload can pre-bind the unprivileged capture port.
+                        // Install a DROP-only OUTPUT guard so pod UDP fails
+                        // closed instead of bypassing Ambient UDP policy until
+                        // the next reconcile can bind the producer socket.
+                        run_shell_script(&fail_closed_for_thread)?;
+                        return Err(std::io::Error::other(error.to_string()));
+                    }
+                };
+            if let Err(error) = run_shell_script(&setup_for_thread) {
+                let _ = run_shell_script(&teardown_pre);
+                return Err(error);
+            }
             Ok((socket, bound_addr, v4_origdst, v6_origdst))
         });
         let (std_socket, bound_addr, v4_origdst, v6_origdst) = match bind_result {
@@ -893,9 +907,8 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                 warn!(
                     pod_uid = %target.pod_uid,
                     %error,
-                    "Ambient UDP producer: in-netns socket bind / rule install failed; cleaning up"
+                    "Ambient UDP producer: in-netns socket bind / rule install failed; fail-closed guard attempted when bind failed"
                 );
-                teardown();
                 return None;
             }
         };
