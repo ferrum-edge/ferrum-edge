@@ -2765,3 +2765,174 @@ async fn streaming_unnamed_tool_frames_released_in_dry_run() {
     assert!(!terminated, "dry-run must not cut the stream");
     assert_eq!(out, bytes, "dry-run must release the held frames unchanged");
 }
+
+// ---------------------------------------------------------------------------
+// Round 5 review fixes: ungovernable streamed calls, redaction re-check, stream
+// ---------------------------------------------------------------------------
+
+/// A `request_transformer` that adds `stream: true` after `before_proxy` must be
+/// re-detected on the final request body so the reqwest streaming path is pinned.
+#[tokio::test]
+async fn final_request_body_redetects_transform_added_stream() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    // No streaming marker before this hook (the transform just added it).
+    assert!(!plugin.forces_reqwest_dispatch(&ctx));
+    let body = json!({ "stream": true, "model": "gpt-4o", "messages": [] }).to_string();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), body.as_bytes())
+            .await,
+    );
+    assert!(
+        plugin.forces_reqwest_dispatch(&ctx),
+        "final-body stream:true must pin reqwest dispatch"
+    );
+}
+
+/// A batch with one named allowed call AND one unnamed tool-call delta must fail
+/// closed in enforce — the ungovernable sibling cannot ride out with the allowed
+/// call.
+#[tokio::test]
+async fn streaming_mixed_named_and_unnamed_fails_closed() {
+    let plugin = make(streaming_config(
+        json!({ "get_weather": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{}\"}},",
+        "{\"index\":1,\"function\":{\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (_out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(
+        terminated,
+        "an ungovernable sibling call must cut the stream even alongside a named allowed call"
+    );
+}
+
+/// A streamed tool call whose `function.arguments` arrive as a non-string JSON
+/// value is ungovernable and fails closed in enforce.
+#[tokio::test]
+async fn streaming_non_string_arguments_fail_closed() {
+    let plugin = make(streaming_config(
+        json!({ "get_weather": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"get_weather\",\"arguments\":{\"city\":\"NYC\"}}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (_out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(
+        terminated,
+        "non-string streamed arguments are ungovernable and must fail closed"
+    );
+}
+
+/// Redacting one call must not re-invoke the approval webhook for a separate
+/// already-approved call in the final re-check (the redaction updates the
+/// governed hash so the final body is treated as already governed).
+#[tokio::test]
+async fn redaction_does_not_trigger_duplicate_approval_on_final() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "tools": {
+            "deploy": { "action": "require_approval" },
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 }
+    }));
+    let body = json!({
+        "id": "1", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": Value::Null, "tool_calls": [
+            { "id": "c1", "type": "function", "function": { "name": "deploy", "arguments": "{}" } },
+            { "id": "c2", "type": "function", "function": { "name": "filesystem.write", "arguments": "{\"token\":\"sk-SECRET123\"}" } }
+        ] }, "finish_reason": "tool_calls" }]
+    })
+    .to_string()
+    .into_bytes();
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    ); // webhook #1 + marks redaction
+    let transformed = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/json"),
+            &json_headers(),
+        )
+        .await
+        .expect("redacted body");
+    assert!(!String::from_utf8_lossy(&transformed).contains("sk-SECRET123"));
+    // Final re-check sees the redacted body → matches updated hash → skip.
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &transformed)
+            .await,
+    );
+    server.verify().await; // still exactly 1
+}
+
+/// A redaction placeholder that contains the pattern name must not be re-flagged
+/// as a blocked-pattern match by the final re-check.
+#[tokio::test]
+async fn redaction_placeholder_not_reflagged_on_final() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": "token" }]
+            }
+        }
+    }));
+    let body = response_with_tool_call("filesystem.write", "{\"data\":\"my token here\"}");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    let transformed = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/json"),
+            &json_headers(),
+        )
+        .await
+        .expect("redacted body");
+    // The placeholder embeds "token" but the final re-check must forward, not 502.
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &transformed)
+            .await,
+    );
+}

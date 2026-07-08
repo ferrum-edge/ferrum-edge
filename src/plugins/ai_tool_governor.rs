@@ -1564,10 +1564,12 @@ impl Plugin for AiToolGovernor {
     }
 
     fn needs_final_request_body_context(&self) -> bool {
-        // `govern_request` needs the real request context: consumer/proxy
-        // correlation, `plugin_http_call_ns` for approval webhooks, and metadata
-        // writes must survive back to the live request.
-        self.enabled && self.inspect.any_request()
+        // `govern_request` needs the real request context (consumer/proxy
+        // correlation, `plugin_http_call_ns` for approval webhooks, metadata
+        // writes), and streaming-only configs need it too so the final-body
+        // `stream: true` re-detection can set the reqwest-pinning marker back on
+        // the live request.
+        self.enabled && (self.inspect.any_request() || self.inspect.streaming_response_tool_calls)
     }
 
     /// Re-run the deterministic request policy on the FINAL backend-visible body.
@@ -1584,13 +1586,52 @@ impl Plugin for AiToolGovernor {
         headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        if !self.enabled || !self.inspect.any_request() {
+        let governs_request = self.enabled && self.inspect.any_request();
+        let detects_streaming = self.enabled && self.inspect.streaming_response_tool_calls;
+        if !governs_request && !detects_streaming {
             return PluginResult::Continue;
         }
-        // Only JSON POST bodies are governed (mirror `should_buffer_request_body`).
+        // Only JSON POST bodies are in scope (mirror `should_buffer_request_body`).
         if ctx.method != "POST"
             || !header_value(headers, "content-type").is_some_and(is_json_content_type)
         {
+            return PluginResult::Continue;
+        }
+        // An empty body has nothing to detect or govern (it is not
+        // "uninspectable" in the fail-closed sense).
+        if body.is_empty() {
+            return PluginResult::Continue;
+        }
+
+        let inspectable =
+            !has_non_identity_content_encoding(headers) && body.len() <= MAX_PARSE_BYTES;
+        let json = inspectable
+            .then(|| serde_json::from_slice::<Value>(body).ok())
+            .flatten();
+
+        // Re-detect `stream: true` on the FINAL backend-visible body: a
+        // `request_transformer` body rule may have added it after `before_proxy`
+        // ran. `forces_reqwest_dispatch` (consulted after this hook) reads the
+        // marker to pin the reqwest path where the SSE inspector is wired. An
+        // uninspectable final body cannot rule out `stream: true`, so mark it
+        // conservatively — reqwest dispatch is always valid.
+        if detects_streaming
+            && ctx.metadata.get(STREAM_REQUESTED_KEY).map(String::as_str) != Some("true")
+        {
+            let is_stream = match &json {
+                Some(json) => json.get("stream").and_then(Value::as_bool) == Some(true),
+                None => true,
+            };
+            if is_stream {
+                ctx.metadata
+                    .insert(STREAM_REQUESTED_KEY.to_string(), "true".to_string());
+                if let Some(model) = json.as_ref().and_then(|j| request_model(j)) {
+                    ctx.metadata.insert(STREAM_MODEL_KEY.to_string(), model);
+                }
+            }
+        }
+
+        if !governs_request {
             return PluginResult::Continue;
         }
 
@@ -1601,46 +1642,18 @@ impl Plugin for AiToolGovernor {
             return PluginResult::Continue;
         }
 
-        let enforce_request = self.engine.mode == Mode::Enforce;
-
         // A still-encoded / oversized / unparseable final body cannot be
         // inspected: fail closed in enforce mode so a transform (or a body
         // `before_proxy` could not read) cannot smuggle a denied call past policy.
-        if has_non_identity_content_encoding(headers) {
-            if enforce_request {
+        let Some(json) = json else {
+            if self.engine.mode == Mode::Enforce {
                 return self.reject_uninspectable(
                     ctx,
                     "request body",
-                    "request body has a content-encoding that cannot be inspected",
+                    "final request body cannot be inspected (encoded, oversized, or not JSON)",
                 );
             }
             return PluginResult::Continue;
-        }
-        if body.is_empty() {
-            return PluginResult::Continue;
-        }
-        if body.len() > MAX_PARSE_BYTES {
-            if enforce_request {
-                return self.reject_uninspectable(
-                    ctx,
-                    "request body",
-                    "request body exceeds the inspectable size limit",
-                );
-            }
-            return PluginResult::Continue;
-        }
-        let json = match serde_json::from_slice::<Value>(body) {
-            Ok(json) => json,
-            Err(_) => {
-                if enforce_request {
-                    return self.reject_uninspectable(
-                        ctx,
-                        "request body",
-                        "request body is not parseable JSON despite a JSON content-type",
-                    );
-                }
-                return PluginResult::Continue;
-            }
         };
         ctx.metadata
             .insert(GOVERNED_REQUEST_HASH_KEY.to_string(), final_hash);
@@ -1817,7 +1830,19 @@ impl Plugin for AiToolGovernor {
         }
         let mut json: Value = serde_json::from_slice(body).ok()?;
         if self.redact_response(&mut json) {
-            return serde_json::to_vec(&json).ok();
+            let rewritten = serde_json::to_vec(&json).ok()?;
+            // Record the redacted body's hash so `on_final_response_body` treats
+            // this plugin's own redaction as already-governed and skips it. Not
+            // doing so would re-run `govern_final_response` over the redacted
+            // body, which (a) re-calls the approval webhook for an unchanged
+            // `require_approval` sibling call (a 502 with `cache_ttl_seconds: 0`
+            // or a one-shot approval service) and (b) can re-match the
+            // `[REDACTED_TOOL_ARG:<name>]` placeholder as a blocked pattern.
+            ctx.metadata.insert(
+                GOVERNED_RESPONSE_HASH_KEY.to_string(),
+                sha256_hex_bytes(&rewritten),
+            );
+            return Some(rewritten);
         }
         None
     }
@@ -1996,6 +2021,10 @@ struct StreamingToolCallAccumulator {
 struct StreamingCall {
     name: String,
     arguments: String,
+    /// A tool-call delta supplied `function.arguments` as a non-string JSON
+    /// value (object/array/number). Those bytes are not accumulated, so the
+    /// call cannot be policy-checked and must be treated as ungovernable.
+    non_string_args: bool,
 }
 
 impl StreamingToolCallAccumulator {
@@ -2023,15 +2052,22 @@ impl StreamingToolCallAccumulator {
                     .and_then(|v| usize::try_from(v).ok())
                     .unwrap_or(tpos);
                 let function = tc.get("function");
+                let name = function.and_then(|f| f.get("name")).and_then(Value::as_str);
+                let args = function.and_then(|f| f.get("arguments"));
+                let args_str = args.and_then(Value::as_str);
+                // Arguments present but not a string: the bytes are not
+                // accumulated, so mark the call ungovernable rather than
+                // evaluating it as empty args.
+                let non_string_args = args.is_some() && args_str.is_none();
                 let entry = self.entry(cidx, tidx);
-                if let Some(name) = function.and_then(|f| f.get("name")).and_then(Value::as_str) {
+                if let Some(name) = name {
                     entry.name.push_str(name);
                 }
-                if let Some(args) = function
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(Value::as_str)
-                {
-                    entry.arguments.push_str(args);
+                if let Some(args_str) = args_str {
+                    entry.arguments.push_str(args_str);
+                }
+                if non_string_args {
+                    entry.non_string_args = true;
                 }
             }
         }
@@ -2059,6 +2095,17 @@ impl StreamingToolCallAccumulator {
     /// Whether every choice that produced tool-call deltas is in `finished`.
     fn choices_finished(&self, finished: &std::collections::HashSet<usize>) -> bool {
         self.calls.iter().all(|((c, _), _)| finished.contains(c))
+    }
+
+    /// Whether any accumulated tool call cannot be policy-checked: it never
+    /// received a `function.name`, or its `function.arguments` arrived as a
+    /// non-string JSON value. `build_calls()` silently drops such calls, so a
+    /// governable named call in the same batch must not carry an ungovernable
+    /// sibling past policy.
+    fn has_ungovernable_call(&self) -> bool {
+        self.calls
+            .iter()
+            .any(|(_, c)| c.name.is_empty() || c.non_string_args)
     }
 
     fn build_calls(&self) -> Vec<ToolCall> {
@@ -2182,19 +2229,28 @@ impl ToolCallStreamInspector {
         if !self.saw_tool_calls {
             return Finalize::Released;
         }
-        let calls = self.accumulator.build_calls();
-        if calls.is_empty() {
-            // Held frames carried tool-call deltas but never produced a tool
-            // name (malformed or an unrecognized provider variant), so they
-            // cannot be policy-checked. Enforce mode fails closed (cut the
-            // stream) rather than forwarding ungovernable tool-call bytes;
-            // dry-run releases them unchanged so observation never disrupts
-            // traffic. Silently dropping them (the previous behavior) is wrong
-            // for both modes.
+        // Any accumulated tool call that cannot be policy-checked — no
+        // `function.name`, or non-string `function.arguments` — makes the whole
+        // batch ungovernable: a governable named call in the same SSE batch
+        // could otherwise carry an unchecked sibling to the client. Enforce mode
+        // fails closed (cut the stream); dry-run releases the held frames
+        // unchanged so observation never disrupts traffic. Detecting ANY
+        // ungovernable call (not just the all-unnamed case) is required because
+        // `build_calls()` silently drops unnamed calls.
+        if self.accumulator.has_ungovernable_call() {
             if self.engine.mode == Mode::Enforce {
                 self.held.clear();
                 return Finalize::Blocked;
             }
+            out.extend_from_slice(&self.held);
+            self.held.clear();
+            self.reset_batch();
+            return Finalize::Released;
+        }
+        let calls = self.accumulator.build_calls();
+        if calls.is_empty() {
+            // Saw a tool-call array but no governable calls (e.g. an empty
+            // array): nothing to check, release the held frames unchanged.
             out.extend_from_slice(&self.held);
             self.held.clear();
             self.reset_batch();
