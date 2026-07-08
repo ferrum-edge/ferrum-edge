@@ -70,6 +70,13 @@ const MD_REQUEST_HASH: &str = "ai_transcript_audit.request_hash";
 const MD_RESPONSE_HASH: &str = "ai_transcript_audit.response_hash";
 const MD_SINK_STATUS: &str = "ai_transcript_audit.sink_status";
 const MD_STREAM_MARKER: &str = "ai_transcript_audit.stream_marker";
+/// Set when the request body carries `stream: true` (an SSE response is
+/// expected), so the response buffer decision does not stall the stream.
+const MD_STREAM_REQUEST: &str = "ai_transcript_audit.stream_request";
+/// Set once the final-request-body hook captured the backend-visible request, so
+/// the reject-path `after_proxy` refresh only runs for `before_proxy`
+/// short-circuits (where that hook never fired).
+const MD_FINAL_REQ_SEEN: &str = "ai_transcript_audit.final_req_seen";
 
 /// What to capture and export.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -666,6 +673,19 @@ impl AiTranscriptAudit {
             .insert(MD_SAMPLE_HIT.to_string(), bool_str(sample_hit));
         ctx.metadata
             .insert(MD_REQUEST_HASH.to_string(), request_hash.clone());
+        // `stream: true` means an SSE response is expected; record it so the
+        // response buffer decision streams rather than stalls (buffering a
+        // stream holds it until EOF, and under retry the buffered->stream
+        // content-type downgrade is disabled).
+        if parsed
+            .as_ref()
+            .and_then(|json| json.get("stream"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            ctx.metadata
+                .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
+        }
 
         // Force the response onto the stream-inspection path when streaming
         // capture applies to this request. In `sampled` mode, only requests
@@ -1036,6 +1056,10 @@ impl Plugin for AiTranscriptAudit {
         if !self.active {
             return PluginResult::Continue;
         }
+        // Mark that the backend-visible request was captured, so the reject-path
+        // `after_proxy` refresh knows this was NOT a `before_proxy` short-circuit.
+        ctx.metadata
+            .insert(MD_FINAL_REQ_SEEN.to_string(), "true".to_string());
         // Staged in `before_proxy`: request transforms may have changed the
         // body since, so refresh the captured hash/excerpt with the final
         // backend-visible bytes.
@@ -1057,6 +1081,41 @@ impl Plugin for AiTranscriptAudit {
         PluginResult::Continue
     }
 
+    // ---- reject-path request refresh ----
+
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        self.active
+    }
+
+    /// On a `before_proxy` short-circuit (no backend dispatch, so no final
+    /// request-body hook), a later terminator can rewrite `request_body` after we
+    /// staged the candidate — e.g. `ai_prompt_shield` redacts, then
+    /// `ai_federation` returns a non-2xx `RejectBinary` whose synthetic
+    /// response-body hooks never run. Refresh the staged request from the final
+    /// `request_body` so the record reflects the provider-visible (redacted)
+    /// request, not the pre-redaction prompt/hash. The normal backend path
+    /// already captured the backend-visible request in the final-body hook
+    /// (`MD_FINAL_REQ_SEEN`), so skip there to avoid reverting it from carried
+    /// pre-transform metadata.
+    async fn after_proxy(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _response_headers: &mut HashMap<String, String>,
+    ) -> PluginResult {
+        if !self.active
+            || flag(&ctx.metadata, MD_FINAL_REQ_SEEN)
+            || !flag(&ctx.metadata, MD_CANDIDATE)
+        {
+            return PluginResult::Continue;
+        }
+        if let Some(body) = ctx.metadata.remove("request_body") {
+            self.refresh_staged_request(ctx, body.as_bytes());
+            ctx.metadata.insert("request_body".to_string(), body);
+        }
+        PluginResult::Continue
+    }
+
     // ---- buffered response capture ----
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -1065,6 +1124,13 @@ impl Plugin for AiTranscriptAudit {
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         if !self.capture.response {
+            return false;
+        }
+        // A `stream: true` request expects an SSE response; do not buffer it —
+        // buffering holds the stream until EOF (and under retry the
+        // buffered->stream content-type downgrade is disabled). Streaming capture
+        // still tees it via the response stream inspector when enabled.
+        if flag(&ctx.metadata, MD_STREAM_REQUEST) {
             return false;
         }
         match ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
@@ -1200,7 +1266,16 @@ impl Plugin for AiTranscriptAudit {
         let sink_unhealthy_reject = self.on_sink_error == SinkErrorPolicy::Reject
             && !self.sink_healthy.load(Ordering::Relaxed);
 
-        let envelope = self.envelope_from_ctx(ctx, response_status);
+        // When we are about to fail closed, the client-visible outcome is the 503
+        // from `reject_audit_unavailable()`, not the backend status — stamp that
+        // on the record so the collector does not read a fail-closed outage as a
+        // successful 2xx transaction.
+        let record_status = if sink_unhealthy_reject {
+            503
+        } else {
+            response_status
+        };
+        let envelope = self.envelope_from_ctx(ctx, record_status);
         let record = self.build_record(
             &record_id,
             envelope,

@@ -2193,3 +2193,147 @@ async fn stream_sampling_reads_instance_staging_not_shared_metadata() {
             .is_none()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Review round 3: fail-closed status, stream:true buffering, short-circuit
+// request refresh
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fail_closed_record_carries_503_status() {
+    // on_sink_error=reject: once the sink is unhealthy, the client-visible
+    // outcome is a 503 from the plugin, so the recovery-probe record must carry
+    // 503 — not the backend 200 that would misreport a fail-closed outage.
+    let server = MockServer::start().await;
+    // First flush fails (flips sink unhealthy); everything after succeeds so the
+    // 503 probe records land.
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let config = json!({
+        "sink": {
+            "type": "http",
+            "endpoint_url": endpoint,
+            "batch_size": 1,
+            "flush_interval_ms": 100,
+            "max_retries": 0,
+            "on_sink_error": "reject"
+        }
+    });
+    let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    let headers = json_headers();
+    let mut saw_503 = false;
+    for _ in 0..100 {
+        let mut ctx = make_ctx();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        let _ = plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let received = server.received_requests().await.unwrap_or_default();
+        for req in &received {
+            if let Ok(body) = serde_json::from_slice::<Value>(&req.body)
+                && let Some(arr) = body.as_array()
+                && arr.iter().any(|r| r["status_code"] == 503)
+            {
+                saw_503 = true;
+            }
+        }
+        if saw_503 {
+            break;
+        }
+    }
+    assert!(
+        saw_503,
+        "fail-closed audit record must carry the client-visible 503 status"
+    );
+}
+
+#[tokio::test]
+async fn stream_true_request_is_not_buffered() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    // A stream:true candidate expects SSE; it must NOT request response buffering.
+    let mut ctx = make_ctx();
+    let stream_body =
+        br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), stream_body)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.stream_request")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert!(!plugin.should_buffer_response_body(&ctx));
+
+    // A non-stream candidate still buffers its (JSON) response.
+    let mut ctx2 = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx2, &json_headers(), ai_request_body())
+        .await;
+    assert!(plugin.should_buffer_response_body(&ctx2));
+}
+
+#[tokio::test]
+async fn non_2xx_short_circuit_refreshes_staged_request_via_after_proxy() {
+    // full_body mode captures raw request bytes. A before_proxy terminator
+    // redacted request_body and then returned a non-2xx RejectBinary (no final
+    // request-body hook, no synthetic response-body hooks). after_proxy must
+    // refresh the staged request so the record reflects the redacted request,
+    // not the pre-redaction prompt.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "mode": "full_body", "allow_full_body": true }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        std::str::from_utf8(ai_request_body()).unwrap().to_string(),
+    );
+    let mut proxy_headers = ctx.headers.clone();
+    plugin.before_proxy(&mut ctx, &mut proxy_headers).await;
+    // Downstream terminator redacted the body, then surfaced a provider 502.
+    let redacted =
+        r#"{"model":"gpt-4o","messages":[{"role":"user","content":"my ssn is [REDACTED]"}]}"#;
+    ctx.metadata
+        .insert("request_body".to_string(), redacted.to_string());
+    let mut response_headers = HashMap::new();
+    plugin
+        .after_proxy(&mut ctx, 502, &mut response_headers)
+        .await;
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 502;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let excerpt = records[0]["request_body"].as_str().expect("request body");
+    assert!(
+        !excerpt.contains("123-45-6789"),
+        "pre-redaction SSN must not leak: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("[REDACTED]"),
+        "record must reflect the redacted request: {excerpt}"
+    );
+}
