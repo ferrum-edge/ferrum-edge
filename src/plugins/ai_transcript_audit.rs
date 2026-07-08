@@ -1127,9 +1127,19 @@ impl Plugin for AiTranscriptAudit {
             return false;
         }
         // A `stream: true` request expects an SSE response; do not buffer it —
-        // buffering holds the stream until EOF (and under retry the
-        // buffered->stream content-type downgrade is disabled). Streaming capture
-        // still tees it via the response stream inspector when enabled.
+        // buffering holds the stream until EOF, and under retry the
+        // buffered->stream content-type downgrade is disabled, so an oversized
+        // stream would be capped at `max_response_body_size_bytes` and fail
+        // rather than stream. Streaming capture still tees it via the response
+        // stream inspector when enabled. Tradeoff (deliberate): a provider that
+        // answers a `stream: true` request with a non-SSE JSON 4xx/5xx error is
+        // then streamed too, so its body is not buffered-captured — the log
+        // fallback still records the request side, status, and error reason.
+        // Forcing a buffer to catch that body would risk the failure above for
+        // the common SSE success case. The marker is derived from the
+        // pre-transform body because this decision is made before request-body
+        // transforms run; a later transformer that rewrites `stream` cannot be
+        // reflected here (same ordering limit as the AI-candidate classification).
         if flag(&ctx.metadata, MD_STREAM_REQUEST) {
             return false;
         }
