@@ -1963,6 +1963,18 @@ impl Plugin for AiToolGovernor {
             return PluginResult::Continue;
         }
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
+        // Framed gRPC/gRPC-Web (including the `+json` variants) is
+        // length-prefixed wire frames owned by the gRPC machinery, not a bare
+        // JSON document — explicitly OUT OF SCOPE, mirroring the request-side
+        // exclusion. This plugin never buffers those labels itself, but when
+        // the response is buffered for reasons outside this plugin
+        // (`response_body_mode: Buffer`, another buffering plugin) this hook
+        // still runs and `is_json_content_type` matches `+json` suffixes, so
+        // without this gate an oversized framed-gRPC body would be
+        // fail-closed rejected despite never being governable here.
+        if is_framed_grpc_content_type(content_type) {
+            return PluginResult::Continue;
+        }
         // A buffered `text/event-stream` body means the stream inspector never
         // attached (streaming inspection disabled, or another plugin/guard
         // kept it buffered): govern the SSE tool calls here rather than
@@ -2042,9 +2054,16 @@ impl Plugin for AiToolGovernor {
         if body.is_empty() {
             return PluginResult::Continue;
         }
-        if body.len() > MAX_PARSE_BYTES {
-            // A padded response must not smuggle governed tool calls past the
-            // parse limit: fail closed in enforce mode.
+        let wire_encoding = content_encoding_value(response_headers);
+        if body.len() > MAX_PARSE_BYTES && wire_encoding.is_none() {
+            // A padded PLAINTEXT response must not smuggle governed tool
+            // calls past the parse limit: fail closed in enforce mode. The
+            // wire-size cap applies only to identity/plaintext bodies — for
+            // a body with a `Content-Encoding` the real inspection bound is
+            // the DECODED size (`decompress_within_limit`'s cap below): an
+            // incompressible payload can exceed the cap on the wire while
+            // its decoded JSON is comfortably inspectable, and rejecting it
+            // before the decode attempt would 502 legitimate traffic.
             if self.engine.mode == Mode::Enforce {
                 return self.reject_uninspectable(
                     ctx,
@@ -2054,9 +2073,15 @@ impl Plugin for AiToolGovernor {
             }
             return PluginResult::Continue;
         }
-        let json = match serde_json::from_slice::<Value>(body) {
-            Ok(json) => json,
-            Err(_) => {
+        // The plaintext parse is attempted only within the wire cap (the cap
+        // bounds serde CPU); an encoded body past it goes straight to the
+        // bounded decode branch.
+        let parsed = (body.len() <= MAX_PARSE_BYTES)
+            .then(|| serde_json::from_slice::<Value>(body).ok())
+            .flatten();
+        let json = match parsed {
+            Some(json) => json,
+            None => {
                 // A JSON-labeled body that does not parse as plaintext but
                 // carries a `Content-Encoding` is usually a perfectly valid
                 // compressed Chat Completions response (an upstream that
@@ -2066,7 +2091,7 @@ impl Plugin for AiToolGovernor {
                 // fails (unsupported/corrupt encoding, or output past the
                 // cap); rejecting before the decode attempt would 502
                 // legitimate compressed responses.
-                let Some(encoding) = content_encoding_value(response_headers) else {
+                let Some(encoding) = wire_encoding else {
                     // Unencoded but unparseable despite the JSON label/shape:
                     // no governable calls can be extracted from it and it was
                     // never encoded, so forward (long-standing plaintext
@@ -2187,6 +2212,14 @@ impl Plugin for AiToolGovernor {
         {
             return None;
         }
+        // Framed gRPC/gRPC-Web is out of scope (same gate as the buffered
+        // hooks): defense in depth — `on_response_body` no longer records the
+        // governed-hash marker for those labels, so the marker gate below
+        // already declines, but a rewrite of framed wire bytes must never be
+        // possible even if that changes.
+        if content_type.is_some_and(is_framed_grpc_content_type) {
+            return None;
+        }
         // Redaction rewrites only bodies this plugin actually governed in
         // `on_response_body` (the governed-response hash marker is recorded
         // only for 2xx in-scope bodies). Without the marker gate, a
@@ -2281,6 +2314,13 @@ impl Plugin for AiToolGovernor {
         }
 
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
+        // Framed gRPC/gRPC-Web wire frames are out of scope on the final
+        // re-check too (same gate as `on_response_body`): a buffered framed
+        // body must not be size- or shape-rejected by a governor that never
+        // inspects it.
+        if is_framed_grpc_content_type(content_type) {
+            return PluginResult::Continue;
+        }
         let json_ct = is_json_content_type(content_type);
 
         // Buffered-SSE parity for the final re-check (mirrors
@@ -2328,12 +2368,9 @@ impl Plugin for AiToolGovernor {
                 // relabeled) as governable on this route, so the same posture
                 // applies here: fail closed in enforce mode, forward in
                 // dry-run — a relabel must not downgrade an uninspectable
-                // encoded body from fail-closed to forward. Only framed
-                // gRPC/gRPC-Web wire frames, which this plugin never buffers
-                // or governs, remain out of scope.
-                if is_framed_grpc_content_type(content_type) {
-                    return PluginResult::Continue;
-                }
+                // encoded body from fail-closed to forward. Framed
+                // gRPC/gRPC-Web wire frames already returned at the top of
+                // this hook and never reach this posture.
                 return self.uninspectable_governed_response(
                     ctx,
                     "response body has a content-encoding that cannot be inspected",
@@ -2450,8 +2487,26 @@ impl Plugin for AiToolGovernor {
         if !(200..300).contains(&response_status) {
             return None;
         }
+        // Attach on an SSE label (the normal case) — and ALSO on a
+        // STREAM-MARKED governed request regardless of the response content
+        // type: a `request_transformer` can add `"stream": true` AFTER the
+        // proxy's buffer/dispatch decisions, so the backend's plain
+        // `application/json` SSE fallback (which can carry denied
+        // `choices[].message.tool_calls[]`) is delivered on the STREAMING
+        // path where the buffered hooks never run. The shape sniff then
+        // routes a JSON-shaped stream into hold-in-full/govern-at-EOF, real
+        // SSE into normal streaming governance, and opaque bytes fail closed
+        // — so the widened attach never weakens inspection. The stream-marker
+        // gate keeps ordinary non-streaming traffic inspector-free, and
+        // framed gRPC/gRPC-Web wire frames stay out of scope (owned by the
+        // gRPC machinery — attaching would opaque-cut them in enforce).
         if !content_type.is_some_and(is_event_stream_content_type) {
-            return None;
+            if !request_is_streaming(ctx) {
+                return None;
+            }
+            if content_type.is_some_and(is_framed_grpc_content_type) {
+                return None;
+            }
         }
         let model = ctx
             .metadata
@@ -3112,12 +3167,35 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 }
                 return ResponseStreamAction::Forward(Bytes::from(std::mem::take(&mut self.carry)));
             }
-            // An Unknown shape at end-of-stream is bytes that never resolved:
-            // whitespace, a partial BOM, or a colon-less printable first line
-            // fragment (no `:` and no line terminator — so no `data:` line,
-            // and therefore no governable call, can be inside); the SSE flush
-            // below forwards them unchanged.
-            StreamBodyShape::Sse | StreamBodyShape::Unknown => {}
+            // An Unknown shape at end-of-stream is bytes that never resolved
+            // before EOF. Two cases, resolved conservatively here:
+            // - Valid UTF-8 (whitespace, a bare BOM, or a colon-less
+            //   printable first-line fragment — no `:` and no line
+            //   terminator, so provably no `data:` line and no governable
+            //   call inside): the SSE flush below forwards it unchanged.
+            // - NOT valid UTF-8 (e.g. high-bit binary with no colon, line
+            //   terminator, or control byte before EOF): never classifiable
+            //   as SSE or JSON. Flushing it through the SSE path would
+            //   classify it `NoData` and forward it even in enforce mode, so
+            //   apply Opaque semantics instead — cut in enforce, release
+            //   unchanged in dry-run.
+            StreamBodyShape::Unknown => {
+                if std::str::from_utf8(&self.carry).is_err() {
+                    if self.engine.mode == Mode::Enforce {
+                        warn!(
+                            target: "ai_tool_governor",
+                            held_bytes = self.carry.len(),
+                            "unclassifiable non-UTF-8 stream under governance cannot be inspected; cutting stream"
+                        );
+                        self.carry.clear();
+                        return self.terminate(Vec::new());
+                    }
+                    return ResponseStreamAction::Forward(Bytes::from(std::mem::take(
+                        &mut self.carry,
+                    )));
+                }
+            }
+            StreamBodyShape::Sse => {}
         }
         let mut out: Vec<u8> = Vec::new();
         let mut trailing: Vec<u8> = Vec::new();
@@ -3149,20 +3227,96 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
 // SSE framing helpers
 // ---------------------------------------------------------------------------
 
-/// Byte index just past the end of the first complete SSE event (first blank
-/// line), or `None` if no event has fully arrived yet.
+/// Length of the SSE line terminator starting at `buf[i]`.
+enum TermAt {
+    /// `buf[i]` does not start a line terminator.
+    None,
+    /// A complete terminator of this byte length (`\n` or `\r` = 1, `\r\n` = 2).
+    Len(usize),
+    /// A `\r` as the FINAL buffer byte: it may be a lone-CR terminator or the
+    /// first half of a `\r\n` straddling a chunk boundary — undecidable until
+    /// the next byte arrives.
+    Ambiguous,
+}
+
+fn terminator_at(buf: &[u8], i: usize) -> TermAt {
+    match buf[i] {
+        b'\n' => TermAt::Len(1),
+        b'\r' => match buf.get(i + 1) {
+            Some(b'\n') => TermAt::Len(2),
+            Some(_) => TermAt::Len(1),
+            None => TermAt::Ambiguous,
+        },
+        _ => TermAt::None,
+    }
+}
+
+/// Byte index just past the end of the first complete SSE event (the first
+/// blank line), or `None` if no event has fully arrived yet. The SSE spec
+/// allows `\r\n`, `\r`, or `\n` as line terminators, so an event ends at any
+/// TWO consecutive terminators — an LF-only scan would leave a CR-only stream
+/// (`data: {...}\r\r`) as one never-complete "line" whose denied deltas flush
+/// as unparsed trailing bytes. A trailing `\r` is held (return `None`) until
+/// the next chunk disambiguates lone-CR from a straddled `\r\n`, so an event
+/// is never split inside one terminator.
 fn next_event_end(buf: &[u8]) -> Option<usize> {
-    for (i, &b) in buf.iter().enumerate() {
-        if b != b'\n' {
-            continue;
+    let mut i = 0;
+    while i < buf.len() {
+        let first = match terminator_at(buf, i) {
+            TermAt::None => {
+                i += 1;
+                continue;
+            }
+            TermAt::Ambiguous => return None,
+            TermAt::Len(len) => len,
+        };
+        let after_first = i + first;
+        if after_first >= buf.len() {
+            // Line terminator at the buffer edge: the next byte decides
+            // whether a blank line follows.
+            return None;
         }
-        match buf.get(i + 1) {
-            Some(b'\n') => return Some(i + 2),
-            Some(b'\r') if buf.get(i + 2) == Some(&b'\n') => return Some(i + 3),
-            _ => {}
+        match terminator_at(buf, after_first) {
+            TermAt::None => i = after_first,
+            TermAt::Ambiguous => return None,
+            TermAt::Len(second) => return Some(after_first + second),
         }
     }
     None
+}
+
+/// Split SSE text into lines on any of the three spec terminators (`\r\n`,
+/// `\r`, `\n`), terminators consumed. `str::lines` is LF-only, so a CR-only
+/// event would collapse into one unparseable line and its `data:` frames
+/// would bypass governance. Terminator bytes are ASCII, so the byte-index
+/// slices always fall on char boundaries.
+fn sse_lines(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\n' => {
+                lines.push(&text[start..i]);
+                i += 1;
+                start = i;
+            }
+            b'\r' => {
+                lines.push(&text[start..i]);
+                i += 1;
+                if bytes.get(i) == Some(&b'\n') {
+                    i += 1;
+                }
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    if start < bytes.len() {
+        lines.push(&text[start..]);
+    }
+    lines
 }
 
 enum SseEvent {
@@ -3187,8 +3341,7 @@ fn classify_event(event: &[u8]) -> SseEvent {
         return SseEvent::NoData;
     };
     let mut data_lines: Vec<&str> = Vec::new();
-    for raw in text.lines() {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
+    for line in sse_lines(text) {
         if let Some(rest) = line
             .strip_prefix("data: ")
             .or_else(|| line.strip_prefix("data:"))
@@ -3377,15 +3530,17 @@ fn extract_sse_tool_calls(body: &[u8]) -> BufferedSseExtract {
         return batches.extract;
     };
     let mut event: Vec<&str> = Vec::new();
-    for raw in text.lines() {
-        // SSE events are separated by a blank line.
-        if raw.strip_suffix('\r').unwrap_or(raw).is_empty() {
+    // Spec-terminator-aware line split (`\r\n` / `\r` / `\n` — see
+    // [`sse_lines`]): a blank line of any terminator form separates events,
+    // so a CR-only stream is parsed identically to the live inspector.
+    for line in sse_lines(text) {
+        if line.is_empty() {
             if !event.is_empty() {
                 batches.on_event(event.join("\n").as_bytes());
                 event.clear();
             }
         } else {
-            event.push(raw);
+            event.push(line);
         }
     }
     if !event.is_empty() {

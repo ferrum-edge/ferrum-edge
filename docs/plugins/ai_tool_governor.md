@@ -55,8 +55,20 @@ an uninspected arm are described under [Limitations (MVP)](#limitations-mvp).
 Requests marked streaming still buffer a plain-JSON fallback
 response so `tool_calls` in it are governed (a `text/event-stream` response
 is released back to the stream path only when streaming inspection is enabled
-and a live inspector will govern it). The inspector also sniffs the stream's
-body shape from its leading bytes: a JSON-shaped stream (a Chat
+and a live inspector will govern it). The live inspector attaches to a
+**stream-marked** governed request's response **regardless of the response
+`Content-Type`**, not only `text/event-stream`: a `request_transformer` can
+add `"stream": true` after the proxy's buffering decisions, in which case the
+backend's plain `application/json` SSE fallback is delivered on the streaming
+path — the attached inspector then governs it by body shape instead of label.
+Framed gRPC / gRPC-Web responses never get an inspector, and a request with
+no streaming marker never does either, so ordinary buffered traffic is
+unaffected. SSE parsing (live and buffered) accepts all three spec line
+terminators (`\r\n`, `\r`, `\n`), so a CR-only stream's events are parsed and
+governed like any other; a `\r` at a chunk edge is held until the next chunk
+disambiguates a straddled `\r\n`. The inspector also sniffs the stream's
+body shape from its leading bytes: a JSON-shaped stream (an SSE fallback, or
+a Chat
 Completions JSON body a transform relabeled `text/event-stream`) is held in
 full and governed at end-of-stream like a buffered JSON body — a denied call
 is never forwarded, an allowed body is released unchanged. A stream whose
@@ -67,7 +79,11 @@ line — printable text with a `:` separator in the first line — since the SSE
 spec ignores unknown field names and legitimate providers open streams with
 extension/heartbeat lines like `ping: 1`; opaque treatment is reserved for
 genuinely binary starts (gzip magic, control bytes) and a complete first line
-with no `:` separator.
+with no `:` separator. A stream whose shape never resolves before
+end-of-stream is resolved conservatively there: bytes that are **not valid
+UTF-8** (never classifiable as SSE or JSON) get the same opaque treatment —
+cut in enforce, released in dry-run — while a colon-less printable UTF-8
+fragment, which provably contains no `data:` frame, is released unchanged.
 
 **Response buffering on governed requests:** when this plugin governs response
 tool calls for a request, a 2xx response with a **missing or non-JSON
@@ -109,9 +125,13 @@ forwarded ungoverned:
   body-transform hooks, so it is opaque here), a body larger than **4 MiB**, a
   non-UTF-8 body, or a body that does not parse as JSON despite a JSON
   content-type.
-- **Response path** (when `response_tool_calls` is enabled): a 2xx JSON
-  response body larger than **4 MiB** (padding must not smuggle tool calls
-  past the parse limit), and a `tool_calls[]` / `function_call` entry that
+- **Response path** (when `response_tool_calls` is enabled): a 2xx
+  **plaintext** (identity-encoded) JSON response body larger than **4 MiB**
+  (padding must not smuggle tool calls past the parse limit) — for a body
+  with a `Content-Encoding` the cap applies to the **decoded** size instead
+  (see the encoded bullet below), so an incompressible payload whose wire
+  bytes exceed 4 MiB while its decoded JSON fits is decoded and governed
+  normally rather than rejected — and a `tool_calls[]` / `function_call` entry that
   cannot be policy-checked — a missing or non-string `function.name` (policy
   is keyed by name), or a `tool_calls` value that is present but not an array.
   A `null` `tool_calls`/`function_call` is OpenAI's normal content-only shape
@@ -281,10 +301,13 @@ approval webhook only when `approval.include_prompt_excerpt: true`.
   no-leak-on-deny take precedence over latency for the rare
   multi-choice-with-tools stream).
 - Request-path governance is scoped to JSON `POST` bodies (the shape OpenAI,
-  MCP, and A2A traffic uses). Framed gRPC / gRPC-Web requests — including the
+  MCP, and A2A traffic uses). Framed gRPC / gRPC-Web traffic — including the
   `application/grpc+json` / `application/grpc-web+json` variants, whose bodies
-  are length-prefixed wire frames rather than a bare JSON document — are out
-  of scope on a mixed proxy, not buffered or rejected.
+  are length-prefixed wire frames rather than a bare JSON document — is out
+  of scope on a mixed proxy in **both directions**: requests are not buffered
+  or rejected, and a framed-gRPC **response** that reaches the buffered hooks
+  (buffered by `response_body_mode: Buffer` or another plugin) is never
+  inspected, size-checked, or rewritten by this plugin.
 - A JSON-labelled **response** body that fails to parse is forwarded (only
   oversized responses fail closed) — rejecting every unparseable JSON response
   on a shared proxy would break unrelated routes.
@@ -300,5 +323,8 @@ approval webhook only when `approval.include_prompt_excerpt: true`.
   client-controllable against real AI providers — a client-sent `stream: true`
   JSON POST is detected and pinned, and OpenAI/Anthropic/Gemini-shaped backends
   do not emit tool-call streams for bodyless requests. Buffered responses and
-  reqwest-arm SSE are always governed. Shared proxy-core follow-up:
+  reqwest-arm streams are always governed — including a stream-marked
+  request's plain-JSON SSE fallback delivered on the streaming path, which
+  the inspector now attaches to regardless of the response `Content-Type`.
+  Shared proxy-core follow-up:
   [#2055](https://github.com/ferrum-edge/ferrum-edge/issues/2055).

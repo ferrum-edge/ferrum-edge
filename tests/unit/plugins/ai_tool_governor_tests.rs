@@ -5036,3 +5036,376 @@ async fn ping_field_prefixed_unlabeled_buffered_sse_is_governed() {
             .await,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 14 review fixes: stream-marked JSON-fallback inspector attach,
+// EOF-unresolved non-UTF-8 opaque semantics, CR/CRLF SSE line terminators,
+// encoded wire-size cap, framed-gRPC buffered-hook exclusion
+// ---------------------------------------------------------------------------
+
+/// A `request_transformer` can add `"stream": true` AFTER the proxy's
+/// buffer/dispatch decisions, so the backend's plain `application/json` SSE
+/// fallback rides the STREAMING path where the buffered hooks never run. The
+/// inspector must therefore attach for a stream-marked governed request
+/// regardless of the response content type: the shape sniff holds a
+/// JSON-shaped stream and governs it at EOF (denied cut, allowed released),
+/// and a real SSE body still gets normal streaming governance. Non-marked
+/// requests and framed gRPC labels never get an inspector.
+#[tokio::test]
+async fn stream_marked_json_fallback_is_governed_via_inspector() {
+    let plugin = make(streaming_config(
+        json!({ "report.read": { "action": "allow" } }),
+        "deny",
+    ));
+    let mut ctx = create_test_context();
+    ctx.metadata.insert(
+        "ai_tool_governor.stream_requested".to_string(),
+        "true".to_string(),
+    );
+
+    // Denied JSON fallback: held in full, cut at EOF, nothing leaked.
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("application/json"))
+        .expect("inspector must attach for a stream-marked request");
+    let denied = response_with_tool_call("kubectl.apply", "{}");
+    let (first, rest) = denied.split_at(denied.len() / 2);
+    let (out, terminated) = drive_stream(&mut inspector, &[first, rest]).await;
+    assert!(terminated, "denied JSON fallback must be cut");
+    assert!(
+        !String::from_utf8_lossy(&out).contains("kubectl.apply"),
+        "denied call leaked"
+    );
+
+    // Allowed JSON fallback: released unchanged at EOF.
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("application/json"))
+        .expect("inspector");
+    let allowed = response_with_tool_call("report.read", "{}");
+    let (first, rest) = allowed.split_at(allowed.len() / 2);
+    let (out, terminated) = drive_stream(&mut inspector, &[first, rest]).await;
+    assert!(!terminated, "allowed JSON fallback must not be cut");
+    assert_eq!(out, allowed, "allowed body must be released unchanged");
+
+    // A real SSE body under a stripped/absent content type on the same
+    // stream-marked request: normal streaming governance still applies.
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, None)
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[SSE_ALLOWED_TOOL_BODY.as_bytes()]).await;
+    assert!(!terminated, "allowed SSE stream must not be cut");
+    assert_eq!(out, SSE_ALLOWED_TOOL_BODY.as_bytes());
+
+    // No stream marker: ordinary non-streaming traffic gets no inspector.
+    let plain = create_test_context();
+    assert!(
+        plugin
+            .response_stream_inspector(&plain, 200, Some("application/json"))
+            .is_none(),
+        "non-stream-marked JSON responses stay on the buffered path"
+    );
+
+    // Framed gRPC stays out of scope even for a stream-marked request.
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, Some("application/grpc+json"))
+            .is_none(),
+        "framed gRPC must never get an inspector"
+    );
+}
+
+/// A stream whose shape never resolves before EOF (no colon, line terminator,
+/// or control byte) is resolved conservatively at end-of-stream: bytes that
+/// are NOT valid UTF-8 can never be classified as SSE/JSON and get Opaque
+/// semantics (cut in enforce, released in dry-run) instead of the SSE flush
+/// (where they would classify `NoData` and forward). A colon-less printable
+/// UTF-8 fragment provably contains no `data:` frame and is still released.
+#[tokio::test]
+async fn eof_unresolved_non_utf8_stream_gets_opaque_semantics() {
+    // High-bit bytes: no colon/terminator/control byte (sniff stays
+    // inconclusive), and not valid UTF-8.
+    let opaque: &[u8] = b"\x80\x81\x82\x83\xfe\xff";
+
+    let enforce = make(streaming_config(
+        json!({ "report.read": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = enforce
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[opaque]).await;
+    assert!(
+        terminated,
+        "unresolved non-UTF-8 stream must be cut at EOF in enforce"
+    );
+    assert!(
+        !out.windows(2).any(|w| w == [0x80, 0x81]),
+        "held bytes leaked"
+    );
+
+    let dry_run = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let ctx = create_test_context();
+    let mut inspector = dry_run
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[opaque]).await;
+    assert!(!terminated, "dry-run must not cut an unresolved stream");
+    assert_eq!(out, opaque, "dry-run must release the bytes unchanged");
+
+    // Colon-less printable UTF-8 with no terminator: provably no `data:`
+    // frame inside — released unchanged even in enforce.
+    let printable: &[u8] = b"printable fragment with no colon or terminator";
+    let ctx = create_test_context();
+    let mut inspector = enforce
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[printable]).await;
+    assert!(
+        !terminated,
+        "printable colon-less fragment must be released"
+    );
+    assert_eq!(out, printable);
+}
+
+/// The SSE spec allows `\r`, `\n`, or `\r\n` line terminators. A CR-only
+/// stream must parse into events (an LF-only splitter sees one unparsed line
+/// and forwards denied deltas) on BOTH the live and buffered paths.
+#[tokio::test]
+async fn cr_only_sse_denied_call_is_caught_live_and_buffered() {
+    let denied_cr = SSE_DENIED_TOOL_BODY.replace('\n', "\r");
+    let allowed_cr = SSE_ALLOWED_TOOL_BODY.replace('\n', "\r");
+
+    // Live path: denied call cut, nothing leaked.
+    let plugin = make(streaming_config(
+        json!({ "report.read": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[denied_cr.as_bytes()]).await;
+    assert!(terminated, "CR-only denied deltas must cut the stream");
+    assert!(
+        !String::from_utf8_lossy(&out).contains("kubectl.apply"),
+        "denied call leaked"
+    );
+
+    // Live path: allowed CR-only stream released byte-for-byte.
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[allowed_cr.as_bytes()]).await;
+    assert!(!terminated, "allowed CR-only stream must not be cut");
+    assert_eq!(out, allowed_cr.as_bytes());
+
+    // Buffered path (streaming inspection disabled: SSE label buffered).
+    let buffered = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_reject(
+        buffered
+            .on_response_body(&mut ctx, 200, &sse_headers(), denied_cr.as_bytes())
+            .await,
+        Some(502),
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        buffered
+            .on_response_body(&mut ctx, 200, &sse_headers(), allowed_cr.as_bytes())
+            .await,
+    );
+}
+
+/// A `\r\n` (or `\r\n\r\n` event boundary) can straddle a chunk boundary. A
+/// chunk ending in `\r` is ambiguous — lone-CR terminator or half of `\r\n` —
+/// so the live inspector must hold it until the next chunk disambiguates
+/// rather than splitting an event inside one terminator.
+#[tokio::test]
+async fn crlf_terminator_straddling_chunks_is_not_mis_split() {
+    let plugin = make(streaming_config(
+        json!({ "report.read": { "action": "allow" } }),
+        "deny",
+    ));
+
+    // Allowed CRLF stream split right after the FIRST `\r` of the boundary:
+    // passes through byte-for-byte.
+    let allowed = SSE_ALLOWED_TOOL_BODY.replace("\n\n", "\r\n\r\n");
+    let split = allowed.find("\r\n\r\n").expect("boundary") + 1;
+    let (first, rest) = allowed.as_bytes().split_at(split);
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[first, rest]).await;
+    assert!(!terminated, "allowed straddled stream must not be cut");
+    assert_eq!(out, allowed.as_bytes());
+
+    // Denied CRLF stream split between `\r` and `\n` of the SECOND
+    // terminator: still parsed as one event and caught.
+    let denied = SSE_DENIED_TOOL_BODY.replace("\n\n", "\r\n\r\n");
+    let split = denied.find("\r\n\r\n").expect("boundary") + 3;
+    let (first, rest) = denied.as_bytes().split_at(split);
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[first, rest]).await;
+    assert!(
+        terminated,
+        "straddled denied deltas must still cut the stream"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out).contains("kubectl.apply"),
+        "denied call leaked"
+    );
+}
+
+/// Wrap `data` in a gzip stream with STORED (uncompressed) deflate blocks so
+/// the wire size slightly EXCEEDS the payload — models an incompressible
+/// upstream payload whose wire bytes exceed the parse cap while the decoded
+/// JSON is within it.
+fn gzip_stored(data: &[u8]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::none());
+    encoder.write_all(data).expect("gzip write");
+    encoder.finish().expect("gzip finish")
+}
+
+/// A JSON tool-call response padded with a `padding` field to exactly
+/// `target_len` bytes.
+fn padded_tool_call_json(name: &str, target_len: usize) -> Vec<u8> {
+    let mut body = json!({
+        "model": "gpt-4o",
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": name, "arguments": "{}" }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }],
+        "padding": ""
+    });
+    let overhead = body.to_string().len();
+    body["padding"] = Value::String("x".repeat(target_len - overhead));
+    let bytes = body.to_string().into_bytes();
+    assert_eq!(bytes.len(), target_len, "padding math");
+    bytes
+}
+
+/// The 4 MiB parse cap must bound the DECODED size for an encoded body, not
+/// the compressed wire bytes: an incompressible >4 MiB-wire payload whose
+/// decoded JSON is within the cap is decoded and governed normally (allowed
+/// forwards, denied rejects), while a decoded-over-cap body still fails
+/// closed. The wire cap continues to apply to identity/plaintext bodies.
+#[tokio::test]
+async fn oversized_wire_encoded_json_within_decoded_cap_is_governed() {
+    let cap = 4 * 1024 * 1024;
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+
+    // Decoded exactly at the cap; stored-gzip wire is slightly larger.
+    let denied = padded_tool_call_json("kubectl.apply", cap);
+    let wire = gzip_stored(&denied);
+    assert!(wire.len() > cap, "test premise: wire must exceed the cap");
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &gzip_headers(), &wire)
+            .await,
+        Some(502),
+    );
+
+    let allowed = padded_tool_call_json("report.read", cap);
+    let wire = gzip_stored(&allowed);
+    assert!(wire.len() > cap, "test premise: wire must exceed the cap");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &gzip_headers(), &wire)
+            .await,
+    );
+
+    // Decoded past the cap: the decoded-size bound still fails closed.
+    let too_big = padded_tool_call_json("report.read", cap + 1);
+    let wire = gzip_stored(&too_big);
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &gzip_headers(), &wire)
+            .await,
+        Some(502),
+    );
+}
+
+/// Framed gRPC / gRPC-Web (`+json` variants included) is out of scope on the
+/// buffered response hooks: when a response is buffered for reasons outside
+/// this plugin, an oversized framed body must NOT trip the fail-closed size
+/// check via its `+json` suffix, and the redaction transform must never
+/// rewrite framed wire bytes.
+#[tokio::test]
+async fn oversized_framed_grpc_buffered_response_is_untouched() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    for ct in ["application/grpc+json", "application/grpc-web+json"] {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), ct.to_string());
+        let oversized = vec![0u8; 4 * 1024 * 1024 + 1];
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &headers, &oversized)
+                .await,
+        );
+        assert_continue(
+            plugin
+                .on_final_response_body(&mut ctx, 200, &headers, &oversized)
+                .await,
+        );
+    }
+
+    // Redaction transform: even with the governed-hash marker present, a
+    // framed gRPC label is never rewritten.
+    let redact = make(json!({
+        "default_action": "allow",
+        "tools": {
+            "deploy": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "s", "regex": "secret" }]
+            }
+        }
+    }));
+    let mut ctx = create_test_context();
+    ctx.metadata.insert(
+        "ai_tool_governor.governed_response_hash".to_string(),
+        "marker".to_string(),
+    );
+    let body = response_with_tool_call("deploy", "{\"k\":\"secret\"}");
+    let rewritten = redact
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/grpc+json"),
+            &HashMap::new(),
+        )
+        .await;
+    assert!(rewritten.is_none(), "framed gRPC must never be rewritten");
+}
