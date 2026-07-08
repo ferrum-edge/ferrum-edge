@@ -18,7 +18,9 @@
 //! - **buffered response tool calls**: `choices[].message.tool_calls[]` and the
 //!   legacy `choices[].message.function_call` on non-streaming responses.
 //! - **streaming response tool calls**: OpenAI SSE `choices[].delta.tool_calls`
-//!   deltas, accumulated across split frames; tool-call frames are HELD until
+//!   and legacy `choices[].delta.function_call` (the `functions` API's one
+//!   implicit call per choice) deltas, accumulated across split frames;
+//!   tool-call frames are HELD until
 //!   the call is complete and policy/approval clears it, then released — or the
 //!   stream is terminated with an SSE error event, never leaking the held call.
 //! - **MCP `tools/call`** and **A2A JSON-RPC methods** (optional, off by
@@ -1035,8 +1037,9 @@ impl AiToolGovernor {
     /// real provider in metadata, so prefer that over body-shape detection —
     /// otherwise an Anthropic/Gemini response reports `openai` and a
     /// provider-specific approval decision (or cache entry) is made for the
-    /// wrong provider. `ai_federation_provider` (the unique configured provider
-    /// name) is preferred over `ai_provider` (the coarse provider type) so two
+    /// wrong provider. The unique configured provider name
+    /// (`ai_federation_provider`, then `ai_stream_router.provider`) is
+    /// preferred over `ai_provider` (the coarse provider type) so two
     /// providers of the same type do not share an approval decision.
     fn resolve_response_provider(&self, ctx: &RequestContext, json: &Value) -> Option<String> {
         federation_provider(ctx)
@@ -1511,7 +1514,7 @@ impl Plugin for AiToolGovernor {
         }
         ctx.headers
             .get("content-type")
-            .is_some_and(|ct| is_json_content_type(ct))
+            .is_some_and(|ct| is_governable_json_request_content_type(ct))
     }
 
     async fn before_proxy(
@@ -1527,11 +1530,13 @@ impl Plugin for AiToolGovernor {
         if !governs_request && !detects_streaming {
             return PluginResult::Continue;
         }
-        // Mirror `should_buffer_request_body`: only JSON POST bodies are in scope.
+        // Mirror `should_buffer_request_body`: only JSON POST bodies are in
+        // scope (framed gRPC/gRPC-Web `+json` variants are wire frames, not
+        // bare JSON — out of scope, never fail-closed).
         if ctx.method != "POST"
             || !header_value(headers, "content-type")
                 .or_else(|| header_value(&ctx.headers, "content-type"))
-                .is_some_and(is_json_content_type)
+                .is_some_and(is_governable_json_request_content_type)
         {
             return PluginResult::Continue;
         }
@@ -1664,8 +1669,14 @@ impl Plugin for AiToolGovernor {
         // applying JSON body rules, so also inspect a JSON-shaped body — otherwise
         // a request initially governed as safe JSON could be transformed into a
         // denied MCP/A2A `tools/call` with the header removed and skip this
-        // re-check.
-        let json_ct = header_value(headers, "content-type").is_some_and(is_json_content_type);
+        // re-check. A framed gRPC/gRPC-Web `+json` label is NOT a JSON label
+        // (the body is length-prefixed wire frames): such a request is out of
+        // scope rather than fail-closed as unparseable, and its framed bytes
+        // never look like JSON, so the shape fallback does not re-admit it —
+        // while a transform that merely relabeled a still-JSON-shaped body is
+        // still caught by `looks_like_json`.
+        let json_ct = header_value(headers, "content-type")
+            .is_some_and(is_governable_json_request_content_type);
         if !json_ct && !looks_like_json(body) {
             return PluginResult::Continue;
         }
@@ -2167,13 +2178,25 @@ impl Plugin for AiToolGovernor {
 // Streaming inspector
 // ---------------------------------------------------------------------------
 
-/// Accumulates OpenAI streaming `choices[].delta.tool_calls` deltas into
-/// complete tool calls, keyed by `(choice_index, tool_index)` with a positional
-/// fallback when `index` is absent.
+/// Slot for one accumulating call within a choice: an indexed
+/// `delta.tool_calls[]` entry, or the single implicit call the legacy
+/// `functions` API streams as `delta.function_call`. A distinct variant (not a
+/// sentinel tool index) so a hostile `tool_calls[].index` can never collide
+/// with — and merge into — the legacy slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ToolSlot {
+    Indexed(usize),
+    LegacyFunctionCall,
+}
+
+/// Accumulates OpenAI streaming tool-call deltas — modern
+/// `choices[].delta.tool_calls` and the legacy `choices[].delta.function_call`
+/// (one implicit call per choice) — into complete tool calls, keyed by
+/// `(choice_index, slot)` with a positional fallback when `index` is absent.
 #[derive(Default)]
 struct StreamingToolCallAccumulator {
-    calls: Vec<((usize, usize), StreamingCall)>,
-    positions: HashMap<(usize, usize), usize>,
+    calls: Vec<((usize, ToolSlot), StreamingCall)>,
+    positions: HashMap<(usize, ToolSlot), usize>,
 }
 
 #[derive(Default)]
@@ -2197,43 +2220,74 @@ impl StreamingToolCallAccumulator {
                 .and_then(Value::as_u64)
                 .and_then(|v| usize::try_from(v).ok())
                 .unwrap_or(cpos);
-            let Some(tool_calls) = choice
-                .get("delta")
+            let delta = choice.get("delta");
+            if let Some(tool_calls) = delta
                 .and_then(|d| d.get("tool_calls"))
                 .and_then(Value::as_array)
-            else {
-                continue;
-            };
-            for (tpos, tc) in tool_calls.iter().enumerate() {
-                let tidx = tc
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .and_then(|v| usize::try_from(v).ok())
-                    .unwrap_or(tpos);
-                let function = tc.get("function");
-                let name = function.and_then(|f| f.get("name")).and_then(Value::as_str);
-                let args = function.and_then(|f| f.get("arguments"));
-                let args_str = args.and_then(Value::as_str);
-                // Arguments present but not a string: the bytes are not
-                // accumulated, so mark the call ungovernable rather than
-                // evaluating it as empty args.
-                let non_string_args = args.is_some() && args_str.is_none();
-                let entry = self.entry(cidx, tidx);
-                if let Some(name) = name {
-                    entry.name.push_str(name);
+            {
+                for (tpos, tc) in tool_calls.iter().enumerate() {
+                    let tidx = tc
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .and_then(|v| usize::try_from(v).ok())
+                        .unwrap_or(tpos);
+                    let function = tc.get("function");
+                    self.push_delta(
+                        cidx,
+                        ToolSlot::Indexed(tidx),
+                        function.and_then(|f| f.get("name")),
+                        function.and_then(|f| f.get("arguments")),
+                    );
                 }
-                if let Some(args_str) = args_str {
-                    entry.arguments.push_str(args_str);
-                }
-                if non_string_args {
-                    entry.non_string_args = true;
-                }
+            }
+            // Legacy `functions` API: a backend streams the single implicit
+            // call per choice as `delta.function_call` `{name, arguments}`
+            // string deltas instead of `delta.tool_calls`. Accumulate it as a
+            // governed call in its own slot so a denied legacy function call
+            // cannot stream past the hold/deny/approval path ungoverned.
+            if let Some(fc) = delta
+                .and_then(|d| d.get("function_call"))
+                .filter(|fc| !fc.is_null())
+            {
+                self.push_delta(
+                    cidx,
+                    ToolSlot::LegacyFunctionCall,
+                    fc.get("name"),
+                    fc.get("arguments"),
+                );
             }
         }
     }
 
-    fn entry(&mut self, choice: usize, tool: usize) -> &mut StreamingCall {
-        let key = (choice, tool);
+    /// Accumulate one name/arguments delta onto the `(choice, slot)` call.
+    /// A non-string name is ignored (the call stays never-named and therefore
+    /// ungovernable); arguments present but not a string mean the bytes are not
+    /// accumulated, so the call is marked ungovernable rather than evaluated
+    /// against empty args.
+    fn push_delta(
+        &mut self,
+        choice: usize,
+        slot: ToolSlot,
+        name: Option<&Value>,
+        args: Option<&Value>,
+    ) {
+        let name_str = name.and_then(Value::as_str);
+        let args_str = args.and_then(Value::as_str);
+        let non_string_args = args.is_some() && args_str.is_none();
+        let entry = self.entry(choice, slot);
+        if let Some(name) = name_str {
+            entry.name.push_str(name);
+        }
+        if let Some(args) = args_str {
+            entry.arguments.push_str(args);
+        }
+        if non_string_args {
+            entry.non_string_args = true;
+        }
+    }
+
+    fn entry(&mut self, choice: usize, slot: ToolSlot) -> &mut StreamingCall {
+        let key = (choice, slot);
         let pos = match self.positions.get(&key).copied() {
             Some(pos) => pos,
             None => {
@@ -2621,17 +2675,24 @@ fn classify_event(event: &[u8]) -> SseEvent {
     }
 }
 
+/// Whether a streaming frame carries governed call deltas: modern
+/// `choices[].delta.tool_calls`, or the legacy `functions`-API
+/// `choices[].delta.function_call`. Frames matching this are HELD until the
+/// accumulated call clears policy.
 fn frame_has_tool_calls(frame: &Value) -> bool {
     frame
         .get("choices")
         .and_then(Value::as_array)
         .is_some_and(|choices| {
             choices.iter().any(|choice| {
-                choice
-                    .get("delta")
+                let delta = choice.get("delta");
+                delta
                     .and_then(|d| d.get("tool_calls"))
                     .and_then(Value::as_array)
                     .is_some_and(|tcs| !tcs.is_empty())
+                    || delta
+                        .and_then(|d| d.get("function_call"))
+                        .is_some_and(|fc| !fc.is_null())
             })
         })
 }
@@ -2792,6 +2853,16 @@ fn is_framed_grpc_content_type(content_type: &str) -> bool {
         || crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
 }
 
+/// Whether a request `Content-Type` labels a bare JSON document this plugin
+/// governs. `application/grpc+json` / `application/grpc-web+json` carry a
+/// `+json` suffix but their bodies are length-prefixed gRPC wire frames, not a
+/// JSON document — on a mixed proxy those requests must be out of scope
+/// (mirroring the response-side framed-gRPC release), not buffered and then
+/// fail-closed as unparseable JSON.
+fn is_governable_json_request_content_type(content_type: &str) -> bool {
+    is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
+}
+
 /// Whether the request was marked as streaming: an `Accept: text/event-stream`
 /// header, a shared `ai_request_streaming` marker from an earlier plugin, or
 /// this plugin's own `stream: true` request-body detection (set in
@@ -2803,16 +2874,20 @@ fn request_is_streaming(ctx: &RequestContext) -> bool {
         || ctx.metadata.get(STREAM_REQUESTED_KEY).map(String::as_str) == Some("true")
 }
 
-/// The serving-provider name recorded by `ai_federation`. Prefer the unique
-/// configured provider name (`ai_federation_provider`) over the coarse provider
-/// type (`ai_provider`), so two providers of the same type/model/proxy are not
-/// conflated into one approval decision or cache entry.
+/// The serving-provider name an upstream AI routing plugin recorded, used for
+/// approval webhook/cache correlation. Precedence: `ai_federation_provider`
+/// (the unique `ai_federation` provider name) → `ai_stream_router.provider`
+/// (the unique `ai_stream_router` provider name) → `ai_provider` (the coarse
+/// provider type), so two configured providers of the same type/model/proxy
+/// are never conflated into one approval decision or cache entry.
 fn federation_provider(ctx: &RequestContext) -> Option<String> {
-    ctx.metadata
-        .get("ai_federation_provider")
-        .or_else(|| ctx.metadata.get("ai_provider"))
-        .filter(|p| !p.is_empty())
-        .cloned()
+    [
+        "ai_federation_provider",
+        "ai_stream_router.provider",
+        "ai_provider",
+    ]
+    .into_iter()
+    .find_map(|key| ctx.metadata.get(key).filter(|p| !p.is_empty()).cloned())
 }
 
 /// The non-identity `Content-Encoding` header value, trimmed, or `None` when

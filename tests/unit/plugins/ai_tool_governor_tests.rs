@@ -3430,3 +3430,301 @@ async fn non_2xx_json_error_body_is_not_rewritten_by_transform() {
         "non-2xx error body must not be silently modified"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 9 review fixes: legacy streaming function_call, framed gRPC requests,
+// stream-router provider correlation
+// ---------------------------------------------------------------------------
+
+/// Frames for a legacy `functions`-API stream: one implicit call per choice as
+/// `choices[].delta.function_call` `{name, arguments}` string deltas, with the
+/// arguments split across frames.
+fn legacy_function_call_stream(name_frames: &[&str], arg_frames: &[&str]) -> String {
+    let mut body = String::from(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"}}]}\n\n",
+    );
+    for name in name_frames {
+        body.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "index": 0, "delta": { "function_call": { "name": name, "arguments": "" } } }] })
+        ));
+    }
+    for args in arg_frames {
+        body.push_str(&format!(
+            "data: {}\n\n",
+            json!({ "choices": [{ "index": 0, "delta": { "function_call": { "arguments": args } } }] })
+        ));
+    }
+    body.push_str(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"function_call\"}]}\n\n",
+    );
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+/// A denied legacy `delta.function_call` stream is HELD and terminated in
+/// enforce mode: the accumulated implicit call rides the same machinery as
+/// `delta.tool_calls`, and none of the held frames leak.
+#[tokio::test]
+async fn streaming_legacy_function_call_deltas_are_held_and_denied() {
+    let plugin = make(streaming_config(
+        json!({ "rm_rf": { "action": "deny" } }),
+        "allow",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    // Name and arguments split across frames: only the reassembled call matches.
+    let body = legacy_function_call_stream(&["rm_", "rf"], &["{\"path\":\"/e", "tc\"}"]);
+    let bytes = body.as_bytes();
+    let (first, second) = bytes.split_at(bytes.len() / 2);
+    let (out, terminated) = drive_stream(&mut inspector, &[first, second]).await;
+    assert!(
+        terminated,
+        "denied legacy function call must cut the stream"
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        !text.contains("rm_"),
+        "held function_call frame leaked: {text}"
+    );
+    assert!(!text.contains("/etc"), "held arguments leaked: {text}");
+    // Clean content deltas released before the block still stream through.
+    assert!(
+        text.contains("\"content\":\"hi\""),
+        "clean frame lost: {text}"
+    );
+    assert!(
+        text.contains("ai_tool_governor_tool_blocked"),
+        "terminal SSE error event missing: {text}"
+    );
+}
+
+/// Dry-run releases the held legacy function-call frames unchanged.
+#[tokio::test]
+async fn streaming_legacy_function_call_released_in_dry_run() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "tools": { "rm_rf": { "action": "deny" } },
+        "default_action": "allow",
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    let body = legacy_function_call_stream(&["rm_rf"], &["{\"path\":\"/etc\"}"]);
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(!terminated, "dry-run must never cut the stream");
+    assert_eq!(
+        out,
+        body.as_bytes(),
+        "dry-run must release every held frame"
+    );
+}
+
+/// A legacy function call that never receives a `name` cannot be
+/// policy-checked: enforce fails closed exactly like an unnamed
+/// `delta.tool_calls` entry.
+#[tokio::test]
+async fn streaming_legacy_function_call_never_named_fails_closed() {
+    let plugin = make(streaming_config(
+        json!({ "safe": { "action": "allow" } }),
+        "allow",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    let body = legacy_function_call_stream(&[], &["{\"path\":\"/etc\"}"]);
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(
+        terminated,
+        "a never-named legacy function call is ungovernable and must fail closed"
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("/etc"), "held arguments leaked: {text}");
+}
+
+/// Streaming `redact_args` cannot rewrite held frames in place, so a matched
+/// pattern on a legacy function call fails closed like everywhere else.
+#[tokio::test]
+async fn streaming_legacy_function_call_redact_args_fails_closed() {
+    let plugin = make(streaming_config(
+        json!({
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        }),
+        "allow",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+
+    let body = legacy_function_call_stream(
+        &["filesystem.write"],
+        &["{\"token\":\"sk-STREAM", "SECRET1\"}"],
+    );
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(terminated, "streaming redact_args must fail closed");
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("sk-STREAM"), "held secret leaked: {text}");
+}
+
+/// The buffered-SSE path shares the streaming accumulator, so a fully-buffered
+/// `text/event-stream` body carrying legacy `delta.function_call` deltas is
+/// governed too: denied calls reject, allowed calls forward.
+#[tokio::test]
+async fn buffered_sse_legacy_function_call_is_governed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut sse_headers = HashMap::new();
+    sse_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+
+    let denied = legacy_function_call_stream(&["kubectl.apply"], &["{}"]);
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers, denied.as_bytes())
+            .await,
+        Some(502),
+    );
+
+    let allowed = legacy_function_call_stream(&["report.read"], &["{}"]);
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers, allowed.as_bytes())
+            .await,
+    );
+
+    // A never-named buffered legacy call is ungovernable: fail closed.
+    let unnamed = legacy_function_call_stream(&[], &["{}"]);
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers, unnamed.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// Framed gRPC / gRPC-Web request bodies (`application/grpc+json`,
+/// `application/grpc-web+json`) are length-prefixed wire frames, not bare JSON:
+/// they must be out of scope on every request-side gate — never buffered, never
+/// fail-closed as unparseable — while genuine `+json` types stay governed.
+#[tokio::test]
+async fn framed_grpc_request_content_types_are_out_of_scope() {
+    let plugin = make(mcp_config("enforce"));
+    for ct in [
+        "application/grpc",
+        "application/grpc+json",
+        "application/grpc-web+json",
+        "application/grpc-web-text+proto",
+    ] {
+        // Buffering opt-in declines framed gRPC.
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.headers
+            .insert("content-type".to_string(), ct.to_string());
+        assert!(
+            !plugin.should_buffer_request_body(&ctx),
+            "framed gRPC request must not be buffered: {ct}"
+        );
+
+        // `before_proxy` treats it as out of scope even with an opaque body
+        // another plugin buffered (previously: fail-closed as unparseable).
+        ctx.metadata
+            .insert("request_body_size_bytes".to_string(), "12".to_string());
+        let mut headers = HashMap::new();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+        // The final-body re-check does not reject framed wire bytes either.
+        let mut final_headers = HashMap::new();
+        final_headers.insert("content-type".to_string(), ct.to_string());
+        let framed: &[u8] = &[0, 0, 0, 0, 5, 1, 2, 3, 4, 5];
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &final_headers, framed)
+                .await,
+        );
+    }
+
+    // A genuine non-gRPC `+json` type is still in scope (buffered + governed).
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/vnd.api+json".to_string(),
+    );
+    assert!(plugin.should_buffer_request_body(&ctx));
+}
+
+/// With `ai_stream_router`, the uniquely-configured provider name lives in
+/// `ai_stream_router.provider`: two router providers of the same coarse type
+/// must get DISTINCT approval decisions (and cache entries), keyed by that name.
+#[tokio::test]
+async fn streaming_approval_uses_stream_router_provider_name() {
+    let server = MockServer::start().await;
+    for provider in ["openai-primary", "openai-secondary"] {
+        Mock::given(method("POST"))
+            .and(path("/approve"))
+            .and(body_string_contains(format!("\"provider\":\"{provider}\"")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 300 },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+
+    for provider in ["openai-primary", "openai-secondary"] {
+        let mut ctx = create_test_context();
+        // Same coarse type for both: without the router-provider precedence the
+        // second call would reuse the first's cached decision.
+        ctx.metadata
+            .insert("ai_provider".to_string(), "openai".to_string());
+        ctx.metadata.insert(
+            "ai_stream_router.provider".to_string(),
+            provider.to_string(),
+        );
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        let tool_frame = json!({
+            "model": "same-model",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": { "name": "deploy", "arguments": "{\"env\":\"prod\"}" }
+                    }]
+                }
+            }]
+        });
+        let finish_frame = json!({
+            "model": "same-model",
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }]
+        });
+        let body = format!("data: {tool_frame}\n\ndata: {finish_frame}\n\ndata: [DONE]\n\n");
+        let (_out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+        assert!(!terminated);
+    }
+
+    server.verify().await;
+}

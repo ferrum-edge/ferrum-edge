@@ -31,7 +31,7 @@ Each is toggled independently under `inspect`; at least one must be enabled.
 | --- | --- | --- |
 | `request_tool_definitions` | `false` | Tool definitions the client exposes to the model (`tools[].function.name`, `functions[].name`). A disallowed definition is rejected/dry-run. |
 | `response_tool_calls` | `true` | Buffered response tool calls (`choices[].message.tool_calls[]` and legacy `choices[].message.function_call`). |
-| `streaming_response_tool_calls` | `false` | OpenAI SSE `choices[].delta.tool_calls` deltas, reassembled across frames. |
+| `streaming_response_tool_calls` | `false` | OpenAI SSE `choices[].delta.tool_calls` deltas and legacy `choices[].delta.function_call` (`functions` API) deltas, reassembled across frames. |
 | `mcp_tool_calls` | `false` | MCP JSON-RPC `tools/call` request bodies (`params.name` + `params.arguments`), including calls inside JSON-RPC **batch arrays**. |
 | `a2a_methods` | `false` | A2A JSON-RPC method names (governed against the `tools` map), including batch arrays. |
 
@@ -220,7 +220,10 @@ approval webhook only when `approval.include_prompt_excerpt: true`.
   completion boundary (all tool-call-holding choices finished); content deltas
   stream through live in the meantime.
 - Request-path governance is scoped to JSON `POST` bodies (the shape OpenAI,
-  MCP, and A2A traffic uses).
+  MCP, and A2A traffic uses). Framed gRPC / gRPC-Web requests — including the
+  `application/grpc+json` / `application/grpc-web+json` variants, whose bodies
+  are length-prefixed wire frames rather than a bare JSON document — are out
+  of scope on a mixed proxy, not buffered or rejected.
 - A JSON-labelled **response** body that fails to parse is forwarded (only
   oversized responses fail closed) — rejecting every unparseable JSON response
   on a shared proxy would break unrelated routes.
