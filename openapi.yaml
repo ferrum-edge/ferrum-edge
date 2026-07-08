@@ -14094,13 +14094,13 @@ components:
     AiTranscriptAuditConfig:
       type: object
       required: [sink]
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Captures AI request/response bodies (after redaction), canonical SHA-256 hashes, model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, and ai_response_guard for enforcement. HTTP-only; gRPC capture is future work."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, and ai_response_guard for enforcement. HTTP-only; gRPC capture is future work."
       properties:
         mode:
           type: string
           enum: [metadata_only, redacted_body, full_body, hash_only]
           default: redacted_body
-          description: "metadata_only: hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: canonical hashes + envelope only."
+          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256 (a mostly-predictable payload around one secret would make an unkeyed digest an offline brute-force oracle)."
         allow_full_body:
           type: boolean
           default: false
@@ -14117,7 +14117,7 @@ components:
               default: true
             streaming_response:
               default: false
-              description: "Capture SSE response excerpts. false | true | 'sampled'. true forces every candidate request's response onto the stream-inspection path. 'sampled' tees only requests that win the sampling.rate roll (or that a request-side guardrail already flagged when always_capture_on_guardrail is set); error responses and response-side guardrail hits on un-sampled streaming requests still emit records via the log fallback, but without a response body/hash — teeing every stream to cover those late triggers would defeat sampled capture."
+              description: "Capture SSE response excerpts. false | true | 'sampled'. true forces every AI-candidate request's response onto the stream-inspection path. 'sampled' tees only requests that win the sampling.rate roll (or whose request-side guardrail fired when always_capture_on_guardrail is set — the tee decision is evaluated at dispatch time, after the request-phase guardrail plugins ran); error responses and response-side guardrail hits on un-sampled streaming requests still emit records via the log fallback, but without a response body/hash — teeing every stream to cover those late triggers would defeat sampled capture."
               oneOf:
                 - type: boolean
                 - type: string
@@ -14181,7 +14181,7 @@ components:
             hash_secret:
               type: string
               minLength: 16
-              description: "Optional key for the redacted-value HMAC. When set (min 16 chars), hashed placeholders are stable across gateway instances and restarts, so values correlate fleet-wide. When omitted, each process generates a random key at startup: placeholders still correlate within one process lifetime but never across restarts/instances, and can never be dictionary-attacked from exported records. Treat like any other secret — do not log or export it."
+              description: "Optional key for the redacted-value HMAC and the exported request/response body hashes. When set (min 16 chars), hashed placeholders and body hashes are stable across gateway instances and restarts, so values correlate fleet-wide. When omitted, each process generates a random key at startup: digests still correlate within one process lifetime but never across restarts/instances, and can never be dictionary-attacked from exported records. Treat like any other secret — do not log or export it."
         limits:
           type: object
           properties:

@@ -335,7 +335,7 @@ async fn ai_request_sets_candidate_metadata() {
         .metadata
         .get("ai_transcript_audit.request_hash")
         .expect("request hash");
-    assert_eq!(hash.len(), 64, "sha256 hex should be 64 chars");
+    assert_eq!(hash.len(), 64, "hmac-sha256 hex should be 64 chars");
     // The raw SSN must never appear in the transaction-log metadata.
     for value in ctx.metadata.values() {
         assert!(
@@ -960,7 +960,7 @@ async fn before_proxy_stages_candidate_from_prebuffered_body() {
 }
 
 #[tokio::test]
-async fn streaming_capture_marks_json_shape_before_transform_classification() {
+async fn stream_marker_only_set_for_ai_candidates() {
     let plugin = AiTranscriptAudit::new(
         &config_with_sink(
             "https://audit.example.com/x",
@@ -969,6 +969,9 @@ async fn streaming_capture_marks_json_shape_before_transform_classification() {
         loopback_http_client(),
     )
     .unwrap();
+    // A non-AI JSON POST must NOT be marked for stream capture: the marker
+    // drives forces_reqwest_dispatch, which would push ordinary JSON traffic
+    // off the native-H3 path before the body proved AI-shaped.
     let mut ctx = make_ctx();
     ctx.metadata
         .insert("request_body".to_string(), r#"{"order_id":42}"#.to_string());
@@ -981,24 +984,35 @@ async fn streaming_capture_marks_json_shape_before_transform_classification() {
         Some("false")
     );
     assert!(
-        plugin.forces_reqwest_dispatch(&ctx),
-        "stream marker must be available before dispatch decisions in case a later request transform creates an AI body"
+        !ctx.metadata
+            .contains_key("ai_transcript_audit.stream_marker"),
+        "non-AI JSON must not carry the stream-capture marker"
+    );
+    assert!(
+        !plugin.forces_reqwest_dispatch(&ctx),
+        "non-AI JSON must stay on the native-H3 dispatch path"
     );
     assert!(
         !plugin.should_buffer_response_body(&ctx),
         "non-candidate JSON should still avoid buffered-response capture"
     );
 
-    plugin
-        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
-        .await;
+    // An AI-shaped body is marked at staging time.
+    let mut ai_ctx = make_ctx();
+    ai_ctx.metadata.insert(
+        "request_body".to_string(),
+        std::str::from_utf8(ai_request_body()).unwrap().to_string(),
+    );
+    let mut ai_headers = ai_ctx.headers.clone();
+    plugin.before_proxy(&mut ai_ctx, &mut ai_headers).await;
     assert_eq!(
-        ctx.metadata
-            .get("ai_transcript_audit.candidate")
+        ai_ctx
+            .metadata
+            .get("ai_transcript_audit.stream_marker")
             .map(String::as_str),
         Some("true")
     );
-    assert!(ctx.metadata.contains_key("ai_transcript_audit.record_id"));
+    assert!(plugin.forces_reqwest_dispatch(&ai_ctx));
 }
 
 #[tokio::test]
@@ -1151,18 +1165,28 @@ async fn sampled_streaming_capture_honors_sampling_rate() {
     .unwrap();
     let headers = json_headers();
 
-    // rate 0, no guardrail: the stream must NOT be teed just because the
-    // always_capture_* defaults are on.
+    // rate 0, no guardrail: the AI candidate is marked (the marker is cheap
+    // bookkeeping) but the tee gate — evaluated at dispatch/response time —
+    // must NOT fire just because the always_capture_* defaults are on.
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
         .await;
     assert!(
-        !ctx.metadata
+        ctx.metadata
             .contains_key("ai_transcript_audit.stream_marker"),
+        "AI candidates are always marked; sampling gates the tee, not the marker"
+    );
+    assert!(
+        !plugin.forces_reqwest_dispatch(&ctx),
+        "sampled mode must honor sampling.rate for the dispatch decision"
+    );
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .is_none(),
         "sampled mode must honor sampling.rate for the tee decision"
     );
-    assert!(!plugin.forces_reqwest_dispatch(&ctx));
 
     // A request-side guardrail already fired: always_capture_on_guardrail
     // justifies the tee even for an un-sampled request.
@@ -1173,12 +1197,11 @@ async fn sampled_streaming_capture_honors_sampling_rate() {
     plugin
         .on_final_request_body_with_context(&mut guardrail_ctx, &headers, ai_request_body())
         .await;
-    assert_eq!(
-        guardrail_ctx
-            .metadata
-            .get("ai_transcript_audit.stream_marker")
-            .map(String::as_str),
-        Some("true")
+    assert!(plugin.forces_reqwest_dispatch(&guardrail_ctx));
+    assert!(
+        plugin
+            .response_stream_inspector(&guardrail_ctx, 200, Some("text/event-stream"))
+            .is_some()
     );
 }
 
@@ -2335,5 +2358,320 @@ async fn non_2xx_short_circuit_refreshes_staged_request_via_after_proxy() {
     assert!(
         excerpt.contains("[REDACTED]"),
         "record must reflect the redacted request: {excerpt}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Review round 5: keyed body hashes, request-derived metadata redaction,
+// transaction-log sampled flag, guardrail-override stream tee
+// ---------------------------------------------------------------------------
+
+/// Reference redactor sharing `secret`, used to compute expected keyed hashes.
+fn keyed_reference(secret: &str) -> PiiRedactor {
+    PiiRedactor::from_config(
+        &["ssn".to_string()],
+        &[],
+        "[REDACTED:{type}]",
+        true,
+        Some(secret),
+        "test",
+    )
+    .expect("valid redactor")
+}
+
+#[tokio::test]
+async fn body_hashes_are_keyed_hmac_not_plain_sha256() {
+    // With a configured hash_secret, the exported request/response hashes must
+    // be HMAC-SHA256 under that key — reusing the redaction-placeholder key —
+    // and never the plain SHA-256 an offline attacker could brute-force through
+    // a predictable JSON wrapper.
+    let secret = "fleet-stable-hmac-key";
+    let resp_body: &[u8] = br#"{"choices":[{"message":{"content":"hi"}}]}"#;
+    let records =
+        capture_roundtrip(json!({ "redaction": { "hash_secret": secret } }), resp_body).await;
+    assert_eq!(records.len(), 1);
+    let reference = keyed_reference(secret);
+    assert_eq!(
+        records[0]["request_hash"],
+        json!(reference.keyed_hash_hex(ai_request_body()))
+    );
+    assert_eq!(
+        records[0]["response_hash"],
+        json!(reference.keyed_hash_hex(resp_body))
+    );
+    use sha2::Digest;
+    let plain_request = hex::encode(sha2::Sha256::digest(ai_request_body()));
+    assert_ne!(
+        records[0]["request_hash"],
+        json!(plain_request),
+        "exported body hash must not be an unkeyed SHA-256 oracle"
+    );
+
+    // hash_only mode uses the same keyed digest for consistency.
+    let hash_only = capture_roundtrip(
+        json!({ "mode": "hash_only", "redaction": { "hash_secret": secret } }),
+        resp_body,
+    )
+    .await;
+    assert_eq!(hash_only.len(), 1);
+    assert_eq!(
+        hash_only[0]["request_hash"],
+        json!(reference.keyed_hash_hex(ai_request_body()))
+    );
+}
+
+#[tokio::test]
+async fn body_hashes_without_secret_use_per_process_random_key() {
+    // No hash_secret: each plugin instance derives its own random key, so the
+    // same body hashes differently across instances — proving the digest is
+    // keyed rather than a stable public SHA-256.
+    let resp_body: &[u8] = br#"{"ok":true}"#;
+    let first = capture_roundtrip(json!({}), resp_body).await;
+    let second = capture_roundtrip(json!({}), resp_body).await;
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_ne!(
+        first[0]["request_hash"], second[0]["request_hash"],
+        "per-process random key must produce instance-local hashes"
+    );
+    use sha2::Digest;
+    let plain_request = hex::encode(sha2::Sha256::digest(ai_request_body()));
+    assert_ne!(first[0]["request_hash"], json!(plain_request));
+}
+
+#[tokio::test]
+async fn stream_hash_is_incremental_keyed_hmac_over_teed_bytes() {
+    let secret = "fleet-stable-hmac-key";
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "capture": { "streaming_response": true },
+                "redaction": { "hash_secret": secret }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let chunk_a: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n";
+    let chunk_b: &[u8] = b"data: [DONE]\n\n";
+    let _ = inspector.on_chunk(chunk_a).await;
+    let _ = inspector.on_chunk(chunk_b).await;
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(
+            &ctx,
+            200,
+            &BodyOutcome::success((chunk_a.len() + chunk_b.len()) as u64),
+        )
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let mut full_stream = chunk_a.to_vec();
+    full_stream.extend_from_slice(chunk_b);
+    assert_eq!(
+        records[0]["response_hash"],
+        json!(keyed_reference(secret).keyed_hash_hex(&full_stream)),
+        "streamed hash must be the keyed HMAC over the full teed byte sequence"
+    );
+}
+
+#[tokio::test]
+async fn request_derived_model_and_tool_names_are_redacted() {
+    // `model` and tool names are copied straight from the user request body, so
+    // PII smuggled into them must not bypass redaction via the metadata side
+    // door — in redacted_body AND metadata_only modes. full_body (the explicit
+    // raw-capture opt-in) keeps the raw values.
+    let body: &[u8] = br#"{"model":"gpt-4o-ssn-123-45-6789","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"lookup-123-45-6789"}}]}"#;
+    for overrides in [json!({}), json!({ "mode": "metadata_only" })] {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let plugin = AiTranscriptAudit::new(
+            &config_with_sink(&endpoint, overrides.clone()),
+            loopback_http_client(),
+        )
+        .expect("valid config");
+        let mut ctx = make_ctx();
+        let headers = json_headers();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body)
+            .await;
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1, "overrides: {overrides}");
+        let model = records[0]["model"].as_str().expect("model");
+        assert!(
+            !model.contains("123-45-6789"),
+            "raw SSN leaked through the model field ({overrides}): {model}"
+        );
+        assert!(model.contains("[REDACTED:ssn:"), "got: {model}");
+        let tool = records[0]["tool_names"][0].as_str().expect("tool name");
+        assert!(
+            !tool.contains("123-45-6789"),
+            "raw SSN leaked through a tool name ({overrides}): {tool}"
+        );
+        assert!(tool.contains("[REDACTED:ssn:"), "got: {tool}");
+    }
+
+    // full_body keeps the raw request-derived values (deliberate opt-in).
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "mode": "full_body", "allow_full_body": true }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, body)
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["model"], "gpt-4o-ssn-123-45-6789");
+}
+
+#[tokio::test]
+async fn transaction_log_sampled_flag_carries_roll_not_emit() {
+    // rate 0 + guardrail override: the record emits, but the transaction-log
+    // `sampled` metadata must carry the losing sampling roll (matching the
+    // exported record's `sampled` field) — `sink_status` already conveys
+    // whether a record was emitted.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "sampling": { "rate": 0.0, "always_capture_on_guardrail": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    ctx.metadata
+        .insert("ai_shield_rejected".to_string(), "true".to_string());
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sampled")
+            .map(String::as_str),
+        Some("false"),
+        "transaction-log sampled flag must be the roll, not the emit decision"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("queued")
+    );
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["sampled"], false);
+    assert_eq!(records[0]["capture_reason"], "guardrail");
+}
+
+#[tokio::test]
+async fn request_guardrail_after_staging_tees_unsampled_stream() {
+    // capture.streaming_response = "sampled" with a losing roll: a request-side
+    // guardrail (ai_prompt_shield 2925 / ai_semantic_firewall 2968 /
+    // ai_request_guard 2975) fires AFTER this plugin staged at 2924 but BEFORE
+    // the proxy's dispatch decision. The tee gate is evaluated at dispatch
+    // time, so always_capture_on_guardrail still captures response evidence.
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "capture": { "streaming_response": "sampled" },
+                "sampling": { "rate": 0.0, "always_capture_on_guardrail": true }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    // Losing roll, no guardrail yet: not teed.
+    assert!(!plugin.forces_reqwest_dispatch(&ctx));
+    // A request-side guardrail publishes its marker after staging.
+    ctx.metadata
+        .insert("ai_shield_redacted".to_string(), "true".to_string());
+    assert!(
+        plugin.forces_reqwest_dispatch(&ctx),
+        "request-side guardrail hit must tee the un-sampled stream"
+    );
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("guardrail-flagged un-sampled stream must get an inspector");
+    let stream: &[u8] = b"data: {\"choices\":[{\"delta\":{\"content\":\"evidence\"}}]}\n\n";
+    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["capture_reason"], "guardrail");
+    assert!(
+        records[0]["response_hash"].is_string(),
+        "guardrail-teed stream must carry response evidence"
+    );
+    assert!(
+        records[0]["response_body"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("evidence")
+    );
+
+    // With the guardrail override disabled, the same hit must NOT tee.
+    let no_override = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "capture": { "streaming_response": "sampled" },
+                "sampling": { "rate": 0.0, "always_capture_on_guardrail": false }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx2 = make_ctx();
+    no_override
+        .on_final_request_body_with_context(&mut ctx2, &headers, ai_request_body())
+        .await;
+    ctx2.metadata
+        .insert("ai_shield_redacted".to_string(), "true".to_string());
+    assert!(!no_override.forces_reqwest_dispatch(&ctx2));
+    assert!(
+        no_override
+            .response_stream_inspector(&ctx2, 200, Some("text/event-stream"))
+            .is_none()
     );
 }

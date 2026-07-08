@@ -1,8 +1,9 @@
 //! AI transcript audit — controlled AI payload capture for compliance.
 //!
-//! Captures AI request/response payloads (after redaction), canonical hashes,
-//! model/provider, token metadata, guardrail decisions, tool names, and cache
-//! metadata, then exports them asynchronously to an HTTP collector in batches
+//! Captures AI request/response payloads (after redaction), keyed HMAC-SHA256
+//! body hashes, model/provider, token metadata, guardrail decisions, tool
+//! names, and cache metadata, then exports them asynchronously to an HTTP
+//! collector in batches
 //! via the shared [`BatchingLogger`]/[`PluginHttpClient`] framework. The proxy
 //! hot path only enqueues records non-blockingly; a background task drains the
 //! queue. Unless the operator opts into a fail-closed policy (`on_buffer_full`
@@ -39,7 +40,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tracing::warn;
 
-use super::utils::ai_pii::PiiRedactor;
+use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use super::utils::{
@@ -638,7 +639,7 @@ impl AiTranscriptAudit {
     /// entry keyed by the new `record_id`. `body` is the request body as
     /// currently known (pre-transform in `before_proxy`, final in the
     /// final-body hook fallback); callers have already checked the JSON
-    /// content-type.
+    /// content-type. Body hashes are keyed (see [`PiiRedactor::keyed_hash_hex`]).
     fn stage_candidate(&self, ctx: &mut RequestContext, body: &[u8]) {
         if body.is_empty() {
             if !flag(&ctx.metadata, MD_CANDIDATE) {
@@ -663,7 +664,11 @@ impl AiTranscriptAudit {
             .cloned()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
-        let request_hash = sha256_hex(body);
+        // Exported body hashes are keyed HMAC-SHA256 (same key as the redaction
+        // placeholders): a plain SHA-256 of a mostly-predictable body (a fixed
+        // chat JSON wrapper around one secret) would be an offline brute-force
+        // oracle for the secret in every mode, including hash_only.
+        let request_hash = self.redactor.keyed_hash_hex(body);
 
         ctx.metadata
             .insert(MD_RECORD_ID.to_string(), record_id.clone());
@@ -687,21 +692,14 @@ impl AiTranscriptAudit {
                 .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
         }
 
-        // Force the response onto the stream-inspection path when streaming
-        // capture applies to this request. In `sampled` mode, only requests
-        // that won the sampling roll — or that a request-side guardrail
-        // already flagged — are teed; response-side guardrail hits and error
-        // statuses on un-sampled requests still emit records via the `log`
-        // fallback, just without a response body/hash (teeing every stream
-        // "just in case" would defeat sampled capture entirely).
-        let stream_wanted = match self.capture.streaming {
-            StreamingCapture::Off => false,
-            StreamingCapture::On => true,
-            StreamingCapture::Sampled => {
-                sample_hit || (self.sampling.always_on_guardrail && guardrail_fired(&ctx.metadata))
-            }
-        };
-        if stream_wanted {
+        // Mark every staged AI candidate for potential stream capture. The
+        // marker alone does not force anything: `forces_reqwest_dispatch` and
+        // `response_stream_inspector` apply the `sampled`-mode tee gate
+        // (`stream_tee_wanted`) at dispatch/response time, when the request-side
+        // guardrails (2925–2975, which run after this plugin's staging at 2924)
+        // have already published their metadata. Non-AI JSON POSTs are never
+        // marked, so they stay on the native-H3 path.
+        if self.capture.streaming != StreamingCapture::Off {
             self.mark_stream_capture(ctx);
         }
 
@@ -735,12 +733,12 @@ impl AiTranscriptAudit {
     /// Refresh an already-staged candidate with the FINAL backend-visible
     /// request body (request transforms run after `before_proxy`, where the
     /// candidate was staged). No-op when the body is unchanged, so the common
-    /// no-transform path costs one SHA-256 pass.
+    /// no-transform path costs one keyed-hash pass.
     fn refresh_staged_request(&self, ctx: &mut RequestContext, body: &[u8]) {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };
-        let request_hash = sha256_hex(body);
+        let request_hash = self.redactor.keyed_hash_hex(body);
         if ctx
             .metadata
             .get(MD_REQUEST_HASH)
@@ -776,6 +774,39 @@ impl AiTranscriptAudit {
             .insert(MD_STREAM_MARKER.to_string(), "true".to_string());
         ctx.metadata
             .insert(self.stream_marker_key(), "true".to_string());
+    }
+
+    /// THIS instance's staged sampling roll, not the shared
+    /// `ai_transcript_audit.sample_hit` metadata key: a second instance of the
+    /// plugin can overwrite that key with its own roll, and each instance keys
+    /// its own `staging` map by the shared record id.
+    fn staged_sample_hit(&self, metadata: &HashMap<String, String>) -> bool {
+        let staged = metadata
+            .get(MD_RECORD_ID)
+            .and_then(|record_id| self.staging.get(record_id))
+            .map(|staging| staging.sample_hit);
+        staged.unwrap_or_else(|| flag(metadata, MD_SAMPLE_HIT))
+    }
+
+    /// Whether a marked AI candidate's stream should actually be teed. `On`
+    /// tees every marked candidate; `Sampled` tees only sampling-roll winners
+    /// plus requests a request-side guardrail flagged (evaluated here — at
+    /// dispatch/response time — because the guardrail plugins at 2925–2975 run
+    /// AFTER staging at 2924 but BEFORE the proxy's dispatch decision, so
+    /// `always_capture_on_guardrail` can still capture response evidence on an
+    /// un-sampled stream). Error statuses and response-side guardrail hits are
+    /// only known later still: on un-sampled streams those overrides emit via
+    /// the `log` fallback without a response body/hash (teeing every stream
+    /// "just in case" would defeat sampled capture entirely).
+    fn stream_tee_wanted(&self, metadata: &HashMap<String, String>) -> bool {
+        match self.capture.streaming {
+            StreamingCapture::Off => false,
+            StreamingCapture::On => true,
+            StreamingCapture::Sampled => {
+                self.staged_sample_hit(metadata)
+                    || (self.sampling.always_on_guardrail && guardrail_fired(metadata))
+            }
+        }
     }
 
     fn envelope_from_ctx(&self, ctx: &RequestContext, status: u16) -> EnvelopeOwned {
@@ -909,14 +940,33 @@ impl AiTranscriptAudit {
         let request_truncated = staging.map(|s| s.request_truncated).unwrap_or(false);
         let request_hash = staging.and_then(|s| s.request_hash.clone());
         let req_model = staging.and_then(|s| s.request_model.clone());
+        // `model` and `tool_names` are copied straight out of the user request
+        // body, so they bypass the body-excerpt redaction path. Run them through
+        // the same redactor before export in every mode except the explicit
+        // `full_body` raw-capture opt-in — a PII-bearing "model" string must not
+        // leak through the metadata side door in redacted/metadata/hash modes.
+        let redact_request_derived = self.mode != AuditMode::FullBody;
         let tool_names = if harvests {
-            staging.map(|s| s.tool_names.clone()).unwrap_or_default()
+            let tool_names = staging.map(|s| s.tool_names.clone()).unwrap_or_default();
+            if redact_request_derived {
+                tool_names
+                    .iter()
+                    .map(|name| self.redactor.redact(name))
+                    .collect()
+            } else {
+                tool_names
+            }
         } else {
             Vec::new()
         };
 
         let model = if harvests {
-            req_model.or(harvest.model)
+            let model = req_model.or(harvest.model);
+            if redact_request_derived {
+                model.map(|value| self.redactor.redact(&value))
+            } else {
+                model
+            }
         } else {
             None
         };
@@ -1024,9 +1074,9 @@ impl Plugin for AiTranscriptAudit {
         if !candidate_shape {
             return PluginResult::Continue;
         }
-        if self.capture.streaming == StreamingCapture::On {
-            self.mark_stream_capture(ctx);
-        }
+        // The stream marker is set inside `stage_candidate`, only once the body
+        // proved AI-shaped — marking every JSON POST here would push ordinary
+        // non-AI traffic off the native-H3 path via `forces_reqwest_dispatch`.
         // The prebuffered body is stored as UTF-8 metadata; JSON is UTF-8 by
         // definition, so a missing entry means the body was not prebuffered on
         // this path (or is not valid JSON anyway) — leave classification to
@@ -1153,10 +1203,11 @@ impl Plugin for AiTranscriptAudit {
             // request's *buffered* response body is not captured. That is a
             // deliberate tradeoff: buffering every JSON POST response instead
             // would re-introduce the over-buffering of ordinary non-AI traffic a
-            // prior review flagged. The transaction is still audited request-side
-            // via the `log` fallback, and streaming capture is unaffected —
-            // `streaming = true` marks every JSON-shaped POST for stream
-            // inspection in `before_proxy` regardless of AI classification.
+            // prior review flagged. The stream marker has the same pre-transform
+            // limit: only bodies that classified as AI at staging time are
+            // marked for stream inspection (proxy-core follow-up: issue #2055).
+            // The transaction is still audited request-side via the `log`
+            // fallback.
             Some("false") => false,
             _ => {
                 ctx.method == "POST"
@@ -1229,7 +1280,7 @@ impl Plugin for AiTranscriptAudit {
         }
 
         let captures_response_body = response_body_capture_allowed(self.capture, response_headers);
-        let response_hash = captures_response_body.then(|| sha256_hex(body));
+        let response_hash = captures_response_body.then(|| self.redactor.keyed_hash_hex(body));
 
         // Peek (do not consume) the staging entry to make the emit decision.
         let sample_hit = self
@@ -1247,7 +1298,11 @@ impl Plugin for AiTranscriptAudit {
             ctx.metadata
                 .insert(MD_RESPONSE_HASH.to_string(), response_hash.clone());
         }
-        ctx.metadata.insert(MD_SAMPLED.to_string(), bool_str(emit));
+        // The transaction-log `sampled` flag carries the sampling ROLL (matching
+        // the exported record's `sampled` field), not the emit decision —
+        // `sink_status` already conveys whether a record was emitted.
+        ctx.metadata
+            .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
 
         if !emit {
             // Leave the staging entry in place. A later same-phase validator
@@ -1329,6 +1384,7 @@ impl Plugin for AiTranscriptAudit {
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
         self.capture.streaming != StreamingCapture::Off
             && flag(&ctx.metadata, &self.stream_marker_key())
+            && self.stream_tee_wanted(&ctx.metadata)
     }
 
     fn response_stream_inspector(
@@ -1345,16 +1401,14 @@ impl Plugin for AiTranscriptAudit {
         if !content_type.is_some_and(is_event_stream) {
             return None;
         }
+        // In `sampled` mode the marker alone is not enough: only tee streams
+        // that won the sampling roll or that a request-side guardrail flagged
+        // (see `stream_tee_wanted`).
+        if !self.stream_tee_wanted(&ctx.metadata) {
+            return None;
+        }
         let record_id = ctx.metadata.get(MD_RECORD_ID)?.clone();
-        // Read THIS instance's staged sampling roll, not the shared
-        // `ai_transcript_audit.sample_hit` metadata key: a second instance of the
-        // plugin can overwrite that key with its own roll, and each instance keys
-        // its own `staging` map by the shared record id.
-        let sample_hit = self
-            .staging
-            .get(&record_id)
-            .map(|staging| staging.sample_hit)
-            .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
+        let sample_hit = self.staged_sample_hit(&ctx.metadata);
         // 2xx SSE is the normal capture path. A non-2xx SSE is teed too when the
         // record will emit anyway — either `always_capture_on_error` is set, or
         // this request won the sampling roll (`emit_decision` emits on `sampled`
@@ -1376,11 +1430,11 @@ impl Plugin for AiTranscriptAudit {
             record_id,
             slot,
             pending_streams: Arc::clone(&self.pending_streams),
+            hasher: self.redactor.keyed_hasher(),
             redactor: Arc::clone(&self.redactor),
             mode: self.mode,
             max_bytes: self.limits.max_stream_capture_bytes,
             accumulated: Vec::new(),
-            hasher: Sha256::new(),
             truncated: false,
             registered: false,
         }))
@@ -1499,7 +1553,8 @@ impl Plugin for AiTranscriptAudit {
 }
 
 /// Tees streaming (SSE) response bytes into a bounded accumulator while
-/// forwarding every chunk unchanged, and hashes the full stream.
+/// forwarding every chunk unchanged, and hashes the full stream incrementally
+/// with the redactor's keyed HMAC (same key as the buffered body hashes).
 struct AuditStreamInspector {
     record_id: String,
     slot: Arc<StreamSlot>,
@@ -1508,7 +1563,7 @@ struct AuditStreamInspector {
     mode: AuditMode,
     max_bytes: usize,
     accumulated: Vec<u8>,
-    hasher: Sha256,
+    hasher: KeyedBodyHasher,
     truncated: bool,
     registered: bool,
 }
@@ -1544,8 +1599,8 @@ impl ResponseStreamInspector for AuditStreamInspector {
 
     async fn on_end(&mut self) -> ResponseStreamAction {
         self.ensure_registered();
-        let digest = std::mem::replace(&mut self.hasher, Sha256::new()).finalize();
-        let response_hash = hex::encode(digest);
+        let response_hash =
+            std::mem::replace(&mut self.hasher, self.redactor.keyed_hasher()).finalize_hex();
         // A cap-truncated redacted stream can cut through an unbounded secret or
         // a custom pattern, leaving only a raw prefix that no regex can match.
         // Omit the excerpt rather than exporting a boundary fragment. Full-body
@@ -1892,10 +1947,6 @@ fn is_event_stream(content_type: &str) -> bool {
 fn is_framed_grpc(content_type: &str) -> bool {
     crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
         || super::grpc_web::is_grpc_web_content_type(content_type)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
 }
 
 /// Uniform value in `[0, 1)` derived from a record id, so the same request rolls

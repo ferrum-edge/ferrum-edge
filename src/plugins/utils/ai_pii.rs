@@ -148,6 +148,25 @@ impl PiiRedactor {
         })
     }
 
+    /// Keyed HMAC-SHA256 hex digest of `bytes`, using the same key as the
+    /// redacted-value placeholders (`hash_secret` when configured, else the
+    /// per-process random key). Exported body hashes must be keyed for the same
+    /// reason placeholder digests are: a plain SHA-256 of a mostly-predictable
+    /// payload (a fixed JSON wrapper around one secret) is an offline
+    /// brute-force oracle for the secret.
+    pub fn keyed_hash_hex(&self, bytes: &[u8]) -> String {
+        let mut mac = self.hash_mac.clone();
+        mac.update(bytes);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// A fresh incremental hasher sharing the same key as
+    /// [`keyed_hash_hex`](Self::keyed_hash_hex), for hashing streamed bodies
+    /// chunk-by-chunk without buffering them.
+    pub fn keyed_hasher(&self) -> KeyedBodyHasher {
+        KeyedBodyHasher(self.hash_mac.clone())
+    }
+
     /// Redact every PII span in `text`. Returns the input unchanged when nothing
     /// matches, so the common no-PII path is a single `RegexSet` scan.
     pub fn redact(&self, text: &str) -> String {
@@ -182,6 +201,20 @@ impl PiiRedactor {
         }
 
         result
+    }
+}
+
+/// Incremental keyed HMAC-SHA256 hasher over a streamed body (see
+/// [`PiiRedactor::keyed_hasher`]). Consumed by `finalize_hex`.
+pub struct KeyedBodyHasher(HmacSha256);
+
+impl KeyedBodyHasher {
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    pub fn finalize_hex(self) -> String {
+        hex::encode(self.0.finalize().into_bytes())
     }
 }
 
