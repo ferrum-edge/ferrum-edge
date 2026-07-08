@@ -79,6 +79,7 @@ const PLUGIN_NAMES_UNDER_TEST: &[&str] = &[
     "ai_semantic_cache",
     "ai_semantic_firewall",
     "ai_tool_governor",
+    "ai_transcript_audit",
     "ai_federation",
     "ai_stream_router",
     "mcp_gateway",
@@ -1541,6 +1542,9 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
         }),
         "ai_tool_governor" => json!({
             "tools": { "github.create_pr": { "action": "allow" } }
+        }),
+        "ai_transcript_audit" => json!({
+            "sink": {"endpoint_url": "http://localhost:9200/audit"}
         }),
         "ai_federation" => {
             json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})

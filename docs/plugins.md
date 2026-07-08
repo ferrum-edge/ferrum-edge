@@ -3288,7 +3288,7 @@ config:
 
 ## AI / LLM Plugins
 
-Eight plugins purpose-built for AI/LLM API gateway use cases. Response-parsing AI plugins auto-detect common provider JSON structures, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock** where applicable.
+Nine plugins purpose-built for AI/LLM API gateway use cases. Response-parsing AI plugins auto-detect common provider JSON structures, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock** where applicable.
 
 ### Upgrade notes (breaking config validation changes)
 
@@ -3306,6 +3306,68 @@ Validation follows the same per-mode tolerance model as other file-dependent con
 - **File mode** — fatal at startup. The gateway refuses to start.
 - **Database mode** — warnings are logged, but the gateway keeps serving with the previous valid config.
 - **DP mode** — the config update from the CP is rejected and the DP continues with its previously applied config.
+
+### `ai_transcript_audit`
+
+Controlled AI payload capture for compliance review, incident response, customer-support debugging, and offline evaluation datasets. It captures the AI request and response (after redaction), keyed HMAC-SHA256 body hashes, model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. It complements the transaction-logging plugins (which summarize metadata/metrics); this plugin is for controlled *payload* capture with redaction, hashing, sampling, size caps, and retention boundaries.
+
+**Not a security boundary by itself.** `ai_transcript_audit` observes and redacts — it does not enforce. Combine it with `ai_prompt_shield`, `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in `ai_semantic_firewall`. It reads the guardrail/model/token metadata those plugins publish into `ctx.metadata` and folds it into each record.
+
+**Placement.** Priority `2924` (`AI_TRANSCRIPT_AUDIT`): before `ai_prompt_shield` (2925), `ai_semantic_firewall` (2968), and `ai_request_guard` (2975) so guardrail-rejected prompts can still be staged for `always_capture_on_guardrail`; final request-body refresh runs after downstream redaction/transforms for traffic that continues. It remains before `ai_semantic_cache` (2980) / `ai_stream_router` (2984) / `ai_federation` (4060) so cache hits, streamed requests, and federated requests remain observable. HTTP-family only (`HTTP_ONLY_PROTOCOLS`); gRPC payload capture is future work.
+
+**Capture modes** (`mode`):
+
+- `metadata_only` — hashes, sizes, model/provider, token and guardrail metadata; no body.
+- `redacted_body` (default) — capped, PII-redacted request/response excerpts.
+- `full_body` — capped **unredacted** excerpts. Requires `allow_full_body: true`; construction fails otherwise so raw capture is never enabled accidentally.
+- `hash_only` — keyed body hashes plus the record envelope only (no harvested model/token/guardrail metadata).
+
+**Body hashes are keyed.** The exported `request_hash` / `response_hash` (including the incrementally-hashed streaming tee) are **keyed HMAC-SHA256** digests in every mode, never plain SHA-256 — most AI payloads are a predictable JSON wrapper around a small secret, so an unkeyed digest would be an offline brute-force oracle. They share the redaction-placeholder key: set `redaction.hash_secret` for hashes that are stable fleet-wide, or omit it to use a process-wide random key shared by every instance and surviving config reloads (hashes correlate within one process lifetime but can never be dictionary-attacked from the exported records).
+
+**Redaction.** Built-in PII patterns are shared with `ai_prompt_shield` / `ai_response_guard` (`ssn`, `credit_card`, `email`, `phone_us`, `api_key`, `aws_key`, `ip_address`, `iban`) via `plugins/utils/ai_pii.rs`, plus `custom_patterns`. In `redacted_body` and `metadata_only` modes the pattern set must not be empty — `builtins: []` with no `custom_patterns` is rejected at construction, since a pass-through redactor would export unredacted data (body excerpts in `redacted_body`; the request-derived `model`/`tool_names` in both) without the `full_body` opt-in. `hash_only` exports no request-derived strings and is exempt. With `hash_redacted_values: true` (default), a match is replaced with `[REDACTED:<type>:<hmac-prefix>]` so identical values stay correlatable without the raw value ever being stored. The digest is a **keyed HMAC-SHA256**, never a plain hash (SSNs, phone numbers, and card numbers are small enough value spaces to brute-force offline from an unsalted digest): set `redaction.hash_secret` (min 16 chars) for placeholders that are stable fleet-wide, or omit it to use a process-wide random key shared by every redactor built without a secret — including across config reloads and multiple plugin instances (correlatable within one process lifetime, never dictionary-attackable from the exported records). Redaction runs over the **full** buffered payload before the excerpt is capped, so a sensitive value straddling a `max_request_bytes`/`max_response_bytes` boundary cannot leak as a raw prefix; cap-truncated stream captures drop a pattern-sized tail before redaction for the same reason. Request-derived record fields that bypass the body-excerpt path — the exported `model` and `tool_names` — are passed through the same redactor in every mode except `full_body`, so PII smuggled into those strings cannot leak through the metadata side door. Harvested `ctx.metadata` values are additionally passed through the transaction-log redaction predicate. This plugin never defeats upstream prompt/response redaction — it captures the already-redacted client-visible body.
+
+**What is captured.** Only likely-AI JSON is narrowed in: request bodies are inspected only for `POST` + `application/json` and must look like an LLM call (OpenAI/Anthropic/Gemini/Cohere-shaped markers, mirroring `ai_rate_limiter`). The candidate is classified and staged in `before_proxy` over the prebuffered request body — before terminate-and-respond plugins (`ai_federation`, `ai_semantic_cache` hits) can consume the transaction, and before the proxy makes its response buffering and backend dispatch decisions — then refreshed with the final backend-visible body after request transforms run. Buffered JSON responses are captured via `on_final_response_body`; SSE responses are captured with a streaming tee (`response_stream_inspector`) up to `max_stream_capture_bytes`, forwarding bytes unchanged and emitting the record at stream termination (so response-side guardrail metadata is included; abnormally-terminated streams emit a truncated, body-omitted record). In `redacted_body` mode, SSE captures whose frames are all parseable OpenAI `chat.completion.chunk` frames export a **reassembled** excerpt, not the raw frames: the `choices[].delta.content` fragments are concatenated per choice index in frame order and redaction runs over the full reassembled completion text, so PII split across streaming deltas cannot evade the per-frame regexes. The excerpt is annotated as `{"sse_reassembled": true, "object": "chat.completion.chunk", "completion_text": {"<choice>": "…"}}`. Non-2xx SSE responses are teed too when `always_capture_on_error` is set, so error transactions carry response evidence.
+
+**Sampling.** `sampling.rate` (0.0–1.0) is the fraction of eligible AI transactions emitted as full records; `always_capture_on_guardrail` / `always_capture_on_error` override the roll so guardrail trips and error responses are always captured. `max_records_per_minute` caps sink volume (0 = unlimited); over the cap, records are dropped and never reject traffic. With `capture.streaming_response: "sampled"`, only requests that win the sampling roll — or whose **request-side** guardrail fired (`ai_prompt_shield`, `ai_semantic_firewall`, `ai_request_guard`) when `always_capture_on_guardrail` is set — are teed onto the stream-inspection path; the tee decision is evaluated at dispatch time, after those guardrails ran, so an un-sampled request a guardrail flagged still captures response evidence. Error statuses and **response-side** guardrail hits are only known after that decision, so on un-sampled streaming requests those overrides still emit a record via the log fallback, just without a response body/hash. Buffered responses are unaffected: their overrides always capture the body.
+
+**Async HTTP sink.** Records batch through the shared `BatchingLogger` + `PluginHttpClient` framework: a bounded queue, batch-by-size/interval, and retry on transient (5xx/408/429) failures. The `endpoint_url` is SSRF-screened against the backend egress policy (literal IPs at construction, resolved hostnames at send time), matching every other logger sink. `sink.custom_headers` values support `${ENV_VAR}` expansion resolved lazily at send time, so a token is referenced by env and never stored in config:
+
+```yaml
+plugin_name: ai_transcript_audit
+config:
+  mode: redacted_body
+  capture: { request: true, response: true, streaming_response: sampled, tool_calls: true }
+  sampling: { rate: 0.10, always_capture_on_guardrail: true, always_capture_on_error: true, max_records_per_minute: 1000 }
+  redaction:
+    builtins: [ssn, credit_card, email, phone_us, api_key, aws_key, iban]
+    custom_patterns: [{ name: internal_customer_id, regex: "CUST-[0-9]{8}" }]
+    hash_redacted_values: true
+    # hash_secret: "fleet-stable-hmac-key-min-16-chars"  # optional; omit for a per-process random key
+  limits: { max_request_bytes: 65536, max_response_bytes: 65536, max_stream_capture_bytes: 65536 }
+  sink:
+    type: http
+    endpoint_url: https://audit.internal.example.com/ferrum/ai-transcripts
+    custom_headers: { Authorization: "Bearer ${AUDIT_TOKEN}" }
+    batch_size: 50
+    flush_interval_ms: 1000
+    buffer_capacity: 10000
+    max_retries: 3
+    on_buffer_full: drop   # drop | reject (reject fails buffered-response requests 503 when the queue is full)
+    on_sink_error: warn    # warn | reject (reject fails buffered-response requests 503 while the sink is unhealthy)
+  privacy: { include_consumer_username: true, include_client_ip: false, include_raw_headers: false }
+```
+
+**Never blocks by default.** Enqueue is non-blocking; a full buffer or a failing sink drops records (warned) unless the operator opts into `on_buffer_full: reject` / `on_sink_error: reject`, which fail **buffered-response** requests with `503` (a response already being streamed cannot be rejected). Under `on_sink_error: reject`, **any** non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired sink token) whose batch is discarded rather than retried, so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, so a successful batch send automatically restores sink health and stops the rejects. **Safe defaults:** `redacted_body`, no raw headers, no client IP, 64 KiB body caps.
+
+**Transaction-log metadata.** The plugin also emits small correlation fields onto the normal transaction logs: `ai_transcript_audit.record_id`, `ai_transcript_audit.request_hash`, `ai_transcript_audit.response_hash` (both keyed HMAC-SHA256, matching the exported record), `ai_transcript_audit.sampled` (the sampling roll, matching the record's `sampled` field — whether a record was emitted is conveyed by `sink_status`; written at staging time, so request-only configs and streamed responses carry it too), and `ai_transcript_audit.sink_status` (`queued` | `dropped` | `deferred` | `rejected`). `deferred` is non-terminal: no record was emitted at buffered-response time (unsampled, no override), but staging is retained so a record may still be emitted through the `log` fallback if a later validator turns the response into an error — correlate by `record_id` against the collector. Response-phase fields are emitted for buffered responses; streamed responses carry the request-phase fields.
+
+**Limitations.**
+
+- *Emission point vs later validators.* A **sampled** buffered record is emitted in `on_final_response_body` at priority `2924` — the only point that carries the response body and can honor `on_sink_error: reject`. A later final-body validator (`body_validator` `2950`, `openapi_validator` `2960`) that replaces the response afterward is not reflected in that record: it exports the backend status/body, not the client-visible rejection. The transaction log's `response_status_code` *is* client-visible and carries `ai_transcript_audit.record_id`, so collectors can join the two and detect the skew; an **unsampled** transaction that a later validator turns into an error is still captured via `always_capture_on_error` through the `log` fallback (final status, no response body). Proxy-core follow-up: [#2056](https://github.com/ferrum-edge/ferrum-edge/issues/2056).
+- *Pre-transform classification.* AI-candidate detection and the `stream: true` marker are read from the pre-transform request body, because the proxy's buffer-vs-stream and backend-dispatch decisions run before request-body transforms. A `request_transformer` that adds or removes `stream` afterward cannot change those decisions; in particular, transformer-added `stream: true` on an HTTP/3-classified backend streams without the capture tee (the tee is wired on the reqwest dispatch arm). Shared proxy-core follow-up: [#2055](https://github.com/ferrum-edge/ferrum-edge/issues/2055).
+- *Stream-request error bodies.* A `stream: true` request answered with a non-SSE JSON `4xx`/`5xx` is deliberately not buffered — forcing a buffer to catch that body would also buffer the common SSE success case, which under retry (buffered→stream downgrade disabled) would cap and fail large streams. The record still captures the request side, the final status, and the error `capture_reason`; only the response body/hash are absent.
+- *Non-OpenAI SSE captures stay per-frame.* The reassembled-excerpt path only applies when every captured `data:` frame parses as an OpenAI `chat.completion.chunk`. Other SSE shapes (Anthropic events, providers that omit `object`, tool-call-only streams with no `delta.content`, unparseable frames) keep the raw-frame excerpt with per-frame redaction, so PII split across such frames' fragments can still evade the regexes there — a value-level residual, since the keyed hash and metadata are unaffected.
+- *Multiple instances share transaction-log keys.* With more than one `ai_transcript_audit` instance on the same proxy, the `ai_transcript_audit.*` transaction-log correlation fields reflect a single instance (the last writer wins); each instance's exported records remain correct and complete. Use one instance per proxy when transaction-log correlation matters.
 
 ### `ai_federation`
 
@@ -3489,7 +3551,7 @@ plugins:
 Use this only when the normal backend has equivalent authentication, model allow-listing, rate limits, prompt/body validation, and logging. Otherwise a request with an uninspectable body, no valid `model`, or an unsupported `model` can avoid the federated provider path entirely.
 
 **Cross-plugin synergy:** Works with all other AI plugins on the same proxy:
-- `ai_prompt_shield` (2925) scans/redacts PII before federation
+- `ai_transcript_audit` (2924) stages transcript capture before guardrails; `ai_prompt_shield` (2925) scans/redacts PII before federation
 - `ai_semantic_firewall` (2968) blocks semantic prompt injection, exfiltration, tool-abuse, and topic-policy violations before semantic cache or federation
 - `ai_request_guard` (2975) validates model, tokens, temperature before federation
 - `ai_prompt_compressor` (4055) shortens plaintext prompt metadata for compatible direct dispatchers and compresses the standard backend-dispatch body after request decompression
@@ -4163,7 +4225,7 @@ config:
 
 ### AI Plugin Composition Example
 
-A typical AI gateway proxy combining all eight AI plugins with `ai_federation` for multi-provider routing:
+A typical AI gateway proxy combining the AI plugins with `ai_federation` for multi-provider routing:
 
 ```yaml
 # Proxy config — ai_federation handles provider routing, so backend_host is unused

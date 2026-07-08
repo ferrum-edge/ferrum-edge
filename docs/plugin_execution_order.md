@@ -240,7 +240,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Tracing, IDs, preflight, and request short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `mesh_outbound_registry` (130), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275), `spiffe_identity` (940) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `oauth2_introspection` (1050), `oidc_relying_party` (1075), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
-| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `adaptive_concurrency` (2090), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_semantic_firewall` (2968), `ai_request_guard` (2975), `ai_tool_governor` (2978), `ai_semantic_cache` (2980), `ai_stream_router` (2984), `mcp_gateway` (2992), `a2a_gateway` (2993), `mesh_route_dispatch` (2995) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `adaptive_concurrency` (2090), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_transcript_audit` (2924), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_semantic_firewall` (2968), `ai_request_guard` (2975), `ai_tool_governor` (2978), `ai_semantic_cache` (2980), `ai_stream_router` (2984), `mcp_gateway` (2992), `a2a_gateway` (2993), `mesh_route_dispatch` (2995) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `request_mirror` (3075), `load_testing` (3080), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, security headers, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_prompt_compressor` (4055), `ai_federation` (4060), `ai_response_guard` (4075), `security_headers` (4080), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
@@ -299,51 +299,52 @@ Given all built-in plugins enabled, the execution order is:
 | 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
 | 34 | `ws_rate_limiting` | 2910 | on_ws_frame |
 | 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
-| 36 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
-| 37 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
-| 38 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
-| 39 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
-| 40 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, on_final_response_body |
-| 41 | `ai_semantic_firewall` | 2968 | before_proxy, on_response_body |
-| 42 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 43 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
-| 44 | `ai_semantic_cache` | 2980 | before_proxy, after_proxy, on_final_response_body |
-| 45 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, response_stream_inspector |
-| 46 | `mcp_gateway` | 2992 | before_proxy, transform_request_body |
-| 47 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body |
-| 48 | `mesh_route_dispatch` | 2995 | before_proxy |
-| 49 | `request_transformer` | 3000 | before_proxy, transform_request_body |
-| 50 | `serverless_function` | 3025 | before_proxy |
-| 51 | `response_mock` | 3030 | before_proxy |
-| 52 | `grpc_deadline` | 3050 | before_proxy |
-| 53 | `request_mirror` | 3075 | before_proxy |
-| 54 | `load_testing` | 3080 | before_proxy |
-| 55 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
-| 56 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
-| 57 | `response_transformer` | 4000 | after_proxy, transform_response_body |
-| 58 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
-| 59 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body |
-| 60 | `ai_federation` | 4060 | before_proxy |
-| 61 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
-| 62 | `security_headers` | 4080 | after_proxy |
-| 63 | `ai_token_metrics` | 4100 | on_response_body |
-| 64 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
-| 65 | `stdout_logging` | 9000 | log, on_stream_disconnect |
-| 66 | `ws_frame_logging` | 9050 | on_ws_frame |
-| 67 | `statsd_logging` | 9075 | log, on_stream_disconnect |
-| 68 | `http_logging` | 9100 | log, on_stream_disconnect |
-| 69 | `tcp_logging` | 9125 | log, on_stream_disconnect |
-| 70 | `kafka_logging` | 9150 | log, on_stream_disconnect |
-| 71 | `loki_logging` | 9155 | log, on_stream_disconnect |
-| 72 | `udp_logging` | 9160 | log, on_stream_disconnect |
-| 73 | `ws_logging` | 9175 | log, on_stream_disconnect |
-| 74 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
-| 75 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
-| 76 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
-| 77 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
-| 78 | `api_chargeback_sink` | 9351 | log, on_stream_disconnect, on_ws_disconnect |
-| 79 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
-| 80 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
+| 36 | `ai_transcript_audit` | 2924 | before_proxy, on_final_request_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated, log |
+| 37 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body |
+| 38 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
+| 39 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
+| 40 | `body_validator` | 2950 | before_proxy, on_final_request_body, on_final_response_body |
+| 41 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, on_final_response_body |
+| 42 | `ai_semantic_firewall` | 2968 | before_proxy, on_response_body |
+| 43 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
+| 44 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
+| 45 | `ai_semantic_cache` | 2980 | before_proxy, after_proxy, on_final_response_body |
+| 46 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, response_stream_inspector |
+| 47 | `mcp_gateway` | 2992 | before_proxy, transform_request_body |
+| 48 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body |
+| 49 | `mesh_route_dispatch` | 2995 | before_proxy |
+| 50 | `request_transformer` | 3000 | before_proxy, transform_request_body |
+| 51 | `serverless_function` | 3025 | before_proxy |
+| 52 | `response_mock` | 3030 | before_proxy |
+| 53 | `grpc_deadline` | 3050 | before_proxy |
+| 54 | `request_mirror` | 3075 | before_proxy |
+| 55 | `load_testing` | 3080 | before_proxy |
+| 56 | `response_size_limiting` | 3490 | after_proxy, on_final_response_body |
+| 57 | `response_caching` | 3500 | before_proxy, after_proxy, on_final_response_body |
+| 58 | `response_transformer` | 4000 | after_proxy, transform_response_body |
+| 59 | `compression` | 4050 | before_proxy, after_proxy, transform_request_body, transform_response_body |
+| 60 | `ai_prompt_compressor` | 4055 | before_proxy, transform_request_body |
+| 61 | `ai_federation` | 4060 | before_proxy |
+| 62 | `ai_response_guard` | 4075 | on_response_body, transform_response_body |
+| 63 | `security_headers` | 4080 | after_proxy |
+| 64 | `ai_token_metrics` | 4100 | on_response_body |
+| 65 | `ai_rate_limiter` | 4200 | before_proxy, after_proxy, on_response_body |
+| 66 | `stdout_logging` | 9000 | log, on_stream_disconnect |
+| 67 | `ws_frame_logging` | 9050 | on_ws_frame |
+| 68 | `statsd_logging` | 9075 | log, on_stream_disconnect |
+| 69 | `http_logging` | 9100 | log, on_stream_disconnect |
+| 70 | `tcp_logging` | 9125 | log, on_stream_disconnect |
+| 71 | `kafka_logging` | 9150 | log, on_stream_disconnect |
+| 72 | `loki_logging` | 9155 | log, on_stream_disconnect |
+| 73 | `udp_logging` | 9160 | log, on_stream_disconnect |
+| 74 | `ws_logging` | 9175 | log, on_stream_disconnect |
+| 75 | `transaction_debugger` | 9200 | on_request_received, after_proxy, log, on_stream_disconnect |
+| 76 | `proxy_alerts` | 9250 | log, on_stream_disconnect, on_ws_disconnect |
+| 77 | `prometheus_metrics` | 9300 | log, on_stream_disconnect |
+| 78 | `api_chargeback` | 9350 | log, on_stream_disconnect, on_ws_disconnect |
+| 79 | `api_chargeback_sink` | 9351 | log, on_stream_disconnect, on_ws_disconnect |
+| 80 | `workload_metrics` | 9360 | before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
+| 81 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
 
 ## Why This Order Matters
 
@@ -400,18 +401,21 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 
 `openapi_validator` runs after the generic `body_validator` so explicit per-proxy body checks can fail first, then the generated OpenAPI contract can enforce operation-specific schemas. It runs before AI request policy and request transformation, which means contract mismatches are caught before the request body is reshaped or sent to an upstream.
 
-### AI Plugins: PII shield → semantic firewall → guard → tool governor → prompt compressor → federation → metrics → rate limiter (2925–4200)
+### AI Plugins: audit → PII shield → semantic firewall → guard → tool governor → routing → metrics → rate limiter (2924–4200)
 
 The AI plugins are ordered to compose correctly:
 
-1. **`ai_prompt_shield` (2925)** runs first in the pre-proxy body flow — PII must be detected/redacted before the request reaches the backend or later body validators. It sits right after `rate_limiting` so brute-force protection applies first. `waf` request metadata checks have already run in `authorize`; WAF request-body checks run on the final backend-visible body after request body transforms.
-2. **`ai_semantic_firewall` (2968)** runs after body/OpenAPI validation and before request guard, semantic cache, and federation — semantically dangerous prompts, RAG content, tool calls, and responses are evaluated before they can reach semantic cache or a federated provider.
-3. **`ai_request_guard` (2975)** runs after semantic firewall — it validates model names, max_tokens, message counts, and temperature. If earlier plugins rejected or redacted the request, the guard validates the accepted backend-visible version.
-4. **`ai_tool_governor` (2978)** runs after the request guard and before semantic cache and federation — it applies deterministic allow/deny/approval policy to concrete tool/function calls by name, arguments, JSON Schema, regex, identity, and an optional approval webhook. A disallowed tool schema in the request `tools[]`, a dangerous tool call in `choices[].message.tool_calls[]`, or a streamed SSE tool-call delta is screened before it reaches the client, semantic cache, or a federated provider. It complements `ai_semantic_firewall` (which catches intent); this plugin is purely deterministic (names, args, schema, regex, identity, approval). Because `request_transformer` (3000) and `response_transformer` (4000) run after the initial `before_proxy`/`on_response_body` inspection, the governor re-runs its deterministic request policy on the final backend-visible body (`on_final_request_body`) and its response policy on the final client-visible body (`on_final_response_body`), so a transform that rewrites an allowed body into a denied `tools/call` or injects a denied `choices[].message.tool_calls[]` is still fail-closed before dispatch or delivery.
-5. **`ai_prompt_compressor` (4055)** runs after the guard, semantic cache, and `compression` request decompression. It shortens prompt text (`messages[].content` for the configured roles, plus the legacy top-level `prompt`) on the standard backend-dispatch path, including uploads that become plaintext after opt-in request decompression. It rewrites `ctx.metadata["request_body"]` in `before_proxy` for already-plaintext JSON bodies and re-derives the wire body in `transform_request_body`; code, URLs, numbers, identifiers, and negations are preserved verbatim. Direct `ai_federation` dispatch can consume the metadata rewrite for plaintext uploads, but compressed client uploads require the standard backend-dispatch path because federation returns before request-body transforms run.
-6. **`ai_federation` (4060)** runs after the guard and prompt compressor — it translates the OpenAI-format request to the matched provider's native format, calls the provider, normalizes non-streaming responses back to OpenAI format, and returns via `RejectBinary`. Matched requests with `"stream": true` are rejected with `501` — unless `ai_stream_router` (2984) already claimed the streaming request (it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`, and `ai_federation` immediately continues, see below). `ai_federation` itself has no provider SSE normalization path. Successful synthetic federation responses are passed through the response-side body hooks before the client receives them — when the normal response-body-buffering capability gate is satisfied, `ai_semantic_firewall`, `ai_response_guard`, response transforms, and final-response hooks still apply over the synthetic 2xx body. (`ai_token_metrics` is the deliberate exception: its `on_response_body` returns early for synthetic short-circuit bodies via the `ferrum:synthetic_short_circuit` marker, so it does not re-parse them — `ai_federation` writes the token metadata directly instead, as described next, keeping accounting correct.) The plugin writes token metadata (`ai_total_tokens`, `ai_prompt_tokens`, `ai_completion_tokens`, `ai_model`, `ai_provider`) directly into `ctx.metadata` using the same keys as `ai_token_metrics`, so federation token accounting works even when no buffering plugin causes `on_response_body` to run.
-7. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses the LLM response body to extract token usage (prompt, completion, total, model) and writes it to `ctx.metadata`. This metadata flows into `TransactionSummary` for all downstream logging plugins. It is observability-only and never enforces budget policy. When `ai_federation` is active, `ai_federation` writes the same metadata keys directly (so accounting is correct even if the synthetic-body hooks are skipped), and `ai_rate_limiter` reconciles usage from that metadata on the rejection path.
-8. **`ai_rate_limiter` (4200)** reserves estimated token usage before proxying JSON `POST` requests, based on output-token caps plus estimated prompt tokens. It runs after `ai_token_metrics` on the response body path, reconciles the reservation to actual usage when usage metadata is available, and keeps/rejects/releases unmetered 2xx responses according to `on_unmetered_response`. Synthetic short-circuit bodies (cache/dedup/mock/etc.) are never charged or released — the limiter exempts them via the internal `ferrum:synthetic_short_circuit` marker. When `ai_federation` is active, the rate limiter uses `applies_after_proxy_on_reject()` to reconcile token usage from federation metadata on the rejection path (the sole federation charger, scoped per limiter instance).
+1. **`ai_transcript_audit` (2924)** stages AI transcript candidates before reject-capable AI guardrails so blocked prompts can still be captured when `always_capture_on_guardrail` is enabled. Its final request-body hook refreshes the captured request after downstream redaction/transforms when traffic continues.
+2. **`ai_prompt_shield` (2925)** runs next in the pre-proxy body flow — PII must be detected/redacted before the request reaches the backend or later body validators. It sits right after audit staging and rate limiting so brute-force protection applies first. `waf` request metadata checks have already run in `authorize`; WAF request-body checks run on the final backend-visible body after request body transforms.
+3. **`ai_semantic_firewall` (2968)** runs after body/OpenAPI validation and before request guard, semantic cache, and federation — semantically dangerous prompts, RAG content, tool calls, and responses are evaluated before they can reach semantic cache or a federated provider.
+4. **`ai_request_guard` (2975)** runs after semantic firewall — it validates model names, max_tokens, message counts, and temperature. If earlier plugins rejected or redacted the request, the guard validates the accepted backend-visible version.
+5. **`ai_tool_governor` (2978)** runs after the request guard and before semantic cache and federation — it applies deterministic allow/deny/approval policy to concrete tool/function calls by name, arguments, JSON Schema, regex, identity, and an optional approval webhook. A disallowed tool schema in the request `tools[]`, a dangerous tool call in `choices[].message.tool_calls[]`, or a streamed SSE tool-call delta is screened before it reaches the client, semantic cache, or a federated provider. It complements `ai_semantic_firewall` (which catches intent); this plugin is purely deterministic (names, args, schema, regex, identity, approval). Because `request_transformer` (3000) and `response_transformer` (4000) run after the initial `before_proxy`/`on_response_body` inspection, the governor re-runs its deterministic request policy on the final backend-visible body (`on_final_request_body`) and its response policy on the final client-visible body (`on_final_response_body`), so a transform that rewrites an allowed body into a denied `tools/call` or injects a denied `choices[].message.tool_calls[]` is still fail-closed before dispatch or delivery.
+6. **`ai_semantic_cache` (2980)** runs after guardrails but before provider routing, so exact and semantic cache hits observe the accepted backend-visible prompt and can short-circuit before outbound provider dispatch.
+7. **`ai_stream_router` (2984)** claims streaming OpenAI Chat Completions requests (`"stream": true`) before non-streaming federation. It rewrites the route for provider-native streaming and normalizes provider SSE where needed without full-response buffering.
+8. **`ai_prompt_compressor` (4055)** runs after the guard, semantic cache, and `compression` request decompression. It shortens prompt text (`messages[].content` for the configured roles, plus the legacy top-level `prompt`) on the standard backend-dispatch path, including uploads that become plaintext after opt-in request decompression. It rewrites `ctx.metadata["request_body"]` in `before_proxy` for already-plaintext JSON bodies and re-derives the wire body in `transform_request_body`; code, URLs, numbers, identifiers, and negations are preserved verbatim. Direct `ai_federation` dispatch can consume the metadata rewrite for plaintext uploads, but compressed client uploads require the standard backend-dispatch path because federation returns before request-body transforms run.
+9. **`ai_federation` (4060)** handles non-streaming provider routing after guardrails and prompt compression. It translates OpenAI-format requests to the matched provider, normalizes non-streaming responses back to OpenAI format, and returns via `RejectBinary`. Matched requests with `"stream": true` are rejected with `501` unless `ai_stream_router` already claimed the request via `ai_stream_router_claimed=true`. Successful synthetic federation responses are passed through the response-side body hooks before the client receives them — when the normal response-body-buffering capability gate is satisfied, `ai_semantic_firewall`, `ai_response_guard`, response transforms, and final-response hooks still apply over the synthetic 2xx body. `ai_token_metrics` is the deliberate exception: it skips synthetic short-circuit bodies, so `ai_federation` writes token metadata directly into `ctx.metadata`.
+10. **`ai_token_metrics` (4100)** runs after the response comes back from the backend — it parses the LLM response body to extract token usage (prompt, completion, total, model) and writes it to `ctx.metadata`. This metadata flows into `TransactionSummary` for all downstream logging plugins. It is observability-only and never enforces budget policy. When `ai_federation` is active, `ai_federation` writes the same metadata keys directly (so accounting is correct even if the synthetic-body hooks are skipped), and `ai_rate_limiter` reconciles usage from that metadata on the rejection path.
+11. **`ai_rate_limiter` (4200)** reserves estimated token usage before proxying JSON `POST` requests, based on output-token caps plus estimated prompt tokens. It runs after `ai_token_metrics` on the response body path, reconciles the reservation to actual usage when usage metadata is available, and keeps/rejects/releases unmetered 2xx responses according to `on_unmetered_response`. Synthetic short-circuit bodies (cache/dedup/mock/etc.) are never charged or released — the limiter exempts them via the internal `ferrum:synthetic_short_circuit` marker. When `ai_federation` is active, the rate limiter uses `applies_after_proxy_on_reject()` to reconcile token usage from federation metadata on the rejection path (the sole federation charger, scoped per limiter instance).
 
 ### Streaming AI: ai_stream_router (2984) claims `stream: true`, ai_federation (4060) owns the rest
 
