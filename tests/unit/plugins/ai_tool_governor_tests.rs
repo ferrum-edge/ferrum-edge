@@ -3143,3 +3143,290 @@ async fn later_transform_does_not_reflag_redacted_call() {
             .await,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 8 review fixes: decode-before-gate, keep-buffered posture, identity
+// counts/correlation fields, marker-gated redaction transform
+// ---------------------------------------------------------------------------
+
+/// A denied tool call injected by a transform, relabeled away from JSON
+/// (`text/html` is compressible), and THEN gzip-compressed must still be
+/// decoded and fail closed: the compressed bytes do not look like JSON and the
+/// header no longer says JSON, so the content gates must run against the
+/// DECODED bytes, not the encoded ones.
+#[tokio::test]
+async fn final_response_decodes_before_content_gates_and_denies_relabeled_compressed_call() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    let clean = json!({
+        "id": "x", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }]
+    })
+    .to_string()
+    .into_bytes();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .await,
+    );
+
+    // A response_transformer injects a denied call and relabels Content-Type;
+    // the compression plugin then gzips the (text/*, compressible) body.
+    let injected = response_with_tool_call("kubectl.apply", "{\"manifest\":\"kind: Pod\"}");
+    let compressed = gzip(&injected);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/html".to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &compressed)
+            .await,
+        Some(502),
+    );
+}
+
+/// A compression-only rewrite of an already-governed body is still skipped
+/// when the content type was ALSO relabeled: the decoded bytes match the
+/// governed hash, so no duplicate approval webhook and no false rejection.
+#[tokio::test]
+async fn relabeled_compressed_unchanged_body_still_skips_final_recheck() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    ); // webhook #1
+    let compressed = gzip(&body);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &compressed)
+            .await,
+    );
+    server.verify().await; // still exactly 1
+}
+
+/// Keep-buffered matrix for the proxy's header-time content-type refinement:
+/// on a governed request, ambiguous labels stay buffered (FailClosed posture);
+/// only genuine SSE and framed gRPC/gRPC-Web are released back to the
+/// streaming path; instances/requests without response governance never force
+/// buffering.
+#[test]
+fn content_type_hook_keeps_ambiguous_labels_buffered() {
+    let plugin = make(json!({ "tools": { "kubectl.apply": { "action": "deny" } } }));
+    let ctx = create_test_context();
+    let response_headers = HashMap::new();
+    let buffered = |ct: Option<&str>| {
+        plugin.should_buffer_response_body_for_content_type(&ctx, ct, 200, &response_headers)
+    };
+    assert!(buffered(Some("application/json")));
+    // Mislabeled/unlabeled 2xx bodies could still be Chat Completions JSON
+    // carrying a denied call: keep them buffered for `on_response_body`.
+    assert!(buffered(Some("text/html")));
+    assert!(buffered(Some("text/plain")));
+    assert!(buffered(None));
+    // Genuine SSE stays on the streaming path (stream inspector or
+    // buffered-SSE governance own it).
+    assert!(!buffered(Some("text/event-stream")));
+    // Framed gRPC / gRPC-Web wire frames are owned by other machinery.
+    assert!(!buffered(Some("application/grpc")));
+    assert!(!buffered(Some("application/grpc+proto")));
+    assert!(!buffered(Some("application/grpc-web+json")));
+    // Non-2xx never buffers.
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        500,
+        &response_headers
+    ));
+
+    // An instance that does not govern responses never forces buffering.
+    let request_only = make(json!({
+        "tools": { "kubectl.apply": { "action": "deny" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    assert!(!request_only.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        200,
+        &response_headers
+    ));
+    assert!(!request_only.should_buffer_response_body_for_content_type(
+        &ctx,
+        None,
+        200,
+        &response_headers
+    ));
+
+    // A streaming-only config buffers only a streaming request's response.
+    let streaming_only = make(json!({
+        "default_action": "deny",
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    assert!(
+        !streaming_only.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some("text/html"),
+            200,
+            &response_headers
+        )
+    );
+    let mut streaming_ctx = create_test_context();
+    streaming_ctx
+        .metadata
+        .insert("ai_request_streaming".to_string(), "true".to_string());
+    assert!(streaming_only.should_buffer_response_body_for_content_type(
+        &streaming_ctx,
+        Some("text/html"),
+        200,
+        &response_headers
+    ));
+    assert!(
+        !streaming_only.should_buffer_response_body_for_content_type(
+            &streaming_ctx,
+            Some("text/event-stream"),
+            200,
+            &response_headers
+        )
+    );
+}
+
+/// A transform that changes only the top-level `model` while leaving an
+/// approved `require_approval` call unchanged must RE-approve: approval
+/// decisions are keyed per model/provider, so the recorded call identity
+/// (which includes those fields) no longer matches.
+#[tokio::test]
+async fn model_change_forces_reapproval_of_unchanged_call() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .and(body_string_contains("\"model\":\"gpt-4o\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .and(body_string_contains("\"model\":\"gpt-4o-mini\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_tool_call_model("deploy", "{\"env\":\"prod\"}", Some("gpt-4o"));
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    ); // webhook #1, approved for model gpt-4o
+
+    // A later transform rewrites ONLY the model; the call itself is unchanged.
+    let relabeled = response_tool_call_model("deploy", "{\"env\":\"prod\"}", Some("gpt-4o-mini"));
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &relabeled)
+            .await,
+    ); // webhook #2, re-approved under the new model
+    server.verify().await;
+}
+
+/// A transform that DUPLICATES an already-approved call (same name + args) must
+/// have the copy re-evaluated: recorded identities are consumed as a multiset,
+/// so with `cache_ttl_seconds: 0` one approval cannot cover two executions.
+#[tokio::test]
+async fn duplicated_approved_call_is_reevaluated() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(2) // one per execution, never one approval for two copies
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    ); // webhook #1 (records deploy with count 1)
+
+    // A later transform duplicates the approved call verbatim.
+    let duplicated = json!({
+        "id": "chatcmpl-1", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": Value::Null, "tool_calls": [
+            { "id": "call_1", "type": "function", "function": { "name": "deploy", "arguments": "{\"env\":\"prod\"}" } },
+            { "id": "call_2", "type": "function", "function": { "name": "deploy", "arguments": "{\"env\":\"prod\"}" } }
+        ] }, "finish_reason": "tool_calls" }],
+        "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
+    })
+    .to_string()
+    .into_bytes();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &duplicated)
+            .await,
+    ); // first copy consumes the recorded count; second copy → webhook #2
+    server.verify().await;
+}
+
+/// A backend 4xx/5xx JSON error body whose shape happens to contain
+/// `choices[].message.tool_calls[]` is out of scope (non-2xx) and must NOT be
+/// rewritten by the redaction transform: redaction is gated on the
+/// governed-response marker, which is only recorded for 2xx governed bodies.
+#[tokio::test]
+async fn non_2xx_json_error_body_is_not_rewritten_by_transform() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "secret", "regex": "sk-[A-Za-z0-9]+" }]
+            }
+        }
+    }));
+    let body = response_with_tool_call("filesystem.write", "{\"token\":\"sk-ERRORSECRET123\"}");
+    let mut ctx = create_test_context();
+    // Backend error: `on_response_body` skips non-2xx and records no marker.
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 500, &json_headers(), &body)
+            .await,
+    );
+    assert!(
+        plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/json"),
+                &json_headers()
+            )
+            .await
+            .is_none(),
+        "non-2xx error body must not be silently modified"
+    );
+}

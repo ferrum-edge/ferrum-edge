@@ -42,11 +42,20 @@
 //! into a denied `tools/call`, a disallowed `tools[]` definition, or an injected
 //! `choices[].message.tool_calls[]` is fail-closed before dispatch/delivery. When
 //! a later transform (e.g. the `compression` plugin) encoded the final response,
-//! the re-check decompresses the gateway's own `gzip`/`br` encoding and inspects
-//! that, so an injected-then-compressed tool call cannot slip through. Redaction
+//! the re-check decompresses the gateway's own `gzip`/`br` encoding FIRST and
+//! applies the JSON-shape/content-type gates to the decoded bytes, so an
+//! injected-then-compressed (and possibly `Content-Type`-relabeled) tool call
+//! cannot slip through. Already-governed calls are skipped by a
+//! correlation-aware identity (consumer/proxy/model/provider + name + args)
+//! with multiset counts, so a transform that changes an approval-relevant
+//! field or duplicates an approved call is re-evaluated while unchanged (and
+//! this plugin's own redacted) calls are not re-approved. Redaction
 //! is unavailable on these re-check paths (no request-body transform, and the
 //! response redaction transform already ran), so a `redact_args` match there
-//! fails closed instead of forwarding the secret.
+//! fails closed instead of forwarding the secret. On a governed request,
+//! ambiguously labeled 2xx responses (missing or non-JSON `Content-Type`,
+//! except genuine SSE and framed gRPC) stay buffered for inspection rather
+//! than being released to the streaming path — deliberate FailClosed posture.
 //!
 //! Non-goals (MVP): it does not execute tools, manage MCP sessions, replace
 //! `mcp_gateway`/A2A routing, or implement an approval UI.
@@ -117,12 +126,18 @@ const STREAM_MODEL_KEY: &str = "ai_tool_governor.stream_model";
 /// rewrote is re-evaluated against the same policy.
 const GOVERNED_REQUEST_HASH_KEY: &str = "ai_tool_governor.governed_request_hash";
 const GOVERNED_RESPONSE_HASH_KEY: &str = "ai_tool_governor.governed_response_hash";
-/// Comma-separated identity hashes (`sha256([name, args])`) of the response tool
-/// calls this plugin already governed/redacted. The post-transform final
-/// re-check skips these so it does not re-call an approval webhook for an
-/// unchanged call, or re-match this plugin's own `[REDACTED_TOOL_ARG:<name>]`
-/// placeholder as a blocked pattern, while still evaluating calls a later
-/// transform injected or changed.
+/// Comma-separated `<identity-hash>=<count>` entries for the response tool
+/// calls this plugin already governed/redacted. The identity hash covers the
+/// approval-relevant correlation fields (consumer/proxy/model/provider — the
+/// same fields in the approval cache key) plus the call name and raw args, so
+/// a transform that changes only e.g. the top-level `model` cannot reuse a
+/// decision keyed to the old model. Counts give the record MULTISET semantics:
+/// the final re-check consumes one count per identical call, so a transform
+/// that duplicates an approved call has the copy re-evaluated instead of both
+/// riding one approval. Unchanged calls (including this plugin's own
+/// `[REDACTED_TOOL_ARG:<name>]` redacted form, re-recorded after redaction)
+/// are skipped so they are not re-approved or re-flagged, while calls a later
+/// transform injected or changed are still evaluated.
 const GOVERNED_CALL_HASHES_KEY: &str = "ai_tool_governor.governed_call_hashes";
 
 // ---------------------------------------------------------------------------
@@ -1341,12 +1356,6 @@ impl AiToolGovernor {
     /// `redact_args` match fails closed (`redaction_unavailable = true`).
     async fn govern_final_response(&self, ctx: &mut RequestContext, json: &Value) -> PluginResult {
         let mut calls = extract_response_tool_calls(json);
-        // Skip calls this plugin already governed/redacted (unchanged args): a
-        // later transform that only touched an unrelated field must not cause a
-        // second approval webhook for an unchanged sibling, nor re-match this
-        // plugin's own redaction placeholder. Calls a later transform injected or
-        // changed have different args and are still evaluated.
-        calls.retain(|call| !call_already_governed(ctx, call));
         if calls.is_empty() {
             return PluginResult::Continue;
         }
@@ -1356,6 +1365,34 @@ impl AiToolGovernor {
             .and_then(Value::as_str)
             .map(str::to_string);
         let corr = self.correlation(ctx, model, provider.as_deref());
+        // Skip calls this plugin already governed/redacted, consuming the
+        // recorded identities as a MULTISET: each recorded identity admits at
+        // most its recorded count of identical calls, so a transform that
+        // DUPLICATES an approved call has the copy re-evaluated (with
+        // `cache_ttl_seconds: 0`, re-approved) instead of two executions riding
+        // one approval. The identity includes the approval-relevant correlation
+        // fields (consumer/proxy/model/provider — the approval cache key
+        // fields), so a transform that changes only e.g. the top-level `model`
+        // no longer matches and the call is re-approved under the new model. A
+        // later transform that only touched an unrelated field still skips the
+        // unchanged siblings — no second approval webhook, and this plugin's
+        // own `[REDACTED_TOOL_ARG:<name>]` redacted form (re-recorded after
+        // redaction) is not re-matched as a blocked pattern.
+        let mut remaining = governed_call_counts(ctx);
+        if !remaining.is_empty() {
+            calls.retain(
+                |call| match remaining.get_mut(&call_identity_hash(&corr, call)) {
+                    Some(count) if *count > 0 => {
+                        *count -= 1;
+                        false
+                    }
+                    _ => true,
+                },
+            );
+        }
+        if calls.is_empty() {
+            return PluginResult::Continue;
+        }
         let batch = self
             .engine
             .govern_calls(&corr, &calls, &ctx.plugin_http_call_ns, true)
@@ -1708,8 +1745,9 @@ impl Plugin for AiToolGovernor {
     /// `choices[].message.tool_calls[]`; opting out here would skip
     /// `on_response_body` entirely and bypass enforce-mode policy.
     /// `should_buffer_response_body_for_content_type` downgrades ONLY a genuine
-    /// event stream back to the streaming path (where the SSE inspector
-    /// attaches when `streaming_response_tool_calls` is enabled).
+    /// event stream (where the SSE inspector attaches when
+    /// `streaming_response_tool_calls` is enabled) and framed gRPC/gRPC-Web
+    /// back to the streaming path.
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         // Buffer for explicit response inspection, or — for a streaming-only
         // config — only when the request was streaming (to catch its SSE-JSON
@@ -1728,11 +1766,21 @@ impl Plugin for AiToolGovernor {
         if !self.should_buffer_response_body(ctx) || !(200..300).contains(&response_status) {
             return false;
         }
-        // Buffer only JSON responses; SSE tool calls go through the stream
-        // inspector, never the buffered path.
+        // Deliberate FailClosed posture: on a governed request, an ambiguously
+        // labeled 2xx response stays BUFFERED so `on_response_body` (and its
+        // `looks_like_json` fallback) can inspect it. The proxy's header-time
+        // refinement downgrades plugin-forced buffering back to streaming when
+        // every plugin declines the content type, so declining `text/html`,
+        // `text/plain`, or a missing `Content-Type` here would let a mislabeled
+        // Chat Completions JSON body containing a denied tool call stream to
+        // the client uninspected. Only two labels are released back to the
+        // streaming path: a genuine `text/event-stream` (the SSE stream
+        // inspector / buffered-SSE governance own that path) and framed
+        // gRPC/gRPC-Web (length-prefixed wire frames owned by the gRPC
+        // machinery, out of this plugin's scope).
         match content_type {
-            Some(ct) => is_json_content_type(ct) && !is_event_stream_content_type(ct),
-            None => false,
+            Some(ct) => !is_event_stream_content_type(ct) && !is_framed_grpc_content_type(ct),
+            None => true,
         }
     }
 
@@ -1839,10 +1887,12 @@ impl Plugin for AiToolGovernor {
             );
             return self.reject(&batch);
         }
-        // Record the governed calls so the final re-check skips them (unless a
-        // later transform changes their args). Redaction updates this set to the
-        // redacted args below.
-        record_governed_calls(ctx, &calls);
+        // Record the governed calls (with correlation-aware identities and
+        // counts) so the final re-check skips them one-for-one — unless a later
+        // transform changes their args, duplicates them, or rewrites an
+        // approval-relevant field like `model`. Redaction updates this record
+        // to the redacted args below.
+        record_governed_calls(ctx, &corr, &calls);
         PluginResult::Continue
     }
 
@@ -1863,17 +1913,24 @@ impl Plugin for AiToolGovernor {
         {
             return None;
         }
+        // Redaction rewrites only bodies this plugin actually governed in
+        // `on_response_body` (the governed-response hash marker is recorded
+        // only for 2xx in-scope bodies). Without the marker gate, a
+        // content-type-only gate would silently rewrite out-of-scope bodies —
+        // e.g. a backend 4xx/5xx JSON error whose shape happens to contain
+        // `choices[].message.tool_calls[]`, which `on_response_body` skips as
+        // non-2xx before recording the hash.
+        if !ctx.metadata.contains_key(GOVERNED_RESPONSE_HASH_KEY) {
+            return None;
+        }
         // Mirror the `looks_like_json` fallback in `on_response_body`: a header
         // rule can strip/relabel `Content-Type: application/json` before this
-        // transform runs while leaving the governed JSON intact. If this plugin
-        // already governed the body as JSON-shaped (governed-response hash
-        // recorded), redaction must still rewrite it — returning `None` here
-        // would forward the matched argument unredacted, and the final re-check
-        // would skip the unchanged governed hash.
+        // transform runs while leaving the governed JSON intact. Redaction must
+        // still rewrite it — returning `None` here would forward the matched
+        // argument unredacted, and the final re-check would skip the unchanged
+        // governed hash.
         let json_ct = content_type.is_some_and(is_json_content_type);
-        let governed_json_shaped =
-            ctx.metadata.contains_key(GOVERNED_RESPONSE_HASH_KEY) && looks_like_json(body);
-        if !json_ct && !governed_json_shaped {
+        if !json_ct && !looks_like_json(body) {
             return None;
         }
         if body.is_empty() || body.len() > MAX_PARSE_BYTES {
@@ -1884,16 +1941,24 @@ impl Plugin for AiToolGovernor {
             let rewritten = serde_json::to_vec(&json).ok()?;
             // Record the redacted body's hash so `on_final_response_body` treats
             // this plugin's own redaction as already-governed and skips it when
-            // no later transform runs. Also re-record the redacted calls' identity
-            // hashes so that even if a later transform changes the body hash, the
-            // final re-check skips these already-redacted calls (avoids re-calling
-            // an approval webhook for an unchanged sibling and re-matching the
-            // `[REDACTED_TOOL_ARG:<name>]` placeholder as a blocked pattern).
+            // no later transform runs. Also re-record the redacted calls'
+            // identity hashes (with the same correlation fields and counts as
+            // `on_response_body`) so that even if a later transform changes the
+            // body hash, the final re-check skips these already-redacted calls
+            // (avoids re-calling an approval webhook for an unchanged sibling
+            // and re-matching the `[REDACTED_TOOL_ARG:<name>]` placeholder as a
+            // blocked pattern).
             ctx.metadata.insert(
                 GOVERNED_RESPONSE_HASH_KEY.to_string(),
                 sha256_hex_bytes(&rewritten),
             );
-            record_governed_calls(ctx, &extract_response_tool_calls(&json));
+            let provider = self.resolve_response_provider(ctx, &json);
+            let model = json
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let corr = self.correlation(ctx, model, provider.as_deref());
+            record_governed_calls(ctx, &corr, &extract_response_tool_calls(&json));
             return Some(rewritten);
         }
         None
@@ -1924,13 +1989,6 @@ impl Plugin for AiToolGovernor {
         if !(200..300).contains(&response_status) {
             return PluginResult::Continue;
         }
-        let content_type = header_value(response_headers, "content-type").unwrap_or("");
-        // Header relabeling must not disable the re-check: inspect a JSON-shaped
-        // body even when a transform rewrote the content type (mirrors
-        // `on_response_body`).
-        if !is_json_content_type(content_type) && !looks_like_json(body) {
-            return PluginResult::Continue;
-        }
         // Mirror `on_response_body`: a streaming-only config re-checks a buffered
         // JSON body only for a streaming request's SSE fallback.
         if !self.governs_buffered_json(ctx) {
@@ -1948,13 +2006,44 @@ impl Plugin for AiToolGovernor {
             return PluginResult::Continue;
         }
 
-        // Parse the final body directly; if a later transform encoded it,
-        // decompress with the gateway's own content-encoding and parse that.
-        let json = if let Some(json) = parse_json_within_limit(body) {
-            json
-        } else if let Some(decoded) = content_encoding_value(response_headers)
-            .and_then(|enc| decompress_within_limit(enc, body))
+        let content_type = header_value(response_headers, "content-type").unwrap_or("");
+        let json_ct = is_json_content_type(content_type);
+
+        // Plaintext parse first: covers unencoded bodies and a spurious
+        // `Content-Encoding` header a header rule added without encoding the
+        // bytes. Header relabeling must not disable the re-check, so a
+        // JSON-shaped body is inspected even when a transform rewrote the
+        // content type (mirrors `on_response_body`).
+        if (json_ct || looks_like_json(body))
+            && let Some(json) = parse_json_within_limit(body)
         {
+            return self.govern_final_response(ctx, &json).await;
+        }
+
+        // When a later transform encoded the final body (e.g. the `compression`
+        // plugin — which compresses `text/*` too), decode FIRST and gate on the
+        // DECODED bytes: compressed bytes never look like JSON, so gating on
+        // the encoded bytes plus a relabeled `Content-Type` would skip the
+        // re-check entirely and forward an injected-then-compressed denied
+        // call uninspected.
+        if let Some(encoding) = content_encoding_value(response_headers) {
+            let governed_earlier = ctx.metadata.contains_key(GOVERNED_RESPONSE_HASH_KEY);
+            let Some(decoded) = decompress_within_limit(encoding, body) else {
+                // Unsupported/undecodable encoding, or decoded output past the
+                // parse limit: cannot verify a later transform did not inject a
+                // governed call. Fail closed when the response plausibly needs
+                // the re-check — labeled JSON, or a body this plugin governed
+                // earlier (relabeling must not downgrade fail-closed to
+                // forward). An unencodable body that was never governed and is
+                // not labeled JSON is out of scope.
+                if json_ct || governed_earlier {
+                    return self.uninspectable_final_response(
+                        ctx,
+                        "response body has a content-encoding that cannot be inspected",
+                    );
+                }
+                return PluginResult::Continue;
+            };
             // Compression-only rewrite of an already-governed body: the decoded
             // bytes match the hash `on_response_body` recorded, so skip to avoid
             // a duplicate approval webhook (which a one-shot approval service
@@ -1962,25 +2051,28 @@ impl Plugin for AiToolGovernor {
             if ctx.metadata.get(GOVERNED_RESPONSE_HASH_KEY) == Some(&sha256_hex_bytes(&decoded)) {
                 return PluginResult::Continue;
             }
-            match parse_json_within_limit(&decoded) {
-                Some(json) => json,
-                // Decoded but oversized or not JSON: cannot verify a transform
-                // did not inject a governed call.
-                None => {
-                    return self.uninspectable_final_response(
-                        ctx,
-                        "response body could not be inspected after decoding",
-                    );
-                }
+            // Content-type / JSON-shape gates against the DECODED bytes.
+            if !json_ct && !looks_like_json(&decoded) {
+                return PluginResult::Continue;
             }
-        } else if has_non_identity_content_encoding(response_headers) {
-            // Encoded with an unsupported/undecodable content-encoding: cannot
-            // verify a later transform did not inject a governed call.
-            return self.uninspectable_final_response(
-                ctx,
-                "response body has a content-encoding that cannot be inspected",
-            );
-        } else if body.len() > MAX_PARSE_BYTES {
+            let Some(json) = parse_json_within_limit(&decoded) else {
+                // Decoded but oversized or not parseable JSON: cannot verify a
+                // transform did not inject a governed call.
+                return self.uninspectable_final_response(
+                    ctx,
+                    "response body could not be inspected after decoding",
+                );
+            };
+            return self.govern_final_response(ctx, &json).await;
+        }
+
+        // Unencoded and not parseable plaintext JSON.
+        if !json_ct && !looks_like_json(body) {
+            // Plaintext but not JSON: `on_response_body` already governed the
+            // original backend body.
+            return PluginResult::Continue;
+        }
+        if body.len() > MAX_PARSE_BYTES {
             // A later transform grew the (hash-changed) plaintext body past the
             // inspectable limit: fail closed like the `on_response_body` path so
             // padding cannot smuggle a denied tool call past enforce policy.
@@ -1988,13 +2080,11 @@ impl Plugin for AiToolGovernor {
                 ctx,
                 "response body exceeds the inspectable size limit after transforms",
             );
-        } else {
-            // Plaintext but not JSON: `on_response_body` already governed the
-            // original backend body.
-            return PluginResult::Continue;
-        };
-
-        self.govern_final_response(ctx, &json).await
+        }
+        // JSON-labeled/shaped but unparseable plaintext within the limit:
+        // forward, mirroring `on_response_body` (rejecting every unparseable
+        // JSON-labeled response on a shared proxy would break unrelated routes).
+        PluginResult::Continue
     }
 
     // --- Streaming response path ------------------------------------------
@@ -2691,6 +2781,17 @@ fn has_non_identity_content_encoding(headers: &HashMap<String, String>) -> bool 
     content_encoding_value(headers).is_some()
 }
 
+/// True for native gRPC (`application/grpc*`) and gRPC-Web
+/// (`application/grpc-web*`) content types, including the `+json` variants.
+/// Their bodies are length-prefixed wire frames owned by the gRPC/gRPC-Web
+/// machinery, not a bare JSON document, so the governor releases them back to
+/// the streaming path instead of buffering them for JSON inspection. Mirrors
+/// `ai_request_guard`/`ai_rate_limiter`.
+fn is_framed_grpc_content_type(content_type: &str) -> bool {
+    crate::proxy::backend_dispatch::is_native_grpc_content_type(content_type.as_bytes())
+        || crate::plugins::grpc_web::is_grpc_web_content_type(content_type)
+}
+
 /// Whether the request was marked as streaming: an `Accept: text/event-stream`
 /// header, a shared `ai_request_streaming` marker from an earlier plugin, or
 /// this plugin's own `stream: true` request-body detection (set in
@@ -2814,34 +2915,67 @@ fn looks_like_json(body: &[u8]) -> bool {
     )
 }
 
-/// Unambiguous identity hash of a tool call (name + raw arguments), used to skip
-/// already-governed/redacted calls in the post-transform final re-check.
-fn call_identity_hash(call: &ToolCall) -> String {
-    sha256_hex(&json!([call.name.as_str(), call.raw_args.as_str()]).to_string())
+/// Unambiguous identity hash of a governed tool call, used to skip
+/// already-governed/redacted calls in the post-transform final re-check. It
+/// hashes the same JSON array as the approval cache key — the correlation
+/// fields (consumer/proxy/model/provider) plus name and raw args — so a
+/// transform that changes any approval-relevant field (e.g. only the top-level
+/// `model`) yields a different identity and the call is re-evaluated (and
+/// re-approved) under the new context instead of riding the old decision.
+fn call_identity_hash(corr: &CorrelationMeta, call: &ToolCall) -> String {
+    sha256_hex(
+        &json!([
+            corr.consumer.as_deref(),
+            corr.proxy.as_deref(),
+            corr.model.as_deref(),
+            corr.provider.as_deref(),
+            call.name.as_str(),
+            call.raw_args.as_str(),
+        ])
+        .to_string(),
+    )
 }
 
-/// Record the identity hashes of governed response tool calls onto the request
-/// context so the final re-check can skip them.
-fn record_governed_calls(ctx: &mut RequestContext, calls: &[ToolCall]) {
+/// Record the identity hashes of governed response tool calls (with per-hash
+/// COUNTS — multiset semantics) onto the request context so the final re-check
+/// can consume them one-for-one.
+fn record_governed_calls(ctx: &mut RequestContext, corr: &CorrelationMeta, calls: &[ToolCall]) {
     if calls.is_empty() {
         return;
     }
-    let hashes = calls
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for call in calls {
+        let hash = call_identity_hash(corr, call);
+        match counts.iter_mut().find(|(h, _)| *h == hash) {
+            Some(entry) => entry.1 += 1,
+            None => counts.push((hash, 1)),
+        }
+    }
+    let serialized = counts
         .iter()
-        .map(call_identity_hash)
+        .map(|(hash, count)| format!("{hash}={count}"))
         .collect::<Vec<_>>()
         .join(",");
     ctx.metadata
-        .insert(GOVERNED_CALL_HASHES_KEY.to_string(), hashes);
+        .insert(GOVERNED_CALL_HASHES_KEY.to_string(), serialized);
 }
 
-/// Whether a tool call was already governed/redacted (its identity hash is in
-/// `GOVERNED_CALL_HASHES_KEY`).
-fn call_already_governed(ctx: &RequestContext, call: &ToolCall) -> bool {
-    let hash = call_identity_hash(call);
-    ctx.metadata
-        .get(GOVERNED_CALL_HASHES_KEY)
-        .is_some_and(|recorded| recorded.split(',').any(|h| h == hash))
+/// Parse the recorded governed-call identity counts from the request context.
+/// Malformed entries are ignored (the corresponding call is simply re-evaluated
+/// — fail safe toward re-governing, never toward skipping).
+fn governed_call_counts(ctx: &RequestContext) -> HashMap<String, usize> {
+    let mut counts = HashMap::new();
+    let Some(recorded) = ctx.metadata.get(GOVERNED_CALL_HASHES_KEY) else {
+        return counts;
+    };
+    for entry in recorded.split(',') {
+        if let Some((hash, count)) = entry.split_once('=')
+            && let Ok(count) = count.parse::<usize>()
+        {
+            *counts.entry(hash.to_string()).or_insert(0) += count;
+        }
+    }
+    counts
 }
 
 fn sha256_hex_bytes(input: &[u8]) -> String {

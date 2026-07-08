@@ -52,6 +52,18 @@ Requests marked streaming still buffer a plain-JSON fallback
 response so `tool_calls` in it are governed (only a genuine
 `text/event-stream` response is released back to the stream path).
 
+**Response buffering on governed requests:** when this plugin governs response
+tool calls for a request, a 2xx response with a **missing or non-JSON
+`Content-Type`** is **buffered and inspected**, not streamed — a transform
+chain can relabel `Content-Type` while the body is still Chat Completions
+JSON, so ambiguous labels are treated fail-closed and run through the
+JSON-shape fallback. Only two response labels are released back to the
+streaming path: a genuine `text/event-stream` (governed by the SSE stream
+inspector, or by buffered-SSE governance if another plugin keeps it buffered)
+and framed gRPC / gRPC-Web content types (owned by the gRPC machinery, out of
+this plugin's scope). Operators should expect mislabeled or unlabeled
+responses on governed routes to be delivered buffered rather than streamed.
+
 ## Fail-closed handling of uninspectable bodies
 
 In `mode: enforce`, a body the plugin is configured to govern but cannot
