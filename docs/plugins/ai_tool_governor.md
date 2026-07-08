@@ -56,10 +56,14 @@ Requests marked streaming still buffer a plain-JSON fallback
 response so `tool_calls` in it are governed (a `text/event-stream` response
 is released back to the stream path only when streaming inspection is enabled
 and a live inspector will govern it). The inspector also sniffs the stream's
-body shape from its first non-whitespace byte: a JSON-shaped stream (a Chat
+body shape from its leading bytes: a JSON-shaped stream (a Chat
 Completions JSON body a transform relabeled `text/event-stream`) is held in
 full and governed at end-of-stream like a buffered JSON body — a denied call
-is never forwarded, an allowed body is released unchanged.
+is never forwarded, an allowed body is released unchanged. A stream whose
+leading bytes are **neither SSE-shaped nor JSON-shaped** (real SSE always
+starts with ASCII field/comment lines; compressed or binary output does not)
+is uninspectable: it is held in full, cut at end-of-stream in enforce mode,
+and released unchanged in dry-run.
 
 **Response buffering on governed requests:** when this plugin governs response
 tool calls for a request, a 2xx response with a **missing or non-JSON
@@ -78,11 +82,16 @@ SSE-labeled body that carries a `Content-Encoding` is **decoded first**
 governed. Response labels released back to the streaming path: framed gRPC /
 gRPC-Web content types (owned by the gRPC machinery, out of this plugin's
 scope) always, and `text/event-stream` **only when streaming inspection is
-enabled** so the live SSE inspector will attach — with streaming inspection
+enabled and the response carries no `Content-Encoding`** so the live SSE
+inspector will attach and can actually parse the frames — an **encoded SSE
+response stays buffered even with streaming inspection enabled** (the
+inspector reads the raw byte stream, where compressed bytes parse as zero
+events; the buffered path decodes and governs instead, failing closed on an
+undecodable encoding in enforce mode). With streaming inspection
 disabled, SSE stays buffered and is governed by buffered-SSE governance (or
 the JSON-shape fallback if the label was lying). Operators should expect
-mislabeled or unlabeled responses on governed routes to be delivered buffered
-rather than streamed.
+mislabeled, unlabeled, or compressed SSE responses on governed routes to be
+delivered buffered rather than streamed.
 
 ## Fail-closed handling of uninspectable bodies
 
@@ -113,7 +122,9 @@ forwarded ungoverned:
   decompressed and the decoded bytes governed normally.
 - **Streaming path**: held tool-call frames plus the partial-event carry are
   capped at **4 MiB**; past that the stream is cut with the terminal SSE error
-  event.
+  event. A stream whose leading bytes are neither SSE-shaped nor JSON-shaped
+  (opaque/binary — e.g. compressed bytes whose `Content-Encoding` header a
+  transform stripped) is held in full and cut at end-of-stream.
 
 In `mode: dry_run` these bodies are forwarded uninspected (and a stream past
 the hold cap is released uninspected) — dry-run never disrupts traffic.

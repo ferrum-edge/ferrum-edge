@@ -1885,7 +1885,7 @@ impl Plugin for AiToolGovernor {
         ctx: &RequestContext,
         content_type: Option<&str>,
         response_status: u16,
-        _response_headers: &HashMap<String, String>,
+        response_headers: &HashMap<String, String>,
     ) -> bool {
         if !self.should_buffer_response_body(ctx) || !(200..300).contains(&response_status) {
             return false;
@@ -1900,7 +1900,8 @@ impl Plugin for AiToolGovernor {
         // the client uninspected. Framed gRPC/gRPC-Web (length-prefixed wire
         // frames owned by the gRPC machinery) is always released — out of this
         // plugin's scope. A `text/event-stream` label is released ONLY when
-        // streaming inspection is enabled, so a live SSE inspector will
+        // streaming inspection is enabled AND the response carries no
+        // `Content-Encoding`, so a live SSE inspector will
         // actually attach and govern it; with streaming inspection disabled
         // there is no inspector, and releasing the label would let real SSE
         // tool-call deltas — or a Chat Completions JSON body a transform
@@ -1913,6 +1914,17 @@ impl Plugin for AiToolGovernor {
                     return false;
                 }
                 if is_event_stream_content_type(ct) {
+                    // The live inspector reads the RAW byte stream, so an SSE
+                    // label with a non-identity `Content-Encoding` must stay
+                    // BUFFERED even when streaming inspection is enabled:
+                    // compressed bytes parse as zero SSE events, and releasing
+                    // them would forward denied tool-call deltas ungoverned.
+                    // The buffered path decodes (`decompress_within_limit`)
+                    // and governs the decoded frames, failing closed on an
+                    // undecodable encoding in enforce mode.
+                    if has_non_identity_content_encoding(response_headers) {
+                        return true;
+                    }
                     return !self.inspect.streaming_response_tool_calls;
                 }
                 true
@@ -2586,21 +2598,84 @@ enum Finalize {
     Blocked,
 }
 
-/// Body shape of an inspected stream, sniffed from the FIRST non-whitespace
-/// byte only (ordinary SSE latency is untouched — no per-chunk re-scan). A
-/// `text/event-stream`-labeled response can actually be a Chat Completions
-/// JSON body a `response_transformer` relabeled: forwarding those bytes as
-/// ordinary non-SSE trailing data would deliver a denied `tool_calls[]`
-/// ungoverned, so a JSON-shaped stream (`{`/`[`) is held in full and governed
-/// at end-of-stream like a buffered JSON body.
+/// Body shape of an inspected stream, sniffed once from the leading bytes via
+/// [`sniff_stream_shape`] (ordinary SSE latency is untouched — no per-chunk
+/// re-scan). A `text/event-stream`-labeled response can actually be a Chat
+/// Completions JSON body a `response_transformer` relabeled: forwarding those
+/// bytes as ordinary non-SSE trailing data would deliver a denied
+/// `tool_calls[]` ungoverned, so a JSON-shaped stream (`{`/`[`) is held in
+/// full and governed at end-of-stream like a buffered JSON body. Leading
+/// bytes that are neither SSE-shaped nor JSON-shaped (gzip magic, other
+/// compressed/binary output) mean the stream can never be inspected as SSE
+/// and is held in full: enforce mode fails closed at end-of-stream, dry-run
+/// releases it unchanged.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StreamBodyShape {
-    /// Nothing but whitespace received so far.
+    /// Too few bytes to classify yet (whitespace, a partial BOM, or a partial
+    /// SSE field name): hold until the shape resolves.
     Unknown,
-    /// Not JSON-shaped: the normal SSE framing path.
+    /// SSE-shaped: the normal SSE framing path.
     Sse,
     /// JSON-shaped: hold the whole body, govern at end-of-stream.
     Json,
+    /// Neither SSE- nor JSON-shaped (e.g. compressed bytes whose
+    /// `Content-Encoding` a transform stripped, or arbitrary binary under an
+    /// SSE label): uninspectable — hold the whole body, fail closed at
+    /// end-of-stream in enforce mode, release unchanged in dry-run.
+    Opaque,
+}
+
+/// Shape verdict from sniffing the leading bytes of an inspected stream.
+enum StreamSniff {
+    /// Not enough bytes to decide yet.
+    Inconclusive,
+    Json,
+    Sse,
+    Opaque,
+}
+
+/// Sniff the body shape from the leading bytes. Real SSE always begins with an
+/// ASCII field or comment line (`data:`, `event:`, `id:`, `retry:`, or a `:`
+/// comment) after an optional UTF-8 BOM and leading whitespace, so leading
+/// bytes matching none of those — and not opening a JSON object/array — can
+/// never yield a governable SSE event. Treating them as [`StreamSniff::Sse`]
+/// would parse every "event" as `NoData` and forward a compressed stream's
+/// denied tool calls ungoverned; they are classified [`StreamSniff::Opaque`]
+/// and held instead.
+fn sniff_stream_shape(buf: &[u8]) -> StreamSniff {
+    const BOM: &[u8] = b"\xEF\xBB\xBF";
+    // The buffer so far is a (possibly empty) prefix of the BOM: wait.
+    if BOM.starts_with(buf) {
+        return StreamSniff::Inconclusive;
+    }
+    let buf = buf.strip_prefix(BOM).unwrap_or(buf);
+    let Some(start) = buf.iter().position(|b| !b.is_ascii_whitespace()) else {
+        return StreamSniff::Inconclusive;
+    };
+    let rest = &buf[start..];
+    if matches!(rest[0], b'{' | b'[') {
+        return StreamSniff::Json;
+    }
+    let mut partial_prefix = false;
+    for prefix in [
+        b"data:".as_slice(),
+        b"event:".as_slice(),
+        b"id:".as_slice(),
+        b"retry:".as_slice(),
+        b":".as_slice(),
+    ] {
+        if rest.starts_with(prefix) {
+            return StreamSniff::Sse;
+        }
+        if prefix.starts_with(rest) {
+            partial_prefix = true;
+        }
+    }
+    if partial_prefix {
+        StreamSniff::Inconclusive
+    } else {
+        StreamSniff::Opaque
+    }
 }
 
 /// Per-response streaming inspector. Holds tool-call SSE frames until the call
@@ -2658,22 +2733,7 @@ impl ToolCallStreamInspector {
     /// hold tool-call deltas are tracked — a hostile stream of synthetic
     /// finish frames for unrelated choice indices cannot grow the set.
     fn record_finished_choices(&mut self, frame: &Value) {
-        let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
-            return;
-        };
-        for (cpos, choice) in choices.iter().enumerate() {
-            if choice.get("finish_reason").is_none_or(|r| r.is_null()) {
-                continue;
-            }
-            let cidx = choice
-                .get("index")
-                .and_then(Value::as_u64)
-                .and_then(|v| usize::try_from(v).ok())
-                .unwrap_or(cpos);
-            if self.accumulator.has_choice(cidx) {
-                self.finished_choices.insert(cidx);
-            }
-        }
+        collect_finished_choices(frame, &self.accumulator, &mut self.finished_choices);
     }
 
     /// Whether the accumulated batch is complete: every choice that produced
@@ -2778,16 +2838,17 @@ impl ToolCallStreamInspector {
         }
     }
 
-    /// A JSON-shaped stream: hold the accumulating body (never forward a
-    /// prefix — releasing bytes before the body can be parsed would leak a
-    /// denied call), bounded by the same hold cap as the SSE path.
-    fn hold_json_body(&mut self) -> ResponseStreamAction {
+    /// A stream held in full (JSON-shaped, opaque, or shape not yet resolved):
+    /// hold the accumulating body (never forward a prefix — releasing bytes
+    /// before the body can be classified/parsed would leak a denied call),
+    /// bounded by the same hold cap as the SSE path.
+    fn hold_entire_body(&mut self) -> ResponseStreamAction {
         if self.carry.len() > MAX_STREAM_HOLD_BYTES {
             warn!(
                 target: "ai_tool_governor",
                 held_bytes = self.carry.len(),
                 mode = self.engine.mode.as_str(),
-                "JSON-shaped stream hold exceeded cap"
+                "held stream exceeded cap"
             );
             if self.engine.mode == Mode::Enforce {
                 self.carry.clear();
@@ -2863,25 +2924,28 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
             return ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk));
         }
         self.carry.extend_from_slice(chunk);
-        // Sniff the body shape once, from the first non-whitespace byte: a
-        // JSON-shaped stream (mislabeled Chat Completions JSON under an SSE
-        // label) must not be forwarded as ordinary non-SSE trailing data —
-        // hold it and govern at end-of-stream like a buffered JSON body.
-        if self.shape == StreamBodyShape::Unknown
-            && let Some(first) = self
-                .carry
-                .iter()
-                .copied()
-                .find(|b| !b.is_ascii_whitespace())
-        {
-            self.shape = if matches!(first, b'{' | b'[') {
-                StreamBodyShape::Json
-            } else {
-                StreamBodyShape::Sse
+        // Sniff the body shape once, from the leading bytes: a JSON-shaped
+        // stream (mislabeled Chat Completions JSON under an SSE label) must
+        // not be forwarded as ordinary non-SSE trailing data — hold it and
+        // govern at end-of-stream like a buffered JSON body — and an OPAQUE
+        // stream (neither SSE- nor JSON-shaped, e.g. compressed bytes) must
+        // not ride the SSE path where every "event" classifies as NoData and
+        // forwards uninspected.
+        if self.shape == StreamBodyShape::Unknown {
+            self.shape = match sniff_stream_shape(&self.carry) {
+                StreamSniff::Json => StreamBodyShape::Json,
+                StreamSniff::Sse => StreamBodyShape::Sse,
+                StreamSniff::Opaque => StreamBodyShape::Opaque,
+                StreamSniff::Inconclusive => StreamBodyShape::Unknown,
             };
         }
-        if self.shape == StreamBodyShape::Json {
-            return self.hold_json_body();
+        match self.shape {
+            // Hold-in-full shapes. An unresolved shape holds too — never
+            // forward bytes whose shape is unknown — bounded by the same cap.
+            StreamBodyShape::Json | StreamBodyShape::Opaque | StreamBodyShape::Unknown => {
+                return self.hold_entire_body();
+            }
+            StreamBodyShape::Sse => {}
         }
         let mut out: Vec<u8> = Vec::new();
 
@@ -2971,8 +3035,30 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
         if self.terminated || self.bypassed {
             return ResponseStreamAction::Forward(Bytes::new());
         }
-        if self.shape == StreamBodyShape::Json {
-            return self.finalize_json_body().await;
+        match self.shape {
+            StreamBodyShape::Json => return self.finalize_json_body().await,
+            StreamBodyShape::Opaque => {
+                // Neither SSE- nor JSON-shaped (e.g. a compressed body whose
+                // `Content-Encoding` a transform stripped): nothing could be
+                // inspected, so a denied tool call may be hiding inside.
+                // Enforce fails closed; dry-run releases the held bytes
+                // unchanged.
+                if self.engine.mode == Mode::Enforce {
+                    warn!(
+                        target: "ai_tool_governor",
+                        held_bytes = self.carry.len(),
+                        "opaque stream under governance cannot be inspected; cutting stream"
+                    );
+                    self.carry.clear();
+                    return self.terminate(Vec::new());
+                }
+                return ResponseStreamAction::Forward(Bytes::from(std::mem::take(&mut self.carry)));
+            }
+            // An Unknown shape at end-of-stream is a handful of bytes that
+            // never resolved (whitespace / a partial SSE field name) — no
+            // governable call can be inside; the SSE flush below forwards
+            // them unchanged.
+            StreamBodyShape::Sse | StreamBodyShape::Unknown => {}
         }
         let mut out: Vec<u8> = Vec::new();
         let mut trailing: Vec<u8> = Vec::new();
@@ -3029,6 +3115,15 @@ enum SseEvent {
 
 /// Classify a raw SSE event by its concatenated `data:` payload.
 fn classify_event(event: &[u8]) -> SseEvent {
+    // A UTF-8 BOM at the very start of the body rides into the FIRST event's
+    // bytes and would make its first line `\u{feff}data: ...`, which the
+    // field matcher below cannot see — the first event's denied call would
+    // classify as NoData and forward. `looks_like_sse` is already
+    // BOM-tolerant; the parser must be too, on both the live streaming path
+    // and the buffered extraction.
+    let event = event
+        .strip_prefix(b"\xEF\xBB\xBF".as_slice())
+        .unwrap_or(event);
     let Ok(text) = std::str::from_utf8(event) else {
         return SseEvent::NoData;
     };
@@ -3056,6 +3151,34 @@ fn classify_event(event: &[u8]) -> SseEvent {
     match serde_json::from_str::<Value>(trimmed) {
         Ok(value) => SseEvent::Frame(value),
         Err(_) => SseEvent::OtherData,
+    }
+}
+
+/// Record the choices `frame` finishes into `finished`. Only choices that
+/// actually hold tool-call deltas in `acc` are tracked — a hostile stream of
+/// synthetic finish frames for unrelated choice indices cannot grow the set.
+/// Shared by the live inspector and the buffered-SSE extraction so their
+/// batch-boundary semantics cannot drift.
+fn collect_finished_choices(
+    frame: &Value,
+    acc: &StreamingToolCallAccumulator,
+    finished: &mut std::collections::HashSet<usize>,
+) {
+    let Some(choices) = frame.get("choices").and_then(Value::as_array) else {
+        return;
+    };
+    for (cpos, choice) in choices.iter().enumerate() {
+        if choice.get("finish_reason").is_none_or(|r| r.is_null()) {
+            continue;
+        }
+        let cidx = choice
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok())
+            .unwrap_or(cpos);
+        if acc.has_choice(cidx) {
+            finished.insert(cidx);
+        }
     }
 }
 
@@ -3101,72 +3224,117 @@ struct BufferedSseExtract {
     provider: Option<String>,
 }
 
+/// Per-batch accumulation state for [`extract_sse_tool_calls`], mirroring the
+/// live inspector's batch lifecycle (`batch_complete` → `finalize` →
+/// `reset_batch`): the accumulator RESETS at every completion boundary
+/// (`finish_reason` for all tool-call choices, or `[DONE]`). Without the
+/// reset, two sequential tool-call batches reusing the same
+/// `(choice, tool_call)` indices would concatenate (`safe`+`danger` →
+/// `safedanger`) and a denied second call would be evaluated under a mangled
+/// name — a bypass under `default_action: allow`.
+struct BufferedSseBatches {
+    acc: StreamingToolCallAccumulator,
+    finished: std::collections::HashSet<usize>,
+    saw_tool_calls: bool,
+    extract: BufferedSseExtract,
+}
+
+impl BufferedSseBatches {
+    fn new() -> Self {
+        Self {
+            acc: StreamingToolCallAccumulator::default(),
+            finished: std::collections::HashSet::new(),
+            saw_tool_calls: false,
+            extract: BufferedSseExtract {
+                calls: Vec::new(),
+                ungovernable: false,
+                model: None,
+                provider: None,
+            },
+        }
+    }
+
+    /// Seal the pending batch at a completion boundary: fold its calls (under
+    /// their TRUE per-batch names) and its ungovernable state into the
+    /// extract, then reset the accumulator for the next batch.
+    fn seal_batch(&mut self) {
+        if !self.saw_tool_calls {
+            return;
+        }
+        self.extract.ungovernable |= self.acc.has_ungovernable_call();
+        self.extract.calls.extend(self.acc.build_calls());
+        self.acc = StreamingToolCallAccumulator::default();
+        self.finished.clear();
+        self.saw_tool_calls = false;
+    }
+
+    fn on_event(&mut self, event: &[u8]) {
+        match classify_event(event) {
+            SseEvent::Frame(frame) => {
+                if self.extract.model.is_none()
+                    && let Some(m) = frame.get("model").and_then(Value::as_str)
+                {
+                    self.extract.model = Some(m.to_string());
+                }
+                if self.extract.provider.is_none()
+                    && let Some(p) = detect_sse_provider(&frame)
+                {
+                    self.extract.provider = Some(p.as_str().to_string());
+                }
+                if frame_has_tool_calls(&frame) {
+                    self.saw_tool_calls = true;
+                    self.acc.push_frame(&frame);
+                }
+                collect_finished_choices(&frame, &self.acc, &mut self.finished);
+                // Every choice holding tool-call deltas has finished: the
+                // batch is complete (the live inspector's `batch_complete`).
+                if self.saw_tool_calls && self.acc.choices_finished(&self.finished) {
+                    self.seal_batch();
+                }
+            }
+            // `[DONE]` is a definitive batch boundary even when no
+            // `finish_reason` frame arrived.
+            SseEvent::Done => self.seal_batch(),
+            SseEvent::OtherData | SseEvent::NoData => {}
+        }
+    }
+}
+
 /// Accumulate the complete OpenAI tool calls from a fully-buffered SSE body.
 /// Used when a `text/event-stream` response is delivered on the buffered path
-/// (streaming inspection disabled, another buffering plugin, or a
-/// content-type-rewrite guard kept it buffered) instead of through the
-/// streaming inspector, so its tool calls are still governed rather than
-/// forwarded uninspected.
+/// (streaming inspection disabled, an encoded SSE response decoded first,
+/// another buffering plugin, or a content-type-rewrite guard kept it buffered)
+/// instead of through the streaming inspector, so its tool calls are still
+/// governed rather than forwarded uninspected. Batches are collected per
+/// completion boundary (see [`BufferedSseBatches`]) so every batch's calls are
+/// governed under their true names.
 fn extract_sse_tool_calls(body: &[u8]) -> BufferedSseExtract {
-    let mut extract = BufferedSseExtract {
-        calls: Vec::new(),
-        ungovernable: false,
-        model: None,
-        provider: None,
-    };
+    let mut batches = BufferedSseBatches::new();
     let Ok(text) = std::str::from_utf8(body) else {
         // Non-UTF-8 SSE bytes: nothing extractable, and not a governable tool
         // call — treat as no calls rather than ungovernable.
-        return extract;
+        return batches.extract;
     };
-    let mut acc = StreamingToolCallAccumulator::default();
     let mut event: Vec<&str> = Vec::new();
-    let flush = |event: &mut Vec<&str>,
-                 acc: &mut StreamingToolCallAccumulator,
-                 model: &mut Option<String>,
-                 provider: &mut Option<String>| {
-        if event.is_empty() {
-            return;
-        }
-        if let SseEvent::Frame(frame) = classify_event(event.join("\n").as_bytes()) {
-            if model.is_none()
-                && let Some(m) = frame.get("model").and_then(Value::as_str)
-            {
-                *model = Some(m.to_string());
-            }
-            if provider.is_none()
-                && let Some(p) = detect_sse_provider(&frame)
-            {
-                *provider = Some(p.as_str().to_string());
-            }
-            acc.push_frame(&frame);
-        }
-        event.clear();
-    };
     for raw in text.lines() {
         // SSE events are separated by a blank line.
         if raw.strip_suffix('\r').unwrap_or(raw).is_empty() {
-            flush(
-                &mut event,
-                &mut acc,
-                &mut extract.model,
-                &mut extract.provider,
-            );
+            if !event.is_empty() {
+                batches.on_event(event.join("\n").as_bytes());
+                event.clear();
+            }
         } else {
             event.push(raw);
         }
     }
-    flush(
-        &mut event,
-        &mut acc,
-        &mut extract.model,
-        &mut extract.provider,
-    );
-    // Surface the ungovernable state (missing name / non-string args) so the
-    // buffered path can fail closed exactly like the live streaming finalizer.
-    extract.calls = acc.build_calls();
-    extract.ungovernable = acc.has_ungovernable_call();
-    extract
+    if !event.is_empty() {
+        batches.on_event(event.join("\n").as_bytes());
+    }
+    // A trailing batch with no completion boundary (stream cut early) is
+    // still surfaced for governance — the mirror of the live inspector's
+    // `on_end` finalize.
+    batches.seal_batch();
+    batches.extract
 }
 
 fn tool_call_from(name: &str, args: Option<&Value>) -> ToolCall {

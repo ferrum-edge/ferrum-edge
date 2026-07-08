@@ -4517,3 +4517,255 @@ async fn buffered_sse_frame_model_keys_distinct_approvals() {
     }
     server.verify().await;
 }
+
+// ---------------------------------------------------------------------------
+// Round 12 review fixes: encoded SSE stays buffered under streaming configs,
+// opaque stream shape fails closed, buffered multi-batch reset, BOM-prefixed
+// SSE parsing
+// ---------------------------------------------------------------------------
+
+/// With streaming inspection ENABLED, an SSE label that carries a
+/// `Content-Encoding` must stay BUFFERED: the live inspector reads the raw
+/// (still-encoded) byte stream where compressed bytes parse as zero SSE
+/// events, so releasing it would forward denied tool calls ungoverned. The
+/// buffered path then decodes and governs (round-11 semantics), end to end.
+#[tokio::test]
+async fn encoded_sse_with_streaming_enabled_stays_buffered_and_is_governed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut streaming_ctx = create_test_context();
+    streaming_ctx
+        .metadata
+        .insert("ai_request_streaming".to_string(), "true".to_string());
+
+    // Plain SSE label: released to the live inspector.
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &streaming_ctx,
+        Some("text/event-stream"),
+        200,
+        &sse_headers()
+    ));
+    // Encoded SSE label: kept buffered so decode-then-govern runs.
+    let mut encoded_headers = sse_headers();
+    encoded_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(plugin.should_buffer_response_body_for_content_type(
+        &streaming_ctx,
+        Some("text/event-stream"),
+        200,
+        &encoded_headers
+    ));
+    // `identity` is not an encoding: still released.
+    let mut identity_headers = sse_headers();
+    identity_headers.insert("content-encoding".to_string(), "identity".to_string());
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &streaming_ctx,
+        Some("text/event-stream"),
+        200,
+        &identity_headers
+    ));
+
+    // End to end on the buffered path the hook now selects: denied call in a
+    // gzip'd SSE body rejects; allowed call forwards.
+    let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ai_request_streaming".to_string(), "true".to_string());
+    assert_reject(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &encoded_headers,
+                &gzip(SSE_DENIED_TOOL_BODY.as_bytes()),
+            )
+            .await,
+        Some(502),
+    );
+    let mut ctx = create_test_context();
+    ctx.metadata
+        .insert("ai_request_streaming".to_string(), "true".to_string());
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &encoded_headers,
+                &gzip(SSE_ALLOWED_TOOL_BODY.as_bytes()),
+            )
+            .await,
+    );
+}
+
+/// Defense in depth for the live inspector: a stream whose leading bytes are
+/// neither SSE-shaped nor JSON-shaped (e.g. gzip bytes whose
+/// `Content-Encoding` header a transform stripped) is opaque — it must be
+/// held in full and cut at end-of-stream in enforce mode rather than parsed
+/// as zero SSE events and forwarded ungoverned. Dry-run releases it
+/// unchanged.
+#[tokio::test]
+async fn opaque_stream_is_held_and_fails_closed_in_enforce() {
+    let compressed = gzip(SSE_DENIED_TOOL_BODY.as_bytes());
+    let (first, second) = compressed.split_at(2); // gzip magic alone resolves the sniff
+
+    let enforce = make(streaming_config(
+        json!({ "report.read": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = enforce
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[first, second]).await;
+    assert!(terminated, "opaque stream must be cut in enforce mode");
+    assert!(
+        !out.windows(2).any(|w| w == [0x1f, 0x8b]),
+        "held opaque bytes leaked"
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("ai_tool_governor_tool_blocked"),
+        "no terminal error event: {text}"
+    );
+
+    // Dry-run: held until end-of-stream, then released byte-for-byte.
+    let dry_run = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let ctx = create_test_context();
+    let mut inspector = dry_run
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[first, second]).await;
+    assert!(!terminated, "dry-run must not cut an opaque stream");
+    assert_eq!(out, compressed, "dry-run must release the bytes unchanged");
+}
+
+/// Two sequential tool-call batches in a buffered SSE body (same choice and
+/// tool indices, separated by a `finish_reason` boundary) must be governed as
+/// SEPARATE batches under their true names — without the batch reset the
+/// accumulator concatenates them (`safe` + `danger` -> `safedanger`) and a
+/// denied second call slides past `default_action: allow`.
+#[tokio::test]
+async fn buffered_multi_batch_sse_governs_second_batch_under_true_name() {
+    let plugin = make(json!({
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny" } }
+    }));
+    let two_batches = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"safe\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c2\",",
+        "\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers(), two_batches.as_bytes())
+            .await,
+        Some(502),
+    );
+
+    // Both batches allowed: forwarded, and each batch's call kept its true
+    // name (a concatenated `safesafe2` would be denied by an exact-name-only
+    // allowlist under default deny).
+    let strict = make(json!({
+        "default_action": "deny",
+        "tools": { "safe": { "action": "allow" }, "safe2": { "action": "allow" } }
+    }));
+    let allowed_batches = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"safe\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c2\",",
+        "\"function\":{\"name\":\"safe2\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        strict
+            .on_response_body(&mut ctx, 200, &sse_headers(), allowed_batches.as_bytes())
+            .await,
+    );
+
+    // `[DONE]` alone (no finish_reason) is also a batch boundary.
+    let done_separated = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"safe\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c2\",",
+        "\"function\":{\"name\":\"danger\",\"arguments\":\"{}\"}}]}}]}\n\n"
+    );
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers(), done_separated.as_bytes())
+            .await,
+        Some(502),
+    );
+}
+
+/// A UTF-8 BOM at the very start of an SSE body makes the first line
+/// `\u{feff}data: ...`; the parser must strip it so the FIRST event's denied
+/// call is not classified NoData and forwarded — on both the live streaming
+/// path and the buffered fallback.
+#[tokio::test]
+async fn bom_prefixed_sse_denied_call_is_caught_on_both_paths() {
+    let mut bom_body = b"\xEF\xBB\xBF".to_vec();
+    bom_body.extend_from_slice(SSE_DENIED_TOOL_BODY.as_bytes());
+
+    // Live streaming path.
+    let plugin = make(streaming_config(
+        json!({ "report.read": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[&bom_body]).await;
+    assert!(terminated, "BOM-prefixed denied call must cut the stream");
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("kubectl.apply"), "held frame leaked: {text}");
+
+    // Live path, allowed call: the BOM must not break release either.
+    let mut bom_allowed = b"\xEF\xBB\xBF".to_vec();
+    bom_allowed.extend_from_slice(SSE_ALLOWED_TOOL_BODY.as_bytes());
+    let allow_plugin = make(streaming_config(
+        json!({ "report.read": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = allow_plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[&bom_allowed]).await;
+    assert!(!terminated, "allowed BOM-prefixed stream must not be cut");
+    assert_eq!(out, bom_allowed, "released bytes must be unchanged");
+
+    // Buffered fallback (streaming inspection disabled: SSE label buffered).
+    let buffered = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_reject(
+        buffered
+            .on_response_body(&mut ctx, 200, &sse_headers(), &bom_body)
+            .await,
+        Some(502),
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        buffered
+            .on_response_body(&mut ctx, 200, &sse_headers(), &bom_allowed)
+            .await,
+    );
+}
