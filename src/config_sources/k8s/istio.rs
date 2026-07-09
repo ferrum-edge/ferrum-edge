@@ -3872,13 +3872,9 @@ fn mesh_cors_policy_from_value(cors: &Value) -> Option<MeshCorsPolicy> {
             Value::Object(map) => {
                 if let Some(prefix) = map.get("prefix").and_then(Value::as_str) {
                     MeshCorsOriginMatch::Prefix(prefix.to_string())
-                } else if let Some(regex) = map.get("regex").and_then(Value::as_str) {
-                    MeshCorsOriginMatch::Regex(regex.to_string())
                 } else {
-                    // `cors_allowed_origins` only emits the three shapes
-                    // above; anything else is a translatability bug upstream —
-                    // stay fail-closed rather than approximate.
-                    return None;
+                    let regex = map.get("regex").and_then(Value::as_str)?;
+                    MeshCorsOriginMatch::Regex(regex.to_string())
                 }
             }
             _ => return None,

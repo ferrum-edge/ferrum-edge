@@ -453,29 +453,25 @@ impl AiSemanticCache {
         }
 
         // Messages — the core of the cache key
-        if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-            start_key_part(&mut key_input, &mut has_part);
-            for (index, msg) in messages.iter().enumerate() {
-                if index > 0 {
-                    key_input.push('|');
-                }
-                let role = msg
-                    .get("role")
-                    .and_then(|r| r.as_str())
-                    .unwrap_or("unknown");
-                let content = self.extract_message_content(msg);
-                key_input.push_str(role);
-                key_input.push(':');
-                key_input.push_str(&content);
+        let messages = body.get("messages").and_then(|m| m.as_array())?;
+        start_key_part(&mut key_input, &mut has_part);
+        for (index, msg) in messages.iter().enumerate() {
+            if index > 0 {
+                key_input.push('|');
             }
-            // Sort for order-independence (optional — most LLM APIs are order-sensitive,
-            // but we sort to catch trivial reorderings of system/user messages)
-            // Actually, message order matters for conversation context, so we preserve order
-            // and only normalize content within each message.
-        } else {
-            // No messages array — not a chat completion request, skip caching
-            return None;
+            let role = msg
+                .get("role")
+                .and_then(|r| r.as_str())
+                .unwrap_or("unknown");
+            let content = self.extract_message_content(msg);
+            key_input.push_str(role);
+            key_input.push(':');
+            key_input.push_str(&content);
         }
+        // Sort for order-independence (optional — most LLM APIs are order-sensitive,
+        // but we sort to catch trivial reorderings of system/user messages)
+        // Actually, message order matters for conversation context, so we preserve order
+        // and only normalize content within each message.
 
         if let Some(fingerprint) = multimodal_fingerprint {
             start_key_part(&mut key_input, &mut has_part);
