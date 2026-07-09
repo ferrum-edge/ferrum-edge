@@ -516,12 +516,18 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
     async fn shutdown_all(&mut self) {
         let mut tasks = tokio::task::JoinSet::new();
         for (netns, mut guarded) in self.guarded.drain() {
-            if !guarded.handle.cleanup() {
-                warn!(
-                    netns_inode = netns,
-                    "Ambient UDP capture shutdown could not remove a retained fail-closed guard"
-                );
-            }
+            // Retained cleanup can spend several seconds in `iptables -w` for
+            // each family. Put it under the same bounded JoinSet as active and
+            // pending producer teardown so multiple guarded failures cannot
+            // serialize unbounded work ahead of the documented shutdown limit.
+            tasks.spawn_blocking(move || {
+                if !guarded.handle.cleanup() {
+                    warn!(
+                        netns_inode = netns,
+                        "Ambient UDP capture shutdown could not remove a retained fail-closed guard"
+                    );
+                }
+            });
         }
         for (_, active) in self.active.drain() {
             if let Some(handle) = active.handle.close() {
@@ -1089,7 +1095,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         );
         let setup_for_thread = setup_script;
         let teardown_pre = capture_teardown_script.clone();
-        let fail_closed_for_thread = fail_closed_script;
+        let fail_closed_for_thread = fail_closed_script.clone();
         let bind_result = super::netns_capture::run_in_netns(netns.as_ref(), move || {
             // Guard before touching stale state or attempting the unprivileged
             // bind. A workload that pre-bound the port can no longer win a
@@ -1144,9 +1150,27 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             warn!(
                 pod_uid = %target.pod_uid,
                 %error,
-                "Ambient UDP producer: could not remove pre-bind fail-closed guard; retaining guard and retrying"
+                "Ambient UDP producer: could not remove pre-bind fail-closed guard; restoring guard before abandoning live capture"
             );
-            teardown_capture_rules();
+            // Guard release can be partially successful (for example v4 jumps
+            // removed before a v6 xtables resource error). Reinstall and verify
+            // the scope-exact guard before removing live rules. If restoration
+            // itself fails, preserve the normal TPROXY rules until the next
+            // reconcile rather than creating a plaintext path; dropping the
+            // bound socket then remains fail-closed (socketless local delivery).
+            let restore_script = fail_closed_script;
+            let restored = super::netns_capture::run_in_netns(netns.as_ref(), move || {
+                run_shell_script(&restore_script)
+            });
+            if restored.is_ok() {
+                teardown_capture_rules();
+            } else if let Err(restore_error) = restored {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    error = %restore_error,
+                    "Ambient UDP producer: could not restore fail-closed guard after partial release; preserving live capture rules until retry"
+                );
+            }
             return NetnsUdpOpenResult::Guarded(retained_guard);
         }
 
@@ -1234,8 +1258,8 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
 /// only from inside a `setns`-bound thread ([`super::netns_capture::run_in_netns`]),
 /// so the child process inherits the pod netns — the same mechanism `ip netns
 /// exec` uses. An empty script is a no-op. Setup and guarded-to-live transition
-/// scripts carry `set -e`; final cleanup scripts use per-command `|| true`
-/// guards so already-absent state remains best-effort.
+/// scripts carry `set -e`; final cleanup removes guard jumps strictly, then uses
+/// per-command `|| true` guards for the remaining already-absent state.
 #[cfg(target_os = "linux")]
 fn run_shell_script(script: &str) -> std::io::Result<()> {
     if script.trim().is_empty() {

@@ -1002,10 +1002,11 @@ impl IptablesPlan {
     /// on pod removal, disabled-mode cleanup, or shutdown. Reuses the
     /// EXACT Ferrum-owned UDP teardown ([`Self::udp_teardown_split`] /
     /// [`Self::udp_teardown_v6_split`]) so producer cleanup and injector/node-agent
-    /// cleanup never diverge, including the dedicated fail-closed guards, and is
-    /// best-effort throughout (NO `set -e`): a
-    /// partially installed ruleset or an already-gone netns must not abort
-    /// teardown. The raw `ip`/`ip -6` routing teardown is emitted unconditionally
+    /// cleanup never diverge, including the dedicated fail-closed guards. Guard
+    /// OUTPUT jumps are removed exhaustively and treat resource errors as fatal,
+    /// so cleanup cannot report success with a duplicate DROP jump still active;
+    /// the remaining chain/routing teardown is best-effort for partial or
+    /// already-absent state. The raw `ip`/`ip -6` routing teardown is emitted unconditionally
     /// (it does not depend on `ip6tables`); only the `ip6tables`-TABLE teardown is
     /// guarded behind an `ip6tables` (`mangle`) availability probe.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -2174,7 +2175,11 @@ fn udp_capture_teardown_for(binary: &str) -> CleanupCommands {
 
 fn udp_fail_closed_chain_teardown_for(binary: &str, chain: &str) -> Vec<String> {
     vec![
-        idempotent_delete(binary, "mangle", "OUTPUT", &format!("-p udp -j {chain}")),
+        // A prior interrupted switch can leave duplicate jumps. Removing only
+        // one before flushing the chain would keep selected egress pointed at an
+        // empty/black-holing guard, so final cleanup uses the same strict loop as
+        // the guarded-to-live transition.
+        udp_strict_output_jump_release_for(binary, chain),
         flush_chain(binary, "mangle", chain),
         delete_chain(binary, "mangle", chain),
     ]
@@ -3597,6 +3602,15 @@ mod tests {
         );
         // v6 table teardown guarded behind the ip6tables (mangle) probe...
         assert!(script.contains("command -v ip6tables") && script.contains("ip6tables -t mangle"));
+        for chain in [UDP_FAIL_CLOSED_CHAIN_A, UDP_FAIL_CLOSED_CHAIN_B] {
+            assert!(
+                script.contains(&format!(
+                    "while true; do\n  if iptables -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} \
+                     -C OUTPUT -p udp -j {chain}"
+                )),
+                "teardown must loop over every duplicate v4 guard jump for {chain}: {script}"
+            );
+        }
         // ...but v6 routing (`ip -6`) emitted UNCONDITIONALLY (not behind the probe).
         assert!(
             script.contains(&format!(

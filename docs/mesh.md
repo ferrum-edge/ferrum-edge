@@ -1984,9 +1984,10 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   and activate a replacement before removing the prior guard; a workload that
   pre-binds the capture port therefore gets DROP, never plaintext bypass. The guard is
   removed only after the socket is adopted and the full TPROXY ruleset is live. Failed
-  attempts leave a stable-netns cleanup handle with the manager, so pod removal and
-  pod removal retains ownership of guard cleanup and retries transient errors; shutdown
-  attempts cleanup through that same stable handle. Cleanup strictly detaches any
+  attempts leave a stable-netns cleanup handle with the manager, so pod removal
+  retains ownership of guard cleanup and retries transient errors; shutdown
+  attempts cleanup through that same stable handle inside the bounded teardown set.
+  Cleanup removes every duplicate guard jump and strictly detaches any
   partial live-capture OUTPUT path before releasing the guard. The guarded-to-live
   switch propagates xtables resource errors and also probes stale IPv6 guard chains
   independently of the current IPv6 setting. The
