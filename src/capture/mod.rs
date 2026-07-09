@@ -959,6 +959,24 @@ impl IptablesPlan {
         chunks.join("\n")
     }
 
+    /// Strictly detach the normal UDP capture path from locally generated
+    /// traffic while a retained fail-closed guard is still active. Abandonment
+    /// cleanup runs this before releasing the guard: if a partial live setup left
+    /// the OUTPUT-mark jump behind, an xtables error must not expose that
+    /// socketless TPROXY path after the DROP guard is removed.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn udp_capture_output_release_script() -> String {
+        let mut chunks = vec!["set -e".to_string()];
+        chunks.push(udp_strict_output_jump_release_for(
+            "iptables",
+            "FERRUM_MESH_UDP_OUTPUT_MARK",
+        ));
+        let v6_release =
+            udp_strict_output_jump_release_for("ip6tables", "FERRUM_MESH_UDP_OUTPUT_MARK");
+        chunks.push(ip6tables_strict_probe_guard(&v6_release, "mangle"));
+        chunks.join("\n")
+    }
+
     /// Remove the normal UDP capture chains/routing while leaving any active
     /// fail-closed guard intact. The producer uses this after installing the
     /// guard and before binding/rebuilding the live capture path.
@@ -1373,8 +1391,8 @@ fn udp_fail_closed_commands_for_family(
     let jump_b = format!("-p udp -j {UDP_FAIL_CLOSED_CHAIN_B}");
     let a_active =
         format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump_a} 2>/dev/null");
-    let release_a = udp_fail_closed_release_jump_for(binary, UDP_FAIL_CLOSED_CHAIN_A);
-    let release_b = udp_fail_closed_release_jump_for(binary, UDP_FAIL_CLOSED_CHAIN_B);
+    let release_a = udp_strict_output_jump_release_for(binary, UDP_FAIL_CLOSED_CHAIN_A);
+    let release_b = udp_strict_output_jump_release_for(binary, UDP_FAIL_CLOSED_CHAIN_B);
     let replace_a = [
         release_b.clone(),
         build_b.join("\n"),
@@ -2180,7 +2198,7 @@ fn udp_fail_closed_release_for(binary: &str) -> Vec<String> {
         .into_iter()
         .flat_map(|chain| {
             [
-                udp_fail_closed_release_jump_for(binary, chain),
+                udp_strict_output_jump_release_for(binary, chain),
                 flush_chain(binary, "mangle", chain),
                 delete_chain(binary, "mangle", chain),
             ]
@@ -2188,7 +2206,7 @@ fn udp_fail_closed_release_for(binary: &str) -> Vec<String> {
         .collect()
 }
 
-fn udp_fail_closed_release_jump_for(binary: &str, chain: &str) -> String {
+fn udp_strict_output_jump_release_for(binary: &str, chain: &str) -> String {
     let jump = format!("-p udp -j {chain}");
     format!(
         "while true; do\n  if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump} 2>/dev/null; then\n    {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D OUTPUT {jump}\n  else\n    status=$?\n    if [ \"$status\" -eq 1 ]; then\n      break\n    fi\n    echo \"{binary} could not check OUTPUT jump {chain} (status $status)\" >&2\n    exit \"$status\"\n  fi\ndone"
@@ -3608,6 +3626,12 @@ mod tests {
         assert!(guard_only.contains("status=$?"));
         assert!(guard_only.contains("exit \"$status\""));
         assert!(guard_only.contains("ip6tables -t mangle"));
+
+        let capture_output = IptablesPlan::udp_capture_output_release_script();
+        assert!(capture_output.starts_with("set -e\n"));
+        assert!(capture_output.contains("-D OUTPUT -p udp -j FERRUM_MESH_UDP_OUTPUT_MARK"));
+        assert!(capture_output.contains("status=$?"));
+        assert!(capture_output.contains("ip6tables -t mangle"));
     }
 
     #[test]
