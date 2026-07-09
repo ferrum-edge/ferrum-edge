@@ -5762,3 +5762,207 @@ async fn bom_prefixed_json_governed_hash_skips_final_recheck() {
     ); // unchanged raw bytes -> hash match -> skip, no webhook #2
     server.verify().await;
 }
+
+// ---------------------------------------------------------------------------
+// Round 17 review fixes
+// ---------------------------------------------------------------------------
+
+/// P2 (:2326): a streaming-only config (`response_tool_calls: false`,
+/// `streaming_response_tool_calls: true`) with a NON-streaming request buffers
+/// an SSE body OUTSIDE this plugin. `on_response_body` governs it via the
+/// SSE-shape branch regardless of `request_is_streaming`; the final re-check
+/// must agree. Previously the `governs_buffered_json` gate ran BEFORE the SSE
+/// branch and early-returned, so a later transform that injected/rewrote an SSE
+/// `data:` frame with a denied tool call escaped the final re-check. It is now
+/// re-governed: enforce rejects, dry-run forwards, and an UNCHANGED SSE body
+/// still hash-skips (no duplicate webhook).
+#[tokio::test]
+async fn final_recheck_governs_externally_buffered_sse_for_streaming_only_config() {
+    // Enforce: the raw backend SSE body is allowed (governed by
+    // `on_response_body`), then a transform rewrites its frame into a DENIED
+    // call. The final re-check must reject instead of early-returning.
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = create_test_context(); // non-streaming request (no stream markers)
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &sse_headers(),
+                SSE_ALLOWED_TOOL_BODY.as_bytes(),
+            )
+            .await,
+    );
+    // A later `response_transformer` body rule rewrote the SSE frame to a denied
+    // tool call (hash changed): the final re-check re-governs and fails closed.
+    assert_reject(
+        plugin
+            .on_final_response_body(
+                &mut ctx,
+                200,
+                &sse_headers(),
+                SSE_DENIED_TOOL_BODY.as_bytes(),
+            )
+            .await,
+        Some(502),
+    );
+
+    // Dry-run: the same injection is recorded but forwarded, never rejected.
+    let dry = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(
+        dry.on_response_body(
+            &mut ctx,
+            200,
+            &sse_headers(),
+            SSE_ALLOWED_TOOL_BODY.as_bytes(),
+        )
+        .await,
+    );
+    assert_continue(
+        dry.on_final_response_body(
+            &mut ctx,
+            200,
+            &sse_headers(),
+            SSE_DENIED_TOOL_BODY.as_bytes(),
+        )
+        .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("deny"),
+        "dry-run must record the would-be denial from the final SSE re-check"
+    );
+}
+
+/// P2 (:2326): an UNCHANGED externally-buffered SSE body — a streaming-only
+/// config, non-streaming request, `require_approval` tool — is governed once in
+/// `on_response_body` and hash-skipped by the final re-check, so the approval
+/// webhook fires exactly once even though the final re-check now runs (it did
+/// not before the gate reorder). Guards against a duplicate webhook regression.
+#[tokio::test]
+async fn final_recheck_unchanged_buffered_sse_skips_second_webhook() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    let body = concat!(
+        "data: {\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"deploy\",\"arguments\":\"{\\\"env\\\":\\\"prod\\\"}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let mut ctx = create_test_context(); // non-streaming request
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+            .await,
+    ); // webhook #1 (approved)
+    // Identical bytes: the recorded SSE hash matches, so the final re-check
+    // hash-skips before re-governing — no webhook #2.
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &sse_headers(), body.as_bytes())
+            .await,
+    );
+    server.verify().await;
+}
+
+/// P3 (:1272): in `dry_run` with request tool-definition inspection AND MCP/A2A
+/// request inspection, a request JSON exposing a DISALLOWED `tools[]` definition
+/// records `decision=deny`, then execution continues and a later ALLOWED MCP
+/// (or A2A) method in the same object must NOT clobber the metadata back to
+/// `allow`. The recorded aggregate decision is sticky-deny so dry-run rollout
+/// logs do not under-report would-be-rejected requests.
+#[tokio::test]
+async fn dry_run_request_decision_is_sticky_deny_across_surfaces() {
+    // Disallowed tool DEFINITION (default deny) + allowed MCP `tools/call` in
+    // one JSON object.
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "safe_mcp_tool": { "action": "allow" } },
+        "inspect": {
+            "request_tool_definitions": true,
+            "mcp_tool_calls": true,
+            "response_tool_calls": false
+        }
+    }));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "model": "gpt-4o",
+            "tools": [
+                { "type": "function", "function": { "name": "dangerous_tool" } }
+            ],
+            "method": "tools/call",
+            "params": { "name": "safe_mcp_tool", "arguments": {} }
+        })
+        .to_string(),
+    );
+    let mut headers = json_headers();
+    // Dry-run never rejects, but the definition deny is recorded first...
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    // ...and the later allowed MCP call must not downgrade it.
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("deny"),
+        "an allowed MCP call must not clobber an earlier definition deny in dry-run"
+    );
+
+    // Same guarantee for an allowed A2A method after a denied definition.
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "safe.a2a": { "action": "allow" } },
+        "inspect": {
+            "request_tool_definitions": true,
+            "a2a_methods": true,
+            "response_tool_calls": false
+        }
+    }));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "tools": [
+                { "type": "function", "function": { "name": "dangerous_tool" } }
+            ],
+            "method": "safe.a2a",
+            "params": {}
+        })
+        .to_string(),
+    );
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("deny"),
+        "an allowed A2A method must not clobber an earlier definition deny in dry-run"
+    );
+}

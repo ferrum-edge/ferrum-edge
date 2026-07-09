@@ -263,7 +263,11 @@ config:
 
 `dry_run` records `ai_tool_governor.decision` (what *would* have happened) without
 blocking any request — use it to observe policy impact before switching to
-`enforce`.
+`enforce`. When one request or response exposes several governable surfaces (a
+`tools[]` definition plus an MCP/A2A call, or multiple response tool calls), the
+recorded `decision` keeps the **highest-severity** outcome across them: a later
+allowed surface never downgrades an earlier `deny`, so rollout logs do not
+under-report requests that `enforce` would have rejected.
 
 ## Observability metadata
 

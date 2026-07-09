@@ -396,6 +396,28 @@ fn label_rank(label: &str) -> u8 {
     }
 }
 
+/// Record the aggregate `ai_tool_governor.decision` metadata, keeping the
+/// HIGHEST-severity label seen across every inspected surface of one request or
+/// response. A single request JSON can carry several governable surfaces (a
+/// `tools[]` definition, an MCP `tools/call`, an A2A method), each governed and
+/// metadata-written in turn; in `dry_run` inspection CONTINUES past a blocking
+/// surface so a later allowed surface would otherwise clobber an earlier
+/// `deny` and under-report would-be-rejected requests in rollout logs. Ranking
+/// by `label_rank` (mirroring the per-batch `overall_label` aggregation) makes a
+/// recorded `deny`/`approval_denied` STICKY — an `allow` never downgrades it —
+/// while a higher-severity label still upgrades a recorded `allow`. Enforce mode
+/// is unaffected: it rejects at the first blocking surface, so no later write
+/// runs to clobber the decision.
+fn set_decision_metadata(m: &mut HashMap<String, String>, label: &str) {
+    let keep_existing = m
+        .get("ai_tool_governor.decision")
+        .is_some_and(|existing| label_rank(existing) >= label_rank(label));
+    if keep_existing {
+        return;
+    }
+    m.insert("ai_tool_governor.decision".to_string(), label.to_string());
+}
+
 impl GovernorEngine {
     /// Deterministic evaluation of one tool call. Returns the outcome, whether
     /// an explicit policy matched, and the call's risk.
@@ -1103,10 +1125,9 @@ impl AiToolGovernor {
             "ai_tool_governor.mode".to_string(),
             self.engine.mode.as_str().to_string(),
         );
-        m.insert(
-            "ai_tool_governor.decision".to_string(),
-            batch.overall_label.to_string(),
-        );
+        // Sticky aggregate: an earlier surface's `deny` in one request/response
+        // is never downgraded by this batch's `allow` (see `set_decision_metadata`).
+        set_decision_metadata(m, batch.overall_label);
 
         let tool_names: Vec<&str> = batch.per_call.iter().map(|c| c.name.as_str()).collect();
         if !tool_names.is_empty() {
@@ -1206,7 +1227,7 @@ impl AiToolGovernor {
                 "ai_tool_governor.mode".to_string(),
                 self.engine.mode.as_str().to_string(),
             );
-            m.insert("ai_tool_governor.decision".to_string(), "deny".to_string());
+            set_decision_metadata(m, "deny");
         }
         PluginResult::Reject {
             status_code: self.engine.response.deny_status_code,
@@ -1328,7 +1349,7 @@ impl AiToolGovernor {
             "ai_tool_governor.mode".to_string(),
             self.engine.mode.as_str().to_string(),
         );
-        m.insert("ai_tool_governor.decision".to_string(), "deny".to_string());
+        set_decision_metadata(m, "deny");
         m.insert("ai_tool_governor.tool_names".to_string(), denied.join(","));
     }
 
@@ -2320,18 +2341,16 @@ impl Plugin for AiToolGovernor {
         if !(200..300).contains(&response_status) {
             return PluginResult::Continue;
         }
-        // Mirror `on_response_body`: a streaming-only config re-checks a buffered
-        // JSON body only for a streaming request's SSE fallback.
-        if !self.governs_buffered_json(ctx) {
-            return PluginResult::Continue;
-        }
         if body.is_empty() {
             return PluginResult::Continue;
         }
 
         // Unchanged since `on_response_body` governed the raw backend body: no
         // transform rewrote it, so re-governing would only risk a duplicate
-        // approval webhook.
+        // approval webhook. This hash-skip runs BEFORE the `governs_buffered_json`
+        // gate so an unchanged SSE body — governed by `on_response_body` when the
+        // buffering came from OUTSIDE this plugin, regardless of whether the
+        // request was streaming — is not re-governed (no duplicate webhook).
         let final_hash = sha256_hex_bytes(body);
         if ctx.metadata.get(GOVERNED_RESPONSE_HASH_KEY) == Some(&final_hash) {
             return PluginResult::Continue;
@@ -2358,11 +2377,31 @@ impl Plugin for AiToolGovernor {
         // instead of bypassing it. Encoded bytes never look like SSE; the
         // content-encoding branch below applies the same checks to the
         // DECODED bytes.
+        //
+        // This SSE branch runs BEFORE the `governs_buffered_json` gate below,
+        // exactly as `on_response_body` routes `looks_like_sse` bodies before
+        // its own `governs_buffered_json` gate: an SSE body buffered OUTSIDE
+        // this plugin (a `response_transformer` body rule, `response_body_mode:
+        // Buffer`, or another plugin) is governed regardless of whether the
+        // request was streaming, so a later transform that injects/relabels an
+        // SSE `data:` frame with a denied tool call — even when only
+        // `streaming_response_tool_calls` is enabled and the request is
+        // non-streaming — is fail-closed re-checked here instead of escaping via
+        // the JSON-fallback streaming gate.
         if content_encoding_value(response_headers).is_none()
             && (looks_like_sse(body)
                 || (is_event_stream_content_type(content_type) && !looks_like_json(body)))
         {
             return self.govern_buffered_sse(ctx, body).await;
+        }
+
+        // Mirror `on_response_body`'s post-SSE gate: a streaming-only config
+        // re-checks a buffered JSON body (and the encoded-body decode below)
+        // only for a streaming request's SSE fallback, never an ordinary
+        // non-streaming JSON response. The SSE-shaped/labelled branch above is
+        // deliberately NOT gated by this, matching `on_response_body`.
+        if !self.governs_buffered_json(ctx) {
+            return PluginResult::Continue;
         }
 
         // Plaintext parse first: covers unencoded bodies and a spurious
