@@ -97,8 +97,10 @@ use super::{
     ResponseStreamInspector,
 };
 
-/// Default deny status code for blocked tool calls / definitions.
-const DEFAULT_DENY_STATUS: u16 = 502;
+/// Default status for deterministic policy denials. Operational failures where
+/// a governed body cannot be inspected remain `502 Bad Gateway`.
+const DEFAULT_DENY_STATUS: u16 = 403;
+const UNINSPECTABLE_STATUS: u16 = 502;
 /// Default redaction placeholder template (`{name}` → matched-pattern name).
 const DEFAULT_REDACTION_PLACEHOLDER: &str = "[REDACTED_TOOL_ARG:{name}]";
 /// Default approval webhook timeout.
@@ -292,7 +294,7 @@ struct ApprovalConfig {
     timeout: Duration,
     cache_ttl: Duration,
     fail_on_error: FailOnError,
-    include_prompt_excerpt: bool,
+    include_arguments: bool,
 }
 
 /// Response-shaping configuration.
@@ -390,6 +392,9 @@ struct CallDecision {
     risk: RiskLevel,
     label: &'static str,
     blocks: bool,
+    /// Operational fail-closed rejection rather than a deterministic policy
+    /// denial. These retain `502 Bad Gateway` semantics.
+    fail_closed: bool,
     redact_patterns: Vec<String>,
     approval_id: Option<String>,
     arguments_hash: Option<String>,
@@ -401,6 +406,7 @@ struct BatchDecision {
     per_call: Vec<CallDecision>,
     /// True when at least one call blocks *and* mode is enforce.
     enforce_blocks: bool,
+    fail_closed: bool,
     overall_label: &'static str,
     max_risk: RiskLevel,
     deny_reason: Option<String>,
@@ -438,36 +444,39 @@ fn set_decision_metadata(m: &mut HashMap<String, String>, label: &str) {
     m.insert("ai_tool_governor.decision".to_string(), label.to_string());
 }
 
-/// Keep the reported tool names aligned with the highest-severity decision.
-/// A higher-severity batch replaces names from a weaker decision, while an
-/// equal-severity batch merges names so multiple inspected surfaces or plugin
-/// instances cannot hide one another's findings.
-fn set_tool_names_metadata(
+/// Keep comma-delimited decision metadata aligned with the highest-severity
+/// decision. A higher-severity batch replaces values from a weaker decision,
+/// while an equal-severity batch merges values so multiple inspected surfaces
+/// or plugin instances cannot hide one another's findings.
+fn set_ranked_csv_metadata(
     m: &mut HashMap<String, String>,
+    key: &str,
     previous_rank: u8,
     batch_rank: u8,
-    tool_names: &[&str],
+    values: &[&str],
 ) {
-    if tool_names.is_empty() || batch_rank < previous_rank {
+    if batch_rank < previous_rank {
         return;
     }
     if batch_rank > previous_rank {
-        m.insert(
-            "ai_tool_governor.tool_names".to_string(),
-            tool_names.join(","),
-        );
+        if values.is_empty() {
+            m.remove(key);
+        } else {
+            m.insert(key.to_string(), values.join(","));
+        }
+        return;
+    }
+    if values.is_empty() {
         return;
     }
 
-    let existing = m
-        .entry("ai_tool_governor.tool_names".to_string())
-        .or_default();
-    for name in tool_names {
-        if !existing.split(',').any(|value| value == *name) {
+    let existing = m.entry(key.to_string()).or_default();
+    for value in values {
+        if !existing.split(',').any(|existing| existing == *value) {
             if !existing.is_empty() {
                 existing.push(',');
             }
-            existing.push_str(name);
+            existing.push_str(value);
         }
     }
 }
@@ -620,22 +629,21 @@ impl GovernorEngine {
         redaction_unavailable: bool,
     ) -> BatchDecision {
         let mut per_call = Vec::with_capacity(calls.len());
+        // Evaluation can run JSON Schema validation and every configured
+        // blocked-argument regex. Cache it for the deterministic-denial
+        // pre-scan and the main loop instead of doing that work twice.
+        let evaluations: Vec<_> = calls
+            .iter()
+            .map(|call| self.evaluate(&call.name, &call.raw_args, call.parsed_args.as_ref()))
+            .collect();
         let skip_approvals = self.mode == Mode::Enforce
-            && calls.iter().any(|call| {
-                let (outcome, _, _) =
-                    self.evaluate(&call.name, &call.raw_args, call.parsed_args.as_ref());
-                match outcome {
-                    PolicyOutcome::Deny(_) => true,
-                    PolicyOutcome::Redact(patterns) => {
-                        redaction_unavailable && !patterns.is_empty()
-                    }
-                    _ => false,
-                }
+            && evaluations.iter().any(|(outcome, _, _)| match outcome {
+                PolicyOutcome::Deny(_) => true,
+                PolicyOutcome::Redact(patterns) => redaction_unavailable && !patterns.is_empty(),
+                _ => false,
             });
 
-        for call in calls {
-            let (outcome, matched, risk) =
-                self.evaluate(&call.name, &call.raw_args, call.parsed_args.as_ref());
+        for (call, (outcome, matched, risk)) in calls.iter().zip(evaluations) {
             let arguments_hash = self
                 .observability
                 .hash_arguments
@@ -647,6 +655,7 @@ impl GovernorEngine {
                 risk,
                 label: "allow",
                 blocks: false,
+                fail_closed: false,
                 redact_patterns: Vec::new(),
                 approval_id: None,
                 arguments_hash: arguments_hash.clone(),
@@ -668,6 +677,7 @@ impl GovernorEngine {
                     if redaction_unavailable && !patterns.is_empty() {
                         cd.label = "deny";
                         cd.blocks = true;
+                        cd.fail_closed = true;
                         cd.reason = Some(format!(
                             "tool '{}' matched a redact_args policy on a path where arguments cannot be redacted in place (failing closed)",
                             call.name
@@ -712,6 +722,7 @@ impl GovernorEngine {
 
         let enforce = self.mode == Mode::Enforce;
         let enforce_blocks = enforce && per_call.iter().any(|c| c.blocks);
+        let fail_closed = per_call.iter().any(|c| c.blocks && c.fail_closed);
         let overall_label = per_call
             .iter()
             .map(|c| c.label)
@@ -730,6 +741,7 @@ impl GovernorEngine {
         BatchDecision {
             per_call,
             enforce_blocks,
+            fail_closed,
             overall_label,
             max_risk,
             deny_reason,
@@ -759,6 +771,7 @@ impl GovernorEngine {
             // reachable; defensively fail closed.
             cd.label = "approval_denied";
             cd.blocks = true;
+            cd.fail_closed = true;
             cd.reason = Some("approval endpoint not configured".to_string());
             return;
         };
@@ -789,6 +802,7 @@ impl GovernorEngine {
                 FailOnError::Reject => {
                     cd.label = "approval_denied";
                     cd.blocks = true;
+                    cd.fail_closed = true;
                     cd.reason = Some(format!("approval endpoint error: {err}"));
                 }
                 FailOnError::Warn => {
@@ -910,7 +924,7 @@ impl GovernorEngine {
                 map.insert("provider".to_string(), json!(v));
             }
             // Raw arguments are sent only when explicitly opted in.
-            if approval.include_prompt_excerpt {
+            if approval.include_arguments {
                 map.insert("arguments".to_string(), json!(input.raw_args));
             }
         }
@@ -1225,7 +1239,13 @@ impl AiToolGovernor {
         set_decision_metadata(m, batch.overall_label);
 
         let tool_names: Vec<&str> = batch.per_call.iter().map(|c| c.name.as_str()).collect();
-        set_tool_names_metadata(m, previous_rank, batch_rank, &tool_names);
+        set_ranked_csv_metadata(
+            m,
+            "ai_tool_governor.tool_names",
+            previous_rank,
+            batch_rank,
+            &tool_names,
+        );
 
         // Risk is an independent aggregate: keep the maximum observed value
         // even when a later lower-risk batch cannot downgrade the sticky
@@ -1245,12 +1265,13 @@ impl AiToolGovernor {
             .filter(|c| c.matched_policy)
             .map(|c| c.name.as_str())
             .collect();
-        if !policy_ids.is_empty() {
-            m.insert(
-                "ai_tool_governor.policy_ids".to_string(),
-                policy_ids.join(","),
-            );
-        }
+        set_ranked_csv_metadata(
+            m,
+            "ai_tool_governor.policy_ids",
+            previous_rank,
+            batch_rank,
+            &policy_ids,
+        );
 
         let approval_ids: Vec<&str> = batch
             .per_call
@@ -1298,7 +1319,11 @@ impl AiToolGovernor {
             .clone()
             .unwrap_or_else(|| "tool call blocked by policy".to_string());
         PluginResult::Reject {
-            status_code: self.engine.response.deny_status_code,
+            status_code: if batch.fail_closed {
+                UNINSPECTABLE_STATUS
+            } else {
+                self.engine.response.deny_status_code
+            },
             body: format!(
                 r#"{{"error":"AI tool call blocked by ai_tool_governor policy","decision":"{}","detail":"{}"}}"#,
                 batch.overall_label,
@@ -1328,7 +1353,7 @@ impl AiToolGovernor {
             set_decision_metadata(m, "deny");
         }
         PluginResult::Reject {
-            status_code: self.engine.response.deny_status_code,
+            status_code: UNINSPECTABLE_STATUS,
             body: format!(
                 r#"{{"error":"ai_tool_governor: {} cannot be inspected","decision":"deny","detail":"{}"}}"#,
                 escape_json_string(surface),
@@ -1348,18 +1373,30 @@ impl AiToolGovernor {
                 return PluginResult::Continue;
             }
             let mut calls = Vec::new();
+            let mut malformed_mcp_call = false;
             for entry in entries {
-                if self.inspect.mcp_tool_calls
-                    && let Some(call) = extract_mcp_tool_call(entry)
-                {
-                    calls.push(call);
-                    continue;
+                if self.inspect.mcp_tool_calls {
+                    match extract_mcp_tool_call(entry) {
+                        McpToolCallExtraction::Call(call) => {
+                            calls.push(call);
+                            continue;
+                        }
+                        McpToolCallExtraction::Malformed => malformed_mcp_call = true,
+                        McpToolCallExtraction::Absent => {}
+                    }
                 }
                 if self.inspect.a2a_methods
                     && let Some(call) = extract_a2a_method(entry)
                 {
                     calls.push(call);
                 }
+            }
+            if malformed_mcp_call && self.engine.mode == Mode::Enforce {
+                return self.reject_uninspectable(
+                    ctx,
+                    "request body",
+                    "request contains an MCP tools/call whose name cannot be policy-checked",
+                );
             }
             if calls.is_empty() {
                 return PluginResult::Continue;
@@ -1407,16 +1444,26 @@ impl AiToolGovernor {
         }
 
         // 2. MCP tools/call (direct JSON-RPC body parsing).
-        if self.inspect.mcp_tool_calls
-            && let Some(call) = extract_mcp_tool_call(json)
-        {
-            let batch = self
-                .engine
-                .govern_calls(&corr, &[call], &ctx.plugin_http_call_ns, true)
-                .await;
-            self.write_metadata(ctx, &batch);
-            if batch.enforce_blocks {
-                return self.reject(&batch);
+        if self.inspect.mcp_tool_calls {
+            match extract_mcp_tool_call(json) {
+                McpToolCallExtraction::Call(call) => {
+                    let batch = self
+                        .engine
+                        .govern_calls(&corr, &[call], &ctx.plugin_http_call_ns, true)
+                        .await;
+                    self.write_metadata(ctx, &batch);
+                    if batch.enforce_blocks {
+                        return self.reject(&batch);
+                    }
+                }
+                McpToolCallExtraction::Malformed if self.engine.mode == Mode::Enforce => {
+                    return self.reject_uninspectable(
+                        ctx,
+                        "request body",
+                        "request contains an MCP tools/call whose name cannot be policy-checked",
+                    );
+                }
+                McpToolCallExtraction::Malformed | McpToolCallExtraction::Absent => {}
             }
         }
 
@@ -1453,7 +1500,23 @@ impl AiToolGovernor {
             .unwrap_or(0);
         set_decision_metadata(m, "deny");
         let denied: Vec<&str> = denied.iter().map(String::as_str).collect();
-        set_tool_names_metadata(m, previous_rank, label_rank("deny"), &denied);
+        set_ranked_csv_metadata(
+            m,
+            "ai_tool_governor.tool_names",
+            previous_rank,
+            label_rank("deny"),
+            &denied,
+        );
+        // A definition denial has no concrete matched-policy ID. If it upgrades
+        // an earlier allowed decision, remove that weaker decision's IDs; at
+        // equal deny severity, preserve IDs from other denied surfaces.
+        set_ranked_csv_metadata(
+            m,
+            "ai_tool_governor.policy_ids",
+            previous_rank,
+            label_rank("deny"),
+            &[],
+        );
     }
 
     /// Redact `redact_args` matches in a buffered response body. Deterministic
@@ -1908,7 +1971,8 @@ impl Plugin for AiToolGovernor {
         // still caught by `looks_like_json`.
         let json_ct = header_value(headers, "content-type")
             .is_some_and(is_governable_json_request_content_type);
-        if !json_ct && !looks_like_json(body) {
+        let json_shaped = looks_like_json(body);
+        if !json_ct && !json_shaped {
             return PluginResult::Continue;
         }
 
@@ -1996,7 +2060,7 @@ impl Plugin for AiToolGovernor {
         // request another plugin merely buffered is not rejected here.
         let Some(json) = json else {
             let was_governed = self.request_hash(ctx).is_some();
-            if self.engine.mode == Mode::Enforce && (json_ct || was_governed) {
+            if self.engine.mode == Mode::Enforce && (json_ct || json_shaped || was_governed) {
                 return self.reject_uninspectable(
                     ctx,
                     "request body",
@@ -3965,14 +4029,30 @@ fn extract_request_tool_definitions(json: &Value) -> Vec<String> {
     names
 }
 
-/// Extract a single tool call from an MCP JSON-RPC `tools/call` request.
-fn extract_mcp_tool_call(json: &Value) -> Option<ToolCall> {
+enum McpToolCallExtraction {
+    Absent,
+    Call(ToolCall),
+    Malformed,
+}
+
+/// Extract a single tool call from an MCP JSON-RPC `tools/call` request while
+/// preserving the distinction between an unrelated JSON-RPC method and a
+/// governed call whose name cannot be policy-checked.
+fn extract_mcp_tool_call(json: &Value) -> McpToolCallExtraction {
     if json.get("method").and_then(Value::as_str) != Some("tools/call") {
-        return None;
+        return McpToolCallExtraction::Absent;
     }
-    let params = json.get("params")?;
-    let name = params.get("name").and_then(Value::as_str)?;
-    Some(tool_call_from(name, params.get("arguments")))
+    let Some(params) = json.get("params") else {
+        return McpToolCallExtraction::Malformed;
+    };
+    let Some(name) = params
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    else {
+        return McpToolCallExtraction::Malformed;
+    };
+    McpToolCallExtraction::Call(tool_call_from(name, params.get("arguments")))
 }
 
 /// Extract an A2A JSON-RPC method as a name-governed "tool" (params as args).
@@ -4530,10 +4610,10 @@ fn parse_approval(
         }
     };
 
-    let include_prompt_excerpt = match obj.get("include_prompt_excerpt") {
+    let include_arguments = match obj.get("include_arguments") {
         None => false,
         Some(v) => v.as_bool().ok_or_else(|| {
-            "ai_tool_governor: 'approval.include_prompt_excerpt' must be a boolean".to_string()
+            "ai_tool_governor: 'approval.include_arguments' must be a boolean".to_string()
         })?,
     };
 
@@ -4544,7 +4624,7 @@ fn parse_approval(
         timeout: Duration::from_millis(timeout_ms),
         cache_ttl: Duration::from_secs(cache_ttl_seconds),
         fail_on_error,
-        include_prompt_excerpt,
+        include_arguments,
     }))
 }
 

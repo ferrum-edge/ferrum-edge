@@ -15153,7 +15153,7 @@ components:
           properties:
             endpoint_url:
               type: string
-              description: "http/https URL POSTed with request_id, consumer, proxy, model, provider, tool_name, arguments_hash, risk (and raw arguments only when include_prompt_excerpt=true). Response: {\"decision\":\"allow|deny\"} or {\"allow\":true|false}, optional approval_id."
+              description: "http/https URL POSTed with request_id, consumer, proxy, model, provider, tool_name, arguments_hash, risk (and raw arguments only when include_arguments=true). Response: {\"decision\":\"allow|deny\"} or {\"allow\":true|false}, optional approval_id."
             timeout_ms:
               type: integer
               minimum: 1
@@ -15162,6 +15162,7 @@ components:
             cache_ttl_seconds:
               type: integer
               minimum: 0
+              maximum: 2592000
               default: 300
               description: "TTL for caching an approval decision keyed by consumer+proxy+model+provider+tool+arguments. 0 disables caching. The cache is bounded (4096 entries); at capacity expired entries are purged and new decisions are not cached rather than growing memory."
             fail_on_error:
@@ -15169,7 +15170,7 @@ components:
               enum: [reject, warn, allow]
               default: reject
               description: "Behavior when the approval endpoint cannot be evaluated: reject fails closed, warn/allow fail open."
-            include_prompt_excerpt:
+            include_arguments:
               type: boolean
               default: false
               description: "Include the raw tool arguments in the approval request body. Off by default so secrets are not sent."
@@ -15180,8 +15181,8 @@ components:
               type: integer
               minimum: 100
               maximum: 599
-              default: 502
-              description: "HTTP status returned when a tool call/definition is blocked in enforce mode."
+              default: 403
+              description: "HTTP status returned for a deterministic tool policy denial in enforce mode. Uninspectable governed bodies fail closed with 502."
             redaction_placeholder:
               type: string
               default: "[REDACTED_TOOL_ARG:{name}]"

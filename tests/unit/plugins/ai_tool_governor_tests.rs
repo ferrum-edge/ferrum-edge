@@ -324,7 +324,7 @@ async fn denies_unknown_tool_via_default_deny() {
     let result = plugin
         .on_response_body(&mut ctx, 200, &json_headers(), &body)
         .await;
-    assert_reject(result, Some(502));
+    assert_reject(result, Some(403));
     assert_eq!(
         ctx.metadata
             .get("ai_tool_governor.decision")
@@ -342,7 +342,7 @@ async fn denies_explicit_deny_tool() {
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &body)
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -360,7 +360,7 @@ async fn denies_on_max_arg_bytes() {
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &body)
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -375,7 +375,7 @@ async fn denies_on_missing_required_args() {
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &body)
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -415,7 +415,7 @@ async fn json_schema_allows_and_denies() {
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &bad)
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -438,7 +438,7 @@ async fn regex_blocked_arg_denies() {
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &body)
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -500,7 +500,7 @@ async fn non_json_and_non_2xx_are_ignored() {
     let mut ctx = create_test_context();
     assert_reject(
         plugin.on_response_body(&mut ctx, 200, &html, &body).await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -781,7 +781,7 @@ async fn denies_request_exposing_disallowed_tool_definition() {
     );
     let mut headers = json_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_reject(result, Some(502));
+    assert_reject(result, Some(403));
 }
 
 #[tokio::test]
@@ -812,7 +812,7 @@ async fn blocks_request_exposing_approval_required_tool_definition() {
         .to_string(),
     );
     let mut headers = json_headers();
-    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
     server.verify().await;
 }
 
@@ -855,7 +855,7 @@ async fn denies_mcp_tools_call_for_denied_tool() {
         .to_string(),
     );
     let mut headers = json_headers();
-    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
 }
 
 // ---------------------------------------------------------------------------
@@ -904,6 +904,34 @@ async fn approval_allow_forwards() {
 }
 
 #[tokio::test]
+async fn approval_include_arguments_opt_in_sends_raw_tool_arguments() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .and(body_string_contains("sensitive-approval-value"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": {
+            "endpoint_url": format!("{}/approve", server.uri()),
+            "include_arguments": true
+        }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("deploy", "{\"value\":\"sensitive-approval-value\"}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn approval_deny_rejects() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -919,7 +947,7 @@ async fn approval_deny_rejects() {
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &body)
             .await,
-        Some(502),
+        Some(403),
     );
     assert_eq!(
         ctx.metadata
@@ -993,7 +1021,7 @@ async fn batch_denial_skips_approval_webhook() {
         .to_string(),
     );
     let mut headers = json_headers();
-    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
     server.verify().await;
 }
 
@@ -1037,6 +1065,34 @@ async fn approval_endpoint_error_fails_open_when_configured() {
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &body)
             .await,
+    );
+}
+
+#[tokio::test]
+async fn approval_endpoint_error_warns_and_fails_open_when_configured() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "fail_on_error": "warn" }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("approved")
     );
 }
 
@@ -1343,7 +1399,7 @@ async fn before_proxy_uses_live_header_argument_for_request_inspection() {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
 
-    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
 }
 
 #[tokio::test]
@@ -1482,7 +1538,7 @@ async fn denies_mcp_tools_call_inside_json_rpc_batch() {
         .to_string(),
     );
     let mut headers = json_headers();
-    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
 }
 
 #[tokio::test]
@@ -1897,7 +1953,7 @@ async fn final_request_body_recheck_denies_transform_injected_definition() {
         plugin
             .on_final_request_body_with_context(&mut ctx, &headers, injected.as_bytes())
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -1924,7 +1980,7 @@ async fn final_request_body_recheck_denies_transform_injected_mcp_call() {
         plugin
             .on_final_request_body_with_context(&mut ctx, &headers, injected.as_bytes())
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -1996,7 +2052,7 @@ async fn final_response_body_recheck_denies_transform_injected_tool_call() {
         plugin
             .on_final_response_body(&mut ctx, 200, &json_headers(), &injected)
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -2284,7 +2340,7 @@ async fn final_response_body_recheck_ignores_out_of_scope_responses() {
         plugin
             .on_final_response_body(&mut ctx, 200, &html, &denied)
             .await,
-        Some(502),
+        Some(403),
     );
 
     // Empty body.
@@ -2364,7 +2420,7 @@ async fn a2a_method_deny_rejects() {
             .to_string(),
     );
     let mut headers = json_headers();
-    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
 }
 
 /// A per-tool `dry_run` action forwards the call while recording an `allow`
@@ -2404,7 +2460,7 @@ async fn tool_risk_levels_surface_in_metadata() {
             plugin
                 .on_response_body(&mut ctx, 200, &json_headers(), &body)
                 .await,
-            Some(502),
+            Some(403),
         );
         assert_eq!(
             ctx.metadata
@@ -2426,6 +2482,16 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(data).expect("gzip write");
     encoder.finish().expect("gzip finish")
+}
+
+fn brotli(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut compressed = Vec::new();
+    {
+        let mut writer = brotli::CompressorWriter::new(&mut compressed, 4096, 5, 22);
+        writer.write_all(data).expect("brotli write");
+    }
+    compressed
 }
 
 fn gzip_headers() -> HashMap<String, String> {
@@ -2538,7 +2604,7 @@ async fn streaming_only_governs_json_fallback_response() {
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &denied)
             .await,
-        Some(502),
+        Some(403),
     );
 
     // Non-streaming request: buffered response inspection is disabled, so the
@@ -2641,7 +2707,40 @@ async fn final_response_decompresses_and_denies_injected_compressed_call() {
         plugin
             .on_final_response_body(&mut ctx, 200, &gzip_headers(), &compressed)
             .await,
-        Some(502),
+        Some(403),
+    );
+}
+
+/// The same final-response decode path supports valid Brotli payloads emitted
+/// by the gateway compression plugin, not only gzip.
+#[tokio::test]
+async fn final_response_decompresses_brotli_and_denies_injected_call() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    let clean = json!({
+        "id": "x", "object": "chat.completion", "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "hi" }, "finish_reason": "stop" }]
+    })
+    .to_string()
+    .into_bytes();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &clean)
+            .await,
+    );
+
+    let injected = response_with_tool_call("kubectl.apply", "{\"manifest\":\"kind: Pod\"}");
+    let compressed = brotli(&injected);
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "br".to_string());
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &compressed)
+            .await,
+        Some(403),
     );
 }
 
@@ -2716,7 +2815,7 @@ async fn final_response_streaming_only_governs_encoded_injected_sse_enforce() {
         plugin
             .on_final_response_body(&mut ctx, 200, &headers, &compressed)
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -2940,7 +3039,7 @@ async fn buffered_sse_response_is_governed() {
         plugin
             .on_response_body(&mut ctx, 200, &sse_headers, denied.as_bytes())
             .await,
-        Some(502),
+        Some(403),
     );
 
     let allowed = concat!(
@@ -3255,7 +3354,7 @@ async fn final_request_governs_json_body_despite_removed_content_type() {
         plugin
             .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -3275,7 +3374,7 @@ async fn response_governs_json_body_despite_relabeled_content_type() {
         plugin
             .on_response_body(&mut ctx, 200, &headers, &body)
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -3359,7 +3458,7 @@ async fn final_response_decodes_before_content_gates_and_denies_relabeled_compre
         plugin
             .on_final_response_body(&mut ctx, 200, &headers, &compressed)
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -3795,7 +3894,7 @@ async fn buffered_sse_legacy_function_call_is_governed() {
         plugin
             .on_response_body(&mut ctx, 200, &sse_headers, denied.as_bytes())
             .await,
-        Some(502),
+        Some(403),
     );
 
     let allowed = legacy_function_call_stream(&["report.read"], &["{}"]);
@@ -3962,7 +4061,7 @@ async fn buffered_sse_without_content_type_is_governed() {
         plugin
             .on_response_body(&mut ctx, 200, &no_ct, SSE_DENIED_TOOL_BODY.as_bytes())
             .await,
-        Some(502),
+        Some(403),
     );
 
     let mut ctx = create_test_context();
@@ -3996,7 +4095,7 @@ async fn buffered_sse_with_relabeled_content_type_is_governed() {
                 SSE_DENIED_TOOL_BODY.as_bytes(),
             )
             .await,
-        Some(502),
+        Some(403),
     );
 
     // Final re-check parity: a transform that rewrote the body into SSE (or
@@ -4011,7 +4110,7 @@ async fn buffered_sse_with_relabeled_content_type_is_governed() {
                 SSE_DENIED_TOOL_BODY.as_bytes(),
             )
             .await,
-        Some(502),
+        Some(403),
     );
     let mut ctx = create_test_context();
     assert_continue(
@@ -4033,7 +4132,7 @@ async fn buffered_sse_with_relabeled_content_type_is_governed() {
         plugin
             .on_response_body(&mut ctx, 200, &plain_headers, &bom_body)
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -4391,7 +4490,7 @@ async fn buffered_sse_gzip_encoded_denied_call_is_caught() {
                 &gzip(SSE_DENIED_TOOL_BODY.as_bytes()),
             )
             .await,
-        Some(502),
+        Some(403),
     );
 
     // Allowed calls decode and forward.
@@ -4539,7 +4638,7 @@ async fn sse_labeled_json_body_with_streaming_disabled_is_buffered_and_governed(
         plugin
             .on_response_body(&mut ctx, 200, &sse_headers(), &denied)
             .await,
-        Some(502),
+        Some(403),
     );
 
     let allowed = response_with_tool_call("report.read", "{}");
@@ -4606,7 +4705,7 @@ async fn keepalive_prefixed_sse_body_is_governed() {
         plugin
             .on_response_body(&mut ctx, 200, &no_ct, denied.as_bytes())
             .await,
-        Some(502),
+        Some(403),
     );
 
     let allowed = format!(": ping\n\n{SSE_ALLOWED_TOOL_BODY}");
@@ -4770,7 +4869,7 @@ async fn encoded_sse_with_streaming_enabled_stays_buffered_and_is_governed() {
                 &gzip(SSE_DENIED_TOOL_BODY.as_bytes()),
             )
             .await,
-        Some(502),
+        Some(403),
     );
     let mut ctx = create_test_context();
     ctx.metadata
@@ -4858,7 +4957,7 @@ async fn buffered_multi_batch_sse_governs_second_batch_under_true_name() {
         plugin
             .on_response_body(&mut ctx, 200, &sse_headers(), two_batches.as_bytes())
             .await,
-        Some(502),
+        Some(403),
     );
 
     // Both batches allowed: forwarded, and each batch's call kept its true
@@ -4897,7 +4996,7 @@ async fn buffered_multi_batch_sse_governs_second_batch_under_true_name() {
         plugin
             .on_response_body(&mut ctx, 200, &sse_headers(), done_separated.as_bytes())
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -4949,7 +5048,7 @@ async fn bom_prefixed_sse_denied_call_is_caught_on_both_paths() {
         buffered
             .on_response_body(&mut ctx, 200, &sse_headers(), &bom_body)
             .await,
-        Some(502),
+        Some(403),
     );
     let mut ctx = create_test_context();
     assert_continue(
@@ -5001,7 +5100,7 @@ async fn buffered_json_gzip_encoded_body_is_decoded_and_governed() {
                 &gzip(&response_with_tool_call("kubectl.apply", "{}")),
             )
             .await,
-        Some(502),
+        Some(403),
     );
 
     // Dry-run is unaffected either way.
@@ -5214,7 +5313,7 @@ async fn ping_field_prefixed_unlabeled_buffered_sse_is_governed() {
         plugin
             .on_response_body(&mut ctx, 200, &no_ct, denied.as_bytes())
             .await,
-        Some(502),
+        Some(403),
     );
 
     let allowed = format!("ping: 1\n\n{SSE_ALLOWED_TOOL_BODY}");
@@ -5358,7 +5457,7 @@ async fn ascii_keepalive_and_ping_prefixes_still_sse_after_high_bit_tightening()
             plugin
                 .on_response_body(&mut ctx, 200, &no_ct, denied.as_bytes())
                 .await,
-            Some(502),
+            Some(403),
         );
     }
 }
@@ -5673,7 +5772,7 @@ async fn cr_only_sse_denied_call_is_caught_live_and_buffered() {
         buffered
             .on_response_body(&mut ctx, 200, &sse_headers(), denied_cr.as_bytes())
             .await,
-        Some(502),
+        Some(403),
     );
     let mut ctx = create_test_context();
     assert_continue(
@@ -5788,7 +5887,7 @@ async fn oversized_wire_encoded_json_within_decoded_cap_is_governed() {
         plugin
             .on_response_body(&mut ctx, 200, &gzip_headers(), &wire)
             .await,
-        Some(502),
+        Some(403),
     );
 
     let allowed = padded_tool_call_json("report.read", cap);
@@ -5964,7 +6063,7 @@ async fn final_request_body_clears_stale_stream_marker_when_transform_disables_s
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &denied)
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -6121,7 +6220,7 @@ async fn bom_prefixed_json_response_denied_call_is_caught() {
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &denied)
             .await,
-        Some(502),
+        Some(403),
     );
     // Final re-check path also strips the BOM.
     let mut ctx = create_test_context();
@@ -6129,7 +6228,7 @@ async fn bom_prefixed_json_response_denied_call_is_caught() {
         plugin
             .on_final_response_body(&mut ctx, 200, &json_headers(), &denied)
             .await,
-        Some(502),
+        Some(403),
     );
 
     // An allowed call with a BOM still forwards on both paths.
@@ -6228,7 +6327,7 @@ async fn final_recheck_governs_externally_buffered_sse_for_streaming_only_config
                 SSE_DENIED_TOOL_BODY.as_bytes(),
             )
             .await,
-        Some(502),
+        Some(403),
     );
 
     // Dry-run: the same injection is recorded but forwarded, never rejected.
@@ -6443,7 +6542,7 @@ async fn definition_only_approval_policies_do_not_require_webhook() {
             .to_string(),
         );
         let mut headers = json_headers();
-        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
     }
 }
 
@@ -6586,7 +6685,7 @@ async fn multiple_governor_instances_do_not_share_final_recheck_ledgers() {
         strict
             .on_final_response_body(&mut ctx, 200, &json_headers(), &injected)
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -6645,7 +6744,7 @@ async fn pre_transform_gateway_compression_keeps_plaintext_json_inspectable() {
                 &response_with_tool_call("kubectl.apply", "{}"),
             )
             .await,
-        Some(502),
+        Some(403),
     );
 }
 
@@ -6702,6 +6801,13 @@ async fn dry_run_metadata_preserves_max_risk_across_governor_instances() {
             .map(String::as_str),
         Some("critical")
     );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.policy_ids")
+            .map(String::as_str),
+        Some("danger"),
+        "the later allowed policy must not replace the sticky denial's policy ID"
+    );
 }
 
 /// P3 (:1419): equal-severity definition denials from separate governor
@@ -6739,5 +6845,89 @@ async fn dry_run_definition_denials_merge_across_governor_instances() {
             .get("ai_tool_governor.tool_names")
             .map(String::as_str),
         Some("first_denied,second_denied")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round 22 review fixes
+// ---------------------------------------------------------------------------
+
+/// P2 (:3974): a JSON-RPC `tools/call` with no checkable `params.name` is a
+/// malformed governed call, not an absent call. Enforce fails closed for both
+/// direct and batch envelopes; dry-run remains non-disruptive.
+#[tokio::test]
+async fn malformed_mcp_tool_call_names_fail_closed_in_enforce() {
+    let enforce = make(mcp_config("enforce"));
+    let malformed = [
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {}
+        }),
+        json!([{
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": 42, "arguments": {} }
+        }]),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": { "name": "", "arguments": {} }
+        }),
+    ];
+
+    for body in &malformed {
+        let mut ctx = json_post_ctx();
+        ctx.metadata
+            .insert("request_body".to_string(), body.to_string());
+        let mut headers = json_headers();
+        assert_reject(
+            enforce.before_proxy(&mut ctx, &mut headers).await,
+            Some(502),
+        );
+    }
+
+    let dry_run = make(mcp_config("dry_run"));
+    let mut ctx = json_post_ctx();
+    ctx.metadata
+        .insert("request_body".to_string(), malformed[0].to_string());
+    let mut headers = json_headers();
+    assert_continue(dry_run.before_proxy(&mut ctx, &mut headers).await);
+}
+
+/// P2 (:1999): JSON shape, not only a trusted Content-Type or an earlier hash,
+/// keeps an oversized relabeled final request in fail-closed scope.
+#[tokio::test]
+async fn oversized_relabeled_json_request_fails_closed() {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "kubectl.apply", "arguments": {} },
+        "padding": "x".repeat(4 * 1024 * 1024)
+    })
+    .to_string();
+    assert!(body.len() > 4 * 1024 * 1024);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+
+    let enforce = make(mcp_config("enforce"));
+    let mut ctx = json_post_ctx();
+    assert_reject(
+        enforce
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(502),
+    );
+
+    let dry_run = make(mcp_config("dry_run"));
+    let mut ctx = json_post_ctx();
+    assert_continue(
+        dry_run
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
     );
 }

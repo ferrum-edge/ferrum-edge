@@ -61,6 +61,12 @@ and a live inspector will govern it). The live inspector attaches to a
 add `"stream": true` after the proxy's buffering decisions, in which case the
 backend's plain `application/json` SSE fallback is delivered on the streaming
 path — the attached inspector then governs it by body shape instead of label.
+With a streaming-only configuration, the pre-header decision conservatively
+buffers every 2xx response until response headers can refine the choice; any
+ambiguous non-SSE response stays buffered even when the request was not marked
+streaming. Scope the plugin to AI routes and budget for the resulting
+latency/memory cost when enabling streaming inspection without buffered-response
+inspection.
 Framed gRPC / gRPC-Web responses never get an inspector, and a request with
 no streaming marker never does either, so ordinary buffered traffic is
 unaffected. SSE parsing (live and buffered) accepts all three spec line
@@ -117,7 +123,7 @@ delivered buffered rather than streamed.
 ## Fail-closed handling of uninspectable bodies
 
 In `mode: enforce`, a body the plugin is configured to govern but cannot
-inspect is **rejected** (with `response.deny_status_code`) rather than
+inspect is **rejected** with `502 Bad Gateway` rather than
 forwarded ungoverned:
 
 - **Request path** (when any request surface is enabled, for JSON `POST`
@@ -206,7 +212,8 @@ config:
 ```
 
 Any tool other than `github.create_pr` — whether exposed as a definition or
-returned as a call — is rejected with `502`.
+returned as a call — is rejected with `403` by default. Set
+`response.deny_status_code` to customize deterministic policy rejections.
 
 ### Approval-required production writes
 
@@ -232,7 +239,7 @@ config:
     timeout_ms: 1500
     cache_ttl_seconds: 300
     fail_on_error: reject      # reject | warn | allow
-    include_prompt_excerpt: false
+    include_arguments: false
 ```
 
 `filesystem.write` calls are POSTed to the approval webhook with request
@@ -280,7 +287,7 @@ When `observability.emit_metadata` is on (default), the plugin writes
 Raw arguments are **never** placed in metadata and never logged unless
 `observability.max_argument_log_bytes > 0` (then a bounded excerpt of a blocked
 call's arguments is logged at `debug` for audit). Raw arguments are sent to the
-approval webhook only when `approval.include_prompt_excerpt: true`.
+approval webhook only when `approval.include_arguments: true`.
 
 The plugin's internal per-request bookkeeping — the governed-body hashes and
 the per-call identity multiset it uses to skip already-governed calls on the
