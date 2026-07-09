@@ -117,7 +117,7 @@ pub(crate) trait AdminResource:
         match error {
             ValidationError::Fields(errors) => validation_error_response::<Self>(errors),
             ValidationError::Message(message) => {
-                validation_error_response::<Self>(&[message.to_string()])
+                validation_error_response::<Self>(std::slice::from_ref(message))
             }
         }
     }

@@ -58,6 +58,7 @@ pub struct ResolvedEnvSecrets {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BackendKind {
+    #[allow(dead_code)]
     DirectEnv,
     File,
     #[cfg(feature = "secrets-vault")]
