@@ -485,6 +485,33 @@ fn set_ranked_csv_metadata(
     }
 }
 
+/// Keep risk aligned with the sticky decision while preserving the maximum
+/// risk among batches at the SAME decision severity. A stronger decision
+/// replaces a weaker decision's risk even when the weaker call happened to
+/// carry a higher risk label; lower-severity later batches cannot downgrade or
+/// overwrite the winning decision's risk.
+fn set_ranked_risk_metadata(
+    m: &mut HashMap<String, String>,
+    previous_rank: u8,
+    batch_rank: u8,
+    risk: RiskLevel,
+) {
+    if batch_rank < previous_rank {
+        return;
+    }
+    let risk = if batch_rank == previous_rank {
+        m.get("ai_tool_governor.risk")
+            .and_then(|value| RiskLevel::from_str(value))
+            .map_or(risk, |existing| existing.max(risk))
+    } else {
+        risk
+    };
+    m.insert(
+        "ai_tool_governor.risk".to_string(),
+        risk.as_str().to_string(),
+    );
+}
+
 impl GovernorEngine {
     /// Deterministic evaluation of one tool call. Returns the outcome, whether
     /// an explicit policy matched, and the call's risk.
@@ -602,19 +629,29 @@ impl GovernorEngine {
         (outcome, true, policy.risk)
     }
 
-    /// Whether exposing a tool *definition* (name only, no arguments) is
-    /// blocked. `require_approval` cannot be resolved for a bare definition
-    /// because there are no concrete arguments to send to the approval webhook.
-    fn definition_blocked(&self, name: &str) -> bool {
+    /// Risk for a blocked tool *definition* (name only, no arguments), or
+    /// `None` when the definition is allowed. `require_approval` cannot be
+    /// resolved for a bare definition because there are no concrete arguments
+    /// to send to the approval webhook.
+    fn definition_denial_risk(&self, name: &str) -> Option<RiskLevel> {
         match self.tools.get(name) {
-            Some(policy) => matches!(
-                policy.action,
-                ToolAction::Deny | ToolAction::RequireApproval
-            ),
-            None => matches!(
+            Some(policy)
+                if matches!(
+                    policy.action,
+                    ToolAction::Deny | ToolAction::RequireApproval
+                ) =>
+            {
+                Some(policy.risk)
+            }
+            Some(_) => None,
+            None if matches!(
                 self.default_action,
                 DefaultAction::Deny | DefaultAction::RequireApproval
-            ),
+            ) =>
+            {
+                Some(RiskLevel::Low)
+            }
+            None => None,
         }
     }
 
@@ -1325,17 +1362,7 @@ impl AiToolGovernor {
             &tool_names,
         );
 
-        // Risk is an independent aggregate: keep the maximum observed value
-        // even when a later lower-risk batch cannot downgrade the sticky
-        // decision (for example, denied MCP followed by allowed A2A in dry-run).
-        let max_risk = m
-            .get("ai_tool_governor.risk")
-            .and_then(|value| RiskLevel::from_str(value))
-            .map_or(batch.max_risk, |existing| existing.max(batch.max_risk));
-        m.insert(
-            "ai_tool_governor.risk".to_string(),
-            max_risk.as_str().to_string(),
-        );
+        set_ranked_risk_metadata(m, previous_rank, batch_rank, batch.max_risk);
 
         let policy_ids: Vec<&str> = batch
             .per_call
@@ -1503,9 +1530,13 @@ impl AiToolGovernor {
 
         // 1. Client tool definitions exposed to the model.
         if self.inspect.request_tool_definitions {
-            let denied: Vec<String> = extract_request_tool_definitions(json)
+            let denied: Vec<(String, RiskLevel)> = extract_request_tool_definitions(json)
                 .into_iter()
-                .filter(|name| self.engine.definition_blocked(name))
+                .filter_map(|name| {
+                    self.engine
+                        .definition_denial_risk(&name)
+                        .map(|risk| (name, risk))
+                })
                 .collect();
             if !denied.is_empty() {
                 self.write_definition_metadata(ctx, &denied);
@@ -1516,7 +1547,7 @@ impl AiToolGovernor {
                             r#"{{"error":"ai_tool_governor: request exposes disallowed tool definitions","decision":"deny","tools":[{}]}}"#,
                             denied
                                 .iter()
-                                .map(|t| format!("\"{}\"", escape_json_string(t)))
+                                .map(|(name, _)| format!("\"{}\"", escape_json_string(name)))
                                 .collect::<Vec<_>>()
                                 .join(","),
                         ),
@@ -1567,7 +1598,7 @@ impl AiToolGovernor {
         PluginResult::Continue
     }
 
-    fn write_definition_metadata(&self, ctx: &mut RequestContext, denied: &[String]) {
+    fn write_definition_metadata(&self, ctx: &mut RequestContext, denied: &[(String, RiskLevel)]) {
         if !self.engine.observability.emit_metadata {
             return;
         }
@@ -1581,25 +1612,35 @@ impl AiToolGovernor {
             .get("ai_tool_governor.decision")
             .map(|value| label_rank(value))
             .unwrap_or(0);
+        let deny_rank = label_rank("deny");
         set_decision_metadata(m, "deny");
-        let denied: Vec<&str> = denied.iter().map(String::as_str).collect();
+        let denied_names: Vec<&str> = denied.iter().map(|(name, _)| name.as_str()).collect();
         set_ranked_csv_metadata(
             m,
             "ai_tool_governor.tool_names",
             previous_rank,
-            label_rank("deny"),
-            &denied,
+            deny_rank,
+            &denied_names,
         );
-        // A definition denial has no concrete matched-policy ID. If it upgrades
-        // an earlier allowed decision, remove that weaker decision's IDs; at
-        // equal deny severity, preserve IDs from other denied surfaces.
-        set_ranked_csv_metadata(
-            m,
+        let max_risk = denied
+            .iter()
+            .map(|(_, risk)| *risk)
+            .max()
+            .unwrap_or(RiskLevel::Low);
+        set_ranked_risk_metadata(m, previous_rank, deny_rank, max_risk);
+
+        // A definition denial has no concrete-call correlation metadata. If it
+        // upgrades an earlier weaker decision, clear every decision-aligned
+        // field from that weaker call; at equal deny severity, the ranked
+        // helper preserves metadata emitted by sibling denied surfaces.
+        for key in [
             "ai_tool_governor.policy_ids",
-            previous_rank,
-            label_rank("deny"),
-            &[],
-        );
+            "ai_tool_governor.approval_id",
+            "ai_tool_governor.arguments_hashes",
+            "ai_tool_governor.redacted_tools",
+        ] {
+            set_ranked_csv_metadata(m, key, previous_rank, deny_rank, &[]);
+        }
     }
 
     /// Redact `redact_args` matches in a buffered response body. Deterministic

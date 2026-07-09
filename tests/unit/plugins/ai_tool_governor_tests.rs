@@ -7019,6 +7019,96 @@ async fn dry_run_definition_denials_merge_across_governor_instances() {
     );
 }
 
+/// A definition-only denial that upgrades an earlier allowed concrete call
+/// replaces every decision-aligned metadata field rather than retaining hashes
+/// or correlation details from the weaker call.
+#[tokio::test]
+async fn definition_denial_clears_lower_rank_concrete_call_metadata() {
+    let earlier_call = make(json!({
+        "mode": "dry_run",
+        "default_action": "allow",
+        "tools": { "safe": { "action": "allow", "risk": "critical" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    let definition_guard = make(json!({
+        "mode": "dry_run",
+        "default_action": "allow",
+        "tools": { "blocked_definition": { "action": "deny", "risk": "high" } },
+        "inspect": { "request_tool_definitions": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    let mut headers = json_headers();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "safe", "arguments": { "scope": "earlier" } }
+        })
+        .to_string(),
+    );
+    assert_continue(earlier_call.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        ctx.metadata
+            .contains_key("ai_tool_governor.arguments_hashes")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.risk")
+            .map(String::as_str),
+        Some("critical")
+    );
+    // Seed the other decision-aligned shapes an approval/redaction surface can
+    // add; the stronger definition denial must clear all of them consistently.
+    ctx.metadata.insert(
+        "ai_tool_governor.approval_id".to_string(),
+        "stale-approval".to_string(),
+    );
+    ctx.metadata.insert(
+        "ai_tool_governor.redacted_tools".to_string(),
+        "stale-redaction".to_string(),
+    );
+
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "tools": [{
+                "type": "function",
+                "function": { "name": "blocked_definition" }
+            }]
+        })
+        .to_string(),
+    );
+    assert_continue(definition_guard.before_proxy(&mut ctx, &mut headers).await);
+
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("deny")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.tool_names")
+            .map(String::as_str),
+        Some("blocked_definition")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.risk")
+            .map(String::as_str),
+        Some("high"),
+        "the stronger definition decision replaces the earlier call risk"
+    );
+    for key in [
+        "ai_tool_governor.policy_ids",
+        "ai_tool_governor.approval_id",
+        "ai_tool_governor.arguments_hashes",
+        "ai_tool_governor.redacted_tools",
+    ] {
+        assert!(!ctx.metadata.contains_key(key), "stale metadata: {key}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Round 22 review fixes
 // ---------------------------------------------------------------------------
