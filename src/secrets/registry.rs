@@ -58,6 +58,9 @@ pub struct ResolvedEnvSecrets {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BackendKind {
+    // Used by the intentionally retained single-key `resolve_secret` path,
+    // which is not referenced by the production binary in every target.
+    #[allow(dead_code)]
     DirectEnv,
     File,
     #[cfg(feature = "secrets-vault")]
