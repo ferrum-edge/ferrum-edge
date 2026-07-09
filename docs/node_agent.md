@@ -257,7 +257,12 @@ TPROXY rules while that guard remains active. The guard mirrors the operator's
 exact outbound include/exclude/family scope and uses alternating chains, so a
 bind collision, setup failure, or guarded retry cannot reopen plaintext egress.
 It is removed only after the bound socket has been adopted and the full
-capture ruleset is live. The reply sockets are created in the same pod netns.
+capture ruleset is live. A failed attempt transfers a stable-netns guard cleanup
+handle to the manager, so registry removal or shutdown still removes the guard
+even if no active producer was ever created. Guard release treats xtables resource
+errors as failures, and always probes Ferrum-owned IPv6 guard chains left by an
+earlier IPv6-enabled run even when IPv6 capture is now disabled. The reply sockets
+are created in the same pod netns.
 
 The producer still writes **no** `.ready` markers. Note the narrower residual
 **enrollment window**: before the producer observes a newly or re-published

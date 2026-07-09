@@ -942,7 +942,7 @@ impl IptablesPlan {
     /// has been adopted and the complete TPROXY ruleset is installed, so traffic
     /// switches directly from DROP guard to live capture.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub fn udp_fail_closed_teardown_script(include_v6: bool) -> String {
+    pub fn udp_fail_closed_teardown_script() -> String {
         // Unlike removal during final cleanup, this is a readiness transition:
         // returning success while an OUTPUT jump remains would leave an otherwise
         // healthy producer black-holed indefinitely. Delete every duplicate jump
@@ -950,13 +950,12 @@ impl IptablesPlan {
         // back down and retries with the guard deliberately retained.
         let mut chunks = vec!["set -e".to_string()];
         chunks.extend(udp_fail_closed_release_for("iptables"));
-        if include_v6 {
-            chunks.extend(
-                udp_fail_closed_release_for("ip6tables")
-                    .iter()
-                    .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
-            );
-        }
+        // Probe stale IPv6 guards regardless of the current install setting. A
+        // pod may restart with IPv6 capture disabled after an earlier enabled
+        // producer retained a v6 guard. Resource errors (notably xtables-lock
+        // timeout) remain fatal; only an unavailable binary/table is skipped.
+        let v6_release = udp_fail_closed_release_for("ip6tables").join("\n");
+        chunks.push(ip6tables_strict_probe_guard(&v6_release, "mangle"));
         chunks.join("\n")
     }
 
@@ -1005,6 +1004,16 @@ impl IptablesPlan {
                     .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
             );
             chunks.extend(v6.ip_routing);
+        } else {
+            // Current IPv6 disablement must not orphan a guard installed by an
+            // earlier enabled process. Limit the cross-setting cleanup to the
+            // dedicated guard chains; normal v6 capture/routing remains gated by
+            // `include_v6` as before.
+            chunks.extend(
+                udp_fail_closed_teardown_for("ip6tables")
+                    .iter()
+                    .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
+            );
         }
         chunks.join("\n")
     }
@@ -1291,32 +1300,30 @@ fn udp_fail_closed_chain_commands(
     if selectors.is_empty() {
         return Vec::new();
     }
-    let mut commands = vec![
-        idempotent_new_chain(binary, "mangle", chain),
-        flush_chain(binary, "mangle", chain),
-    ];
+    // This builder is used only after the other generation is known to be
+    // active (or during the first install). Reset and populate the inactive
+    // chain strictly: treating an xtables resource error as "already exists"
+    // could leave stale selectors in the replacement guard.
+    let mut commands = vec![format!(
+        "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -N {chain} 2>/dev/null || \
+         {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -F {chain}"
+    )];
     for cidr in exclude_cidrs {
-        commands.push(idempotent_append(
-            binary,
-            "mangle",
-            chain,
-            &format!("-p udp -d {cidr} -j RETURN"),
+        commands.push(format!(
+            "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} \
+             -p udp -d {cidr} -j RETURN"
         ));
     }
     for port in &config.exclude_ports {
-        commands.push(idempotent_append(
-            binary,
-            "mangle",
-            chain,
-            &format!("-p udp --dport {port} -j RETURN"),
+        commands.push(format!(
+            "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} \
+             -p udp --dport {port} -j RETURN"
         ));
     }
     for selector in selectors {
-        commands.push(idempotent_append(
-            binary,
-            "mangle",
-            chain,
-            &format!("{selector} -m addrtype ! --dst-type LOCAL -j DROP"),
+        commands.push(format!(
+            "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} \
+             {selector} -m addrtype ! --dst-type LOCAL -j DROP"
         ));
     }
     commands
@@ -1366,21 +1373,24 @@ fn udp_fail_closed_commands_for_family(
     let jump_b = format!("-p udp -j {UDP_FAIL_CLOSED_CHAIN_B}");
     let a_active =
         format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump_a} 2>/dev/null");
+    let release_a = udp_fail_closed_release_jump_for(binary, UDP_FAIL_CLOSED_CHAIN_A);
+    let release_b = udp_fail_closed_release_jump_for(binary, UDP_FAIL_CLOSED_CHAIN_B);
     let replace_a = [
+        release_b.clone(),
         build_b.join("\n"),
-        idempotent_insert_first(binary, "mangle", "OUTPUT", &jump_b),
-        udp_fail_closed_chain_teardown_for(binary, UDP_FAIL_CLOSED_CHAIN_A).join("\n"),
+        format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -I OUTPUT 1 {jump_b}"),
+        release_a,
     ]
     .join("\n");
     let replace_b_or_install = [
         build_a.join("\n"),
-        idempotent_insert_first(binary, "mangle", "OUTPUT", &jump_a),
-        udp_fail_closed_chain_teardown_for(binary, UDP_FAIL_CLOSED_CHAIN_B).join("\n"),
+        format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -I OUTPUT 1 {jump_a}"),
+        release_b,
     ]
     .join("\n");
 
     vec![format!(
-        "if {a_active}; then\n{replace_a}\nelse\n{replace_b_or_install}\nfi"
+        "if {a_active}; then\n{replace_a}\nelse\nstatus=$?\nif [ \"$status\" -ne 1 ]; then\n  echo \"{binary} could not inspect active UDP fail-closed guard (status $status)\" >&2\n  exit \"$status\"\nfi\n{replace_b_or_install}\nfi"
     )]
 }
 
@@ -1971,6 +1981,16 @@ pub(crate) fn ip6tables_probe_guard(cmd: &str, table: &str) -> String {
     )
 }
 
+/// Strict optional-ip6tables wrapper for the guarded→live readiness transition.
+/// Missing tooling / an unavailable kernel table is optional, but resource and
+/// command errors must propagate so callers cannot report success while a stale
+/// OUTPUT jump remains active.
+fn ip6tables_strict_probe_guard(commands: &str, table: &str) -> String {
+    format!(
+        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n    {commands}\n  else\n    status=$?\n    if [ \"$status\" -eq 3 ]; then\n      echo \"ip6tables {table} table unavailable; skipping IPv6 mesh capture rules\"\n    else\n      echo \"ip6tables {table} probe failed with status $status\" >&2\n      exit \"$status\"\n    fi\n  fi\nelse\n  echo \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
+    )
+}
+
 /// The UDP-only command list for one address family, filtering include/exclude
 /// CIDRs to that family exactly like [`commands_for_family`] before delegating
 /// to the shared `udp_tproxy_commands_for_family`. This is what keeps the
@@ -2159,16 +2179,20 @@ fn udp_fail_closed_release_for(binary: &str) -> Vec<String> {
     [UDP_FAIL_CLOSED_CHAIN_A, UDP_FAIL_CLOSED_CHAIN_B]
         .into_iter()
         .flat_map(|chain| {
-            let jump = format!("-p udp -j {chain}");
             [
-                format!(
-                    "while {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump} 2>/dev/null; do\n  {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D OUTPUT {jump}\ndone"
-                ),
+                udp_fail_closed_release_jump_for(binary, chain),
                 flush_chain(binary, "mangle", chain),
                 delete_chain(binary, "mangle", chain),
             ]
         })
         .collect()
+}
+
+fn udp_fail_closed_release_jump_for(binary: &str, chain: &str) -> String {
+    let jump = format!("-p udp -j {chain}");
+    format!(
+        "while true; do\n  if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump} 2>/dev/null; then\n    {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D OUTPUT {jump}\n  else\n    status=$?\n    if [ \"$status\" -eq 1 ]; then\n      break\n    fi\n    echo \"{binary} could not check OUTPUT jump {chain} (status $status)\" >&2\n    exit \"$status\"\n  fi\ndone"
+    )
 }
 
 /// Full UDP teardown used by node-agent cleanup, producer removal, and disabled
@@ -2191,12 +2215,6 @@ fn idempotent_new_chain(binary: &str, table: &str, chain: &str) -> String {
 fn idempotent_append(binary: &str, table: &str, chain: &str, rule: &str) -> String {
     format!(
         "{binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -C {chain} {rule} 2>/dev/null || {binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} {rule}"
-    )
-}
-
-fn idempotent_insert_first(binary: &str, table: &str, chain: &str, rule: &str) -> String {
-    format!(
-        "{binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -C {chain} {rule} 2>/dev/null || {binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -I {chain} 1 {rule}"
     )
 }
 
@@ -3579,23 +3597,32 @@ mod tests {
         assert!(!capture_only.contains(UDP_FAIL_CLOSED_CHAIN_A));
         assert!(!capture_only.contains(UDP_FAIL_CLOSED_CHAIN_B));
 
-        let guard_only = IptablesPlan::udp_fail_closed_teardown_script(true);
+        let guard_only = IptablesPlan::udp_fail_closed_teardown_script();
         assert!(guard_only.starts_with("set -e\n"));
         assert!(guard_only.contains(UDP_FAIL_CLOSED_CHAIN_A));
         assert!(guard_only.contains(UDP_FAIL_CLOSED_CHAIN_B));
         assert!(!guard_only.contains("FERRUM_MESH_UDP_OUTPUT_MARK"));
         assert!(!guard_only.contains("ip rule del"));
-        assert!(guard_only.contains("while iptables -t mangle"));
+        assert!(guard_only.contains("while true; do"));
         assert!(guard_only.contains("-D OUTPUT -p udp -j FERRUM_UDP_FAIL_CLOSED_A"));
+        assert!(guard_only.contains("status=$?"));
+        assert!(guard_only.contains("exit \"$status\""));
+        assert!(guard_only.contains("ip6tables -t mangle"));
     }
 
     #[test]
-    fn udp_teardown_script_v4_only_omits_v6() {
+    fn udp_teardown_script_v4_only_still_reaps_stale_v6_guards() {
         let script = IptablesPlan::udp_teardown_script(false);
         assert!(script.contains("FERRUM_MESH_UDP_OUTBOUND"));
         assert!(
-            !script.contains("ip -6") && !script.contains("ip6tables"),
-            "v4-only teardown must emit no v6 commands: {script}"
+            script.contains("ip6tables")
+                && script.contains(UDP_FAIL_CLOSED_CHAIN_A)
+                && script.contains(UDP_FAIL_CLOSED_CHAIN_B),
+            "v4-only teardown must reap guards from an earlier v6-enabled run: {script}"
+        );
+        assert!(
+            !script.contains("ip -6") && !script.contains("FERRUM_MESH_UDP_OUTBOUND_V6"),
+            "normal v6 capture teardown remains disabled: {script}"
         );
     }
 

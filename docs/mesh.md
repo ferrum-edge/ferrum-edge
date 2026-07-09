@@ -1983,7 +1983,11 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   outbound capture scope. The guard uses alternating chains so guarded retries build
   and activate a replacement before removing the prior guard; a workload that
   pre-binds the capture port therefore gets DROP, never plaintext bypass. The guard is
-  removed only after the socket is adopted and the full TPROXY ruleset is live. The
+  removed only after the socket is adopted and the full TPROXY ruleset is live. Failed
+  attempts leave a stable-netns cleanup handle with the manager, so pod removal and
+  shutdown retain ownership of guard cleanup; the guarded-to-live switch propagates
+  xtables resource errors and also probes stale IPv6 guard chains independently of
+  the current IPv6 setting. The
   pre-first-poll enrollment window remains tracked under #2013, and live source-capture
   plus bind-collision verification remains #2038. The producer tears down only its own
   rules on pod removal / config change / shutdown
