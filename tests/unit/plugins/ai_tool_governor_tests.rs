@@ -2507,14 +2507,15 @@ fn streaming_only_config_advertises_buffering() {
     }));
     assert!(plugin.requires_request_body_buffering());
     assert!(plugin.requires_response_body_buffering());
-    // Per-request: buffer only a streaming request's response (its SSE-JSON
-    // fallback), not an ordinary non-streaming response.
+    // Per-request pre-header gate stays enabled even for an unmarked request:
+    // response headers are needed to distinguish raw SSE (release to the live
+    // inspector) from encoded SSE (keep buffered for decode-and-govern).
     let mut streaming = create_test_context();
     streaming
         .metadata
         .insert("ai_request_streaming".to_string(), "true".to_string());
     assert!(plugin.should_buffer_response_body(&streaming));
-    assert!(!plugin.should_buffer_response_body(&create_test_context()));
+    assert!(plugin.should_buffer_response_body(&create_test_context()));
 }
 
 /// When a `stream: true` request's backend returns a plain JSON Chat Completions
@@ -3451,19 +3452,38 @@ fn content_type_hook_keeps_ambiguous_labels_buffered() {
         &response_headers
     ));
 
-    // A streaming-only config buffers only a streaming request's response.
+    // A streaming-only config keeps the pre-header buffering candidate enabled
+    // even for an unmarked/bodyless request. Header-time refinement releases
+    // unencoded SSE to the live inspector, but keeps encoded or ambiguous
+    // labels buffered so an unmarked `GET /events` cannot send gzip bytes into
+    // the raw SSE parser.
     let streaming_only = make(json!({
         "default_action": "deny",
         "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
     }));
+    assert!(streaming_only.should_buffer_response_body(&ctx));
+    assert!(streaming_only.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/html"),
+        200,
+        &response_headers
+    ));
     assert!(
         !streaming_only.should_buffer_response_body_for_content_type(
             &ctx,
-            Some("text/html"),
+            Some("text/event-stream"),
             200,
             &response_headers
         )
     );
+    let mut encoded_sse_headers = sse_headers();
+    encoded_sse_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(streaming_only.should_buffer_response_body_for_content_type(
+        &ctx,
+        Some("text/event-stream"),
+        200,
+        &encoded_sse_headers
+    ));
     let mut streaming_ctx = create_test_context();
     streaming_ctx
         .metadata
@@ -6330,6 +6350,13 @@ async fn dry_run_request_decision_is_sticky_deny_across_surfaces() {
         Some("deny"),
         "an allowed MCP call must not clobber an earlier definition deny in dry-run"
     );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.tool_names")
+            .map(String::as_str),
+        Some("dangerous_tool"),
+        "the allowed MCP call must not hide the denied definition name"
+    );
 
     // Same guarantee for an allowed A2A method after a denied definition.
     let plugin = make(json!({
@@ -6364,6 +6391,13 @@ async fn dry_run_request_decision_is_sticky_deny_across_surfaces() {
             .map(String::as_str),
         Some("deny"),
         "an allowed A2A method must not clobber an earlier definition deny in dry-run"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.tool_names")
+            .map(String::as_str),
+        Some("dangerous_tool"),
+        "the allowed A2A call must not hide the denied definition name"
     );
 }
 
@@ -6494,4 +6528,58 @@ async fn complete_oversized_sse_event_is_capped_before_parsing() {
     let (out, terminated) = drive_stream(&mut inspector, &[event.as_slice()]).await;
     assert!(!terminated, "dry-run must not disrupt an over-cap event");
     assert_eq!(out, event, "dry-run must forward the event unchanged");
+}
+
+// ---------------------------------------------------------------------------
+// Round 20 review fixes
+// ---------------------------------------------------------------------------
+
+/// P2 (:1462): private body/call dedup ledgers are scoped to one governor
+/// instance. A permissive instance that clears a transform-injected call must
+/// not let a stricter later instance consume that identity and skip policy.
+#[tokio::test]
+async fn multiple_governor_instances_do_not_share_final_recheck_ledgers() {
+    let permissive = make(json!({
+        "default_action": "allow",
+        "tools": { "kubectl.apply": { "action": "allow" } }
+    }));
+    let strict = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let original = json!({
+        "model": "gpt-4o",
+        "choices": [{ "index": 0, "message": { "role": "assistant", "content": "ok" } }]
+    })
+    .to_string()
+    .into_bytes();
+    let injected = response_with_tool_call("kubectl.apply", "{}");
+    let mut ctx = create_test_context();
+
+    // Both instances see and clear the original call-free backend body.
+    assert_continue(
+        permissive
+            .on_response_body(&mut ctx, 200, &json_headers(), &original)
+            .await,
+    );
+    assert_continue(
+        strict
+            .on_response_body(&mut ctx, 200, &json_headers(), &original)
+            .await,
+    );
+
+    // A later transform injects a call. The first instance allows and records
+    // it, but that record belongs only to the first instance; the strict one
+    // must still evaluate and reject it.
+    assert_continue(
+        permissive
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &injected)
+            .await,
+    );
+    assert_reject(
+        strict
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &injected)
+            .await,
+        Some(502),
+    );
 }

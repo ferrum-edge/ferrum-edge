@@ -132,8 +132,10 @@ const STREAM_REQUESTED_KEY: &str = "ai_tool_governor.stream_requested";
 const STREAM_MODEL_KEY: &str = "ai_tool_governor.stream_model";
 // Internal correlation state (the governed-body hashes and the per-call
 // identity multiset) lives on NON-SERIALIZED `RequestContext` fields
-// (`ai_tool_governor_request_hash` / `ai_tool_governor_response_hash` /
-// `ai_tool_governor_call_hashes`), NOT in `ctx.metadata`. The
+// (`ai_tool_governor_request_hashes` / `ai_tool_governor_response_hashes` /
+// `ai_tool_governor_call_hashes`), NOT in `ctx.metadata`. The maps are keyed by
+// a process-unique plugin-instance ID so multiple governors on one proxy never
+// consume each other's dedup state. The
 // `on_final_request_body` / `on_final_response_body` re-checks read them so an
 // unchanged body is not governed twice (avoids duplicate approval webhooks)
 // while a body a later `request_transformer` / `response_transformer` rewrote
@@ -143,6 +145,11 @@ const STREAM_MODEL_KEY: &str = "ai_tool_governor.stream_model";
 // leaked to transaction logs via a correlation marker (the identity hash is
 // otherwise correlatable/dictionary-guessable). See `RequestContext` for the
 // per-call identity/multiset semantics preserved by the accessors below.
+
+/// Process-unique scope for private per-request dedup ledgers. Plugin instances
+/// are immutable and shared through `Arc`, so one ID remains stable for the
+/// lifetime of a cache snapshot; a rebuilt snapshot gets fresh IDs.
+static NEXT_GOVERNOR_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -920,6 +927,7 @@ impl GovernorEngine {
 // ---------------------------------------------------------------------------
 
 pub struct AiToolGovernor {
+    instance_id: u64,
     enabled: bool,
     inspect: InspectConfig,
     engine: Arc<GovernorEngine>,
@@ -935,6 +943,8 @@ impl AiToolGovernor {
         if !config.is_object() {
             return Err("ai_tool_governor: config must be an object".to_string());
         }
+        let instance_id =
+            NEXT_GOVERNOR_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let enabled = optional_bool(config, "enabled")?.unwrap_or(true);
         if !enabled {
@@ -958,6 +968,7 @@ impl AiToolGovernor {
                 approval_cache_insert_lock: std::sync::Mutex::new(()),
             };
             return Ok(Self {
+                instance_id,
                 enabled: false,
                 inspect: InspectConfig {
                     request_tool_definitions: false,
@@ -1068,6 +1079,7 @@ impl AiToolGovernor {
         };
 
         Ok(Self {
+            instance_id,
             enabled,
             inspect,
             engine: Arc::new(engine),
@@ -1122,6 +1134,28 @@ impl AiToolGovernor {
             || (self.inspect.streaming_response_tool_calls && request_is_streaming(ctx))
     }
 
+    fn response_hash<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
+        ctx.ai_tool_governor_response_hashes
+            .get(&self.instance_id)
+            .map(String::as_str)
+    }
+
+    fn set_response_hash(&self, ctx: &mut RequestContext, hash: String) {
+        ctx.ai_tool_governor_response_hashes
+            .insert(self.instance_id, hash);
+    }
+
+    fn request_hash<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
+        ctx.ai_tool_governor_request_hashes
+            .get(&self.instance_id)
+            .map(String::as_str)
+    }
+
+    fn set_request_hash(&self, ctx: &mut RequestContext, hash: String) {
+        ctx.ai_tool_governor_request_hashes
+            .insert(self.instance_id, hash);
+    }
+
     /// Write aggregate decision metadata onto the request context.
     fn write_metadata(&self, ctx: &mut RequestContext, batch: &BatchDecision) {
         let obs = self.engine.observability;
@@ -1136,14 +1170,37 @@ impl AiToolGovernor {
         );
         // Sticky aggregate: an earlier surface's `deny` in one request/response
         // is never downgraded by this batch's `allow` (see `set_decision_metadata`).
+        // Keep the tool-name list aligned with that highest-severity decision:
+        // a later allowed MCP/A2A call must not replace the denied definition's
+        // name and leave logs saying only `decision=deny` with an allowed tool.
+        let previous_rank = m
+            .get("ai_tool_governor.decision")
+            .map(|value| label_rank(value))
+            .unwrap_or(0);
+        let batch_rank = label_rank(batch.overall_label);
         set_decision_metadata(m, batch.overall_label);
 
         let tool_names: Vec<&str> = batch.per_call.iter().map(|c| c.name.as_str()).collect();
         if !tool_names.is_empty() {
-            m.insert(
-                "ai_tool_governor.tool_names".to_string(),
-                tool_names.join(","),
-            );
+            if batch_rank > previous_rank {
+                m.insert(
+                    "ai_tool_governor.tool_names".to_string(),
+                    tool_names.join(","),
+                );
+            } else if batch_rank == previous_rank {
+                let existing = m
+                    .entry("ai_tool_governor.tool_names".to_string())
+                    .or_default();
+                for name in tool_names {
+                    let already_present = existing.split(',').any(|value| value == name);
+                    if !already_present {
+                        if !existing.is_empty() {
+                            existing.push(',');
+                        }
+                        existing.push_str(name);
+                    }
+                }
+            }
         }
         m.insert(
             "ai_tool_governor.risk".to_string(),
@@ -1459,7 +1516,7 @@ impl AiToolGovernor {
             .iter()
             .map(|call| call_identity_hash(&corr, call))
             .collect();
-        let mut remaining = governed_call_counts(ctx);
+        let mut remaining = governed_call_counts(ctx, self.instance_id);
         let mut to_govern: Vec<ToolCall> = Vec::new();
         for (call, identity) in calls.into_iter().zip(identities.iter()) {
             match remaining.get_mut(identity) {
@@ -1487,7 +1544,7 @@ impl AiToolGovernor {
         // a later re-check of this same call set — this path also runs from
         // `on_response_body` for a decoded mislabeled-JSON body — skips
         // one-for-one instead of re-firing approval webhooks.
-        record_governed_identities(ctx, &identities);
+        record_governed_identities(ctx, self.instance_id, &identities);
         PluginResult::Continue
     }
 
@@ -1529,9 +1586,9 @@ impl AiToolGovernor {
         // bodies back through this path) can skip an unchanged body instead of
         // re-governing it — for `require_approval` policies that would mean a
         // duplicate approval webhook call. Stored on the non-serialized
-        // `ai_tool_governor_response_hash` field so this body-derived hash never
+        // per-instance `ai_tool_governor_response_hashes` map so this body-derived hash never
         // reaches transaction logs.
-        ctx.ai_tool_governor_response_hash = Some(sha256_hex_bytes(body));
+        self.set_response_hash(ctx, sha256_hex_bytes(body));
         let extracted = extract_sse_tool_calls(body);
         // Mirror the live streaming finalizer: a buffered SSE tool call that
         // cannot be policy-checked (missing `function.name` or non-string
@@ -1572,7 +1629,7 @@ impl AiToolGovernor {
             .iter()
             .map(|call| call_identity_hash(&corr, call))
             .collect();
-        let mut remaining = governed_call_counts(ctx);
+        let mut remaining = governed_call_counts(ctx, self.instance_id);
         let mut to_govern: Vec<ToolCall> = Vec::new();
         for (call, identity) in extracted.calls.into_iter().zip(identities.iter()) {
             match remaining.get_mut(identity) {
@@ -1593,7 +1650,7 @@ impl AiToolGovernor {
         // Record the full identity multiset (skipped + freshly cleared) so the
         // final re-check skips unchanged calls one-for-one while a transform
         // that injects, duplicates, or rewrites a call is still re-evaluated.
-        record_governed_identities(ctx, &identities);
+        record_governed_identities(ctx, self.instance_id, &identities);
         PluginResult::Continue
     }
 
@@ -1746,7 +1803,7 @@ impl Plugin for AiToolGovernor {
             // Stored on a non-serialized field so this arg-derived hash never
             // reaches transaction logs.
             if let Some(hash) = ctx.metadata.get("request_body").map(|b| sha256_hex(b)) {
-                ctx.ai_tool_governor_request_hash = Some(hash);
+                self.set_request_hash(ctx, hash);
             }
             return self.govern_request(ctx, &json).await;
         }
@@ -1890,7 +1947,7 @@ impl Plugin for AiToolGovernor {
         // Unchanged since `before_proxy` governed it: nothing new to check, and
         // re-governing would risk a duplicate approval webhook.
         let final_hash = sha256_hex_bytes(body);
-        if ctx.ai_tool_governor_request_hash.as_deref() == Some(final_hash.as_str()) {
+        if self.request_hash(ctx) == Some(final_hash.as_str()) {
             return PluginResult::Continue;
         }
 
@@ -1901,7 +1958,7 @@ impl Plugin for AiToolGovernor {
         // content type or one `before_proxy` already governed — so a non-JSON
         // request another plugin merely buffered is not rejected here.
         let Some(json) = json else {
-            let was_governed = ctx.ai_tool_governor_request_hash.is_some();
+            let was_governed = self.request_hash(ctx).is_some();
             if self.engine.mode == Mode::Enforce && (json_ct || was_governed) {
                 return self.reject_uninspectable(
                     ctx,
@@ -1911,7 +1968,7 @@ impl Plugin for AiToolGovernor {
             }
             return PluginResult::Continue;
         };
-        ctx.ai_tool_governor_request_hash = Some(final_hash);
+        self.set_request_hash(ctx, final_hash);
         self.govern_request(ctx, &json).await
     }
 
@@ -1921,23 +1978,19 @@ impl Plugin for AiToolGovernor {
         self.enabled && self.inspect.any_buffered_response()
     }
 
-    /// Buffer by default — even for requests marked streaming (`Accept:
-    /// text/event-stream`, a shared `ai_request_streaming` marker set by an
-    /// earlier plugin, or this plugin's own `stream: true` marker). The
-    /// pre-header decision cannot see the response content-type, and a backend
-    /// may answer a `stream: true` request with plain JSON
-    /// `choices[].message.tool_calls[]`; opting out here would skip
-    /// `on_response_body` entirely and bypass enforce-mode policy.
+    /// Buffer by default whenever a response inspection surface is enabled.
+    /// The pre-header decision cannot see response `Content-Type` or
+    /// `Content-Encoding`: even an unmarked/bodyless request such as
+    /// `GET /events` can return encoded SSE, which the raw live inspector cannot
+    /// decode. The header-time refinement below releases only unencoded SSE to
+    /// that inspector (plus framed gRPC, which is out of scope) and keeps
+    /// encoded/ambiguous bodies on the decode-and-govern path.
     /// `should_buffer_response_body_for_content_type` downgrades ONLY an event
     /// stream that the live SSE inspector will actually govern
     /// (`streaming_response_tool_calls` enabled) and framed gRPC/gRPC-Web back
     /// to the streaming path.
-    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        // Buffer for explicit response inspection, or — for a streaming-only
-        // config — only when the request was streaming (to catch its SSE-JSON
-        // fallback). A non-streaming response under a streaming-only config is
-        // not buffered/governed.
-        self.enabled && self.governs_buffered_json(ctx)
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+        self.enabled && self.inspect.any_buffered_response()
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -2064,7 +2117,7 @@ impl Plugin for AiToolGovernor {
                     if !self.governs_buffered_json(ctx) {
                         return PluginResult::Continue;
                     }
-                    ctx.ai_tool_governor_response_hash = Some(sha256_hex_bytes(&decoded));
+                    self.set_response_hash(ctx, sha256_hex_bytes(&decoded));
                     let Some(json) = parse_json_within_limit(&decoded) else {
                         return self.uninspectable_governed_response(
                             ctx,
@@ -2161,7 +2214,7 @@ impl Plugin for AiToolGovernor {
                 // own decode against this, so a compression-only final body
                 // is hash-skipped instead of re-governed (no duplicate
                 // approval webhook).
-                ctx.ai_tool_governor_response_hash = Some(sha256_hex_bytes(&decoded));
+                self.set_response_hash(ctx, sha256_hex_bytes(&decoded));
                 let Some(json) = parse_json_within_limit(&decoded) else {
                     return self.uninspectable_governed_response(
                         ctx,
@@ -2182,8 +2235,8 @@ impl Plugin for AiToolGovernor {
         // client-visible body (recorded even when there are no calls: a later
         // `response_transformer` that injects one changes the hash and forces a
         // fresh evaluation). Stored on the non-serialized
-        // `ai_tool_governor_response_hash` field, off `ctx.metadata`.
-        ctx.ai_tool_governor_response_hash = Some(sha256_hex_bytes(body));
+        // per-instance `ai_tool_governor_response_hashes` map, off `ctx.metadata`.
+        self.set_response_hash(ctx, sha256_hex_bytes(body));
 
         let (calls, ungovernable) = extract_response_tool_calls(&json);
         // Streaming parity: an ungovernable `tool_calls[]` entry (a missing
@@ -2232,7 +2285,7 @@ impl Plugin for AiToolGovernor {
         // transform changes their args, duplicates them, or rewrites an
         // approval-relevant field like `model`. Redaction updates this record
         // to the redacted args below.
-        record_governed_calls(ctx, &corr, &calls);
+        record_governed_calls(ctx, self.instance_id, &corr, &calls);
         PluginResult::Continue
     }
 
@@ -2268,7 +2321,7 @@ impl Plugin for AiToolGovernor {
         // e.g. a backend 4xx/5xx JSON error whose shape happens to contain
         // `choices[].message.tool_calls[]`, which `on_response_body` skips as
         // non-2xx before recording the hash.
-        ctx.ai_tool_governor_response_hash.as_ref()?;
+        self.response_hash(ctx)?;
         // Mirror the `looks_like_json` fallback in `on_response_body`: a header
         // rule can strip/relabel `Content-Type: application/json` before this
         // transform runs while leaving the governed JSON intact. Redaction must
@@ -2298,14 +2351,19 @@ impl Plugin for AiToolGovernor {
             // (avoids re-calling an approval webhook for an unchanged sibling
             // and re-matching the `[REDACTED_TOOL_ARG:<name>]` placeholder as a
             // blocked pattern).
-            ctx.ai_tool_governor_response_hash = Some(sha256_hex_bytes(&rewritten));
+            self.set_response_hash(ctx, sha256_hex_bytes(&rewritten));
             let provider = self.resolve_response_provider(ctx, &json);
             let model = json
                 .get("model")
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let corr = self.correlation(ctx, model, provider.as_deref());
-            record_governed_calls(ctx, &corr, &extract_response_tool_calls(&json).0);
+            record_governed_calls(
+                ctx,
+                self.instance_id,
+                &corr,
+                &extract_response_tool_calls(&json).0,
+            );
             return Some(rewritten);
         }
         None
@@ -2347,7 +2405,7 @@ impl Plugin for AiToolGovernor {
         // buffering came from OUTSIDE this plugin, regardless of whether the
         // request was streaming — is not re-governed (no duplicate webhook).
         let final_hash = sha256_hex_bytes(body);
-        if ctx.ai_tool_governor_response_hash.as_deref() == Some(final_hash.as_str()) {
+        if self.response_hash(ctx) == Some(final_hash.as_str()) {
             return PluginResult::Continue;
         }
 
@@ -2423,9 +2481,7 @@ impl Plugin for AiToolGovernor {
                 // Compression-only rewrite of an already-governed body: decoded
                 // bytes match the recorded hash, so skip (no duplicate approval
                 // webhook), regardless of the request-streaming gate.
-                if ctx.ai_tool_governor_response_hash.as_deref()
-                    == Some(sha256_hex_bytes(&decoded).as_str())
-                {
+                if self.response_hash(ctx) == Some(sha256_hex_bytes(&decoded).as_str()) {
                     return PluginResult::Continue;
                 }
                 // Encoded-SSE shape check on the DECODED bytes, ungated by
@@ -2509,9 +2565,7 @@ impl Plugin for AiToolGovernor {
             // could deny, turning an allowed response into a 502). (Already
             // checked for the streaming-config early-decode path above; repeated
             // here for the `response_tool_calls`-only decode-now path.)
-            if ctx.ai_tool_governor_response_hash.as_deref()
-                == Some(sha256_hex_bytes(&decoded).as_str())
-            {
+            if self.response_hash(ctx) == Some(sha256_hex_bytes(&decoded).as_str()) {
                 return PluginResult::Continue;
             }
             // Buffered-SSE parity on the DECODED bytes: a compressed SSE body
@@ -4147,24 +4201,33 @@ fn call_identity_hash(corr: &CorrelationMeta, call: &ToolCall) -> String {
 /// Record the identity hashes of governed response tool calls (with per-hash
 /// COUNTS — multiset semantics) onto the request context so the final re-check
 /// can consume them one-for-one.
-fn record_governed_calls(ctx: &mut RequestContext, corr: &CorrelationMeta, calls: &[ToolCall]) {
+fn record_governed_calls(
+    ctx: &mut RequestContext,
+    instance_id: u64,
+    corr: &CorrelationMeta,
+    calls: &[ToolCall],
+) {
     let identities: Vec<String> = calls
         .iter()
         .map(|call| call_identity_hash(corr, call))
         .collect();
-    record_governed_identities(ctx, &identities);
+    record_governed_identities(ctx, instance_id, &identities);
 }
 
 /// Record pre-computed governed-call identity hashes (multiset counts) onto the
 /// request context, replacing any previous record. Stored on the non-serialized
 /// `ai_tool_governor_call_hashes` field (NOT `ctx.metadata`) so this arg-derived
 /// identity ledger never reaches transaction logs, while remaining readable to
-/// this plugin's own later hooks (the `on_final_response_body` re-check).
-fn record_governed_identities(ctx: &mut RequestContext, identities: &[String]) {
+/// this exact plugin instance's own later hooks (the `on_final_response_body`
+/// re-check).
+fn record_governed_identities(ctx: &mut RequestContext, instance_id: u64, identities: &[String]) {
     if identities.is_empty() {
         return;
     }
-    let counts = &mut ctx.ai_tool_governor_call_hashes;
+    let counts = ctx
+        .ai_tool_governor_call_hashes
+        .entry(instance_id)
+        .or_default();
     counts.clear();
     for hash in identities {
         *counts.entry(hash.clone()).or_insert(0) += 1;
@@ -4172,8 +4235,11 @@ fn record_governed_identities(ctx: &mut RequestContext, identities: &[String]) {
 }
 
 /// Read the recorded governed-call identity counts from the request context.
-fn governed_call_counts(ctx: &RequestContext) -> HashMap<String, usize> {
-    ctx.ai_tool_governor_call_hashes.clone()
+fn governed_call_counts(ctx: &RequestContext, instance_id: u64) -> HashMap<String, usize> {
+    ctx.ai_tool_governor_call_hashes
+        .get(&instance_id)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn sha256_hex_bytes(input: &[u8]) -> String {

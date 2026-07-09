@@ -473,24 +473,26 @@ pub struct RequestContext {
     /// final body hooks. Kept out of public metadata so per-instance state does
     /// not leak into transaction logs.
     pub(crate) openapi_validator_matches: HashMap<usize, (String, String)>,
-    /// `ai_tool_governor` internal correlation markers staged between
+    /// Per-`ai_tool_governor`-instance internal correlation markers staged between
     /// `on_response_body` / `transform_response_body` and the
     /// `on_final_response_body` re-check. Kept out of public `metadata` so this
     /// per-request bookkeeping — the governed-body hash and the per-call
     /// identity multiset, both DERIVED FROM RAW TOOL ARGUMENTS — never reaches
     /// transaction logs (an operator who disabled `observability.hash_arguments`
     /// must not get an arg-derived hash logged via a correlation marker).
-    pub(crate) ai_tool_governor_response_hash: Option<String>,
-    /// `ai_tool_governor` governed-call identity multiset (identity hash ->
-    /// count), the one-for-one skip ledger the final re-check consumes. Paired
-    /// with `ai_tool_governor_response_hash`; kept off `metadata` for the same
-    /// reason.
-    pub(crate) ai_tool_governor_call_hashes: HashMap<String, usize>,
-    /// `ai_tool_governor` governed-request-body hash, staged in `before_proxy`
-    /// for the `on_final_request_body` re-check. Same leak class as the
-    /// response markers (a hash over the raw request body including tool-call
-    /// arguments), so it is kept off `metadata` too.
-    pub(crate) ai_tool_governor_request_hash: Option<String>,
+    /// The outer key is a process-unique governor instance ID. Multiple
+    /// instances may coexist on one proxy and must never consume each other's
+    /// dedup state.
+    pub(crate) ai_tool_governor_response_hashes: HashMap<u64, String>,
+    /// Per-instance governed-call identity multisets (identity hash -> count),
+    /// the one-for-one skip ledgers final re-checks consume. Kept off
+    /// `metadata` for the same reason as the response hashes.
+    pub(crate) ai_tool_governor_call_hashes: HashMap<u64, HashMap<String, usize>>,
+    /// Per-instance governed-request-body hashes, staged in `before_proxy` for
+    /// the `on_final_request_body` re-check. Same leak class as the response
+    /// markers (a hash over the raw request body including tool-call arguments),
+    /// so they remain off `metadata` too.
+    pub(crate) ai_tool_governor_request_hashes: HashMap<u64, String>,
     /// A2A gateway detection state staged between request and response hooks.
     /// Kept out of public metadata so Agent Card rewriting can work even when
     /// `observability.emit_metadata` is disabled.
@@ -741,9 +743,9 @@ impl RequestContext {
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
-            ai_tool_governor_response_hash: None,
+            ai_tool_governor_response_hashes: HashMap::new(),
             ai_tool_governor_call_hashes: HashMap::new(),
-            ai_tool_governor_request_hash: None,
+            ai_tool_governor_request_hashes: HashMap::new(),
             a2a_gateway_detected: false,
             a2a_gateway_binding: None,
             a2a_gateway_is_agent_card: false,
@@ -822,9 +824,9 @@ impl RequestContext {
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
-            ai_tool_governor_response_hash: self.ai_tool_governor_response_hash.clone(),
+            ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_tool_governor_call_hashes: self.ai_tool_governor_call_hashes.clone(),
-            ai_tool_governor_request_hash: self.ai_tool_governor_request_hash.clone(),
+            ai_tool_governor_request_hashes: self.ai_tool_governor_request_hashes.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
             a2a_gateway_binding: self.a2a_gateway_binding,
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
