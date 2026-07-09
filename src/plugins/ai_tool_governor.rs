@@ -1008,6 +1008,7 @@ impl AiToolGovernor {
         }
         let instance_id =
             NEXT_GOVERNOR_INSTANCE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let approval_cache_shard_amount = http_client.pool_shard_amount();
 
         let enabled = optional_bool(config, "enabled")?.unwrap_or(true);
         if !enabled {
@@ -1027,7 +1028,7 @@ impl AiToolGovernor {
                     max_argument_log_bytes: 0,
                 },
                 http_client,
-                approval_cache: DashMap::new(),
+                approval_cache: DashMap::with_shard_amount(approval_cache_shard_amount),
                 approval_cache_insert_lock: std::sync::Mutex::new(()),
             };
             return Ok(Self {
@@ -1137,7 +1138,7 @@ impl AiToolGovernor {
             response,
             observability,
             http_client,
-            approval_cache: DashMap::new(),
+            approval_cache: DashMap::with_shard_amount(approval_cache_shard_amount),
             approval_cache_insert_lock: std::sync::Mutex::new(()),
         };
 
@@ -1219,11 +1220,45 @@ impl AiToolGovernor {
             .insert(self.instance_id, hash);
     }
 
+    /// Identity used by the post-transform response re-check. Approval-capable
+    /// calls retain every approval-cache correlation field so a model/provider
+    /// rewrite requires a fresh decision. `redact_args` is deterministic and
+    /// does not consult those fields, so its already-redacted identity remains
+    /// stable when a later transform changes only model/provider metadata.
+    fn governed_call_identity_hash(&self, corr: &CorrelationMeta, call: &ToolCall) -> String {
+        if self
+            .engine
+            .tools
+            .get(&call.name)
+            .is_some_and(|policy| policy.action == ToolAction::RedactArgs)
+        {
+            deterministic_call_identity_hash(call)
+        } else {
+            correlated_call_identity_hash(corr, call)
+        }
+    }
+
+    /// Record governed response calls as a multiset for the final re-check.
+    fn record_governed_calls(
+        &self,
+        ctx: &mut RequestContext,
+        corr: &CorrelationMeta,
+        calls: &[ToolCall],
+    ) {
+        let identities: Vec<String> = calls
+            .iter()
+            .map(|call| self.governed_call_identity_hash(corr, call))
+            .collect();
+        record_governed_identities(ctx, self.instance_id, &identities);
+    }
+
     /// Request media types this instance can govern. MCP/A2A gateways accept
     /// JSON-RPC's registered-in-practice media type and absent Content-Type, so
     /// their policy surface must do the same or the gateway can consume a call
-    /// before the governor ever sees it. Other request/streaming inspection
-    /// remains scoped to ordinary JSON media types.
+    /// before the governor ever sees it. An absent type is only a tentative
+    /// buffering signal here; `before_proxy` additionally requires a
+    /// JSON-shaped body before treating it as governed. Other request/streaming
+    /// inspection remains scoped to ordinary JSON media types.
     fn governs_request_content_type(&self, content_type: Option<&str>) -> bool {
         let governs_json_rpc = self.inspect.mcp_tool_calls || self.inspect.a2a_methods;
         match content_type {
@@ -1625,17 +1660,16 @@ impl AiToolGovernor {
         // most its recorded count of identical calls, so a transform that
         // DUPLICATES an approved call has the copy re-evaluated (with
         // `cache_ttl_seconds: 0`, re-approved) instead of two executions riding
-        // one approval. The identity includes the approval-relevant correlation
+        // one approval. Approval-capable identities include the correlation
         // fields (consumer/proxy/model/provider — the approval cache key
-        // fields), so a transform that changes only e.g. the top-level `model`
-        // no longer matches and the call is re-approved under the new model. A
-        // later transform that only touched an unrelated field still skips the
-        // unchanged siblings — no second approval webhook, and this plugin's
-        // own `[REDACTED_TOOL_ARG:<name>]` redacted form (re-recorded after
-        // redaction) is not re-matched as a blocked pattern.
+        // fields), so a top-level `model` rewrite forces re-approval. A
+        // deterministic `redact_args` identity deliberately omits those fields:
+        // a model/provider-only rewrite cannot make this plugin's own safe
+        // `[REDACTED_TOOL_ARG:<name>]` form look new and re-match the placeholder
+        // as a blocked pattern.
         let identities: Vec<String> = calls
             .iter()
-            .map(|call| call_identity_hash(&corr, call))
+            .map(|call| self.governed_call_identity_hash(&corr, call))
             .collect();
         let mut remaining = governed_call_counts(ctx, self.instance_id);
         let mut to_govern: Vec<ToolCall> = Vec::new();
@@ -1748,7 +1782,7 @@ impl AiToolGovernor {
         let identities: Vec<String> = extracted
             .calls
             .iter()
-            .map(|call| call_identity_hash(&corr, call))
+            .map(|call| self.governed_call_identity_hash(&corr, call))
             .collect();
         let mut remaining = governed_call_counts(ctx, self.instance_id);
         let mut to_govern: Vec<ToolCall> = Vec::new();
@@ -1824,7 +1858,7 @@ impl Plugin for AiToolGovernor {
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         if !self.enabled
             || !(self.inspect.any_request() || self.inspect.streaming_response_tool_calls)
-            || ctx.method != "POST"
+            || !ctx.method.eq_ignore_ascii_case("POST")
         {
             return false;
         }
@@ -1848,8 +1882,9 @@ impl Plugin for AiToolGovernor {
         // JSON-RPC/absent media types accepted by MCP/A2A gateways are in
         // scope. Framed gRPC/gRPC-Web `+json` variants are wire frames, not
         // bare JSON — out of scope, never fail-closed.
-        if ctx.method != "POST"
-            || !self.governs_request_content_type(header_value(headers, "content-type"))
+        let content_type = header_value(headers, "content-type");
+        if !ctx.method.eq_ignore_ascii_case("POST")
+            || !self.governs_request_content_type(content_type)
         {
             return PluginResult::Continue;
         }
@@ -1864,19 +1899,29 @@ impl Plugin for AiToolGovernor {
         let enforce_request = governs_request && self.engine.mode == Mode::Enforce;
         let mut uninspectable: Option<&'static str> = None;
 
-        if header_value(headers, "content-encoding")
-            .map(str::trim)
-            .is_some_and(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"))
-        {
-            uninspectable = Some("request body has a content-encoding that cannot be inspected");
-        }
-
         let body_size: usize = ctx
             .metadata
             .get("request_body_size_bytes")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         let body = ctx.metadata.get("request_body");
+
+        // A missing Content-Type is accepted by MCP/A2A gateways, but it is
+        // not evidence that every POST on a mixed proxy is JSON-RPC. Body
+        // buffering is necessarily tentative (the body is unavailable when
+        // `should_buffer_request_body` runs); once available, only a JSON-shaped
+        // body enters fail-closed governance. Unrelated form/binary uploads are
+        // released instead of being rejected as malformed JSON.
+        if content_type.is_none() && !body.is_some_and(|body| looks_like_json(body.as_bytes())) {
+            return PluginResult::Continue;
+        }
+
+        if header_value(headers, "content-encoding")
+            .map(str::trim)
+            .is_some_and(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"))
+        {
+            uninspectable = Some("request body has a content-encoding that cannot be inspected");
+        }
 
         if uninspectable.is_none() {
             if body_size == 0 && body.is_none_or(|b| b.is_empty()) {
@@ -1969,7 +2014,7 @@ impl Plugin for AiToolGovernor {
         if !governs_request && !detects_streaming {
             return PluginResult::Continue;
         }
-        if ctx.method != "POST" {
+        if !ctx.method.eq_ignore_ascii_case("POST") {
             return PluginResult::Continue;
         }
         // An empty body has nothing to detect or govern (it is not
@@ -1988,7 +2033,8 @@ impl Plugin for AiToolGovernor {
         // never look like JSON, so the shape fallback does not re-admit it —
         // while a transform that merely relabeled a still-JSON-shaped body is
         // still caught by `looks_like_json`.
-        let json_ct = self.governs_request_content_type(header_value(headers, "content-type"));
+        let json_ct = header_value(headers, "content-type")
+            .is_some_and(|content_type| self.governs_request_content_type(Some(content_type)));
         let json_shaped = looks_like_json(body);
         if !json_ct && !json_shaped {
             return PluginResult::Continue;
@@ -2407,12 +2453,11 @@ impl Plugin for AiToolGovernor {
             );
             return self.reject(&batch);
         }
-        // Record the governed calls (with correlation-aware identities and
-        // counts) so the final re-check skips them one-for-one — unless a later
-        // transform changes their args, duplicates them, or rewrites an
-        // approval-relevant field like `model`. Redaction updates this record
-        // to the redacted args below.
-        record_governed_calls(ctx, self.instance_id, &corr, &calls);
+        // Record the governed calls with multiset counts so the final re-check
+        // skips them one-for-one. Approval-capable calls use correlation-aware
+        // identities; deterministic `redact_args` calls use name/args only.
+        // Redaction updates the latter record to the redacted args below.
+        self.record_governed_calls(ctx, &corr, &calls);
         PluginResult::Continue
     }
 
@@ -2472,12 +2517,12 @@ impl Plugin for AiToolGovernor {
             // Record the redacted body's hash so `on_final_response_body` treats
             // this plugin's own redaction as already-governed and skips it when
             // no later transform runs. Also re-record the redacted calls'
-            // identity hashes (with the same correlation fields and counts as
-            // `on_response_body`) so that even if a later transform changes the
-            // body hash, the final re-check skips these already-redacted calls
-            // (avoids re-calling an approval webhook for an unchanged sibling
-            // and re-matching the `[REDACTED_TOOL_ARG:<name>]` placeholder as a
-            // blocked pattern).
+            // identity hashes (with the same per-policy identity rules and
+            // counts as `on_response_body`) so that even if a later transform
+            // changes the body hash or only the model/provider, the final
+            // re-check skips these already-redacted calls. Approval-capable
+            // siblings keep their correlation-aware identities and still
+            // require re-approval when those fields change.
             self.set_response_hash(ctx, sha256_hex_bytes(&rewritten));
             let provider = self.resolve_response_provider(ctx, &json);
             let model = json
@@ -2485,12 +2530,7 @@ impl Plugin for AiToolGovernor {
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let corr = self.correlation(ctx, model, provider.as_deref());
-            record_governed_calls(
-                ctx,
-                self.instance_id,
-                &corr,
-                &extract_response_tool_calls(&json).0,
-            );
+            self.record_governed_calls(ctx, &corr, &extract_response_tool_calls(&json).0);
             return Some(rewritten);
         }
         None
@@ -4082,7 +4122,8 @@ fn extract_a2a_method(json: &Value) -> Option<ToolCall> {
     if method == "tools/call" {
         return None;
     }
-    Some(tool_call_from(method, json.get("params")))
+    let canonical_method = super::a2a_gateway::canonical_a2a_method(method).unwrap_or(method);
+    Some(tool_call_from(canonical_method, json.get("params")))
 }
 
 fn request_model(json: &Value) -> Option<String> {
@@ -4330,14 +4371,11 @@ fn looks_like_sse(body: &[u8]) -> bool {
     false
 }
 
-/// Unambiguous identity hash of a governed tool call, used to skip
-/// already-governed/redacted calls in the post-transform final re-check. It
-/// hashes the same JSON array as the approval cache key — the correlation
-/// fields (consumer/proxy/model/provider) plus name and raw args — so a
-/// transform that changes any approval-relevant field (e.g. only the top-level
-/// `model`) yields a different identity and the call is re-evaluated (and
-/// re-approved) under the new context instead of riding the old decision.
-fn call_identity_hash(corr: &CorrelationMeta, call: &ToolCall) -> String {
+/// Unambiguous correlated identity hash of a governed tool call. It hashes the
+/// same JSON array as the approval cache key — correlation fields plus name and
+/// raw args — so an approval-relevant rewrite is evaluated under the new
+/// context instead of riding the old decision.
+fn correlated_call_identity_hash(corr: &CorrelationMeta, call: &ToolCall) -> String {
     sha256_hex(
         &json!([
             corr.consumer.as_deref(),
@@ -4351,20 +4389,12 @@ fn call_identity_hash(corr: &CorrelationMeta, call: &ToolCall) -> String {
     )
 }
 
-/// Record the identity hashes of governed response tool calls (with per-hash
-/// COUNTS — multiset semantics) onto the request context so the final re-check
-/// can consume them one-for-one.
-fn record_governed_calls(
-    ctx: &mut RequestContext,
-    instance_id: u64,
-    corr: &CorrelationMeta,
-    calls: &[ToolCall],
-) {
-    let identities: Vec<String> = calls
-        .iter()
-        .map(|call| call_identity_hash(corr, call))
-        .collect();
-    record_governed_identities(ctx, instance_id, &identities);
+/// Identity for a deterministic `redact_args` result. The request-scoped
+/// instance ledger already provides isolation, and name/args are the only
+/// inputs to redaction policy; approval-only correlation fields must not make
+/// an already-redacted call look new after a model/provider-only rewrite.
+fn deterministic_call_identity_hash(call: &ToolCall) -> String {
+    sha256_hex(&json!([call.name.as_str(), call.raw_args.as_str()]).to_string())
 }
 
 /// Record pre-computed governed-call identity hashes (multiset counts) onto the

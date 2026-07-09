@@ -1093,7 +1093,7 @@ fn canonical_policy_method(method: &str) -> Option<&'static str> {
     }
 }
 
-fn canonical_a2a_method(method: &str) -> Option<&'static str> {
+pub(crate) fn canonical_a2a_method(method: &str) -> Option<&'static str> {
     if let Some(canonical) = JSONRPC_METHODS
         .iter()
         .copied()

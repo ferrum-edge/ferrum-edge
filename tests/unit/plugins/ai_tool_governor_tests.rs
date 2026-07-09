@@ -2430,21 +2430,24 @@ fn capabilities_and_warmup_hostnames() {
     );
 }
 
-/// An A2A JSON-RPC method governed by a `deny` policy is rejected on the request.
+/// Canonical A2A JSON-RPC methods and gateway-supported PascalCase aliases use
+/// the same policy key, so an alias cannot bypass a canonical deny rule.
 #[tokio::test]
 async fn a2a_method_deny_rejects() {
     let plugin = make(json!({
         "tools": { "message/send": { "action": "deny" } },
         "inspect": { "a2a_methods": true, "response_tool_calls": false }
     }));
-    let mut ctx = json_post_ctx();
-    ctx.metadata.insert(
-        "request_body".to_string(),
-        json!({ "jsonrpc": "2.0", "id": 1, "method": "message/send", "params": { "foo": "bar" } })
-            .to_string(),
-    );
-    let mut headers = json_headers();
-    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
+    for method in ["message/send", "SendMessage"] {
+        let mut ctx = json_post_ctx();
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            json!({ "jsonrpc": "2.0", "id": 1, "method": method, "params": { "foo": "bar" } })
+                .to_string(),
+        );
+        let mut headers = json_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
+    }
 }
 
 /// A per-tool `dry_run` action forwards the call while recording an `allow`
@@ -3438,6 +3441,46 @@ async fn later_transform_does_not_reflag_redacted_call() {
     assert_continue(
         plugin
             .on_final_response_body(&mut ctx, 200, &json_headers(), &later)
+            .await,
+    );
+}
+
+/// A model-only rewrite is approval-relevant for `require_approval`, but not
+/// for deterministic `redact_args`. The already-redacted placeholder must not
+/// be re-evaluated and rejected merely because the top-level model changed.
+#[tokio::test]
+async fn model_only_transform_does_not_reflag_redacted_call() {
+    let plugin = make(json!({
+        "tools": {
+            "filesystem.write": {
+                "action": "redact_args",
+                "blocked_arg_patterns": [{ "name": "token", "regex": "token" }]
+            }
+        }
+    }));
+    let body = response_with_tool_call("filesystem.write", "{\"data\":\"my token here\"}");
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    let redacted = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            &body,
+            Some("application/json"),
+            &json_headers(),
+        )
+        .await
+        .expect("redacted body");
+
+    let mut val: Value = serde_json::from_slice(&redacted).unwrap();
+    val["model"] = json!("gpt-4o-mini");
+    let model_rewritten = serde_json::to_vec(&val).unwrap();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &model_rewritten)
             .await,
     );
 }
@@ -7023,9 +7066,12 @@ async fn json_rpc_media_types_are_governed_for_mcp_and_a2a() {
     ];
 
     for (plugin, body) in cases {
-        for content_type in [Some("application/json-rpc; charset=utf-8"), None] {
+        for (content_type, method) in [
+            (Some("application/json-rpc; charset=utf-8"), "post"),
+            (None, "PoSt"),
+        ] {
             let mut ctx = create_test_context();
-            ctx.method = "POST".to_string();
+            ctx.method = method.to_string();
             ctx.headers.remove("content-type");
             if let Some(content_type) = content_type {
                 ctx.headers
@@ -7038,5 +7084,50 @@ async fn json_rpc_media_types_are_governed_for_mcp_and_a2a() {
             let mut headers = ctx.headers.clone();
             assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
         }
+
+        let mut final_ctx = create_test_context();
+        final_ctx.method = "pOsT".to_string();
+        let final_headers = HashMap::new();
+        let final_body = body.to_string();
+        assert_reject(
+            plugin
+                .on_final_request_body_with_context(
+                    &mut final_ctx,
+                    &final_headers,
+                    final_body.as_bytes(),
+                )
+                .await,
+            Some(403),
+        );
     }
+}
+
+/// Missing Content-Type is only a tentative JSON-RPC buffering signal. Once
+/// the body is available, unrelated no-type form/binary POSTs remain out of
+/// scope instead of failing closed as malformed JSON.
+#[tokio::test]
+async fn absent_content_type_non_json_posts_are_out_of_scope() {
+    let plugin = make(mcp_config("enforce"));
+    let mut ctx = create_test_context();
+    ctx.method = "post".to_string();
+    ctx.headers.remove("content-type");
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        "file=not-json&mode=upload".to_string(),
+    );
+    ctx.metadata
+        .insert("request_body_size_bytes".to_string(), "25".to_string());
+
+    // The pre-body hook must buffer to classify absent-type traffic.
+    assert!(plugin.should_buffer_request_body(&ctx));
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    let mut final_ctx = create_test_context();
+    final_ctx.method = "PoSt".to_string();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut final_ctx, &headers, b"\x00\x01binary upload")
+            .await,
+    );
 }
