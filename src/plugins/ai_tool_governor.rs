@@ -206,6 +206,16 @@ impl RiskLevel {
             RiskLevel::Critical => "critical",
         }
     }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "low" => Some(RiskLevel::Low),
+            "medium" => Some(RiskLevel::Medium),
+            "high" => Some(RiskLevel::High),
+            "critical" => Some(RiskLevel::Critical),
+            _ => None,
+        }
+    }
 }
 
 /// What to do when the approval endpoint cannot be evaluated.
@@ -426,6 +436,40 @@ fn set_decision_metadata(m: &mut HashMap<String, String>, label: &str) {
         return;
     }
     m.insert("ai_tool_governor.decision".to_string(), label.to_string());
+}
+
+/// Keep the reported tool names aligned with the highest-severity decision.
+/// A higher-severity batch replaces names from a weaker decision, while an
+/// equal-severity batch merges names so multiple inspected surfaces or plugin
+/// instances cannot hide one another's findings.
+fn set_tool_names_metadata(
+    m: &mut HashMap<String, String>,
+    previous_rank: u8,
+    batch_rank: u8,
+    tool_names: &[&str],
+) {
+    if tool_names.is_empty() || batch_rank < previous_rank {
+        return;
+    }
+    if batch_rank > previous_rank {
+        m.insert(
+            "ai_tool_governor.tool_names".to_string(),
+            tool_names.join(","),
+        );
+        return;
+    }
+
+    let existing = m
+        .entry("ai_tool_governor.tool_names".to_string())
+        .or_default();
+    for name in tool_names {
+        if !existing.split(',').any(|value| value == *name) {
+            if !existing.is_empty() {
+                existing.push(',');
+            }
+            existing.push_str(name);
+        }
+    }
 }
 
 impl GovernorEngine {
@@ -1181,30 +1225,18 @@ impl AiToolGovernor {
         set_decision_metadata(m, batch.overall_label);
 
         let tool_names: Vec<&str> = batch.per_call.iter().map(|c| c.name.as_str()).collect();
-        if !tool_names.is_empty() {
-            if batch_rank > previous_rank {
-                m.insert(
-                    "ai_tool_governor.tool_names".to_string(),
-                    tool_names.join(","),
-                );
-            } else if batch_rank == previous_rank {
-                let existing = m
-                    .entry("ai_tool_governor.tool_names".to_string())
-                    .or_default();
-                for name in tool_names {
-                    let already_present = existing.split(',').any(|value| value == name);
-                    if !already_present {
-                        if !existing.is_empty() {
-                            existing.push(',');
-                        }
-                        existing.push_str(name);
-                    }
-                }
-            }
-        }
+        set_tool_names_metadata(m, previous_rank, batch_rank, &tool_names);
+
+        // Risk is an independent aggregate: keep the maximum observed value
+        // even when a later lower-risk batch cannot downgrade the sticky
+        // decision (for example, denied MCP followed by allowed A2A in dry-run).
+        let max_risk = m
+            .get("ai_tool_governor.risk")
+            .and_then(|value| RiskLevel::from_str(value))
+            .map_or(batch.max_risk, |existing| existing.max(batch.max_risk));
         m.insert(
             "ai_tool_governor.risk".to_string(),
-            batch.max_risk.as_str().to_string(),
+            max_risk.as_str().to_string(),
         );
 
         let policy_ids: Vec<&str> = batch
@@ -1415,8 +1447,13 @@ impl AiToolGovernor {
             "ai_tool_governor.mode".to_string(),
             self.engine.mode.as_str().to_string(),
         );
+        let previous_rank = m
+            .get("ai_tool_governor.decision")
+            .map(|value| label_rank(value))
+            .unwrap_or(0);
         set_decision_metadata(m, "deny");
-        m.insert("ai_tool_governor.tool_names".to_string(), denied.join(","));
+        let denied: Vec<&str> = denied.iter().map(String::as_str).collect();
+        set_tool_names_metadata(m, previous_rank, label_rank("deny"), &denied);
     }
 
     /// Redact `redact_args` matches in a buffered response body. Deterministic
@@ -2091,7 +2128,15 @@ impl Plugin for AiToolGovernor {
         }
         if is_event_stream_content_type(content_type) {
             // SSE-labeled but not SSE-shaped plaintext.
-            if let Some(encoding) = content_encoding_value(response_headers) {
+            // Try the plaintext JSON-shape route first even when the header
+            // already carries `Content-Encoding`: the gateway compression
+            // plugin commits that header in `after_proxy`, but its body
+            // transform runs after this hook, so the bytes are still plaintext
+            // here. A real upstream-encoded body will not look like JSON and
+            // continues to the bounded decode path below.
+            if !looks_like_json(body)
+                && let Some(encoding) = content_encoding_value(response_headers)
+            {
                 // An SSE label with a `Content-Encoding`: DECODE FIRST (the
                 // same gzip/br decode the final re-check uses) and govern the
                 // decoded bytes. Feeding compressed bytes into the SSE
@@ -2467,11 +2512,10 @@ impl Plugin for AiToolGovernor {
         // (threaded through `decoded_encoded`) so an encoded body is never
         // decompressed twice.
         //
-        // An explicitly SSE-labeled body that cannot be decoded is governed
-        // even for a non-streaming request when buffering came from outside
-        // this plugin. Reject it before the JSON-only request gate below;
-        // otherwise a streaming-only config would forward an uninspectable SSE
-        // body. Other undecodable labels keep the existing gated behavior.
+        // Any encoded body on this streaming-governance path that cannot be
+        // decoded is uninspectable regardless of its label. A relabel such as
+        // `text/plain` cannot prove the opaque bytes do not contain denied SSE
+        // frames, so reject before the JSON-only request gate below.
         let wire_encoding = content_encoding_value(response_headers);
         let mut decoded_encoded: Option<Vec<u8>> = None;
         if let Some(encoding) = wire_encoding
@@ -2496,7 +2540,7 @@ impl Plugin for AiToolGovernor {
                 // Not SSE-shaped: keep the decoded bytes for the JSON re-check below
                 // (which is gated) so the body is not decompressed a second time.
                 decoded_encoded = Some(decoded);
-            } else if is_event_stream_content_type(content_type) {
+            } else {
                 return self.uninspectable_governed_response(
                     ctx,
                     "SSE response body has a content-encoding that cannot be inspected",

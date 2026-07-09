@@ -6447,14 +6447,13 @@ async fn definition_only_approval_policies_do_not_require_webhook() {
     }
 }
 
-/// P2 (:2406): an externally-buffered final SSE body remains governed even for
-/// a non-streaming request under a streaming-only config. If its explicit SSE
-/// encoding is unsupported/corrupt, enforce must fail closed before the later
-/// JSON-only request gate; dry-run continues without disrupting traffic.
+/// P2 (:2406, round 21 follow-up): an externally-buffered final encoded body
+/// remains governed even for a non-streaming request under a streaming-only
+/// config. If its encoding is unsupported/corrupt, enforce must fail closed
+/// before the later JSON-only request gate even after an SSE body was relabeled;
+/// dry-run continues without disrupting traffic.
 #[tokio::test]
 async fn final_undecodable_encoded_sse_fails_closed_for_streaming_only_config() {
-    let mut headers = sse_headers();
-    headers.insert("content-encoding".to_string(), "zstd".to_string());
     let opaque = b"\x28\xb5\x2f\xfdopaque-zstd-sse";
 
     let enforce = make(json!({
@@ -6464,14 +6463,6 @@ async fn final_undecodable_encoded_sse_fails_closed_for_streaming_only_config() 
             "streaming_response_tool_calls": true
         }
     }));
-    let mut ctx = create_test_context(); // deliberately non-streaming request
-    assert_reject(
-        enforce
-            .on_final_response_body(&mut ctx, 200, &headers, opaque)
-            .await,
-        Some(502),
-    );
-
     let dry_run = make(json!({
         "mode": "dry_run",
         "default_action": "deny",
@@ -6480,12 +6471,27 @@ async fn final_undecodable_encoded_sse_fails_closed_for_streaming_only_config() 
             "streaming_response_tool_calls": true
         }
     }));
-    let mut ctx = create_test_context();
-    assert_continue(
-        dry_run
-            .on_final_response_body(&mut ctx, 200, &headers, opaque)
-            .await,
-    );
+
+    for content_type in ["text/event-stream", "text/plain"] {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), content_type.to_string());
+        headers.insert("content-encoding".to_string(), "zstd".to_string());
+
+        let mut ctx = create_test_context(); // deliberately non-streaming request
+        assert_reject(
+            enforce
+                .on_final_response_body(&mut ctx, 200, &headers, opaque)
+                .await,
+            Some(502),
+        );
+
+        let mut ctx = create_test_context();
+        assert_continue(
+            dry_run
+                .on_final_response_body(&mut ctx, 200, &headers, opaque)
+                .await,
+        );
+    }
 }
 
 /// One complete SSE event larger than the retained-byte cap must be handled
@@ -6581,5 +6587,157 @@ async fn multiple_governor_instances_do_not_share_final_recheck_ledgers() {
             .on_final_response_body(&mut ctx, 200, &json_headers(), &injected)
             .await,
         Some(502),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Round 21 review fixes
+// ---------------------------------------------------------------------------
+
+/// P2 (:2107): gateway compression commits `Content-Encoding` in `after_proxy`
+/// before body transforms run. The governor therefore still receives plaintext
+/// here and must parse a JSON-shaped SSE fallback before attempting to decode
+/// bytes that compression has not transformed yet.
+#[tokio::test]
+async fn pre_transform_gateway_compression_keeps_plaintext_json_inspectable() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": {
+            "response_tool_calls": false,
+            "streaming_response_tool_calls": true
+        }
+    }));
+    let mut headers = sse_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+
+    let mut ctx = create_test_context();
+    ctx.metadata.insert(
+        "ai_tool_governor.stream_requested".to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata
+        .insert("compression:algorithm".to_string(), "gzip".to_string());
+    assert_continue(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &headers,
+                &response_with_tool_call("report.read", "{}"),
+            )
+            .await,
+    );
+
+    let mut ctx = create_test_context();
+    ctx.metadata.insert(
+        "ai_tool_governor.stream_requested".to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata
+        .insert("compression:algorithm".to_string(), "gzip".to_string());
+    assert_reject(
+        plugin
+            .on_response_body(
+                &mut ctx,
+                200,
+                &headers,
+                &response_with_tool_call("kubectl.apply", "{}"),
+            )
+            .await,
+        Some(502),
+    );
+}
+
+/// P3 (:1208): later lower-risk inspection cannot downgrade the maximum risk
+/// associated with a sticky dry-run denial.
+#[tokio::test]
+async fn dry_run_metadata_preserves_max_risk_across_governor_instances() {
+    let high_risk = make(json!({
+        "mode": "dry_run",
+        "default_action": "allow",
+        "tools": { "danger": { "action": "deny", "risk": "critical" } },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false }
+    }));
+    let low_risk = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "safe.a2a": { "action": "allow", "risk": "low" } },
+        "inspect": { "a2a_methods": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "danger", "arguments": {} }
+        })
+        .to_string(),
+    );
+    let mut headers = json_headers();
+    assert_continue(high_risk.before_proxy(&mut ctx, &mut headers).await);
+
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "safe.a2a",
+            "params": {}
+        })
+        .to_string(),
+    );
+    assert_continue(low_risk.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("deny")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.risk")
+            .map(String::as_str),
+        Some("critical")
+    );
+}
+
+/// P3 (:1419): equal-severity definition denials from separate governor
+/// instances merge their names rather than replacing the earlier finding.
+#[tokio::test]
+async fn dry_run_definition_denials_merge_across_governor_instances() {
+    let first = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "inspect": { "request_tool_definitions": true, "response_tool_calls": false }
+    }));
+    let second = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "inspect": { "request_tool_definitions": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    let mut headers = json_headers();
+
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({ "tools": [{ "type": "function", "function": { "name": "first_denied" } }] })
+            .to_string(),
+    );
+    assert_continue(first.before_proxy(&mut ctx, &mut headers).await);
+
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({ "tools": [{ "type": "function", "function": { "name": "second_denied" } }] })
+            .to_string(),
+    );
+    assert_continue(second.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.tool_names")
+            .map(String::as_str),
+        Some("first_denied,second_denied")
     );
 }
