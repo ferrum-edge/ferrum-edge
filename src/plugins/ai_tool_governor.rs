@@ -1644,7 +1644,6 @@ impl Plugin for AiToolGovernor {
         // bare JSON — out of scope, never fail-closed).
         if ctx.method != "POST"
             || !header_value(headers, "content-type")
-                .or_else(|| header_value(&ctx.headers, "content-type"))
                 .is_some_and(is_governable_json_request_content_type)
         {
             return PluginResult::Continue;
@@ -1661,7 +1660,6 @@ impl Plugin for AiToolGovernor {
         let mut uninspectable: Option<&'static str> = None;
 
         if header_value(headers, "content-encoding")
-            .or_else(|| header_value(&ctx.headers, "content-encoding"))
             .map(str::trim)
             .is_some_and(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"))
         {

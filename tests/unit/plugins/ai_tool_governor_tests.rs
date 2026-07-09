@@ -783,7 +783,7 @@ async fn denies_request_exposing_disallowed_tool_definition() {
         })
         .to_string(),
     );
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_reject(result, Some(502));
 }
@@ -815,7 +815,7 @@ async fn blocks_request_exposing_approval_required_tool_definition() {
         })
         .to_string(),
     );
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
     server.verify().await;
 }
@@ -858,7 +858,7 @@ async fn denies_mcp_tools_call_for_denied_tool() {
         })
         .to_string(),
     );
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
 }
 
@@ -996,7 +996,7 @@ async fn batch_denial_skips_approval_webhook() {
         ])
         .to_string(),
     );
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
     server.verify().await;
 }
@@ -1316,11 +1316,10 @@ async fn enforce_rejects_content_encoded_request_body() {
     // body is opaque here: enforce mode must not forward it ungoverned.
     let plugin = make(mcp_config("enforce"));
     let mut ctx = json_post_ctx();
-    ctx.headers
-        .insert("content-encoding".to_string(), "gzip".to_string());
     ctx.metadata
         .insert("request_body_size_bytes".to_string(), "64".to_string());
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
     assert_eq!(
         ctx.metadata
@@ -1352,14 +1351,65 @@ async fn before_proxy_uses_live_header_argument_for_request_inspection() {
 }
 
 #[tokio::test]
+async fn before_proxy_ignores_stale_ctx_headers_content_type() {
+    // Per `.claude/rules/plugins.md`: `before_proxy` must read the live `headers`
+    // argument, never `ctx.headers`. The handler may have moved headers out of
+    // `ctx.headers` (leaving it empty), or an earlier hook may have rewritten
+    // Content-Type. Here the live `headers` carries a NON-JSON content-type while
+    // the stale `ctx.headers` still claims `application/json` over a body that
+    // WOULD be denied if parsed. The plugin must treat the request as out of
+    // scope (Continue) and never parse/reject it from the stale header.
+    let plugin = make(mcp_config("enforce"));
+    let mut ctx = json_post_ctx();
+    // `json_post_ctx()` leaves `application/json` in `ctx.headers`; a denied
+    // tools/call body sits behind it.
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "kubectl.apply", "arguments": { "manifest": "kind: Pod" } }
+        })
+        .to_string(),
+    );
+    // The live header argument reflects what the request actually is: not JSON.
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        !ctx.metadata.contains_key("ai_tool_governor.decision"),
+        "out-of-scope request must not be governed from the stale ctx.headers"
+    );
+
+    // An empty live `headers` (handler moved them out) is likewise out of scope.
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "kubectl.apply", "arguments": { "manifest": "kind: Pod" } }
+        })
+        .to_string(),
+    );
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert!(
+        !ctx.metadata.contains_key("ai_tool_governor.decision"),
+        "empty live headers means out of scope; stale ctx.headers must be ignored"
+    );
+}
+
+#[tokio::test]
 async fn dry_run_forwards_content_encoded_request_body() {
     let plugin = make(mcp_config("dry_run"));
     let mut ctx = json_post_ctx();
-    ctx.headers
-        .insert("content-encoding".to_string(), "gzip".to_string());
     ctx.metadata
         .insert("request_body_size_bytes".to_string(), "64".to_string());
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -1374,7 +1424,7 @@ async fn enforce_rejects_oversized_request_body() {
         body.len().to_string(),
     );
     ctx.metadata.insert("request_body".to_string(), body);
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
 }
 
@@ -1384,7 +1434,7 @@ async fn enforce_rejects_unparseable_json_request_body() {
     let mut ctx = json_post_ctx();
     ctx.metadata
         .insert("request_body".to_string(), "not-json{{{".to_string());
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
 }
 
@@ -1396,7 +1446,7 @@ async fn enforce_rejects_non_utf8_request_body() {
     let mut ctx = json_post_ctx();
     ctx.metadata
         .insert("request_body_size_bytes".to_string(), "12".to_string());
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
 }
 
@@ -1406,13 +1456,11 @@ async fn non_json_posts_are_not_rejected() {
     let plugin = make(mcp_config("enforce"));
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
-    ctx.headers
-        .insert("content-type".to_string(), "text/plain".to_string());
-    ctx.headers
-        .insert("content-encoding".to_string(), "gzip".to_string());
     ctx.metadata
         .insert("request_body_size_bytes".to_string(), "64".to_string());
     let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
@@ -1437,7 +1485,7 @@ async fn denies_mcp_tools_call_inside_json_rpc_batch() {
         ])
         .to_string(),
     );
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
     assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
 }
 
@@ -1463,7 +1511,7 @@ async fn stream_true_request_forces_reqwest_dispatch() {
         json!({ "x": { "action": "allow" } }),
         "deny",
     ));
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
 
     let mut ctx = json_post_ctx();
     ctx.metadata.insert(
@@ -1499,11 +1547,10 @@ async fn uninspectable_body_conservatively_forces_reqwest_when_streaming_only() 
         "deny",
     ));
     let mut ctx = json_post_ctx();
-    ctx.headers
-        .insert("content-encoding".to_string(), "br".to_string());
     ctx.metadata
         .insert("request_body_size_bytes".to_string(), "64".to_string());
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
+    headers.insert("content-encoding".to_string(), "br".to_string());
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert!(plugin.forces_reqwest_dispatch(&ctx));
 }
@@ -4124,7 +4171,7 @@ async fn final_request_body_refreshes_stream_model_for_approval() {
         "request_body".to_string(),
         json!({ "stream": true, "model": "model-a", "messages": [] }).to_string(),
     );
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(
         ctx.metadata
@@ -5445,7 +5492,7 @@ async fn final_request_body_clears_stale_stream_marker_when_transform_disables_s
         "request_body".to_string(),
         json!({ "stream": true, "model": "gpt-4o", "messages": [] }).to_string(),
     );
-    let mut headers = HashMap::new();
+    let mut headers = json_headers();
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert_eq!(
         ctx.metadata
