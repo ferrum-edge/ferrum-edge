@@ -228,6 +228,17 @@ impl InspectConfig {
         self.request_tool_definitions || self.mcp_tool_calls || self.a2a_methods
     }
 
+    /// True when policy can reach a concrete call whose `require_approval`
+    /// action is resolved through the approval webhook. Bare request tool
+    /// definitions carry only a name and deliberately treat
+    /// `require_approval` as blocked without calling the webhook.
+    fn any_approval_capable_surface(self) -> bool {
+        self.response_tool_calls
+            || self.streaming_response_tool_calls
+            || self.mcp_tool_calls
+            || self.a2a_methods
+    }
+
     /// True when a buffered (non-SSE) response body must be governed. This
     /// includes streaming inspection, because a `stream: true` request whose
     /// backend answers with a plain `application/json` Chat Completions body
@@ -1025,9 +1036,15 @@ impl AiToolGovernor {
             );
         }
 
-        // Approval endpoint is required when any policy can reach require_approval.
+        // Approval endpoint is required only when a concrete-call inspection
+        // surface can reach `require_approval`. Definition-only inspection
+        // handles that action as a name-only block and never calls the webhook.
         let approval = parse_approval(config, http_client.backend_allow_ips())?;
-        if mode == Mode::Enforce && any_require_approval && approval.is_none() {
+        if mode == Mode::Enforce
+            && any_require_approval
+            && inspect.any_approval_capable_surface()
+            && approval.is_none()
+        {
             return Err(
                 "ai_tool_governor: 'approval.endpoint_url' is required when any policy uses 'require_approval'"
                     .to_string(),
@@ -2392,39 +2409,43 @@ impl Plugin for AiToolGovernor {
         // (threaded through `decoded_encoded`) so an encoded body is never
         // decompressed twice.
         //
-        // A decode FAILURE short-circuits the `&&` and skips this block, so the
-        // ORIGINAL gated flow below handles it unchanged: a spurious
-        // `Content-Encoding` header on plaintext JSON is caught by the plaintext
-        // parse, and a genuinely-undecodable encoded body reaches the gated
-        // fail-closed posture in the encoded branch (enforce-cut past the gate,
-        // forward for a non-streaming request under a streaming-only config,
-        // exactly as before this fix).
+        // An explicitly SSE-labeled body that cannot be decoded is governed
+        // even for a non-streaming request when buffering came from outside
+        // this plugin. Reject it before the JSON-only request gate below;
+        // otherwise a streaming-only config would forward an uninspectable SSE
+        // body. Other undecodable labels keep the existing gated behavior.
         let wire_encoding = content_encoding_value(response_headers);
         let mut decoded_encoded: Option<Vec<u8>> = None;
         if let Some(encoding) = wire_encoding
             && self.inspect.streaming_response_tool_calls
-            && let Some(decoded) = decompress_within_limit(encoding, body)
         {
-            // Compression-only rewrite of an already-governed body: decoded
-            // bytes match the recorded hash, so skip (no duplicate approval
-            // webhook), regardless of the request-streaming gate.
-            if ctx.ai_tool_governor_response_hash.as_deref()
-                == Some(sha256_hex_bytes(&decoded).as_str())
-            {
-                return PluginResult::Continue;
+            if let Some(decoded) = decompress_within_limit(encoding, body) {
+                // Compression-only rewrite of an already-governed body: decoded
+                // bytes match the recorded hash, so skip (no duplicate approval
+                // webhook), regardless of the request-streaming gate.
+                if ctx.ai_tool_governor_response_hash.as_deref()
+                    == Some(sha256_hex_bytes(&decoded).as_str())
+                {
+                    return PluginResult::Continue;
+                }
+                // Encoded-SSE shape check on the DECODED bytes, ungated by
+                // `governs_buffered_json` — matching the unencoded SSE branch. An
+                // SSE-labeled body that decodes to JSON-shaped bytes is mislabeled
+                // Chat Completions JSON and takes the gated JSON re-check instead.
+                if looks_like_sse(&decoded)
+                    || (is_event_stream_content_type(content_type) && !looks_like_json(&decoded))
+                {
+                    return self.govern_buffered_sse(ctx, &decoded).await;
+                }
+                // Not SSE-shaped: keep the decoded bytes for the JSON re-check below
+                // (which is gated) so the body is not decompressed a second time.
+                decoded_encoded = Some(decoded);
+            } else if is_event_stream_content_type(content_type) {
+                return self.uninspectable_governed_response(
+                    ctx,
+                    "SSE response body has a content-encoding that cannot be inspected",
+                );
             }
-            // Encoded-SSE shape check on the DECODED bytes, ungated by
-            // `governs_buffered_json` — matching the unencoded SSE branch. An
-            // SSE-labeled body that decodes to JSON-shaped bytes is mislabeled
-            // Chat Completions JSON and takes the gated JSON re-check instead.
-            if looks_like_sse(&decoded)
-                || (is_event_stream_content_type(content_type) && !looks_like_json(&decoded))
-            {
-                return self.govern_buffered_sse(ctx, &decoded).await;
-            }
-            // Not SSE-shaped: keep the decoded bytes for the JSON re-check below
-            // (which is gated) so the body is not decompressed a second time.
-            decoded_encoded = Some(decoded);
         }
 
         // Mirror `on_response_body`'s post-SSE gate: a streaming-only config
@@ -3109,6 +3130,30 @@ impl ToolCallStreamInspector {
         ResponseStreamAction::Forward(Bytes::new())
     }
 
+    /// Apply the retained-byte cap without parsing the bytes that crossed it.
+    /// In enforce mode none of the over-cap event/carry is released; in dry-run
+    /// all retained bytes are forwarded unchanged and later chunks bypass
+    /// inspection so observation never disrupts traffic.
+    fn handle_hold_overflow(&mut self, mut out: Vec<u8>) -> ResponseStreamAction {
+        warn!(
+            target: "ai_tool_governor",
+            held_bytes = self.held.len(),
+            carry_bytes = self.carry.len(),
+            mode = self.engine.mode.as_str(),
+            "streaming tool-call hold exceeded cap"
+        );
+        if self.engine.mode == Mode::Enforce {
+            self.held.clear();
+            self.carry.clear();
+            return self.terminate(out);
+        }
+        out.append(&mut self.held);
+        out.append(&mut self.carry);
+        self.reset_batch();
+        self.bypassed = true;
+        ResponseStreamAction::Forward(Bytes::from(out))
+    }
+
     /// Govern a fully-held JSON-shaped stream at end-of-stream, mirroring the
     /// buffered JSON path: extract `choices[].message.tool_calls[]` /
     /// `function_call`, fail closed on ungovernable entries and blocked calls
@@ -3199,6 +3244,13 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
         let mut out: Vec<u8> = Vec::new();
 
         while let Some(end) = next_event_end(&self.carry) {
+            // Enforce the retained-byte bound BEFORE draining and classifying
+            // the event. Otherwise one complete >4 MiB `data:` frame is copied
+            // and JSON-parsed before the cap below runs (and a non-JSON event
+            // can be forwarded without ever tripping that retained-byte check).
+            if self.held.len().saturating_add(end) > MAX_STREAM_HOLD_BYTES {
+                return self.handle_hold_overflow(out);
+            }
             let event: Vec<u8> = self.carry.drain(..end).collect();
             match classify_event(&event) {
                 SseEvent::Frame(frame) => {
@@ -3259,22 +3311,8 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
         // event-terminator-free byte stream) must not grow gateway memory
         // unboundedly. Enforce mode fails closed; dry-run releases everything
         // uninspected rather than disrupting traffic.
-        if self.held.len() + self.carry.len() > MAX_STREAM_HOLD_BYTES {
-            warn!(
-                target: "ai_tool_governor",
-                held_bytes = self.held.len(),
-                carry_bytes = self.carry.len(),
-                mode = self.engine.mode.as_str(),
-                "streaming tool-call hold exceeded cap"
-            );
-            if self.engine.mode == Mode::Enforce {
-                self.held.clear();
-                return self.terminate(out);
-            }
-            out.append(&mut self.held);
-            out.append(&mut self.carry);
-            self.reset_batch();
-            self.bypassed = true;
+        if self.held.len().saturating_add(self.carry.len()) > MAX_STREAM_HOLD_BYTES {
+            return self.handle_hold_overflow(out);
         }
 
         ResponseStreamAction::Forward(Bytes::from(out))

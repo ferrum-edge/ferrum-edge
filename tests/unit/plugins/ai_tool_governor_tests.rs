@@ -6366,3 +6366,132 @@ async fn dry_run_request_decision_is_sticky_deny_across_surfaces() {
         "an allowed A2A method must not clobber an earlier definition deny in dry-run"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Round 19 review fixes
+// ---------------------------------------------------------------------------
+
+/// P3 (:1032): definition-only policies never invoke the approval webhook — a
+/// bare tool definition has no arguments to approve, so `require_approval` is
+/// deliberately treated as a blocked definition. Both an explicit tool action
+/// and the default action must therefore be valid without an endpoint when no
+/// concrete-call inspection surface is enabled.
+#[tokio::test]
+async fn definition_only_approval_policies_do_not_require_webhook() {
+    let configs = [
+        json!({
+            "default_action": "allow",
+            "tools": { "deploy": { "action": "require_approval" } },
+            "inspect": {
+                "request_tool_definitions": true,
+                "response_tool_calls": false
+            }
+        }),
+        json!({
+            "default_action": "require_approval",
+            "tools": {},
+            "inspect": {
+                "request_tool_definitions": true,
+                "response_tool_calls": false
+            }
+        }),
+    ];
+
+    for config in configs {
+        let plugin = try_make(config).expect("definition-only policy must not need a webhook");
+        let mut ctx = json_post_ctx();
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            json!({
+                "model": "gpt-4o",
+                "tools": [{ "type": "function", "function": { "name": "deploy" } }]
+            })
+            .to_string(),
+        );
+        let mut headers = json_headers();
+        assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(502));
+    }
+}
+
+/// P2 (:2406): an externally-buffered final SSE body remains governed even for
+/// a non-streaming request under a streaming-only config. If its explicit SSE
+/// encoding is unsupported/corrupt, enforce must fail closed before the later
+/// JSON-only request gate; dry-run continues without disrupting traffic.
+#[tokio::test]
+async fn final_undecodable_encoded_sse_fails_closed_for_streaming_only_config() {
+    let mut headers = sse_headers();
+    headers.insert("content-encoding".to_string(), "zstd".to_string());
+    let opaque = b"\x28\xb5\x2f\xfdopaque-zstd-sse";
+
+    let enforce = make(json!({
+        "default_action": "deny",
+        "inspect": {
+            "response_tool_calls": false,
+            "streaming_response_tool_calls": true
+        }
+    }));
+    let mut ctx = create_test_context(); // deliberately non-streaming request
+    assert_reject(
+        enforce
+            .on_final_response_body(&mut ctx, 200, &headers, opaque)
+            .await,
+        Some(502),
+    );
+
+    let dry_run = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "inspect": {
+            "response_tool_calls": false,
+            "streaming_response_tool_calls": true
+        }
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(
+        dry_run
+            .on_final_response_body(&mut ctx, 200, &headers, opaque)
+            .await,
+    );
+}
+
+/// One complete SSE event larger than the retained-byte cap must be handled
+/// before `classify_event` can copy/parse it. A non-JSON `data:` payload makes
+/// the behavioral regression observable: the old classify-first path forwarded
+/// it and emptied `carry`, so the post-loop retained-byte check never fired.
+#[tokio::test]
+async fn complete_oversized_sse_event_is_capped_before_parsing() {
+    let mut event = b"data: ".to_vec();
+    event.extend(std::iter::repeat_n(b'A', 4 * 1024 * 1024 + 1));
+    event.extend_from_slice(b"\n\n");
+
+    let enforce = make(streaming_config(json!({}), "deny"));
+    let ctx = create_test_context();
+    let mut inspector = enforce
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[event.as_slice()]).await;
+    assert!(
+        terminated,
+        "one over-cap complete event must cut enforce mode"
+    );
+    assert!(
+        out.len() < 1024,
+        "oversized event bytes must not be forwarded before termination"
+    );
+
+    let dry_run = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "inspect": {
+            "response_tool_calls": false,
+            "streaming_response_tool_calls": true
+        }
+    }));
+    let ctx = create_test_context();
+    let mut inspector = dry_run
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[event.as_slice()]).await;
+    assert!(!terminated, "dry-run must not disrupt an over-cap event");
+    assert_eq!(out, event, "dry-run must forward the event unchanged");
+}
