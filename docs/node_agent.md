@@ -251,17 +251,21 @@ connect4-deferral posture (that stays gated on `node_waypoint_in_netns`) — it
 only makes the per-pod `uid → cgroup` registry available so the Ambient mesh
 proxy's `NetnsUdpCaptureManager` (`src/proxy/netns_udp_capture.rs`) can discover
 enrolled pods. For each pod the producer enters the pod netns
-(`setns(CLONE_NEWNET)` on a dedicated thread), installs the UDP TPROXY rules,
-and binds the transparent capture + reply sockets there. It writes **no**
-`.ready` markers (unlike the NodeWaypoint TCP path): the producer binds the
-socket **before** installing the rules, so a captured datagram is never diverted
-to a not-yet-bound socket. Note the residual **enrollment window**: between the
-registry entry appearing and the producer's next poll installing the pod's
-rules, pod UDP egress passes **uncaptured** (fail-open for that window — there
-is no default UDP redirect to refuse against, unlike the NodeWaypoint TCP
-connect-hook path). Closing it needs a producer→node-agent readiness handshake
-plus a deny-before-enroll default, tracked with the other live-datapath
-residuals under issue #2013.
+(`setns(CLONE_NEWNET)` on a dedicated thread), installs a dedicated fail-closed
+OUTPUT guard, then binds the transparent capture socket and installs the UDP
+TPROXY rules while that guard remains active. The guard mirrors the operator's
+exact outbound include/exclude/family scope and uses alternating chains, so a
+bind collision, setup failure, or guarded retry cannot reopen plaintext egress.
+It is removed only after the bound socket has been adopted and the full
+capture ruleset is live. The reply sockets are created in the same pod netns.
+
+The producer still writes **no** `.ready` markers. Note the narrower residual
+**enrollment window**: before the producer observes a newly or re-published
+registry entry and installs the guard, pod UDP egress passes **uncaptured**
+(fail-open for that pre-poll window). Closing that remaining window needs the
+producer→node-agent readiness handshake plus deny-before-enroll default tracked
+under issue #2013; the live bind-collision/source-capture verification remains
+part of #2038.
 
 The Ambient UDP producer needs the same host access the NodeWaypoint in-netns
 listener needs — the read-only host cgroup mount + host `/proc` to resolve pod

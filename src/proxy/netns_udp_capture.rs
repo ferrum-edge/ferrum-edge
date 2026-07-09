@@ -12,10 +12,11 @@
 //! capture path uses ([`super::netns_capture::DirectoryCaptureSource`] over the
 //! node-agent-published registry dir): a [`NetnsUdpCaptureManager`] polls the
 //! enrolled-pod set and, for each pod netns, opens a UDP capture "producer" that
-//!   1. binds a transparent UDP capture socket INSIDE the pod netns, then
-//!   2. installs the UDP TPROXY rules INSIDE the pod netns (socket first, so the
-//!      rules never divert into a not-yet-bound socket — no black-hole window),
-//!   3. runs the shared capture/session/egress loop
+//!   1. installs a scope-exact fail-closed OUTPUT guard INSIDE the pod netns,
+//!   2. binds a transparent UDP capture socket and installs the UDP TPROXY rules
+//!      while that guard remains active,
+//!   3. removes the guard only after the socket/rules are ready, then runs the
+//!      shared capture/session/egress loop
 //!      ([`super::mesh_udp_capture::run_mesh_udp_capture_on_socket`]) with a
 //!      pod-netns reply-socket factory (so return-path replies are spoofed from
 //!      the captured VIP:port INSIDE the pod netns), and
@@ -102,7 +103,9 @@ pub trait NetnsUdpBackend: Send + Sync + 'static {
     /// loop INSIDE the target pod's netns. `expected_netns` is the inode resolved
     /// during this reconcile pass; the backend must fail closed if the reopened
     /// netns handle no longer matches it. `None` on failure (retried next
-    /// reconcile); the backend must leave no partial rules behind on failure.
+    /// reconcile); the backend must leave no partial capture rules behind on
+    /// failure. It may intentionally retain a dedicated fail-closed guard until a
+    /// later retry succeeds.
     fn open_udp_capture(
         &self,
         target: &PodCaptureTarget,
@@ -773,7 +776,9 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         }
         let include_v6 = self.capture_config.ip6tables_mode != Ip6TablesMode::Disabled;
         let teardown_script = IptablesPlan::udp_teardown_script(include_v6);
+        let capture_teardown_script = IptablesPlan::udp_capture_rules_teardown_script(include_v6);
         let fail_closed_script = IptablesPlan::udp_fail_closed_script(&self.capture_config);
+        let fail_closed_teardown_script = IptablesPlan::udp_fail_closed_teardown_script(include_v6);
 
         // Stable netns handle for the whole capture lifetime (survives PID exit).
         let netns = match super::netns_capture::open_pod_netns_handle(&target.cgroup_path) {
@@ -867,34 +872,43 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                 });
             }
         };
+        // Capture-only cleanup leaves the pre-bind fail-closed guard in place.
+        // Used on bind/adoption/setup failures so a retry never reopens egress.
+        let teardown_capture_rules = {
+            let netns = netns.clone();
+            let capture_teardown_script = capture_teardown_script.clone();
+            move || {
+                let netns = netns.clone();
+                let capture_teardown_script = capture_teardown_script.clone();
+                let _ = super::netns_capture::run_in_netns(netns.as_ref(), move || {
+                    run_shell_script(&capture_teardown_script)
+                });
+            }
+        };
 
-        // Bind the capture socket, THEN install the rules — both INSIDE the pod
-        // netns, on one `setns`-bound thread. Socket-first means the TPROXY rules
-        // never divert into a not-yet-bound socket (no black-hole window). A
-        // reconfigure reaps stale rules first (idempotent teardown) so a changed
-        // port/mark can't leave a stale rule ahead of the new one.
+        // Install a scope-exact DROP guard first, then reap/rebuild the normal
+        // capture state and bind the socket — all inside the pod netns on one
+        // `setns`-bound thread. The guard uses independent alternating chains, so
+        // neither stale-state cleanup nor a retry flushes the active guard. It is
+        // removed only after the socket is adopted below and the complete TPROXY
+        // ruleset is live.
         let bind_addr = std::net::SocketAddr::new(
             std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
             self.capture_port,
         );
         let setup_for_thread = setup_script;
-        let teardown_pre = teardown_script.clone();
+        let teardown_pre = capture_teardown_script.clone();
         let fail_closed_for_thread = fail_closed_script;
         let bind_result = super::netns_capture::run_in_netns(netns.as_ref(), move || {
-            // Reap any stale UDP rules from a prior crashed producer first.
+            // Guard before touching stale state or attempting the unprivileged
+            // bind. A workload that pre-bound the port can no longer win a
+            // capture-bypass window between cleanup and bind failure.
+            run_shell_script(&fail_closed_for_thread)?;
+            // Reap only normal capture state; the dedicated guard stays live.
             let _ = run_shell_script(&teardown_pre);
             let (socket, bound_addr, v4_origdst, v6_origdst) =
-                match super::mesh_udp_capture::bind_mesh_udp_capture_socket(bind_addr) {
-                    Ok(bound) => bound,
-                    Err(error) => {
-                        // A workload can pre-bind the unprivileged capture port.
-                        // Install a DROP-only OUTPUT guard so pod UDP fails
-                        // closed instead of bypassing Ambient UDP policy until
-                        // the next reconcile can bind the producer socket.
-                        run_shell_script(&fail_closed_for_thread)?;
-                        return Err(std::io::Error::other(error.to_string()));
-                    }
-                };
+                super::mesh_udp_capture::bind_mesh_udp_capture_socket(bind_addr)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
             if let Err(error) = run_shell_script(&setup_for_thread) {
                 let _ = run_shell_script(&teardown_pre);
                 return Err(error);
@@ -907,7 +921,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                 warn!(
                     pod_uid = %target.pod_uid,
                     %error,
-                    "Ambient UDP producer: in-netns socket bind / rule install failed; fail-closed guard attempted when bind failed"
+                    "Ambient UDP producer: in-netns guard / socket bind / rule install failed; fail-closed guard retained when installed"
                 );
                 return None;
             }
@@ -919,12 +933,31 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                 warn!(
                     pod_uid = %target.pod_uid,
                     %error,
-                    "Ambient UDP producer: could not adopt in-netns capture socket; cleaning up"
+                    "Ambient UDP producer: could not adopt in-netns capture socket; retaining fail-closed guard"
                 );
-                teardown();
+                teardown_capture_rules();
                 return None;
             }
         };
+
+        // The Tokio socket now owns the bound descriptor and the complete live
+        // capture rules are installed. Remove the temporary guard so traffic
+        // switches directly from fail-closed DROP to TPROXY capture. If setns or
+        // guard cleanup fails, keep the guard and remove normal capture state;
+        // the next reconcile retries without a plaintext bypass.
+        let guard_teardown = {
+            let script = fail_closed_teardown_script;
+            super::netns_capture::run_in_netns(netns.as_ref(), move || run_shell_script(&script))
+        };
+        if let Err(error) = guard_teardown {
+            warn!(
+                pod_uid = %target.pod_uid,
+                %error,
+                "Ambient UDP producer: could not remove pre-bind fail-closed guard; retaining guard and retrying"
+            );
+            teardown_capture_rules();
+            return None;
+        }
 
         let reply_socket_factory: Arc<dyn super::mesh_udp_capture::ReplySocketFactory> = Arc::new(
             super::mesh_udp_capture::PodNetnsReplySocketFactory::new(netns.clone()),
