@@ -5409,3 +5409,309 @@ async fn oversized_framed_grpc_buffered_response_is_untouched() {
         .await;
     assert!(rewritten.is_none(), "framed gRPC must never be rewritten");
 }
+
+// ---------------------------------------------------------------------------
+// Round 15 review fixes:
+//   1. final-body stream re-detection CLEARS a stale stream marker when a
+//      transformer reverts `stream: true` -> `false` (round-14 regression).
+//   2. an SSE frame with a MALFORMED (non-array) `delta.tool_calls` fails
+//      closed like the buffered non-array case, not forwarded.
+//   3. a UTF-8 BOM before a buffered JSON body no longer bypasses governance.
+// ---------------------------------------------------------------------------
+
+/// Fix 1: a `request_transformer` that rewrites an initially-`stream: true`
+/// request back to `stream: false` on the FINAL backend-visible body must CLEAR
+/// the stale `stream_requested` marker `before_proxy` set. Otherwise the
+/// response mode stays "streaming", so a plain non-streaming JSON response is
+/// misrouted through the SSE inspector (held-in-full, governed as an SSE
+/// fallback) instead of the buffered JSON path. After clearing, the SSE
+/// inspector no longer attaches to a plain-JSON response and the buffered path
+/// governs it — a denied call is still rejected. The round-14 case (transformer
+/// ADDS `stream: true`) must still pin streaming.
+#[tokio::test]
+async fn final_request_body_clears_stale_stream_marker_when_transform_disables_stream() {
+    // Both response and streaming inspection enabled so the buffered path
+    // governs regardless of the marker; the marker only decides SSE-vs-buffered
+    // routing of the response.
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "response_tool_calls": true, "streaming_response_tool_calls": true }
+    }));
+
+    let mut ctx = json_post_ctx();
+    // before_proxy sees the ORIGINAL streaming request and marks it.
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({ "stream": true, "model": "gpt-4o", "messages": [] }).to_string(),
+    );
+    let mut headers = HashMap::new();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.stream_requested")
+            .map(String::as_str),
+        Some("true"),
+        "before_proxy marks the streaming request"
+    );
+    // With the stale marker, a plain-JSON response would get the SSE inspector.
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, Some("application/json"))
+            .is_some(),
+        "test premise: stale marker misroutes plain JSON to the SSE inspector"
+    );
+
+    // The transformer rewrote `stream: true` -> `false` on the final body.
+    let final_body = json!({ "stream": false, "model": "gpt-4o", "messages": [] }).to_string();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), final_body.as_bytes())
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_tool_governor.stream_requested"),
+        None,
+        "a parsed non-streaming final body must CLEAR the stale stream marker"
+    );
+    assert_eq!(
+        ctx.metadata.get("ai_tool_governor.stream_model"),
+        None,
+        "the dependent stream model must be cleared too"
+    );
+    assert!(
+        !plugin.forces_reqwest_dispatch(&ctx),
+        "cleared marker must no longer force reqwest dispatch"
+    );
+    // The plain-JSON response now stays on the buffered path (no SSE inspector).
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, Some("application/json"))
+            .is_none(),
+        "cleared marker: plain JSON response governed as buffered JSON, not SSE"
+    );
+    // A denied call in that non-streaming JSON response is still rejected via
+    // the buffered path.
+    let denied = response_with_tool_call("kubectl.apply", "{}");
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &denied)
+            .await,
+        Some(502),
+    );
+}
+
+/// Fix 1 (round-14 regression guard): a transformer that ADDS `stream: true` on
+/// the final body still pins streaming — clearing must be strictly one-way
+/// (only a parsed non-streaming body clears).
+#[tokio::test]
+async fn final_request_body_still_pins_stream_when_transform_adds_stream() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    let mut ctx = json_post_ctx();
+    assert!(!plugin.forces_reqwest_dispatch(&ctx));
+    let body = json!({ "stream": true, "model": "gpt-4o", "messages": [] }).to_string();
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), body.as_bytes())
+            .await,
+    );
+    assert!(
+        plugin.forces_reqwest_dispatch(&ctx),
+        "transform-added stream:true must still pin reqwest dispatch"
+    );
+
+    // An UNPARSEABLE final body must NOT clear a marker either (conservative):
+    // seed the marker, then feed a non-JSON body.
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "ai_tool_governor.stream_requested".to_string(),
+        "true".to_string(),
+    );
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), b"not json at all")
+            .await,
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.stream_requested")
+            .map(String::as_str),
+        Some("true"),
+        "an unparseable final body must not clear the conservative stream marker"
+    );
+}
+
+/// Fix 2: an SSE frame whose `choices[].delta.tool_calls` is present but NOT a
+/// JSON array is ungovernable (its entries cannot be accumulated) — the live
+/// inspector must fail closed in enforce (cut the stream, no leak) and release
+/// unchanged in dry-run, mirroring the buffered non-array case.
+#[tokio::test]
+async fn streaming_non_array_tool_calls_frame_fails_closed_in_enforce() {
+    let plugin = make(streaming_config(json!({}), "deny"));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    // `tool_calls` is an OBJECT, not an array.
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":",
+        "{\"name\":\"kubectl.apply\"}}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let (out, terminated) = drive_stream(&mut inspector, &[body.as_bytes()]).await;
+    assert!(
+        terminated,
+        "a malformed non-array tool_calls frame must cut the stream in enforce"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out).contains("kubectl.apply"),
+        "malformed frame must not be forwarded before the cut: {}",
+        String::from_utf8_lossy(&out)
+    );
+}
+
+/// Fix 2 (dry-run): the same malformed non-array `tool_calls` frame is released
+/// unchanged — dry-run never disrupts traffic.
+#[tokio::test]
+async fn streaming_non_array_tool_calls_frame_released_in_dry_run() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let body = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":",
+        "{\"name\":\"kubectl.apply\"}}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let bytes = body.as_bytes();
+    let (out, terminated) = drive_stream(&mut inspector, &[bytes]).await;
+    assert!(!terminated, "dry-run must not cut the stream");
+    assert_eq!(
+        out, bytes,
+        "dry-run must release the malformed frame unchanged"
+    );
+}
+
+/// Fix 2 (buffered-SSE parity): the buffered-SSE extractor must also treat a
+/// non-array `delta.tool_calls` frame as ungovernable — enforce reject,
+/// dry-run forward — so the two SSE paths agree with the buffered JSON path.
+#[tokio::test]
+async fn buffered_sse_non_array_tool_calls_frame_fails_closed() {
+    let malformed = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":",
+        "{\"name\":\"kubectl.apply\"}}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    // Enforce (streaming disabled -> SSE label buffered): reject.
+    let enforce = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_reject(
+        enforce
+            .on_response_body(&mut ctx, 200, &sse_headers(), malformed.as_bytes())
+            .await,
+        Some(502),
+    );
+    // Dry-run: forward unchanged.
+    let dry = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(
+        dry.on_response_body(&mut ctx, 200, &sse_headers(), malformed.as_bytes())
+            .await,
+    );
+}
+
+/// Fix 3: a UTF-8 BOM before an `application/json` Chat Completions body must
+/// not let a denied `choices[].message.tool_calls[]` bypass policy —
+/// `serde_json` rejects a BOM-prefixed body, so the un-stripped path forwarded
+/// it ungoverned. A denied call is now rejected, an allowed call forwarded, on
+/// both `on_response_body` and `on_final_response_body`.
+#[tokio::test]
+async fn bom_prefixed_json_response_denied_call_is_caught() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+
+    let mut denied = b"\xEF\xBB\xBF".to_vec();
+    denied.extend_from_slice(&response_with_tool_call("kubectl.apply", "{}"));
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &denied)
+            .await,
+        Some(502),
+    );
+    // Final re-check path also strips the BOM.
+    let mut ctx = create_test_context();
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &denied)
+            .await,
+        Some(502),
+    );
+
+    // An allowed call with a BOM still forwards on both paths.
+    let mut allowed = b"\xEF\xBB\xBF".to_vec();
+    allowed.extend_from_slice(&response_with_tool_call("report.read", "{}"));
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &allowed)
+            .await,
+    );
+    let mut ctx = create_test_context();
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &allowed)
+            .await,
+    );
+}
+
+/// Fix 3 (hash consistency): the governed-response hash is recorded over the
+/// RAW (BOM-included) bytes on BOTH `on_response_body` and the final re-check,
+/// so an unchanged BOM-prefixed body governed once is hash-skipped on the final
+/// pass — no duplicate approval webhook.
+#[tokio::test]
+async fn bom_prefixed_json_governed_hash_skips_final_recheck() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 }
+    }));
+    let mut ctx = create_test_context();
+    let mut body = b"\xEF\xBB\xBF".to_vec();
+    body.extend_from_slice(&response_with_tool_call("deploy", "{\"env\":\"prod\"}"));
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    ); // webhook #1
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    ); // unchanged raw bytes -> hash match -> skip, no webhook #2
+    server.verify().await;
+}

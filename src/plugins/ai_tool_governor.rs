@@ -1796,15 +1796,22 @@ impl Plugin for AiToolGovernor {
             .then(|| serde_json::from_slice::<Value>(body).ok())
             .flatten();
 
-        // Re-detect `stream: true` on the FINAL backend-visible body: a
-        // `request_transformer` body rule may have added it after `before_proxy`
-        // ran. `forces_reqwest_dispatch` (consulted after this hook) reads the
-        // marker to pin the reqwest path where the SSE inspector is wired. An
-        // uninspectable final body cannot rule out `stream: true`, so mark it
-        // conservatively — reqwest dispatch is always valid.
+        // Re-detect the stream mode on the FINAL backend-visible body: a
+        // `request_transformer` body rule may have added OR removed `stream:
+        // true` after `before_proxy` ran. `forces_reqwest_dispatch` /
+        // `request_is_streaming` (consulted after this hook) read the marker to
+        // pin the reqwest path and — in a streaming-only config
+        // (`response_tool_calls: false`) — to route the response as an SSE
+        // fallback vs. ordinary buffered JSON. The backend-visible request
+        // governs the response mode, so the marker must track it in BOTH
+        // directions.
         if detects_streaming {
             let already_marked =
                 ctx.metadata.get(STREAM_REQUESTED_KEY).map(String::as_str) == Some("true");
+            // An uninspectable final body (encoded, oversized, non-JSON) cannot
+            // rule out `stream: true`, so treat it as streaming — reqwest
+            // dispatch is always valid, and this preserves the round-14
+            // transformer-adds-stream fix.
             let is_stream = match &json {
                 Some(json) => json.get("stream").and_then(Value::as_bool) == Some(true),
                 None => true,
@@ -1812,18 +1819,31 @@ impl Plugin for AiToolGovernor {
             if is_stream && !already_marked {
                 ctx.metadata
                     .insert(STREAM_REQUESTED_KEY.to_string(), "true".to_string());
+            } else if !is_stream && json.is_some() {
+                // A `request_transformer` rewrote an initially-streaming request
+                // to `stream: false` (or removed the field): the backend now
+                // sees a non-streaming request, so CLEAR the stale marker (and
+                // the dependent stream model) or a normal non-streaming JSON
+                // response would be mis-governed as an SSE fallback and denied
+                // under a streaming-only config. Only clear when a final body
+                // was actually parsed and is provably non-streaming — never on
+                // an unparseable/absent body, which stays conservatively marked
+                // (round-14).
+                ctx.metadata.remove(STREAM_REQUESTED_KEY);
+                ctx.metadata.remove(STREAM_MODEL_KEY);
             }
             // Refresh the recorded model from the FINAL backend-visible body —
-            // even when `before_proxy` already marked the request streaming: a
-            // `request_transformer` can change `model` after the initial
+            // a `request_transformer` can change `model` after the initial
             // detection, the stream inspector seeds its correlation from this
             // key (and ignores SSE-frame models once correlation is `Some`),
             // and approval webhooks/cache must key on the model the backend
             // actually serves. When an inspectable final body no longer
             // carries a model, drop the stale key so the inspector falls back
-            // to the `model` reported in the SSE frames; an uninspectable
-            // final body leaves the last-known value in place.
-            if (is_stream || already_marked) && json.is_some() {
+            // to the `model` reported in the SSE frames. Only runs on a parsed
+            // STILL-streaming body; the non-streaming clear branch above
+            // already removed both keys, and an uninspectable body leaves the
+            // last-known value in place.
+            if is_stream && json.is_some() {
                 match json.as_ref().and_then(request_model) {
                     Some(model) => {
                         ctx.metadata.insert(STREAM_MODEL_KEY.to_string(), model);
@@ -2075,9 +2095,11 @@ impl Plugin for AiToolGovernor {
         }
         // The plaintext parse is attempted only within the wire cap (the cap
         // bounds serde CPU); an encoded body past it goes straight to the
-        // bounded decode branch.
+        // bounded decode branch. `parse_json_within_limit` strips a leading
+        // UTF-8 BOM so a `\u{feff}`-prefixed Chat Completions body is governed
+        // rather than forwarded as unparseable (the SSE path already strips it).
         let parsed = (body.len() <= MAX_PARSE_BYTES)
-            .then(|| serde_json::from_slice::<Value>(body).ok())
+            .then(|| parse_json_within_limit(body))
             .flatten();
         let json = match parsed {
             Some(json) => json,
@@ -2243,7 +2265,11 @@ impl Plugin for AiToolGovernor {
         if body.is_empty() || body.len() > MAX_PARSE_BYTES {
             return None;
         }
-        let mut json: Value = serde_json::from_slice(body).ok()?;
+        // Strip a leading BOM (same as the governance parse) so a BOM-prefixed
+        // governed body — now inspected by `on_response_body` — is also
+        // redactable rather than forwarded unredacted; the re-serialized output
+        // is BOM-free valid JSON.
+        let mut json: Value = serde_json::from_slice(strip_json_bom(body)).ok()?;
         if self.redact_response(&mut json) {
             let rewritten = serde_json::to_vec(&json).ok()?;
             // Record the redacted body's hash so `on_final_response_body` treats
@@ -2560,6 +2586,11 @@ enum ToolSlot {
 struct StreamingToolCallAccumulator {
     calls: Vec<((usize, ToolSlot), StreamingCall)>,
     positions: HashMap<(usize, ToolSlot), usize>,
+    /// A frame carried a MALFORMED `tool_calls` container (present but not a
+    /// JSON array): its entries cannot be accumulated, so the batch is
+    /// ungovernable — the SSE mirror of the buffered `extract_response_tool_calls`
+    /// non-array case (round 10). Enforce cuts the stream; dry-run releases.
+    malformed: bool,
 }
 
 #[derive(Default)]
@@ -2584,24 +2615,31 @@ impl StreamingToolCallAccumulator {
                 .and_then(|v| usize::try_from(v).ok())
                 .unwrap_or(cpos);
             let delta = choice.get("delta");
-            if let Some(tool_calls) = delta
-                .and_then(|d| d.get("tool_calls"))
-                .and_then(Value::as_array)
-            {
-                for (tpos, tc) in tool_calls.iter().enumerate() {
-                    let tidx = tc
-                        .get("index")
-                        .and_then(Value::as_u64)
-                        .and_then(|v| usize::try_from(v).ok())
-                        .unwrap_or(tpos);
-                    let function = tc.get("function");
-                    self.push_delta(
-                        cidx,
-                        ToolSlot::Indexed(tidx),
-                        function.and_then(|f| f.get("name")),
-                        function.and_then(|f| f.get("arguments")),
-                    );
-                }
+            let tool_calls =
+                match classify_tool_calls_container(delta.and_then(|d| d.get("tool_calls"))) {
+                    ToolCallsContainer::Array(items) => items,
+                    // Present but not an array: cannot be accumulated. Flag the
+                    // batch ungovernable (mirrors the buffered non-array case) so
+                    // `has_ungovernable_call()` fails closed in enforce.
+                    ToolCallsContainer::Malformed => {
+                        self.malformed = true;
+                        &[]
+                    }
+                    ToolCallsContainer::None => &[],
+                };
+            for (tpos, tc) in tool_calls.iter().enumerate() {
+                let tidx = tc
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|v| usize::try_from(v).ok())
+                    .unwrap_or(tpos);
+                let function = tc.get("function");
+                self.push_delta(
+                    cidx,
+                    ToolSlot::Indexed(tidx),
+                    function.and_then(|f| f.get("name")),
+                    function.and_then(|f| f.get("arguments")),
+                );
             }
             // Legacy `functions` API: a backend streams the single implicit
             // call per choice as `delta.function_call` `{name, arguments}`
@@ -2674,14 +2712,18 @@ impl StreamingToolCallAccumulator {
     }
 
     /// Whether any accumulated tool call cannot be policy-checked: it never
-    /// received a `function.name`, or its `function.arguments` arrived as a
-    /// non-string JSON value. `build_calls()` silently drops such calls, so a
-    /// governable named call in the same batch must not carry an ungovernable
-    /// sibling past policy.
+    /// received a `function.name`, its `function.arguments` arrived as a
+    /// non-string JSON value, or a frame carried a MALFORMED `tool_calls`
+    /// container (present but not an array). `build_calls()` silently drops
+    /// unnamed calls and `push_frame` cannot accumulate a non-array container,
+    /// so a governable named call in the same batch must not carry an
+    /// ungovernable sibling past policy.
     fn has_ungovernable_call(&self) -> bool {
-        self.calls
-            .iter()
-            .any(|(_, c)| c.name.is_empty() || c.non_string_args)
+        self.malformed
+            || self
+                .calls
+                .iter()
+                .any(|(_, c)| c.name.is_empty() || c.non_string_args)
     }
 
     fn build_calls(&self) -> Vec<ToolCall> {
@@ -2982,7 +3024,7 @@ impl ToolCallStreamInspector {
     /// JSON-shaped plaintext within the size cap.
     async fn finalize_json_body(&mut self) -> ResponseStreamAction {
         let body = std::mem::take(&mut self.carry);
-        let Ok(json) = serde_json::from_slice::<Value>(&body) else {
+        let Ok(json) = serde_json::from_slice::<Value>(strip_json_bom(&body)) else {
             return ResponseStreamAction::Forward(Bytes::from(body));
         };
         let (calls, ungovernable) = extract_response_tool_calls(&json);
@@ -3394,7 +3436,55 @@ fn collect_finished_choices(
     }
 }
 
-/// Whether a streaming frame carries governed call deltas: modern
+/// Classify a `tool_calls` container Value the ONE way this plugin decides
+/// governability, shared by the buffered-JSON extractor and the SSE frame
+/// paths so they cannot diverge (round 10 established the buffered posture;
+/// this is the shared choke point):
+///   - a JSON array is a governable container (its entries are checked);
+///   - absent or explicit `null` means no tool calls;
+///   - any OTHER JSON type (object, string, number, bool) is MALFORMED — an
+///     unrecognized shape that could hide a call the extractor would silently
+///     drop, so it is treated as ungovernable (enforce cut / dry-run release).
+enum ToolCallsContainer<'a> {
+    Array(&'a [Value]),
+    None,
+    Malformed,
+}
+
+fn classify_tool_calls_container(value: Option<&Value>) -> ToolCallsContainer<'_> {
+    match value {
+        Some(Value::Array(items)) => ToolCallsContainer::Array(items),
+        None | Some(Value::Null) => ToolCallsContainer::None,
+        Some(_) => ToolCallsContainer::Malformed,
+    }
+}
+
+/// Whether a `choices[].delta` carries governed call deltas (a non-empty
+/// `tool_calls` array, or a non-null legacy `function_call`) OR a MALFORMED
+/// tool-call container (`tool_calls` present but not an array). A malformed
+/// container must return `true` so the frame is HELD and pushed into the
+/// accumulator (which flags it ungovernable): otherwise the live inspector and
+/// the buffered-SSE extractor would treat it as ordinary data and forward it
+/// even under enforce/default-deny — the SSE mirror of the round-10 buffered
+/// non-array fix.
+fn delta_has_tool_calls(delta: Option<&Value>) -> bool {
+    let tool_calls = delta.and_then(|d| d.get("tool_calls"));
+    match classify_tool_calls_container(tool_calls) {
+        ToolCallsContainer::Array(items) => {
+            if !items.is_empty() {
+                return true;
+            }
+        }
+        ToolCallsContainer::Malformed => return true,
+        ToolCallsContainer::None => {}
+    }
+    delta
+        .and_then(|d| d.get("function_call"))
+        .is_some_and(|fc| !fc.is_null())
+}
+
+/// Whether a streaming frame carries governed call deltas (or a malformed
+/// tool-call container that must be held and flagged ungovernable): modern
 /// `choices[].delta.tool_calls`, or the legacy `functions`-API
 /// `choices[].delta.function_call`. Frames matching this are HELD until the
 /// accumulated call clears policy.
@@ -3403,16 +3493,9 @@ fn frame_has_tool_calls(frame: &Value) -> bool {
         .get("choices")
         .and_then(Value::as_array)
         .is_some_and(|choices| {
-            choices.iter().any(|choice| {
-                let delta = choice.get("delta");
-                delta
-                    .and_then(|d| d.get("tool_calls"))
-                    .and_then(Value::as_array)
-                    .is_some_and(|tcs| !tcs.is_empty())
-                    || delta
-                        .and_then(|d| d.get("function_call"))
-                        .is_some_and(|fc| !fc.is_null())
-            })
+            choices
+                .iter()
+                .any(|choice| delta_has_tool_calls(choice.get("delta")))
         })
 }
 
@@ -3593,8 +3676,9 @@ fn extract_response_tool_calls(json: &Value) -> (Vec<ToolCall>, bool) {
         let Some(message) = choice.get("message") else {
             continue;
         };
-        match message.get("tool_calls") {
-            Some(Value::Array(tool_calls)) => {
+        // Same container classification the SSE paths use (shared choke point).
+        match classify_tool_calls_container(message.get("tool_calls")) {
+            ToolCallsContainer::Array(tool_calls) => {
                 for tc in tool_calls {
                     let function = tc.get("function");
                     match function.and_then(|f| f.get("name")).and_then(Value::as_str) {
@@ -3612,9 +3696,9 @@ fn extract_response_tool_calls(json: &Value) -> (Vec<ToolCall>, bool) {
                 }
             }
             // Absent or explicitly-null: no tool calls for this choice.
-            None | Some(Value::Null) => {}
+            ToolCallsContainer::None => {}
             // `tool_calls` present but not an array: not a checkable shape.
-            Some(_) => ungovernable = true,
+            ToolCallsContainer::Malformed => ungovernable = true,
         }
         match message.get("function_call") {
             Some(Value::Null) | None => {}
@@ -3746,12 +3830,15 @@ fn content_encoding_value(headers: &HashMap<String, String>) -> Option<&str> {
         .filter(|enc| !enc.is_empty() && !enc.eq_ignore_ascii_case("identity"))
 }
 
-/// Parse `body` as JSON only when it is within the inspectable size limit.
+/// Parse `body` as JSON only when it is within the inspectable size limit. A
+/// leading UTF-8 BOM is stripped before the parse (`serde_json` rejects a
+/// BOM-prefixed document), so a `\u{feff}`-prefixed Chat Completions response
+/// cannot slip a denied tool call past the governor by making the parse fail.
 fn parse_json_within_limit(body: &[u8]) -> Option<Value> {
     if body.is_empty() || body.len() > MAX_PARSE_BYTES {
         return None;
     }
-    serde_json::from_slice(body).ok()
+    serde_json::from_slice(strip_json_bom(body)).ok()
 }
 
 /// Decompress a gateway-encoded response body (the same `gzip`/`br` encodings
@@ -3826,14 +3913,35 @@ fn sha256_hex(input: &str) -> String {
     sha256_hex_bytes(input.as_bytes())
 }
 
+/// Strip a single leading UTF-8 BOM (`EF BB BF`) so JSON parsing/shape checks
+/// see the document itself. `serde_json` rejects a BOM-prefixed body, so a
+/// backend (or a `response_transformer`) that emits `\u{feff}{...}` would make
+/// `on_response_body`/`on_final_response_body` fail to parse and — with no
+/// `Content-Encoding` — forward a denied `choices[].message.tool_calls[]`
+/// ungoverned. The SSE parser already strips the BOM (`classify_event`,
+/// `looks_like_sse`); this is the JSON-path counterpart, applied on every
+/// JSON parse in this plugin so the two paths cannot diverge again. Only the
+/// PARSE/SHAPE view is stripped — the governed-response hash still covers the
+/// RAW bytes on both `on_response_body` and the final re-check, so the
+/// hash-skip stays consistent.
+fn strip_json_bom(body: &[u8]) -> &[u8] {
+    body.strip_prefix(b"\xEF\xBB\xBF".as_slice())
+        .unwrap_or(body)
+}
+
 /// Whether a body's first non-whitespace byte starts a JSON object/array. Used
 /// so a `request_transformer`/`response_transformer` that removes or rewrites the
 /// `Content-Type` header cannot disable governance while leaving the JSON body
 /// intact — a JSON-shaped body is still inspected. Bounds the extra parse to
-/// bodies that actually look like JSON.
+/// bodies that actually look like JSON. BOM-tolerant (mirrors `looks_like_sse`)
+/// so a BOM-prefixed JSON body a header rule relabeled still routes into the
+/// JSON parse rather than being skipped by the content-type/shape gate.
 fn looks_like_json(body: &[u8]) -> bool {
     matches!(
-        body.iter().copied().find(|b| !b.is_ascii_whitespace()),
+        strip_json_bom(body)
+            .iter()
+            .copied()
+            .find(|b| !b.is_ascii_whitespace()),
         Some(b'{') | Some(b'[')
     )
 }
