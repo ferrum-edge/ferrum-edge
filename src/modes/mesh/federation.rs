@@ -1325,7 +1325,7 @@ fn overlay_polled_federation_bundles(set: &mut TrustBundleSet, snapshot: &Federa
     // domain the poller has fetched, then append the fresh polled bundles.
     set.federated
         .retain(|fed| !snapshot.bundles.contains_key(&fed.trust_domain));
-    for (_td, federated) in snapshot.bundles.iter() {
+    for federated in snapshot.bundles.values() {
         set.federated.push(federated.bundle.clone());
     }
 }
