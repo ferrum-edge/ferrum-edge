@@ -2222,9 +2222,13 @@ fn udp_strict_output_jump_release_for(binary: &str, chain: &str) -> String {
 /// stale-state cleanup. It removes both fail-closed guard generations and the
 /// normal TPROXY/routing state.
 fn udp_teardown_for(binary: &str) -> CleanupCommands {
-    let mut capture = udp_capture_teardown_for(binary);
-    let mut iptables = udp_fail_closed_teardown_for(binary);
-    iptables.append(&mut capture.iptables);
+    let capture = udp_capture_teardown_for(binary);
+    // Remove the normal capture path first while any retained DROP guard still
+    // protects selected egress. Guard removal is strict and comes last: a
+    // transient resource error can then leave the workload fail-closed, but can
+    // never prevent cleanup from detaching a socketless TPROXY path.
+    let mut iptables = capture.iptables;
+    iptables.extend(udp_fail_closed_teardown_for(binary));
     CleanupCommands {
         iptables,
         ip_routing: capture.ip_routing,
@@ -3611,6 +3615,15 @@ mod tests {
                 "teardown must loop over every duplicate v4 guard jump for {chain}: {script}"
             );
         }
+        assert!(
+            script
+                .find("-D OUTPUT -p udp -j FERRUM_MESH_UDP_OUTPUT_MARK")
+                .expect("normal capture OUTPUT cleanup")
+                < script
+                    .find("-D OUTPUT -p udp -j FERRUM_UDP_FAIL_CLOSED_A")
+                    .expect("strict guard cleanup"),
+            "normal capture must detach before strict guard cleanup: {script}"
+        );
         // ...but v6 routing (`ip -6`) emitted UNCONDITIONALLY (not behind the probe).
         assert!(
             script.contains(&format!(
