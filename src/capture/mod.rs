@@ -2263,6 +2263,14 @@ fn delete_chain(binary: &str, table: &str, chain: &str) -> String {
 mod tests {
     use super::*;
 
+    fn tolerates_missing_cleanup_state(command: &str) -> bool {
+        command.contains("|| true")
+            || (command.contains("while true; do")
+                && command.contains("FERRUM_UDP_FAIL_CLOSED_")
+                && command.contains("if [ \"$status\" -eq 1 ]")
+                && command.contains("exit \"$status\""))
+    }
+
     #[test]
     fn iptables_plan_is_idempotent() {
         let mut config = CaptureConfig::explicit(15006, 15001);
@@ -2529,11 +2537,13 @@ mod tests {
     fn cleanup_commands_all_tolerate_missing_chains() {
         let cleanup = IptablesPlan::cleanup_commands(true);
 
-        // Every cleanup command must have "|| true" so partial cleanup doesn't
-        // fail the overall teardown
+        // Ordinary cleanup remains best-effort. Fail-closed guard cleanup uses a
+        // strict loop instead: status 1 (missing jump) is still a no-op, while
+        // resource errors propagate so cleanup cannot report success with a DROP
+        // jump left active.
         for cmd in &cleanup {
             assert!(
-                cmd.contains("|| true"),
+                tolerates_missing_cleanup_state(cmd),
                 "cleanup command must tolerate missing chains: {cmd}"
             );
         }
@@ -4476,10 +4486,11 @@ mod tests {
                 .any(|c| c.contains("route flush table") || c.contains("rule del lookup")),
             "cleanup must NOT flush a table or delete-by-lookup (shared-table hazard): {cleanup:?}"
         );
-        // Every cleanup command stays best-effort.
+        // Every command tolerates missing state; dedicated guard loops still
+        // propagate resource errors instead of hiding an active DROP jump.
         for cmd in &cleanup {
             assert!(
-                cmd.contains("|| true"),
+                tolerates_missing_cleanup_state(cmd),
                 "UDP cleanup command must tolerate missing state: {cmd}"
             );
         }
@@ -4942,8 +4953,8 @@ mod tests {
                 "UDP teardown must not flush a table or delete-by-lookup: {cmd}"
             );
             assert!(
-                cmd.contains("|| true") || cmd.contains("if command -v ip6tables"),
-                "UDP teardown command must be best-effort (or ip6tables-probe-wrapped): {cmd}"
+                tolerates_missing_cleanup_state(cmd) || cmd.contains("if command -v ip6tables"),
+                "UDP teardown command must tolerate missing state (or be ip6tables-probe-wrapped): {cmd}"
             );
         }
     }
