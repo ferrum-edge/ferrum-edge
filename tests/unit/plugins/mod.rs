@@ -16,6 +16,7 @@ mod ai_semantic_cache_tests;
 mod ai_semantic_firewall_tests;
 mod ai_stream_router_tests;
 mod ai_token_metrics_tests;
+mod ai_transcript_audit_tests;
 mod api_chargeback_sink_tests;
 mod api_chargeback_tests;
 mod basic_auth_tests;

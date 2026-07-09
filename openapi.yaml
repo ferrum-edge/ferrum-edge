@@ -3792,6 +3792,7 @@ paths:
                 - ai_semantic_cache
                 - ai_stream_router
                 - ai_federation
+                - ai_transcript_audit
                 - mcp_gateway
                 - a2a_gateway
                 - ws_message_size_limiting
@@ -7021,6 +7022,16 @@ components:
             properties:
               config:
                 $ref: "#/components/schemas/AiFederationConfig"
+        - if:
+            required: [plugin_name]
+            properties:
+              plugin_name:
+                const: ai_transcript_audit
+          then:
+            required: [config]
+            properties:
+              config:
+                $ref: "#/components/schemas/AiTranscriptAuditConfig"
         - if:
             required: [plugin_name]
             properties:
@@ -14080,6 +14091,169 @@ components:
           description: Object form for tuning a built-in AI semantic firewall pack.
       description: Built-in pack toggle or tuning object.
 
+    AiTranscriptAuditConfig:
+      type: object
+      required: [sink]
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, and ai_response_guard for enforcement. HTTP-only; gRPC capture is future work."
+      properties:
+        mode:
+          type: string
+          enum: [metadata_only, redacted_body, full_body, hash_only]
+          default: redacted_body
+          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts — SSE captures whose frames are all parseable OpenAI chat.completion.chunk frames export a reassembled per-choice completion-text excerpt (annotated sse_reassembled) so PII split across streaming deltas cannot evade per-frame redaction; other SSE shapes keep the per-frame-redacted raw frames. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256 (a mostly-predictable payload around one secret would make an unkeyed digest an offline brute-force oracle)."
+        allow_full_body:
+          type: boolean
+          default: false
+          description: "Required guardrail for mode=full_body, which captures unredacted payloads. Construction fails if full_body is set without this opt-in."
+        capture:
+          type: object
+          description: "What to capture."
+          properties:
+            request:
+              type: boolean
+              default: true
+            response:
+              type: boolean
+              default: true
+            streaming_response:
+              default: false
+              description: "Capture SSE response excerpts. false | true | 'sampled'. true forces every AI-candidate request's response onto the stream-inspection path. 'sampled' tees only requests that win the sampling.rate roll (or whose request-side guardrail fired when always_capture_on_guardrail is set — the tee decision is evaluated at dispatch time, after the request-phase guardrail plugins ran); error responses and response-side guardrail hits on un-sampled streaming requests still emit records via the log fallback, but without a response body/hash — teeing every stream to cover those late triggers would defeat sampled capture."
+              oneOf:
+                - type: boolean
+                - type: string
+                  enum: [sampled]
+            headers:
+              type: boolean
+              default: false
+              description: "Capture response headers (redacted by key). Also gated by privacy.include_raw_headers."
+            tool_calls:
+              type: boolean
+              default: true
+              description: "Extract tool/function names from the request body."
+        sampling:
+          type: object
+          properties:
+            rate:
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+              default: 1.0
+              description: "Fraction of eligible AI transactions emitted as full records. Guardrail/error captures override the roll."
+            always_capture_on_guardrail:
+              type: boolean
+              default: true
+            always_capture_on_error:
+              type: boolean
+              default: true
+            max_records_per_minute:
+              type: integer
+              minimum: 0
+              default: 0
+              description: "Records-per-minute cap (0 = unlimited). Over the cap, records are dropped (never reject traffic)."
+        redaction:
+          type: object
+          description: "PII redaction policy for captured excerpts. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt)."
+          properties:
+            builtins:
+              type: array
+              items:
+                type: string
+                enum: [ssn, credit_card, email, phone_us, api_key, aws_key, ip_address, iban]
+              description: "Built-in PII patterns, shared with ai_prompt_shield/ai_response_guard."
+            custom_patterns:
+              type: array
+              items:
+                type: object
+                required: [name, regex]
+                properties:
+                  name:
+                    type: string
+                  regex:
+                    type: string
+            placeholder:
+              type: string
+              default: "[REDACTED:{type}]"
+              description: "Non-hashing replacement template; {type} is substituted with the pattern name."
+            hash_redacted_values:
+              type: boolean
+              default: true
+              description: "Replace matches with [REDACTED:<type>:<hmac-prefix>] so identical values stay correlatable without storing the raw value. The digest is a keyed HMAC-SHA256 (see hash_secret), never a plain hash — most PII value spaces are small enough to brute-force offline from an unsalted digest."
+            hash_secret:
+              type: string
+              minLength: 16
+              description: "Optional key for the redacted-value HMAC and the exported request/response body hashes. When set (min 16 chars), hashed placeholders and body hashes are stable across gateway instances and restarts, so values correlate fleet-wide. When omitted, each process generates a random key at startup: digests still correlate within one process lifetime but never across restarts/instances, and can never be dictionary-attacked from exported records. Treat like any other secret — do not log or export it."
+        limits:
+          type: object
+          properties:
+            max_request_bytes:
+              type: integer
+              minimum: 1
+              default: 65536
+            max_response_bytes:
+              type: integer
+              minimum: 1
+              default: 65536
+            max_stream_capture_bytes:
+              type: integer
+              minimum: 1
+              default: 65536
+        sink:
+          type: object
+          required: [endpoint_url]
+          description: "Async batched HTTP sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames)."
+          properties:
+            type:
+              type: string
+              enum: [http]
+              default: http
+            endpoint_url:
+              type: string
+              format: uri
+              description: "http(s) collector URL."
+            custom_headers:
+              type: object
+              additionalProperties:
+                type: string
+              description: "Extra headers sent on every batch. Values support ${ENV_VAR} expansion resolved lazily at send time, so secrets are not stored in config (e.g. Authorization: 'Bearer ${AUDIT_TOKEN}')."
+            batch_size:
+              type: integer
+              minimum: 1
+              default: 50
+            flush_interval_ms:
+              type: integer
+              minimum: 100
+              default: 1000
+            buffer_capacity:
+              type: integer
+              minimum: 1
+              default: 10000
+            max_retries:
+              type: integer
+              minimum: 0
+              default: 3
+            on_buffer_full:
+              type: string
+              enum: [drop, reject]
+              default: drop
+              description: "drop: silently drop when the queue is full (never block). reject: fail the request 503 when a buffered-response record cannot be enqueued (fail-closed audit)."
+            on_sink_error:
+              type: string
+              enum: [warn, reject]
+              default: warn
+              description: "warn: log and drop on permanent sink failure. reject: fail buffered-response requests 503 while the sink is unhealthy. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
+        privacy:
+          type: object
+          properties:
+            include_consumer_username:
+              type: boolean
+              default: true
+            include_client_ip:
+              type: boolean
+              default: false
+            include_raw_headers:
+              type: boolean
+              default: false
+
     AiSemanticFirewallConfig:
       type: object
       description: "Plugin: ai_semantic_firewall — Semantic LLM guardrails for prompt injection, jailbreaks, system/developer prompt exfiltration, data exfiltration intent, indirect prompt injection, tool abuse, business-topic allow/deny policy, response leakage, dry-run rollout, and audit metadata."
@@ -15005,7 +15179,7 @@ components:
 
     AiStreamRouterConfig:
       type: object
-      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (after ai_semantic_cache at 2980, before ai_federation at 2985). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Fallback across providers after the first downstream byte is out of scope (ai_stream_router.fallback_attempts is always 0). NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
+      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (after ai_semantic_cache at 2980, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Fallback across providers after the first downstream byte is out of scope (ai_stream_router.fallback_attempts is always 0). NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
       required: [providers]
       properties:
         enabled:

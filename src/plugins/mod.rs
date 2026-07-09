@@ -34,6 +34,7 @@ pub mod ai_semantic_cache;
 pub mod ai_semantic_firewall;
 pub mod ai_stream_router;
 pub mod ai_token_metrics;
+pub mod ai_transcript_audit;
 pub mod api_chargeback;
 pub mod api_chargeback_sink;
 pub mod basic_auth;
@@ -1519,6 +1520,11 @@ pub trait ResponseStreamInspector: Send {
     async fn on_end(&mut self) -> ResponseStreamAction {
         ResponseStreamAction::Forward(bytes::Bytes::new())
     }
+
+    /// Called on inspectors that already saw bytes when a later inspector cuts
+    /// the chain. Earlier inspectors can use this to discard pre-cut state that
+    /// no longer represents the client-visible stream.
+    fn on_downstream_terminated(&mut self) {}
 }
 
 /// Compose the stream inspectors of several plugins into one, so a response with
@@ -1590,15 +1596,18 @@ struct ChainedResponseStreamInspector {
 impl ResponseStreamInspector for ChainedResponseStreamInspector {
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
         let mut buf = bytes::Bytes::copy_from_slice(chunk);
-        for inspector in &mut self.inspectors {
+        for index in 0..self.inspectors.len() {
             if buf.is_empty() {
                 // An upstream inspector is holding this window; nothing yet for
                 // the rest of the chain to see.
                 return ResponseStreamAction::Forward(bytes::Bytes::new());
             }
-            match inspector.on_chunk(&buf).await {
+            match self.inspectors[index].on_chunk(&buf).await {
                 ResponseStreamAction::Forward(out) => buf = out,
-                terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                terminate @ ResponseStreamAction::Terminate(_) => {
+                    self.notify_prior_downstream_terminated(index);
+                    return terminate;
+                }
             }
         }
         ResponseStreamAction::Forward(buf)
@@ -1608,21 +1617,35 @@ impl ResponseStreamInspector for ChainedResponseStreamInspector {
         // Flush each inspector in order; bytes flushed by inspector *i* are fed to
         // inspector *i+1* as a final chunk before *i+1* is itself flushed.
         let mut carry = bytes::Bytes::new();
-        for inspector in &mut self.inspectors {
+        for index in 0..self.inspectors.len() {
             let mut released = bytes::BytesMut::new();
             if !carry.is_empty() {
-                match inspector.on_chunk(&carry).await {
+                match self.inspectors[index].on_chunk(&carry).await {
                     ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
-                    terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                    terminate @ ResponseStreamAction::Terminate(_) => {
+                        self.notify_prior_downstream_terminated(index);
+                        return terminate;
+                    }
                 }
             }
-            match inspector.on_end().await {
+            match self.inspectors[index].on_end().await {
                 ResponseStreamAction::Forward(out) => released.extend_from_slice(&out),
-                terminate @ ResponseStreamAction::Terminate(_) => return terminate,
+                terminate @ ResponseStreamAction::Terminate(_) => {
+                    self.notify_prior_downstream_terminated(index);
+                    return terminate;
+                }
             }
             carry = released.freeze();
         }
         ResponseStreamAction::Forward(carry)
+    }
+}
+
+impl ChainedResponseStreamInspector {
+    fn notify_prior_downstream_terminated(&mut self, index: usize) {
+        for inspector in &mut self.inspectors[..index] {
+            inspector.on_downstream_terminated();
+        }
     }
 }
 
@@ -2208,9 +2231,9 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Pre-routing, tracing, and preflight       | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_transcript_audit (2924), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
-/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_federation (4060), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
+/// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365) |
 #[allow(dead_code)]
 pub mod priority {
@@ -2251,6 +2274,11 @@ pub mod priority {
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
+    /// Runs before reject-capable AI guardrails so blocked prompts can still be
+    /// staged for `always_capture_on_guardrail`, while final request-body hooks
+    /// refresh the capture after downstream redaction/transforms when traffic
+    /// continues.
+    pub const AI_TRANSCRIPT_AUDIT: u16 = 2924;
     pub const AI_PROMPT_SHIELD: u16 = 2925;
     pub const WAF: u16 = 2930;
     pub const FAULT_INJECTION: u16 = 2940;
@@ -3437,6 +3465,10 @@ pub fn create_plugin_with_http_client(
             config,
             http_client.clone(),
         )?))),
+        "ai_transcript_audit" => Ok(Some(Arc::new(ai_transcript_audit::AiTranscriptAudit::new(
+            config,
+            http_client.clone(),
+        )?))),
         "mcp_gateway" => Ok(Some(Arc::new(mcp_gateway::McpGateway::new(
             config,
             http_client.clone(),
@@ -3786,6 +3818,12 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("ai_semantic_cache", PluginFailurePolicy::KeepLastKnownGood),
     builtin_plugin("ai_stream_router", PluginFailurePolicy::FailClosed),
     builtin_plugin("ai_federation", PluginFailurePolicy::KeepLastKnownGood),
+    // Observability sink family (http/tcp/udp_logging, prometheus_metrics):
+    // a construction/validation failure logs and omits the plugin rather than
+    // rejecting startup/reload. Runtime fail-closed capture is the explicit
+    // `sink.on_sink_error` / `sink.on_buffer_full` = `reject` config, not
+    // registration policy.
+    builtin_plugin("ai_transcript_audit", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("mcp_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("a2a_gateway", PluginFailurePolicy::FailClosed),
     builtin_plugin("ws_message_size_limiting", PluginFailurePolicy::FailClosed),
