@@ -231,6 +231,24 @@ impl Plugin for PriorityOverridePlugin {
             .on_response_body(ctx, response_status, response_headers, body)
             .await
     }
+    async fn normalize_response_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        body: &[u8],
+        content_type: Option<&str>,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        self.inner
+            .normalize_response_body_with_context(
+                ctx,
+                response_status,
+                body,
+                content_type,
+                response_headers,
+            )
+            .await
+    }
     async fn transform_request_body(
         &self,
         body: &[u8],

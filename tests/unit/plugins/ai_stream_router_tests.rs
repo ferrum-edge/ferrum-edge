@@ -6,7 +6,8 @@ use ferrum_edge::plugins::ai_federation::AiFederation;
 use ferrum_edge::plugins::ai_stream_router::AiStreamRouter;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext,
-    ResponseStreamAction, ResponseStreamInspector, priority,
+    ResponseStreamAction, ResponseStreamInspector, ResponseStreamInspectorStage,
+    chain_response_stream_inspectors, priority,
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -82,6 +83,25 @@ fn forwarded(action: ResponseStreamAction) -> Vec<u8> {
     match action {
         ResponseStreamAction::Forward(b) => b.to_vec(),
         ResponseStreamAction::Terminate(b) => b.map(|b| b.to_vec()).unwrap_or_default(),
+    }
+}
+
+/// Test guardrail that cuts if provider-native Anthropic framing reaches it.
+/// Its default stage is `Inspect`, so the chain must move a normalizer supplied
+/// later in the vector ahead of it.
+struct RejectProviderNative;
+
+#[async_trait::async_trait]
+impl ResponseStreamInspector for RejectProviderNative {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        if chunk
+            .windows(b"content_block_delta".len())
+            .any(|window| window == b"content_block_delta")
+        {
+            ResponseStreamAction::Terminate(None)
+        } else {
+            ResponseStreamAction::Forward(bytes::Bytes::copy_from_slice(chunk))
+        }
     }
 }
 
@@ -747,6 +767,36 @@ async fn test_inspector_gating() {
     );
 }
 
+#[tokio::test]
+async fn test_stream_normalizer_stage_precedes_policy_inspection() {
+    let plugin = build(openai_and_anthropic_config());
+    let claude = json!({"model": "claude-3-5-sonnet", "stream": true, "messages": []});
+    let mut ctx = post_ctx(&claude);
+    let mut headers = json_headers();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let normalizer = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("normalizer");
+    assert_eq!(normalizer.stage(), ResponseStreamInspectorStage::Normalize);
+
+    // Deliberately supply the policy inspector first. Stage ordering must still
+    // normalize before it, without hard-coding plugin names or changing
+    // request-side priority semantics.
+    let mut chain =
+        chain_response_stream_inspectors(vec![Box::new(RejectProviderNative), normalizer])
+            .expect("chained inspectors");
+    let output = match chain.on_chunk(ANTHROPIC_SSE.as_bytes()).await {
+        ResponseStreamAction::Forward(output) => output,
+        ResponseStreamAction::Terminate(_) => {
+            panic!("policy inspector saw provider-native Anthropic SSE")
+        }
+    };
+    let output = String::from_utf8(output.to_vec()).expect("normalized UTF-8 SSE");
+    assert!(output.contains("chat.completion.chunk"));
+    assert!(!output.contains("content_block_delta"));
+}
+
 const ANTHROPIC_SSE: &str = concat!(
     "event: message_start\n",
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_123\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":10,\"output_tokens\":1}}}\n\n",
@@ -862,8 +912,9 @@ async fn test_buffered_anthropic_sse_is_normalized_too() {
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
     let buffered = plugin
-        .transform_response_body_with_context(
+        .normalize_response_body_with_context(
             &mut ctx,
+            200,
             ANTHROPIC_SSE.as_bytes(),
             Some("text/event-stream"),
             &HashMap::new(),
@@ -876,6 +927,20 @@ async fn test_buffered_anthropic_sse_is_normalized_too() {
     assert_eq!(strip_created(&buffered), strip_created(&streamed));
     assert!(buffered.contains("chat.completion.chunk"));
     assert!(buffered.trim_end().ends_with("data: [DONE]"));
+
+    assert!(
+        plugin
+            .normalize_response_body_with_context(
+                &mut ctx,
+                500,
+                ANTHROPIC_SSE.as_bytes(),
+                Some("text/event-stream"),
+                &HashMap::new(),
+            )
+            .await
+            .is_none(),
+        "provider error streams must stay untouched"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RequestContext, ResponseStreamAction, TransactionSummary,
+    normalize_response_body_for_inspection,
 };
 use crate::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
 use crate::proxy::headers::{
@@ -4359,6 +4360,19 @@ async fn handle_h3_request(
         // Mirrors the HTTP/1.1 path in proxy/mod.rs.
         if !after_proxy_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
+            if normalize_response_body_for_inspection(
+                &plugins,
+                &mut ctx,
+                response_status,
+                &mut response_headers,
+                &mut response_body,
+            )
+            .await
+            {
+                // Normalization replaced the backend representation, so its
+                // body-specific trailers no longer describe the bytes on wire.
+                response_trailers = None;
+            }
             let mut response_body_reject = None;
             for plugin in plugins.iter() {
                 let result = plugin

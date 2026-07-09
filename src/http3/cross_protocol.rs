@@ -111,6 +111,7 @@ use crate::load_balancer::LoadBalancer;
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RequestContext, ResponseStreamAction, ResponseStreamInspector,
+    normalize_response_body_for_inspection,
 };
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::{record_backend_outcome, record_backend_outcome_no_conn_end};
@@ -2147,6 +2148,14 @@ where
         };
 
         if !plugins.is_empty() {
+            normalize_response_body_for_inspection(
+                plugins,
+                ctx,
+                response_status,
+                &mut response_headers,
+                &mut response_body,
+            )
+            .await;
             for plugin in plugins {
                 let result = plugin
                     .on_response_body(ctx, response_status, &response_headers, &response_body)
@@ -3431,6 +3440,17 @@ where
             let mut response_status = resp.status;
             let mut response_body = resp.body;
             let mut response_trailers = resp.trailers;
+            if normalize_response_body_for_inspection(
+                plugins,
+                ctx,
+                response_status,
+                &mut plugin_response_headers,
+                &mut response_body,
+            )
+            .await
+            {
+                response_trailers.clear();
+            }
             for plugin in plugins.iter() {
                 let result = plugin
                     .on_response_body(

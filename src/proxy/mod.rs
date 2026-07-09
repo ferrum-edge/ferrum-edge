@@ -12413,6 +12413,15 @@ async fn apply_synthetic_response_body_hooks(
         "true".to_string(),
     );
 
+    crate::plugins::normalize_response_body_for_inspection(
+        plugins,
+        ctx,
+        *response_status,
+        response_headers,
+        response_body,
+    )
+    .await;
+
     let mut response_body_reject = None;
     for plugin in plugins.iter() {
         let result = plugin
@@ -16297,6 +16306,14 @@ async fn handle_proxy_request_inner(
 
                 if !after_proxy_rejected {
                     let phase_start = Instant::now();
+                    crate::plugins::normalize_response_body_for_inspection(
+                        &plugins,
+                        &mut ctx,
+                        response_status,
+                        &mut plugin_response_headers,
+                        &mut response_body,
+                    )
+                    .await;
                     for plugin in plugins.iter() {
                         let result = plugin
                             .on_response_body(
@@ -17773,34 +17790,28 @@ async fn handle_proxy_request_inner(
         );
     }
 
-    // Anthropic ai_stream_router responses must be normalized before response
-    // body guardrails run. Most transforms intentionally happen after
-    // on_response_body, but the semantic firewall extracts OpenAI-shaped SSE
-    // deltas; inspecting provider-native Anthropic SSE would fail open.
-    let mut ai_stream_router_response_transform_applied = false;
+    // Provider/protocol normalizers run before response-body guardrails. This is
+    // a distinct lifecycle phase from ordinary presentation transforms, which
+    // intentionally remain after on_response_body.
     if !after_proxy_rejected
         && !plugins.is_empty()
         && let ResponseBody::Buffered(ref mut data) = response_body
     {
-        let content_type = response_headers.get("content-type").cloned();
-        let ct_ref = content_type.as_deref();
-        for plugin in plugins.iter().filter(|p| p.name() == "ai_stream_router") {
-            if let Some(transformed) = plugin
-                .transform_response_body_with_context(&mut ctx, data, ct_ref, &response_headers)
-                .await
-            {
-                response_headers
-                    .insert("content-length".to_string(), transformed.len().to_string());
-                *data = transformed;
-                ai_stream_router_response_transform_applied = true;
-            }
-        }
+        let phase_start = Instant::now();
+        crate::plugins::normalize_response_body_for_inspection(
+            &plugins,
+            &mut ctx,
+            response_status,
+            &mut response_headers,
+            data,
+        )
+        .await;
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
     // on_response_body hooks — only for buffered responses, only when plugins exist.
-    // This phase sees the backend body before ordinary response transformations.
-    // Anthropic ai_stream_router SSE is normalized first so OpenAI-shaped response
-    // guardrails inspect the same representation that reaches the client.
+    // This phase sees the normalized backend body before ordinary response
+    // transformations, so guardrails inspect the client-visible protocol shape.
     // A Reject result replaces the response before it reaches the client.
     if !after_proxy_rejected
         && !plugins.is_empty()
@@ -17854,9 +17865,6 @@ async fn handle_proxy_request_inner(
         let content_type = response_headers.get("content-type").cloned();
         let ct_ref = content_type.as_deref();
         for plugin in plugins.iter() {
-            if ai_stream_router_response_transform_applied && plugin.name() == "ai_stream_router" {
-                continue;
-            }
             if let Some(transformed) = plugin
                 .transform_response_body_with_context(&mut ctx, data, ct_ref, &response_headers)
                 .await
@@ -18061,23 +18069,12 @@ async fn handle_proxy_request_inner(
         let content_type = response_headers.get("content-type").map(String::as_str);
         // Chain EVERY opted-in plugin (not just the first), gated to the response
         // status so error bodies are not inspected.
-        let mut inspectors: Vec<_> = Vec::new();
-        // Normalize Anthropic provider SSE before security inspectors such as
-        // ai_semantic_firewall, which evaluate OpenAI chat.completion.chunk deltas.
-        for plugin in plugins.iter().filter(|p| p.name() == "ai_stream_router") {
-            if let Some(inspector) =
+        let inspectors: Vec<_> = plugins
+            .iter()
+            .filter_map(|plugin| {
                 plugin.response_stream_inspector(&ctx, response_status, content_type)
-            {
-                inspectors.push(inspector);
-            }
-        }
-        for plugin in plugins.iter().filter(|p| p.name() != "ai_stream_router") {
-            if let Some(inspector) =
-                plugin.response_stream_inspector(&ctx, response_status, content_type)
-            {
-                inspectors.push(inspector);
-            }
-        }
+            })
+            .collect();
         crate::plugins::chain_response_stream_inspectors(inspectors)
     } else {
         None
