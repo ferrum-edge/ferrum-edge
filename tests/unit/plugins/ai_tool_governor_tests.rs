@@ -651,24 +651,20 @@ async fn relabeled_json_shaped_response_is_still_redacted_by_transform() {
     assert!(!text.contains("RELABELEDSECRET"), "secret leaked: {text}");
     assert!(text.contains("[REDACTED_TOOL_ARG:secret]"), "{text}");
 
-    // The governed hash now tracks the redacted body (as on the JSON-labeled
-    // path), so the final re-check treats the plugin's own redaction as
-    // already governed and forwards it untouched.
-    let redacted_hash: String = <sha2::Sha256 as sha2::Digest>::digest(&transformed)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    assert_eq!(
-        ctx.metadata
-            .get("ai_tool_governor.governed_response_hash")
-            .map(String::as_str),
-        Some(redacted_hash.as_str())
-    );
+    // The governed hash (recorded off `ctx.metadata`, on a non-serialized
+    // request field so an arg-derived hash cannot leak to logs) now tracks the
+    // redacted body, so the final re-check treats the plugin's own redaction as
+    // already governed and forwards it untouched — observed here as a `Continue`
+    // that does NOT re-run redaction/approval. The internal marker is no longer
+    // observable from an external test, so this asserts the behavior it drives.
     assert_continue(
         plugin
             .on_final_response_body(&mut ctx, 200, &html, &transformed)
             .await,
     );
+    // Defense in depth: the raw secret must never appear in transaction
+    // metadata (the governed-hash / call-identity markers moved off metadata).
+    assert_no_metadata_contains(&ctx, "RELABELEDSECRET");
 
     // A non-JSON body that was never governed as JSON-shaped stays untouched:
     // the fallback keys off this plugin's own governed-response marker.
@@ -2676,6 +2672,132 @@ async fn final_response_allows_legit_compressed_body() {
             .on_final_response_body(&mut ctx, 200, &gzip_headers(), &compressed)
             .await,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round 18 fix (finding 1): the final re-check decodes an encoded body and runs
+// the `looks_like_sse` check on the DECODED bytes BEFORE the JSON-fallback
+// streaming-request gate, so a transform that injects an SSE `data:` frame AND
+// compresses it (e.g. under a compressible `text/plain` relabel) is governed
+// even under a streaming-ONLY config on a NON-streaming request.
+// ---------------------------------------------------------------------------
+
+/// A denied tool call injected as an SSE `data:` frame and then gzip-compressed
+/// under a streaming-ONLY config (`response_tool_calls: false`) on a
+/// NON-streaming request: the final re-check must DECODE and route the decoded
+/// SSE bytes through buffered-SSE governance BEFORE the `governs_buffered_json`
+/// gate (which is false here), so enforce mode fails closed. Without the fix the
+/// gate returned `Continue` before the decoded `looks_like_sse` check ran and
+/// the injected-then-compressed call escaped governance.
+#[tokio::test]
+async fn final_response_streaming_only_governs_encoded_injected_sse_enforce() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    // A plain, non-streaming request (no SSE Accept, no streaming marker):
+    // `governs_buffered_json` is false for this request.
+    let mut ctx = create_test_context();
+
+    // A later transform injects a denied SSE frame and compresses it, relabeling
+    // to a compressible `text/plain` (so `on_response_body` never governed it).
+    let injected_sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"kubectl.apply\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let compressed = gzip(injected_sse.as_bytes());
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_reject(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &compressed)
+            .await,
+        Some(502),
+    );
+}
+
+/// Dry-run counterpart: the same encoded injected-SSE denied call under a
+/// streaming-only config on a non-streaming request is FORWARDED (observation
+/// never disrupts traffic), and the raw call name is not leaked to metadata.
+#[tokio::test]
+async fn final_response_streaming_only_encoded_injected_sse_dry_run_forwards() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    let mut ctx = create_test_context();
+    let injected_sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"kubectl.apply\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    let compressed = gzip(injected_sse.as_bytes());
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/plain".to_string());
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &headers, &compressed)
+            .await,
+    );
+}
+
+/// The narrow decode-before-gate must not re-govern (or re-call an approval
+/// webhook for) an UNCHANGED already-governed encoded SSE body: the decoded
+/// hash matches the recorded governed marker, so the final re-check hash-skips.
+#[tokio::test]
+async fn final_response_streaming_only_encoded_sse_unchanged_hash_skips() {
+    let server = MockServer::start().await;
+    // Exactly ONE approval call: the buffered-SSE governance in `on_response_body`.
+    // The final re-check must hash-skip and not call it a second time.
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    // Streaming request so the buffered-SSE fallback is governed by
+    // `on_response_body` (records the governed marker on the decoded bytes is
+    // handled by `govern_buffered_sse`).
+    let mut ctx = create_test_context();
+    ctx.headers
+        .insert("accept".to_string(), "text/event-stream".to_string());
+
+    let sse = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",",
+        "\"function\":{\"name\":\"report.read\",\"arguments\":\"{}\"}}]}}]}\n\n",
+        "data: [DONE]\n\n"
+    );
+    // `on_response_body` sees an SSE-labeled (encoded) body and governs the
+    // decoded SSE — one approval call — recording the decoded-body marker.
+    let compressed = gzip(sse.as_bytes());
+    let mut sse_headers = HashMap::new();
+    sse_headers.insert("content-type".to_string(), "text/event-stream".to_string());
+    sse_headers.insert("content-encoding".to_string(), "gzip".to_string());
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &sse_headers, &compressed)
+            .await,
+    );
+    // The client-visible body is the SAME compressed bytes: the final re-check
+    // decodes, matches the recorded hash, and skips — no second approval call.
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &sse_headers, &compressed)
+            .await,
+    );
+    server.verify().await;
 }
 
 // ---------------------------------------------------------------------------
@@ -5085,6 +5207,276 @@ async fn ping_field_prefixed_unlabeled_buffered_sse_is_governed() {
 }
 
 // ---------------------------------------------------------------------------
+// Round 18 fix (finding 2): the SSE-shape acceptance (live sniff + buffered
+// fallback) requires the prefix line UP TO the first `:` to be ASCII. A
+// first line with a HIGH-BIT (invalid-UTF-8/binary) byte BEFORE a colon is now
+// OPAQUE, not SSE — a `Content-Encoding`-stripped compressed/binary stream that
+// happens to carry a `:` early no longer passes uninspected in enforce.
+// ---------------------------------------------------------------------------
+
+/// Live inspector: a first line with a high-bit non-ASCII byte before a colon
+/// (invalid UTF-8) must be classified opaque and held/cut in enforce, NOT
+/// forwarded as an `Sse`-shaped stream whose "events" parse as `NoData`. Before
+/// the fix, `sniff_stream_shape` let bytes >=0x80 fall through as "text" and
+/// returned `Sse` on the first colon, so the denied call rode the stream
+/// uninspected.
+#[tokio::test]
+async fn high_bit_colon_prefix_stream_is_opaque_cut_in_enforce() {
+    // Leading high-bit bytes (0xFF/0xFE — the UTF-16 BOM / gzip-adjacent binary)
+    // then a colon before any newline: NOT valid SSE, must be opaque.
+    let mut body: Vec<u8> = vec![0xFF, 0xFE, b'x', b':', b' ', b'1', b'\n', b'\n'];
+    body.extend_from_slice(SSE_DENIED_TOOL_BODY.as_bytes());
+
+    let enforce = make(streaming_config(
+        json!({ "report.read": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = enforce
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[&body]).await;
+    assert!(
+        terminated,
+        "high-bit colon-prefix stream must be cut (opaque) in enforce mode"
+    );
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("kubectl.apply"), "held bytes leaked: {text}");
+
+    // Dry-run releases the same bytes unchanged (observation never disrupts).
+    let dry_run = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let ctx = create_test_context();
+    let mut inspector = dry_run
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[&body]).await;
+    assert!(!terminated, "dry-run must not cut an opaque stream");
+    assert_eq!(out, body, "dry-run must release the bytes unchanged");
+}
+
+/// Buffered fallback: `looks_like_sse` must agree with the live sniff — an
+/// SSE-labeled buffered body whose first line carries a high-bit byte before a
+/// colon is NOT SSE-shaped, so it is treated as ungovernable (not valid UTF-8)
+/// and fails closed in enforce / forwards in dry-run rather than routing through
+/// the SSE extractor as zero frames.
+#[tokio::test]
+async fn high_bit_colon_prefix_buffered_body_fails_closed_enforce_only() {
+    let mut body: Vec<u8> = vec![0xC0, 0x80, b'a', b':', b' ', b'1', b'\n', b'\n'];
+    body.extend_from_slice(SSE_DENIED_TOOL_BODY.as_bytes());
+
+    let enforce = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_reject(
+        enforce
+            .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+            .await,
+        Some(502),
+    );
+    assert_no_metadata_contains(&ctx, "kubectl.apply");
+
+    let dry_run = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } }
+    }));
+    let mut ctx = create_test_context();
+    assert_continue(
+        dry_run
+            .on_response_body(&mut ctx, 200, &sse_headers(), &body)
+            .await,
+    );
+}
+
+/// Regression guard: the tightening must NOT reject legitimate ASCII SSE
+/// preludes. A `: ka` comment keepalive and a `ping: 1` extension field (both
+/// pure ASCII before the colon) still classify as SSE and govern their tool
+/// calls, live and buffered.
+#[tokio::test]
+async fn ascii_keepalive_and_ping_prefixes_still_sse_after_high_bit_tightening() {
+    let plugin = make(streaming_config(
+        json!({ "report.read": { "action": "allow" } }),
+        "deny",
+    ));
+    let no_ct: HashMap<String, String> = HashMap::new();
+
+    for prelude in [": ka", "ping: 1"] {
+        // Live inspector: an allowed call after the ASCII prelude passes through
+        // (opaque would have cut/held it).
+        let allowed = format!("{prelude}\n\n{SSE_ALLOWED_TOOL_BODY}");
+        let ctx = create_test_context();
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        let (out, terminated) = drive_stream(&mut inspector, &[allowed.as_bytes()]).await;
+        assert!(!terminated, "ASCII `{prelude}` stream must not be cut");
+        assert_eq!(out, allowed.as_bytes(), "`{prelude}` stream altered");
+
+        // Live inspector: a denied call after the ASCII prelude IS governed.
+        let denied = format!("{prelude}\n\n{SSE_DENIED_TOOL_BODY}");
+        let ctx = create_test_context();
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        let (out, terminated) = drive_stream(&mut inspector, &[denied.as_bytes()]).await;
+        assert!(terminated, "denied call after `{prelude}` must cut");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("kubectl.apply"),
+            "`{prelude}` leaked: {text}"
+        );
+
+        // Buffered fallback: same denied body under no content type is governed.
+        let mut ctx = create_test_context();
+        assert_reject(
+            plugin
+                .on_response_body(&mut ctx, 200, &no_ct, denied.as_bytes())
+                .await,
+            Some(502),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Round 18 fix (finding 4): the plugin's internal correlation markers (the
+// governed-body hashes and the per-call identity multiset, both derived from
+// raw tool arguments) live on non-serialized `RequestContext` fields, NOT in
+// `ctx.metadata`, so they never reach transaction logs — even with
+// `hash_arguments: false` — while the plugin's own re-check dedup still works.
+// ---------------------------------------------------------------------------
+
+/// With `observability.hash_arguments: false`, a governed response with tool
+/// calls must NOT put `governed_call_hashes` / `governed_response_hash` (or any
+/// raw-argument-derived value) into logged metadata — and the plugin's own
+/// final re-check must still hash-skip the unchanged body (no duplicate
+/// approval webhook).
+#[tokio::test]
+async fn governed_markers_absent_from_metadata_when_hash_arguments_disabled() {
+    let server = MockServer::start().await;
+    // Exactly ONE approval call: the re-check must dedup the unchanged body.
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 },
+        "observability": { "emit_metadata": true, "hash_arguments": false }
+    }));
+    let mut ctx = create_test_context();
+    // A distinctive raw-argument secret whose hash would be correlatable.
+    let body = response_with_tool_call("deploy", "{\"token\":\"sk-CORRELATABLE-SECRET-123\"}");
+    assert_continue(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+
+    // No internal correlation markers in metadata (they moved to non-serialized
+    // request fields), and no raw-argument-derived value of any kind.
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_tool_governor.governed_call_hashes"),
+        "governed_call_hashes leaked into metadata: {:?}",
+        ctx.metadata
+    );
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_tool_governor.governed_response_hash"),
+        "governed_response_hash leaked into metadata: {:?}",
+        ctx.metadata
+    );
+    // Any key whose name mentions a governed-hash marker is a leak.
+    for key in ctx.metadata.keys() {
+        assert!(
+            !(key.contains("governed_response_hash") || key.contains("governed_call_hashes")),
+            "internal marker key leaked into metadata: {key}"
+        );
+    }
+    // `hash_arguments: false` also means no per-call argument hashes are emitted.
+    assert!(
+        !ctx.metadata
+            .contains_key("ai_tool_governor.arguments_hashes"),
+        "arguments_hashes emitted despite hash_arguments: false"
+    );
+    // The raw secret must never appear anywhere in metadata.
+    assert_no_metadata_contains(&ctx, "sk-CORRELATABLE-SECRET-123");
+
+    // Dedup still works: the unchanged final body must NOT re-fire the webhook.
+    assert_continue(
+        plugin
+            .on_final_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    server.verify().await;
+}
+
+/// The governed-request marker (a hash over the raw request body) is likewise
+/// off metadata, so a governed request never leaks it — and the final-request
+/// re-check still dedups the unchanged body.
+#[tokio::test]
+async fn governed_request_marker_absent_from_metadata_and_dedups() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "decision": "allow" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let plugin = make(json!({
+        "default_action": "require_approval",
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()), "cache_ttl_seconds": 0 },
+        "inspect": { "mcp_tool_calls": true, "response_tool_calls": false },
+        "observability": { "emit_metadata": true, "hash_arguments": false }
+    }));
+    let mut ctx = json_post_ctx();
+    let call = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "deploy", "arguments": { "token": "sk-REQSECRET-456" } }
+    })
+    .to_string();
+    ctx.metadata
+        .insert("request_body".to_string(), call.clone());
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    for key in ctx.metadata.keys() {
+        assert!(
+            !key.contains("governed_request_hash"),
+            "governed_request_hash leaked into metadata: {key}"
+        );
+    }
+    // No raw-argument-derived value in any key this plugin WROTE. (`request_body`
+    // is the test's own input, not a plugin-written key, and the proxy strips it
+    // from log metadata before serialization — so it is excluded here.)
+    for (key, value) in &ctx.metadata {
+        if key == "request_body" {
+            continue;
+        }
+        assert!(
+            !value.contains("sk-REQSECRET-456"),
+            "raw request-arg secret leaked in metadata key {key}: {value}"
+        );
+    }
+
+    // Unchanged final request body: the re-check must hash-skip (no 2nd webhook).
+    assert_continue(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &json_headers(), call.as_bytes())
+            .await,
+    );
+    server.verify().await;
+}
+
+// ---------------------------------------------------------------------------
 // Round 14 review fixes: stream-marked JSON-fallback inspector attach,
 // EOF-unresolved non-UTF-8 opaque semantics, CR/CRLF SSE line terminators,
 // encoded wire-size cap, framed-gRPC buffered-hook exclusion
@@ -5430,7 +5822,10 @@ async fn oversized_framed_grpc_buffered_response_is_untouched() {
     }
 
     // Redaction transform: even with the governed-hash marker present, a
-    // framed gRPC label is never rewritten.
+    // framed gRPC label is never rewritten. The marker now lives on a
+    // non-serialized request field, so establish it the real way — govern a
+    // genuine JSON body first (which records the marker) — instead of poking it
+    // into metadata.
     let redact = make(json!({
         "default_action": "allow",
         "tools": {
@@ -5441,11 +5836,16 @@ async fn oversized_framed_grpc_buffered_response_is_untouched() {
         }
     }));
     let mut ctx = create_test_context();
-    ctx.metadata.insert(
-        "ai_tool_governor.governed_response_hash".to_string(),
-        "marker".to_string(),
-    );
     let body = response_with_tool_call("deploy", "{\"k\":\"secret\"}");
+    // Govern the body as JSON: records the governed-response marker on the
+    // request so the marker gate in the transform is satisfied.
+    assert_continue(
+        redact
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+    );
+    // With the marker present, the framed-gRPC gate (which precedes the marker
+    // gate) is what declines the rewrite.
     let rewritten = redact
         .transform_response_body_with_context(
             &mut ctx,

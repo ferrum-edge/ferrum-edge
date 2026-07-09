@@ -282,6 +282,25 @@ Raw arguments are **never** placed in metadata and never logged unless
 call's arguments is logged at `debug` for audit). Raw arguments are sent to the
 approval webhook only when `approval.include_prompt_excerpt: true`.
 
+The plugin's internal per-request bookkeeping — the governed-body hashes and
+the per-call identity multiset it uses to skip already-governed calls on the
+post-transform re-check — is **not** transaction metadata: it lives on
+non-serialized request fields and never reaches logs, so an operator who set
+`observability.hash_arguments: false` never gets an argument-derived hash
+logged through a correlation marker.
+
+> **Streaming decisions and `mode: dry_run`.** Decision metadata
+> (`ai_tool_governor.decision`, `tool_names`, `arguments_hashes`) is written for
+> **buffered** responses. On the **streaming** SSE path, a mid-stream decision
+> can only be surfaced via a stream cut (enforce mode, logged at `warn`); in
+> `dry_run` a streamed denied/approval-required call is forwarded and is **not**
+> recorded in transaction metadata. Response stream inspectors run in a detached
+> task with no write-back channel to `ctx.metadata`, so streaming dry-run
+> telemetry needs proxy-core support and is tracked at
+> [#2061](https://github.com/ferrum-edge/ferrum-edge/issues/2061) (shared with
+> `ai_semantic_firewall`/`ai_transcript_audit`). Streaming **enforce** decisions
+> are fully effective — the stream is cut — and are logged.
+
 ## Composition
 
 - **`ai_semantic_firewall`** — the semantic firewall catches *intent* (prompt
@@ -315,6 +334,13 @@ approval webhook only when `approval.include_prompt_excerpt: true`.
 - A JSON-labelled **response** body that fails to parse is forwarded (only
   oversized responses fail closed) — rejecting every unparseable JSON response
   on a shared proxy would break unrelated routes.
+- **Streaming `dry_run` decisions are not written to transaction metadata.** A
+  streamed denied/approval-required tool call is only actioned by a stream cut
+  (enforce mode); response stream inspectors have no write-back channel to
+  `ctx.metadata`, so in `dry_run` the streamed decision is forwarded and
+  unlogged in metadata (enforce cuts are logged at `warn`). Proxy-core
+  follow-up shared with `ai_semantic_firewall`/`ai_transcript_audit`:
+  [#2061](https://github.com/ferrum-edge/ferrum-edge/issues/2061).
 - The plugin governs tool calls; it does not execute tools, manage MCP sessions,
   or replace `mcp_gateway`/A2A routing.
 - Streaming inspection rides the proxy's reqwest dispatch arm (the same

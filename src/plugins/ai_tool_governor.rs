@@ -130,27 +130,19 @@ const MAX_APPROVAL_CACHE_ENTRIES: usize = 4096;
 /// inspector is wired.
 const STREAM_REQUESTED_KEY: &str = "ai_tool_governor.stream_requested";
 const STREAM_MODEL_KEY: &str = "ai_tool_governor.stream_model";
-/// SHA-256 (hex) of the request/response body the deterministic policy last ran
-/// over, recorded in `before_proxy` / `on_response_body`. The post-transform
-/// `on_final_request_body` / `on_final_response_body` re-checks compare against
-/// it so an unchanged body is not governed twice (avoids duplicate approval
-/// webhooks) while a body a later `request_transformer` / `response_transformer`
-/// rewrote is re-evaluated against the same policy.
-const GOVERNED_REQUEST_HASH_KEY: &str = "ai_tool_governor.governed_request_hash";
-const GOVERNED_RESPONSE_HASH_KEY: &str = "ai_tool_governor.governed_response_hash";
-/// Comma-separated `<identity-hash>=<count>` entries for the response tool
-/// calls this plugin already governed/redacted. The identity hash covers the
-/// approval-relevant correlation fields (consumer/proxy/model/provider — the
-/// same fields in the approval cache key) plus the call name and raw args, so
-/// a transform that changes only e.g. the top-level `model` cannot reuse a
-/// decision keyed to the old model. Counts give the record MULTISET semantics:
-/// the final re-check consumes one count per identical call, so a transform
-/// that duplicates an approved call has the copy re-evaluated instead of both
-/// riding one approval. Unchanged calls (including this plugin's own
-/// `[REDACTED_TOOL_ARG:<name>]` redacted form, re-recorded after redaction)
-/// are skipped so they are not re-approved or re-flagged, while calls a later
-/// transform injected or changed are still evaluated.
-const GOVERNED_CALL_HASHES_KEY: &str = "ai_tool_governor.governed_call_hashes";
+// Internal correlation state (the governed-body hashes and the per-call
+// identity multiset) lives on NON-SERIALIZED `RequestContext` fields
+// (`ai_tool_governor_request_hash` / `ai_tool_governor_response_hash` /
+// `ai_tool_governor_call_hashes`), NOT in `ctx.metadata`. The
+// `on_final_request_body` / `on_final_response_body` re-checks read them so an
+// unchanged body is not governed twice (avoids duplicate approval webhooks)
+// while a body a later `request_transformer` / `response_transformer` rewrote
+// is re-evaluated against the same policy. They are DERIVED FROM RAW TOOL
+// ARGUMENTS, so keeping them off `ctx.metadata` guarantees an operator who
+// disabled `observability.hash_arguments` never gets an arg-derived hash
+// leaked to transaction logs via a correlation marker (the identity hash is
+// otherwise correlatable/dictionary-guessable). See `RequestContext` for the
+// per-call identity/multiset semantics preserved by the accessors below.
 
 // ---------------------------------------------------------------------------
 // Enums
@@ -1519,11 +1511,10 @@ impl AiToolGovernor {
         // `on_final_response_body` re-check (which routes SSE-labeled/shaped
         // bodies back through this path) can skip an unchanged body instead of
         // re-governing it — for `require_approval` policies that would mean a
-        // duplicate approval webhook call.
-        ctx.metadata.insert(
-            GOVERNED_RESPONSE_HASH_KEY.to_string(),
-            sha256_hex_bytes(body),
-        );
+        // duplicate approval webhook call. Stored on the non-serialized
+        // `ai_tool_governor_response_hash` field so this body-derived hash never
+        // reaches transaction logs.
+        ctx.ai_tool_governor_response_hash = Some(sha256_hex_bytes(body));
         let extracted = extract_sse_tool_calls(body);
         // Mirror the live streaming finalizer: a buffered SSE tool call that
         // cannot be policy-checked (missing `function.name` or non-string
@@ -1735,9 +1726,10 @@ impl Plugin for AiToolGovernor {
             // post-transform `on_final_request_body` re-check can skip an
             // unchanged backend-visible body instead of governing (and, for
             // `require_approval` policies, calling the webhook) a second time.
+            // Stored on a non-serialized field so this arg-derived hash never
+            // reaches transaction logs.
             if let Some(hash) = ctx.metadata.get("request_body").map(|b| sha256_hex(b)) {
-                ctx.metadata
-                    .insert(GOVERNED_REQUEST_HASH_KEY.to_string(), hash);
+                ctx.ai_tool_governor_request_hash = Some(hash);
             }
             return self.govern_request(ctx, &json).await;
         }
@@ -1881,7 +1873,7 @@ impl Plugin for AiToolGovernor {
         // Unchanged since `before_proxy` governed it: nothing new to check, and
         // re-governing would risk a duplicate approval webhook.
         let final_hash = sha256_hex_bytes(body);
-        if ctx.metadata.get(GOVERNED_REQUEST_HASH_KEY) == Some(&final_hash) {
+        if ctx.ai_tool_governor_request_hash.as_deref() == Some(final_hash.as_str()) {
             return PluginResult::Continue;
         }
 
@@ -1892,7 +1884,7 @@ impl Plugin for AiToolGovernor {
         // content type or one `before_proxy` already governed — so a non-JSON
         // request another plugin merely buffered is not rejected here.
         let Some(json) = json else {
-            let was_governed = ctx.metadata.contains_key(GOVERNED_REQUEST_HASH_KEY);
+            let was_governed = ctx.ai_tool_governor_request_hash.is_some();
             if self.engine.mode == Mode::Enforce && (json_ct || was_governed) {
                 return self.reject_uninspectable(
                     ctx,
@@ -1902,8 +1894,7 @@ impl Plugin for AiToolGovernor {
             }
             return PluginResult::Continue;
         };
-        ctx.metadata
-            .insert(GOVERNED_REQUEST_HASH_KEY.to_string(), final_hash);
+        ctx.ai_tool_governor_request_hash = Some(final_hash);
         self.govern_request(ctx, &json).await
     }
 
@@ -2056,10 +2047,7 @@ impl Plugin for AiToolGovernor {
                     if !self.governs_buffered_json(ctx) {
                         return PluginResult::Continue;
                     }
-                    ctx.metadata.insert(
-                        GOVERNED_RESPONSE_HASH_KEY.to_string(),
-                        sha256_hex_bytes(&decoded),
-                    );
+                    ctx.ai_tool_governor_response_hash = Some(sha256_hex_bytes(&decoded));
                     let Some(json) = parse_json_within_limit(&decoded) else {
                         return self.uninspectable_governed_response(
                             ctx,
@@ -2156,10 +2144,7 @@ impl Plugin for AiToolGovernor {
                 // own decode against this, so a compression-only final body
                 // is hash-skipped instead of re-governed (no duplicate
                 // approval webhook).
-                ctx.metadata.insert(
-                    GOVERNED_RESPONSE_HASH_KEY.to_string(),
-                    sha256_hex_bytes(&decoded),
-                );
+                ctx.ai_tool_governor_response_hash = Some(sha256_hex_bytes(&decoded));
                 let Some(json) = parse_json_within_limit(&decoded) else {
                     return self.uninspectable_governed_response(
                         ctx,
@@ -2179,11 +2164,9 @@ impl Plugin for AiToolGovernor {
         // post-transform `on_final_response_body` re-check can skip an unchanged
         // client-visible body (recorded even when there are no calls: a later
         // `response_transformer` that injects one changes the hash and forces a
-        // fresh evaluation).
-        ctx.metadata.insert(
-            GOVERNED_RESPONSE_HASH_KEY.to_string(),
-            sha256_hex_bytes(body),
-        );
+        // fresh evaluation). Stored on the non-serialized
+        // `ai_tool_governor_response_hash` field, off `ctx.metadata`.
+        ctx.ai_tool_governor_response_hash = Some(sha256_hex_bytes(body));
 
         let (calls, ungovernable) = extract_response_tool_calls(&json);
         // Streaming parity: an ungovernable `tool_calls[]` entry (a missing
@@ -2268,9 +2251,7 @@ impl Plugin for AiToolGovernor {
         // e.g. a backend 4xx/5xx JSON error whose shape happens to contain
         // `choices[].message.tool_calls[]`, which `on_response_body` skips as
         // non-2xx before recording the hash.
-        if !ctx.metadata.contains_key(GOVERNED_RESPONSE_HASH_KEY) {
-            return None;
-        }
+        ctx.ai_tool_governor_response_hash.as_ref()?;
         // Mirror the `looks_like_json` fallback in `on_response_body`: a header
         // rule can strip/relabel `Content-Type: application/json` before this
         // transform runs while leaving the governed JSON intact. Redaction must
@@ -2300,10 +2281,7 @@ impl Plugin for AiToolGovernor {
             // (avoids re-calling an approval webhook for an unchanged sibling
             // and re-matching the `[REDACTED_TOOL_ARG:<name>]` placeholder as a
             // blocked pattern).
-            ctx.metadata.insert(
-                GOVERNED_RESPONSE_HASH_KEY.to_string(),
-                sha256_hex_bytes(&rewritten),
-            );
+            ctx.ai_tool_governor_response_hash = Some(sha256_hex_bytes(&rewritten));
             let provider = self.resolve_response_provider(ctx, &json);
             let model = json
                 .get("model")
@@ -2352,7 +2330,7 @@ impl Plugin for AiToolGovernor {
         // buffering came from OUTSIDE this plugin, regardless of whether the
         // request was streaming — is not re-governed (no duplicate webhook).
         let final_hash = sha256_hex_bytes(body);
-        if ctx.metadata.get(GOVERNED_RESPONSE_HASH_KEY) == Some(&final_hash) {
+        if ctx.ai_tool_governor_response_hash.as_deref() == Some(final_hash.as_str()) {
             return PluginResult::Continue;
         }
 
@@ -2395,10 +2373,64 @@ impl Plugin for AiToolGovernor {
             return self.govern_buffered_sse(ctx, body).await;
         }
 
+        // Encoded-SSE parity for the final re-check, BEFORE the
+        // `governs_buffered_json` gate — the encoded mirror of the unencoded
+        // SSE branch above. Compressed bytes never look like SSE, so the
+        // decoded-shape check must run on the DECODED bytes; but a blanket
+        // decode-before-gate would add a decompress to every ordinary
+        // non-streaming JSON response. Scope it to the ONLY case that needs it:
+        // an encoded body under a config that governs STREAMING tool calls.
+        // There a later transform can inject an SSE `data:` frame with a denied
+        // call AND compress it (e.g. under a compressible `text/plain` relabel)
+        // on a NON-streaming request, where `governs_buffered_json` is false —
+        // so the decoded `looks_like_sse` check below would never be reached and
+        // the injected-then-compressed call would escape governance. Ordinary
+        // `response_tool_calls` JSON traffic keeps decoding on its own branch
+        // (after the gate), so it is not decoded twice here.
+        //
+        // The single decode performed here is REUSED by the JSON re-check below
+        // (threaded through `decoded_encoded`) so an encoded body is never
+        // decompressed twice.
+        //
+        // A decode FAILURE short-circuits the `&&` and skips this block, so the
+        // ORIGINAL gated flow below handles it unchanged: a spurious
+        // `Content-Encoding` header on plaintext JSON is caught by the plaintext
+        // parse, and a genuinely-undecodable encoded body reaches the gated
+        // fail-closed posture in the encoded branch (enforce-cut past the gate,
+        // forward for a non-streaming request under a streaming-only config,
+        // exactly as before this fix).
+        let wire_encoding = content_encoding_value(response_headers);
+        let mut decoded_encoded: Option<Vec<u8>> = None;
+        if let Some(encoding) = wire_encoding
+            && self.inspect.streaming_response_tool_calls
+            && let Some(decoded) = decompress_within_limit(encoding, body)
+        {
+            // Compression-only rewrite of an already-governed body: decoded
+            // bytes match the recorded hash, so skip (no duplicate approval
+            // webhook), regardless of the request-streaming gate.
+            if ctx.ai_tool_governor_response_hash.as_deref()
+                == Some(sha256_hex_bytes(&decoded).as_str())
+            {
+                return PluginResult::Continue;
+            }
+            // Encoded-SSE shape check on the DECODED bytes, ungated by
+            // `governs_buffered_json` — matching the unencoded SSE branch. An
+            // SSE-labeled body that decodes to JSON-shaped bytes is mislabeled
+            // Chat Completions JSON and takes the gated JSON re-check instead.
+            if looks_like_sse(&decoded)
+                || (is_event_stream_content_type(content_type) && !looks_like_json(&decoded))
+            {
+                return self.govern_buffered_sse(ctx, &decoded).await;
+            }
+            // Not SSE-shaped: keep the decoded bytes for the JSON re-check below
+            // (which is gated) so the body is not decompressed a second time.
+            decoded_encoded = Some(decoded);
+        }
+
         // Mirror `on_response_body`'s post-SSE gate: a streaming-only config
         // re-checks a buffered JSON body (and the encoded-body decode below)
         // only for a streaming request's SSE fallback, never an ordinary
-        // non-streaming JSON response. The SSE-shaped/labelled branch above is
+        // non-streaming JSON response. The SSE-shaped/labelled branches above are
         // deliberately NOT gated by this, matching `on_response_body`.
         if !self.governs_buffered_json(ctx) {
             return PluginResult::Continue;
@@ -2421,36 +2453,53 @@ impl Plugin for AiToolGovernor {
         // the encoded bytes plus a relabeled `Content-Type` would skip the
         // re-check entirely and forward an injected-then-compressed denied
         // call uninspected.
-        if let Some(encoding) = content_encoding_value(response_headers) {
-            let Some(decoded) = decompress_within_limit(encoding, body) else {
-                // Unsupported/undecodable encoding (`deflate`/`zstd`, corrupt
-                // gzip/br), or decoded output past the parse limit: cannot
-                // verify a later transform did not inject a governed call.
-                // Header-time buffering already treated every
-                // non-framed-gRPC label (JSON, SSE, `text/plain`, missing,
-                // relabeled) as governable on this route, so the same posture
-                // applies here: fail closed in enforce mode, forward in
-                // dry-run — a relabel must not downgrade an uninspectable
-                // encoded body from fail-closed to forward. Framed
-                // gRPC/gRPC-Web wire frames already returned at the top of
-                // this hook and never reach this posture.
-                return self.uninspectable_governed_response(
-                    ctx,
-                    "response body has a content-encoding that cannot be inspected",
-                );
+        if let Some(encoding) = wire_encoding {
+            // Reuse the decode already performed for the encoded-SSE check when a
+            // streaming-governing config took that path; otherwise (a
+            // `response_tool_calls`-only config) decode now, here, on its own
+            // branch — so ordinary non-streaming JSON traffic is not decoded
+            // before the gate above.
+            let decoded = match decoded_encoded {
+                Some(decoded) => decoded,
+                None => {
+                    let Some(decoded) = decompress_within_limit(encoding, body) else {
+                        // Unsupported/undecodable encoding (`deflate`/`zstd`,
+                        // corrupt gzip/br), or decoded output past the parse
+                        // limit: cannot verify a later transform did not inject a
+                        // governed call. Header-time buffering already treated
+                        // every non-framed-gRPC label (JSON, SSE, `text/plain`,
+                        // missing, relabeled) as governable on this route, so the
+                        // same posture applies here: fail closed in enforce mode,
+                        // forward in dry-run — a relabel must not downgrade an
+                        // uninspectable encoded body from fail-closed to forward.
+                        // Framed gRPC/gRPC-Web wire frames already returned at the
+                        // top of this hook and never reach this posture.
+                        return self.uninspectable_governed_response(
+                            ctx,
+                            "response body has a content-encoding that cannot be inspected",
+                        );
+                    };
+                    decoded
+                }
             };
             // Compression-only rewrite of an already-governed body: the decoded
             // bytes match the hash `on_response_body` recorded, so skip to avoid
             // a duplicate approval webhook (which a one-shot approval service
-            // could deny, turning an allowed response into a 502).
-            if ctx.metadata.get(GOVERNED_RESPONSE_HASH_KEY) == Some(&sha256_hex_bytes(&decoded)) {
+            // could deny, turning an allowed response into a 502). (Already
+            // checked for the streaming-config early-decode path above; repeated
+            // here for the `response_tool_calls`-only decode-now path.)
+            if ctx.ai_tool_governor_response_hash.as_deref()
+                == Some(sha256_hex_bytes(&decoded).as_str())
+            {
                 return PluginResult::Continue;
             }
             // Buffered-SSE parity on the DECODED bytes: a compressed SSE body
             // (the `compression` plugin compresses `text/*` too) must be
             // re-governed, not skipped by the JSON-shape gate below — while an
             // SSE-labeled body that decodes to JSON-shaped bytes is mislabeled
-            // Chat Completions JSON and takes the JSON re-check instead.
+            // Chat Completions JSON and takes the JSON re-check instead. (A
+            // streaming-governing config already handled the SSE shape above;
+            // this covers the `response_tool_calls`-only decode-now path.)
             if looks_like_sse(&decoded)
                 || (is_event_stream_content_type(content_type) && !looks_like_json(&decoded))
             {
@@ -2823,20 +2872,26 @@ enum StreamSniff {
 
 /// Sniff the body shape from the leading bytes. Real SSE always begins with a
 /// syntactically valid field or comment line after an optional UTF-8 BOM and
-/// leading whitespace: printable text with a `:` field separator before the
-/// first line ends. The SSE spec ignores unknown field names, so legitimate
-/// providers open streams with extension/heartbeat lines like `ping: 1` — a
-/// fixed `data:`/`event:`/`id:`/`retry:`/`:` whitelist would misclassify
-/// those streams as opaque and cut them at EOF in enforce mode. Leading bytes
-/// that are binary (gzip magic, control bytes) or a COMPLETE first line with
-/// no `:` separator — and not opening a JSON object/array — can never yield a
+/// leading whitespace: printable **ASCII** text with a `:` field separator
+/// before the first line ends. An SSE field name (`data`/`event`/`id`/`retry`,
+/// or empty for a `:comment`) is pure ASCII, so the prefix UP TO the first
+/// `:` must be ASCII too. The SSE spec ignores unknown field names, so
+/// legitimate providers open streams with extension/heartbeat lines like
+/// `ping: 1` — a fixed `data:`/`event:`/`id:`/`retry:`/`:` whitelist would
+/// misclassify those streams as opaque and cut them at EOF in enforce mode.
+/// Leading bytes that are binary (gzip magic, control bytes, or a HIGH-BIT
+/// non-ASCII byte before the first `:`) or a COMPLETE first line with no `:`
+/// separator — and not opening a JSON object/array — can never yield a
 /// governable SSE event: treating them as [`StreamSniff::Sse`] would parse
-/// every "event" as `NoData` and forward a compressed stream's denied tool
-/// calls ungoverned, so they are classified [`StreamSniff::Opaque`] and held.
-/// (Accepted consequence: colon-containing plaintext under an SSE label is
-/// parsed as SSE — no `data:` frames, forwarded — the pre-round-12 behavior
-/// for that shape; fail-closed opaque treatment is reserved for
-/// binary/non-text starts.)
+/// every "event" as `NoData` and forward a compressed/binary stream's denied
+/// tool calls ungoverned, so they are classified [`StreamSniff::Opaque`] and
+/// held. A high-bit byte before the colon is REQUIRED to opaque-classify (not
+/// fall through as "text"): otherwise a `Content-Encoding`-stripped compressed
+/// stream whose first bytes happen to carry a `:` before any newline would
+/// pass uninspected in enforce. (Accepted consequence: colon-containing ASCII
+/// plaintext under an SSE label is parsed as SSE — no `data:` frames, forwarded
+/// — the pre-round-12 behavior for that shape; fail-closed opaque treatment is
+/// reserved for binary/non-ASCII starts.)
 fn sniff_stream_shape(buf: &[u8]) -> StreamSniff {
     const BOM: &[u8] = b"\xEF\xBB\xBF";
     // The buffer so far is a (possibly empty) prefix of the BOM: wait.
@@ -2858,9 +2913,11 @@ fn sniff_stream_shape(buf: &[u8]) -> StreamSniff {
             b':' => return StreamSniff::Sse,
             // The first line completed without a `:` — not an SSE field line.
             b'\r' | b'\n' => return StreamSniff::Opaque,
-            // Control/binary byte (gzip magic 0x1f, NUL, escape codes): never
-            // SSE text. `\t` (0x09) is legal inside field names/values.
-            0x00..=0x08 | 0x0B..=0x1F | 0x7F => return StreamSniff::Opaque,
+            // Control/binary byte (gzip magic 0x1f, NUL, escape codes), or a
+            // HIGH-BIT non-ASCII byte (0x80..=0xFF) before the colon: never a
+            // valid SSE field name, so this is binary/non-ASCII — opaque, not
+            // text. `\t` (0x09) is legal inside field names/values.
+            0x00..=0x08 | 0x0B..=0x1F | 0x7F..=0xFF => return StreamSniff::Opaque,
             _ => {}
         }
     }
@@ -3985,11 +4042,13 @@ fn looks_like_json(body: &[u8]) -> bool {
 
 /// Whether a body is shaped like a Server-Sent Events stream: after an optional
 /// UTF-8 BOM and leading whitespace/blank lines, the first non-empty line is a
-/// syntactically valid SSE field or comment line — printable text with a `:`
-/// field separator (the same widened check as [`sniff_stream_shape`], so live
-/// and buffered classification agree: the SSE spec ignores unknown field
-/// names, and legitimate extension/heartbeat preludes like `ping: 1` or the
-/// standard `: ping` keepalive comment must not bypass the shape fallback).
+/// syntactically valid SSE field or comment line — printable ASCII text with a
+/// `:` field separator (the prefix up to the colon must be ASCII: a valid SSE
+/// field name is pure ASCII, and a high-bit/binary prefix is opaque, not SSE).
+/// The same tightened check as [`sniff_stream_shape`], so live and buffered
+/// classification agree: the SSE spec ignores unknown field names, and
+/// legitimate extension/heartbeat preludes like `ping: 1` or the standard
+/// `: ping` keepalive comment must not bypass the shape fallback.
 /// The SSE-shape counterpart of [`looks_like_json`]: an upstream that omits
 /// `Content-Type: text/event-stream` (or a `response_transformer` header rule
 /// that relabels it, e.g. to `text/plain`) must not route a buffered SSE body
@@ -4012,11 +4071,17 @@ fn looks_like_sse(body: &[u8]) -> bool {
         match b {
             b':' => return true,
             b'\r' | b'\n' => return false,
-            0x00..=0x08 | 0x0B..=0x1F | 0x7F => return false,
+            // Control/binary byte OR a HIGH-BIT non-ASCII byte (0x80..=0xFF)
+            // before the colon: not a valid SSE field name (which is pure
+            // ASCII), so this is binary/non-ASCII, not SSE. Matches the same
+            // tightening in `sniff_stream_shape` so live and buffered
+            // classification agree — a `Content-Encoding`-stripped compressed
+            // body with an early `:` is NOT accepted as SSE.
+            0x00..=0x08 | 0x0B..=0x1F | 0x7F..=0xFF => return false,
             _ => {}
         }
     }
-    // The whole body is one colon-less printable line: no SSE framing.
+    // The whole body is one colon-less printable ASCII line: no SSE framing.
     false
 }
 
@@ -4052,44 +4117,25 @@ fn record_governed_calls(ctx: &mut RequestContext, corr: &CorrelationMeta, calls
     record_governed_identities(ctx, &identities);
 }
 
-/// Record pre-computed governed-call identity hashes (multiset counts) onto
-/// the request context, replacing any previous record.
+/// Record pre-computed governed-call identity hashes (multiset counts) onto the
+/// request context, replacing any previous record. Stored on the non-serialized
+/// `ai_tool_governor_call_hashes` field (NOT `ctx.metadata`) so this arg-derived
+/// identity ledger never reaches transaction logs, while remaining readable to
+/// this plugin's own later hooks (the `on_final_response_body` re-check).
 fn record_governed_identities(ctx: &mut RequestContext, identities: &[String]) {
     if identities.is_empty() {
         return;
     }
-    let mut counts: Vec<(&str, usize)> = Vec::new();
+    let counts = &mut ctx.ai_tool_governor_call_hashes;
+    counts.clear();
     for hash in identities {
-        match counts.iter_mut().find(|(h, _)| *h == hash.as_str()) {
-            Some(entry) => entry.1 += 1,
-            None => counts.push((hash.as_str(), 1)),
-        }
+        *counts.entry(hash.clone()).or_insert(0) += 1;
     }
-    let serialized = counts
-        .iter()
-        .map(|(hash, count)| format!("{hash}={count}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    ctx.metadata
-        .insert(GOVERNED_CALL_HASHES_KEY.to_string(), serialized);
 }
 
-/// Parse the recorded governed-call identity counts from the request context.
-/// Malformed entries are ignored (the corresponding call is simply re-evaluated
-/// — fail safe toward re-governing, never toward skipping).
+/// Read the recorded governed-call identity counts from the request context.
 fn governed_call_counts(ctx: &RequestContext) -> HashMap<String, usize> {
-    let mut counts = HashMap::new();
-    let Some(recorded) = ctx.metadata.get(GOVERNED_CALL_HASHES_KEY) else {
-        return counts;
-    };
-    for entry in recorded.split(',') {
-        if let Some((hash, count)) = entry.split_once('=')
-            && let Ok(count) = count.parse::<usize>()
-        {
-            *counts.entry(hash.to_string()).or_insert(0) += count;
-        }
-    }
-    counts
+    ctx.ai_tool_governor_call_hashes.clone()
 }
 
 fn sha256_hex_bytes(input: &[u8]) -> String {
