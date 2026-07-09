@@ -2197,6 +2197,12 @@ pub(crate) fn store_request_body_metadata(
 
 pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove("request_body");
+    // ai_tool_governor uses these request-scoped markers to select the
+    // inspectable streaming path and seed approval correlation. They are
+    // lifecycle bookkeeping, not observability metadata, and must never make
+    // `observability.emit_metadata: false` ineffective.
+    metadata.remove(crate::plugins::ai_tool_governor::STREAM_REQUESTED_KEY);
+    metadata.remove(crate::plugins::ai_tool_governor::STREAM_MODEL_KEY);
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {

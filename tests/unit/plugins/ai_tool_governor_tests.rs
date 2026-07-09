@@ -1,6 +1,7 @@
 //! Tests for the ai_tool_governor plugin.
 
 use ferrum_edge::{
+    _test_support::clone_log_metadata,
     config::{BackendAllowIps, BackendEgressPolicy},
     plugins::{
         Plugin, PluginHttpClient, RequestContext, ResponseStreamAction, ResponseStreamInspector,
@@ -214,6 +215,30 @@ fn rejects_excessive_approval_cache_ttl() {
     .err()
     .unwrap();
     assert!(err.contains("approval.cache_ttl_seconds"), "{err}");
+}
+
+#[test]
+fn rejects_non_error_deny_status_codes() {
+    for status in [100, 200, 302, 399, 600] {
+        let err = try_make(json!({
+            "tools": { "x": { "action": "deny" } },
+            "response": { "deny_status_code": status }
+        }))
+        .err()
+        .unwrap();
+        assert!(err.contains("error status"), "status {status}: {err}");
+    }
+
+    for status in [400, 599] {
+        assert!(
+            try_make(json!({
+                "tools": { "x": { "action": "deny" } },
+                "response": { "deny_status_code": status }
+            }))
+            .is_ok(),
+            "HTTP error status {status} should be accepted"
+        );
+    }
 }
 
 #[test]
@@ -1615,6 +1640,37 @@ async fn stream_true_request_forces_reqwest_dispatch() {
 }
 
 #[tokio::test]
+async fn stream_markers_are_excluded_from_transaction_log_metadata() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "x": { "action": "allow" } },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true },
+        "observability": { "emit_metadata": false }
+    }));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({ "model": "private-model", "stream": true, "messages": [] }).to_string(),
+    );
+    let mut headers = json_headers();
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+    // The live lifecycle still needs these markers for dispatch/correlation.
+    assert!(
+        ctx.metadata
+            .contains_key("ai_tool_governor.stream_requested")
+    );
+    assert!(ctx.metadata.contains_key("ai_tool_governor.stream_model"));
+
+    // But disabling governor metadata must keep both out of every transaction
+    // summary built through the shared logging boundary.
+    let logged = clone_log_metadata(&ctx);
+    assert!(!logged.contains_key("ai_tool_governor.stream_requested"));
+    assert!(!logged.contains_key("ai_tool_governor.stream_model"));
+    assert!(!logged.values().any(|value| value == "private-model"));
+}
+
+#[tokio::test]
 async fn uninspectable_body_conservatively_forces_reqwest_when_streaming_only() {
     // Streaming-only configs never reject, but an uninspectable body may hide
     // `stream: true`, so the request must stay on the inspectable path.
@@ -2448,6 +2504,41 @@ async fn a2a_method_deny_rejects() {
         let mut headers = json_headers();
         assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
     }
+
+    // The inverse spelling must work too: an operator-provided alias policy is
+    // mirrored under the canonical method used by request extraction.
+    let alias_policy = make(json!({
+        "default_action": "allow",
+        "tools": { "SendMessage": { "action": "deny" } },
+        "inspect": { "a2a_methods": true, "response_tool_calls": false }
+    }));
+    for method in ["message/send", "SendMessage"] {
+        let mut ctx = json_post_ctx();
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            json!({ "jsonrpc": "2.0", "id": 2, "method": method, "params": {} }).to_string(),
+        );
+        let mut headers = json_headers();
+        assert_reject(
+            alias_policy.before_proxy(&mut ctx, &mut headers).await,
+            Some(403),
+        );
+    }
+}
+
+#[test]
+fn rejects_conflicting_a2a_alias_and_canonical_policies() {
+    let err = try_make(json!({
+        "default_action": "allow",
+        "tools": {
+            "SendMessage": { "action": "deny" },
+            "message/send": { "action": "allow" }
+        },
+        "inspect": { "a2a_methods": true, "response_tool_calls": false }
+    }))
+    .err()
+    .unwrap();
+    assert!(err.contains("conflicts with canonical method"), "{err}");
 }
 
 /// A per-tool `dry_run` action forwards the call while recording an `allow`
@@ -6839,12 +6930,17 @@ async fn dry_run_metadata_preserves_max_risk_across_governor_instances() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "danger", "arguments": {} }
+            "params": { "name": "danger", "arguments": { "scope": "denied" } }
         })
         .to_string(),
     );
     let mut headers = json_headers();
     assert_continue(high_risk.before_proxy(&mut ctx, &mut headers).await);
+    let denied_hashes = ctx
+        .metadata
+        .get("ai_tool_governor.arguments_hashes")
+        .cloned()
+        .expect("denied call hash");
 
     ctx.metadata.insert(
         "request_body".to_string(),
@@ -6852,7 +6948,7 @@ async fn dry_run_metadata_preserves_max_risk_across_governor_instances() {
             "jsonrpc": "2.0",
             "id": 2,
             "method": "safe.a2a",
-            "params": {}
+            "params": { "scope": "allowed" }
         })
         .to_string(),
     );
@@ -6875,6 +6971,13 @@ async fn dry_run_metadata_preserves_max_risk_across_governor_instances() {
             .map(String::as_str),
         Some("danger"),
         "the later allowed policy must not replace the sticky denial's policy ID"
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.arguments_hashes")
+            .map(String::as_str),
+        Some(denied_hashes.as_str()),
+        "the later allowed call must not replace the sticky denial's argument hash"
     );
 }
 

@@ -213,7 +213,8 @@ config:
 
 Any tool other than `github.create_pr` — whether exposed as a definition or
 returned as a call — is rejected with `403` by default. Set
-`response.deny_status_code` to customize deterministic policy rejections.
+`response.deny_status_code` to customize deterministic policy rejections with
+an HTTP error status from `400` through `599`.
 
 ### Approval-required production writes
 
@@ -292,12 +293,12 @@ Raw arguments are **never** placed in metadata and never logged unless
 call's arguments is logged at `debug` for audit). Raw arguments are sent to the
 approval webhook only when `approval.include_arguments: true`.
 
-The plugin's internal per-request bookkeeping — the governed-body hashes and
-the per-call identity multiset it uses to skip already-governed calls on the
-post-transform re-check — is **not** transaction metadata: it lives on
-non-serialized request fields and never reaches logs, so an operator who set
-`observability.hash_arguments: false` never gets an argument-derived hash
-logged through a correlation marker.
+The plugin's internal per-request bookkeeping — governed-body hashes, the
+per-call identity multiset used to skip already-governed calls on the
+post-transform re-check, and stream/model dispatch markers — is **not** emitted
+as transaction metadata. Hash/identity state lives on non-serialized request
+fields, and stream/model markers are stripped at the transaction-log boundary,
+so disabling metadata/hash observability cannot be bypassed by lifecycle state.
 
 > **Streaming decisions and `mode: dry_run`.** Decision metadata
 > (`ai_tool_governor.decision`, `tool_names`, `arguments_hashes`) is written for

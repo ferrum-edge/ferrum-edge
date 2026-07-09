@@ -134,8 +134,8 @@ const MAX_APPROVAL_CACHE_ENTRIES: usize = 4096;
 /// request body (or could not rule it out for an uninspectable body), so the
 /// response must stay on the reqwest dispatch path where the SSE stream
 /// inspector is wired.
-const STREAM_REQUESTED_KEY: &str = "ai_tool_governor.stream_requested";
-const STREAM_MODEL_KEY: &str = "ai_tool_governor.stream_model";
+pub(crate) const STREAM_REQUESTED_KEY: &str = "ai_tool_governor.stream_requested";
+pub(crate) const STREAM_MODEL_KEY: &str = "ai_tool_governor.stream_model";
 // Internal correlation state (the governed-body hashes and the per-call
 // identity multiset) lives on NON-SERIALIZED `RequestContext` fields
 // (`ai_tool_governor_request_hashes` / `ai_tool_governor_response_hashes` /
@@ -1079,6 +1079,25 @@ impl AiToolGovernor {
                 if name.is_empty() {
                     return Err("ai_tool_governor: tool names must not be empty".to_string());
                 }
+                // A2A request extraction uses the gateway's canonical method
+                // names. Retain the raw key for ordinary AI/MCP tool calls, but
+                // mirror a configured PascalCase A2A alias under its canonical
+                // key so an explicit alias policy cannot become unreachable.
+                // Reject ambiguous duplicate spellings rather than choosing a
+                // policy based on JSON map iteration order.
+                let canonical_a2a_alias = if inspect.a2a_methods {
+                    super::a2a_gateway::canonical_a2a_method(name)
+                } else {
+                    None
+                }
+                .filter(|canonical| *canonical != name);
+                if let Some(canonical) = canonical_a2a_alias
+                    && (map.contains_key(canonical) || tools.contains_key(canonical))
+                {
+                    return Err(format!(
+                        "ai_tool_governor: A2A tool policy alias {name:?} conflicts with canonical method {canonical:?}"
+                    ));
+                }
                 let policy = parse_tool_policy(name, spec)?;
                 if policy.action == ToolAction::RequireApproval {
                     any_require_approval = true;
@@ -1087,6 +1106,9 @@ impl AiToolGovernor {
                     needs_response_transform = true;
                 }
                 tools.insert(name.clone(), policy);
+                if let Some(canonical) = canonical_a2a_alias {
+                    tools.insert(canonical.to_string(), parse_tool_policy(name, spec)?);
+                }
             }
         }
 
@@ -1334,26 +1356,30 @@ impl AiToolGovernor {
             .iter()
             .filter_map(|c| c.approval_id.as_deref())
             .collect();
-        if !approval_ids.is_empty() {
-            m.insert(
-                "ai_tool_governor.approval_id".to_string(),
-                approval_ids.join(","),
-            );
-        }
+        set_ranked_csv_metadata(
+            m,
+            "ai_tool_governor.approval_id",
+            previous_rank,
+            batch_rank,
+            &approval_ids,
+        );
 
-        if obs.hash_arguments {
-            let hashes: Vec<&str> = batch
+        let hashes: Vec<&str> = if obs.hash_arguments {
+            batch
                 .per_call
                 .iter()
                 .filter_map(|c| c.arguments_hash.as_deref())
-                .collect();
-            if !hashes.is_empty() {
-                m.insert(
-                    "ai_tool_governor.arguments_hashes".to_string(),
-                    hashes.join(","),
-                );
-            }
-        }
+                .collect()
+        } else {
+            Vec::new()
+        };
+        set_ranked_csv_metadata(
+            m,
+            "ai_tool_governor.arguments_hashes",
+            previous_rank,
+            batch_rank,
+            &hashes,
+        );
 
         let redacted: Vec<&str> = batch
             .per_call
@@ -1361,12 +1387,13 @@ impl AiToolGovernor {
             .filter(|c| !c.redact_patterns.is_empty())
             .map(|c| c.name.as_str())
             .collect();
-        if !redacted.is_empty() {
-            m.insert(
-                "ai_tool_governor.redacted_tools".to_string(),
-                redacted.join(","),
-            );
-        }
+        set_ranked_csv_metadata(
+            m,
+            "ai_tool_governor.redacted_tools",
+            previous_rank,
+            batch_rank,
+            &redacted,
+        );
     }
 
     fn reject(&self, batch: &BatchDecision) -> PluginResult {
@@ -4701,9 +4728,9 @@ fn parse_response(config: &Value) -> Result<ResponseConfig, String> {
             let n = v.as_u64().ok_or_else(|| {
                 "ai_tool_governor: 'response.deny_status_code' must be an integer".to_string()
             })?;
-            if !(100..=599).contains(&n) {
+            if !(400..=599).contains(&n) {
                 return Err(
-                    "ai_tool_governor: 'response.deny_status_code' must be a valid HTTP status (100-599)"
+                    "ai_tool_governor: 'response.deny_status_code' must be an HTTP error status (400-599)"
                         .to_string(),
                 );
             }

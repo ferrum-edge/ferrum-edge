@@ -15179,10 +15179,10 @@ components:
           properties:
             deny_status_code:
               type: integer
-              minimum: 100
+              minimum: 400
               maximum: 599
               default: 403
-              description: "HTTP status returned for a deterministic tool policy denial in enforce mode. Uninspectable governed bodies fail closed with 502."
+              description: "HTTP error status (400-599) returned for a deterministic tool policy denial in enforce mode. Uninspectable governed bodies fail closed with 502."
             redaction_placeholder:
               type: string
               default: "[REDACTED_TOOL_ARG:{name}]"
