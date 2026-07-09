@@ -15153,7 +15153,7 @@ components:
           properties:
             endpoint_url:
               type: string
-              description: "http/https URL POSTed with request_id, consumer, proxy, model, provider, tool_name, arguments_hash, risk (and raw arguments only when include_arguments=true). Response: {\"decision\":\"allow|deny\"} or {\"allow\":true|false}, optional approval_id."
+              description: "http/https URL POSTed with request_id, consumer, proxy, model, provider, tool_name, arguments_hash, risk (and raw arguments only when include_arguments=true). Response: {\"decision\":\"allow|deny\"} or {\"allow\":true|false}, optional approval_id. Response bodies are capped at 64 KiB."
             timeout_ms:
               type: integer
               minimum: 1

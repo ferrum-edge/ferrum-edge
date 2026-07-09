@@ -256,6 +256,9 @@ decisions are simply not cached. When the endpoint is unreachable,
 
 The webhook returns `{"decision":"allow"|"deny"}` (or `{"allow":true|false}`),
 optionally with `{"approval_id":"..."}`.
+Approval response bodies are capped at 64 KiB while streaming; an oversized or
+unreadable response is handled through `approval.fail_on_error` rather than
+buffered without bound.
 
 ### Dry-run rollout
 

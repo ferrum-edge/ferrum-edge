@@ -1097,6 +1097,32 @@ async fn approval_endpoint_error_warns_and_fails_open_when_configured() {
 }
 
 #[tokio::test]
+async fn oversized_approval_response_fails_closed_without_unbounded_buffering() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/approve"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "decision": "allow",
+            "padding": "x".repeat(128 * 1024)
+        })))
+        .mount(&server)
+        .await;
+
+    let plugin = make(json!({
+        "tools": { "deploy": { "action": "require_approval" } },
+        "approval": { "endpoint_url": format!("{}/approve", server.uri()) }
+    }));
+    let mut ctx = create_test_context();
+    let body = response_with_tool_call("deploy", "{\"env\":\"prod\"}");
+    assert_reject(
+        plugin
+            .on_response_body(&mut ctx, 200, &json_headers(), &body)
+            .await,
+        Some(502),
+    );
+}
+
+#[tokio::test]
 async fn approval_endpoint_with_credentials_and_query_still_calls_webhook() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1434,7 +1460,9 @@ async fn before_proxy_ignores_stale_ctx_headers_content_type() {
         "out-of-scope request must not be governed from the stale ctx.headers"
     );
 
-    // An empty live `headers` (handler moved them out) is likewise out of scope.
+    // An empty live `headers` is now deliberately in scope for MCP/A2A because
+    // their gateways accept an absent Content-Type as JSON-RPC. The decision
+    // still comes from the live absence, not the stale application/json value.
     let mut ctx = json_post_ctx();
     ctx.metadata.insert(
         "request_body".to_string(),
@@ -1447,11 +1475,7 @@ async fn before_proxy_ignores_stale_ctx_headers_content_type() {
         .to_string(),
     );
     let mut headers = HashMap::new();
-    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-    assert!(
-        !ctx.metadata.contains_key("ai_tool_governor.decision"),
-        "empty live headers means out of scope; stale ctx.headers must be ignored"
-    );
+    assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
 }
 
 #[tokio::test]
@@ -3944,6 +3968,7 @@ async fn framed_grpc_request_content_types_are_out_of_scope() {
         ctx.metadata
             .insert("request_body_size_bytes".to_string(), "12".to_string());
         let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), ct.to_string());
         assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 
         // The final-body re-check does not reject framed wire bytes either.
@@ -6930,4 +6955,88 @@ async fn oversized_relabeled_json_request_fails_closed() {
             .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
             .await,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Round 23 review fixes
+// ---------------------------------------------------------------------------
+
+/// P2 (:3980): empty names are not matchable because configuration rejects
+/// empty policy keys. Buffered modern and legacy calls therefore fail closed
+/// as ungovernable even under a default-allow denylist.
+#[tokio::test]
+async fn empty_buffered_tool_call_names_fail_closed() {
+    let plugin = make(json!({
+        "default_action": "allow",
+        "tools": { "blocked": { "action": "deny" } }
+    }));
+    let bodies = [
+        response_with_tool_call("", "{}"),
+        json!({
+            "choices": [{
+                "message": { "function_call": { "name": "", "arguments": "{}" } }
+            }]
+        })
+        .to_string()
+        .into_bytes(),
+    ];
+
+    for body in &bodies {
+        let mut ctx = create_test_context();
+        assert_reject(
+            plugin
+                .on_response_body(&mut ctx, 200, &json_headers(), body)
+                .await,
+            Some(502),
+        );
+    }
+}
+
+/// P1 (:1835): match the MCP/A2A gateways' JSON-RPC media-type handling so a
+/// denied call cannot bypass `before_proxy` via `application/json-rpc` or an
+/// absent Content-Type.
+#[tokio::test]
+async fn json_rpc_media_types_are_governed_for_mcp_and_a2a() {
+    let cases = [
+        (
+            make(mcp_config("enforce")),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "kubectl.apply", "arguments": {} }
+            }),
+        ),
+        (
+            make(json!({
+                "default_action": "allow",
+                "tools": { "danger.a2a": { "action": "deny" } },
+                "inspect": { "a2a_methods": true, "response_tool_calls": false }
+            })),
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "danger.a2a",
+                "params": {}
+            }),
+        ),
+    ];
+
+    for (plugin, body) in cases {
+        for content_type in [Some("application/json-rpc; charset=utf-8"), None] {
+            let mut ctx = create_test_context();
+            ctx.method = "POST".to_string();
+            ctx.headers.remove("content-type");
+            if let Some(content_type) = content_type {
+                ctx.headers
+                    .insert("content-type".to_string(), content_type.to_string());
+            }
+            ctx.metadata
+                .insert("request_body".to_string(), body.to_string());
+            assert!(plugin.should_buffer_request_body(&ctx));
+
+            let mut headers = ctx.headers.clone();
+            assert_reject(plugin.before_proxy(&mut ctx, &mut headers).await, Some(403));
+        }
+    }
 }

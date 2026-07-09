@@ -91,6 +91,7 @@ use sha2::{Digest, Sha256};
 use super::utils::ai_providers::{detect_response_provider, detect_sse_provider};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::utils::json_escape::escape_json_string;
+use super::utils::response_body::read_response_body_bounded;
 use super::utils::sse::{encode_sse_error_event, is_sse_request};
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
@@ -107,6 +108,9 @@ const DEFAULT_REDACTION_PLACEHOLDER: &str = "[REDACTED_TOOL_ARG:{name}]";
 const DEFAULT_APPROVAL_TIMEOUT_MS: u64 = 1500;
 /// Default approval cache TTL.
 const DEFAULT_APPROVAL_CACHE_TTL_S: u64 = 300;
+/// Approval responses contain only a decision and optional ID. Bound the
+/// out-of-band response so a compromised service cannot exhaust gateway memory.
+const MAX_APPROVAL_RESPONSE_BYTES: usize = 64 * 1024;
 /// Maximum approval cache TTL. Larger values risk overflowing `Instant`
 /// arithmetic on some platforms and keep stale approvals alive too long.
 const MAX_APPROVAL_CACHE_TTL_S: u64 = 30 * 24 * 60 * 60;
@@ -951,9 +955,10 @@ impl GovernorEngine {
             return Err(format!("endpoint returned HTTP {}", response.status()));
         }
 
-        let value: Value = response
-            .json()
+        let response_body = read_response_body_bounded(response, MAX_APPROVAL_RESPONSE_BYTES)
             .await
+            .map_err(|e| format!("response read failed: {e}"))?;
+        let value: Value = serde_json::from_slice(&response_body)
             .map_err(|e| format!("response parse failed: {e}"))?;
 
         let approval_id = value
@@ -1212,6 +1217,22 @@ impl AiToolGovernor {
     fn set_request_hash(&self, ctx: &mut RequestContext, hash: String) {
         ctx.ai_tool_governor_request_hashes
             .insert(self.instance_id, hash);
+    }
+
+    /// Request media types this instance can govern. MCP/A2A gateways accept
+    /// JSON-RPC's registered-in-practice media type and absent Content-Type, so
+    /// their policy surface must do the same or the gateway can consume a call
+    /// before the governor ever sees it. Other request/streaming inspection
+    /// remains scoped to ordinary JSON media types.
+    fn governs_request_content_type(&self, content_type: Option<&str>) -> bool {
+        let governs_json_rpc = self.inspect.mcp_tool_calls || self.inspect.a2a_methods;
+        match content_type {
+            Some(content_type) => {
+                is_governable_json_request_content_type(content_type)
+                    || (governs_json_rpc && is_json_rpc_content_type(content_type))
+            }
+            None => governs_json_rpc,
+        }
     }
 
     /// Write aggregate decision metadata onto the request context.
@@ -1807,9 +1828,7 @@ impl Plugin for AiToolGovernor {
         {
             return false;
         }
-        ctx.headers
-            .get("content-type")
-            .is_some_and(|ct| is_governable_json_request_content_type(ct))
+        self.governs_request_content_type(ctx.headers.get("content-type").map(String::as_str))
     }
 
     async fn before_proxy(
@@ -1825,12 +1844,12 @@ impl Plugin for AiToolGovernor {
         if !governs_request && !detects_streaming {
             return PluginResult::Continue;
         }
-        // Mirror `should_buffer_request_body`: only JSON POST bodies are in
-        // scope (framed gRPC/gRPC-Web `+json` variants are wire frames, not
-        // bare JSON — out of scope, never fail-closed).
+        // Mirror `should_buffer_request_body`: ordinary JSON plus the
+        // JSON-RPC/absent media types accepted by MCP/A2A gateways are in
+        // scope. Framed gRPC/gRPC-Web `+json` variants are wire frames, not
+        // bare JSON — out of scope, never fail-closed.
         if ctx.method != "POST"
-            || !header_value(headers, "content-type")
-                .is_some_and(is_governable_json_request_content_type)
+            || !self.governs_request_content_type(header_value(headers, "content-type"))
         {
             return PluginResult::Continue;
         }
@@ -1969,8 +1988,7 @@ impl Plugin for AiToolGovernor {
         // never look like JSON, so the shape fallback does not re-admit it —
         // while a transform that merely relabeled a still-JSON-shaped body is
         // still caught by `looks_like_json`.
-        let json_ct = header_value(headers, "content-type")
-            .is_some_and(is_governable_json_request_content_type);
+        let json_ct = self.governs_request_content_type(header_value(headers, "content-type"));
         let json_shaped = looks_like_json(body);
         if !json_ct && !json_shaped {
             return PluginResult::Continue;
@@ -3976,7 +3994,7 @@ fn extract_response_tool_calls(json: &Value) -> (Vec<ToolCall>, bool) {
                 for tc in tool_calls {
                     let function = tc.get("function");
                     match function.and_then(|f| f.get("name")).and_then(Value::as_str) {
-                        Some(name) => {
+                        Some(name) if !name.is_empty() => {
                             out.push(tool_call_from(
                                 name,
                                 function.and_then(|f| f.get("arguments")),
@@ -3985,7 +4003,7 @@ fn extract_response_tool_calls(json: &Value) -> (Vec<ToolCall>, bool) {
                         // Arguments/id without a checkable `function.name`:
                         // policy is keyed by name, so this call cannot be
                         // evaluated and must not vanish from the batch.
-                        None => ungovernable = true,
+                        Some(_) | None => ungovernable = true,
                     }
                 }
             }
@@ -3997,8 +4015,10 @@ fn extract_response_tool_calls(json: &Value) -> (Vec<ToolCall>, bool) {
         match message.get("function_call") {
             Some(Value::Null) | None => {}
             Some(function_call) => match function_call.get("name").and_then(Value::as_str) {
-                Some(name) => out.push(tool_call_from(name, function_call.get("arguments"))),
-                None => ungovernable = true,
+                Some(name) if !name.is_empty() => {
+                    out.push(tool_call_from(name, function_call.get("arguments")));
+                }
+                Some(_) | None => ungovernable = true,
             },
         }
     }
@@ -4103,6 +4123,15 @@ fn is_framed_grpc_content_type(content_type: &str) -> bool {
 /// fail-closed as unparseable JSON.
 fn is_governable_json_request_content_type(content_type: &str) -> bool {
     is_json_content_type(content_type) && !is_framed_grpc_content_type(content_type)
+}
+
+fn is_json_rpc_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim()
+        .eq_ignore_ascii_case("application/json-rpc")
 }
 
 /// Whether the request was marked as streaming: an `Accept: text/event-stream`
