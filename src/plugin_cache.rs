@@ -164,6 +164,21 @@ impl Plugin for PriorityOverridePlugin {
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
         self.inner.should_buffer_response_body(ctx)
     }
+    fn may_release_response_body_under_retries(&self, ctx: &RequestContext) -> bool {
+        self.inner.may_release_response_body_under_retries(ctx)
+    }
+    fn should_release_response_body_under_retries(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &std::collections::HashMap<String, String>,
+    ) -> bool {
+        self.inner.should_release_response_body_under_retries(
+            ctx,
+            response_status,
+            response_headers,
+        )
+    }
     fn should_release_response_body_before_content_type_rewrite(
         &self,
         ctx: &RequestContext,
@@ -311,6 +326,14 @@ impl Plugin for PriorityOverridePlugin {
             .transform_response_body_with_context(ctx, body, content_type, response_headers)
             .await
     }
+    fn on_response_body_transformed(
+        &self,
+        ctx: &mut RequestContext,
+        response_headers: &mut std::collections::HashMap<String, String>,
+    ) {
+        self.inner
+            .on_response_body_transformed(ctx, response_headers);
+    }
     async fn on_final_response_body(
         &self,
         ctx: &mut RequestContext,
@@ -324,7 +347,7 @@ impl Plugin for PriorityOverridePlugin {
     }
     async fn on_response_stream_terminated(
         &self,
-        ctx: &RequestContext,
+        ctx: &mut RequestContext,
         response_status: u16,
         outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {

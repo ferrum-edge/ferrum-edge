@@ -2470,7 +2470,7 @@ async fn test_priority_override_delegates_response_stream_termination_hook() {
     assert_eq!(plugins[0].tracked_keys_count(), Some(1));
 
     plugins[0]
-        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(32))
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(32))
         .await;
     assert_eq!(
         plugins[0].tracked_keys_count(),

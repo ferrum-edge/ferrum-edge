@@ -1,5 +1,5 @@
 use ferrum_edge::_test_support::{
-    soap_count_wsu_id_occurrences_for_test, soap_find_element_by_wsu_id_for_test,
+    soap_count_wsu_id_occurrences_for_test, soap_exclusive_canonicalize_element_for_test,
 };
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
@@ -345,104 +345,35 @@ fn count_wsu_id_occurrences_fails_closed_on_unterminated_comment() {
 }
 
 #[test]
-fn find_element_by_wsu_id_skips_comment_content_like_counter() {
-    let xml = r#"
-        <!-- <Signed wsu:Id="X">signed bytes</Signed> -->
-        <Unsigned xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd" wsu:Id="X">backend bytes</Unsigned>
-    "#;
+fn exclusive_c14n_reemits_inherited_namespaces_and_orders_attributes() {
+    let xml = r#"<outer xmlns="urn:default" xmlns:p="urn:payload" xmlns:keep="urn:inclusive">
+        <p:Payload z="last" p:qualified="third" a="first"><Child/><p:Empty/></p:Payload>
+    </outer>"#;
+
+    let canonical = soap_exclusive_canonicalize_element_for_test(xml, "Payload", "keep #default")
+        .expect("fixture must canonicalize");
 
     assert_eq!(
-        soap_count_wsu_id_occurrences_for_test(xml, "X").expect("comment content should not count"),
-        1
-    );
-    let resolved = soap_find_element_by_wsu_id_for_test(xml, "X")
-        .expect("real unsigned element should resolve");
-
-    assert!(resolved.starts_with("<Unsigned"));
-    assert!(resolved.contains("backend bytes"));
-    assert!(!resolved.contains("signed bytes"));
-}
-
-#[test]
-fn find_element_by_wsu_id_skips_cdata_and_pi_content_like_counter() {
-    let xml = r#"
-        <![CDATA[<Signed wsu:Id="X">signed bytes</Signed>]]>
-        <?debug <Other wsu:Id="X">signed bytes</Other>?>
-        <Real Id="X">backend bytes</Real>
-    "#;
-
-    assert_eq!(
-        soap_count_wsu_id_occurrences_for_test(xml, "X")
-            .expect("CDATA and PI content should not count"),
-        1
-    );
-    let resolved =
-        soap_find_element_by_wsu_id_for_test(xml, "X").expect("real element should resolve");
-
-    assert!(resolved.starts_with("<Real"));
-    assert!(resolved.contains("backend bytes"));
-    assert!(!resolved.contains("signed bytes"));
-}
-
-#[test]
-fn find_element_by_wsu_id_resolves_prefixed_id_bound_to_wsu_namespace() {
-    let xml = r#"
-        <soap:Body xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
-            <Target u:Id="B">signed body bytes</Target>
-        </soap:Body>
-    "#;
-
-    assert_eq!(
-        soap_count_wsu_id_occurrences_for_test(xml, "B")
-            .expect("prefixed local-name Id should count for duplicate protection"),
-        1
-    );
-    let resolved = soap_find_element_by_wsu_id_for_test(xml, "B")
-        .expect("WSU-bound prefixed Id should resolve");
-
-    assert!(resolved.starts_with("<Target"));
-    assert!(resolved.contains("signed body bytes"));
-}
-
-#[test]
-fn find_element_by_wsu_id_rejects_prefixed_id_bound_to_non_wsu_namespace() {
-    let xml = r#"
-        <soap:Body xmlns:evil="urn:not-wsu">
-            <Target evil:Id="B">signed body bytes</Target>
-        </soap:Body>
-    "#;
-
-    assert_eq!(
-        soap_count_wsu_id_occurrences_for_test(xml, "B")
-            .expect("broad duplicate protection still counts prefixed local-name Id"),
-        1
-    );
-    assert!(
-        soap_find_element_by_wsu_id_for_test(xml, "B").is_none(),
-        "non-WSU namespace prefixes must not resolve as WS-Security Utility IDs"
+        canonical,
+        "<p:Payload xmlns=\"urn:default\" xmlns:keep=\"urn:inclusive\" xmlns:p=\"urn:payload\" a=\"first\" z=\"last\" p:qualified=\"third\"><Child></Child><p:Empty></p:Empty></p:Payload>"
     );
 }
 
 #[test]
-fn find_element_by_wsu_id_rejects_prefix_after_namespace_scope_ends() {
-    let xml = r#"
-        <soap:Body>
-            <Scoped xmlns:u="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
-                <Signed u:Id="A">signed body bytes</Signed>
-            </Scoped>
-            <Target u:Id="B">unbound prefixed id</Target>
-        </soap:Body>
-    "#;
+fn exclusive_c14n_rejects_excessive_element_depth() {
+    let mut xml = String::from("<Root>");
+    for _ in 0..257 {
+        xml.push_str("<Nested>");
+    }
+    for _ in 0..257 {
+        xml.push_str("</Nested>");
+    }
+    xml.push_str("</Root>");
 
-    assert!(
-        soap_find_element_by_wsu_id_for_test(xml, "B").is_none(),
-        "WSU prefixes must not remain resolvable after their namespace scope closes"
-    );
-    let resolved = soap_find_element_by_wsu_id_for_test(xml, "A")
-        .expect("WSU-bound id inside namespace scope should resolve");
+    let error = soap_exclusive_canonicalize_element_for_test(&xml, "Root", "")
+        .expect_err("excessive c14n depth must fail closed");
 
-    assert!(resolved.starts_with("<Signed"));
-    assert!(resolved.contains("signed body bytes"));
+    assert!(error.contains("depth exceeds"), "unexpected error: {error}");
 }
 
 #[test]
@@ -926,10 +857,10 @@ async fn test_nonce_replay_detected() {
 //   1. Locates `<Signature>` inside the assertion.
 //   2. Confirms the signing cert (from `KeyInfo/X509Data/X509Certificate`)
 //      matches one of `saml.trusted_signing_certs` by SHA-256 fingerprint.
-//   3. Verifies each `<Reference>` digest against the assertion with its own
-//      `<Signature>` element excised (enveloped-signature transform).
-//   4. Verifies `<SignatureValue>` over the `<SignedInfo>` bytes using the
-//      cert's public key.
+//   3. Applies the declared enveloped-signature and exclusive-c14n transforms
+//      before verifying each `<Reference>` digest.
+//   4. Verifies `<SignatureValue>` over exclusive-canonicalized `<SignedInfo>`
+//      using the cert's public key.
 //   5. THEN checks Issuer / NotBefore / NotOnOrAfter / Audience.
 //
 // Tests below construct SAML assertions and sign them with a bundled test
@@ -1244,19 +1175,25 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 "<Assertion ID=\"{}\"><Issuer>{}</Issuer>{}</Assertion>",
                 self.assertion_id, self.issuer, signed_body_after_issuer
             );
+            let canonical_assertion = super::soap_exclusive_canonicalize_element_for_test(
+                &assertion_no_sig,
+                "Assertion",
+                "",
+            )
+            .expect("test assertion must canonicalize");
 
             let (digest_method_uri, asserted_digest) = if self.use_sha1_digest {
                 (
                     "http://www.w3.org/2000/09/xmldsig#sha1",
                     ring::digest::digest(
                         &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-                        assertion_no_sig.as_bytes(),
+                        canonical_assertion.as_bytes(),
                     ),
                 )
             } else {
                 (
                     "http://www.w3.org/2001/04/xmlenc#sha256",
-                    ring::digest::digest(&ring::digest::SHA256, assertion_no_sig.as_bytes()),
+                    ring::digest::digest(&ring::digest::SHA256, canonical_assertion.as_bytes()),
                 )
             };
             let digest_b64 = B64.encode(asserted_digest.as_ref());
@@ -1268,12 +1205,19 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
 <CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
 <SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>\
 <Reference URI=\"#{}\">\
+<Transforms>\
+<Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/>\
+<Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>\
+</Transforms>\
 <DigestMethod Algorithm=\"{}\"/>\
 <DigestValue>{}</DigestValue>\
 </Reference>\
 </SignedInfo>",
                 self.assertion_id, digest_method_uri, digest_b64
             );
+            let canonical_signed_info =
+                super::soap_exclusive_canonicalize_element_for_test(&signed_info, "SignedInfo", "")
+                    .expect("test SignedInfo must canonicalize");
 
             // Pick the signing key + matching cert.
             let (key_pkcs8_b64, cert_pem) = if self.sign_with_untrusted_key {
@@ -1291,7 +1235,7 @@ RiLyj1MbQGDtoeJVlV4qwHDVyoumjb4+S0KQL68geIlE70lPpQ==
                 .sign(
                     &RSA_PKCS1_SHA256,
                     &rng,
-                    signed_info.as_bytes(),
+                    canonical_signed_info.as_bytes(),
                     &mut sig_bytes,
                 )
                 .expect("test signing must succeed");
@@ -1384,6 +1328,33 @@ async fn test_saml_valid_signed_assertion_accepted() {
         ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
         Some("alice@example.com"),
         "Subject NameID must be exported as metadata"
+    );
+}
+
+#[tokio::test]
+async fn test_saml_decodes_signed_authorization_fields_from_verified_dom() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-entities",
+        "https://idp.example.com&#x2f;metadata",
+        "alice&#x40;example.com",
+    )
+    .build();
+    let body = wrap_saml_assertion(&assertion);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "signed entity-encoded SAML fields should pass, got {result:?}"
+    );
+    assert_eq!(
+        ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
+        Some("alice@example.com")
     );
 }
 
@@ -2107,9 +2078,10 @@ mod x509_roundtrip {
 
     /// Construct a SOAP envelope whose `<wsse:Security>` block contains a
     /// `<Timestamp wsu:Id="TS-1">` and a `<Signature>` covering that Timestamp.
-    /// The `<SignedInfo>` byte sequence in the returned envelope is exactly
-    /// what `validate_x509_signature` extracts via `find_element_block`, so
-    /// the signature computed here will match what the verifier checks.
+    /// The signed bytes are exclusive-canonicalized rather than copied from
+    /// the wire. Namespace declarations are intentionally inherited and then
+    /// re-emitted by c14n, making this a regression fixture for the old
+    /// wire-byte verifier.
     fn build_signed_soap_envelope(cert: &TestRsaCert) -> String {
         build_signed_soap_envelope_with_timestamp_prefix(cert, "wsu")
     }
@@ -2131,33 +2103,47 @@ mod x509_roundtrip {
             expires = expires,
         );
 
-        // verify_reference_digests hashes the raw bytes of the referenced
-        // element as extracted from the envelope (no XML C14N in this impl),
-        // so we hash the exact `timestamp_xml` string we'll embed below.
-        let ts_digest = ring::digest::digest(&ring::digest::SHA256, timestamp_xml.as_bytes());
+        let timestamp_context = format!(
+            r#"<root xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:{prefix}="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">{timestamp}</root>"#,
+            prefix = timestamp_prefix,
+            timestamp = timestamp_xml,
+        );
+        let canonical_timestamp =
+            soap_exclusive_canonicalize_element_for_test(&timestamp_context, "Timestamp", "soap")
+                .expect("test Timestamp must canonicalize");
+        assert_ne!(
+            canonical_timestamp, timestamp_xml,
+            "fixture must differ from wire bytes to regress raw-byte verification"
+        );
+        let ts_digest = ring::digest::digest(&ring::digest::SHA256, canonical_timestamp.as_bytes());
         let ts_digest_b64 = B64.encode(ts_digest.as_ref());
 
-        // Build SignedInfo as the EXACT bytes that will appear in the envelope.
-        // This is what `find_element_block(security_block, "SignedInfo")`
-        // returns and what we pass into `ring::RsaKeyPair::sign`.
-        // Raw-string delimiter must be `##` because the URL fragments
-        // `xml-exc-c14n#`, `xmldsig-more#`, and `xmlenc#` contain `#`
-        // and a single-`#` raw literal would terminate at the first
-        // `"#` (e.g. inside `xml-exc-c14n#"/>`), which is what tripped
-        // the parser before the fix.
         let signed_info = format!(
-            r##"<SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#TS-1"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{}</DigestValue></Reference></SignedInfo>"##,
+            r##"<SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></CanonicalizationMethod><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><Reference URI="#TS-1"><Transforms><Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"><ec:InclusiveNamespaces xmlns:ec="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="soap"/></Transform></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue>{}</DigestValue></Reference></SignedInfo>"##,
             ts_digest_b64
         );
+        let signed_info_context = format!(
+            r#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">{signed_info}</Signature>"#,
+        );
+        let canonical_signed_info = soap_exclusive_canonicalize_element_for_test(
+            &signed_info_context,
+            "SignedInfo",
+            "soap",
+        )
+        .expect("test SignedInfo must canonicalize");
+        assert_ne!(
+            canonical_signed_info, signed_info,
+            "fixture must sign canonical form rather than wire bytes"
+        );
 
-        // Sign the SignedInfo bytes with RSA-PKCS1-v1_5 over SHA-256.
+        // Sign the exclusive-canonicalized SignedInfo with RSA-PKCS1-v1_5.
         let rng = SystemRandom::new();
         let mut signature = vec![0u8; cert.signing_key.public().modulus_len()];
         cert.signing_key
             .sign(
                 &RSA_PKCS1_SHA256,
                 &rng,
-                signed_info.as_bytes(),
+                canonical_signed_info.as_bytes(),
                 &mut signature,
             )
             .expect("ring RSA sign");
@@ -2215,6 +2201,99 @@ mod x509_roundtrip {
             matches!(result, PluginResult::Continue),
             "expected Continue with valid RSA signature, got {:?}",
             result,
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_signed_info_canonicalization_is_rejected() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+        let body = build_signed_soap_envelope(&cert).replacen(
+            "http://www.w3.org/2001/10/xml-exc-c14n#",
+            "urn:unsupported:canonicalization",
+            1,
+        );
+
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        assert!(
+            reject_body(&result).contains("unsupported CanonicalizationMethod"),
+            "unexpected rejection: {}",
+            reject_body(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_reference_transform_is_rejected() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+        let body = build_signed_soap_envelope(&cert).replace(
+            "<Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\">",
+            "<Transform Algorithm=\"urn:unsupported:transform\">",
+        );
+
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        assert!(
+            reject_body(&result).contains("unsupported Transform algorithm"),
+            "unexpected rejection: {}",
+            reject_body(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_inclusive_namespace_prefix_list_is_rejected() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+        let prefix_list = (0..65)
+            .map(|index| format!("p{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let body = build_signed_soap_envelope(&cert).replacen(
+            "PrefixList=\"soap\"",
+            &format!("PrefixList=\"{prefix_list}\""),
+            1,
+        );
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        assert!(
+            reject_body(&result).contains("more than 64 prefixes"),
+            "unexpected rejection: {}",
+            reject_body(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn overly_complex_soap_dom_is_rejected_before_signature_verification() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+        let many_nodes = "<N/>".repeat(66_000);
+        let body = build_signed_soap_envelope(&cert)
+            .replace("<soap:Body>", &format!("<soap:Body>{many_nodes}"));
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        assert!(
+            reject_body(&result).contains("overly complex"),
+            "unexpected rejection: {}",
+            reject_body(&result)
         );
     }
 
@@ -2307,6 +2386,94 @@ mod x509_roundtrip {
             }
             other => panic!("expected Reject for duplicate wsu:Id, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn entity_encoded_timestamp_id_is_recognized_as_signed() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+        let body =
+            build_signed_soap_envelope(&cert).replace("wsu:Id=\"TS-1\"", "wsu:Id=\"TS&#x2D;1\"");
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "entity-equivalent timestamp ID should remain signed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn entity_encoded_id_and_raw_duplicate_are_rejected_as_wrapping() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path())).unwrap();
+
+        let entity_encoded =
+            build_signed_soap_envelope(&cert).replace("wsu:Id=\"TS-1\"", "wsu:Id=\"TS&#x2D;1\"");
+        let wrapped = entity_encoded.replace(
+            "<soap:Body>",
+            "<soap:Body><Injected wsu:Id=\"TS-1\" \
+             xmlns:wsu=\"http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd\">attacker</Injected>",
+        );
+        let mut ctx = make_ctx_with_soap_body(&wrapped);
+        let mut headers = soap_headers();
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        assert!(
+            reject_body(&result).contains("not unique"),
+            "decoded duplicate ID must fail the XSW guard: {}",
+            reject_body(&result)
+        );
+    }
+
+    #[tokio::test]
+    async fn x509_verification_is_scoped_to_selected_soap_header_security() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let mut config = x509_plugin_config(cert_file.path());
+        config["x509_signature"]["require_signed_timestamp"] = json!(false);
+        let plugin = SoapWsSecurity::new(&config).unwrap();
+
+        let valid = build_signed_soap_envelope(&cert);
+        let security_start = valid.find("<wsse:Security").expect("Security start");
+        let security_end = valid[security_start..]
+            .find("</wsse:Security>")
+            .map(|offset| security_start + offset + "</wsse:Security>".len())
+            .expect("Security end");
+        let signed_security = &valid[security_start..security_end];
+        let signature_start = signed_security
+            .find("<Signature ")
+            .expect("Signature start");
+        let signature_end = signed_security[signature_start..]
+            .find("</Signature>")
+            .map(|offset| signature_start + offset + "</Signature>".len())
+            .expect("Signature end");
+        let mut unsigned_security = signed_security.to_string();
+        unsigned_security.replace_range(signature_start..signature_end, "");
+        unsigned_security = unsigned_security.replace("wsu:Id=\"TS-1\"", "wsu:Id=\"TS-actual\"");
+        let header_unsigned = valid.replacen(signed_security, &unsigned_security, 1);
+        let body = header_unsigned.replacen(
+            "<soap:Header>",
+            &format!("{}<soap:Header>", signed_security),
+            1,
+        );
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(is_reject(&result));
+        assert!(
+            reject_body(&result).contains("missing Signature"),
+            "pre-header signed Security must not satisfy header verification: {}",
+            reject_body(&result)
+        );
     }
 
     #[tokio::test]

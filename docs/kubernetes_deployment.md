@@ -118,6 +118,13 @@ helm install ferrum ./charts/ferrum-mesh -n ferrum \
   -f charts/ferrum-mesh/examples/production-existing-secrets-values.yaml
 ```
 
+Production control planes also need CP/DP gRPC TLS configured before serving on
+the in-cluster non-loopback listener. Mount the certificate/key material and set
+`FERRUM_CP_GRPC_TLS_CERT_PATH` and `FERRUM_CP_GRPC_TLS_KEY_PATH` in the values
+file (and configure DP trust) rather than enabling
+`FERRUM_CP_DP_GRPC_ALLOW_PLAINTEXT`, which is only appropriate for isolated
+local-development smoke tests.
+
 The chart never generates JWT secrets. That avoids predictable credentials and
 also avoids Helm upgrade churn from random template functions. If you need
 structured database settings instead of a single URL Secret, `controlPlane.database`

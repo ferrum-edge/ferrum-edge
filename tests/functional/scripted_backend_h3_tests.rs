@@ -19,6 +19,11 @@
 //! the standard admin JWT auth path — see `docs/admin_api.md` +
 //! `openapi.yaml`. These tests exercise them over the same admin port
 //! operators use in production.
+//!
+//! Step-vocabulary audit: every `H3Step` variant is exercised in this file.
+//! The connection-phase test covers `RejectHandshake`, `DropInitialPacket`,
+//! and explicit `AcceptHandshake`; the mid-body fault matrix covers
+//! `SendStreamReset` and `SendGoaway` before the declared body completes.
 
 #![allow(clippy::bool_assert_comparison)]
 
@@ -105,6 +110,26 @@ async fn wait_for_capability_entry(
     }
 }
 
+/// Wait for the single capability entry's H3 class to match `expected`.
+async fn wait_for_h3_class(
+    harness: &GatewayHarness,
+    expected: &str,
+    timeout: Duration,
+) -> Result<Option<Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(entry) = fetch_capability_entry(harness).await?
+            && entry["plain_http"]["h3"].as_str() == Some(expected)
+        {
+            return Ok(Some(entry));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Drive the gateway's HTTPS port via the scripted H3 client.
 async fn h3_get(
     harness: &GatewayHarness,
@@ -149,45 +174,62 @@ async fn spawn_h3_harness_with_explicit_https_port(
     pool_warmup_enabled: bool,
     refresh_interval_secs: Option<u64>,
 ) -> (GatewayHarness, String, u16) {
-    // Reserve an HTTPS port (TCP); we then let the gateway also bind UDP
-    // on the same port for QUIC. The reservation is dropped before the
-    // gateway spawns — there's a brief race window but the retry-on-health
-    // loop inside TestGatewayBuilder handles it.
-    let reservation = reserve_port().await.expect("reserve https port");
-    let https_port = reservation.port;
-    drop(reservation);
+    const STARTUP_ATTEMPTS: u32 = 3;
+    let mut last_error = None;
+    for attempt in 1..=STARTUP_ATTEMPTS {
+        // A fixed env-pinned HTTPS/QUIC port cannot be reused after a failed
+        // startup. Retry the complete harness with a fresh port and scratch
+        // directory, matching the chunked-harness stabilization in PR #2065.
+        let reservation = reserve_port().await.expect("reserve https port");
+        let https_port = reservation.port;
+        drop(reservation);
 
-    let scratch = tempfile::tempdir().expect("scratch");
-    let (ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-ca");
-    Box::leak(Box::new(scratch));
+        let scratch = tempfile::tempdir().expect("scratch");
+        let (ca_pem, cert_path, key_path) = write_frontend_certs(scratch.path(), "h3-gw-ca");
+        let yaml = file_mode_yaml_for_h3(backend_port);
+        let mut builder = GatewayHarness::builder()
+            .file_config(yaml)
+            .log_level("info")
+            .capture_output()
+            .max_attempts(1)
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
+            .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
+            .env("FERRUM_TLS_NO_VERIFY", "true")
+            .env(
+                "FERRUM_POOL_WARMUP_ENABLED",
+                if pool_warmup_enabled { "true" } else { "false" },
+            );
+        if let Some(secs) = refresh_interval_secs {
+            builder = builder.env(
+                "FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS",
+                secs.to_string(),
+            );
+        }
 
-    let yaml = file_mode_yaml_for_h3(backend_port);
-    let mut builder = GatewayHarness::builder()
-        .file_config(yaml)
-        .log_level("info")
-        .capture_output()
-        .env("FERRUM_ENABLE_HTTP3", "true")
-        .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
-        .env("FERRUM_FRONTEND_TLS_CERT_PATH", cert_path)
-        .env("FERRUM_FRONTEND_TLS_KEY_PATH", key_path)
-        .env("FERRUM_TLS_NO_VERIFY", "true")
-        .env(
-            "FERRUM_POOL_WARMUP_ENABLED",
-            if pool_warmup_enabled { "true" } else { "false" },
-        );
-    if let Some(secs) = refresh_interval_secs {
-        builder = builder.env(
-            "FERRUM_BACKEND_CAPABILITY_REFRESH_INTERVAL_SECS",
-            secs.to_string(),
-        );
+        match builder.spawn().await {
+            Ok(harness) => {
+                Box::leak(Box::new(scratch));
+                let port_file = harness.temp_path().join("https-port.txt");
+                std::fs::write(&port_file, https_port.to_string()).expect("write https-port.txt");
+                return (harness, ca_pem, https_port);
+            }
+            Err(error) => {
+                eprintln!(
+                    "H3 harness startup attempt {attempt}/{STARTUP_ATTEMPTS} failed: {error}"
+                );
+                last_error = Some(error.to_string());
+                if attempt < STARTUP_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
     }
-    let harness = builder.spawn().await.expect("spawn gateway");
-
-    // Stash the HTTPS port in the temp dir so tests can recover it.
-    let port_file = harness.temp_path().join("https-port.txt");
-    std::fs::write(&port_file, https_port.to_string()).expect("write https-port.txt");
-
-    (harness, ca_pem, https_port)
+    panic!(
+        "H3 harness failed after {STARTUP_ATTEMPTS} fresh-port attempts: {}",
+        last_error.unwrap_or_else(|| "no startup error recorded".to_string())
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -249,6 +291,108 @@ async fn h3_probe_classifies_backend_without_quic_as_h3_unsupported() {
     );
 
     let _ = https_port;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_quic_phase_failures_are_observable_and_recoverable() {
+    for (name, connection_step) in [
+        ("reject-handshake", H3Step::RejectHandshake),
+        ("drop-initial", H3Step::DropInitialPacket),
+    ] {
+        let ca = TestCa::new(&format!("phase-h3-{name}")).expect("ca");
+        let (cert, key) = ca.valid().expect("leaf");
+        let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+            .await
+            .expect("colocated tcp/udp");
+        let backend_port = tcp_res.port;
+
+        let _tcp_backend = ScriptedTlsBackend::builder(
+            tcp_res.into_listener(),
+            TlsConfig::new(cert.clone(), key.clone())
+                .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+        )
+        .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+        .step(TcpStep::Write(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nbridge".to_vec(),
+        ))
+        .step(TcpStep::Drop)
+        .spawn()
+        .expect("spawn TLS sidecar");
+
+        let h3_backend =
+            ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+                .steps([
+                    connection_step,
+                    H3Step::AcceptHandshake,
+                    H3Step::AcceptStream,
+                    H3Step::RespondHeaders(vec![
+                        (":status", "200".into()),
+                        ("content-length", "2".into()),
+                    ]),
+                    H3Step::RespondData(bytes::Bytes::from_static(b"ok")),
+                    H3Step::StallFor(Duration::from_millis(100)),
+                ])
+                .spawn()
+                .expect("spawn H3 backend");
+
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(file_mode_yaml_for_h3(backend_port))
+            .pool_warmup_enabled(true)
+            .env("FERRUM_TLS_NO_VERIFY", "true")
+            .spawn()
+            .await
+            .expect("spawn gateway");
+
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let observed = match name {
+                    "reject-handshake" => h3_backend.refused_handshakes() == 1,
+                    "drop-initial" => h3_backend.dropped_initial_packets() == 1,
+                    _ => false,
+                };
+                if observed {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{name} was not consumed by the QUIC capability probe"));
+
+        // The open UDP socket proves this was a QUIC connection-phase failure,
+        // not the no-listener/ECONNREFUSED family. An explicit refresh then
+        // opens a second connection and executes `AcceptHandshake`.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            harness.post_admin_json("/backend-capabilities/refresh", &json!({})),
+        )
+        .await
+        .expect("refresh request bounded")
+        .expect("refresh request");
+        let entry = wait_for_h3_class(&harness, "supported", Duration::from_secs(10))
+            .await
+            .expect("capability lookup")
+            .unwrap_or_else(|| panic!("{name} did not recover to h3=supported"));
+
+        let client = harness.http_client().expect("HTTP client");
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.get(&harness.proxy_url("/api/phase")),
+        )
+        .await
+        .expect("post-refresh request bounded")
+        .expect("post-refresh response");
+        assert_eq!(response.status.as_u16(), 200, "entry={entry:#?}");
+        assert_eq!(response.body_text(), "ok");
+
+        let requests = h3_backend.received_requests().await;
+        assert!(
+            requests.iter().any(|request| request.path == "/phase"),
+            "{name} recovery must execute the explicit H3 handshake/stream script; requests={requests:?}"
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1626,14 +1770,23 @@ fn file_mode_yaml_for_h3_with_compression_and_read_timeout(
         }],
         "consumers": [],
         "upstreams": [],
-        "plugin_configs": [{
-            "id": "compress-1",
-            "proxy_id": "scripted-h3",
-            "plugin_name": "compression",
-            "scope": "proxy",
-            "enabled": true,
-            "config": { "algorithms": ["gzip"] },
-        }],
+        "plugin_configs": [
+            {
+                "id": "compress-1",
+                "proxy_id": "scripted-h3",
+                "plugin_name": "compression",
+                "scope": "proxy",
+                "enabled": true,
+                "config": { "algorithms": ["gzip"] },
+            },
+            {
+                "id": "h3-access-log",
+                "plugin_name": "stdout_logging",
+                "scope": "global",
+                "enabled": true,
+                "config": {},
+            }
+        ],
     });
     serde_yaml::to_string(&config).expect("yaml serialize")
 }
@@ -1873,6 +2026,155 @@ async fn spawn_h3_frontend_refined_buffering_harness(
     );
 
     (harness, h3_backend, https_port)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_mid_body_reset_and_goaway_surface_protocol_error_family() {
+    for (name, terminal_step) in [
+        ("reset-stream", H3Step::SendStreamReset(0x10c)),
+        ("goaway", H3Step::SendGoaway(0)),
+    ] {
+        let declared_len = 64usize;
+        let prefix = bytes::Bytes::from_static(b"partial-");
+        let (harness, h3_backend) = spawn_h3_streaming_downgrade_harness(
+            &format!("phase-h3-{name}"),
+            vec![
+                H3Step::AcceptStream,
+                H3Step::RespondHeaders(vec![
+                    (":status", "206".to_string()),
+                    (
+                        "content-range",
+                        format!("bytes 0-{}/{declared_len}", declared_len - 1),
+                    ),
+                    ("content-length", declared_len.to_string()),
+                    ("content-type", "text/plain".to_string()),
+                ]),
+                H3Step::RespondData(prefix.clone()),
+                H3Step::StallFor(Duration::from_millis(50)),
+                terminal_step,
+            ],
+            &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
+        )
+        .await;
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            raw_h2c_request(
+                &harness.proxy_url(&format!("/api/{name}")),
+                "GET",
+                &[("accept-encoding", "gzip"), ("range", "bytes=0-63")],
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name} response hung past the outer timeout"))
+        .unwrap_or_else(|error| panic!("{name} raw H2 client error: {error}"));
+
+        assert_eq!(
+            response.status, 206,
+            "{name} should fail after the streaming response head; response body_error={:?}",
+            response.body_error
+        );
+        assert_eq!(response.body.as_slice(), prefix.as_ref());
+        assert!(
+            response.body_error.is_some(),
+            "{name} must terminate the partial body with an error, not clean END_STREAM"
+        );
+
+        let logs = harness
+            .wait_for_log_contains(
+                |logs| logs.contains("\"body_error_class\":\"protocol_error\""),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(
+            logs.contains("\"body_error_class\":\"protocol_error\""),
+            "{name} must classify as the H3 protocol-error family; logs:\n{logs}"
+        );
+        assert!(
+            !logs.contains("\"body_error_class\":\"connection_reset\""),
+            "{name} was falsely classified as a connection reset instead of a stream protocol error; logs:\n{logs}"
+        );
+
+        let capability = fetch_capability_entry(&harness)
+            .await
+            .expect("capability lookup")
+            .expect("capability entry");
+        assert_eq!(
+            capability["plain_http"]["h3"].as_str(),
+            Some("supported"),
+            "{name} is a post-headers stream fault and must not falsely downgrade the backend's H3 capability; capability={capability:#?}"
+        );
+        let requests = h3_backend.received_requests().await;
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.path == format!("/{name}")),
+            "{name} request did not reach the native H3 backend; requests={requests:?}"
+        );
+        assert!(
+            h3_backend.step_errors().await.is_empty(),
+            "{name} script errors: {:?}",
+            h3_backend.step_errors().await
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_native_pool_partial_data_read_timeout_returns_timeout_without_downgrade() {
+    let prefix = bytes::Bytes::from_static(b"partial-");
+    let (harness, h3_backend) = spawn_h3_streaming_downgrade_harness_with_read_timeout(
+        "phase-h3-partial-read-timeout",
+        vec![
+            H3Step::AcceptStream,
+            H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-length", "64".to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]),
+            H3Step::RespondData(prefix),
+            H3Step::StallFor(Duration::from_secs(30)),
+        ],
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
+        200,
+    )
+    .await;
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(4),
+        raw_h2c_request(
+            &harness.proxy_url("/api/partial-timeout"),
+            "GET",
+            &[("accept-encoding", "gzip")],
+        ),
+    )
+    .await
+    .expect("native-H3 read timeout must beat the scripted 30s stall")
+    .expect("gateway timeout response");
+
+    assert_eq!(response.status, 504, "response={:?}", response.body);
+    assert!(
+        String::from_utf8_lossy(&response.body).contains("Backend timeout"),
+        "unexpected timeout body: {:?}",
+        response.body
+    );
+    let entry = fetch_capability_entry(&harness)
+        .await
+        .expect("capability lookup")
+        .expect("capability entry");
+    assert_eq!(
+        entry["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "a response read timeout proves latency, not loss of H3 capability; entry={entry:#?}"
+    );
+    let requests = h3_backend.received_requests().await;
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path == "/partial-timeout"),
+        "timeout request did not reach the native H3 backend; requests={requests:?}"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────

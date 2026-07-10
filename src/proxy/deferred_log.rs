@@ -80,15 +80,17 @@ impl BodyOutcome {
 
 pub async fn run_response_stream_termination_hooks(
     plugins: &[Arc<dyn Plugin>],
-    ctx: &RequestContext,
+    ctx: &mut RequestContext,
     response_status: u16,
     outcome: &BodyOutcome,
 ) {
+    crate::plugins::wait_for_response_stream_inspector(ctx).await;
     for plugin in plugins {
         plugin
             .on_response_stream_terminated(ctx, response_status, outcome)
             .await;
     }
+    crate::plugins::clear_response_stream_inspector_state(ctx);
 }
 
 /// Logger that defers a `log_with_mirror()` call until the response body
@@ -108,7 +110,7 @@ pub struct DeferredTransactionLogger {
 struct LogState {
     summary: TransactionSummary,
     plugins: Arc<Vec<Arc<dyn Plugin>>>,
-    ctx: Arc<RequestContext>,
+    ctx: RequestContext,
     /// Request start instant captured by the handler when it first sees the
     /// request. Used at fire time to re-derive `latency_total_ms` so
     /// streaming responses report the wall-clock duration from request
@@ -137,7 +139,7 @@ impl DeferredTransactionLogger {
     pub fn new(
         summary: TransactionSummary,
         plugins: Arc<Vec<Arc<dyn Plugin>>>,
-        ctx: Arc<RequestContext>,
+        ctx: RequestContext,
     ) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(Some(LogState {
@@ -170,7 +172,7 @@ impl DeferredTransactionLogger {
     pub fn new_with_start_time(
         summary: TransactionSummary,
         plugins: Arc<Vec<Arc<dyn Plugin>>>,
-        ctx: Arc<RequestContext>,
+        ctx: RequestContext,
         start_time: Instant,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -219,7 +221,7 @@ impl DeferredTransactionLogger {
         let LogState {
             mut summary,
             plugins,
-            ctx,
+            mut ctx,
             start_time,
         } = state;
         summary.body_completed = outcome.body_completed;
@@ -259,11 +261,17 @@ impl DeferredTransactionLogger {
                     let response_status = summary.response_status_code;
                     run_response_stream_termination_hooks(
                         plugins.as_slice(),
-                        &ctx,
+                        &mut ctx,
                         response_status,
                         &outcome,
                     )
                     .await;
+                    // The summary skeleton is captured when response headers
+                    // are committed, but streamed inspectors only know their
+                    // aggregate decision at body termination. Refresh metadata
+                    // after the mutable terminal hooks so every log sink sees
+                    // the finalized per-request values.
+                    summary.metadata = crate::proxy::clone_log_metadata(&ctx);
                     log_with_mirror(plugins.as_slice(), &summary, &ctx).await;
                 });
             }
@@ -298,11 +306,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> =
             Arc::new(vec![Arc::new(CountingPlugin(counter.clone()))]);
-        let ctx = Arc::new(RequestContext::new(
-            "1.2.3.4".to_string(),
-            "GET".to_string(),
-            "/".to_string(),
-        ));
+        let ctx = RequestContext::new("1.2.3.4".to_string(), "GET".to_string(), "/".to_string());
         let summary = fake_summary();
 
         let logger = DeferredTransactionLogger::new(summary, plugins, ctx);
@@ -320,11 +324,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> =
             Arc::new(vec![Arc::new(CountingPlugin(counter.clone()))]);
-        let ctx = Arc::new(RequestContext::new(
-            "1.2.3.4".to_string(),
-            "GET".to_string(),
-            "/".to_string(),
-        ));
+        let ctx = RequestContext::new("1.2.3.4".to_string(), "GET".to_string(), "/".to_string());
         let logger = DeferredTransactionLogger::new(fake_summary(), plugins, ctx);
         drop(logger);
 
@@ -342,11 +342,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
         let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
-        let ctx = Arc::new(RequestContext::new(
-            "1.2.3.4".to_string(),
-            "GET".to_string(),
-            "/".to_string(),
-        ));
+        let ctx = RequestContext::new("1.2.3.4".to_string(), "GET".to_string(), "/".to_string());
         let logger = DeferredTransactionLogger::new(fake_summary(), plugins, ctx);
         logger.fire(BodyOutcome::success(12345));
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -365,11 +361,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
         let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
-        let ctx = Arc::new(RequestContext::new(
-            "1.2.3.4".to_string(),
-            "GET".to_string(),
-            "/".to_string(),
-        ));
+        let ctx = RequestContext::new("1.2.3.4".to_string(), "GET".to_string(), "/".to_string());
 
         // Summary captured at "header flush" time has latency_total_ms=1.0,
         // latency_plugin_execution_ms=0.5, latency_backend_ttfb_ms=0.8.
@@ -413,11 +405,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
         let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
-        let ctx = Arc::new(RequestContext::new(
-            "1.2.3.4".to_string(),
-            "GET".to_string(),
-            "/".to_string(),
-        ));
+        let ctx = RequestContext::new("1.2.3.4".to_string(), "GET".to_string(), "/".to_string());
 
         let mut summary = fake_summary();
         summary.latency_total_ms = 42.0;
@@ -458,11 +446,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> =
             Arc::new(vec![Arc::new(CountingPlugin(counter.clone()))]);
-        let ctx = Arc::new(RequestContext::new(
-            "1.2.3.4".to_string(),
-            "GET".to_string(),
-            "/".to_string(),
-        ));
+        let ctx = RequestContext::new("1.2.3.4".to_string(), "GET".to_string(), "/".to_string());
         let logger = DeferredTransactionLogger::new(fake_summary(), plugins, ctx);
         logger.fire(BodyOutcome::success(10));
         drop(logger);
@@ -507,11 +491,8 @@ mod tests {
         let mut handles = Vec::with_capacity(2 * N);
 
         for _ in 0..N {
-            let ctx = Arc::new(RequestContext::new(
-                "1.2.3.4".to_string(),
-                "GET".to_string(),
-                "/".to_string(),
-            ));
+            let ctx =
+                RequestContext::new("1.2.3.4".to_string(), "GET".to_string(), "/".to_string());
             let logger = DeferredTransactionLogger::new(fake_summary(), plugins.clone(), ctx);
 
             // Two Arc clones — one for each task. Dropping the last clone

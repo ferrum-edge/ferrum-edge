@@ -14,6 +14,14 @@
 //!
 //! See `docs/plans/test_framework_scripted_backends.md` Phase 2 for the
 //! scope of these tests.
+//!
+//! Step-vocabulary audit: every `GrpcStep` is exercised in this file.
+//! `H2Step::SendGoawayAndClose`, `H2Step::SendRstStream`, and
+//! `H2Step::DropConnection` are exercised through the corresponding
+//! `GrpcStep::{SendGoaway,SendRstStream,CloseAfterHeaders}` lowering.
+//! `H2Step::SendGoaway` (the non-closing graceful form) is intentionally
+//! reserved for in-flight graceful-drain coverage: the round-2 matrix needs
+//! a terminal connection fault, so it uses `SendGoawayAndClose` instead.
 
 #![allow(clippy::bool_assert_comparison)]
 
@@ -395,6 +403,334 @@ async fn h2_stream_reset_classified_as_protocol_error() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// Round-2 error-code matrices. Error handling is asserted as a family because
+// the response may be a Trailers-Only gRPC error or a transport-level stream
+// error depending on whether the peer's GOAWAY/RST wins the header race.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_goaway_error_code_matrix_surfaces_error_family() {
+    for (name, error_code) in [
+        ("PROTOCOL_ERROR", 1_u32),
+        ("REFUSED_STREAM", 7_u32),
+        ("ENHANCE_YOUR_CALM", 11_u32),
+    ] {
+        let reservation = reserve_port().await.expect("reserve port");
+        let backend_port = reservation.port;
+        let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+            .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+            .step(GrpcStep::SendGoaway { error_code })
+            .spawn()
+            .expect("spawn backend");
+
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(grpc_file_config(backend_port, Value::Null))
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("spawn gateway");
+        let gw_port = harness
+            .proxy_base_url()
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .expect("gateway port");
+        let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+        let response = tokio::time::timeout(
+            Duration::from_secs(4),
+            client.unary("/grpc/ferrum.Echo/Ping", Bytes::new()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name} GOAWAY hung past the outer timeout"))
+        .unwrap_or_else(|error| panic!("{name} GOAWAY client error: {error}"));
+
+        let error_family = matches!(response.http_status, 502 | 503)
+            || response.grpc_status().is_some_and(|status| status != 0)
+            || response.stream_error.is_some();
+        assert!(
+            error_family,
+            "{name} GOAWAY must surface a gateway/gRPC/stream error family; response={response:?}"
+        );
+        assert_eq!(
+            backend.received_stream_count(),
+            1,
+            "{name} GOAWAY must be driven by one backend RPC"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_rst_stream_error_code_matrix_surfaces_error_family() {
+    for (name, error_code) in [
+        ("PROTOCOL_ERROR", 1_u32),
+        ("REFUSED_STREAM", 7_u32),
+        ("ENHANCE_YOUR_CALM", 11_u32),
+    ] {
+        let reservation = reserve_port().await.expect("reserve port");
+        let backend_port = reservation.port;
+        let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+            .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+            .step(GrpcStep::SendInitialHeaders)
+            .step(GrpcStep::SendRstStream { error_code })
+            .spawn()
+            .expect("spawn backend");
+
+        let harness = GatewayHarness::builder()
+            .mode_in_process()
+            .file_config(grpc_file_config(backend_port, Value::Null))
+            .pool_warmup_enabled(false)
+            .spawn()
+            .await
+            .expect("spawn gateway");
+        let gw_port = harness
+            .proxy_base_url()
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse::<u16>().ok())
+            .expect("gateway port");
+        let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+        let response = tokio::time::timeout(
+            Duration::from_secs(4),
+            client.unary("/grpc/ferrum.Echo/Ping", Bytes::new()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{name} RST_STREAM hung past the outer timeout"))
+        .unwrap_or_else(|error| panic!("{name} RST_STREAM client error: {error}"));
+
+        let error_family = matches!(response.http_status, 502 | 503)
+            || response.grpc_status().is_some_and(|status| status != 0)
+            || response.stream_error.is_some()
+            || response.trailers.is_none();
+        assert!(
+            error_family,
+            "{name} RST_STREAM must surface a gateway/gRPC/stream error family; response={response:?}"
+        );
+        assert_eq!(
+            backend.received_stream_count(),
+            1,
+            "{name} RST_STREAM must be driven by one backend RPC"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_pool_opens_fresh_connection_after_prior_stream_reset() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let grpc_ok_frame = Bytes::from_static(&[0, 0, 0, 0, 2, b'o', b'k']);
+    let backend = ScriptedH2Backend::builder_plain(reservation.into_listener())
+        .connection_scripts([
+            vec![
+                H2Step::ExpectHeaders(MatchHeaders::any()),
+                H2Step::DrainRequestBody,
+                H2Step::RespondHeaders(vec![
+                    (":status", "200".into()),
+                    ("content-type", "application/grpc".into()),
+                ]),
+                H2Step::SendRstStream { error_code: 7 },
+            ],
+            vec![
+                H2Step::ExpectHeaders(MatchHeaders::any()),
+                H2Step::DrainRequestBody,
+                H2Step::RespondHeaders(vec![
+                    (":status", "200".into()),
+                    ("content-type", "application/grpc".into()),
+                ]),
+                H2Step::RespondData {
+                    data: grpc_ok_frame,
+                    end_stream: false,
+                },
+                H2Step::RespondTrailers(vec![("grpc-status", "0".into())]),
+            ],
+        ])
+        .spawn()
+        .expect("spawn backend");
+
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(grpc_file_config(backend_port, Value::Null))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(4),
+        client.unary("/grpc/ferrum.Echo/Reset", Bytes::new()),
+    )
+    .await
+    .expect("first RPC bounded")
+    .expect("first response surfaced");
+    assert!(
+        first.grpc_status().is_some_and(|status| status != 0)
+            || first.stream_error.is_some()
+            || first.trailers.is_none(),
+        "first RPC must expose the scripted reset; response={first:?}"
+    );
+
+    // The connection-index-0 script terminates after its RST_STREAM and the
+    // fixture gives the H2 driver a bounded 100ms flush tail. Wait beyond that
+    // tail so request two deterministically exercises stale-pool replacement,
+    // not a request-write-vs-connection-close race.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(4),
+        client.unary("/grpc/ferrum.Echo/Healthy", Bytes::new()),
+    )
+    .await
+    .expect("second RPC bounded")
+    .expect("second response surfaced");
+    assert_eq!(second.grpc_status(), Some(0), "response={second:?}");
+    assert!(
+        second
+            .messages
+            .iter()
+            .any(|message| message.as_ref() == b"ok"),
+        "replacement connection did not return the healthy payload; response={second:?}"
+    );
+    assert!(
+        backend.accepted_connections() >= 2,
+        "the reset connection must not be reused; accepted_connections={} streams={:?}",
+        backend.accepted_connections(),
+        backend.received_streams().await
+    );
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_trailers_only_response_preserves_status_in_initial_headers() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedH2Backend::builder_plain(reservation.into_listener())
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::DrainRequestBody)
+        .step(H2Step::RespondHeadersEndStream(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc".into()),
+            ("grpc-status", "0".into()),
+            ("grpc-message", "trailers-only".into()),
+        ]))
+        .spawn()
+        .expect("spawn backend");
+
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(grpc_file_config(backend_port, Value::Null))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let response = tokio::time::timeout(
+        Duration::from_secs(4),
+        client.unary("/grpc/ferrum.Echo/Ping", Bytes::new()),
+    )
+    .await
+    .expect("trailers-only RPC bounded")
+    .expect("trailers-only response surfaced");
+
+    assert_eq!(response.http_status, 200, "response={response:?}");
+    assert_eq!(response.grpc_status(), Some(0), "response={response:?}");
+    assert!(response.messages.is_empty(), "response={response:?}");
+    assert!(response.stream_error.is_none(), "response={response:?}");
+    assert_eq!(backend.received_stream_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_close_after_headers_surfaces_clean_error_family() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::CloseAfterHeaders)
+        .spawn()
+        .expect("spawn backend");
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(grpc_file_config(backend_port, Value::Null))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let response = tokio::time::timeout(
+        Duration::from_secs(4),
+        client.unary("/grpc/ferrum.Echo/Ping", Bytes::new()),
+    )
+    .await
+    .expect("close-after-headers RPC bounded")
+    .expect("response surfaced");
+
+    assert!(
+        response.effective_grpc_status() != 0 || response.stream_error.is_some(),
+        "backend close after headers must not become a successful RPC; response={response:?}"
+    );
+    assert_eq!(backend.received_stream_count(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn grpc_stall_after_headers_is_bounded_by_backend_read_timeout() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
+        .step(GrpcStep::AcceptRpc(MatchRpc::any()))
+        .step(GrpcStep::StallAfterHeaders(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn backend");
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(grpc_file_config(
+            backend_port,
+            json!({ "backend_read_timeout_ms": 300 }),
+        ))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let gw_port = harness
+        .proxy_base_url()
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .expect("gateway port");
+    let client = GrpcClient::h2c(format!("127.0.0.1:{gw_port}"));
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.unary("/grpc/ferrum.Echo/Ping", Bytes::new()),
+    )
+    .await
+    .expect("gateway read timeout must beat the scripted 30s stall")
+    .expect("timeout response surfaced");
+
+    assert!(
+        response.effective_grpc_status() != 0 || response.stream_error.is_some(),
+        "stalled backend must not become a successful RPC; response={response:?}"
+    );
+    assert_eq!(backend.received_stream_count(), 1);
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Test 3 — gRPC backend omits trailers → client sees a well-formed
 //          non-OK status, not a hang.
 // ────────────────────────────────────────────────────────────────────────────
@@ -503,7 +839,10 @@ async fn grpc_deadline_exceeded_propagates_as_deadline_exceeded_not_unavailable(
     let backend_port = reservation.port;
     let _backend = ScriptedGrpcBackend::builder_plain(reservation.into_listener())
         .step(GrpcStep::AcceptRpc(MatchRpc::any()))
-        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::SendInitialHeadersOverride(vec![
+            (":status", "200".into()),
+            ("content-type", "application/grpc+proto".into()),
+        ]))
         // Empty data frame is fine for unary — trailers carry the status.
         .step(GrpcStep::RespondStatus {
             code: 4, // DEADLINE_EXCEEDED
@@ -670,7 +1009,7 @@ async fn h2_window_stall_triggers_backend_read_timeout_on_grpc() {
         .with_settings(settings)
         .step(H2Step::ExpectHeaders(MatchHeaders::any()))
         // Stall for 30s — the gateway's watchdog should fire far before this.
-        .step(H2Step::Sleep(Duration::from_secs(30)))
+        .step(H2Step::StallWindowFor(Duration::from_secs(30)))
         .spawn()
         .expect("spawn backend");
 

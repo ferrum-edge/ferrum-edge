@@ -720,7 +720,7 @@ async fn test_streamed_event_stream_releases_inflight_marker_on_clean_completion
     );
 
     plugin
-        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::success(32))
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(32))
         .await;
     assert_eq!(
         plugin.tracked_keys_count(),
@@ -769,7 +769,7 @@ async fn test_streamed_event_stream_retains_inflight_marker_on_client_disconnect
     // The client stopped consuming mid-stream (Drop safety net): the body never
     // completed, so the marker must survive to block an immediate retry.
     plugin
-        .on_response_stream_terminated(&ctx, 200, &BodyOutcome::client_disconnect(32))
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::client_disconnect(32))
         .await;
     assert_eq!(
         plugin.tracked_keys_count(),
@@ -836,7 +836,7 @@ async fn test_stale_stream_end_does_not_clear_successor_inflight_marker() {
     assert_eq!(plugin.tracked_keys_count(), Some(1));
 
     plugin
-        .on_response_stream_terminated(&original_ctx, 200, &BodyOutcome::success(32))
+        .on_response_stream_terminated(&mut original_ctx, 200, &BodyOutcome::success(32))
         .await;
 
     let mut duplicate_ctx = RequestContext::new(
@@ -861,7 +861,7 @@ async fn test_stale_stream_end_does_not_clear_successor_inflight_marker() {
     );
 
     plugin
-        .on_response_stream_terminated(&successor_ctx, 200, &BodyOutcome::success(32))
+        .on_response_stream_terminated(&mut successor_ctx, 200, &BodyOutcome::success(32))
         .await;
     assert_eq!(
         plugin.tracked_keys_count(),

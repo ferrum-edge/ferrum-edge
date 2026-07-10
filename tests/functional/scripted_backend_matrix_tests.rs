@@ -117,6 +117,14 @@ gateway_matrix! {
 //   backend_accepts_then_rst_returns_502__h2_to_grpc
 //   backend_accepts_then_rst_returns_502__h2_to_tcp
 //   backend_accepts_then_rst_returns_502__grpc_to_grpc
+//
+// The gRPC cell is also the regression guard for #2057. Unlike the
+// bodyless GET cells, its raw h2 client sends request HEADERS and DATA
+// separately. A fast Trailers-Only UNAVAILABLE may close the request
+// direction before the local DATA write runs, so the client can observe
+// `inactive stream` from `send_data` while the response future still carries
+// the correctly formatted gateway error. The client must keep awaiting that
+// response rather than treating the request-write race as the RPC outcome.
 gateway_matrix! {
     name = backend_accepts_then_rst_returns_502,
     frontend = [H1, H2, Grpc],

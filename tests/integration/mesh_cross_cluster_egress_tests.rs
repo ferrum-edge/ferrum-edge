@@ -21,7 +21,8 @@ use ferrum_edge::modes::mesh::config::{
 };
 use ferrum_edge::modes::mesh::{MeshTopology, prepare_gateway_config_for_mesh};
 use ferrum_edge::proxy::mesh_mtls_pool::{
-    MESH_CROSS_CLUSTER_TAG, MESH_EASTWEST_SNI_TAG, MESH_MTLS_PORT_TAG, MESH_MTLS_TARGET_TAG,
+    MESH_CROSS_CLUSTER_TAG, MESH_EASTWEST_SNI_TAG, MESH_MTLS_AUTHORITY_HOST_TAG,
+    MESH_MTLS_DIAL_HOST_TAG, MESH_MTLS_PORT_TAG, MESH_MTLS_TARGET_TAG,
 };
 
 use ferrum_edge::identity::spiffe::{SpiffeId, TrustDomain};
@@ -337,18 +338,15 @@ fn sidecar_client_runtime() -> ferrum_edge::modes::mesh::MeshRuntimeConfig {
     runtime
 }
 
-/// [1] P1: a TCP (stream-family) service port with a remote workload + a
-/// matching east-west gateway must yield NO cross-cluster target. The
-/// cross-cluster append is HTTP-family-only; the L4 tunnel paths can't carry the
-/// SNI-passthrough semantics, so they must never get a gateway-addressed target.
+/// Raw TCP now materializes a per-pod cross-cluster Sidecar tunnel target. The
+/// east-west gateway is the network dial, while the real pod IP remains the
+/// CONNECT authority and the L4 service port always uses a per-port SNI alias.
 #[test]
-fn no_cross_cluster_target_for_tcp_service_port() {
+fn sidecar_cross_cluster_target_for_tcp_service_port_uses_per_port_sni() {
     let runtime = sidecar_client_runtime();
 
-    // A TCP service port (7070). Local + remote workloads both expose it; the
-    // remote workload sits on net-b with a matching gateway, so WITHOUT the
-    // HTTP-family gate a cross-cluster target would be appended — proving the
-    // gate (not just an absence of remote endpoints).
+    // The TCP port deliberately shares :7070 with the service's sole HTTP port.
+    // HTTP keeps the base FQDN; L4 must still use p7070 and a distinct id.
     let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
     local.ports = vec![WorkloadPort {
         port: 7070,
@@ -368,12 +366,20 @@ fn no_cross_cluster_target_for_tcp_service_port() {
         cluster_ips: vec!["10.96.0.50".to_string()],
         name: "svc-b".to_string(),
         namespace: "default".to_string(),
-        ports: vec![ServicePort {
-            port: 7070,
-            protocol: AppProtocol::Tcp,
-            name: Some("tcp".to_string()),
-            target_port: None,
-        }],
+        ports: vec![
+            ServicePort {
+                port: 7070,
+                protocol: AppProtocol::Http,
+                name: Some("http-same-number".to_string()),
+                target_port: None,
+            },
+            ServicePort {
+                port: 7070,
+                protocol: AppProtocol::Tcp,
+                name: Some("tcp".to_string()),
+                target_port: None,
+            },
+        ],
         workloads: vec![
             WorkloadRef {
                 spiffe_id: local.spiffe_id.clone(),
@@ -393,25 +399,34 @@ fn no_cross_cluster_target_for_tcp_service_port() {
     let tcp_targets = upstreams
         .get("__mesh-out-tcp-upstream-default-svc-b-7070")
         .expect("raw-TCP per-port upstream must materialize for the TCP service port");
-    // ... and carries NO cross-cluster target.
-    let cross = tcp_targets
+    let cross: Vec<_> = tcp_targets
         .iter()
         .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
-        .count();
+        .collect();
+    assert_eq!(cross.len(), 1);
+    let target = cross[0];
+    assert_eq!(target.port, 7070);
+    assert!(target.host.starts_with("mesh-xc-l4-"));
     assert_eq!(
-        cross, 0,
-        "a TCP service port must NOT yield a cross-cluster target (HTTP-family only)"
+        target.tags.get(MESH_EASTWEST_SNI_TAG).map(String::as_str),
+        Some("p7070.svc-b.default.svc.cluster.local")
     );
-    // No cross-cluster target may appear in ANY materialized upstream either.
-    let cross_anywhere = upstreams
-        .values()
-        .flatten()
-        .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
-        .count();
     assert_eq!(
-        cross_anywhere, 0,
-        "no cross-cluster target may be materialized for a TCP-only service"
+        target.tags.get(MESH_MTLS_DIAL_HOST_TAG).map(String::as_str),
+        Some(GATEWAY_HOST)
     );
+    assert_eq!(
+        target
+            .tags
+            .get(MESH_MTLS_AUTHORITY_HOST_TAG)
+            .map(String::as_str),
+        Some("10.244.5.5")
+    );
+    assert_eq!(
+        target.tags.get("mesh.trust_domain").map(String::as_str),
+        Some(REMOTE_TRUST_DOMAIN)
+    );
+    assert!(!target.tags.contains_key("mesh.spiffe_id"));
 }
 
 /// Multi-port east-west (issue #2010 phase 3): a multi-port HTTP service now
@@ -2296,11 +2311,10 @@ fn ambient_cross_cluster_distinct_td_distinct_endpoints_both_emitted() {
     );
 }
 
-/// Ambient: a TCP (stream-family) service port must yield NO cross-cluster
-/// target (HTTP-family only — the L4 tunnel can't carry the SNI-passthrough
-/// semantics), proving the HTTP-family gate on the Ambient branch too.
+/// Ambient raw TCP uses the existing per-pod HBONE cross-cluster target shape;
+/// the widened materializer stamps the L4 per-port alias.
 #[test]
-fn ambient_no_cross_cluster_target_for_tcp_service_port() {
+fn ambient_cross_cluster_target_for_tcp_service_port_uses_per_port_sni() {
     let runtime = ambient_client_runtime();
 
     let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
@@ -2341,13 +2355,107 @@ fn ambient_no_cross_cluster_target_for_tcp_service_port() {
     mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
 
     let upstreams = materialize_all_upstream_targets(mesh, &runtime);
-    let cross_anywhere = upstreams
-        .values()
-        .flatten()
+    let tcp_targets = upstreams
+        .get("__mesh-out-tcp-upstream-default-svc-b-7070")
+        .expect("Ambient raw-TCP upstream");
+    let cross: Vec<_> = tcp_targets
+        .iter()
         .filter(|t| t.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
-        .count();
+        .collect();
+    assert_eq!(cross.len(), 1);
     assert_eq!(
-        cross_anywhere, 0,
-        "an Ambient TCP-only service must yield NO cross-cluster target (HTTP-family only)"
+        cross[0].tags.get(MESH_EASTWEST_SNI_TAG).map(String::as_str),
+        Some("p7070.svc-b.default.svc.cluster.local")
     );
+    assert_eq!(
+        cross[0].tags.get(HBONE_DIAL_HOST_TAG).map(String::as_str),
+        Some(GATEWAY_HOST)
+    );
+    assert_eq!(
+        cross[0]
+            .tags
+            .get(HBONE_AUTHORITY_HOST_TAG)
+            .map(String::as_str),
+        Some("10.244.5.5")
+    );
+}
+
+#[test]
+fn cross_cluster_udp_materializes_per_port_targets_for_both_captured_topologies() {
+    for topology in [MeshTopology::Sidecar, MeshTopology::Ambient] {
+        let mut runtime = default_mesh_runtime();
+        runtime.topology = topology;
+        runtime.workload_spiffe_id =
+            Some("spiffe://cluster.local/ns/default/sa/client".to_string());
+        let mut local = workload_for("svc-b", "default", [("app", "svc-b")], ["10.0.0.1"]);
+        local.ports = vec![WorkloadPort {
+            port: 5353,
+            protocol: AppProtocol::Udp,
+            name: Some("dns".to_string()),
+        }];
+        let mut remote = remote_workload(Some(REMOTE_NETWORK));
+        remote.ports = vec![WorkloadPort {
+            port: 5353,
+            protocol: AppProtocol::Udp,
+            name: Some("dns".to_string()),
+        }];
+        let service = MeshService {
+            cluster_ips: vec!["10.96.0.53".to_string()],
+            name: "svc-b".to_string(),
+            namespace: "default".to_string(),
+            ports: vec![
+                ServicePort {
+                    port: 5353,
+                    protocol: AppProtocol::Tcp,
+                    name: Some("dns-tcp".to_string()),
+                    target_port: None,
+                },
+                ServicePort {
+                    port: 5353,
+                    protocol: AppProtocol::Udp,
+                    name: Some("dns-udp".to_string()),
+                    target_port: None,
+                },
+            ],
+            workloads: vec![
+                WorkloadRef {
+                    spiffe_id: local.spiffe_id.clone(),
+                },
+                WorkloadRef {
+                    spiffe_id: remote.spiffe_id.clone(),
+                },
+            ],
+            protocol_overrides: std::collections::HashMap::new(),
+        };
+        let mut mesh = mesh_config_with(vec![local, remote], vec![service], Vec::new());
+        mesh.multi_cluster = Some(multi_cluster_with_gateway(Some(REMOTE_NETWORK)));
+        let upstreams = materialize_all_upstream_targets(mesh, &runtime);
+        let targets = upstreams
+            .get("__mesh-out-udp-upstream-default-svc-b-5353")
+            .expect("UDP per-port upstream");
+        let cross: Vec<_> = targets
+            .iter()
+            .filter(|target| target.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+            .collect();
+        assert_eq!(cross.len(), 1, "{topology:?}");
+        assert_eq!(
+            cross[0].tags.get(MESH_EASTWEST_SNI_TAG).map(String::as_str),
+            Some("p5353-udp.svc-b.default.svc.cluster.local")
+        );
+        assert_eq!(cross[0].port, 5353);
+        assert!(!cross[0].tags.contains_key("mesh.spiffe_id"));
+        let tcp_cross = upstreams
+            .get("__mesh-out-tcp-upstream-default-svc-b-5353")
+            .expect("TCP per-port upstream")
+            .iter()
+            .find(|target| target.tags.contains_key(MESH_CROSS_CLUSTER_TAG))
+            .expect("cross-cluster TCP target");
+        assert_eq!(
+            tcp_cross
+                .tags
+                .get(MESH_EASTWEST_SNI_TAG)
+                .map(String::as_str),
+            Some("p5353-tcp.svc-b.default.svc.cluster.local")
+        );
+    }
 }

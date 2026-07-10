@@ -1482,7 +1482,7 @@ impl Plugin for AiTranscriptAudit {
 
     async fn on_response_stream_terminated(
         &self,
-        ctx: &RequestContext,
+        ctx: &mut RequestContext,
         response_status: u16,
         outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {
@@ -1497,21 +1497,13 @@ impl Plugin for AiTranscriptAudit {
         };
         let downstream_terminated = slot.downstream_terminated.load(Ordering::Relaxed);
         let captured = slot.captured.lock().ok().and_then(|mut guard| guard.take());
-        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
-
-        let sample_hit = staging
-            .as_ref()
+        let sample_hit = self
+            .staging
+            .get(&record_id)
             .map(|staging| staging.sample_hit)
             .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
         let errored = response_status >= 400 || !outcome.body_completed;
         let guardrail = guardrail_fired(&ctx.metadata) || downstream_terminated;
-        let (emit, reason) = self.emit_decision(sample_hit, guardrail, errored);
-        if !emit {
-            return;
-        }
-
-        // A response already being streamed cannot be rejected, so the
-        // fail-closed sink stance only applies to buffered responses.
         let (excerpt, truncated, hash) = if downstream_terminated {
             (None, true, None)
         } else {
@@ -1524,6 +1516,23 @@ impl Plugin for AiTranscriptAudit {
                 None => (None, true, None), // abnormal end: on_end never ran
             }
         };
+        if let Some(response_hash) = hash.as_ref() {
+            ctx.metadata
+                .insert(MD_RESPONSE_HASH.to_string(), response_hash.clone());
+        }
+        let (emit, reason) = self.emit_decision(sample_hit, guardrail, errored);
+        if !emit {
+            // Match the buffered path: the response evidence is finalized, but
+            // no record was emitted at this hook. Keep staging for the immediate
+            // log fallback to consume and mark the sink status non-terminal.
+            ctx.metadata
+                .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
+            return;
+        }
+
+        // A response already being streamed cannot be rejected, so the
+        // fail-closed sink stance only applies to buffered responses.
+        let staging = self.staging.remove(&record_id).map(|(_, value)| value);
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
             &record_id,
@@ -1537,7 +1546,13 @@ impl Plugin for AiTranscriptAudit {
             reason,
             None,
         );
-        let _ = self.enqueue(record);
+        let status = match self.enqueue(record) {
+            SinkOutcome::Queued => "queued",
+            SinkOutcome::Dropped => "dropped",
+            SinkOutcome::Rejected => "rejected",
+        };
+        ctx.metadata
+            .insert(MD_SINK_STATUS.to_string(), status.to_string());
     }
 
     // ---- fallback emission ----

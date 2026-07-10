@@ -841,6 +841,26 @@ mod tests {
     }
 
     #[test]
+    fn grpc_status_assertion_accepts_inactive_request_stream_with_formatted_error() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("grpc-status", "14".parse().unwrap());
+        let response = MatrixResponse::Grpc(GrpcResponse {
+            http_status: 200,
+            headers,
+            messages: Vec::new(),
+            raw_body_frames: Vec::new(),
+            trailers: None,
+            stream_error: None,
+            request_send_error: Some("request body error: user error: inactive stream".into()),
+        });
+
+        // A fast Trailers-Only response can close the request direction before
+        // the raw h2 client writes DATA. The request-send error is diagnostic;
+        // the complete response remains the authoritative RPC outcome (#2057).
+        FrontendKind::Grpc.assert_status(&response, 502);
+    }
+
+    #[test]
     fn yaml_files_are_per_backend_kind() {
         let h1 = BackendKind::H1.file_mode_yaml(8000);
         assert!(h1.contains("listen_path: /api"), "got {h1}");

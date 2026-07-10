@@ -75,7 +75,7 @@ fn h3_plain_and_grpc_bridges_keep_unresolved_base_proxy_for_retries() {
 fn h3_native_retry_loop_resolves_effective_proxy_per_attempt() {
     let source = include_str!("../../../src/http3/server.rs");
     let retry_loop = source
-        .find("} else if let Some(retry_config) = &proxy.retry {")
+        .find(") = if let Some(retry_config) = &proxy.retry {")
         .expect("buffered native-H3 retry loop must remain present");
     let loop_src = &source[retry_loop..];
 

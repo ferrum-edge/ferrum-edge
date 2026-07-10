@@ -75,15 +75,16 @@ pub enum HttpStep {
         /// - `false` → FIN (shutdown + drop).
         reset: bool,
     },
-    /// Drip a body a chunk at a time, with a pause between chunks. Tests
-    /// "slow backend" behaviour and `backend_read_timeout_ms`.
+    /// Drip `body` `chunk_size` bytes at a time, with a pause between
+    /// chunks. Tests "slow backend" behaviour and
+    /// `backend_read_timeout_ms`.
     TrickleBody {
         status: u16,
         reason: String,
         headers: Vec<(String, String)>,
-        chunk: Vec<u8>,
+        body: Vec<u8>,
+        chunk_size: usize,
         pause: Duration,
-        count: u32,
     },
     /// Send a deliberately malformed header line (e.g., missing colon) then
     /// close. Triggers client-side parse errors.
@@ -168,6 +169,7 @@ impl Request {
 pub struct ScriptedHttp1BackendBuilder {
     listener: TcpListener,
     steps: Vec<HttpStep>,
+    connection_scripts: Vec<Vec<HttpStep>>,
 }
 
 impl ScriptedHttp1BackendBuilder {
@@ -175,6 +177,7 @@ impl ScriptedHttp1BackendBuilder {
         Self {
             listener,
             steps: Vec::new(),
+            connection_scripts: Vec::new(),
         }
     }
 
@@ -188,12 +191,25 @@ impl ScriptedHttp1BackendBuilder {
         self
     }
 
+    /// Supply connection-indexed scripts. Connection 0 receives the first
+    /// script, connection 1 the second, and later connections repeat the
+    /// final script. This is useful for deterministic retry tests such as
+    /// `503 -> 200` without coordinating an out-of-band mutable flag.
+    ///
+    /// When non-empty, these scripts take precedence over [`Self::step`] /
+    /// [`Self::steps`].
+    pub fn connection_scripts(mut self, scripts: impl IntoIterator<Item = Vec<HttpStep>>) -> Self {
+        self.connection_scripts.extend(scripts);
+        self
+    }
+
     pub fn spawn(self) -> io::Result<ScriptedHttp1Backend> {
         let port = self.listener.local_addr()?.port();
         let state = Arc::new(Http1State::default());
         let state_task = state.clone();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let steps = self.steps;
+        let connection_scripts = self.connection_scripts;
         let listener = self.listener;
         let handle = tokio::spawn(async move {
             loop {
@@ -202,9 +218,14 @@ impl ScriptedHttp1BackendBuilder {
                     _ = &mut shutdown_rx => return,
                     accept_result = listener.accept() => {
                         let Ok((stream, _addr)) = accept_result else { continue; };
-                        state_task.accepted.fetch_add(1, Ordering::SeqCst);
+                        let connection_index =
+                            state_task.accepted.fetch_add(1, Ordering::SeqCst) as usize;
                         let state_conn = state_task.clone();
-                        let script = steps.clone();
+                        let script = connection_scripts
+                            .get(connection_index)
+                            .or_else(|| connection_scripts.last())
+                            .cloned()
+                            .unwrap_or_else(|| steps.clone());
                         let track = state_conn.clone();
                         let jh = tokio::spawn(async move {
                             let state_err = state_conn.clone();
@@ -593,9 +614,9 @@ async fn run_http_script(
                 status,
                 reason,
                 headers,
-                chunk,
+                body,
+                chunk_size,
                 pause,
-                count,
             } => {
                 if !request_consumed
                     && let Ok(Some(r)) = read_http_prelude(&mut stream, &mut carryover).await
@@ -610,8 +631,14 @@ async fn run_http_script(
                     stream.write_all(format!("{k}: {v}\r\n").as_bytes()).await?;
                 }
                 stream.write_all(b"\r\n").await?;
-                for _ in 0..count {
-                    if stream.write_all(&chunk).await.is_err() {
+                if chunk_size == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "TrickleBody chunk_size must be greater than zero",
+                    ));
+                }
+                for chunk in body.chunks(chunk_size) {
+                    if stream.write_all(chunk).await.is_err() {
                         break;
                     }
                     tokio::time::sleep(pause).await;
@@ -732,9 +759,9 @@ mod tests {
                 status: 200,
                 reason: "OK".into(),
                 headers: vec![("Content-Length".into(), "4".into())],
-                chunk: b"xy".to_vec(),
+                body: b"xyxy".to_vec(),
+                chunk_size: 2,
                 pause: Duration::from_millis(5),
-                count: 2,
             })
             .spawn()
             .expect("spawn");

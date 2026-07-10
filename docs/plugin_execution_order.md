@@ -75,11 +75,13 @@ Request In
 
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, CORS returns a `204` preflight response in phase 1 without ever reaching authentication. Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
+When a plugin returns a replacement body from `transform_response_body`, the core immediately calls that plugin's `on_response_body_transformed` callback before the next transform. This lets the transforming plugin invalidate representation-specific response headers only when it actually changed the body; the callback does not run when the transform returns `None`.
+
 For gateway-generated rejection responses, a small set of header-only `after_proxy` plugins opt in to still run. This preserves headers such as `Access-Control-Allow-Origin`, `traceparent`, and request IDs on rejected responses without treating them as backend responses.
 
 `after_proxy` rejections are also honored before anything is sent downstream. This matters for plugins like `response_size_limiting`, whose `Content-Length` fast path now replaces oversized backend responses instead of only logging a warning.
 
-`on_response_stream_terminated` is streaming-only. It receives the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup and accounting after the stream ends. Plugins that hold per-request state across streamed responses use this hook for cleanup when doing so does not weaken correctness guarantees, keying off the terminal `BodyOutcome`; for example, `request_deduplication` releases a non-buffered streamed marker on clean completion (`body_completed`) but intentionally retains it until `inflight_ttl_seconds` when the stream is interrupted (client disconnect or backend error), so a same-key retry cannot re-execute a side-effecting operation that has no replayable response or tombstone.
+`on_response_stream_terminated` is streaming-only. It receives mutable request context plus the terminal body outcome and response status, cannot replace the response or access a full body buffer, and fires before the final `TransactionSummary.metadata` snapshot and `log` from the same deferred terminal path used for streaming accounting. It is distinct from `ResponseStreamInspector` chunk inspection: this hook is for state cleanup, accounting, and aggregate metadata write-back after the stream ends. Plugins can key bounded shared inspector state by `ctx.response_stream_id()`, remove it here on every terminal outcome (including client disconnect), and write the aggregate into `ctx.metadata`; for example, `ai_tool_governor` writes streamed dry-run decisions before transaction logging. `request_deduplication` uses the same hook to release a non-buffered streamed marker on clean completion (`body_completed`) but intentionally retains it until `inflight_ttl_seconds` when the stream is interrupted (client disconnect or backend error), so a same-key retry cannot re-execute a side-effecting operation that has no replayable response or tombstone.
 
 ## Stream Proxy Lifecycle (TCP/UDP)
 
@@ -312,11 +314,11 @@ Given all built-in plugins enabled, the execution order is:
 | 41 | `openapi_validator` | 2960 | before_proxy, on_final_request_body, on_final_response_body |
 | 42 | `ai_semantic_firewall` | 2968 | before_proxy, on_response_body |
 | 43 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
-| 44 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
+| 44 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector, on_response_stream_terminated |
 | 45 | `ai_semantic_cache` | 2980 | before_proxy, after_proxy, on_final_response_body |
 | 46 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, normalize_response_body, response_stream_inspector |
-| 47 | `mcp_gateway` | 2992 | before_proxy, transform_request_body |
-| 48 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body |
+| 47 | `mcp_gateway` | 2992 | before_proxy, transform_request_body, transform_response_body |
+| 48 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body, response_stream_inspector |
 | 49 | `mesh_route_dispatch` | 2995 | before_proxy |
 | 50 | `request_transformer` | 3000 | before_proxy, transform_request_body |
 | 51 | `serverless_function` | 3025 | before_proxy |
@@ -596,7 +598,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
 | `ai_stream_router` | ✓ | | | | | Claims `stream: true` OpenAI Chat Completions, route-overrides to a provider, normalizes provider SSE to OpenAI SSE |
 | `ai_federation` | ✓ | ✓ | | | | Routes to AI providers, normalizes responses |
-| `mcp_gateway` | ✓ | ✓ | | | | Parses MCP JSON-RPC, emits `mcp.*` metadata, and routes namespaced MCP tools/resources/prompts |
+| `mcp_gateway` | ✓ | ✓ | | | | Parses MCP JSON-RPC, emits `mcp.*` metadata, routes namespaced MCP tools/resources/prompts, and reverse-maps routed JSON results |
 | `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP Agent Cards, applies method policy, and emits `a2a.*` metadata |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
 | `ai_token_metrics` | ✓ | ✓ | | | | Parses JSON response bodies for token usage |

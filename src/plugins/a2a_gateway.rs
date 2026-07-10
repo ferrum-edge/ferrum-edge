@@ -5,13 +5,17 @@
 //! gRPC. The plugin does not own A2A task state or route between agents in V1.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::Utc;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use tracing::warn;
 use url::Url;
 
-use super::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext};
+use super::{
+    HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, ResponseStreamAction,
+    ResponseStreamInspector,
+};
 
 const DEFAULT_ENDPOINT_PATH: &str = "/a2a";
 const DEFAULT_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
@@ -19,6 +23,7 @@ const DEFAULT_PROTOCOL_VERSION: &str = "0.3.0";
 const DEFAULT_VERSION_HEADER: &str = "A2A-Version";
 const DEFAULT_MAX_DETECTION_BODY_BYTES: u64 = 1024 * 1024;
 const DEFAULT_GRPC_SERVICE: &str = "lf.a2a.v1.A2AService";
+const MAX_SSE_EVENT_BYTES: usize = 1024 * 1024;
 
 /// Response headers that describe the backend's original body and become stale
 /// the moment the Agent Card body is re-serialized as uncompressed JSON. Dropped
@@ -170,6 +175,212 @@ pub struct A2aGateway {
     discovery: A2aDiscoveryConfig,
     observability: A2aObservabilityConfig,
     policy: A2aPolicyConfig,
+}
+
+/// Observe-only SSE parser for one A2A response.
+///
+/// Bytes are never retained for release: `on_chunk` copies and returns the
+/// current chunk immediately, while this owned state independently reassembles
+/// SSE lines/events for metadata extraction. The per-event cap prevents a
+/// malformed stream without delimiters from growing the accumulator without
+/// bound; oversized events still pass through unchanged and are counted.
+struct A2aSseStreamInspector {
+    binding: Option<&'static str>,
+    line: Vec<u8>,
+    data: Vec<u8>,
+    line_had_bytes: bool,
+    pending_cr: bool,
+    discarding_event: bool,
+    event_has_data: bool,
+    stream_events: u64,
+    task_id: Option<String>,
+    context_id: Option<String>,
+    task_state: Option<String>,
+    emitted: bool,
+}
+
+impl A2aSseStreamInspector {
+    fn new(binding: Option<&'static str>) -> Self {
+        Self {
+            binding,
+            line: Vec::new(),
+            data: Vec::new(),
+            line_had_bytes: false,
+            pending_cr: false,
+            discarding_event: false,
+            event_has_data: false,
+            stream_events: 0,
+            task_id: None,
+            context_id: None,
+            task_state: None,
+            emitted: false,
+        }
+    }
+
+    fn ingest(&mut self, chunk: &[u8]) {
+        for &byte in chunk {
+            if self.pending_cr {
+                self.pending_cr = false;
+                self.finish_line();
+                if byte == b'\n' {
+                    continue;
+                }
+            }
+            match byte {
+                b'\r' => self.pending_cr = true,
+                b'\n' => self.finish_line(),
+                _ => self.push_line_byte(byte),
+            }
+        }
+    }
+
+    fn push_line_byte(&mut self, byte: u8) {
+        self.line_had_bytes = true;
+        if self.discarding_event {
+            return;
+        }
+        if self.line.len() == MAX_SSE_EVENT_BYTES {
+            self.event_has_data |= self.line.starts_with(b"data:");
+            self.discarding_event = true;
+            self.line.clear();
+            self.data.clear();
+            return;
+        }
+        self.line.push(byte);
+    }
+
+    fn finish_line(&mut self) {
+        if !self.line_had_bytes {
+            self.finish_event();
+            return;
+        }
+
+        if !self.discarding_event
+            && let Some(payload) = self.line.strip_prefix(b"data:")
+        {
+            let append_separator = self.event_has_data;
+            self.event_has_data = true;
+            let payload = payload.strip_prefix(b" ").unwrap_or(payload);
+            let separator_len = usize::from(append_separator);
+            if self
+                .data
+                .len()
+                .saturating_add(separator_len)
+                .saturating_add(payload.len())
+                > MAX_SSE_EVENT_BYTES
+            {
+                self.discarding_event = true;
+                self.data.clear();
+            } else {
+                if separator_len != 0 {
+                    self.data.push(b'\n');
+                }
+                self.data.extend_from_slice(payload);
+            }
+        }
+
+        self.line.clear();
+        self.line_had_bytes = false;
+    }
+
+    fn finish_event(&mut self) {
+        if self.event_has_data {
+            self.stream_events = self.stream_events.saturating_add(1);
+            if !self.discarding_event
+                && self.data.as_slice() != b"[DONE]"
+                && let Ok(value) = serde_json::from_slice::<Value>(&self.data)
+            {
+                if let Some(task_id) = extract_task_id_from_response(self.binding, &value) {
+                    self.task_id = Some(task_id);
+                }
+                if let Some(context_id) = extract_context_id_from_response(self.binding, &value) {
+                    self.context_id = Some(context_id);
+                }
+                if let Some(task_state) = find_task_state(&value) {
+                    self.task_state = Some(task_state);
+                }
+            }
+        }
+
+        self.line.clear();
+        self.data.clear();
+        self.line_had_bytes = false;
+        self.discarding_event = false;
+        self.event_has_data = false;
+    }
+
+    fn finish(&mut self) {
+        if self.pending_cr {
+            self.pending_cr = false;
+            self.finish_line();
+        }
+        if self.line_had_bytes {
+            self.finish_line();
+        }
+        if self.event_has_data || self.discarding_event {
+            self.finish_event();
+        }
+    }
+
+    fn emit_observation(&mut self) {
+        if self.emitted {
+            return;
+        }
+        self.emitted = true;
+        let task_state = self.task_state.as_deref().unwrap_or("");
+        match (self.task_id.as_deref(), self.context_id.as_deref()) {
+            (Some(task_id), Some(context_id)) => tracing::info!(
+                target: "a2a_gateway",
+                {
+                    "a2a.stream_events" = self.stream_events,
+                    "a2a.task_id" = task_id,
+                    "a2a.context_id" = context_id,
+                    "a2a.task_state" = task_state
+                },
+                "observed A2A SSE response metadata"
+            ),
+            (Some(task_id), None) => tracing::info!(
+                target: "a2a_gateway",
+                {
+                    "a2a.stream_events" = self.stream_events,
+                    "a2a.task_id" = task_id,
+                    "a2a.task_state" = task_state
+                },
+                "observed A2A SSE response metadata"
+            ),
+            (None, Some(context_id)) => tracing::info!(
+                target: "a2a_gateway",
+                {
+                    "a2a.stream_events" = self.stream_events,
+                    "a2a.context_id" = context_id,
+                    "a2a.task_state" = task_state
+                },
+                "observed A2A SSE response metadata"
+            ),
+            (None, None) => tracing::info!(
+                target: "a2a_gateway",
+                {
+                    "a2a.stream_events" = self.stream_events,
+                    "a2a.task_state" = task_state
+                },
+                "observed A2A SSE response metadata"
+            ),
+        }
+    }
+}
+
+#[async_trait]
+impl ResponseStreamInspector for A2aSseStreamInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        self.ingest(chunk);
+        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        self.finish();
+        self.emit_observation();
+        ResponseStreamAction::Forward(Bytes::new())
+    }
 }
 
 impl A2aGateway {
@@ -570,6 +781,37 @@ impl Plugin for A2aGateway {
             return false;
         }
         self.should_buffer_response_body(ctx)
+    }
+
+    fn requires_response_stream_hooks(&self) -> bool {
+        self.enabled && self.observability.emit_metadata
+    }
+
+    fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
+        self.enabled
+            && self.observability.emit_metadata
+            && ctx.a2a_gateway_detected
+            && ctx.a2a_gateway_streaming
+            && ctx.a2a_gateway_binding != Some("grpc")
+    }
+
+    fn response_stream_inspector(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        content_type: Option<&str>,
+    ) -> Option<Box<dyn ResponseStreamInspector>> {
+        if !self.enabled
+            || !self.observability.emit_metadata
+            || !ctx.a2a_gateway_detected
+            || !(200..300).contains(&response_status)
+            || !content_type.is_some_and(is_event_stream_content_type)
+        {
+            return None;
+        }
+        Some(Box::new(A2aSseStreamInspector::new(
+            ctx.a2a_gateway_binding,
+        )))
     }
 
     async fn before_proxy(

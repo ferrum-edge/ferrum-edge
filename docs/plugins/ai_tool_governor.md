@@ -310,17 +310,14 @@ as transaction metadata. Hash/identity state lives on non-serialized request
 fields, and stream/model markers are stripped at the transaction-log boundary,
 so disabling metadata/hash observability cannot be bypassed by lifecycle state.
 
-> **Streaming decisions and `mode: dry_run`.** Decision metadata
-> (`ai_tool_governor.decision`, `tool_names`, `arguments_hashes`) is written for
-> **buffered** responses. On the **streaming** SSE path, a mid-stream decision
-> can only be surfaced via a stream cut (enforce mode, logged at `warn`); in
-> `dry_run` a streamed denied/approval-required call is forwarded and is **not**
-> recorded in transaction metadata. Response stream inspectors run in a detached
-> task with no write-back channel to `ctx.metadata`, so streaming dry-run
-> telemetry needs proxy-core support and is tracked at
-> [#2061](https://github.com/ferrum-edge/ferrum-edge/issues/2061) (shared with
-> `ai_semantic_firewall`/`ai_transcript_audit`). Streaming **enforce** decisions
-> are fully effective — the stream is cut — and are logged.
+> **Streaming decisions and `mode: dry_run`.** Streaming SSE batches write the
+> same decision metadata as buffered responses. The inspector records only the
+> configured aggregate fields while a batch is evaluated; the stream-terminal
+> hook folds them into `ctx.metadata` before `TransactionSummary` is finalized.
+> Thus a dry-run denied/approval-required call remains forwarded but appears in
+> transaction logs with `decision`, `tool_names`, and (when
+> `hash_arguments: true`) `arguments_hashes`. Streaming **enforce** decisions
+> still cut the stream and are also logged at `warn`.
 
 ## Composition
 
@@ -355,13 +352,6 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
 - A JSON-labelled **response** body that fails to parse is forwarded (only
   oversized responses fail closed) — rejecting every unparseable JSON response
   on a shared proxy would break unrelated routes.
-- **Streaming `dry_run` decisions are not written to transaction metadata.** A
-  streamed denied/approval-required tool call is only actioned by a stream cut
-  (enforce mode); response stream inspectors have no write-back channel to
-  `ctx.metadata`, so in `dry_run` the streamed decision is forwarded and
-  unlogged in metadata (enforce cuts are logged at `warn`). Proxy-core
-  follow-up shared with `ai_semantic_firewall`/`ai_transcript_audit`:
-  [#2061](https://github.com/ferrum-edge/ferrum-edge/issues/2061).
 - The plugin governs tool calls; it does not execute tools, manage MCP sessions,
   or replace `mcp_gateway`/A2A routing.
 - Streaming inspection rides the proxy's reqwest dispatch arm. Because a

@@ -1144,10 +1144,11 @@ impl FirewallEngine {
     }
 
     /// Record a streamed `inspect` mode violation to the structured log — never
-    /// the client or `/metrics` (security detail belongs in logs). The detached
-    /// H1/H2 inspection task cannot write `RequestContext` metadata, so for both
-    /// `block` (cut) and `detect` (release-then-detect) this is the audit trail
-    /// for a streamed decision. No raw response text is logged (privacy); only
+    /// the client or `/metrics` (security detail belongs in logs). Core now has a
+    /// mutable stream-terminal metadata hook, but `detect` evaluations are
+    /// intentionally detached and may finish after that hook; keeping block and
+    /// detect on one structured-log contract avoids mode-dependent transaction
+    /// fields. No raw response text is logged (privacy); only
     /// matched rule ids, peak severity, and snippet hashes. `cut` distinguishes a
     /// `block`-mode cut from a `detect`-mode would-block.
     fn log_stream_detection(&self, decision: &FirewallDecision, cut: bool) {
@@ -3162,17 +3163,16 @@ impl StreamInspector {
             };
         }
 
-        // A confirmed reject cuts the stream; dry-run never cuts. Log the decision
-        // so the cut stream still has an audit trail (rule ids / severity) — the
-        // detached task cannot write `RequestContext` metadata.
+        // A confirmed reject cuts the stream; dry-run never cuts. Keep streamed
+        // decision details on the structured-log contract shared with detached
+        // detect-mode evaluations (which may outlive transaction finalization).
         if outcome.decision.action == Action::Reject && !outcome.decision.dry_run {
             self.engine.log_stream_detection(&outcome.decision, true);
             self.terminate()
         } else {
-            // A NON-cutting policy hit (a `warn` action, or a dry-run `would_reject`)
-            // is still forwarded — but log it, because the streaming path cannot
-            // write the `would_*`/`warn` transaction metadata the buffered path
-            // does, and logs are this path's only audit trail.
+            // A NON-cutting policy hit (a `warn` action, or a dry-run
+            // `would_reject`) is still forwarded and uses the same structured
+            // stream-decision log as detect mode.
             if matches!(outcome.decision.action, Action::Reject | Action::Warn)
                 && !outcome.decision.matches.is_empty()
             {
@@ -3214,8 +3214,8 @@ impl StreamInspector {
             let provider_error = engine
                 .should_handle_provider_error(&outcome.decision, outcome.provider_error.as_deref());
             // Log both `reject` and `warn` hits — same action gate as block mode.
-            // A streamed `warn` cannot write the buffered-path metadata, so the log
-            // is its only audit record.
+            // Detached detect results can complete after transaction metadata is
+            // finalized, so their structured log remains the audit record.
             if !provider_error
                 && matches!(outcome.decision.action, Action::Reject | Action::Warn)
                 && !outcome.decision.matches.is_empty()

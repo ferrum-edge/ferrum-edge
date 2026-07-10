@@ -1,10 +1,12 @@
 use ferrum_edge::plugins::request_mirror::RequestMirror;
 use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, Plugin, PluginHttpClient, PluginResult, RequestContext, priority,
+    HTTP_GRPC_PROTOCOLS, MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult,
+    RequestContext, TransactionSummary, log_with_mirror, priority,
 };
 use serde_json::json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use super::plugin_utils;
 
@@ -34,6 +36,73 @@ fn make_ctx_with_proxy() -> RequestContext {
     .unwrap();
     ctx.matched_proxy = Some(Arc::new(proxy));
     ctx
+}
+
+struct CapturingMirrorLogger {
+    summaries: Mutex<Vec<TransactionSummary>>,
+}
+
+#[async_trait::async_trait]
+impl Plugin for CapturingMirrorLogger {
+    fn name(&self) -> &str {
+        "capturing_mirror_logger"
+    }
+
+    fn priority(&self) -> u16 {
+        priority::STDOUT_LOGGING
+    }
+
+    async fn log(&self, summary: &TransactionSummary) {
+        self.summaries.lock().unwrap().push(summary.clone());
+    }
+}
+
+#[tokio::test]
+async fn test_mirror_result_logging_is_detached_from_primary_path() {
+    let logger = Arc::new(CapturingMirrorLogger {
+        summaries: Mutex::new(Vec::new()),
+    });
+    let plugins: Vec<Arc<dyn Plugin>> = vec![logger.clone()];
+    let mut ctx = make_ctx();
+    let (tx, rx) = tokio::sync::watch::channel(None);
+    ctx.mirror_result_rx = Some(rx);
+    let summary = TransactionSummary {
+        response_status_code: 200,
+        ..TransactionSummary::default()
+    };
+
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        log_with_mirror(&plugins, &summary, &ctx),
+    )
+    .await
+    .expect("primary logging must not wait for the mirror result");
+    assert_eq!(logger.summaries.lock().unwrap().len(), 1);
+
+    tx.send(Some(MirrorResponseMeta {
+        mirror_target_url: "http://mirror.local:8080/api/users".to_string(),
+        mirror_response_status_code: Some(204),
+        mirror_response_size_bytes: Some(0),
+        mirror_latency_ms: 250.0,
+        mirror_error: None,
+    }))
+    .expect("detached mirror logger should retain its receiver");
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if logger.summaries.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached mirror summary was not logged");
+
+    let summaries = logger.summaries.lock().unwrap();
+    assert!(!summaries[0].mirror);
+    assert!(summaries[1].mirror);
+    assert_eq!(summaries[1].response_status_code, 204);
 }
 
 // ---------------------------------------------------------------------------

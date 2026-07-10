@@ -79,6 +79,11 @@ pub const MESH_MTLS_AUTHORITY_PORT_TAG: &str = "mesh.mtls_authority_port";
 /// never stamps this tag: its outbound routes are host-routed by the service
 /// name, so the client authority is already the routing key the peer matches.
 pub const MESH_MTLS_AUTHORITY_HOST_TAG: &str = "mesh.mtls_authority_host";
+/// Outer network dial host for a Sidecar cross-cluster L4 tunnel. The target's
+/// `host` remains a scoped synthetic workload identity for LB/health maps while
+/// this tag carries the remote east-west gateway address. Absent means the
+/// normal in-cluster shape where `target.host` is dialed directly.
+pub const MESH_MTLS_DIAL_HOST_TAG: &str = "mesh.mtls_dial_host";
 /// Tag overriding the ClientHello SNI of a Sidecar mesh-mTLS dial. Value = the
 /// DESTINATION service FQDN. Stamped ONLY on cross-cluster east-west targets
 /// (see [`MESH_CROSS_CLUSTER_TAG`]): the dial host is the remote east-west
@@ -158,6 +163,20 @@ pub fn target_mesh_mtls_authority_host(target: &UpstreamTarget) -> Option<&str> 
         .get(MESH_MTLS_AUTHORITY_HOST_TAG)
         .map(String::as_str)
         .filter(|host| !host.is_empty())
+}
+
+/// Network host a Sidecar mesh-mTLS tunnel dials. A present-but-empty override
+/// is invalid and must fail closed; callers use the target host only when the
+/// tag is genuinely absent.
+pub fn target_mesh_mtls_dial_host(target: &UpstreamTarget) -> Result<&str, HbonePoolError> {
+    match target.tags.get(MESH_MTLS_DIAL_HOST_TAG) {
+        Some(host) if host.trim().is_empty() => Err(HbonePoolError::InvalidDialHostTag {
+            value: host.clone(),
+            message: format!("{MESH_MTLS_DIAL_HOST_TAG} must not be empty"),
+        }),
+        Some(host) => Ok(host.trim()),
+        None => Ok(target.host.as_str()),
+    }
 }
 
 /// Whether a target is a CROSS-CLUSTER east-west mesh-mTLS target (carries
@@ -299,9 +318,8 @@ impl MeshMtlsDialError {
 
 /// Resolved peer-verification + SNI parameters for a Sidecar mesh-mTLS dial,
 /// derived ONCE from a target's mesh tags and shared by every mesh-mTLS dispatch
-/// surface — HTTP/gRPC (`proxy_to_backend_mesh_mtls`) and WebSocket
-/// (`open_ws_connect_tunnel`) — so the in-cluster-pinned vs cross-cluster
-/// (east-west) split cannot drift between paths (issue #2010).
+/// surface — HTTP/gRPC, WebSocket, raw TCP, and UDP — so the in-cluster-pinned
+/// vs cross-cluster (east-west) split cannot drift between paths (issue #2010).
 ///
 /// The two shapes:
 /// - **In-cluster** (default): the destination workload identity is PINNED from
@@ -710,7 +728,10 @@ impl MeshMtlsConnectionPool {
     /// [`MeshMtlsSender`] connections) and Ambient raw-TCP egress (which
     /// multiplexes over the shared HBONE pool), each captured raw-TCP stream
     /// gets its OWN mesh-mTLS H2 connection carrying exactly ONE CONNECT
-    /// stream (1:1, dropped when the stream closes). Raw-TCP streams are
+    /// stream (1:1, dropped when the stream closes). `dial_host` is the peer
+    /// pod in-cluster or the east-west gateway cross-cluster;
+    /// `authority_host:target_port` is always the real destination workload.
+    /// Raw-TCP streams are
     /// long-lived, so the handshake amortizes over the connection's lifetime,
     /// and SVID rotation is automatic because every new stream dials with the
     /// current SVID. Pooling these tunnels is a documented follow-up.
@@ -721,15 +742,20 @@ impl MeshMtlsConnectionPool {
     /// destination's inbound relay (`build_inbound_hbone_relay_proxy`, gated by
     /// `is_hbone_connect` + `mesh_direction == Inbound`, which a bare H2 CONNECT
     /// satisfies) dials the authority. Fail-closed: a missing gateway SVID
-    /// errors before the dial, and the dial PINS `expected_peer`.
+    /// errors before the dial. In-cluster dials pin `expected_peer`; cross-
+    /// cluster dials use the caller's trust-domain scope + SNI override.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_connect_tunnel(
         &self,
         proxy: &Proxy,
-        target_host: &str,
+        dial_host: &str,
+        authority_host: &str,
         target_port: u16,
         target_policy_port: u16,
         mtls_port: u16,
-        expected_peer: &SpiffeId,
+        expected_peer: Option<&SpiffeId>,
+        expected_trust_domain: Option<&TrustDomain>,
+        sni_override: Option<&str>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         // Fail closed when no gateway SVID is loaded — never dial a mesh peer
         // identity-less (parity with `get_sender` and the HBONE raw-TCP path).
@@ -750,14 +776,11 @@ impl MeshMtlsConnectionPool {
             &self.dns_cache,
             &self.gateway_svid,
             proxy,
-            target_host,
+            dial_host,
             mtls_port,
-            Some(expected_peer),
-            // In-cluster pinned-peer raw-TCP CONNECT tunnel: no cross-cluster
-            // trust-domain scope / SNI override (those ride the cross-cluster
-            // HTTP path's own TLS build in `get_sender`).
-            None,
-            None,
+            expected_peer,
+            expected_trust_domain,
+            sni_override,
             &pool_config,
             keepalive_override,
             Some(connect_timeout),
@@ -765,11 +788,11 @@ impl MeshMtlsConnectionPool {
         .await?;
         tokio::time::timeout(
             connect_timeout,
-            open_h2_connect_stream(sender, target_host, target_port, None, None),
+            open_h2_connect_stream(sender, authority_host, target_port, None, None),
         )
         .await
         .map_err(|_| HbonePoolError::ConnectStream {
-            authority: authority_for_host_port(target_host, target_port),
+            authority: authority_for_host_port(authority_host, target_port),
             message: format!(
                 "timed out after {}ms waiting for sidecar mesh-mTLS CONNECT response",
                 effective_connect_timeout_ms
@@ -781,7 +804,7 @@ impl MeshMtlsConnectionPool {
     /// mTLS listener (`:15006`, or the `mesh.mtls_port`-tagged override) over a
     /// FRESH SVID-mTLS H2 connection — the Sidecar counterpart of
     /// [`HboneConnectionPool::get_datagram_tunnel`] (F3 §3.3 Stage 4 Sidecar
-    /// relay). `target_host:target_port` is the destination workload's address
+    /// relay). `authority_host:target_port` is the destination workload's address
     /// and UDP app port; the CONNECT `:authority` is that app addr+port the
     /// peer's transport-agnostic inbound relay unframes the tunnel into a local
     /// `UdpSocket` toward.
@@ -806,17 +829,21 @@ impl MeshMtlsConnectionPool {
     /// SVID). Honors the destination app port's DR `connectTimeout` /
     /// `tcpKeepalive` overrides the same way `get_datagram_tunnel` does. NO
     /// capability probe: a slice-declared sidecar peer speaks mesh-mTLS by
-    /// construction. Fail-closed: a missing gateway SVID errors before the dial,
-    /// and the dial PINS `expected_peer`.
-    #[allow(dead_code)]
+    /// construction. Fail-closed: a missing gateway SVID errors before the dial;
+    /// in-cluster dials pin `expected_peer`, while cross-cluster dials require
+    /// trust-domain scope + SNI override.
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub async fn open_datagram_tunnel(
         &self,
         proxy: &Proxy,
-        target_host: &str,
+        dial_host: &str,
+        authority_host: &str,
         target_port: u16,
         target_policy_port: u16,
         mtls_port: u16,
-        expected_peer: &SpiffeId,
+        expected_peer: Option<&SpiffeId>,
+        expected_trust_domain: Option<&TrustDomain>,
+        sni_override: Option<&str>,
     ) -> Result<H2ConnectTunnel, HbonePoolError> {
         // Fail closed when no gateway SVID is loaded — never dial a mesh peer
         // identity-less (parity with `open_connect_tunnel` and `get_sender`).
@@ -854,13 +881,11 @@ impl MeshMtlsConnectionPool {
             &self.dns_cache,
             &self.gateway_svid,
             proxy,
-            target_host,
+            dial_host,
             mtls_port,
-            Some(expected_peer),
-            // In-cluster pinned-peer datagram CONNECT tunnel: no cross-cluster
-            // trust-domain scope / SNI override.
-            None,
-            None,
+            expected_peer,
+            expected_trust_domain,
+            sni_override,
             &pool_config,
             keepalive_override,
             Some(connect_timeout),
@@ -871,7 +896,7 @@ impl MeshMtlsConnectionPool {
             connect_timeout,
             open_h2_connect_stream(
                 sender,
-                target_host,
+                authority_host,
                 target_port,
                 Some(&baggage),
                 Some(crate::modes::mesh::hbone::UDP_PROTOCOL),
@@ -879,7 +904,7 @@ impl MeshMtlsConnectionPool {
         )
         .await
         .map_err(|_| HbonePoolError::ConnectStream {
-            authority: authority_for_host_port(target_host, target_port),
+            authority: authority_for_host_port(authority_host, target_port),
             message: format!(
                 "timed out after {}ms waiting for sidecar mesh-mTLS datagram CONNECT response",
                 effective_connect_timeout_ms
@@ -1739,10 +1764,13 @@ mod tests {
             .open_datagram_tunnel(
                 &proxy,
                 "10.0.0.1",
+                "10.0.0.1",
                 53,
                 53,
                 ISTIO_SIDECAR_INBOUND_PORT,
-                &peer,
+                Some(&peer),
+                None,
+                None,
             )
             .await
         {

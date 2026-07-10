@@ -123,8 +123,16 @@ pub mod _test_support {
         crate::plugins::soap_ws_security::count_wsu_id_occurrences(xml, id)
     }
 
-    pub fn soap_find_element_by_wsu_id_for_test(xml: &str, id: &str) -> Option<String> {
-        crate::plugins::soap_ws_security::find_element_by_wsu_id_in_range(xml, 0, xml.len(), id)
+    pub fn soap_exclusive_canonicalize_element_for_test(
+        xml: &str,
+        local_name: &str,
+        prefix_list: &str,
+    ) -> Result<String, String> {
+        crate::plugins::soap_ws_security::exclusive_canonicalize_element_for_test(
+            xml,
+            local_name,
+            prefix_list,
+        )
     }
 
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────

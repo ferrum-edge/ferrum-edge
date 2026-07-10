@@ -223,12 +223,16 @@ Every plugin implements the `Plugin` trait from `src/plugins/mod.rs`. All method
 | `on_final_request_body(&headers, &body)` | Pre-backend (post-transform) | Yes | Validate the final request body after all transforms |
 | `after_proxy(&mut ctx, status, &mut headers)` | Post-backend | Yes | Transform response headers, reject responses |
 | `on_response_body(&mut ctx, status, &headers, &body)` | Post-backend (buffered) | Yes | Inspect buffered response body, extract metrics |
-| `transform_response_body(&body, content_type)` | Post-backend (buffered) | No | Rewrite response body before sending to client |
+| `transform_response_body(&body, content_type, &headers)` | Post-backend (buffered) | No | Rewrite response body before sending to client |
 | `on_final_response_body(&mut ctx, status, &headers, &body)` | Post-backend (post-transform) | Yes | Validate the final response body after all transforms |
+| `response_stream_inspector(&ctx, status, content_type)` | Post-backend (streaming) | No (can truncate) | Create one stateful, per-response body inspector |
+| `on_response_stream_terminated(&mut ctx, status, outcome)` | Post-backend (streaming terminal) | No | Clean up/account for streaming state and write aggregate transaction metadata before logging; does not receive body bytes |
 | `log(&summary)` | Logging | No | Send transaction data to external systems |
 | `on_ws_frame(proxy_id, connection_id, direction, &message)` | WebSocket frame | Close* | Inspect/transform per-frame WebSocket traffic |
 
 \*`on_ws_frame` cannot return `PluginResult::Reject`. Instead, return `Some(Message::Close(...))` to close the connection in both directions. Return `None` for passthrough, or `Some(transformed_message)` to replace the frame.
+
+**Streaming inspectors:** A `ResponseStreamInspector` runs after response headers have been committed. It can forward, hold, or terminate the remaining body, but it cannot change the response status or retract bytes already sent.
 
 **`before_proxy` header parameter**: In `before_proxy`, always read request headers from the `headers` parameter, **not** from `ctx.headers`. The proxy handler avoids cloning the headers HashMap when no plugin modifies them — it moves headers out of `ctx.headers` into the `headers` parameter via `std::mem::take()`, leaving `ctx.headers` empty during the call. After `before_proxy` completes, headers are moved back. This means `ctx.headers.get("content-type")` returns `None` inside `before_proxy`, while `headers.get("content-type")` returns the actual value. If your plugin calls helper methods that need request headers, pass the `headers` parameter through rather than reading `ctx.headers` in the helper. This only affects `before_proxy` — other phases like `authenticate` and `on_request_received` can safely read `ctx.headers`.
 
@@ -253,7 +257,13 @@ For TCP+TLS proxies, `on_stream_connect` runs **after** the frontend TLS handsha
 | `fn requires_request_body_before_before_proxy(&self) -> bool` | `false` | Set to `true` if your plugin needs the raw request body available during `before_proxy`. |
 | `fn requires_request_body_buffering(&self) -> bool` | Derived | By default returns `true` if `modifies_request_body()` or `requires_request_body_before_before_proxy()`. Override for custom logic. |
 | `fn should_buffer_request_body(&self, &ctx) -> bool` | Delegates | Per-request decision on whether to buffer. Defaults to `requires_request_body_buffering()`. Override for conditional buffering (e.g., only for certain content types). |
-| `fn requires_response_body_buffering(&self) -> bool` | `false` | Set to `true` if your plugin needs the entire response body buffered. Disables streaming for the proxy. |
+| `fn requires_response_body_buffering(&self) -> bool` | `false` | Config-time upper bound. Set to `true` if the plugin may need the complete response body. |
+| `fn should_buffer_response_body(&self, &ctx) -> bool` | Delegates | Per-request refinement. Defaults to `requires_response_body_buffering()` and may skip buffering for irrelevant requests. |
+| `fn should_buffer_response_body_for_content_type(&self, &ctx, content_type, status, &headers) -> bool` | Delegates | Post-header refinement on supported dispatch paths. This is narrowing-only: it may release a response selected for buffering, but cannot force a streaming response to buffer. |
+| `fn may_modify_response_content_type(&self, &ctx, backend_content_type) -> bool` | `false` | Set when `after_proxy` may relabel the backend `Content-Type`; this prevents an unsafe buffer-to-stream downgrade. The answer must match the current request and backend type exactly. |
+| `fn requires_response_stream_hooks(&self) -> bool` | `false` | Config-time opt-in for streaming response inspection. |
+| `fn response_stream_inspector(&self, &ctx, status, content_type) -> Option<Box<dyn ResponseStreamInspector>>` | `None` | Create state owned by one eligible streaming response, or return `None` for passthrough. |
+| `fn forces_reqwest_dispatch(&self, &ctx) -> bool` | `false` | Per-request native-H3 dispatch override for requests whose response inspector must run. See the current transport limitation below. |
 | `fn applies_after_proxy_on_reject(&self) -> bool` | `false` | Set to `true` if your plugin's `after_proxy` should also run on gateway-generated rejection responses (e.g., CORS headers on error responses). |
 | `fn requires_ws_frame_hooks(&self) -> bool` | `false` | Set to `true` if your plugin implements `on_ws_frame()`. Pre-computed per proxy for zero overhead when unused. |
 | `fn warmup_hostnames(&self) -> Vec<String>` | `[]` | Hostnames your plugin connects to (for DNS pre-warming at startup). |
@@ -443,57 +453,212 @@ impl Plugin for MyBodyTransformer {
 }
 ```
 
-## Writing a Response Body Plugin
+## Streaming-safe response plugins
 
-### Inspecting the Response Body
+Response plugins have two different body-access models:
+
+- **Buffer the complete body** with `requires_response_body_buffering()` and the `should_buffer_response_body*()` refinements. Use the buffered lifecycle hooks when the decision needs the complete payload or must replace the status/body before headers are sent.
+- **Inspect while streaming** with `requires_response_stream_hooks()` and `response_stream_inspector()`. Use this for bounded, incremental inspection of latency-sensitive or unbounded responses such as SSE.
+
+**Which do I pick?** If correctness requires the complete body, or you must transform it or reject it with a new HTTP status, buffer it. If you can decide from bounded windows and forwarding must remain incremental, use a stream inspector. Do not set `requires_response_body_buffering()` merely to observe an SSE stream: doing so removes its streaming behavior and can collect an unbounded body until the response-size limit produces a 502.
+
+A stream inspector runs only when the response remains on a streaming path. Non-SSE responses with a known `Content-Length` at or below `FERRUM_RESPONSE_BUFFER_CUTOFF_BYTES` (64 KiB by default) may be eagerly buffered before an inspector is created. If a plugin must cover those responses too, implement the corresponding buffered hook as a fallback or configure the cutoff to `0`. SSE is always exempt from this adaptive small-response buffering.
+
+See the [response-body streaming guide](docs/response_body_streaming.md) for the gateway's buffering decision flow and protocol-specific behavior.
+
+### Buffer the complete response
+
+`requires_response_body_buffering()` is the config-time upper bound. `should_buffer_response_body()` may narrow it using request context. On dispatch paths that support the post-header downgrade, `should_buffer_response_body_for_content_type()` gets one final opportunity to narrow the decision after the backend status and headers arrive. The content-type hook cannot turn a streaming decision into buffering; returning `true` where `should_buffer_response_body()` returned `false` has no effect. See the response-body streaming guide for the current protocol coverage.
 
 ```rust
 #[async_trait]
-impl Plugin for MyResponseInspector {
-    fn name(&self) -> &str { "my_response_inspector" }
+impl Plugin for MyJsonResponseInspector {
+    fn name(&self) -> &str { "my_json_response_inspector" }
 
     fn requires_response_body_buffering(&self) -> bool {
-        true  // Forces response buffering (disables streaming)
+        true
+    }
+
+    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
+        ctx.method == "POST"
+    }
+
+    fn should_buffer_response_body_for_content_type(
+        &self,
+        ctx: &RequestContext,
+        content_type: Option<&str>,
+        response_status: u16,
+        _response_headers: &HashMap<String, String>,
+    ) -> bool {
+        self.should_buffer_response_body(ctx)
+            && (200..300).contains(&response_status)
+            && content_type.is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+            })
     }
 
     async fn on_response_body(
-        &self,
-        _ctx: &mut RequestContext,
-        response_status: u16,
-        _response_headers: &HashMap<String, String>,
-        body: &[u8],
-    ) -> PluginResult {
-        // Inspect the raw backend response body (before transforms)
-        PluginResult::Continue
-    }
-
-    async fn on_final_response_body(
         &self,
         _ctx: &mut RequestContext,
         _response_status: u16,
         _response_headers: &HashMap<String, String>,
         body: &[u8],
     ) -> PluginResult {
-        // Validate the final response body (after all transforms)
+        // Inspect the normalized body before ordinary response transforms.
+        let _inspected_bytes = body.len();
         PluginResult::Continue
     }
 }
 ```
 
-### Transforming the Response Body
+Use `on_final_response_body()` instead when you need the final client-visible body after all `transform_response_body*()` hooks. To replace a buffered body, use the current three-argument signature:
 
 ```rust
 async fn transform_response_body(
     &self,
     body: &[u8],
     content_type: Option<&str>,
+    response_headers: &HashMap<String, String>,
 ) -> Option<Vec<u8>> {
-    // Return Some(new_body) to replace, None to leave unchanged
-    None
+    let _ = (body, content_type, response_headers);
+    None // Some(new_body) replaces it
 }
 ```
 
-**Important**: Response body buffering disables streaming, increasing memory usage and latency. Use it sparingly.
+### Inspect while streaming
+
+`requires_response_stream_hooks()` opts the plugin into the streaming pipeline. For each streaming response, `response_stream_inspector()` receives immutable request context plus the final response status and content type. Return a fresh inspector for responses you handle, or `None` for passthrough.
+
+The inspector must own all per-response state. The proxy may move it into a detached H1/H2 task or drive it inside an H3 loop; it cannot borrow `RequestContext`. Keep accumulators bounded because SSE and similar streams may never end.
+
+For transaction-metadata write-back, use `ctx.response_stream_id()` in the factory as the key for a bounded plugin-owned shared slot (for example an `Arc<DashMap<u64, Arc<Mutex<...>>>>`). Give the inspector the slot handle, update it only at decision/window boundaries (never lock on every chunk), then remove the entry in `on_response_stream_terminated(&mut ctx, ..., outcome)` and fold the aggregate into `ctx.metadata`. The terminal hook runs for clean EOF, backend errors, policy cuts, and client disconnects, before `TransactionSummary.metadata` is finalized. Gate slot creation on both returning an inspector and the plugin's own observability setting; the no-inspector path must allocate nothing. Configuration such as metadata emission and argument hashing remains the plugin's responsibility—the core does not interpret or filter plugin fields.
+
+```rust
+use bytes::Bytes;
+use crate::plugins::{ResponseStreamAction, ResponseStreamInspector};
+
+const BLOCKED: &[u8] = b"forbidden";
+
+struct SseInspector {
+    // Retain only enough bytes to detect a match split across two chunks.
+    tail: Vec<u8>,
+}
+
+#[async_trait]
+impl ResponseStreamInspector for SseInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        let mut scan = Vec::with_capacity(self.tail.len() + chunk.len());
+        scan.extend_from_slice(&self.tail);
+        scan.extend_from_slice(chunk);
+        if scan.windows(BLOCKED.len()).any(|window| window == BLOCKED) {
+            return ResponseStreamAction::Terminate(Some(Bytes::from_static(
+                b"event: error\ndata: blocked\n\n",
+            )));
+        }
+
+        let keep = BLOCKED.len().saturating_sub(1).min(scan.len());
+        let held_tail = scan.split_off(scan.len() - keep);
+        self.tail = held_tail;
+        // Release only bytes that cannot begin a future cross-chunk match.
+        ResponseStreamAction::Forward(Bytes::from(scan))
+    }
+
+    async fn on_end(&mut self) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(Bytes::from(std::mem::take(&mut self.tail)))
+    }
+}
+
+#[async_trait]
+impl Plugin for MySseInspector {
+    fn name(&self) -> &str { "my_sse_inspector" }
+
+    fn requires_response_stream_hooks(&self) -> bool {
+        true
+    }
+
+    fn response_stream_inspector(
+        &self,
+        _ctx: &RequestContext,
+        response_status: u16,
+        content_type: Option<&str>,
+    ) -> Option<Box<dyn ResponseStreamInspector>> {
+        let is_sse = content_type.is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+        });
+        ((200..300).contains(&response_status) && is_sse)
+            .then(|| {
+                Box::new(SseInspector { tail: Vec::new() })
+                    as Box<dyn ResponseStreamInspector>
+            })
+    }
+
+    fn forces_reqwest_dispatch(&self, _ctx: &RequestContext) -> bool {
+        true // Prevents native H3 only; direct H2 remains subject to #2055.
+    }
+}
+```
+
+On today's standard HTTP handler, the example also requires `pool_enable_http2: false` on a plain-HTTPS proxy to exclude the direct-H2 arm and guarantee reqwest dispatch. That setting is not a universal workaround for gRPC or mesh H2 transports, and a backend TLS SNI override may require direct H2. Until #2055 is resolved, test every backend transport the plugin can select; constrain enforcing routes to supported dispatch or provide a buffered fallback where inspectors are not wired. In production, also narrow `forces_reqwest_dispatch()` with a request marker when only some requests can be inspected, rather than moving all traffic off native H3.
+
+The `ResponseStreamInspector` action contract is:
+
+- `on_chunk(&mut self, chunk)` receives each decoded body chunk. `Forward(bytes)` releases those bytes now; `Forward(Bytes::new())` emits nothing and means the inspector is holding data in its own accumulator. `Terminate(None)` ends the body, while `Terminate(Some(bytes))` emits the final bytes and then ends it.
+- `on_end(&mut self)` is the clean end-of-stream flush for a trailing partial window. Its default returns an empty `Forward`.
+- Response headers are already committed before either hook runs. `Terminate` can only truncate the in-flight response; it cannot change the HTTP status, replace headers, or retract previously forwarded bytes.
+
+There is one current transport limitation to design around:
+
+- In the standard HTTP proxy handler, inspectors currently attach only to the reqwest `ResponseBody::Streaming` arm, not the direct `StreamingH2` or `StreamingH3` arms ([#2055](https://github.com/ferrum-edge/ferrum-edge/issues/2055)). `forces_reqwest_dispatch()` prevents native-H3 selection for requests where it returns `true`; make that decision per request when possible. It does not itself exclude every direct-H2/HBONE case, so do not assume universal transport coverage until #2055 is resolved. The dedicated H3 frontend native and cross-protocol loops do drive inspectors, which is why the inspector must be portable across H1/H2 and H3 drivers.
+
+### `Content-Type` relabeling trap
+
+The gateway may downgrade a pre-flight buffer decision to streaming after it sees the backend `Content-Type`. If your `after_proxy()` hook may relabel that type, you must also implement `may_modify_response_content_type()` so a body-inspection plugin is not incorrectly bypassed before the relabel occurs.
+
+The capability answer must mirror `after_proxy()` for the current request and backend type. In particular, return `false` when the backend already sent the target type: reporting a possible relabel for an already-SSE response can pin an unbounded event stream to the buffered path.
+
+```rust
+fn is_event_stream(content_type: Option<&str>) -> bool {
+    content_type.is_some_and(|value| {
+        value
+            .split(';')
+            .next()
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+    })
+}
+
+fn may_modify_response_content_type(
+    &self,
+    _ctx: &RequestContext,
+    backend_content_type: Option<&str>,
+) -> bool {
+    !is_event_stream(backend_content_type)
+}
+
+async fn after_proxy(
+    &self,
+    _ctx: &mut RequestContext,
+    _response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+) -> PluginResult {
+    if !is_event_stream(response_headers.get("content-type").map(String::as_str)) {
+        response_headers.insert("content-type".into(), "text/event-stream".into());
+    }
+    PluginResult::Continue
+}
+```
+
+This declaration is a safety gate; it is not a request to buffer by itself. Likewise, `should_buffer_response_body_for_content_type()` is narrowing-only and cannot opt a plugin into buffering after headers arrive.
+
+### SSE and gRPC implications
+
+- SSE (`text/event-stream`) is exempt from adaptive small-response buffering whenever streaming has been selected, regardless of `Content-Length`. Buffered hooks such as `on_response_body()` never see a response that remains streamed. Use a stream inspector for incremental SSE inspection; forcing full-body buffering destroys SSE latency and can run until the response-size limit.
+- A response-body-buffering plugin takes gRPC off its streaming response/trailer path. The gateway collects the full body and trailers before constructing the response, so do not opt into buffering for gRPC unless the plugin genuinely requires complete-message access and can accept the loss of live server streaming.
 
 ## Writing a Stream Plugin (TCP/UDP)
 
@@ -1178,7 +1343,9 @@ Use the gateway's test infrastructure in `tests/` to create end-to-end tests wit
 - [ ] `is_auth_plugin()` returns `true` if it's an auth plugin
 - [ ] `modifies_request_body()` returns `true` if it transforms the request body
 - [ ] `requires_request_body_buffering()` returns `true` if it reads the request body
-- [ ] `requires_response_body_buffering()` returns `true` if it reads the response body
+- [ ] Complete-body response plugins declare `requires_response_body_buffering()` and only narrow it in `should_buffer_response_body*()`
+- [ ] Streaming response plugins declare `requires_response_stream_hooks()` and return a bounded, state-owning `ResponseStreamInspector`
+- [ ] A plugin that relabels response `Content-Type` declares `may_modify_response_content_type()` with the same conditions as `after_proxy()`
 - [ ] `requires_ws_frame_hooks()` returns `true` if it implements `on_ws_frame()`
 - [ ] `warmup_hostnames()` returns external hosts if applicable
 - [ ] If using database tables: `plugin_migrations()` exported with versioned migrations

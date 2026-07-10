@@ -1152,18 +1152,22 @@ async fn run_udp_egress_session(
     // a local `UdpSocket` (`is_udp_hbone_connect` → `handle_hbone_udp_request`).
     // A target with neither tag fails closed (materializer bug).
     let tunnel = if crate::proxy::hbone_pool::target_hbone_enabled(&target) {
-        // HBONE capability must be proven (the enrollment pass + widened probe
+        // In-cluster HBONE capability must be proven (the enrollment pass + widened probe
         // gate keep these records alive; the dispatch gate fails closed until
         // proven). Target-effective keying: enrollment builds probe keys from
         // the relay proxy AFTER per-target override resolution, so this
         // fail-closed gate must read the same key or a per-port DR TLS override
-        // on the stream upstream drops every UDP session forever.
-        if !crate::proxy::get_backend_capability_for_target(
-            state.backend_capabilities.as_ref(),
-            proxy,
-            Some(&target),
-        )
-        .is_some_and(|record| record.hbone.is_supported())
+        // on the stream upstream drops every UDP session forever. Cross-cluster
+        // targets bypass probing because only the operator gateway is dialable;
+        // SNI/trust-domain metadata is validated below.
+        let cross_cluster = crate::proxy::hbone_pool::target_hbone_cross_cluster(&target);
+        if !cross_cluster
+            && !crate::proxy::get_backend_capability_for_target(
+                state.backend_capabilities.as_ref(),
+                proxy,
+                Some(&target),
+            )
+            .is_some_and(|record| record.hbone.is_supported())
         {
             debug!(
                 service = %entry.service_fqdn,
@@ -1176,17 +1180,53 @@ async fn run_udp_egress_session(
         }
         // Pinned peer identity: present-but-corrupt fails closed. An absent tag
         // keeps trust-domain-only verification for operator-supplied targets.
-        let expected_peer = match crate::proxy::hbone_pool::target_expected_peer_spiffe(&target) {
-            Ok(peer) => peer,
+        let authority_host = match crate::proxy::hbone_pool::target_hbone_authority_host(&target) {
+            Ok(host) => host,
             Err(err) => {
                 warn!(
                     service = %entry.service_fqdn,
                     target_host = %target.host,
                     error = %err,
-                    "Mesh UDP egress target carries a corrupt pinned identity; refusing dial"
+                    "Mesh UDP egress target carries an invalid CONNECT authority; refusing dial"
                 );
                 return;
             }
+        };
+        if cross_cluster
+            && !target
+                .tags
+                .contains_key(crate::proxy::hbone_pool::HBONE_AUTHORITY_HOST_TAG)
+        {
+            warn!(
+                service = %entry.service_fqdn,
+                target_host = %target.host,
+                "Cross-cluster UDP HBONE target is missing its real-pod CONNECT authority; refusing dial"
+            );
+            return;
+        }
+        let (expected_peer, expected_trust_domain, sni_override) = if cross_cluster {
+            let Some(sni) = crate::proxy::hbone_pool::target_hbone_eastwest_sni(&target) else {
+                warn!(service = %entry.service_fqdn, "Cross-cluster UDP HBONE target is missing its SNI override; refusing dial");
+                return;
+            };
+            let Some(td) =
+                crate::proxy::hbone_pool::target_hbone_cross_cluster_trust_domain(&target)
+            else {
+                warn!(service = %entry.service_fqdn, "Cross-cluster UDP HBONE target is missing its trust domain; refusing dial");
+                return;
+            };
+            (None, Some(td), Some(sni))
+        } else {
+            let expected_peer = match crate::proxy::hbone_pool::target_expected_peer_spiffe(&target)
+            {
+                Ok(peer) => peer,
+                Err(err) => {
+                    warn!(service = %entry.service_fqdn, target_host = %target.host, error = %err,
+                        "Mesh UDP egress target carries a corrupt pinned identity; refusing dial");
+                    return;
+                }
+            };
+            (expected_peer, None, None)
         };
         let hbone_port = crate::proxy::hbone_pool::target_hbone_port(&target);
         let dial_host = match crate::proxy::hbone_pool::target_hbone_dial_host(&target) {
@@ -1207,10 +1247,12 @@ async fn run_udp_egress_session(
                 proxy,
                 dial_host,
                 hbone_port,
-                &target.host,
+                authority_host,
                 target.port,
                 target.dispatch_policy_port(),
                 expected_peer.as_ref(),
+                expected_trust_domain.as_ref(),
+                sni_override,
             )
             .await
         {
@@ -1227,35 +1269,54 @@ async fn run_udp_egress_session(
             }
         }
     } else if crate::proxy::mesh_mtls_pool::target_mesh_mtls_enabled(&target) {
-        // `mesh.mtls` targets are only ever produced by the materializer, which
-        // always stamps the destination identity — a missing/corrupt pin is a
-        // config-corruption signal and fails closed rather than dialing unpinned.
-        // No capability registry: a slice-declared sidecar peer speaks mesh-mTLS
-        // by construction (mirrors the raw-TCP mesh-mTLS branch).
-        let expected_peer =
-            match crate::proxy::mesh_mtls_pool::target_mesh_mtls_expected_peer(&target) {
-                Ok(peer) => peer,
-                Err(err) => {
-                    warn!(
-                        service = %entry.service_fqdn,
-                        target_host = %target.host,
-                        error = %err,
-                        "Mesh UDP egress mesh.mtls target carries no/invalid pinned identity; \
-                         refusing dial"
-                    );
-                    return;
-                }
-            };
+        // Same-cluster targets require a pinned peer; cross-cluster targets use
+        // the shared Sidecar dial plan's mandatory SNI + trust-domain scope.
+        // No capability registry: a slice-declared sidecar peer speaks
+        // mesh-mTLS by construction.
+        let dial_plan = match crate::proxy::mesh_mtls_pool::MeshMtlsDialPlan::resolve(&target) {
+            Ok(plan) => plan,
+            Err(err) => {
+                warn!(
+                    service = %entry.service_fqdn,
+                    target_host = %target.host,
+                    error = %err,
+                    "Mesh UDP egress mesh.mtls dial metadata is invalid; refusing dial"
+                );
+                return;
+            }
+        };
+        let dial_host = match crate::proxy::mesh_mtls_pool::target_mesh_mtls_dial_host(&target) {
+            Ok(host) => host,
+            Err(err) => {
+                warn!(service = %entry.service_fqdn, target_host = %target.host, error = %err,
+                    "Mesh UDP egress mesh.mtls dial host is invalid; refusing dial");
+                return;
+            }
+        };
+        let authority_host = match crate::proxy::mesh_mtls_pool::target_mesh_mtls_authority_host(
+            &target,
+        ) {
+            Some(host) => host,
+            None if dial_plan.cross_cluster => {
+                warn!(service = %entry.service_fqdn,
+                        "Cross-cluster UDP mesh.mtls target is missing its CONNECT authority; refusing dial");
+                return;
+            }
+            None => target.host.as_str(),
+        };
         let mtls_port = crate::proxy::mesh_mtls_pool::target_mesh_mtls_port(&target);
         match state
             .mesh_mtls_pool
             .open_datagram_tunnel(
                 proxy,
-                &target.host,
+                dial_host,
+                authority_host,
                 target.port,
                 target.dispatch_policy_port(),
                 mtls_port,
-                &expected_peer,
+                dial_plan.expected_peer.as_ref(),
+                dial_plan.expected_trust_domain.as_ref(),
+                dial_plan.sni_override,
             )
             .await
         {

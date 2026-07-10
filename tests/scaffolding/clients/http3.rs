@@ -169,6 +169,7 @@ impl Http3Client {
         let headers = resp.headers().clone();
 
         let mut body_bytes = Vec::new();
+        let mut body_error = None;
         loop {
             match tokio::time::timeout(Duration::from_secs(15), stream.recv_data()).await {
                 Ok(Ok(Some(mut chunk))) => {
@@ -179,7 +180,14 @@ impl Http3Client {
                     }
                 }
                 Ok(Ok(None)) => break,
-                Ok(Err(_)) | Err(_) => break,
+                Ok(Err(error)) => {
+                    body_error = Some(error.to_string());
+                    break;
+                }
+                Err(_) => {
+                    body_error = Some("response body read timed out".to_string());
+                    break;
+                }
             }
         }
 
@@ -199,6 +207,7 @@ impl Http3Client {
             headers,
             body_bytes: Bytes::from(body_bytes),
             trailers,
+            body_error,
         })
     }
 
@@ -253,6 +262,7 @@ impl Http3Client {
         let headers = resp.headers().clone();
 
         let mut body_bytes = Vec::new();
+        let mut body_error = None;
         loop {
             match tokio::time::timeout(Duration::from_secs(15), stream.recv_data()).await {
                 Ok(Ok(Some(mut chunk))) => {
@@ -263,7 +273,14 @@ impl Http3Client {
                     }
                 }
                 Ok(Ok(None)) => break,
-                Ok(Err(_)) | Err(_) => break,
+                Ok(Err(error)) => {
+                    body_error = Some(error.to_string());
+                    break;
+                }
+                Err(_) => {
+                    body_error = Some("response body read timed out".to_string());
+                    break;
+                }
             }
         }
 
@@ -275,6 +292,7 @@ impl Http3Client {
             headers,
             body_bytes: Bytes::from(body_bytes),
             trailers: None,
+            body_error,
         })
     }
 
@@ -426,6 +444,10 @@ pub struct Http3Response {
     /// backend/gateway sent a TRAILERS frame. `None` for a trailers-only or
     /// no-trailer response.
     pub trailers: Option<HeaderMap>,
+    /// Terminal response-body error, kept separate from the response head so
+    /// tests can distinguish a clean short response from RESET_STREAM or a
+    /// bounded body-read timeout.
+    pub body_error: Option<String>,
 }
 
 impl Http3Response {

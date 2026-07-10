@@ -170,6 +170,10 @@ pub(crate) const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_respo
 /// precise signal; the normal buffered backend-response path never sets it.
 pub(crate) const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
 
+/// Internal marker carried only on a response-decision context clone while an
+/// effective retry policy is active. It never reaches transaction metadata.
+const RETRY_RESPONSE_BUFFERING_METADATA_KEY: &str = "ferrum:retry_response_buffering";
+
 /// Marker recorded in `ctx.metadata` when the ORIGINAL backend response was a
 /// range/partial response (`206` or carrying `Content-Range`), captured before
 /// any `after_proxy` hook can mutate the response headers. A plugin whose
@@ -194,6 +198,22 @@ pub(crate) const NO_TRANSFORM_RESPONSE_METADATA_KEY: &str = "ferrum:no_transform
 /// headers. Compression reads this to avoid returning transformed bytes with
 /// the origin's strong validator.
 pub(crate) const STRONG_ETAG_RESPONSE_METADATA_KEY: &str = "ferrum:strong_etag_response";
+
+/// Marker proving that the original backend response metadata below was
+/// captured before any `after_proxy` hook mutated its headers.
+pub(crate) const ORIGINAL_RESPONSE_METADATA_STAMPED_KEY: &str =
+    "ferrum:original_response_metadata_stamped";
+
+/// Parsed `Content-Length` from the original backend response. Body transforms
+/// use this snapshot when a later gateway plugin (notably `compression`)
+/// removes the wire header before the buffered-body phase.
+pub(crate) const ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY: &str =
+    "ferrum:original_response_content_length";
+
+/// Marker that the original backend response carried a non-identity
+/// `Content-Encoding`. This distinguishes origin encoding from an encoding
+/// selected later by the gateway compression plugin.
+pub(crate) const ORIGIN_ENCODED_RESPONSE_METADATA_KEY: &str = "ferrum:origin_encoded_response";
 
 /// The ORIGINAL backend HTTP status, captured at the start of
 /// `run_after_proxy_hooks` before any `after_proxy` hook can reject the response
@@ -261,6 +281,31 @@ pub(crate) fn stamp_original_response_metadata(
     response_status: u16,
     response_headers: &HashMap<String, String>,
 ) {
+    ctx.metadata.insert(
+        ORIGINAL_RESPONSE_METADATA_STAMPED_KEY.to_string(),
+        "true".to_string(),
+    );
+    ctx.metadata
+        .remove(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY);
+    if let Some(content_length) = response_headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        ctx.metadata.insert(
+            ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY.to_string(),
+            content_length.to_string(),
+        );
+    }
+    ctx.metadata.remove(ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
+    if response_headers
+        .get("content-encoding")
+        .is_some_and(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+    {
+        ctx.metadata.insert(
+            ORIGIN_ENCODED_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+    }
     if response_status == 206 || response_headers.contains_key("content-range") {
         ctx.metadata
             .insert(RANGE_RESPONSE_METADATA_KEY.to_string(), "true".to_string());
@@ -1040,6 +1085,25 @@ pub(crate) fn should_stream_response_body(
     }
 }
 
+pub(crate) fn retry_response_decision_context(ctx: &RequestContext) -> RequestContext {
+    let mut retry_ctx = ctx.clone();
+    retry_ctx.metadata.insert(
+        RETRY_RESPONSE_BUFFERING_METADATA_KEY.to_string(),
+        "true".to_string(),
+    );
+    retry_ctx
+}
+
+pub(crate) fn plugins_may_release_response_body_under_retries(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) -> bool {
+    plugins.iter().any(|plugin| {
+        plugin.should_buffer_response_body(ctx)
+            && plugin.may_release_response_body_under_retries(ctx)
+    })
+}
+
 #[derive(Debug, Default)]
 struct LaterHeaderSimulation {
     cache_control_no_transform: bool,
@@ -1097,9 +1161,10 @@ fn simulate_later_after_proxy_headers(
 /// plugin that needs the body (caching/compression/transform, or `waf` for an
 /// allowlisted content-type) is never affected. An explicit
 /// [`ResponseBodyMode::Buffer`] is always honored, and a `None` context leaves
-/// the pre-flight decision unchanged — callers pass `None` when retries are
-/// configured, since a retry may need to replay the response body and a
-/// non-final attempt must stay buffered.
+/// the pre-flight decision unchanged. Retry-enabled callers pass a marked
+/// context clone: ordinary responses stay buffered, while every active
+/// buffering plugin must explicitly opt an inherently streaming response out
+/// after headers arrive.
 ///
 /// If any plugin can mutate the response `Content-Type` in a later
 /// `after_proxy` hook, the helper keeps the original buffered decision. That
@@ -1129,6 +1194,38 @@ pub(crate) fn refine_stream_response_for_content_type(
     let mut simulated_ctx = ctx.clone();
     stamp_original_response_metadata(&mut simulated_ctx, response_status, response_headers);
     let mut simulated_response_headers = response_headers.clone();
+    if simulated_ctx
+        .metadata
+        .contains_key(RETRY_RESPONSE_BUFFERING_METADATA_KEY)
+    {
+        if plugins
+            .iter()
+            .any(|plugin| plugin.may_modify_response_content_type(ctx, content_type))
+        {
+            return false;
+        }
+        let mut saw_retry_release_plugin = false;
+        let all_active_plugins_release = plugins.iter().all(|plugin| {
+            if !plugin.should_buffer_response_body(&simulated_ctx) {
+                true
+            } else if plugin.may_release_response_body_under_retries(&simulated_ctx) {
+                saw_retry_release_plugin = true;
+                plugin.should_release_response_body_under_retries(
+                    &simulated_ctx,
+                    response_status,
+                    response_headers,
+                )
+            } else {
+                !plugin.should_buffer_response_body_for_content_type(
+                    &simulated_ctx,
+                    content_type,
+                    response_status,
+                    response_headers,
+                )
+            }
+        });
+        return saw_retry_release_plugin && all_active_plugins_release;
+    }
     let all_active_plugins_can_release_before_content_type_rewrite =
         plugins.iter().enumerate().all(|(index, plugin)| {
             let can_release = if plugin.should_buffer_response_body(&simulated_ctx) {
@@ -2212,12 +2309,16 @@ pub(crate) fn store_request_body_metadata(
 
 pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove("request_body");
+    metadata.remove(ORIGINAL_RESPONSE_METADATA_STAMPED_KEY);
+    metadata.remove(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY);
+    metadata.remove(ORIGIN_ENCODED_RESPONSE_METADATA_KEY);
     // ai_tool_governor uses these request-scoped markers to select the
     // inspectable streaming path and seed approval correlation. They are
     // lifecycle bookkeeping, not observability metadata, and must never make
     // `observability.emit_metadata: false` ineffective.
     metadata.remove(crate::plugins::ai_tool_governor::STREAM_REQUESTED_KEY);
     metadata.remove(crate::plugins::ai_tool_governor::STREAM_MODEL_KEY);
+    crate::plugins::mcp_gateway::redact_internal_log_metadata(metadata);
 }
 
 pub(crate) fn clone_log_metadata(ctx: &RequestContext) -> HashMap<String, String> {
@@ -5224,10 +5325,9 @@ impl ProxyState {
                     // (slice-declared sidecars speak mesh-mTLS by construction),
                     // so enrolling them would dial a non-existent `:15008` HBONE
                     // listener and record a spurious unsupported verdict. Also
-                    // skip any cross-cluster east-west target (HTTP-family-only by
-                    // construction, so it should never land on a raw-TCP upstream
-                    // — defensive: it dials the gateway `:15443`, never a
-                    // probeable `:15008`, and dispatch bypasses the registry).
+                    // skip cross-cluster east-west targets: they dial the
+                    // operator gateway `:15443`, never a probeable workload
+                    // `:15008`, and L4 dispatch bypasses the registry.
                     if !crate::proxy::hbone_pool::target_hbone_enabled(target)
                         || crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
                     {
@@ -5270,8 +5370,8 @@ impl ProxyState {
             for target in &upstream.targets {
                 // Ambient `mesh.hbone` per-workload targets only; Sidecar
                 // `mesh.mtls` (no probe) and cross-cluster east-west targets
-                // (HTTP-family-only, gateway-dialed, registry-bypassed) are
-                // excluded — same rationale as the VIP pass above.
+                // (gateway-dialed, registry-bypassed) are excluded — same
+                // rationale as the VIP pass above.
                 if !crate::proxy::hbone_pool::target_hbone_enabled(target)
                     || crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
                 {
@@ -5318,8 +5418,8 @@ impl ProxyState {
                 for target in &upstream.targets {
                     // Ambient `mesh.hbone` UDP targets only; Sidecar `mesh.mtls`
                     // (no probe) and cross-cluster east-west targets
-                    // (HTTP-family-only, gateway-dialed, registry-bypassed) are
-                    // excluded — same rationale as the raw-TCP passes above.
+                    // (gateway-dialed, registry-bypassed) are excluded — same
+                    // rationale as the raw-TCP passes above.
                     if !crate::proxy::hbone_pool::target_hbone_enabled(target)
                         || crate::proxy::hbone_pool::target_hbone_cross_cluster(target)
                     {
@@ -12470,6 +12570,7 @@ async fn apply_synthetic_response_body_hooks(
         {
             response_headers.insert("content-length".to_string(), transformed.len().to_string());
             *response_body = transformed;
+            plugin.on_response_body_transformed(ctx, response_headers);
         }
     }
 
@@ -15980,7 +16081,7 @@ async fn handle_proxy_request_inner(
                         Some(crate::proxy::deferred_log::DeferredTransactionLogger::new_with_start_time(
                             summary,
                             Arc::clone(&plugins),
-                            Arc::new(ctx.clone()),
+                            ctx.clone(),
                             start_time,
                         ))
                     }
@@ -16399,6 +16500,10 @@ async fn handle_proxy_request_inner(
                                 transformed.len().to_string(),
                             );
                             response_body = transformed;
+                            plugin.on_response_body_transformed(
+                                &mut ctx,
+                                &mut plugin_response_headers,
+                            );
                         }
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -17394,6 +17499,8 @@ async fn handle_proxy_request_inner(
                     current_target.as_deref(),
                     retained_body.as_deref(),
                     h3_retry_stream_response,
+                    &plugins,
+                    &ctx,
                     &ctx.client_ip,
                     &request_xff_append_ip,
                     is_tls,
@@ -17410,6 +17517,8 @@ async fn handle_proxy_request_inner(
                     current_target.as_deref(),
                     retained_body.as_deref(),
                     should_stream && is_last_attempt,
+                    &plugins,
+                    &ctx,
                     &ctx.client_ip,
                     &request_xff_append_ip,
                     is_tls,
@@ -17894,6 +18003,7 @@ async fn handle_proxy_request_inner(
                 response_headers
                     .insert("content-length".to_string(), transformed.len().to_string());
                 *data = transformed;
+                plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
             }
         }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
@@ -17977,6 +18087,24 @@ async fn handle_proxy_request_inner(
             | ResponseBody::StreamingH2(_)
             | ResponseBody::StreamingH3(_)
     );
+    // Resolve the inspector before cloning the context into the deferred
+    // logger. The resolver stamps a private stream id only when an inspector
+    // actually attaches; the terminal hook uses that id to drain plugin-owned
+    // aggregate state into transaction metadata.
+    let response_inspector = if matches!(response_body, ResponseBody::Streaming { .. }) {
+        let content_type = response_headers.get("content-type").map(String::as_str);
+        crate::plugins::create_response_stream_inspector(
+            &plugins,
+            &mut ctx,
+            response_status,
+            content_type,
+        )
+    } else {
+        None
+    };
+    if response_inspector.is_some() {
+        response_headers.remove("content-length");
+    }
     let needs_transaction_summary =
         !plugins.is_empty() || body_will_stream || backend_error_class.is_some();
     let deferred_logger: Option<Arc<crate::proxy::deferred_log::DeferredTransactionLogger>> =
@@ -18034,7 +18162,7 @@ async fn handle_proxy_request_inner(
                     crate::proxy::deferred_log::DeferredTransactionLogger::new_with_start_time(
                         summary,
                         Arc::clone(&plugins),
-                        Arc::new(ctx.clone()),
+                        ctx.clone(),
                         start_time,
                     ),
                 )
@@ -18076,33 +18204,6 @@ async fn handle_proxy_request_inner(
     }
 
     record_request(&state, response_status);
-
-    // Streaming response inspection (e.g. ai_semantic_firewall `inspect` mode):
-    // resolve the per-response inspector BEFORE the headers are applied so we can
-    // strip Content-Length when present — the inspector transforms the body
-    // (releases windows, may cut), so the backend's length no longer matches what
-    // we send, and leaving it would make a mid-stream cut look like a truncated
-    // body to the client. Gated to streaming responses with an opted-in plugin;
-    // the common case skips it. Consumed by the `ResponseBody::Streaming` arm.
-    let response_inspector = if matches!(response_body, ResponseBody::Streaming { .. })
-        && plugins.iter().any(|p| p.requires_response_stream_hooks())
-    {
-        let content_type = response_headers.get("content-type").map(String::as_str);
-        // Chain EVERY opted-in plugin (not just the first), gated to the response
-        // status so error bodies are not inspected.
-        let inspectors: Vec<_> = plugins
-            .iter()
-            .filter_map(|plugin| {
-                plugin.response_stream_inspector(&ctx, response_status, content_type)
-            })
-            .collect();
-        crate::plugins::chain_response_stream_inspectors(inspectors)
-    } else {
-        None
-    };
-    if response_inspector.is_some() {
-        response_headers.remove("content-length");
-    }
 
     // Build final response
     let mut resp_builder = Response::builder()
@@ -19156,6 +19257,8 @@ pub(crate) async fn proxy_to_backend_retry(
     upstream_target: Option<&UpstreamTarget>,
     request_body: Option<&[u8]>,
     stream_response: bool,
+    plugins: &[Arc<dyn Plugin>],
+    request_ctx: &RequestContext,
     client_ip: &str,
     xff_append_ip: &str,
     is_tls: bool,
@@ -19393,6 +19496,21 @@ pub(crate) async fn proxy_to_backend_retry(
             let status = response.status().as_u16();
             let mut resp_headers = HashMap::with_capacity(response.headers().keys_len());
             collect_response_headers(response.headers(), &mut resp_headers);
+            let retry_ctx = (!stream_response
+                && plugins_may_release_response_body_under_retries(plugins, request_ctx))
+            .then(|| retry_response_decision_context(request_ctx));
+            let stream_response = if stream_response {
+                true
+            } else {
+                refine_stream_response_for_content_type(
+                    false,
+                    proxy,
+                    plugins,
+                    retry_ctx.as_ref(),
+                    status,
+                    &resp_headers,
+                )
+            };
 
             // Enforce response body size limit — mirrors the logic in
             // `proxy_to_backend`. Without this the retry path would accept
@@ -19831,14 +19949,15 @@ async fn proxy_to_backend(
     let backend_admission_permits: Option<BackendAdmissionPermitSet>;
 
     // Context for the response-side buffer->stream downgrade. Use the real
-    // request context (not the request-body-hook clone), but suppress the
-    // downgrade entirely when retries are configured: a retry may need to
-    // replay the response body, so every attempt must stay buffered rather than
-    // stream a non-final response. Non-retry requests get the real context so
-    // response-inspection-only configs (e.g. `waf` `response_body_inspection`)
-    // actually benefit.
+    // request context (not the request-body-hook clone). Retry-enabled requests
+    // use a private marked clone so ordinary responses remain buffered while an
+    // inherently streaming representation can be released only when every
+    // active buffering plugin explicitly opts in.
+    let retry_response_ctx = (retain_request_body
+        && plugins_may_release_response_body_under_retries(plugins, request_ctx))
+    .then(|| retry_response_decision_context(request_ctx));
     let response_decision_ctx = if retain_request_body {
-        None
+        retry_response_ctx.as_ref()
     } else {
         Some(request_ctx)
     };
@@ -25240,6 +25359,8 @@ async fn proxy_to_backend_http3_retry(
     upstream_target: Option<&UpstreamTarget>,
     request_body: Option<&[u8]>,
     stream_response: bool,
+    plugins: &[Arc<dyn Plugin>],
+    request_ctx: &RequestContext,
     client_ip: &str,
     xff_append_ip: &str,
     is_tls: bool,
@@ -25297,8 +25418,11 @@ async fn proxy_to_backend_http3_retry(
     );
 
     let body_bytes = bytes::Bytes::copy_from_slice(request_body.unwrap_or(&[]));
+    let may_release_after_headers =
+        !stream_response && plugins_may_release_response_body_under_retries(plugins, request_ctx);
+    let retry_ctx = may_release_after_headers.then(|| retry_response_decision_context(request_ctx));
 
-    if stream_response {
+    if stream_response || may_release_after_headers {
         let connection_pool = state.connection_pool.clone();
         let proxy_clone = proxy.clone();
         let h3_result = if let Some(target) = upstream_target {
@@ -25350,19 +25474,43 @@ async fn proxy_to_backend_http3_retry(
                         state.max_response_body_size_bytes,
                     );
                 }
-                debug!(
-                    proxy_id = %proxy.id,
-                    status = response.status,
-                    "HTTP/3 backend streaming retry request successful"
-                );
-                let headers = std::mem::take(&mut response.headers);
-                retry::BackendResponse {
-                    status_code: response.status,
-                    body: ResponseBody::StreamingH3(Box::new(response)),
-                    headers,
-                    connection_error: false,
-                    backend_resolved_ip: resolved_ip,
-                    error_class: None,
+                let should_stream = if stream_response {
+                    true
+                } else {
+                    refine_stream_response_for_content_type(
+                        false,
+                        proxy,
+                        plugins,
+                        retry_ctx.as_ref(),
+                        response.status,
+                        &response.headers,
+                    )
+                };
+                if should_stream {
+                    debug!(
+                        proxy_id = %proxy.id,
+                        status = response.status,
+                        "HTTP/3 backend streaming retry request successful"
+                    );
+                    let headers = std::mem::take(&mut response.headers);
+                    retry::BackendResponse {
+                        status_code: response.status,
+                        body: ResponseBody::StreamingH3(Box::new(response)),
+                        headers,
+                        connection_error: false,
+                        backend_resolved_ip: resolved_ip,
+                        error_class: None,
+                    }
+                } else {
+                    drain_h3_streaming_response_to_buffered(
+                        response,
+                        state,
+                        proxy,
+                        method,
+                        backend_url,
+                        resolved_ip,
+                    )
+                    .await
                 }
             }
             Err(e) => {
@@ -26611,6 +26759,8 @@ mod tests {
         buffer_content_type: &'static str,
     }
 
+    struct RetrySseReleasePlugin;
+
     #[async_trait]
     impl Plugin for ContentTypeBufferPlugin {
         fn name(&self) -> &str {
@@ -26633,6 +26783,36 @@ mod tests {
             _response_headers: &HashMap<String, String>,
         ) -> bool {
             content_type == Some(self.buffer_content_type)
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for RetrySseReleasePlugin {
+        fn name(&self) -> &str {
+            "retry_sse_release_plugin"
+        }
+
+        fn requires_response_body_buffering(&self) -> bool {
+            true
+        }
+
+        fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+            true
+        }
+
+        fn may_release_response_body_under_retries(&self, _ctx: &RequestContext) -> bool {
+            true
+        }
+
+        fn should_release_response_body_under_retries(
+            &self,
+            _ctx: &RequestContext,
+            _response_status: u16,
+            response_headers: &HashMap<String, String>,
+        ) -> bool {
+            response_headers
+                .get("content-type")
+                .is_some_and(|value| value.starts_with("text/event-stream"))
         }
     }
 
@@ -27820,12 +28000,35 @@ mod tests {
             .insert("waf.rule_hits".to_string(), "SPOOFED".to_string());
         ctx.metadata
             .insert("waf.action".to_string(), "blocked".to_string());
+        ctx.metadata
+            .insert("mcp.needs_response_rewrite".to_string(), "true".to_string());
+        ctx.metadata.insert(
+            "mcp.response_rewrite.session".to_string(),
+            "internal-session-hash".to_string(),
+        );
+        ctx.metadata.insert(
+            ORIGINAL_RESPONSE_METADATA_STAMPED_KEY.to_string(),
+            "true".to_string(),
+        );
+        ctx.metadata.insert(
+            ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY.to_string(),
+            "128".to_string(),
+        );
+        ctx.metadata.insert(
+            ORIGIN_ENCODED_RESPONSE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
 
         let metadata = clone_log_metadata(&ctx);
 
         assert!(!metadata.contains_key("request_body"));
         assert!(!metadata.contains_key("waf.rule_hits"));
         assert!(!metadata.contains_key("waf.action"));
+        assert!(!metadata.contains_key("mcp.needs_response_rewrite"));
+        assert!(!metadata.contains_key("mcp.response_rewrite.session"));
+        assert!(!metadata.contains_key(ORIGINAL_RESPONSE_METADATA_STAMPED_KEY));
+        assert!(!metadata.contains_key(ORIGINAL_RESPONSE_CONTENT_LENGTH_METADATA_KEY));
+        assert!(!metadata.contains_key(ORIGIN_ENCODED_RESPONSE_METADATA_KEY));
 
         ctx.set_waf_metadata("waf.rule_hits", "FE-SQLI-001");
         ctx.metadata
@@ -28221,6 +28424,7 @@ mod tests {
         proxy.backend_port = 1;
         proxy.dns_override = Some("127.0.0.1".to_string());
         proxy.resolved_tls.sni = Some("backend.mesh.internal".to_string());
+        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
 
         let resp = proxy_to_backend_retry(
             &state,
@@ -28231,6 +28435,8 @@ mod tests {
             None,
             None,
             true,
+            &[],
+            &ctx,
             "127.0.0.1",
             "127.0.0.1",
             true,
@@ -28357,6 +28563,88 @@ mod tests {
             matches!(json_body, ResponseBody::Buffered(_)),
             "allowlisted (json) response must stay buffered so the WAF can scan it"
         );
+    }
+
+    #[tokio::test]
+    async fn retry_enabled_dispatch_releases_inherently_streaming_sse_after_headers() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/events"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_bytes(b"data: ready\n\n".to_vec()),
+            )
+            .mount(&server)
+            .await;
+
+        let state = make_test_proxy_state(GatewayConfig::default());
+        let mut proxy = test_proxy(ResponseBodyMode::Stream);
+        proxy.backend_scheme = Some(BackendScheme::Http);
+        proxy.backend_host = server.address().ip().to_string();
+        proxy.backend_port = server.address().port();
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RetrySseReleasePlugin)];
+        let ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/events".into());
+        let bytes_sent = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let initial = proxy_to_backend(
+            &state,
+            &proxy,
+            &format!("{}/events", server.uri()),
+            "GET",
+            &HashMap::new(),
+            ClientRequestBody::Buffered(Vec::new()),
+            None,
+            &plugins,
+            &[],
+            None,
+            &ctx,
+            false,
+            false,
+            true,
+            true,
+            "127.0.0.1",
+            "127.0.0.1",
+            false,
+            false,
+            false,
+            false,
+            &bytes_sent,
+            hyper::Version::HTTP_11,
+            &mut std::time::Instant::now(),
+        )
+        .await;
+        let initial_response = match initial {
+            BackendDispatchResult::Response { response, .. } => *response,
+            BackendDispatchResult::AdmissionRejected(_) => {
+                panic!("test does not configure backend admission plugins")
+            }
+        };
+        assert!(matches!(
+            initial_response.body,
+            ResponseBody::Streaming { .. }
+        ));
+
+        let retry_response = proxy_to_backend_retry(
+            &state,
+            &proxy,
+            &format!("{}/events", server.uri()),
+            "GET",
+            &HashMap::new(),
+            None,
+            None,
+            false,
+            &plugins,
+            &ctx,
+            "127.0.0.1",
+            "127.0.0.1",
+            false,
+            hyper::Version::HTTP_11,
+        )
+        .await;
+        assert!(matches!(
+            retry_response.body,
+            ResponseBody::Streaming { .. }
+        ));
     }
 
     #[tokio::test]
@@ -30301,8 +30589,8 @@ mod tests {
             &binary_headers,
         ));
 
-        // No request context (the proxy passes None when retries are
-        // configured): keep the pre-flight buffering decision.
+        // No request context (including retry configurations with no eligible
+        // release plugin): keep the pre-flight buffering decision.
         assert!(!refine_stream_response_for_content_type(
             false,
             &proxy,
@@ -30324,6 +30612,57 @@ mod tests {
             Some(&ctx),
             200,
             &binary_headers,
+        ));
+
+        let retry_ctx = retry_response_decision_context(&ctx);
+        let sse_headers = HashMap::from([(
+            "content-type".to_string(),
+            "text/event-stream; charset=utf-8".to_string(),
+        )]);
+        let retry_sse_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(RetrySseReleasePlugin)];
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &retry_sse_plugins,
+            Some(&retry_ctx),
+            200,
+            &sse_headers,
+        ));
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &retry_sse_plugins,
+            Some(&retry_ctx),
+            200,
+            &json_headers,
+        ));
+        let retry_sse_with_json_only_inspector: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(RetrySseReleasePlugin),
+            Arc::new(ContentTypeBufferPlugin {
+                buffer_content_type: "application/json",
+            }),
+        ];
+        assert!(refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &retry_sse_with_json_only_inspector,
+            Some(&retry_ctx),
+            200,
+            &sse_headers,
+        ));
+        let retry_sse_blocked_by_other_buffering_plugin: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(RetrySseReleasePlugin),
+            Arc::new(ResponseBufferPlugin {
+                should_buffer: true,
+            }),
+        ];
+        assert!(!refine_stream_response_for_content_type(
+            false,
+            &proxy,
+            &retry_sse_blocked_by_other_buffering_plugin,
+            Some(&retry_ctx),
+            200,
+            &sse_headers,
         ));
     }
 

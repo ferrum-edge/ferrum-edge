@@ -139,12 +139,12 @@ pub fn raw_status_trickle(payload: &str, chunk_size: usize, pause: Duration) -> 
     out
 }
 
-/// Send `count` body chunks of `chunk_size` bytes (filled with `'x'`)
+/// Send `count` body chunks of `chunk_size` bytes (filled with `'x'`),
 /// each separated by `pause`. Headers + status come from the
 /// `TrickleBody` step so the request prelude is consumed correctly.
 pub fn slow_body_trickle(chunk_size: usize, pause: Duration, count: u32) -> Vec<HttpStep> {
     let total = (chunk_size as u64) * (count as u64);
-    let chunk = vec![b'x'; chunk_size];
+    let body = vec![b'x'; total as usize];
     vec![HttpStep::TrickleBody {
         status: 200,
         reason: "OK".into(),
@@ -153,9 +153,9 @@ pub fn slow_body_trickle(chunk_size: usize, pause: Duration, count: u32) -> Vec<
             ("Content-Length".into(), total.to_string()),
             ("Connection".into(), "close".into()),
         ],
-        chunk,
+        body,
+        chunk_size,
         pause,
-        count,
     }]
 }
 

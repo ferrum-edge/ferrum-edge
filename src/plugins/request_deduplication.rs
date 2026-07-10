@@ -1786,7 +1786,7 @@ impl Plugin for RequestDeduplication {
 
     async fn on_response_stream_terminated(
         &self,
-        ctx: &RequestContext,
+        ctx: &mut RequestContext,
         _response_status: u16,
         outcome: &crate::proxy::deferred_log::BodyOutcome,
     ) {

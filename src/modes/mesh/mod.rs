@@ -1927,28 +1927,23 @@ fn build_east_west_service_proxies_and_upstreams(
 
     for service in &mesh_slice.services {
         // MULTI-PORT east-west (issue #2010 phase 3): materialize ONE
-        // SNI-passthrough proxy per HTTP-family service port. A SINGLE-HTTP-port
+        // SNI-passthrough proxy per cross-cluster service port. A SINGLE-HTTP-port
         // service materializes exactly one proxy on the bare base service FQDN
         // with the port-less legacy id, byte-identical to the pre-multi-port
         // behavior. A MULTI-HTTP-port service materializes a proxy per port on an
         // explicit `p<port>.<fqdn>` SNI alias — the lowest port INCLUDED — so
         // client + destination agree per EXPLICIT numeric port and cannot
         // cross-wire under cross-cluster port skew (codex #2040 Finding A);
-        // `cross_cluster_service_sni` is the shared source of that SNI. Non-HTTP
-        // -family ports get no east-west proxy (raw-TCP/UDP cross-cluster is a
-        // later phase).
-        let base_port = cross_cluster_service_base_port(service);
-        for service_port in service_http_family_ports(service) {
+        // `cross_cluster_service_sni` is the shared source of that SNI. L4 ports
+        // are inherently per-port and use `p<port>.<fqdn>` (or the
+        // protocol-suffixed form when TCP and UDP share a number).
+        for service_port in &service.ports {
             // `None` (⇒ port-less legacy id) ONLY for a single-port service's sole
             // port (`cross_cluster_service_base_port` returns `None` for a
             // multi-port service); every port of a multi-port service carries its
             // own `.p<port>` id so the per-port proxies never collide (codex #2040
             // Finding B).
-            let id_port = if base_port == Some(service_port.port) {
-                None
-            } else {
-                Some(service_port.port)
-            };
+            let id_suffix = cross_cluster_service_sni_label(service, service_port);
             // Build upstream targets for THIS service port.
             let targets = build_east_west_service_targets(
                 service,
@@ -2006,8 +2001,11 @@ fn build_east_west_service_proxies_and_upstreams(
                 continue;
             }
 
-            let upstream_id =
-                mesh_east_west_service_upstream_id(&service.namespace, &service.name, id_port);
+            let upstream_id = mesh_east_west_service_upstream_id(
+                &service.namespace,
+                &service.name,
+                id_suffix.as_deref(),
+            );
 
             let upstream = Upstream {
                 id: upstream_id.clone(),
@@ -2041,8 +2039,11 @@ fn build_east_west_service_proxies_and_upstreams(
             };
             upstreams.push(upstream);
 
-            let proxy_id =
-                mesh_east_west_service_proxy_id(&service.namespace, &service.name, id_port);
+            let proxy_id = mesh_east_west_service_proxy_id(
+                &service.namespace,
+                &service.name,
+                id_suffix.as_deref(),
+            );
             let proxy = east_west_service_proxy(
                 &proxy_id,
                 &sni_hostname,
@@ -2188,6 +2189,51 @@ pub(crate) fn cross_cluster_service_base_port(
     }
 }
 
+/// DNS label (and internal id suffix) for a service port's east-west alias.
+/// `None` is the HTTP-only bare-base compatibility case. L4 normally uses
+/// `p<port>`; when TCP-family and UDP share the same numeric service port, the
+/// transport discriminator is required because their targetPorts may differ.
+fn cross_cluster_service_sni_label(
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+) -> Option<String> {
+    let effective_protocol = service
+        .protocol_overrides
+        .get(&service_port.port)
+        .copied()
+        .unwrap_or(service_port.protocol);
+    if is_http_family_mesh_protocol(effective_protocol)
+        && cross_cluster_service_base_port(service) == Some(service_port.port)
+    {
+        return None;
+    }
+
+    let l4_same_number = service
+        .ports
+        .iter()
+        .filter(|candidate| {
+            candidate.port == service_port.port
+                && !is_http_family_mesh_protocol(
+                    service
+                        .protocol_overrides
+                        .get(&candidate.port)
+                        .copied()
+                        .unwrap_or(candidate.protocol),
+                )
+        })
+        .count();
+    if l4_same_number > 1 {
+        let transport = if is_udp_mesh_protocol(effective_protocol) {
+            "udp"
+        } else {
+            "tcp"
+        };
+        Some(format!("p{}-{transport}", service_port.port))
+    } else {
+        Some(format!("p{}", service_port.port))
+    }
+}
+
 /// The cross-cluster east-west SNI a `(service, service_port)` routes on
 /// (multi-port scheme, issue #2010 phase 3; codex #2040 Finding A).
 ///
@@ -2199,6 +2245,9 @@ pub(crate) fn cross_cluster_service_base_port(
 ///   lowest — on an explicit per-port alias `p<service_port>.<base_fqdn>` (e.g.
 ///   `p8080.reviews...`, `p9090.reviews...`). The bare base FQDN routes to NO
 ///   port for a multi-port service.
+/// - A **raw-TCP or UDP** port routes on `p<service_port>.<base_fqdn>`; when
+///   TCP and UDP share the number, `-tcp` / `-udp` disambiguates their aliases.
+///   L4 capture never consumes the HTTP-only bare-base compatibility case.
 ///
 /// Aliasing every port of a multi-port service (rather than routing the lowest
 /// port on the bare base) is what makes the scheme fail CLOSED under
@@ -2224,11 +2273,8 @@ pub(crate) fn cross_cluster_service_sni(
     let base = cross_cluster_service_base_fqdn(service, cluster_domain);
     // Bare base FQDN ONLY for a single-HTTP-port service (its sole port). Every
     // port of a multi-port service — lowest included — gets an explicit alias.
-    if cross_cluster_service_base_port(service) == Some(service_port.port) {
-        base
-    } else {
-        format!("p{}.{base}", service_port.port)
-    }
+    cross_cluster_service_sni_label(service, service_port)
+        .map_or(base.clone(), |label| format!("{label}.{base}"))
 }
 
 /// Build upstream targets from workloads that belong to the given service, for
@@ -2378,11 +2424,12 @@ fn sanitize_mesh_id_component(component: &str) -> String {
     component.replace(['/', '.'], "-")
 }
 
-/// East-west per-service proxy id. `service_port` is `None` for a SINGLE-HTTP-port
+/// East-west per-service proxy id. `sni_label` is `None` for a SINGLE-HTTP-port
 /// service — which keeps the historic port-LESS `__mesh-ew-svc-<ns>-<name>` id so
 /// that service is byte-identical to the pre-multi-port shape — and `Some(port)`
 /// for EVERY port of a MULTI-port service (multi-port east-west, issue #2010
-/// phase 3; no bare base id is emitted for a multi-port service, matching the
+/// phase 3; L4 labels may additionally carry a `-tcp` / `-udp` discriminator
+/// when both transports share one number. No bare base id is emitted for a multi-port service, matching the
 /// SNI scheme where every port of a multi-port service takes an explicit
 /// `p<port>.<fqdn>` alias).
 ///
@@ -2396,32 +2443,28 @@ fn sanitize_mesh_id_component(component: &str) -> String {
 /// sanitized (`/`,`.` → `-`) BEFORE the `.p<port>` marker is appended so a
 /// malformed component can never forge the structural separator, while the
 /// intentional marker dot is preserved (never collapsed).
-fn mesh_east_west_service_proxy_id(
-    namespace: &str,
-    name: &str,
-    service_port: Option<u16>,
-) -> String {
+fn mesh_east_west_service_proxy_id(namespace: &str, name: &str, sni_label: Option<&str>) -> String {
     let namespace = sanitize_mesh_id_component(namespace);
     let name = sanitize_mesh_id_component(name);
-    match service_port {
+    match sni_label {
         None => format!("__mesh-ew-svc-{namespace}-{name}"),
-        Some(port) => format!("__mesh-ew-svc-{namespace}-{name}.p{port}"),
+        Some(label) => format!("__mesh-ew-svc-{namespace}-{name}.{label}"),
     }
 }
 
-/// East-west per-service upstream id; `service_port` semantics and the
+/// East-west per-service upstream id; `sni_label` semantics and the
 /// collision-free `.p<port>` marker mirror [`mesh_east_west_service_proxy_id`]
 /// (single-port ⇒ port-less legacy id; multi-port ⇒ explicit per-port id).
 fn mesh_east_west_service_upstream_id(
     namespace: &str,
     name: &str,
-    service_port: Option<u16>,
+    sni_label: Option<&str>,
 ) -> String {
     let namespace = sanitize_mesh_id_component(namespace);
     let name = sanitize_mesh_id_component(name);
-    match service_port {
+    match sni_label {
         None => format!("__mesh-ew-upstream-{namespace}-{name}"),
-        Some(port) => format!("__mesh-ew-upstream-{namespace}-{name}.p{port}"),
+        Some(label) => format!("__mesh-ew-upstream-{namespace}-{name}.{label}"),
     }
 }
 
@@ -4918,38 +4961,47 @@ fn build_outbound_mesh_targets(
     //   (`mesh.hbone_dial_host` / `mesh.hbone_port`)
     //   (`append_cross_cluster_ambient_hbone_targets`).
     //
-    // HTTP-FAMILY ONLY: `build_outbound_mesh_targets` is shared by the HTTP,
-    // raw-TCP, and UDP materializers. The cross-cluster east-west dial is an
-    // HTTP/2-over-mTLS path (the gateway's SNI passthrough routes the HTTP
-    // request); the L4 (raw-TCP / UDP) tunnel paths don't understand the
-    // cross-cluster / SNI-override semantics, so the append runs only for
-    // HTTP-family ports. Reuses the shared `is_http_family_mesh_protocol`
-    // classifier (do not invent a new one).
-    if is_http_family_mesh_protocol(protocol) {
-        match transport {
-            MeshEgressTransport::SidecarMtls => append_cross_cluster_mesh_targets(
-                &mut targets,
-                &runtime.cluster_domain,
-                service,
-                service_port,
-                protocol,
-                workloads,
-                multi_cluster,
-            ),
-            MeshEgressTransport::Hbone => append_cross_cluster_ambient_hbone_targets(
-                &mut targets,
-                runtime,
-                service,
-                service_port,
-                protocol,
-                workloads,
-                multi_cluster,
-            ),
-            // NodeWaypoint captured-Service egress is dispatched per the selected
-            // workload's NodeWaypoint metadata, not an east-west gateway; no
-            // cross-cluster target.
-            MeshEgressTransport::NodeWaypointCapturedService => {}
+    // Cross-cluster transport is available to all three protocol lanes. HTTP
+    // keeps its gateway-endpoint target shape because the destination routes
+    // the inner request by Host. Raw TCP and UDP instead require a per-pod
+    // CONNECT authority, so Sidecar uses the L4-specific target shape below;
+    // Ambient already uses a per-pod authority for every protocol.
+    match transport {
+        MeshEgressTransport::SidecarMtls => {
+            if is_http_family_mesh_protocol(protocol) {
+                append_cross_cluster_mesh_targets(
+                    &mut targets,
+                    &runtime.cluster_domain,
+                    service,
+                    service_port,
+                    protocol,
+                    workloads,
+                    multi_cluster,
+                )
+            } else {
+                append_cross_cluster_sidecar_l4_targets(
+                    &mut targets,
+                    &runtime.cluster_domain,
+                    service,
+                    service_port,
+                    protocol,
+                    workloads,
+                    multi_cluster,
+                )
+            }
         }
+        MeshEgressTransport::Hbone => append_cross_cluster_ambient_hbone_targets(
+            &mut targets,
+            runtime,
+            service,
+            service_port,
+            protocol,
+            workloads,
+            multi_cluster,
+        ),
+        // NodeWaypoint captured-Service egress is dispatched per the selected
+        // workload's NodeWaypoint metadata, not an east-west gateway.
+        MeshEgressTransport::NodeWaypointCapturedService => {}
     }
 
     targets
@@ -5320,6 +5372,162 @@ pub(crate) fn append_cross_cluster_mesh_targets_prematched(
     }
 }
 
+/// Append Sidecar cross-cluster raw-TCP / UDP targets. Unlike HTTP-family
+/// Sidecar egress, an L4 CONNECT has no inner Host route. Each remote workload
+/// address therefore gets a target whose network dial is the east-west gateway
+/// while `mesh.mtls_authority_host` carries the real pod address the selected
+/// destination relay is allowed to dial. `target.host` is a scoped synthetic
+/// identity including gateway, trust domain, SNI, and pod address so distinct
+/// connection identities cannot collide in LB/health/circuit-breaker maps.
+#[allow(clippy::too_many_arguments)]
+fn append_cross_cluster_sidecar_l4_targets(
+    targets: &mut Vec<UpstreamTarget>,
+    cluster_domain: &str,
+    service: &crate::modes::mesh::config::MeshService,
+    service_port: &crate::modes::mesh::config::ServicePort,
+    protocol: AppProtocol,
+    workloads: &[crate::modes::mesh::config::Workload],
+    multi_cluster: Option<&crate::modes::mesh::config::MultiClusterConfig>,
+) {
+    let Some(multi_cluster) = multi_cluster else {
+        return;
+    };
+    let remote_workloads =
+        matched_remote_service_workloads(service, workloads, Some(multi_cluster));
+    let remote_workloads: Vec<_> = remote_workloads
+        .into_iter()
+        .filter(|workload| east_west_workload_is_reachable(service_port, workload))
+        .collect();
+    if remote_workloads.is_empty() {
+        return;
+    }
+
+    let base_fqdn = cross_cluster_service_base_fqdn(service, cluster_domain);
+    let dial_sni = cross_cluster_service_sni(service, service_port, cluster_domain);
+    let acceptable_snis = east_west_acceptable_snis(&base_fqdn, &dial_sni);
+    struct BuiltTarget {
+        target: UpstreamTarget,
+        dial_endpoint: (String, u16),
+        trust_domain: String,
+    }
+    let mut built = Vec::new();
+
+    for workload in remote_workloads {
+        let Some(gateway) = select_east_west_gateway_for_network(
+            multi_cluster,
+            workload.network.as_deref(),
+            &acceptable_snis,
+            &workload.trust_domain,
+        ) else {
+            warn!(
+                service = %service.name,
+                namespace = %service.namespace,
+                network = workload.network.as_deref().unwrap_or("<none>"),
+                "Skipping cross-cluster Sidecar L4 workload without a matching east-west gateway"
+            );
+            continue;
+        };
+        if gateway.host.trim().is_empty() || gateway.port == 0 {
+            warn!(service = %service.name, gateway = %gateway.name,
+                "Skipping cross-cluster Sidecar L4 workload with an unusable gateway endpoint");
+            continue;
+        }
+        let app_port = match service_port.target_port.as_ref() {
+            Some(_) => resolve_target_port(service_port.target_port.as_ref(), &workload.ports)
+                .filter(|port| *port != 0),
+            None => (service_port.port != 0).then_some(service_port.port),
+        };
+        let Some(app_port) = app_port else {
+            continue;
+        };
+
+        for address in &workload.addresses {
+            let mut tags = crate::service_discovery::mesh::mesh_sidecar_mtls_target_tags(
+                service,
+                workload,
+                protocol,
+                service_port.name.as_deref(),
+            );
+            tags.remove(crate::proxy::hbone_pool::MESH_SPIFFE_ID_TAG);
+            tags.insert(
+                crate::proxy::mesh_mtls_pool::MESH_TRUST_DOMAIN_TAG.to_string(),
+                workload.trust_domain.as_str().to_string(),
+            );
+            tags.insert(
+                crate::modes::mesh::multicluster::MESH_REMOTE_TAG.to_string(),
+                crate::modes::mesh::multicluster::MESH_REMOTE_TAG_VALUE.to_string(),
+            );
+            tags.insert(
+                crate::proxy::mesh_mtls_pool::MESH_MTLS_DIAL_HOST_TAG.to_string(),
+                gateway.host.clone(),
+            );
+            tags.insert(
+                crate::proxy::mesh_mtls_pool::MESH_MTLS_PORT_TAG.to_string(),
+                gateway.port.to_string(),
+            );
+            tags.insert(
+                crate::proxy::mesh_mtls_pool::MESH_MTLS_AUTHORITY_HOST_TAG.to_string(),
+                address.clone(),
+            );
+            tags.insert(
+                crate::proxy::mesh_mtls_pool::MESH_EASTWEST_SNI_TAG.to_string(),
+                dial_sni.clone(),
+            );
+            tags.insert(
+                crate::proxy::mesh_mtls_pool::MESH_CROSS_CLUSTER_TAG.to_string(),
+                "true".to_string(),
+            );
+            let synthetic_host = format!(
+                "mesh-xc-l4-{}|{}|{}|{}|{}",
+                gateway.host,
+                gateway.port,
+                workload.trust_domain.as_str(),
+                dial_sni,
+                address
+            );
+            built.push(BuiltTarget {
+                target: UpstreamTarget {
+                    host: synthetic_host,
+                    port: app_port,
+                    service_port_policy_key: Some(service_port.port),
+                    weight: 1,
+                    tags,
+                    locality: workload.locality.clone(),
+                    path: None,
+                },
+                dial_endpoint: (gateway.host.clone(), gateway.port),
+                trust_domain: workload.trust_domain.as_str().to_string(),
+            });
+        }
+    }
+
+    let mut trust_domains_by_endpoint: std::collections::HashMap<
+        (String, u16),
+        std::collections::HashSet<String>,
+    > = std::collections::HashMap::new();
+    for item in &built {
+        trust_domains_by_endpoint
+            .entry(item.dial_endpoint.clone())
+            .or_default()
+            .insert(item.trust_domain.clone());
+    }
+    for item in built {
+        if trust_domains_by_endpoint
+            .get(&item.dial_endpoint)
+            .is_some_and(|domains| domains.len() > 1)
+        {
+            warn!(
+                service = %service.name,
+                gateway_host = %item.dial_endpoint.0,
+                gateway_port = item.dial_endpoint.1,
+                "Skipping ambiguous cross-cluster Sidecar L4 target: one gateway endpoint serves multiple trust domains"
+            );
+            continue;
+        }
+        targets.push(item.target);
+    }
+}
+
 /// Build the SCOPED SYNTHETIC `UpstreamTarget.host` for an AMBIENT cross-cluster
 /// HBONE target, keyed by `(east-west gateway dial endpoint, real pod addr)`. It
 /// is an OPAQUE identity for every host:port-keyed runtime map (load balancer,
@@ -5460,14 +5668,13 @@ pub(crate) fn append_cross_cluster_ambient_hbone_targets_prematched(
     remote_workloads: &[&crate::modes::mesh::config::Workload],
     multi_cluster: &crate::modes::mesh::config::MultiClusterConfig,
 ) {
-    // MULTI-PORT (issue #2010 phase 3): every HTTP-family `service_port` gets
-    // per-remote-pod cross-cluster targets — identical scheme to the Sidecar path.
+    // Every supported service port gets per-remote-pod cross-cluster targets.
     // The client SELECTS the gateway by the base FQDN or the exact dialed alias
     // (`east_west_acceptable_snis`) but DIALS the per-port SNI
     // (`cross_cluster_service_sni`); the inner HBONE CONNECT
     // `:authority` already carries the per-port app port (`resolve_app_port`
-    // below, which honors `service_port.target_port`). Non-HTTP-family ports never
-    // reach here (the caller gates on `is_http_family_mesh_protocol`).
+    // below, which honors `service_port.target_port`). Raw-TCP/UDP ports always
+    // get the explicit `p<port>` alias from `cross_cluster_service_sni`.
     if remote_workloads.is_empty() {
         return;
     }

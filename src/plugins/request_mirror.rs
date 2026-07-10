@@ -22,10 +22,9 @@
 //! ## Mirror response logging
 //!
 //! The spawned task captures mirror response metadata (status code, response
-//! size, latency) and writes it to a `tokio::sync::watch` channel. The proxy
-//! handler collects the result before building `TransactionSummary`, so all
-//! logging plugins (stdout, http_logging, prometheus, transaction_debugger)
-//! receive mirror metadata in the `mirror` field automatically.
+//! size, latency) and writes it to a `tokio::sync::watch` channel. Transaction
+//! logging consumes that channel from a separate detached task, so all logging
+//! plugins receive mirror metadata without delaying the client response.
 //!
 //! Mirror timeout defaults to the proxy's `backend_read_timeout_ms`, ensuring
 //! shadow requests respect the same timeout budget as the real backend call.
@@ -438,8 +437,8 @@ impl Plugin for RequestMirror {
         });
 
         // Create a watch channel for the spawned task to send mirror response
-        // metadata back. The proxy handler collects the result via
-        // `ctx.collect_mirror_result()` before building TransactionSummary.
+        // metadata back. Transaction logging consumes it from another detached
+        // task after the primary summary is available.
         let (tx, rx) = tokio::sync::watch::channel(None);
         ctx.mirror_result_rx = Some(rx);
 

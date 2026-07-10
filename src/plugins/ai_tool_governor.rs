@@ -1048,7 +1048,13 @@ pub struct AiToolGovernor {
     needs_response_transform: bool,
     /// Cached copy of the redaction placeholder template for the transform path.
     redaction_placeholder: String,
+    /// Inspector-completed observability batches waiting for the mutable
+    /// response-stream terminal hook. Entries exist only for concrete streams
+    /// that attached this plugin's inspector with metadata emission enabled.
+    pending_stream_metadata: Arc<DashMap<u64, StreamMetadataSlot>>,
 }
+
+type StreamMetadataSlot = Arc<std::sync::Mutex<HashMap<String, String>>>;
 
 impl AiToolGovernor {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
@@ -1093,6 +1099,9 @@ impl AiToolGovernor {
                 engine: Arc::new(engine),
                 needs_response_transform: false,
                 redaction_placeholder: DEFAULT_REDACTION_PLACEHOLDER.to_string(),
+                pending_stream_metadata: Arc::new(DashMap::with_shard_amount(
+                    approval_cache_shard_amount,
+                )),
             });
         }
 
@@ -1220,6 +1229,9 @@ impl AiToolGovernor {
             engine: Arc::new(engine),
             needs_response_transform,
             redaction_placeholder,
+            pending_stream_metadata: Arc::new(DashMap::with_shard_amount(
+                approval_cache_shard_amount,
+            )),
         })
     }
 
@@ -1343,15 +1355,26 @@ impl AiToolGovernor {
 
     /// Write aggregate decision metadata onto the request context.
     fn write_metadata(&self, ctx: &mut RequestContext, batch: &BatchDecision) {
-        let obs = self.engine.observability;
+        Self::write_metadata_into(&self.engine, &mut ctx.metadata, batch);
+    }
+
+    /// Shared buffered/streaming metadata formatter. Streaming inspectors write
+    /// into an inspector-owned slot, then the terminal hook merges that slot
+    /// into `ctx.metadata`; keeping the formatter shared prevents observability
+    /// config or key-shape drift between the two paths.
+    fn write_metadata_into(
+        engine: &GovernorEngine,
+        m: &mut HashMap<String, String>,
+        batch: &BatchDecision,
+    ) {
+        let obs = engine.observability;
         if !obs.emit_metadata {
             return;
         }
-        let m = &mut ctx.metadata;
         m.insert("ai_tool_governor.enabled".to_string(), "true".to_string());
         m.insert(
             "ai_tool_governor.mode".to_string(),
-            self.engine.mode.as_str().to_string(),
+            engine.mode.as_str().to_string(),
         );
         // Sticky aggregate: an earlier surface's `deny` in one request/response
         // is never downgraded by this batch's `allow` (see `set_decision_metadata`).
@@ -1435,6 +1458,62 @@ impl AiToolGovernor {
         );
     }
 
+    fn write_uninspectable_metadata_into(
+        engine: &GovernorEngine,
+        metadata: &mut HashMap<String, String>,
+    ) {
+        if !engine.observability.emit_metadata {
+            return;
+        }
+        metadata.insert("ai_tool_governor.enabled".to_string(), "true".to_string());
+        metadata.insert(
+            "ai_tool_governor.mode".to_string(),
+            engine.mode.as_str().to_string(),
+        );
+        set_decision_metadata(metadata, "deny");
+    }
+
+    fn merge_stream_metadata(
+        target: &mut HashMap<String, String>,
+        source: &HashMap<String, String>,
+    ) {
+        let Some(label) = source.get("ai_tool_governor.decision") else {
+            return;
+        };
+        if let Some(enabled) = source.get("ai_tool_governor.enabled") {
+            target.insert("ai_tool_governor.enabled".to_string(), enabled.clone());
+        }
+        if let Some(mode) = source.get("ai_tool_governor.mode") {
+            target.insert("ai_tool_governor.mode".to_string(), mode.clone());
+        }
+
+        let previous_rank = target
+            .get("ai_tool_governor.decision")
+            .map(|value| label_rank(value))
+            .unwrap_or(0);
+        let batch_rank = label_rank(label);
+        set_decision_metadata(target, label);
+        for key in [
+            "ai_tool_governor.tool_names",
+            "ai_tool_governor.policy_ids",
+            "ai_tool_governor.approval_id",
+            "ai_tool_governor.arguments_hashes",
+            "ai_tool_governor.redacted_tools",
+        ] {
+            let values: Vec<&str> = source
+                .get(key)
+                .map(|value| value.split(',').filter(|value| !value.is_empty()).collect())
+                .unwrap_or_default();
+            set_ranked_csv_metadata(target, key, previous_rank, batch_rank, &values);
+        }
+        if let Some(risk) = source
+            .get("ai_tool_governor.risk")
+            .and_then(|value| RiskLevel::from_str(value))
+        {
+            set_ranked_risk_metadata(target, previous_rank, batch_rank, risk);
+        }
+    }
+
     fn reject(&self, batch: &BatchDecision) -> PluginResult {
         let reason = batch
             .deny_reason
@@ -1465,15 +1544,7 @@ impl AiToolGovernor {
         surface: &str,
         reason: &str,
     ) -> PluginResult {
-        if self.engine.observability.emit_metadata {
-            let m = &mut ctx.metadata;
-            m.insert("ai_tool_governor.enabled".to_string(), "true".to_string());
-            m.insert(
-                "ai_tool_governor.mode".to_string(),
-                self.engine.mode.as_str().to_string(),
-            );
-            set_decision_metadata(m, "deny");
-        }
+        Self::write_uninspectable_metadata_into(&self.engine, &mut ctx.metadata);
         PluginResult::Reject {
             status_code: UNINSPECTABLE_STATUS,
             body: format!(
@@ -2946,11 +3017,44 @@ impl Plugin for AiToolGovernor {
             .cloned();
         let provider = federation_provider(ctx);
         let corr = self.correlation(ctx, model, provider.as_deref());
+        let stream_metadata = if self.engine.observability.emit_metadata
+            && let Some(stream_id) = ctx.response_stream_id()
+        {
+            let slot = Arc::new(std::sync::Mutex::new(HashMap::new()));
+            self.pending_stream_metadata
+                .insert(stream_id, Arc::clone(&slot));
+            Some(slot)
+        } else {
+            None
+        };
         Some(Box::new(ToolCallStreamInspector::new(
             Arc::clone(&self.engine),
             corr,
             Arc::clone(&ctx.plugin_http_call_ns),
+            stream_metadata,
         )))
+    }
+
+    async fn on_response_stream_terminated(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _outcome: &crate::proxy::deferred_log::BodyOutcome,
+    ) {
+        if !self.engine.observability.emit_metadata {
+            return;
+        }
+        let Some(stream_id) = ctx.response_stream_id() else {
+            return;
+        };
+        let Some((_, slot)) = self.pending_stream_metadata.remove(&stream_id) else {
+            return;
+        };
+        let pending = match slot.lock() {
+            Ok(mut guard) => std::mem::take(&mut *guard),
+            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
+        };
+        Self::merge_stream_metadata(&mut ctx.metadata, &pending);
     }
 }
 
@@ -2965,6 +3069,10 @@ impl AiToolGovernor {
 
     pub fn approval_cache_max_entries() -> usize {
         MAX_APPROVAL_CACHE_ENTRIES
+    }
+
+    pub fn pending_stream_metadata_len(&self) -> usize {
+        self.pending_stream_metadata.len()
     }
 }
 
@@ -3276,6 +3384,9 @@ struct ToolCallStreamInspector {
     engine: Arc<GovernorEngine>,
     corr: CorrelationMeta,
     plugin_http_call_ns: Arc<AtomicU64>,
+    /// Shared only with this plugin instance's terminal-hook entry. Written at
+    /// completed policy-batch boundaries, never on the per-chunk path.
+    stream_metadata: Option<StreamMetadataSlot>,
     /// Raw bytes received but not yet a complete SSE event.
     carry: Vec<u8>,
     /// Raw bytes of held (un-released) events, in arrival order. Contains the
@@ -3304,11 +3415,13 @@ impl ToolCallStreamInspector {
         engine: Arc<GovernorEngine>,
         corr: CorrelationMeta,
         plugin_http_call_ns: Arc<AtomicU64>,
+        stream_metadata: Option<StreamMetadataSlot>,
     ) -> Self {
         Self {
             engine,
             corr,
             plugin_http_call_ns,
+            stream_metadata,
             carry: Vec::new(),
             held: Vec::new(),
             accumulator: StreamingToolCallAccumulator::default(),
@@ -3356,6 +3469,36 @@ impl ToolCallStreamInspector {
         }
     }
 
+    fn record_metadata(&self, batch: &BatchDecision) {
+        let Some(slot) = &self.stream_metadata else {
+            return;
+        };
+        match slot.lock() {
+            Ok(mut metadata) => {
+                AiToolGovernor::write_metadata_into(&self.engine, &mut metadata, batch);
+            }
+            Err(poisoned) => {
+                let mut metadata = poisoned.into_inner();
+                AiToolGovernor::write_metadata_into(&self.engine, &mut metadata, batch);
+            }
+        }
+    }
+
+    fn record_uninspectable_metadata(&self) {
+        let Some(slot) = &self.stream_metadata else {
+            return;
+        };
+        match slot.lock() {
+            Ok(mut metadata) => {
+                AiToolGovernor::write_uninspectable_metadata_into(&self.engine, &mut metadata);
+            }
+            Err(poisoned) => {
+                let mut metadata = poisoned.into_inner();
+                AiToolGovernor::write_uninspectable_metadata_into(&self.engine, &mut metadata);
+            }
+        }
+    }
+
     /// Evaluate the accumulated tool calls at a completion boundary. On
     /// release, appends the held raw bytes to `out` and resets batch state.
     async fn finalize(&mut self, out: &mut Vec<u8>) -> Finalize {
@@ -3372,6 +3515,7 @@ impl ToolCallStreamInspector {
         // `build_calls()` silently drops unnamed calls.
         if self.accumulator.has_ungovernable_call() {
             if self.engine.mode == Mode::Enforce {
+                self.record_uninspectable_metadata();
                 self.held.clear();
                 return Finalize::Blocked;
             }
@@ -3393,6 +3537,7 @@ impl ToolCallStreamInspector {
             .engine
             .govern_calls(&self.corr, &calls, &self.plugin_http_call_ns, true)
             .await;
+        self.record_metadata(&batch);
 
         if batch.enforce_blocks {
             warn!(
@@ -3442,6 +3587,7 @@ impl ToolCallStreamInspector {
                 "held stream exceeded cap"
             );
             if self.engine.mode == Mode::Enforce {
+                self.record_uninspectable_metadata();
                 self.carry.clear();
                 return self.terminate(Vec::new());
             }
@@ -3464,6 +3610,7 @@ impl ToolCallStreamInspector {
             "streaming tool-call hold exceeded cap"
         );
         if self.engine.mode == Mode::Enforce {
+            self.record_uninspectable_metadata();
             self.held.clear();
             self.carry.clear();
             return self.terminate(out);
@@ -3490,6 +3637,7 @@ impl ToolCallStreamInspector {
         let (calls, ungovernable) = extract_response_tool_calls(&json);
         if ungovernable {
             if self.engine.mode == Mode::Enforce {
+                self.record_uninspectable_metadata();
                 warn!(
                     target: "ai_tool_governor",
                     "JSON-shaped stream contains an ungovernable tool call; cutting stream"
@@ -3516,6 +3664,7 @@ impl ToolCallStreamInspector {
             .engine
             .govern_calls(&self.corr, &calls, &self.plugin_http_call_ns, true)
             .await;
+        self.record_metadata(&batch);
         if batch.enforce_blocks {
             warn!(
                 target: "ai_tool_governor",
@@ -3652,6 +3801,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
                 // Enforce fails closed; dry-run releases the held bytes
                 // unchanged.
                 if self.engine.mode == Mode::Enforce {
+                    self.record_uninspectable_metadata();
                     warn!(
                         target: "ai_tool_governor",
                         held_bytes = self.carry.len(),
@@ -3677,6 +3827,7 @@ impl ResponseStreamInspector for ToolCallStreamInspector {
             StreamBodyShape::Unknown => {
                 if std::str::from_utf8(&self.carry).is_err() {
                     if self.engine.mode == Mode::Enforce {
+                        self.record_uninspectable_metadata();
                         warn!(
                             target: "ai_tool_governor",
                             held_bytes = self.carry.len(),

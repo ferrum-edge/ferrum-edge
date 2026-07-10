@@ -1,7 +1,48 @@
 use bytes::Bytes;
-use ferrum_edge::plugins::{HTTP_GRPC_PROTOCOLS, PluginResult, RequestContext, create_plugin};
+use ferrum_edge::plugins::{
+    HTTP_GRPC_PROTOCOLS, PluginResult, RequestContext, ResponseStreamAction, create_plugin,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io;
+use std::sync::{Arc, Mutex};
+use tracing_subscriber::fmt::MakeWriter;
+
+#[derive(Clone, Default)]
+struct SharedWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedWriter {
+    fn contents(&self) -> String {
+        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
+    }
+}
+
+struct SharedGuard {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl io::Write for SharedGuard {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.buffer.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> MakeWriter<'a> for SharedWriter {
+    type Writer = SharedGuard;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        SharedGuard {
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
+}
 
 fn plugin(config: Value) -> std::sync::Arc<dyn ferrum_edge::plugins::Plugin> {
     create_plugin("a2a_gateway", &config)
@@ -410,6 +451,7 @@ async fn grpc_a2a_method_is_detected_without_request_buffering() {
         Some("true")
     );
     assert!(!plugin.should_buffer_response_body(&ctx));
+    assert!(!plugin.forces_reqwest_dispatch(&ctx));
 }
 
 #[tokio::test]
@@ -1247,6 +1289,92 @@ async fn streaming_jsonrpc_does_not_force_response_buffering() {
         200,
         &headers
     ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn streaming_jsonrpc_inspector_extracts_multichunk_sse_terminal_metadata() {
+    let writer = SharedWriter::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+
+    let plugin = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-stream",
+        "method": "message/stream"
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(plugin.requires_response_stream_hooks());
+    assert!(plugin.forces_reqwest_dispatch(&ctx));
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream; charset=utf-8"))
+        .expect("detected 2xx A2A SSE response should attach an inspector");
+    let chunks: &[&[u8]] = &[
+        b"data: {\"jsonrpc\":\"2.0\",\"result\":{\"taskId\":\"task-9\",\"contextId\":\"ctx-4\",\"status\":{\"state\":\"working\"}}}\n\nda",
+        b"ta: {\"jsonrpc\":\"2.0\",\"result\":{\"taskId\":\"task-9\",\"contextId\":\"ctx-4\",\"status\":{\"state\":\"TASK_STATE_",
+        b"COMPLETED\"},\"final\":true}}\r",
+        b"\n\r\n",
+    ];
+    for chunk in chunks {
+        let action = inspector.on_chunk(chunk).await;
+        let ResponseStreamAction::Forward(forwarded) = action else {
+            panic!("observe-only A2A inspector must never terminate a stream");
+        };
+        assert_eq!(forwarded.as_ref(), *chunk);
+    }
+    let end = inspector.on_end().await;
+    assert!(matches!(end, ResponseStreamAction::Forward(ref bytes) if bytes.is_empty()));
+
+    drop(guard);
+    let logs = writer.contents();
+    assert!(logs.contains("a2a.stream_events=2"), "logs: {logs}");
+    assert!(logs.contains("a2a.task_id=\"task-9\""), "logs: {logs}");
+    assert!(logs.contains("a2a.context_id=\"ctx-4\""), "logs: {logs}");
+    assert!(
+        logs.contains("a2a.task_state=\"completed\""),
+        "logs: {logs}"
+    );
+}
+
+#[tokio::test]
+async fn streaming_jsonrpc_inspector_forwards_incomplete_event_without_holding() {
+    let plugin = plugin(json!({}));
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-stream",
+        "method": "message/stream"
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 206, Some("TEXT/EVENT-STREAM"))
+        .expect("detected 2xx A2A SSE response should attach an inspector");
+    let partial = b"data: {\"result\":{\"status\":{\"state\":\"work";
+    let action = inspector.on_chunk(partial).await;
+    let ResponseStreamAction::Forward(forwarded) = action else {
+        panic!("observe-only A2A inspector must never terminate a stream");
+    };
+    assert_eq!(forwarded.as_ref(), partial);
+    let end = inspector.on_end().await;
+    assert!(matches!(end, ResponseStreamAction::Forward(ref bytes) if bytes.is_empty()));
+
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 500, Some("text/event-stream"))
+            .is_none()
+    );
+    assert!(
+        plugin
+            .response_stream_inspector(&ctx, 200, Some("application/json"))
+            .is_none()
+    );
 }
 
 #[test]

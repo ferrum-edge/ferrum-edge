@@ -134,6 +134,10 @@ pub enum H2Step {
     /// stream — call `RespondData { end_stream: true }` or
     /// `RespondTrailers` to close.
     RespondHeaders(Vec<(&'static str, String)>),
+    /// Send response HEADERS and END_STREAM together. This is the wire shape
+    /// used by gRPC Trailers-Only responses, where `grpc-status` is carried in
+    /// the first and only HEADERS block.
+    RespondHeadersEndStream(Vec<(&'static str, String)>),
     /// Send a DATA frame on the current stream. `end_stream` closes the
     /// stream after flushing.
     RespondData { data: Bytes, end_stream: bool },
@@ -208,6 +212,7 @@ pub struct ScriptedH2BackendBuilder {
     listener: TcpListener,
     tls: Option<TlsParams>,
     steps: Vec<H2Step>,
+    connection_scripts: Vec<Vec<H2Step>>,
     settings: ConnectionSettings,
 }
 
@@ -226,6 +231,7 @@ impl ScriptedH2BackendBuilder {
             listener,
             tls: None,
             steps: Vec::new(),
+            connection_scripts: Vec::new(),
             settings: ConnectionSettings::default(),
         }
     }
@@ -242,6 +248,7 @@ impl ScriptedH2BackendBuilder {
                 server_config: Arc::new(tls_config),
             }),
             steps: Vec::new(),
+            connection_scripts: Vec::new(),
             settings: ConnectionSettings::default(),
         })
     }
@@ -263,6 +270,7 @@ impl ScriptedH2BackendBuilder {
                 server_config: Arc::new(tls_config),
             }),
             steps: Vec::new(),
+            connection_scripts: Vec::new(),
             settings: ConnectionSettings::default(),
         })
     }
@@ -276,6 +284,18 @@ impl ScriptedH2BackendBuilder {
     /// Append multiple steps.
     pub fn steps(mut self, steps: impl IntoIterator<Item = H2Step>) -> Self {
         self.steps.extend(steps);
+        self
+    }
+
+    /// Supply connection-indexed scripts. Connection 0 receives the first
+    /// script, connection 1 the second, and later connections repeat the
+    /// final script. This lets pool-poisoning tests make the first connection
+    /// reset a stream and a replacement connection answer successfully.
+    ///
+    /// When non-empty, these scripts take precedence over [`Self::step`] /
+    /// [`Self::steps`].
+    pub fn connection_scripts(mut self, scripts: impl IntoIterator<Item = Vec<H2Step>>) -> Self {
+        self.connection_scripts.extend(scripts);
         self
     }
 
@@ -309,6 +329,7 @@ impl ScriptedH2BackendBuilder {
         let listener = self.listener;
         let tls = self.tls;
         let steps = self.steps;
+        let connection_scripts = self.connection_scripts;
         let settings = self.settings;
 
         let handle = tokio::spawn(async move {
@@ -318,8 +339,13 @@ impl ScriptedH2BackendBuilder {
                     _ = &mut shutdown_rx => return,
                     accept_result = listener.accept() => {
                         let Ok((tcp, _addr)) = accept_result else { continue; };
-                        state_task.accepted.fetch_add(1, Ordering::SeqCst);
-                        let script = steps.clone();
+                        let connection_index =
+                            state_task.accepted.fetch_add(1, Ordering::SeqCst) as usize;
+                        let script = connection_scripts
+                            .get(connection_index)
+                            .or_else(|| connection_scripts.last())
+                            .cloned()
+                            .unwrap_or_else(|| steps.clone());
                         let conn_state = state_task.clone();
                         let settings = settings.clone();
                         let tls_params = tls.as_ref().map(|t| t.server_config.clone());
@@ -744,6 +770,31 @@ async fn run_script(
                     .send_response(response, false)
                     .map_err(|e| format!("send_response: {e}"))?;
                 current_body_sender = Some(body_sender);
+            }
+            H2Step::RespondHeadersEndStream(headers) => {
+                let Some(cs) = current_stream.as_mut() else {
+                    return Err("RespondHeadersEndStream: no current stream".into());
+                };
+                let status = headers
+                    .iter()
+                    .find(|(k, _)| *k == ":status")
+                    .and_then(|(_, v)| v.parse::<u16>().ok())
+                    .unwrap_or(200);
+                let mut resp = Response::builder()
+                    .status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
+                for (k, v) in &headers {
+                    if *k == ":status" {
+                        continue;
+                    }
+                    resp = resp.header(*k, v);
+                }
+                let response = resp
+                    .body(())
+                    .map_err(|e| format!("RespondHeadersEndStream: build error: {e}"))?;
+                cs.send
+                    .send_response(response, true)
+                    .map_err(|e| format!("send trailers-only response: {e}"))?;
+                current_body_sender = None;
             }
             H2Step::RespondData { data, end_stream } => {
                 let Some(sender) = current_body_sender.as_mut() else {

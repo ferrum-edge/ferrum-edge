@@ -31,11 +31,19 @@
 //!   overload` event at INFO. Captures both stdout and stderr to a single
 //!   file because the gateway's `SeverityWriter` routes INFO to stdout
 //!   and WARN to stderr.
+//! * `scripted_backend_stall_sheds_h3_frontend_request` — holds request guards
+//!   open with a scripted backend and verifies H3 admission returns the same
+//!   coarse overload reason without dispatching another backend request.
 //!
 //! Run with:
 //!   cargo build --bin ferrum-edge
 //!   cargo test --test functional_tests -- --ignored --nocapture functional_overload
 
+use crate::scaffolding::backends::{HttpStep, RequestMatcher, ScriptedHttp1Backend};
+use crate::scaffolding::certs::TestCa;
+use crate::scaffolding::clients::Http3Client;
+use crate::scaffolding::harness::GatewayHarness;
+use crate::scaffolding::ports::reserve_port;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -426,9 +434,195 @@ async fn spawn_slow_backend(delay_ms: u64) -> (u16, Arc<AtomicBool>, tokio::task
     (port, stop, handle)
 }
 
+fn scripted_overload_yaml(backend_port: u16) -> String {
+    serde_yaml::to_string(&serde_json::json!({
+        "version": "1",
+        "proxies": [{
+            "id": "scripted-overload",
+            "listen_path": "/slow",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 1000,
+            "backend_read_timeout_ms": 30_000,
+            "backend_write_timeout_ms": 5000,
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    }))
+    .expect("serialize overload config")
+}
+
+async fn spawn_h3_overload_harness(yaml: String) -> (GatewayHarness, u16, tempfile::TempDir) {
+    const STARTUP_ATTEMPTS: u32 = 3;
+    let mut last_error = None;
+    for attempt in 1..=STARTUP_ATTEMPTS {
+        let reservation = reserve_port().await.expect("reserve HTTPS port");
+        let https_port = reservation.port;
+        drop(reservation);
+
+        let scratch = tempfile::tempdir().expect("frontend TLS scratch");
+        let ca = TestCa::new("overload-h3-frontend").expect("frontend CA");
+        let (cert, key) = ca.valid().expect("frontend leaf");
+        let cert_path = scratch.path().join("gateway.cert.pem");
+        let key_path = scratch.path().join("gateway.key.pem");
+        std::fs::write(&cert_path, cert).expect("write frontend cert");
+        std::fs::write(&key_path, key).expect("write frontend key");
+
+        let builder = GatewayHarness::builder()
+            .file_config(yaml.clone())
+            // Retry the complete pinned-port harness so a failed attempt never
+            // reuses its HTTPS/QUIC port or TLS scratch (PR #2065 pattern).
+            .max_attempts(1)
+            .pool_warmup_enabled(false)
+            .env("FERRUM_ENABLE_HTTP3", "true")
+            .env("FERRUM_PROXY_HTTPS_PORT", https_port.to_string())
+            .env(
+                "FERRUM_FRONTEND_TLS_CERT_PATH",
+                cert_path.to_string_lossy().into_owned(),
+            )
+            .env(
+                "FERRUM_FRONTEND_TLS_KEY_PATH",
+                key_path.to_string_lossy().into_owned(),
+            )
+            .env("FERRUM_MAX_REQUESTS", "3")
+            .env("FERRUM_OVERLOAD_CHECK_INTERVAL_MS", "100")
+            .env("FERRUM_OVERLOAD_REQ_PRESSURE_THRESHOLD", "0.3")
+            .env("FERRUM_OVERLOAD_REQ_CRITICAL_THRESHOLD", "0.5");
+
+        match builder.spawn().await {
+            Ok(harness) => return (harness, https_port, scratch),
+            Err(error) => {
+                last_error = Some(error.to_string());
+                eprintln!(
+                    "H3 overload harness startup attempt {attempt}/{STARTUP_ATTEMPTS} failed: {error}"
+                );
+                if attempt < STARTUP_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+    panic!(
+        "H3 overload harness failed after {STARTUP_ATTEMPTS} attempts: {}",
+        last_error.unwrap_or_else(|| "no startup error recorded".to_string())
+    );
+}
+
+async fn harness_overload_snapshot(
+    harness: &GatewayHarness,
+) -> Result<(u16, serde_json::Value), Box<dyn std::error::Error + Send + Sync>> {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()?
+        .get(harness.admin_url("/overload"))
+        .header("Authorization", harness.admin_auth_header())
+        .send()
+        .await?;
+    let status = response.status().as_u16();
+    Ok((status, response.json().await?))
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[ignore]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scripted_backend_stall_sheds_h3_frontend_request() {
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::any()))
+        .step(HttpStep::Sleep(Duration::from_secs(30)))
+        .spawn()
+        .expect("spawn scripted backend");
+    let (harness, https_port, _tls_scratch) =
+        spawn_h3_overload_harness(scripted_overload_yaml(backend_port)).await;
+
+    let slow_url = harness.proxy_url("/slow/hold");
+    let mut inflight = Vec::new();
+    for _ in 0..3 {
+        let url = slow_url.clone();
+        inflight.push(tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .pool_max_idle_per_host(0)
+                .http1_only()
+                .build()
+                .expect("saturation client");
+            client.get(url).send().await
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(4), async {
+        loop {
+            if backend.received_requests().await.len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("three stalling requests must reach the backend");
+
+    let mut critical_snapshot = None;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok((status, body)) = harness_overload_snapshot(&harness).await
+                && body["actions"]["reject_new_requests"].as_bool() == Some(true)
+            {
+                critical_snapshot = Some((status, body));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("overload monitor must observe scripted request pressure");
+    let (overload_status, overload_body) = critical_snapshot.expect("critical snapshot");
+    assert_eq!(overload_status, 503, "snapshot={overload_body}");
+    assert_eq!(
+        overload_body["level"].as_str(),
+        Some("critical"),
+        "snapshot={overload_body}"
+    );
+
+    let backend_count_before_h3 = backend.received_requests().await.len();
+    let h3_url = format!("https://127.0.0.1:{https_port}/slow/rejected-h3");
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let h3_client = Http3Client::insecure().expect("H3 client");
+            match tokio::time::timeout(Duration::from_secs(2), h3_client.get(&h3_url)).await {
+                Ok(Ok(response)) => break response,
+                Ok(Err(_)) | Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await
+    .expect("H3 listener did not return a bounded overload response");
+    assert_eq!(response.status.as_u16(), 503, "response={response:?}");
+    let body: serde_json::Value =
+        serde_json::from_slice(&response.body_bytes).expect("JSON overload body");
+    let overload_reason = body.get("error").and_then(|value| value.as_str());
+    assert_eq!(
+        overload_reason,
+        Some("Service overloaded"),
+        "H3 rejection must expose the coarse overload reason; body={body}"
+    );
+    assert!(response.body_error.is_none(), "response={response:?}");
+    assert_eq!(
+        backend.received_requests().await.len(),
+        backend_count_before_h3,
+        "the shed H3 request must be rejected before backend dispatch"
+    );
+
+    for task in inflight {
+        task.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
+}
 
 /// Test 1: `/overload` endpoint shape under normal load.
 #[ignore]

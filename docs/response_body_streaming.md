@@ -147,6 +147,8 @@ response_body_mode = buffer?
 
 Response body buffering uses a **two-tier check** mirroring the request-body pattern:
 
+Custom plugin authors should also read [Streaming-safe response plugins](../CUSTOM_PLUGINS.md#streaming-safe-response-plugins) for complete-body buffering, incremental `ResponseStreamInspector` hooks, `Content-Type` relabel safety, and the current transport limitations.
+
 1. **Config-time upper bound** — `requires_response_body_buffering()` is pre-computed in `PluginCache` at config load time. O(1) HashMap lookup per request.
 2. **Per-request refinement** — `should_buffer_response_body(&RequestContext)` lets plugins skip buffering when the request context makes it irrelevant.
 
@@ -209,9 +211,12 @@ and then skipped, saving memory and latency for bodies the WAF would not scan.
 
 This downgrade is **narrowing-only**: it never forces buffering, so plugins that
 need the body (caching, compression, response transforms, or `waf` for an
-allowlisted type) are unaffected. It is also **suppressed when retries are
-configured** — a retry may need to replay the response body, so every attempt
-stays buffered.
+allowlisted type) are unaffected. With retries configured, ordinary responses
+stay buffered. An active buffering plugin may explicitly opt an inherently
+streaming representation out after headers arrive only when every other active
+buffering plugin reports that it does not need that content type; MCP uses this
+for `text/event-stream`, whose retry decision is complete from status and
+headers and whose body must not be collected to EOF.
 
 **Protocol coverage.** The downgrade applies on the HTTP/1.1 + HTTP/2 (reqwest),
 direct-HTTP/2, and HBONE backend paths. **Native HTTP/3**, the **HTTP/3
@@ -259,7 +264,7 @@ buffering decision and may narrow that decision by request or response
 
 When retry is configured on a proxy, the gateway must be able to inspect the response status code before deciding whether to retry. This creates an interaction with streaming:
 
-- **During retry attempts**: The response is always **buffered**, because the gateway needs to check the status code and potentially discard the response and retry.
+- **During retry attempts**: Ordinary responses are **buffered** so the gateway can discard the response and retry. Inherently streaming responses may stream after headers only through the all-plugin opt-in described above; a retryable status is still discarded before any bytes reach the client, while a failure after downstream streaming begins cannot be retried.
 - **Final attempt**: If streaming is enabled, the final response (after all retries are exhausted or the response is successful) is **streamed** to the client.
 
 This ensures retry logic works correctly while still providing streaming benefits for the final response.

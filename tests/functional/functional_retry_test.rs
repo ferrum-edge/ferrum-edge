@@ -16,6 +16,8 @@
 //!   fire the body).
 //! * `max_retries: 0` disables retries even with `retry_on_connect_failure`
 //!   enabled.
+//! * A retriable HTTP status can recover within one request (`503 -> 200`)
+//!   and the backend observes exactly two attempts.
 //!
 //! Run with:
 //!
@@ -28,8 +30,8 @@
 #![allow(clippy::bool_assert_comparison)]
 
 use crate::scaffolding::backends::{
-    H3Step, H3TlsConfig, ScriptedH3Backend, ScriptedTcpBackend, ScriptedTlsBackend, TcpStep,
-    TlsConfig,
+    H3Step, H3TlsConfig, HttpStep, RequestMatcher, ScriptedH3Backend, ScriptedHttp1Backend,
+    ScriptedTcpBackend, ScriptedTlsBackend, TcpStep, TlsConfig,
 };
 use crate::scaffolding::certs::TestCa;
 use crate::scaffolding::clients::Http3Client;
@@ -224,6 +226,94 @@ async fn retry_respects_retry_on_methods() {
          got {get_count}. Anything other than 4 means either the retry loop short-circuited \
          (< 4) or exceeded the cap (> 4). post_total={post_total}, total_count={total_count}."
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Status-based retry recovery — first attempt 503, second attempt 200.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn retry_on_status_recovers_and_records_two_attempts() {
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .connection_scripts([
+            vec![
+                HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/recover")),
+                HttpStep::RespondStatus {
+                    status: 503,
+                    reason: "Service Unavailable".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Content-Length".into(),
+                    value: "5".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Connection".into(),
+                    value: "close".into(),
+                },
+                HttpStep::RespondBodyChunk(b"retry".to_vec()),
+                HttpStep::RespondBodyEnd,
+            ],
+            vec![
+                HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/recover")),
+                HttpStep::RespondStatus {
+                    status: 200,
+                    reason: "OK".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Content-Length".into(),
+                    value: "9".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Connection".into(),
+                    value: "close".into(),
+                },
+                HttpStep::RespondBodyChunk(b"recovered".to_vec()),
+                HttpStep::RespondBodyEnd,
+            ],
+        ])
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = http_with_retry(
+        backend_port,
+        json!({
+            "max_retries": 1,
+            "retryable_status_codes": [503],
+            "retryable_methods": ["GET"],
+            "retry_on_connect_failure": false,
+        }),
+    );
+    let harness = GatewayHarness::builder()
+        .mode_in_process()
+        .file_config(yaml)
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = harness.http_client().expect("client");
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.get(&harness.proxy_url("/api/recover")),
+    )
+    .await
+    .expect("status retry must be bounded")
+    .expect("gateway response");
+
+    assert_eq!(response.status.as_u16(), 200, "response={response:?}");
+    assert_eq!(response.body_text(), "recovered");
+
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "503 -> 200 recovery must make exactly two backend attempts; requests={requests:?}"
+    );
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

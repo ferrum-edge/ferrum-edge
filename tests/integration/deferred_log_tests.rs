@@ -27,7 +27,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http_body::Body as _;
 
-use ferrum_edge::plugins::{Plugin, RequestContext, TransactionSummary};
+use ferrum_edge::plugins::{
+    Plugin, RequestContext, ResponseStreamAction, ResponseStreamInspector, TransactionSummary,
+    create_response_stream_inspector,
+};
 use ferrum_edge::proxy::ProxyBody;
 use ferrum_edge::proxy::deferred_log::{BodyOutcome, DeferredTransactionLogger};
 use ferrum_edge::retry::ErrorClass;
@@ -69,6 +72,16 @@ struct StreamTerminationCapturingPlugin {
     events: Arc<Mutex<Vec<&'static str>>>,
     status: Arc<Mutex<Option<u16>>>,
     outcome: Arc<Mutex<Option<BodyOutcome>>>,
+    summaries: Arc<Mutex<Vec<TransactionSummary>>>,
+}
+
+struct PassthroughInspector;
+
+#[async_trait]
+impl ResponseStreamInspector for PassthroughInspector {
+    async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
+        ResponseStreamAction::Forward(Bytes::copy_from_slice(chunk))
+    }
 }
 
 #[async_trait]
@@ -81,18 +94,36 @@ impl Plugin for StreamTerminationCapturingPlugin {
         9000
     }
 
-    async fn on_response_stream_terminated(
+    fn requires_response_stream_hooks(&self) -> bool {
+        true
+    }
+
+    fn response_stream_inspector(
         &self,
         _ctx: &RequestContext,
+        _response_status: u16,
+        _content_type: Option<&str>,
+    ) -> Option<Box<dyn ResponseStreamInspector>> {
+        Some(Box::new(PassthroughInspector))
+    }
+
+    async fn on_response_stream_terminated(
+        &self,
+        ctx: &mut RequestContext,
         response_status: u16,
         outcome: &BodyOutcome,
     ) {
+        ctx.metadata.insert(
+            "stream.finalized".to_string(),
+            "before_summary_log".to_string(),
+        );
         self.events.lock().unwrap().push("stream_terminated");
         *self.status.lock().unwrap() = Some(response_status);
         *self.outcome.lock().unwrap() = Some(outcome.clone());
     }
 
-    async fn log(&self, _summary: &TransactionSummary) {
+    async fn log(&self, summary: &TransactionSummary) {
+        self.summaries.lock().unwrap().push(summary.clone());
         self.events.lock().unwrap().push("log");
     }
 }
@@ -131,12 +162,12 @@ fn make_summary_with_status(status: u16) -> TransactionSummary {
     }
 }
 
-fn make_ctx() -> Arc<RequestContext> {
-    Arc::new(RequestContext::new(
+fn make_ctx() -> RequestContext {
+    RequestContext::new(
         "10.0.0.1".to_string(),
         "GET".to_string(),
         "/things/42".to_string(),
-    ))
+    )
 }
 
 /// Wait until the spawned `log_with_mirror` task has run and pushed a summary
@@ -197,10 +228,12 @@ async fn fire_invokes_response_stream_termination_before_log() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let status = Arc::new(Mutex::new(None));
     let outcome = Arc::new(Mutex::new(None));
+    let summaries = Arc::new(Mutex::new(Vec::new()));
     let plugin: Arc<dyn Plugin> = Arc::new(StreamTerminationCapturingPlugin {
         events: events.clone(),
         status: status.clone(),
         outcome: outcome.clone(),
+        summaries: summaries.clone(),
     });
     let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![plugin]);
     let mut summary = make_summary_with_status(206);
@@ -221,6 +254,51 @@ async fn fire_invokes_response_stream_termination_before_log() {
     assert_eq!(outcome.body_error_class, Some(ErrorClass::ReadWriteTimeout));
     assert!(!outcome.client_disconnected);
     assert_eq!(outcome.bytes_streamed, 77);
+    let summaries = summaries.lock().unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(
+        summaries[0]
+            .metadata
+            .get("stream.finalized")
+            .map(String::as_str),
+        Some("before_summary_log"),
+        "metadata written by the terminal hook must reach TransactionSummary"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn deferred_log_waits_for_detached_inspector_completion() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let status = Arc::new(Mutex::new(None));
+    let outcome = Arc::new(Mutex::new(None));
+    let summaries = Arc::new(Mutex::new(Vec::new()));
+    let plugin: Arc<dyn Plugin> = Arc::new(StreamTerminationCapturingPlugin {
+        events: events.clone(),
+        status,
+        outcome,
+        summaries,
+    });
+    let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![plugin]);
+    let mut ctx = make_ctx();
+    let inspector = create_response_stream_inspector(
+        plugins.as_slice(),
+        &mut ctx,
+        200,
+        Some("text/event-stream"),
+    )
+    .expect("inspector");
+    let logger = DeferredTransactionLogger::new(make_summary_with_status(200), plugins, ctx);
+
+    logger.fire(BodyOutcome::client_disconnect(0));
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "terminal hooks must wait while the detached inspector is still alive"
+    );
+
+    drop(inspector);
+    let events = wait_for_events(&events, 2).await;
+    assert_eq!(events.as_slice(), ["stream_terminated", "log"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]

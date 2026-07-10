@@ -2036,6 +2036,8 @@ async fn handle_h3_request(
     let forces_reqwest_dispatch = plugins.iter().any(|p| p.forces_reqwest_dispatch(&ctx));
     let backend_supports_native_h3 =
         crate::proxy::supports_native_http3_backend(&state, &proxy, upstream_target.as_deref());
+    let retry_response_needs_header_refinement =
+        has_retry && crate::proxy::plugins_may_release_response_body_under_retries(&plugins, &ctx);
     let use_native_h3_pool =
         http_flavor == HttpFlavor::Plain && !forces_reqwest_dispatch && backend_supports_native_h3;
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
@@ -2551,6 +2553,21 @@ async fn handle_h3_request(
             .load(std::sync::atomic::Ordering::Relaxed) as f64
             / 1_000_000.0;
         let gateway_processing_ms = total_ms - outcome.backend_total_ms;
+        if outcome.response_streamed {
+            let stream_outcome = BodyOutcome {
+                body_completed: outcome.body_completed,
+                body_error_class: outcome.body_error_class,
+                bytes_streamed: outcome.bytes_streamed,
+                client_disconnected: outcome.client_disconnected,
+            };
+            run_response_stream_termination_hooks(
+                &plugins,
+                &mut ctx,
+                outcome.response_status,
+                &stream_outcome,
+            )
+            .await;
+        }
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -2588,21 +2605,6 @@ async fn handle_h3_request(
             mirror: false,
             metadata: crate::proxy::clone_log_metadata(&ctx),
         };
-        if outcome.response_streamed {
-            let stream_outcome = BodyOutcome {
-                body_completed: outcome.body_completed,
-                body_error_class: outcome.body_error_class,
-                bytes_streamed: outcome.bytes_streamed,
-                client_disconnected: outcome.client_disconnected,
-            };
-            run_response_stream_termination_hooks(
-                &plugins,
-                &ctx,
-                summary.response_status_code,
-                &stream_outcome,
-            )
-            .await;
-        }
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
         return Ok(());
@@ -3077,18 +3079,13 @@ async fn handle_h3_request(
         // can be stripped — the inspector transforms the body, so the backend's
         // length no longer applies and would make a cut look like a truncated body.
         // Gated once per response; the common case (no opt-in) skips it entirely.
-        let mut response_inspector = if plugins.iter().any(|p| p.requires_response_stream_hooks()) {
-            let content_type = response_headers.get("content-type").map(String::as_str);
-            // Chain EVERY opted-in plugin (not just the first), gated to the
-            // response status so error bodies are not inspected.
-            let inspectors: Vec<_> = plugins
-                .iter()
-                .filter_map(|p| p.response_stream_inspector(&ctx, response_status, content_type))
-                .collect();
-            crate::plugins::chain_response_stream_inspectors(inspectors)
-        } else {
-            None
-        };
+        let content_type = response_headers.get("content-type").map(String::as_str);
+        let mut response_inspector = crate::plugins::create_response_stream_inspector(
+            &plugins,
+            &mut ctx,
+            response_status,
+            content_type,
+        );
         // Capture the backend's declared length BEFORE stripping it for the
         // client — the graceful-close recovery below still needs it to tell a
         // complete body from a truncated one (an inspected response strips
@@ -3480,6 +3477,18 @@ async fn handle_h3_request(
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
+        // Native H3 drives the inspector in this task rather than a detached
+        // body task. Drop it explicitly so the shared completion signal is set
+        // before terminal hooks wait and drain metadata.
+        drop(response_inspector);
+        let stream_outcome = BodyOutcome {
+            body_completed,
+            body_error_class,
+            bytes_streamed,
+            client_disconnected,
+        };
+        run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
+            .await;
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -3518,19 +3527,6 @@ async fn handle_h3_request(
             metadata: crate::proxy::clone_log_metadata(&ctx),
         };
 
-        let stream_outcome = BodyOutcome {
-            body_completed,
-            body_error_class,
-            bytes_streamed,
-            client_disconnected,
-        };
-        run_response_stream_termination_hooks(
-            &plugins,
-            &ctx,
-            summary.response_status_code,
-            &stream_outcome,
-        )
-        .await;
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
         record_request(&state, response_status);
         return Ok(());
@@ -3746,7 +3742,7 @@ async fn handle_h3_request(
     }
 
     let can_refine_h3_response_buffering = needs_response_buffering
-        && !has_retry
+        && (!has_retry || retry_response_needs_header_refinement)
         && matches!(
             proxy.response_body_mode,
             crate::config::types::ResponseBodyMode::Stream
@@ -3756,13 +3752,21 @@ async fn handle_h3_request(
     let refined_streaming_response = if can_refine_h3_response_buffering {
         let client_ip_for_refined = ctx.client_ip.clone();
         let is_early_data = ctx.is_early_data;
+        // A retryable first response falls back into the native-H3 retry loop,
+        // which must retain the transformed request bytes for replay. The
+        // non-retry path can keep the allocation-free move.
+        let refined_body_data = if has_retry {
+            body_data.clone()
+        } else {
+            std::mem::take(&mut body_data)
+        };
         match proxy_to_backend_h3_refined_response(
             &state,
             &proxy,
             &backend_url,
             &method,
             &proxy_headers,
-            std::mem::take(&mut body_data),
+            refined_body_data,
             &client_ip_for_refined,
             socket_ip,
             upstream_target.as_deref(),
@@ -3774,6 +3778,11 @@ async fn handle_h3_request(
             &mut plugin_execution_ns,
             is_early_data,
             backend_admission_start,
+            if has_retry {
+                proxy.retry.as_ref()
+            } else {
+                None
+            },
         )
         .await?
         {
@@ -3960,6 +3969,14 @@ async fn handle_h3_request(
         let gateway_processing_ms = total_ms - backend_total_ms;
         let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
 
+        let stream_outcome = BodyOutcome {
+            body_completed: h3_stream_result.body_completed,
+            body_error_class: h3_stream_result.body_error_class,
+            bytes_streamed: h3_stream_result.bytes_streamed,
+            client_disconnected: h3_stream_result.client_disconnected,
+        };
+        run_response_stream_termination_hooks(&plugins, &mut ctx, response_status, &stream_outcome)
+            .await;
         let summary = TransactionSummary {
             namespace: proxy.namespace.clone(),
             timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -3995,19 +4012,6 @@ async fn handle_h3_request(
             metadata: crate::proxy::clone_log_metadata(&ctx),
         };
 
-        let stream_outcome = BodyOutcome {
-            body_completed: h3_stream_result.body_completed,
-            body_error_class: h3_stream_result.body_error_class,
-            bytes_streamed: h3_stream_result.bytes_streamed,
-            client_disconnected: h3_stream_result.client_disconnected,
-        };
-        run_response_stream_termination_hooks(
-            &plugins,
-            &ctx,
-            summary.response_status_code,
-            &stream_outcome,
-        )
-        .await;
         crate::plugins::log_with_mirror(&plugins, &summary, &ctx).await;
 
         record_request(&state, response_status);
@@ -4036,18 +4040,7 @@ async fn handle_h3_request(
             h3_request_on_wire,
             final_cb_target_key,
             final_target,
-        ) = if let Some(result) = refined_buffered_response {
-            (
-                result.status,
-                result.body,
-                result.headers,
-                result.trailers,
-                result.error_class,
-                result.request_on_wire,
-                cb_target_key,
-                upstream_target.clone(),
-            )
-        } else if let Some(retry_config) = &proxy.retry {
+        ) = if let Some(retry_config) = &proxy.retry {
             let mut attempt = 0u32;
             let mut current_target = upstream_target.clone();
             let mut current_cb_target_key = cb_target_key.clone();
@@ -4067,19 +4060,24 @@ async fn handle_h3_request(
                 &selected_base_proxy,
                 current_target.as_deref(),
             );
-            let mut result = proxy_to_backend_h3(
-                &state,
-                attempt_dispatch_proxy.as_ref(),
-                &current_url,
-                &method,
-                &proxy_headers,
-                &body_data,
-                &ctx.client_ip,
-                socket_ip,
-                current_target.as_deref(),
-                ctx.is_early_data,
-            )
-            .await;
+            let mut result = match refined_buffered_response {
+                Some(result) => result,
+                None => {
+                    proxy_to_backend_h3(
+                        &state,
+                        attempt_dispatch_proxy.as_ref(),
+                        &current_url,
+                        &method,
+                        &proxy_headers,
+                        &body_data,
+                        &ctx.client_ip,
+                        socket_ip,
+                        current_target.as_deref(),
+                        ctx.is_early_data,
+                    )
+                    .await
+                }
+            };
 
             // Build a lightweight BackendResponse for should_retry — only
             // status_code and connection_error are read. Use empty body/headers
@@ -4254,6 +4252,17 @@ async fn handle_h3_request(
                 result.request_on_wire,
                 current_cb_target_key,
                 current_target,
+            )
+        } else if let Some(result) = refined_buffered_response {
+            (
+                result.status,
+                result.body,
+                result.headers,
+                result.trailers,
+                result.error_class,
+                result.request_on_wire,
+                cb_target_key,
+                upstream_target.clone(),
             )
         } else {
             // No retry configured — single attempt
@@ -4439,6 +4448,7 @@ async fn handle_h3_request(
                     response_headers
                         .insert("content-length".to_string(), transformed.len().to_string());
                     response_body = transformed;
+                    plugin.on_response_body_transformed(&mut ctx, &mut response_headers);
                     // A plugin (response_transformer, compression, grpc_web, …)
                     // replaced the bytes sent to the client. The backend's
                     // trailers (digest/checksum/app-status) described the
@@ -5189,6 +5199,7 @@ async fn proxy_to_backend_h3_refined_response(
     plugin_execution_ns: &mut u64,
     is_early_data: bool,
     backend_admission_start: std::time::Instant,
+    retry_config: Option<&crate::config::types::RetryConfig>,
 ) -> Result<H3RefinedResponse, anyhow::Error> {
     let h3_headers = build_h3_backend_headers(
         proxy,
@@ -5235,6 +5246,22 @@ async fn proxy_to_backend_h3_refined_response(
                     .backend_capabilities
                     .mark_h3_unsupported(proxy, upstream_target);
             }
+            let (reject_status, reject_body) = h3_backend_failure_status_body(&error);
+            if retry_config.is_some() {
+                // Nothing has been committed downstream yet. Preserve this
+                // failure as a buffered result so the native-H3 retry loop can
+                // apply retry_on_connect_failure / status policy and rotate the
+                // target. The final exhausted failure is emitted by the normal
+                // buffered response path.
+                return Ok(H3RefinedResponse::Buffered(H3BufferedDispatchResult {
+                    status: reject_status.as_u16(),
+                    body: reject_body.as_bytes().to_vec(),
+                    headers: HashMap::new(),
+                    trailers: None,
+                    error_class: Some(h3_error_class),
+                    request_on_wire,
+                }));
+            }
             // Do NOT propagate a send error here: this refined path already
             // started least-connections LB tracking before dispatch, so
             // returning `Err` would skip the caller's `record_backend_outcome`
@@ -5243,7 +5270,6 @@ async fn proxy_to_backend_h3_refined_response(
             // disconnect in the result so the caller still records the outcome
             // and releases the connection — mirrors the size-limit / after_proxy
             // reject paths in `stream_h3_open_response_to_client`.
-            let (reject_status, reject_body) = h3_backend_failure_status_body(&error);
             let reject_sent = send_h3_response(h3_stream, reject_status, reject_body)
                 .await
                 .is_ok();
@@ -5264,38 +5290,57 @@ async fn proxy_to_backend_h3_refined_response(
     let mut response_headers = h3_resp.headers;
     response_headers.retain(|name, _| !is_backend_response_strip_header(name));
 
-    // Stamp original response invariants before the buffer/stream refine and
-    // before any `after_proxy` hook can strip `Content-Range` or `Cache-Control`.
-    // The streaming branch below runs `compression.after_proxy` later (via
-    // `stream_h3_open_response_to_client`), which honors these markers.
-    stamp_h3_original_response_metadata(ctx, response_status, &response_headers);
-
-    if crate::proxy::refine_stream_response_for_content_type(
-        false,
-        proxy,
-        plugins,
-        Some(ctx),
-        response_status,
-        &response_headers,
-    ) {
-        let result = stream_h3_open_response_to_client(
-            state,
-            proxy,
+    let response_is_retryable = retry_config.is_some_and(|retry_config| {
+        crate::retry::should_retry(
+            retry_config,
             method,
-            response_status,
-            response_headers,
-            h3_resp.recv_stream,
-            epoch,
-            upstream_target,
-            sticky_cookie_needed,
-            h3_stream,
-            plugins,
-            ctx,
-            plugin_execution_ns,
-            backend_admission_elapsed,
+            &crate::retry::BackendResponse {
+                status_code: response_status,
+                body: crate::retry::ResponseBody::Buffered(Vec::new()),
+                headers: HashMap::new(),
+                connection_error: false,
+                backend_resolved_ip: None,
+                error_class: None,
+            },
+            0,
         )
-        .await?;
-        return Ok(H3RefinedResponse::Streamed(result));
+    });
+    if !response_is_retryable {
+        // Stamp original response invariants before the buffer/stream refine and
+        // before any `after_proxy` hook can strip `Content-Range` or
+        // `Cache-Control`. Retryable responses skip this because their body is
+        // discarded by the retry loop; stale first-attempt invariants must not
+        // leak into the final attempt's plugin decisions.
+        stamp_h3_original_response_metadata(ctx, response_status, &response_headers);
+        let retry_ctx = retry_config.map(|_| crate::proxy::retry_response_decision_context(&*ctx));
+        let response_decision_ctx = retry_ctx.as_ref().unwrap_or(&*ctx);
+        if crate::proxy::refine_stream_response_for_content_type(
+            false,
+            proxy,
+            plugins,
+            Some(response_decision_ctx),
+            response_status,
+            &response_headers,
+        ) {
+            let result = stream_h3_open_response_to_client(
+                state,
+                proxy,
+                method,
+                response_status,
+                response_headers,
+                h3_resp.recv_stream,
+                epoch,
+                upstream_target,
+                sticky_cookie_needed,
+                h3_stream,
+                plugins,
+                ctx,
+                plugin_execution_ns,
+                backend_admission_elapsed,
+            )
+            .await?;
+            return Ok(H3RefinedResponse::Streamed(result));
+        }
     }
 
     Ok(H3RefinedResponse::Buffered(
@@ -8209,6 +8254,41 @@ fn record_request(state: &ProxyState, status: u16) {
             .fetch_add(1, Ordering::Relaxed);
     }
     crate::runtime_metrics::global_ref().record_http_status(status);
+}
+
+#[cfg(test)]
+mod native_h3_retry_refinement_tests {
+    #[test]
+    fn retry_release_keeps_native_h3_and_uses_marked_header_refinement() {
+        let src = include_str!("server.rs");
+        let handler_start = src
+            .find("async fn handle_h3_request(")
+            .expect("handle_h3_request not found");
+        let handler_tail = &src[handler_start..];
+        let handler_end = handler_tail
+            .find("\nfn build_h3_backend_url_for_flavor")
+            .expect("end of handle_h3_request not found");
+        let handler = &handler_tail[..handler_end];
+        assert!(handler.contains("(!has_retry || retry_response_needs_header_refinement)"));
+        assert!(handler.contains(
+            "http_flavor == HttpFlavor::Plain && !forces_reqwest_dispatch && backend_supports_native_h3"
+        ));
+        assert!(handler.contains("let refined_body_data = if has_retry"));
+        assert!(handler.contains("body_data.clone()"));
+
+        let refine_start = src
+            .find("async fn proxy_to_backend_h3_refined_response(")
+            .expect("proxy_to_backend_h3_refined_response not found");
+        let refine_tail = &src[refine_start..];
+        let refine_end = refine_tail
+            .find("\nasync fn collect_h3_open_response_body")
+            .expect("end of proxy_to_backend_h3_refined_response not found");
+        let refine = &refine_tail[..refine_end];
+        assert!(refine.contains("retry_response_decision_context(&*ctx)"));
+        assert!(refine.contains("if !response_is_retryable"));
+        assert!(refine.contains("if retry_config.is_some()"));
+        assert!(refine.contains("H3RefinedResponse::Buffered(H3BufferedDispatchResult"));
+    }
 }
 
 #[cfg(test)]
