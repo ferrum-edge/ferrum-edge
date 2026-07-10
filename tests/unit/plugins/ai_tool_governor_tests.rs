@@ -2541,16 +2541,31 @@ fn rejects_conflicting_a2a_alias_and_canonical_policies() {
     assert!(err.contains("conflicts with canonical method"), "{err}");
 }
 
-/// A per-tool `dry_run` action forwards the call while recording an `allow`
-/// observational decision even when the plugin mode is `enforce`.
+/// A per-tool `dry_run` action forwards the call while recording a distinct
+/// observational decision even when the plugin mode is `enforce`. A sibling
+/// allow in the same batch must not erase that rollout signal.
 #[tokio::test]
 async fn per_tool_dry_run_action_allows_and_labels() {
     let plugin = make(json!({
-        "default_action": "deny",
-        "tools": { "report.read": { "action": "dry_run" } }
+        "default_action": "allow",
+        "tools": {
+            "report.read": { "action": "dry_run" },
+            "status.read": { "action": "allow" }
+        }
     }));
     let mut ctx = create_test_context();
-    let body = response_with_tool_call("report.read", "{}");
+    let body = json!({
+        "choices": [{
+            "message": {
+                "tool_calls": [
+                    { "function": { "name": "report.read", "arguments": "{}" } },
+                    { "function": { "name": "status.read", "arguments": "{}" } }
+                ]
+            }
+        }]
+    })
+    .to_string()
+    .into_bytes();
     assert_continue(
         plugin
             .on_response_body(&mut ctx, 200, &json_headers(), &body)
@@ -2560,7 +2575,7 @@ async fn per_tool_dry_run_action_allows_and_labels() {
         ctx.metadata
             .get("ai_tool_governor.decision")
             .map(String::as_str),
-        Some("allow")
+        Some("dry_run")
     );
 }
 
@@ -3041,7 +3056,7 @@ async fn per_tool_dry_run_forwards_despite_failing_arg_checks() {
         ctx.metadata
             .get("ai_tool_governor.decision")
             .map(String::as_str),
-        Some("allow")
+        Some("dry_run")
     );
 }
 

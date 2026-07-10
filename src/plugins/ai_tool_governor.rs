@@ -418,11 +418,12 @@ struct BatchDecision {
 
 fn label_rank(label: &str) -> u8 {
     match label {
-        "deny" => 5,
-        "approval_denied" => 4,
-        "require_approval" => 3,
-        "approved" => 2,
-        _ => 1, // allow / dry_run / redact-forward
+        "deny" => 6,
+        "approval_denied" => 5,
+        "require_approval" => 4,
+        "approved" => 3,
+        "dry_run" => 2,
+        _ => 1, // allow / redact-forward
     }
 }
 
@@ -707,7 +708,7 @@ impl GovernorEngine {
                 PolicyOutcome::Allow => {}
                 PolicyOutcome::DryRun => {
                     // Per-tool dry-run: forward, but record the observational label.
-                    cd.label = "allow";
+                    cd.label = "dry_run";
                 }
                 PolicyOutcome::Deny(reason) => {
                     cd.label = "deny";

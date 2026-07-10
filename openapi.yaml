@@ -15115,7 +15115,7 @@ components:
               action:
                 type: string
                 enum: [allow, deny, redact_args, require_approval, dry_run]
-                description: "allow forwards; deny blocks; redact_args replaces blocked_arg_patterns matches with redaction_placeholder (buffered path); require_approval calls the approval webhook; dry_run forwards and records the observational decision."
+                description: "allow forwards; deny blocks; redact_args replaces blocked_arg_patterns matches with redaction_placeholder (buffered path); require_approval calls the approval webhook; dry_run forwards and records ai_tool_governor.decision=dry_run distinctly from a real allow."
               risk:
                 type: string
                 enum: [low, medium, high, critical]

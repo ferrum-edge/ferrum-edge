@@ -280,11 +280,17 @@ recorded `decision` keeps the **highest-severity** outcome across them: a later
 allowed surface never downgrades an earlier `deny`, so rollout logs do not
 under-report requests that `enforce` would have rejected.
 
+An individual `tools.<name>.action: dry_run` is distinct from global dry-run
+mode: that tool always forwards and records `ai_tool_governor.decision=dry_run`
+even while the plugin is in `enforce` mode. The observational label is sticky
+over a plain `allow`, but approval outcomes and denials remain higher severity.
+
 ## Observability metadata
 
 When `observability.emit_metadata` is on (default), the plugin writes
 `ai_tool_governor.*` transaction metadata: `enabled`, `mode`, `decision`
-(`allow` / `deny` / `require_approval` / `approved` / `approval_denied`),
+(`allow` / `dry_run` / `deny` / `require_approval` / `approved` /
+`approval_denied`),
 `tool_names`, `risk` (max), `policy_ids`, `approval_id`, `arguments_hashes`
 (SHA-256, when `hash_arguments` is on), and `redacted_tools`.
 
