@@ -47,6 +47,12 @@ pub struct GrpcResponse {
     pub trailers: Option<HeaderMap>,
     /// Stream-level error if the response failed mid-stream.
     pub stream_error: Option<String>,
+    /// Error from the local h2 `send_data` of the request body, kept separate
+    /// from `stream_error` because it can legitimately coexist with a complete,
+    /// well-formed response: a fast Trailers-Only gateway error can close the
+    /// request direction before the client DATA write is observed locally.
+    /// Diagnostic only — response-shape assertions should use `stream_error`.
+    pub request_send_error: Option<String>,
 }
 
 impl GrpcResponse {
@@ -261,7 +267,7 @@ impl GrpcClient {
                 // Stream-level error before headers arrived. Synthesize a
                 // response so the caller can inspect it.
                 conn_task.abort();
-                let stream_error = match request_send_error {
+                let stream_error = match request_send_error.as_deref() {
                     Some(send_error) => format!("{send_error}; response error: {e}"),
                     None => format!("response error: {e}"),
                 };
@@ -272,13 +278,15 @@ impl GrpcClient {
                     raw_body_frames: Vec::new(),
                     trailers: None,
                     stream_error: Some(stream_error),
+                    request_send_error,
                 });
             }
             Err(_) => {
                 conn_task.abort();
-                let stream_error = request_send_error
-                    .map(|send_error| format!("{send_error}; response timed out"))
-                    .unwrap_or_else(|| "response timed out".to_string());
+                let stream_error = match request_send_error.as_deref() {
+                    Some(send_error) => format!("{send_error}; response timed out"),
+                    None => "response timed out".to_string(),
+                };
                 return Ok(GrpcResponse {
                     http_status: 0,
                     headers: HeaderMap::new(),
@@ -286,6 +294,7 @@ impl GrpcClient {
                     raw_body_frames: Vec::new(),
                     trailers: None,
                     stream_error: Some(stream_error),
+                    request_send_error,
                 });
             }
         };
@@ -340,6 +349,7 @@ impl GrpcClient {
                         raw_body_frames: Vec::new(),
                         trailers: None,
                         stream_error: Some("body/trailers read timed out".into()),
+                        request_send_error,
                     });
                 }
             };
@@ -355,6 +365,7 @@ impl GrpcClient {
             raw_body_frames: raw_frames,
             trailers,
             stream_error,
+            request_send_error,
         })
     }
 }
@@ -552,6 +563,7 @@ mod tests {
             raw_body_frames: Vec::new(),
             trailers,
             stream_error: None,
+            request_send_error: None,
         }
     }
 

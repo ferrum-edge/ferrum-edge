@@ -462,7 +462,10 @@ async fn run_h3_script(
     // ends so dropping the response side does not race the peer's final DATA /
     // FIN with an implicit STOP_SENDING. This is especially important for the
     // native-H3 gRPC fixtures, which intentionally respond without consuming
-    // the request body themselves.
+    // the request body themselves. Trade-off: a retained stream is never read,
+    // so its flow-control credit is never returned — scripted request bodies
+    // must stay comfortably below the default QUIC stream/connection receive
+    // windows or the peer's upload would stall instead.
     let mut finished_response_streams = Vec::new();
 
     for step in steps {
