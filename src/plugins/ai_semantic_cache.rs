@@ -1794,8 +1794,8 @@ impl Plugin for AiSemanticCache {
         // Synthetic short-circuit guard. On a semantic-cache MISS this plugin's
         // `before_proxy` sets `AI_CACHE_KEY_METADATA` so this hook stores the
         // (real) backend response. But this plugin (priority 2980) runs BEFORE
-        // the later synthetic-2xx producers — `ai_federation` (2985),
-        // `mesh_route_dispatch` (2995), `serverless_function` (3025),
+        // the later synthetic-2xx producers — `mesh_route_dispatch` (2995),
+        // `serverless_function` (3025), `ai_federation` (4060),
         // `response_mock` (3030), `request_termination`, and a
         // `request_deduplication` replay — so when ANY of those short-circuits
         // with a 2xx body, the generic synthetic body-hook path

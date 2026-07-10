@@ -852,6 +852,15 @@ impl Plugin for ServerlessFunction {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        if ctx
+            .metadata
+            .get("ai_stream_router_claimed")
+            .map(String::as_str)
+            == Some("true")
+        {
+            return PluginResult::Continue;
+        }
+
         // Terminate mode is incompatible with gRPC: the gateway normalizes
         // RejectBinary into trailers-only gRPC errors, dropping the body.
         // Fail clearly rather than silently losing the function response.

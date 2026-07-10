@@ -1881,6 +1881,12 @@ async fn test_rejection_body_format() {
         }
         _ => panic!("Expected Reject"),
     }
+    let rejected = ctx
+        .metadata
+        .get("ai_shield_rejected")
+        .expect("reject marker");
+    assert!(rejected.contains("ssn"), "got: {rejected}");
+    assert!(rejected.contains("email"), "got: {rejected}");
 }
 
 // ─── Streaming awareness ───────────────────────────────────────────────

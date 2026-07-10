@@ -41,12 +41,19 @@ Preserve phase order and protocol matrix from `src/plugins/mod.rs` and `docs/plu
 4. `before_proxy`: SOAP, AI plugins, workload metrics, transformers, serverless, mock, gRPC deadline, mirror, load, cache, compression
 5. `on_final_request_body`: body validator and gRPC-Web validation
 6. `after_proxy`: response-side counterpart to before_proxy
-7. `on_final_response_body`: dedup/cache store, size limiting, response cache predictor
-8. `on_response_body`: AI response guard and token metrics
-9. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
-10. `on_ws_frame`: WS size, rate, and frame logging
-11. `on_stream_connect` / `on_stream_disconnect`: TCP+TLS after handshake; UDP+DTLS after DTLS handshake
-12. `on_udp_datagram`: bidirectional datagram hooks only when `requires_udp_datagram_hooks()`
+7. `normalize_response_body`: provider/protocol adapters produce the client-visible buffered representation
+8. `on_response_body`: AI response guard and token metrics inspect the normalized body
+9. `transform_response_body`: ordinary client-facing body rewrites
+10. `on_final_response_body`: dedup/cache store, size limiting, response cache predictor
+11. `log`: stdout/statsd/http/tcp/kafka/loki/udp/ws/tx_debug/prometheus/chargeback
+12. `on_ws_frame`: WS size, rate, and frame logging
+13. `on_stream_connect` / `on_stream_disconnect`: TCP+TLS after handshake; UDP+DTLS after DTLS handshake
+14. `on_udp_datagram`: bidirectional datagram hooks only when `requires_udp_datagram_hooks()`
+
+Streaming response inspectors are staged: `Normalize` runs before `Inspect`,
+with configured plugin order preserved within each stage. Do not hard-code
+plugin names or change request-side priorities to obtain response representation
+ordering.
 
 Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 

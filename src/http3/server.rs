@@ -30,6 +30,7 @@ use crate::load_balancer::LoadBalancerCache;
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RequestContext, ResponseStreamAction, TransactionSummary,
+    normalize_response_body_for_inspection,
 };
 use crate::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
 use crate::proxy::headers::{
@@ -3592,11 +3593,32 @@ async fn handle_h3_request(
         && capabilities.has(crate::plugin_cache::PluginCapabilities::MODIFIES_REQUEST_BODY)
     {
         let content_type = proxy_headers.get("content-type").map(|s| s.as_str());
+        // Expose the request method as a `:method` pseudo-header so
+        // method-sensitive plugins that only override the plain
+        // `transform_request_body` (e.g. `ai_prompt_compressor` skips non-POST
+        // bodies) can still gate on it through the default context-aware
+        // delegation. This mirrors the gRPC path's hook-only header map and is
+        // never forwarded to the backend (dispatch uses `proxy_headers`).
+        let mut hook_headers = proxy_headers.clone();
+        hook_headers
+            .entry(":method".to_string())
+            .or_insert_with(|| method.clone());
         let mut current = body_data;
         for plugin in plugins.iter() {
+            // Use the context-aware hook (which falls back to the plain
+            // `transform_request_body` by default) so plugins that transform
+            // based on `before_proxy` decisions recorded in `ctx.metadata`
+            // (e.g. `ai_stream_router`'s provider-specific body translation)
+            // behave identically on the native H3 frontend and the H1/H2
+            // dispatch path.
             if plugin.modifies_request_body()
                 && let Some(transformed) = plugin
-                    .transform_request_body(&current, content_type, &proxy_headers)
+                    .transform_request_body_with_context(
+                        &mut ctx,
+                        &current,
+                        content_type,
+                        &hook_headers,
+                    )
                     .await
             {
                 current = transformed;
@@ -4338,6 +4360,19 @@ async fn handle_h3_request(
         // Mirrors the HTTP/1.1 path in proxy/mod.rs.
         if !after_proxy_rejected && !plugins.is_empty() {
             let phase_start = std::time::Instant::now();
+            if normalize_response_body_for_inspection(
+                &plugins,
+                &mut ctx,
+                response_status,
+                &mut response_headers,
+                &mut response_body,
+            )
+            .await
+            {
+                // Normalization replaced the backend representation, so its
+                // body-specific trailers no longer describe the bytes on wire.
+                response_trailers = None;
+            }
             let mut response_body_reject = None;
             for plugin in plugins.iter() {
                 let result = plugin

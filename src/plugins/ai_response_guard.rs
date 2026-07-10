@@ -101,21 +101,10 @@ pub struct AiResponseGuard {
     max_completion_length: usize,
 }
 
-/// Built-in PII pattern definitions (shared with ai_prompt_shield).
+/// Built-in PII pattern definitions (shared with ai_prompt_shield and
+/// ai_transcript_audit via [`crate::plugins::utils::ai_pii`]).
 fn builtin_pii_pattern(name: &str) -> Option<&'static str> {
-    match name {
-        "ssn" => Some(r"\b\d{3}[-.\s]?\d{2}[-.\s]?\d{4}\b"),
-        "credit_card" => Some(
-            r"\b(?:4\d{3}|5[1-5]\d{2}|3[47]\d{2}|6(?:011|5\d{2}))[-.\s]?\d{4}[-.\s]?\d{4}[-.\s]?\d{0,4}\b",
-        ),
-        "email" => Some(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
-        "phone_us" => Some(r"\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
-        "api_key" => Some(r"\b(?:sk|pk|api|key|token|secret|password)[-_]?[A-Za-z0-9]{20,}\b"),
-        "aws_key" => Some(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b"),
-        "ip_address" => Some(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b"),
-        "iban" => Some(r"\b[A-Z]{2}\d{2}[A-Z0-9]{4}\d{7}(?:[A-Z0-9]?\d{0,16})\b"),
-        _ => None,
-    }
+    crate::plugins::utils::ai_pii::builtin_pii_pattern(name)
 }
 
 impl AiResponseGuard {
@@ -761,6 +750,11 @@ impl AiResponseGuard {
     }
 
     /// Shared action handler for detected PII/blocked content.
+    fn mark_rejected(ctx: &mut RequestContext, reason: impl Into<String>) {
+        ctx.metadata
+            .insert("ai_response_guard_rejected".to_string(), reason.into());
+    }
+
     fn respond_to_detection(&self, ctx: &mut RequestContext, detected: &[String]) -> PluginResult {
         match self.action {
             GuardAction::Reject => {
@@ -768,6 +762,7 @@ impl AiResponseGuard {
                     "ai_response_guard: content detected (types: {:?}), rejecting response",
                     detected
                 );
+                Self::mark_rejected(ctx, detected.join(","));
                 let types_json: Vec<String> = detected
                     .iter()
                     .map(|t| format!("\"{}\"", escape_json_string(t)))
@@ -1115,6 +1110,7 @@ impl Plugin for AiResponseGuard {
                 if let Some(reason) = self.check_completion_length(&refs) {
                     match self.action {
                         GuardAction::Reject => {
+                            Self::mark_rejected(ctx, reason.clone());
                             return PluginResult::Reject {
                                 status_code: 502,
                                 body: format!(
@@ -1162,6 +1158,7 @@ impl Plugin for AiResponseGuard {
                     .iter()
                     .map(|t| format!("\"{}\"", escape_json_string(t)))
                     .collect();
+                Self::mark_rejected(ctx, detected.join(","));
                 return PluginResult::Reject {
                     status_code: 502,
                     body: format!(
@@ -1182,6 +1179,7 @@ impl Plugin for AiResponseGuard {
             Ok(v) => v,
             Err(_) => {
                 if self.require_json {
+                    Self::mark_rejected(ctx, "invalid_json");
                     return PluginResult::Reject {
                         status_code: 502,
                         body: r#"{"error":"AI response is not valid JSON"}"#.to_string(),
@@ -1195,6 +1193,7 @@ impl Plugin for AiResponseGuard {
         // Check required fields
         for field in &self.required_fields {
             if json.get(field.as_str()).is_none() {
+                Self::mark_rejected(ctx, format!("missing_required_field:{field}"));
                 return PluginResult::Reject {
                     status_code: 502,
                     body: format!(
@@ -1219,6 +1218,7 @@ impl Plugin for AiResponseGuard {
         {
             match self.action {
                 GuardAction::Reject => {
+                    Self::mark_rejected(ctx, reason.clone());
                     return PluginResult::Reject {
                         status_code: 502,
                         body: format!(
@@ -1265,6 +1265,7 @@ impl Plugin for AiResponseGuard {
                 .iter()
                 .map(|t| format!("\"{}\"", escape_json_string(t)))
                 .collect();
+            Self::mark_rejected(ctx, detected.join(","));
             return PluginResult::Reject {
                 status_code: 502,
                 body: format!(

@@ -365,6 +365,14 @@ impl Plugin for RequestMirror {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        if ctx
+            .metadata
+            .get("ai_stream_router_claimed")
+            .map(String::as_str)
+            == Some("true")
+        {
+            return PluginResult::Continue;
+        }
         if !self.should_mirror() {
             return PluginResult::Continue;
         }

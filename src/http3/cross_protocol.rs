@@ -111,6 +111,7 @@ use crate::load_balancer::LoadBalancer;
 use crate::plugins::{
     BackendAdmissionOutcome, BackendAdmissionPermitSet, Plugin, PluginResult, ProxyProtocol,
     RequestContext, ResponseStreamAction, ResponseStreamInspector,
+    normalize_response_body_for_inspection,
 };
 use crate::proxy::ProxyState;
 use crate::proxy::backend_dispatch::{record_backend_outcome, record_backend_outcome_no_conn_end};
@@ -528,8 +529,20 @@ where
     // `apply_request_body_plugins`.
     let prebuffered_body = match prebuffered_body {
         Some(body) if !plugins.is_empty() => {
-            let transformed =
-                crate::proxy::apply_request_body_plugins(plugins, proxy_headers, body).await;
+            // Use the context-aware variant so body transforms that depend on
+            // `before_proxy` decisions in `ctx.metadata` (e.g.
+            // `ai_stream_router`'s provider-specific translation) and
+            // method-sensitive body plugins (e.g. `ai_prompt_compressor`, which
+            // gates on the real request method) run on the H3 bridge exactly as
+            // they do on the H1/H2 dispatch path. This bridge path has no
+            // `:method` pseudo-header for the no-context hook to consult.
+            let transformed = crate::proxy::apply_request_body_plugins_with_context(
+                plugins,
+                Some(&mut *ctx),
+                proxy_headers,
+                body,
+            )
+            .await;
             // Run validators. Reject = emit a trailers-only gRPC error
             // (Grpc flavor) or a plain JSON error (everything else) and
             // return early WITHOUT dispatching to the backend.
@@ -2135,6 +2148,14 @@ where
         };
 
         if !plugins.is_empty() {
+            normalize_response_body_for_inspection(
+                plugins,
+                ctx,
+                response_status,
+                &mut response_headers,
+                &mut response_body,
+            )
+            .await;
             for plugin in plugins {
                 let result = plugin
                     .on_response_body(ctx, response_status, &response_headers, &response_body)
@@ -3419,6 +3440,17 @@ where
             let mut response_status = resp.status;
             let mut response_body = resp.body;
             let mut response_trailers = resp.trailers;
+            if normalize_response_body_for_inspection(
+                plugins,
+                ctx,
+                response_status,
+                &mut plugin_response_headers,
+                &mut response_body,
+            )
+            .await
+            {
+                response_trailers.clear();
+            }
             for plugin in plugins.iter() {
                 let result = plugin
                     .on_response_body(

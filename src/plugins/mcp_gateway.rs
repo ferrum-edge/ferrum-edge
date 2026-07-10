@@ -2446,6 +2446,13 @@ impl Plugin for McpGateway {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        if ctx
+            .metadata
+            .get("ai_stream_router_claimed")
+            .is_some_and(|value| value == "true")
+        {
+            return PluginResult::Continue;
+        }
         if !self.enabled || !self.matches_endpoint(ctx) {
             return PluginResult::Continue;
         }

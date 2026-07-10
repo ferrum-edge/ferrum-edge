@@ -151,6 +151,13 @@ async fn test_pii_detection_reject() {
         }
         _ => panic!("Expected Reject, got {:?}", result),
     }
+    assert!(
+        ctx.metadata
+            .get("ai_response_guard_rejected")
+            .is_some_and(|value| value.contains("pii:ssn")),
+        "reject marker missing or wrong: {:?}",
+        ctx.metadata.get("ai_response_guard_rejected")
+    );
 }
 
 // Marker set by the proxy on `ctx.metadata` while the response-body hooks run
@@ -1012,6 +1019,13 @@ async fn test_sse_pii_detection_reject() {
         }
         _ => panic!("Expected Reject for SSE with SSN, got {:?}", result),
     }
+    assert!(
+        ctx.metadata
+            .get("ai_response_guard_rejected")
+            .is_some_and(|value| value.contains("pii:ssn")),
+        "reject marker missing or wrong: {:?}",
+        ctx.metadata.get("ai_response_guard_rejected")
+    );
 }
 
 #[tokio::test]
