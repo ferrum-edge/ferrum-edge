@@ -941,6 +941,16 @@ fn should_probe_selected_h3_cache_after_fast_path(fast_path_failed_pre_wire: boo
     !fast_path_failed_pre_wire
 }
 
+/// A native-H3 streaming request may reconnect after a cached-connection
+/// failure only while the request is still pre-wire. `do_request_streaming_body`
+/// does not poll the borrowed frontend body until `send_request` opens the
+/// backend stream, so a pre-wire failure leaves that body untouched and safe to
+/// forward on a fresh connection. Once `request_on_wire` is true, replay would
+/// risk double-executing a non-idempotent gRPC call.
+fn should_reconnect_streaming_body_after_cached_failure(error: &H3PoolError) -> bool {
+    !error.request_on_wire()
+}
+
 /// Result of a streaming HTTP/3 request — headers received, body still in flight.
 ///
 /// The caller reads response body chunks via `recv_stream.recv_data()`.
@@ -2410,15 +2420,13 @@ impl Http3ConnectionPool {
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
 
-        // No thread-local fast path for streaming body — the frontend stream is
-        // consumed during the request, so we can't retry on a different connection
-        // if the first attempt fails mid-body. Go straight to the slow path.
+        // No thread-local fast path for streaming body. A post-wire failure may
+        // have consumed frontend bytes and cannot be replayed, but a cached
+        // connection that fails before `send_request` opens the backend stream
+        // leaves the borrowed frontend body untouched, so reconnecting is safe.
         let key = self.pool_key_with_current_generation(proxy, start);
 
         if let Some(pooled) = self.pool.cached(&key) {
-            // Single attempt — body is consumed, no retry possible.
-            // On error, evict the stale connection so subsequent requests
-            // don't repeatedly fail on the same dead QUIC handle.
             let mut sr = pooled.send_request;
             match Self::do_request_streaming_body(
                 &mut sr,
@@ -2442,16 +2450,20 @@ impl Http3ConnectionPool {
                         e
                     );
                     self.pool.invalidate(&key);
-                    return Err(e);
+                    if !should_reconnect_streaming_body_after_cached_failure(&e) {
+                        return Err(e);
+                    }
+                    // `send_request` failed before opening a backend stream, so
+                    // `frontend_stream` has not been polled. Fall through to a
+                    // fresh connection instead of surfacing a spurious gRPC
+                    // UNAVAILABLE for a stale warmed pool entry.
                 }
             }
         }
 
-        // Create new connection. Single-attempt path — no fallback chain,
-        // so no prior post-wire attempt exists whose `request_on_wire` flag
-        // would need to be carried forward via `.promote_on_wire_if(...)`.
-        // See `H3PoolError::promote_on_wire_if` for the pattern that any
-        // future multi-attempt loop here MUST follow.
+        // Create a new connection. Reaching here after a cached failure is safe
+        // only because the gate above proved it was pre-wire; therefore no sticky
+        // `request_on_wire` state needs to be promoted into this attempt.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let pooled = self
@@ -2621,16 +2633,17 @@ impl Http3ConnectionPool {
                         target_host, target_port, e
                     );
                     self.pool.invalidate(&key);
-                    return Err(e);
+                    if !should_reconnect_streaming_body_after_cached_failure(&e) {
+                        return Err(e);
+                    }
+                    // Pre-wire means the borrowed frontend stream is still
+                    // untouched, so retry the same target on a fresh connection.
                 }
             }
         }
 
-        // Create new connection. Single-attempt path — no fallback chain,
-        // so no prior post-wire attempt exists whose `request_on_wire` flag
-        // would need to be carried forward via `.promote_on_wire_if(...)`.
-        // See `H3PoolError::promote_on_wire_if` for the pattern that any
-        // future multi-attempt loop here MUST follow.
+        // Create a new connection. Any cached failure that reached this point
+        // was pre-wire, so replay safety is preserved.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let pooled = self
@@ -3327,6 +3340,21 @@ mod h3_pool_error_tests {
         assert!(
             !should_probe_selected_h3_cache_after_fast_path(true),
             "a pre-wire fast-path failure already tried the selected entry, so the slow path must skip it"
+        );
+    }
+
+    #[test]
+    fn streaming_body_reconnects_only_before_request_reaches_wire() {
+        let pre_wire = H3PoolError::pre_wire(anyhow::anyhow!("cached send_request failed"));
+        assert!(
+            should_reconnect_streaming_body_after_cached_failure(&pre_wire),
+            "pre-wire cached failure leaves the borrowed frontend body untouched"
+        );
+
+        let post_wire = H3PoolError::post_wire(anyhow::anyhow!("cached send_data failed"));
+        assert!(
+            !should_reconnect_streaming_body_after_cached_failure(&post_wire),
+            "post-wire cached failure may have consumed body bytes and must not replay"
         );
     }
 

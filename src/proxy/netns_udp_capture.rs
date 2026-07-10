@@ -12,10 +12,11 @@
 //! capture path uses ([`super::netns_capture::DirectoryCaptureSource`] over the
 //! node-agent-published registry dir): a [`NetnsUdpCaptureManager`] polls the
 //! enrolled-pod set and, for each pod netns, opens a UDP capture "producer" that
-//!   1. binds a transparent UDP capture socket INSIDE the pod netns, then
-//!   2. installs the UDP TPROXY rules INSIDE the pod netns (socket first, so the
-//!      rules never divert into a not-yet-bound socket — no black-hole window),
-//!   3. runs the shared capture/session/egress loop
+//!   1. installs a scope-exact fail-closed OUTPUT guard INSIDE the pod netns,
+//!   2. binds a transparent UDP capture socket and installs the UDP TPROXY rules
+//!      while that guard remains active,
+//!   3. removes the guard only after the socket/rules are ready, then runs the
+//!      shared capture/session/egress loop
 //!      ([`super::mesh_udp_capture::run_mesh_udp_capture_on_socket`]) with a
 //!      pod-netns reply-socket factory (so return-path replies are spoofed from
 //!      the captured VIP:port INSIDE the pod netns), and
@@ -90,6 +91,48 @@ impl OpenedUdpCapture {
     }
 }
 
+/// Cleanup ownership for a fail-closed guard retained after producer setup
+/// failed. The stable netns handle lives inside the callback, so registry removal
+/// can still remove the guard even after the pod's cgroup/proc lookup disappears.
+pub struct RetainedUdpGuard {
+    cleanup: Option<Box<dyn FnMut() -> bool + Send>>,
+}
+
+impl RetainedUdpGuard {
+    #[cfg(any(target_os = "linux", test))]
+    fn new(cleanup: Box<dyn FnMut() -> bool + Send>) -> Self {
+        Self {
+            cleanup: Some(cleanup),
+        }
+    }
+
+    /// Attempt strict guard removal. Keep the callback (and its stable netns
+    /// handle) on failure so the next reconcile can retry rather than orphaning
+    /// a black-holing OUTPUT jump after a transient xtables resource error.
+    fn cleanup(&mut self) -> bool {
+        let cleaned = self.cleanup.as_mut().is_none_or(|cleanup| cleanup());
+        if cleaned {
+            self.cleanup.take();
+        }
+        cleaned
+    }
+
+    /// The backend successfully switched to live capture and already removed
+    /// every guard jump. Drop cleanup ownership without touching the live rules.
+    fn disarm(mut self) {
+        self.cleanup.take();
+    }
+}
+
+/// Result of one producer-open attempt. A guarded failure is distinct from a
+/// pre-guard failure so the manager can retain teardown ownership while retrying.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum NetnsUdpOpenResult {
+    Opened(OpenedUdpCapture),
+    Guarded(RetainedUdpGuard),
+    Failed,
+}
+
 /// Opens/closes per-pod-netns UDP capture. A trait so the manager's reconcile
 /// logic is unit-testable with a mock (no real netns, `setns`, or iptables).
 pub trait NetnsUdpBackend: Send + Sync + 'static {
@@ -101,13 +144,14 @@ pub trait NetnsUdpBackend: Send + Sync + 'static {
     /// Install UDP TPROXY rules + bind the capture socket + start the capture
     /// loop INSIDE the target pod's netns. `expected_netns` is the inode resolved
     /// during this reconcile pass; the backend must fail closed if the reopened
-    /// netns handle no longer matches it. `None` on failure (retried next
-    /// reconcile); the backend must leave no partial rules behind on failure.
+    /// netns handle no longer matches it. Failures are retried next reconcile;
+    /// [`NetnsUdpOpenResult::Guarded`] transfers cleanup ownership for a deliberate
+    /// fail-closed guard retained after partial capture state is removed.
     fn open_udp_capture(
         &self,
         target: &PodCaptureTarget,
         expected_netns: u64,
-    ) -> Option<OpenedUdpCapture>;
+    ) -> NetnsUdpOpenResult;
 }
 
 /// Best-effort cleanup backend used when Ambient UDP capture is disabled. It
@@ -127,6 +171,29 @@ struct ActiveUdpCapture {
     pod_uids: HashSet<String>,
 }
 
+/// One netns whose producer is not active but whose selected UDP egress is
+/// deliberately guarded while retries continue.
+struct GuardedUdpCapture {
+    handle: RetainedUdpGuard,
+    pod_uids: HashSet<String>,
+}
+
+fn capture_is_still_justified(
+    netns: u64,
+    pod_uids: &HashSet<String>,
+    registry_uids: &HashSet<String>,
+    resolved_uid_netns: &HashMap<String, u64>,
+    unresolved_uids: &HashSet<String>,
+) -> bool {
+    pod_uids.iter().any(|uid| {
+        registry_uids.contains(uid)
+            && match resolved_uid_netns.get(uid) {
+                Some(resolved) => *resolved == netns,
+                None => unresolved_uids.contains(uid),
+            }
+    })
+}
+
 /// Reconciles per-pod-netns UDP capture producers against the enrolled-pod set.
 pub struct NetnsUdpCaptureManager<B: NetnsUdpBackend> {
     /// The UDP capture port bound (dual-stack `[::]`) inside each pod netns.
@@ -137,6 +204,10 @@ pub struct NetnsUdpCaptureManager<B: NetnsUdpBackend> {
     poll_interval: Duration,
     /// netns inode → its active producer.
     active: HashMap<u64, ActiveUdpCapture>,
+    /// netns inode → fail-closed guard retained after an open failure. Keeping
+    /// this separate from `active` preserves retries while ensuring pod removal
+    /// and shutdown still own teardown.
+    guarded: HashMap<u64, GuardedUdpCapture>,
     /// netns inode → the still-running teardown of a producer we just closed
     /// (pod removal / netns move / registry flap). The reopen path AWAITS the
     /// entry for a netns before opening a new producer for that same netns, so a
@@ -164,6 +235,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             backend,
             poll_interval,
             active: HashMap::new(),
+            guarded: HashMap::new(),
             pending_teardowns: HashMap::new(),
             last_registry_uids: HashSet::new(),
             unresolved_reasons: HashMap::new(),
@@ -278,13 +350,13 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             .active
             .iter()
             .filter(|(netns, active)| {
-                !active.pod_uids.iter().any(|uid| {
-                    registry_uids.contains(uid)
-                        && match resolved_uid_netns.get(uid) {
-                            Some(resolved) => *resolved == **netns,
-                            None => unresolved_uids.contains(uid),
-                        }
-                })
+                !capture_is_still_justified(
+                    **netns,
+                    &active.pod_uids,
+                    &registry_uids,
+                    &resolved_uid_netns,
+                    &unresolved_uids,
+                )
             })
             .map(|(netns, _)| *netns)
             .collect();
@@ -313,12 +385,51 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             }
         }
 
+        // A retained guard has the same registry lifetime as an active producer.
+        // Unlike an active handle it has no supervising task, so clean it here
+        // synchronously using the stable netns handle captured by the backend.
+        let abandoned_guards: Vec<u64> = self
+            .guarded
+            .iter()
+            .filter(|(netns, guarded)| {
+                !capture_is_still_justified(
+                    **netns,
+                    &guarded.pod_uids,
+                    &registry_uids,
+                    &resolved_uid_netns,
+                    &unresolved_uids,
+                )
+            })
+            .map(|(netns, _)| *netns)
+            .collect();
+        for netns in abandoned_guards {
+            let cleaned = self
+                .guarded
+                .get_mut(&netns)
+                .is_some_and(|guarded| guarded.handle.cleanup());
+            if cleaned {
+                self.guarded.remove(&netns);
+                info!(
+                    netns_inode = netns,
+                    "Removed abandoned Ambient UDP fail-closed guard"
+                );
+            } else {
+                warn!(
+                    netns_inode = netns,
+                    "Could not remove abandoned Ambient UDP fail-closed guard; retaining cleanup ownership and retrying"
+                );
+            }
+        }
+
         // Open producers for newly-seen netns; for an existing netns, refresh pod
         // membership (a shared netns may gain/lose pods without a socket rebind).
         for (netns, pod_uids) in desired {
             if let Some(active) = self.active.get_mut(&netns) {
                 active.pod_uids = pod_uids;
                 continue;
+            }
+            if let Some(guarded) = self.guarded.get_mut(&netns) {
+                guarded.pod_uids = pod_uids.clone();
             }
             // New netns: open one producer. Any target in this netns can open it —
             // they share the namespace.
@@ -344,7 +455,13 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                 );
             }
             match self.backend.open_udp_capture(target, netns) {
-                Some(handle) => {
+                NetnsUdpOpenResult::Opened(handle) => {
+                    // The successful backend transition removed all guard jumps.
+                    // Disarm the older stable cleanup handle so it cannot later
+                    // tear down this new live capture instance.
+                    if let Some(guarded) = self.guarded.remove(&netns) {
+                        guarded.handle.disarm();
+                    }
                     info!(
                         netns_inode = netns,
                         pod_uid = %target.pod_uid,
@@ -354,7 +471,25 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                     self.active
                         .insert(netns, ActiveUdpCapture { handle, pod_uids });
                 }
-                None => {
+                NetnsUdpOpenResult::Guarded(handle) => {
+                    match self.guarded.entry(netns) {
+                        std::collections::hash_map::Entry::Occupied(_) => {
+                            // The existing handle already pins the same netns for
+                            // cleanup. Keep it and discard the duplicate retry
+                            // handle without removing the still-active guard.
+                            handle.disarm();
+                        }
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(GuardedUdpCapture { handle, pod_uids });
+                        }
+                    }
+                    warn!(
+                        netns_inode = netns,
+                        pod_uid = %target.pod_uid,
+                        "Ambient UDP producer open failed after guard installation; guard retained and retrying"
+                    );
+                }
+                NetnsUdpOpenResult::Failed => {
                     warn!(
                         netns_inode = netns,
                         pod_uid = %target.pod_uid,
@@ -380,6 +515,20 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
     /// hang shutdown.
     async fn shutdown_all(&mut self) {
         let mut tasks = tokio::task::JoinSet::new();
+        for (netns, mut guarded) in self.guarded.drain() {
+            // Retained cleanup can spend several seconds in `iptables -w` for
+            // each family. Put it under the same bounded JoinSet as active and
+            // pending producer teardown so multiple guarded failures cannot
+            // serialize unbounded work ahead of the documented shutdown limit.
+            tasks.spawn_blocking(move || {
+                if !guarded.handle.cleanup() {
+                    warn!(
+                        netns_inode = netns,
+                        "Ambient UDP capture shutdown could not remove a retained fail-closed guard"
+                    );
+                }
+            });
+        }
         for (_, active) in self.active.drain() {
             if let Some(handle) = active.handle.close() {
                 tasks.spawn(async move {
@@ -757,7 +906,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         &self,
         target: &PodCaptureTarget,
         expected_netns: u64,
-    ) -> Option<OpenedUdpCapture> {
+    ) -> NetnsUdpOpenResult {
         use crate::capture::{Ip6TablesMode, IptablesPlan};
 
         // The UDP-only setup + teardown scripts for THIS pod netns. `host_netns`
@@ -769,10 +918,14 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                 pod_uid = %target.pod_uid,
                 "Ambient UDP producer: empty UDP setup script (capture disabled?); not opening"
             );
-            return None;
+            return NetnsUdpOpenResult::Failed;
         }
         let include_v6 = self.capture_config.ip6tables_mode != Ip6TablesMode::Disabled;
         let teardown_script = IptablesPlan::udp_teardown_script(include_v6);
+        let capture_teardown_script = IptablesPlan::udp_capture_rules_teardown_script(include_v6);
+        let fail_closed_script = IptablesPlan::udp_fail_closed_script(&self.capture_config);
+        let fail_closed_teardown_script = IptablesPlan::udp_fail_closed_teardown_script();
+        let capture_output_release_script = IptablesPlan::udp_capture_output_release_script();
 
         // Stable netns handle for the whole capture lifetime (survives PID exit).
         let netns = match super::netns_capture::open_pod_netns_handle(&target.cgroup_path) {
@@ -784,7 +937,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                     %error,
                     "Ambient UDP producer: could not open pod netns handle"
                 );
-                return None;
+                return NetnsUdpOpenResult::Failed;
             }
         };
 
@@ -801,7 +954,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                     "Ambient UDP producer: could not read opened pod netns identity; \
                      refusing to install pod UDP rules (fail closed)"
                 );
-                return None;
+                return NetnsUdpOpenResult::Failed;
             }
         };
         if opened_netns != expected_netns {
@@ -813,7 +966,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                 "Ambient UDP producer: pod netns changed between reconcile and open; \
                  refusing to install rules under a stale key"
             );
-            return None;
+            return NetnsUdpOpenResult::Failed;
         }
 
         // Refuse to run pod UDP setup INSIDE the host/proxy network namespace.
@@ -837,7 +990,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                          (hostNetwork or stale entry); refusing to install pod UDP rules \
                          in the node namespace"
                     );
-                    return None;
+                    return NetnsUdpOpenResult::Failed;
                 }
             }
             Err(error) => {
@@ -848,9 +1001,59 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                     "Ambient UDP producer: could not compare pod vs host netns identity; \
                      refusing to install pod UDP rules (fail closed)"
                 );
-                return None;
+                return NetnsUdpOpenResult::Failed;
             }
         }
+
+        // Transfer this stable-netns teardown owner to the manager on any error
+        // after guard installation is attempted. This closes the lifecycle hole
+        // where a registry entry could disappear before a retry created an active
+        // producer handle, leaving the retained OUTPUT guard orphaned.
+        let retained_guard = {
+            let netns = netns.clone();
+            let pod_uid = target.pod_uid.clone();
+            let teardown_script = teardown_script.clone();
+            let guard_teardown_script = fail_closed_teardown_script.clone();
+            let capture_output_release_script = capture_output_release_script.clone();
+            RetainedUdpGuard::new(Box::new(move || {
+                // Detach any partially installed normal capture path while the
+                // fail-closed guard still protects selected egress. Otherwise a
+                // successful guard release followed by a hidden normal-teardown
+                // failure could leave a socketless TPROXY jump black-holing UDP.
+                let capture_release = capture_output_release_script.clone();
+                if let Err(error) = super::netns_capture::run_in_netns(netns.as_ref(), move || {
+                    run_shell_script(&capture_release)
+                }) {
+                    warn!(
+                        pod_uid = %pod_uid,
+                        %error,
+                        "Ambient UDP producer: retained partial-capture cleanup failed; will retry with guard active"
+                    );
+                    return false;
+                }
+
+                let strict_release = guard_teardown_script.clone();
+                if let Err(error) = super::netns_capture::run_in_netns(netns.as_ref(), move || {
+                    run_shell_script(&strict_release)
+                }) {
+                    warn!(
+                        pod_uid = %pod_uid,
+                        %error,
+                        "Ambient UDP producer: retained fail-closed guard cleanup failed; will retry"
+                    );
+                    return false;
+                }
+
+                // Once every guard jump is provably gone, the remaining normal
+                // capture teardown is safe to keep best-effort and cannot leave
+                // selected workload egress black-holed.
+                let cleanup = teardown_script.clone();
+                let _ = super::netns_capture::run_in_netns(netns.as_ref(), move || {
+                    run_shell_script(&cleanup)
+                });
+                true
+            }))
+        };
 
         // Best-effort in-netns teardown helper (pod removal / failure paths).
         // `Fn` (clones its captures per call) so it can be borrowed on the error
@@ -866,25 +1069,47 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                 });
             }
         };
+        // Capture-only cleanup leaves the pre-bind fail-closed guard in place.
+        // Used on bind/adoption/setup failures so a retry never reopens egress.
+        let teardown_capture_rules = {
+            let netns = netns.clone();
+            let capture_teardown_script = capture_teardown_script.clone();
+            move || {
+                let netns = netns.clone();
+                let capture_teardown_script = capture_teardown_script.clone();
+                let _ = super::netns_capture::run_in_netns(netns.as_ref(), move || {
+                    run_shell_script(&capture_teardown_script)
+                });
+            }
+        };
 
-        // Bind the capture socket, THEN install the rules — both INSIDE the pod
-        // netns, on one `setns`-bound thread. Socket-first means the TPROXY rules
-        // never divert into a not-yet-bound socket (no black-hole window). A
-        // reconfigure reaps stale rules first (idempotent teardown) so a changed
-        // port/mark can't leave a stale rule ahead of the new one.
+        // Install a scope-exact DROP guard first, then reap/rebuild the normal
+        // capture state and bind the socket — all inside the pod netns on one
+        // `setns`-bound thread. The guard uses independent alternating chains, so
+        // neither stale-state cleanup nor a retry flushes the active guard. It is
+        // removed only after the socket is adopted below and the complete TPROXY
+        // ruleset is live.
         let bind_addr = std::net::SocketAddr::new(
             std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
             self.capture_port,
         );
         let setup_for_thread = setup_script;
-        let teardown_pre = teardown_script.clone();
+        let teardown_pre = capture_teardown_script.clone();
+        let fail_closed_for_thread = fail_closed_script.clone();
         let bind_result = super::netns_capture::run_in_netns(netns.as_ref(), move || {
-            // Reap any stale UDP rules from a prior crashed producer first.
+            // Guard before touching stale state or attempting the unprivileged
+            // bind. A workload that pre-bound the port can no longer win a
+            // capture-bypass window between cleanup and bind failure.
+            run_shell_script(&fail_closed_for_thread)?;
+            // Reap only normal capture state; the dedicated guard stays live.
             let _ = run_shell_script(&teardown_pre);
             let (socket, bound_addr, v4_origdst, v6_origdst) =
                 super::mesh_udp_capture::bind_mesh_udp_capture_socket(bind_addr)
-                    .map_err(|e| std::io::Error::other(e.to_string()))?;
-            run_shell_script(&setup_for_thread)?;
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+            if let Err(error) = run_shell_script(&setup_for_thread) {
+                let _ = run_shell_script(&teardown_pre);
+                return Err(error);
+            }
             Ok((socket, bound_addr, v4_origdst, v6_origdst))
         });
         let (std_socket, bound_addr, v4_origdst, v6_origdst) = match bind_result {
@@ -893,10 +1118,9 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                 warn!(
                     pod_uid = %target.pod_uid,
                     %error,
-                    "Ambient UDP producer: in-netns socket bind / rule install failed; cleaning up"
+                    "Ambient UDP producer: in-netns guard / socket bind / rule install failed; fail-closed guard retained when installed"
                 );
-                teardown();
-                return None;
+                return NetnsUdpOpenResult::Guarded(retained_guard);
             }
         };
 
@@ -906,12 +1130,51 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                 warn!(
                     pod_uid = %target.pod_uid,
                     %error,
-                    "Ambient UDP producer: could not adopt in-netns capture socket; cleaning up"
+                    "Ambient UDP producer: could not adopt in-netns capture socket; retaining fail-closed guard"
                 );
-                teardown();
-                return None;
+                teardown_capture_rules();
+                return NetnsUdpOpenResult::Guarded(retained_guard);
             }
         };
+
+        // The Tokio socket now owns the bound descriptor and the complete live
+        // capture rules are installed. Remove the temporary guard so traffic
+        // switches directly from fail-closed DROP to TPROXY capture. If setns or
+        // guard cleanup fails, keep the guard and remove normal capture state;
+        // the next reconcile retries without a plaintext bypass.
+        let guard_teardown = {
+            let script = fail_closed_teardown_script;
+            super::netns_capture::run_in_netns(netns.as_ref(), move || run_shell_script(&script))
+        };
+        if let Err(error) = guard_teardown {
+            warn!(
+                pod_uid = %target.pod_uid,
+                %error,
+                "Ambient UDP producer: could not remove pre-bind fail-closed guard; restoring guard before abandoning live capture"
+            );
+            // Guard release can be partially successful (for example v4 jumps
+            // removed before a v6 xtables resource error). Reinstall and verify
+            // the scope-exact guard before removing live rules. If restoration
+            // itself fails, preserve the normal TPROXY rules until the next
+            // reconcile rather than creating a plaintext path; dropping the
+            // bound socket then remains fail-closed (socketless local delivery).
+            let restore_script = fail_closed_script;
+            let restored = super::netns_capture::run_in_netns(netns.as_ref(), move || {
+                run_shell_script(&restore_script)
+            });
+            if restored.is_ok() {
+                teardown_capture_rules();
+            } else if let Err(restore_error) = restored {
+                warn!(
+                    pod_uid = %target.pod_uid,
+                    error = %restore_error,
+                    "Ambient UDP producer: could not restore fail-closed guard after partial release; preserving live capture rules until retry"
+                );
+            }
+            return NetnsUdpOpenResult::Guarded(retained_guard);
+        }
+
+        retained_guard.disarm();
 
         let reply_socket_factory: Arc<dyn super::mesh_udp_capture::ReplySocketFactory> = Arc::new(
             super::mesh_udp_capture::PodNetnsReplySocketFactory::new(netns.clone()),
@@ -960,7 +1223,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             .await;
         });
 
-        Some(OpenedUdpCapture::new(stop_tx, task))
+        NetnsUdpOpenResult::Opened(OpenedUdpCapture::new(stop_tx, task))
     }
 }
 
@@ -974,7 +1237,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         &self,
         _target: &PodCaptureTarget,
         _expected_netns: u64,
-    ) -> Option<OpenedUdpCapture> {
+    ) -> NetnsUdpOpenResult {
         // Touch every field so the non-Linux build does not flag them dead.
         let _ = (
             &self.state,
@@ -987,15 +1250,16 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             &self.global_shutdown,
         );
         warn!("Ambient per-pod-netns UDP capture is Linux-only; not opening");
-        None
+        NetnsUdpOpenResult::Failed
     }
 }
 
 /// Run a shell script (`sh -c`) synchronously and fail on a non-zero exit. Called
 /// only from inside a `setns`-bound thread ([`super::netns_capture::run_in_netns`]),
 /// so the child process inherits the pod netns — the same mechanism `ip netns
-/// exec` uses. An empty script is a no-op. Setup scripts carry `set -e` (fail
-/// closed); teardown scripts carry per-command `|| true` guards (best-effort).
+/// exec` uses. An empty script is a no-op. Setup and guarded-to-live transition
+/// scripts carry `set -e`; final cleanup removes guard jumps strictly, then uses
+/// per-command `|| true` guards for the remaining already-absent state.
 #[cfg(target_os = "linux")]
 fn run_shell_script(script: &str) -> std::io::Result<()> {
     if script.trim().is_empty() {
@@ -1043,6 +1307,9 @@ mod tests {
         events: Arc<Mutex<Vec<Event>>>,
         /// netns inodes for which `open_udp_capture` should fail (retry testing).
         fail_open: Mutex<HashSet<u64>>,
+        /// Retained-guard cleanup fails once for these netns, exercising manager
+        /// ownership across a transient xtables-style cleanup error.
+        fail_guard_cleanup_once: Arc<Mutex<HashSet<u64>>>,
         /// When true, `close()` returns a real supervising task that records the
         /// teardown only AFTER yielding — so a reopen that does not await it would
         /// record `Opened(N)` before `TornDown(N)` in `events`. This models the
@@ -1061,6 +1328,7 @@ mod tests {
                 closed: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(Vec::new())),
                 fail_open: Mutex::new(HashSet::new()),
+                fail_guard_cleanup_once: Arc::new(Mutex::new(HashSet::new())),
                 slow_teardown: false,
             }
         }
@@ -1095,6 +1363,10 @@ mod tests {
                 set.remove(&netns);
             }
         }
+
+        fn fail_next_guard_cleanup(&self, netns: u64) {
+            self.fail_guard_cleanup_once.lock().unwrap().insert(netns);
+        }
     }
 
     impl NetnsUdpBackend for MockBackend {
@@ -1114,7 +1386,7 @@ mod tests {
             &self,
             target: &PodCaptureTarget,
             expected_netns: u64,
-        ) -> Option<OpenedUdpCapture> {
+        ) -> NetnsUdpOpenResult {
             let open_netns = self
                 .open_netns_by_cgroup
                 .lock()
@@ -1132,10 +1404,20 @@ mod tests {
                 })
                 .unwrap();
             if netns != expected_netns {
-                return None;
+                return NetnsUdpOpenResult::Failed;
             }
             if self.fail_open.lock().unwrap().contains(&netns) {
-                return None;
+                let closed = self.closed.clone();
+                let events = self.events.clone();
+                let fail_once = self.fail_guard_cleanup_once.clone();
+                return NetnsUdpOpenResult::Guarded(RetainedUdpGuard::new(Box::new(move || {
+                    if fail_once.lock().unwrap().remove(&netns) {
+                        return false;
+                    }
+                    closed.lock().unwrap().push(netns);
+                    events.lock().unwrap().push(Event::TornDown(netns));
+                    true
+                })));
             }
             self.opened.lock().unwrap().push(netns);
             self.events.lock().unwrap().push(Event::Opened(netns));
@@ -1153,9 +1435,9 @@ mod tests {
                     closed.lock().unwrap().push(netns);
                     events.lock().unwrap().push(Event::TornDown(netns));
                 });
-                Some(OpenedUdpCapture::new(stop_tx, task))
+                NetnsUdpOpenResult::Opened(OpenedUdpCapture::new(stop_tx, task))
             } else {
-                Some(OpenedUdpCapture::with_on_close(
+                NetnsUdpOpenResult::Opened(OpenedUdpCapture::with_on_close(
                     stop_tx,
                     Box::new(move || {
                         closed.lock().unwrap().push(netns);
@@ -1333,10 +1615,63 @@ mod tests {
         // First pass fails to open → no active producer.
         assert_eq!(mgr.reconcile_once().await, 0);
         assert!(opened.lock().unwrap().is_empty());
+        assert_eq!(
+            mgr.guarded.len(),
+            1,
+            "failed open retains cleanup ownership"
+        );
         // Recover → next reconcile opens it.
         mgr.backend.set_fail_open(100, false);
         assert_eq!(mgr.reconcile_once().await, 1);
         assert_eq!(*opened.lock().unwrap(), vec![100]);
+        assert!(
+            mgr.guarded.is_empty(),
+            "live capture disarms retained cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_guard_is_cleaned_when_registry_entry_disappears() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        backend.set_fail_open(100, true);
+        let cleaned = backend.closed.clone();
+        let mut mgr = manager(source.clone(), backend);
+
+        assert_eq!(mgr.reconcile_once().await, 0);
+        assert_eq!(mgr.guarded.len(), 1);
+
+        // Removal can race ahead of the next successful bind. The manager must
+        // use the retained stable-netns cleanup owner rather than relying on a
+        // now-missing cgroup/proc lookup or active producer handle.
+        source.0.lock().unwrap().clear();
+        assert_eq!(mgr.reconcile_once().await, 0);
+        assert!(mgr.guarded.is_empty());
+        assert_eq!(*cleaned.lock().unwrap(), vec![100]);
+    }
+
+    #[tokio::test]
+    async fn retained_guard_cleanup_failure_is_retried() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        backend.set_fail_open(100, true);
+        backend.fail_next_guard_cleanup(100);
+        let cleaned = backend.closed.clone();
+        let mut mgr = manager(source.clone(), backend);
+
+        assert_eq!(mgr.reconcile_once().await, 0);
+        source.0.lock().unwrap().clear();
+        assert_eq!(mgr.reconcile_once().await, 0);
+        assert_eq!(
+            mgr.guarded.len(),
+            1,
+            "a failed strict cleanup keeps the stable-netns owner"
+        );
+        assert!(cleaned.lock().unwrap().is_empty());
+
+        assert_eq!(mgr.reconcile_once().await, 0);
+        assert!(mgr.guarded.is_empty());
+        assert_eq!(*cleaned.lock().unwrap(), vec![100]);
     }
 
     #[tokio::test]
@@ -1380,6 +1715,26 @@ mod tests {
         let mut got = closed.lock().unwrap().clone();
         got.sort_unstable();
         assert_eq!(got, vec![100, 200], "shutdown closes every producer");
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_cleans_retained_guard() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        backend.set_fail_open(100, true);
+        let cleaned = backend.closed.clone();
+        let mut mgr = manager(source, backend);
+
+        assert_eq!(mgr.reconcile_once().await, 0);
+        assert_eq!(mgr.guarded.len(), 1);
+        mgr.shutdown_all().await;
+
+        assert!(mgr.guarded.is_empty());
+        assert_eq!(
+            *cleaned.lock().unwrap(),
+            vec![100],
+            "shutdown must remove a guard retained after producer setup failed"
+        );
     }
 
     /// The core codex fix: a registry flap (a pod's netns closed, then the same

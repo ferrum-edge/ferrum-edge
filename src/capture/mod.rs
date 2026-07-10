@@ -110,6 +110,13 @@ pub(crate) const TPROXY_ROUTE_TABLE: u16 = 33133;
 ///    number stays the high Ferrum-owned `33133`; only this RULE priority is low.
 pub(crate) const TPROXY_ROUTE_RULE_PRIORITY: u32 = 100;
 
+/// Two alternating fail-closed chains used by the Ambient per-pod UDP
+/// producer. A replacement chain is fully populated and jumped from OUTPUT
+/// before the previous chain is removed, so guarded retries never create a
+/// fail-open gap by flushing the currently active guard.
+const UDP_FAIL_CLOSED_CHAIN_A: &str = "FERRUM_UDP_FAIL_CLOSED_A";
+const UDP_FAIL_CLOSED_CHAIN_B: &str = "FERRUM_UDP_FAIL_CLOSED_B";
+
 /// Istio-compatible `includeOutboundPorts` annotation. The injector and the
 /// node-agent eBPF backend both read this key — keep the spelling exactly
 /// in sync with Istio so existing operator annotations apply unchanged.
@@ -902,13 +909,104 @@ impl IptablesPlan {
         )
     }
 
+    /// Build the fail-closed UDP egress guard installed before the Ambient
+    /// per-pod-netns producer touches stale capture state or attempts its socket
+    /// bind. The guard mirrors the configured outbound capture scope exactly
+    /// (includes, excludes, address family, and non-LOCAL direction) and uses
+    /// dedicated alternating chains, so a guarded retry never flushes the
+    /// currently active guard before its replacement is live.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn udp_fail_closed_script(config: &CaptureConfig) -> String {
+        let v4_commands = udp_fail_closed_commands_for_family("iptables", config, CidrFamily::V4);
+        let v6_enabled = config.ip6tables_mode != Ip6TablesMode::Disabled;
+        let v6_has_cidrs = config
+            .include_cidrs
+            .iter()
+            .chain(config.exclude_cidrs.iter())
+            .any(|cidr| cidr_family(cidr) == Some(CidrFamily::V6));
+        let v6_commands = if v6_enabled && v6_has_cidrs {
+            udp_fail_closed_commands_for_family("ip6tables", config, CidrFamily::V6)
+        } else {
+            Vec::new()
+        };
+        if v4_commands.is_empty() && v6_commands.is_empty() {
+            return String::new();
+        }
+        format!(
+            "set -e\n{}",
+            udp_iptables_script(&v4_commands, &v6_commands, config.ip6tables_mode, true,)
+        )
+    }
+
+    /// Remove only the fail-closed guard chains. Called after the capture socket
+    /// has been adopted and the complete TPROXY ruleset is installed, so traffic
+    /// switches directly from DROP guard to live capture.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn udp_fail_closed_teardown_script() -> String {
+        // Unlike removal during final cleanup, this is a readiness transition:
+        // returning success while an OUTPUT jump remains would leave an otherwise
+        // healthy producer black-holed indefinitely. Delete every duplicate jump
+        // under `set -e`; a failed deletion aborts so the caller tears live capture
+        // back down and retries with the guard deliberately retained.
+        let mut chunks = vec!["set -e".to_string()];
+        chunks.extend(udp_fail_closed_release_for("iptables"));
+        // Probe stale IPv6 guards regardless of the current install setting. A
+        // pod may restart with IPv6 capture disabled after an earlier enabled
+        // producer retained a v6 guard. Resource errors (notably xtables-lock
+        // timeout) remain fatal; only an unavailable binary/table is skipped.
+        let v6_release = udp_fail_closed_release_for("ip6tables").join("\n");
+        chunks.push(ip6tables_strict_probe_guard(&v6_release, "mangle"));
+        chunks.join("\n")
+    }
+
+    /// Strictly detach the normal UDP capture path from locally generated
+    /// traffic while a retained fail-closed guard is still active. Abandonment
+    /// cleanup runs this before releasing the guard: if a partial live setup left
+    /// the OUTPUT-mark jump behind, an xtables error must not expose that
+    /// socketless TPROXY path after the DROP guard is removed.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn udp_capture_output_release_script() -> String {
+        let mut chunks = vec!["set -e".to_string()];
+        chunks.push(udp_strict_output_jump_release_for(
+            "iptables",
+            "FERRUM_MESH_UDP_OUTPUT_MARK",
+        ));
+        let v6_release =
+            udp_strict_output_jump_release_for("ip6tables", "FERRUM_MESH_UDP_OUTPUT_MARK");
+        chunks.push(ip6tables_strict_probe_guard(&v6_release, "mangle"));
+        chunks.join("\n")
+    }
+
+    /// Remove the normal UDP capture chains/routing while leaving any active
+    /// fail-closed guard intact. The producer uses this after installing the
+    /// guard and before binding/rebuilding the live capture path.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn udp_capture_rules_teardown_script(include_v6: bool) -> String {
+        let v4 = udp_capture_teardown_for("iptables");
+        let mut chunks = Vec::new();
+        chunks.extend(v4.iptables);
+        chunks.extend(v4.ip_routing);
+        if include_v6 {
+            let v6 = udp_capture_teardown_for("ip6tables");
+            chunks.extend(
+                v6.iptables
+                    .iter()
+                    .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
+            );
+            chunks.extend(v6.ip_routing);
+        }
+        chunks.join("\n")
+    }
+
     /// The UDP-only teardown script the Ambient producer runs INSIDE a pod netns
-    /// on pod removal, config change, install failure, or shutdown. Reuses the
+    /// on pod removal, disabled-mode cleanup, or shutdown. Reuses the
     /// EXACT Ferrum-owned UDP teardown ([`Self::udp_teardown_split`] /
     /// [`Self::udp_teardown_v6_split`]) so producer cleanup and injector/node-agent
-    /// cleanup never diverge, and is best-effort throughout (NO `set -e`): a
-    /// partially installed ruleset or an already-gone netns must not abort
-    /// teardown. The raw `ip`/`ip -6` routing teardown is emitted unconditionally
+    /// cleanup never diverge, including the dedicated fail-closed guards. Guard
+    /// OUTPUT jumps are removed exhaustively and treat resource errors as fatal,
+    /// so cleanup cannot report success with a duplicate DROP jump still active;
+    /// the remaining chain/routing teardown is best-effort for partial or
+    /// already-absent state. The raw `ip`/`ip -6` routing teardown is emitted unconditionally
     /// (it does not depend on `ip6tables`); only the `ip6tables`-TABLE teardown is
     /// guarded behind an `ip6tables` (`mangle`) availability probe.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -925,6 +1023,16 @@ impl IptablesPlan {
                     .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
             );
             chunks.extend(v6.ip_routing);
+        } else {
+            // Current IPv6 disablement must not orphan a guard installed by an
+            // earlier enabled process. Limit the cross-setting cleanup to the
+            // dedicated guard chains; normal v6 capture/routing remains gated by
+            // `include_v6` as before.
+            chunks.extend(
+                udp_fail_closed_teardown_for("ip6tables")
+                    .iter()
+                    .map(|cmd| ip6tables_probe_guard(cmd, "mangle")),
+            );
         }
         chunks.join("\n")
     }
@@ -1153,6 +1261,158 @@ fn commands_for_family(
     commands
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn udp_outbound_selectors_for_family(
+    config: &CaptureConfig,
+    family: CidrFamily,
+    include_cidrs: &[&str],
+) -> Vec<String> {
+    // When an explicit include list selects only the other address family, do
+    // not synthesize this family's catch-all. Port includes are family-agnostic
+    // and still apply. This is the shared source of truth for both live TPROXY
+    // capture and the fail-closed guard; security fallback must never broaden
+    // or narrow the operator's configured capture scope.
+    let suppress_catch_all = config.include_cidrs_explicit
+        && include_cidrs.is_empty()
+        && config
+            .include_cidrs
+            .iter()
+            .any(|cidr| cidr_family(cidr).is_some_and(|cidr_family| cidr_family != family));
+
+    let mut selectors = Vec::new();
+    if config.include_all_outbound_ports {
+        if !suppress_catch_all {
+            selectors.push("-p udp".to_string());
+        }
+    } else {
+        let emit_include_cidrs =
+            config.include_outbound_ports.is_empty() || config.include_cidrs_explicit;
+        if emit_include_cidrs {
+            if include_cidrs.is_empty() {
+                if !suppress_catch_all {
+                    selectors.push("-p udp".to_string());
+                }
+            } else {
+                selectors.extend(include_cidrs.iter().map(|cidr| format!("-p udp -d {cidr}")));
+            }
+        }
+        selectors.extend(
+            config
+                .include_outbound_ports
+                .iter()
+                .map(|port| format!("-p udp --dport {port}")),
+        );
+    }
+    selectors
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn udp_fail_closed_chain_commands(
+    binary: &str,
+    chain: &str,
+    config: &CaptureConfig,
+    family: CidrFamily,
+    include_cidrs: &[&str],
+    exclude_cidrs: &[&str],
+) -> Vec<String> {
+    let selectors = udp_outbound_selectors_for_family(config, family, include_cidrs);
+    if selectors.is_empty() {
+        return Vec::new();
+    }
+    // This builder is used only after the other generation is known to be
+    // active (or during the first install). Reset and populate the inactive
+    // chain strictly: treating an xtables resource error as "already exists"
+    // could leave stale selectors in the replacement guard.
+    let mut commands = vec![format!(
+        "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -N {chain} 2>/dev/null || \
+         {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -F {chain}"
+    )];
+    for cidr in exclude_cidrs {
+        commands.push(format!(
+            "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} \
+             -p udp -d {cidr} -j RETURN"
+        ));
+    }
+    for port in &config.exclude_ports {
+        commands.push(format!(
+            "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} \
+             -p udp --dport {port} -j RETURN"
+        ));
+    }
+    for selector in selectors {
+        commands.push(format!(
+            "{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -A {chain} \
+             {selector} -m addrtype ! --dst-type LOCAL -j DROP"
+        ));
+    }
+    commands
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn udp_fail_closed_commands_for_family(
+    binary: &str,
+    config: &CaptureConfig,
+    family: CidrFamily,
+) -> Vec<String> {
+    if !config.udp_capture_enabled || config.host_netns {
+        return Vec::new();
+    }
+    let include_cidrs: Vec<&str> = config
+        .include_cidrs
+        .iter()
+        .filter(|cidr| cidr_family(cidr) == Some(family))
+        .map(String::as_str)
+        .collect();
+    let exclude_cidrs: Vec<&str> = config
+        .exclude_cidrs
+        .iter()
+        .filter(|cidr| cidr_family(cidr) == Some(family))
+        .map(String::as_str)
+        .collect();
+    let build_a = udp_fail_closed_chain_commands(
+        binary,
+        UDP_FAIL_CLOSED_CHAIN_A,
+        config,
+        family,
+        &include_cidrs,
+        &exclude_cidrs,
+    );
+    if build_a.is_empty() {
+        return Vec::new();
+    }
+    let build_b = udp_fail_closed_chain_commands(
+        binary,
+        UDP_FAIL_CLOSED_CHAIN_B,
+        config,
+        family,
+        &include_cidrs,
+        &exclude_cidrs,
+    );
+    let jump_a = format!("-p udp -j {UDP_FAIL_CLOSED_CHAIN_A}");
+    let jump_b = format!("-p udp -j {UDP_FAIL_CLOSED_CHAIN_B}");
+    let a_active =
+        format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump_a} 2>/dev/null");
+    let release_a = udp_strict_output_jump_release_for(binary, UDP_FAIL_CLOSED_CHAIN_A);
+    let release_b = udp_strict_output_jump_release_for(binary, UDP_FAIL_CLOSED_CHAIN_B);
+    let replace_a = [
+        release_b.clone(),
+        build_b.join("\n"),
+        format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -I OUTPUT 1 {jump_b}"),
+        release_a,
+    ]
+    .join("\n");
+    let replace_b_or_install = [
+        build_a.join("\n"),
+        format!("{binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -I OUTPUT 1 {jump_a}"),
+        release_b,
+    ]
+    .join("\n");
+
+    vec![format!(
+        "if {a_active}; then\n{replace_a}\nelse\nstatus=$?\nif [ \"$status\" -ne 1 ]; then\n  echo \"{binary} could not inspect active UDP fail-closed guard (status $status)\" >&2\n  exit \"$status\"\nfi\n{replace_b_or_install}\nfi"
+    )]
+}
+
 /// Emit UDP TPROXY capture rules for one address family (F3 §3.3 Stage 2).
 ///
 /// Unlike the TCP path (`nat`-table REDIRECT, which rewrites the destination to
@@ -1260,35 +1520,6 @@ fn udp_tproxy_commands_for_family(
         return Vec::new();
     }
 
-    // Cross-family CATCH-ALL suppression (codex r4 finding #1, narrowed by codex
-    // r5 finding #2): when the include list is EXPLICIT and NONE of its CIDRs
-    // belong to THIS family (e.g. an IPv6-only include leaving the IPv4 family
-    // with no include CIDR), this family was NOT selected by CIDR. We must NOT
-    // emit the unqualified `-j TPROXY` CATCH-ALLs (the implicit outbound catch-all
-    // AND the inbound `--dst-type LOCAL` catch-all) — an unqualified UDP TPROXY
-    // would divert ALL of this family's UDP (DNS included) into the marked routing
-    // table, and until the Stage 3 UDP listener exists that is a silent
-    // black-hole. This is DELIBERATELY the OPPOSITE of the TCP cross-family
-    // fallback (`emit_outbound_redirect_commands`, which fails closed to a
-    // catch-all REDIRECT that delivers to the existing TCP outbound listener).
-    //
-    // BUT port includes (`includeOutboundPorts`/`--dport`) are NOT family-scoped:
-    // an IPv4 DNS-port (53) include must still emit its IPv4 `--dport` TPROXY rule
-    // even when only an IPv6 CIDR is set (codex r5 finding #2 — the old whole-
-    // family early-return silently dropped it). So this suppresses only the
-    // unqualified catch-alls; the per-port `--dport` and per-CIDR `-d` rules below
-    // still emit. If nothing else emits a TPROXY rule the family produces no UDP
-    // state at all (computed at the end), preserving the original behavior for the
-    // pure-CIDR cross-family case. An IMPLICIT default (`!include_cidrs_explicit`)
-    // or a genuinely-empty/ports-only explicit config (no family carries an
-    // include CIDR) does NOT trip this — the catch-all is the intended capture.
-    let suppress_catch_all = config.include_cidrs_explicit
-        && include_cidrs.is_empty()
-        && config
-            .include_cidrs
-            .iter()
-            .any(|cidr| cidr_family(cidr).is_some_and(|cidr_family| cidr_family != family));
-
     let mark = config.tproxy_mark;
     let mark_arg = format!("0x{mark:x}/0x{TPROXY_MARK_MASK:x}");
     let tproxy_jump = format!(
@@ -1323,42 +1554,9 @@ fn udp_tproxy_commands_for_family(
     //     of the OUTPUT chain (owner-match is OUTPUT-context-only — invalid in
     //     PREROUTING); the dst-type scope handles non-proxy local destinations the
     //     owner RETURN cannot (a different UID's pod-to-self/loopback datagram).
-    // `catch_all` selectors (the implicit-CIDR / `include_all_outbound_ports`
-    // catch-alls) are suppressed when this family was NOT CIDR-selected
-    // (cross-family case); the per-CIDR `-d` and per-port `--dport` selectors
-    // always emit (codex r5 finding #2 — port includes are not family-scoped).
-    let mut outbound_selectors: Vec<String> = Vec::new();
-    if config.include_all_outbound_ports {
-        if !suppress_catch_all {
-            outbound_selectors.push("-p udp".to_string());
-        }
-    } else {
-        let emit_include_cidrs =
-            config.include_outbound_ports.is_empty() || config.include_cidrs_explicit;
-        if emit_include_cidrs {
-            if include_cidrs.is_empty() {
-                // Unqualified outbound catch-all — emitted only when this family is
-                // NOT cross-family-suppressed (an IMPLICIT `0.0.0.0/0`/`::/0`
-                // default or a genuinely-empty / ports-only explicit config — both
-                // of which intend full-family UDP capture). Suppressed for a family
-                // the operator did not select by CIDR (codex r4 + r5).
-                if !suppress_catch_all {
-                    outbound_selectors.push("-p udp".to_string());
-                }
-            } else {
-                for cidr in include_cidrs {
-                    outbound_selectors.push(format!("-p udp -d {cidr}"));
-                }
-            }
-        }
-        // Port includes (`--dport`) are NOT family-scoped: an IPv4 DNS-port (53)
-        // include emits its IPv4 `--dport` rule even when only an IPv6 CIDR is set
-        // (codex r5 finding #2). These survive the cross-family catch-all
-        // suppression above.
-        for port in &config.include_outbound_ports {
-            outbound_selectors.push(format!("-p udp --dport {port}"));
-        }
-    }
+    // Shared with the pre-bind fail-closed guard so fallback behavior preserves
+    // the exact same include/CIDR/family scope as live capture.
+    let outbound_selectors = udp_outbound_selectors_for_family(config, family, include_cidrs);
     let outbound_tproxy_rules: Vec<String> = outbound_selectors
         .iter()
         .map(|sel| format!("{sel} {outbound_dst_scope} {tproxy_jump}"))
@@ -1802,6 +2000,16 @@ pub(crate) fn ip6tables_probe_guard(cmd: &str, table: &str) -> String {
     )
 }
 
+/// Strict optional-ip6tables wrapper for the guarded→live readiness transition.
+/// Missing tooling / an unavailable kernel table is optional, but resource and
+/// command errors must propagate so callers cannot report success while a stale
+/// OUTPUT jump remains active.
+fn ip6tables_strict_probe_guard(commands: &str, table: &str) -> String {
+    format!(
+        "if command -v ip6tables >/dev/null 2>&1; then\n  if ip6tables -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -L >/dev/null 2>&1; then\n    {commands}\n  else\n    status=$?\n    if [ \"$status\" -eq 3 ]; then\n      echo \"ip6tables {table} table unavailable; skipping IPv6 mesh capture rules\"\n    else\n      echo \"ip6tables {table} probe failed with status $status\" >&2\n      exit \"$status\"\n    fi\n  fi\nelse\n  echo \"ip6tables not found; skipping IPv6 mesh capture rules\"\nfi"
+    )
+}
+
 /// The UDP-only command list for one address family, filtering include/exclude
 /// CIDRs to that family exactly like [`commands_for_family`] before delegating
 /// to the shared `udp_tproxy_commands_for_family`. This is what keeps the
@@ -1879,7 +2087,7 @@ fn cleanup_commands_for(binary: &str, udp_capture_enabled: bool) -> CleanupComma
 /// chains by name, the fwmark rule by its stable priority, the route by its exact
 /// table spec) and is idempotent/best-effort, so running it when no UDP state
 /// exists is a no-op.
-fn udp_teardown_for(binary: &str) -> CleanupCommands {
+fn udp_capture_teardown_for(binary: &str) -> CleanupCommands {
     let family = if binary == "ip6tables" {
         CidrFamily::V6
     } else {
@@ -1965,6 +2173,68 @@ fn udp_teardown_for(binary: &str) -> CleanupCommands {
     }
 }
 
+fn udp_fail_closed_chain_teardown_for(binary: &str, chain: &str) -> Vec<String> {
+    vec![
+        // A prior interrupted switch can leave duplicate jumps. Removing only
+        // one before flushing the chain would keep selected egress pointed at an
+        // empty/black-holing guard, so final cleanup uses the same strict loop as
+        // the guarded-to-live transition.
+        udp_strict_output_jump_release_for(binary, chain),
+        flush_chain(binary, "mangle", chain),
+        delete_chain(binary, "mangle", chain),
+    ]
+}
+
+fn udp_fail_closed_teardown_for(binary: &str) -> Vec<String> {
+    let mut commands = udp_fail_closed_chain_teardown_for(binary, UDP_FAIL_CLOSED_CHAIN_A);
+    commands.extend(udp_fail_closed_chain_teardown_for(
+        binary,
+        UDP_FAIL_CLOSED_CHAIN_B,
+    ));
+    commands
+}
+
+/// Strict transition from guarded to live capture. The best-effort teardown
+/// helpers intentionally hide missing state, but readiness must surface a
+/// deletion failure so the producer cannot report success while still dropping
+/// its workload's selected UDP egress.
+fn udp_fail_closed_release_for(binary: &str) -> Vec<String> {
+    [UDP_FAIL_CLOSED_CHAIN_A, UDP_FAIL_CLOSED_CHAIN_B]
+        .into_iter()
+        .flat_map(|chain| {
+            [
+                udp_strict_output_jump_release_for(binary, chain),
+                flush_chain(binary, "mangle", chain),
+                delete_chain(binary, "mangle", chain),
+            ]
+        })
+        .collect()
+}
+
+fn udp_strict_output_jump_release_for(binary: &str, chain: &str) -> String {
+    let jump = format!("-p udp -j {chain}");
+    format!(
+        "while true; do\n  if {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -C OUTPUT {jump} 2>/dev/null; then\n    {binary} -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} -D OUTPUT {jump}\n  else\n    status=$?\n    if [ \"$status\" -eq 1 ]; then\n      break\n    fi\n    echo \"{binary} could not check OUTPUT jump {chain} (status $status)\" >&2\n    exit \"$status\"\n  fi\ndone"
+    )
+}
+
+/// Full UDP teardown used by node-agent cleanup, producer removal, and disabled
+/// stale-state cleanup. It removes both fail-closed guard generations and the
+/// normal TPROXY/routing state.
+fn udp_teardown_for(binary: &str) -> CleanupCommands {
+    let capture = udp_capture_teardown_for(binary);
+    // Remove the normal capture path first while any retained DROP guard still
+    // protects selected egress. Guard removal is strict and comes last: a
+    // transient resource error can then leave the workload fail-closed, but can
+    // never prevent cleanup from detaching a socketless TPROXY path.
+    let mut iptables = capture.iptables;
+    iptables.extend(udp_fail_closed_teardown_for(binary));
+    CleanupCommands {
+        iptables,
+        ip_routing: capture.ip_routing,
+    }
+}
+
 fn idempotent_new_chain(binary: &str, table: &str, chain: &str) -> String {
     format!("{binary} -t {table} -w {XTABLES_LOCK_WAIT_SECONDS} -N {chain} 2>/dev/null || true")
 }
@@ -1993,6 +2263,14 @@ fn delete_chain(binary: &str, table: &str, chain: &str) -> String {
 mod tests {
     use super::*;
 
+    fn tolerates_missing_cleanup_state(command: &str) -> bool {
+        command.contains("|| true")
+            || (command.contains("while true; do")
+                && command.contains("FERRUM_UDP_FAIL_CLOSED_")
+                && command.contains("if [ \"$status\" -eq 1 ]")
+                && command.contains("exit \"$status\""))
+    }
+
     #[test]
     fn iptables_plan_is_idempotent() {
         let mut config = CaptureConfig::explicit(15006, 15001);
@@ -2013,6 +2291,61 @@ mod tests {
             plan.v4_commands
                 .iter()
                 .any(|cmd| cmd.contains("--to-ports 15001"))
+        );
+    }
+
+    #[test]
+    fn udp_fail_closed_script_drops_udp_after_exclusions() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.udp_capture_enabled = true;
+        config.exclude_cidrs = vec!["10.0.0.0/8".to_string()];
+        config.exclude_ports = vec![53];
+
+        let script = IptablesPlan::udp_fail_closed_script(&config);
+
+        assert!(script.starts_with("set -e\n"));
+        assert!(script.contains(UDP_FAIL_CLOSED_CHAIN_A));
+        assert!(script.contains(UDP_FAIL_CLOSED_CHAIN_B));
+        assert!(script.contains("-I OUTPUT 1 -p udp -j FERRUM_UDP_FAIL_CLOSED_"));
+        assert!(!script.contains("FERRUM_MESH_UDP_OUTPUT_MARK"));
+        assert!(script.contains("-p udp -d 10.0.0.0/8 -j RETURN"));
+        assert!(script.contains("-p udp --dport 53 -j RETURN"));
+        assert!(script.contains("-p udp -d 0.0.0.0/0 -m addrtype ! --dst-type LOCAL -j DROP"));
+        let then_block = script
+            .split_once("; then\n")
+            .and_then(|(_, rest)| rest.split_once("\nelse\n").map(|(block, _)| block))
+            .expect("alternating guard switch");
+        let build_replacement = then_block
+            .find(&format!("-F {UDP_FAIL_CLOSED_CHAIN_B}"))
+            .expect("replacement guard is populated");
+        let insert_replacement = then_block
+            .find(&format!("-I OUTPUT 1 -p udp -j {UDP_FAIL_CLOSED_CHAIN_B}"))
+            .expect("replacement guard is activated");
+        let remove_previous = then_block
+            .find(&format!("-D OUTPUT -p udp -j {UDP_FAIL_CLOSED_CHAIN_A}"))
+            .expect("previous guard is removed");
+        assert!(build_replacement < insert_replacement && insert_replacement < remove_previous);
+    }
+
+    #[test]
+    fn udp_fail_closed_script_preserves_include_scope_and_local_traffic() {
+        let mut config = CaptureConfig::explicit(15006, 15001);
+        config.udp_capture_enabled = true;
+        config.include_outbound_ports = vec![443];
+
+        let script = IptablesPlan::udp_fail_closed_script(&config);
+
+        assert!(script.contains("-p udp --dport 443 -m addrtype ! --dst-type LOCAL -j DROP"));
+        assert!(
+            !script.contains("-p udp -d 0.0.0.0/0 -m addrtype ! --dst-type LOCAL -j DROP"),
+            "a port-scoped capture policy must not become a catch-all guard: {script}"
+        );
+        assert!(
+            script
+                .lines()
+                .filter(|line| line.contains("-j DROP"))
+                .all(|line| line.contains("! --dst-type LOCAL")),
+            "pod-local/loopback UDP is outside the outbound capture contract: {script}"
         );
     }
 
@@ -2204,11 +2537,13 @@ mod tests {
     fn cleanup_commands_all_tolerate_missing_chains() {
         let cleanup = IptablesPlan::cleanup_commands(true);
 
-        // Every cleanup command must have "|| true" so partial cleanup doesn't
-        // fail the overall teardown
+        // Ordinary cleanup remains best-effort. Fail-closed guard cleanup uses a
+        // strict loop instead: status 1 (missing jump) is still a no-op, while
+        // resource errors propagate so cleanup cannot report success with a DROP
+        // jump left active.
         for cmd in &cleanup {
             assert!(
-                cmd.contains("|| true"),
+                tolerates_missing_cleanup_state(cmd),
                 "cleanup command must tolerate missing chains: {cmd}"
             );
         }
@@ -3258,6 +3593,8 @@ mod tests {
             "FERRUM_MESH_UDP_INBOUND",
             "FERRUM_MESH_UDP_OUTPUT_MARK",
             "FERRUM_MESH_UDP_REINJECT",
+            UDP_FAIL_CLOSED_CHAIN_A,
+            UDP_FAIL_CLOSED_CHAIN_B,
         ] {
             assert!(
                 script.contains(chain),
@@ -3279,6 +3616,24 @@ mod tests {
         );
         // v6 table teardown guarded behind the ip6tables (mangle) probe...
         assert!(script.contains("command -v ip6tables") && script.contains("ip6tables -t mangle"));
+        for chain in [UDP_FAIL_CLOSED_CHAIN_A, UDP_FAIL_CLOSED_CHAIN_B] {
+            assert!(
+                script.contains(&format!(
+                    "while true; do\n  if iptables -t mangle -w {XTABLES_LOCK_WAIT_SECONDS} \
+                     -C OUTPUT -p udp -j {chain}"
+                )),
+                "teardown must loop over every duplicate v4 guard jump for {chain}: {script}"
+            );
+        }
+        assert!(
+            script
+                .find("-D OUTPUT -p udp -j FERRUM_MESH_UDP_OUTPUT_MARK")
+                .expect("normal capture OUTPUT cleanup")
+                < script
+                    .find("-D OUTPUT -p udp -j FERRUM_UDP_FAIL_CLOSED_A")
+                    .expect("strict guard cleanup"),
+            "normal capture must detach before strict guard cleanup: {script}"
+        );
         // ...but v6 routing (`ip -6`) emitted UNCONDITIONALLY (not behind the probe).
         assert!(
             script.contains(&format!(
@@ -3291,12 +3646,44 @@ mod tests {
     }
 
     #[test]
-    fn udp_teardown_script_v4_only_omits_v6() {
+    fn udp_capture_rules_teardown_keeps_guard_until_live_capture_is_ready() {
+        let capture_only = IptablesPlan::udp_capture_rules_teardown_script(true);
+        assert!(capture_only.contains("FERRUM_MESH_UDP_OUTPUT_MARK"));
+        assert!(!capture_only.contains(UDP_FAIL_CLOSED_CHAIN_A));
+        assert!(!capture_only.contains(UDP_FAIL_CLOSED_CHAIN_B));
+
+        let guard_only = IptablesPlan::udp_fail_closed_teardown_script();
+        assert!(guard_only.starts_with("set -e\n"));
+        assert!(guard_only.contains(UDP_FAIL_CLOSED_CHAIN_A));
+        assert!(guard_only.contains(UDP_FAIL_CLOSED_CHAIN_B));
+        assert!(!guard_only.contains("FERRUM_MESH_UDP_OUTPUT_MARK"));
+        assert!(!guard_only.contains("ip rule del"));
+        assert!(guard_only.contains("while true; do"));
+        assert!(guard_only.contains("-D OUTPUT -p udp -j FERRUM_UDP_FAIL_CLOSED_A"));
+        assert!(guard_only.contains("status=$?"));
+        assert!(guard_only.contains("exit \"$status\""));
+        assert!(guard_only.contains("ip6tables -t mangle"));
+
+        let capture_output = IptablesPlan::udp_capture_output_release_script();
+        assert!(capture_output.starts_with("set -e\n"));
+        assert!(capture_output.contains("-D OUTPUT -p udp -j FERRUM_MESH_UDP_OUTPUT_MARK"));
+        assert!(capture_output.contains("status=$?"));
+        assert!(capture_output.contains("ip6tables -t mangle"));
+    }
+
+    #[test]
+    fn udp_teardown_script_v4_only_still_reaps_stale_v6_guards() {
         let script = IptablesPlan::udp_teardown_script(false);
         assert!(script.contains("FERRUM_MESH_UDP_OUTBOUND"));
         assert!(
-            !script.contains("ip -6") && !script.contains("ip6tables"),
-            "v4-only teardown must emit no v6 commands: {script}"
+            script.contains("ip6tables")
+                && script.contains(UDP_FAIL_CLOSED_CHAIN_A)
+                && script.contains(UDP_FAIL_CLOSED_CHAIN_B),
+            "v4-only teardown must reap guards from an earlier v6-enabled run: {script}"
+        );
+        assert!(
+            !script.contains("ip -6") && !script.contains("FERRUM_MESH_UDP_OUTBOUND_V6"),
+            "normal v6 capture teardown remains disabled: {script}"
         );
     }
 
@@ -4099,10 +4486,11 @@ mod tests {
                 .any(|c| c.contains("route flush table") || c.contains("rule del lookup")),
             "cleanup must NOT flush a table or delete-by-lookup (shared-table hazard): {cleanup:?}"
         );
-        // Every cleanup command stays best-effort.
+        // Every command tolerates missing state; dedicated guard loops still
+        // propagate resource errors instead of hiding an active DROP jump.
         for cmd in &cleanup {
             assert!(
-                cmd.contains("|| true"),
+                tolerates_missing_cleanup_state(cmd),
                 "UDP cleanup command must tolerate missing state: {cmd}"
             );
         }
@@ -4565,8 +4953,8 @@ mod tests {
                 "UDP teardown must not flush a table or delete-by-lookup: {cmd}"
             );
             assert!(
-                cmd.contains("|| true") || cmd.contains("if command -v ip6tables"),
-                "UDP teardown command must be best-effort (or ip6tables-probe-wrapped): {cmd}"
+                tolerates_missing_cleanup_state(cmd) || cmd.contains("if command -v ip6tables"),
+                "UDP teardown command must tolerate missing state (or be ip6tables-probe-wrapped): {cmd}"
             );
         }
     }

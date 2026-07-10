@@ -1978,8 +1978,22 @@ per-datagram recoverable original address, and there is no UDP equivalent of
   (`handle_hbone_udp_request` → local `UdpSocket`) AND the source pod's return-path
   reply to the client — black-holing the relayed UDP both ways. It rides the per-pod
   registry the node-agent publishes (now also published for Ambient when UDP capture
-  is enabled). It binds the socket BEFORE installing the rules (no black-hole window)
-  and tears down only its own rules on pod removal / config change / shutdown
+  is enabled). Before touching stale state or binding the unprivileged capture port,
+  it installs a dedicated fail-closed OUTPUT guard that mirrors the exact configured
+  outbound capture scope. The guard uses alternating chains so guarded retries build
+  and activate a replacement before removing the prior guard; a workload that
+  pre-binds the capture port therefore gets DROP, never plaintext bypass. The guard is
+  removed only after the socket is adopted and the full TPROXY ruleset is live. Failed
+  attempts leave a stable-netns cleanup handle with the manager, so pod removal
+  retains ownership of guard cleanup and retries transient errors; shutdown
+  attempts cleanup through that same stable handle inside the bounded teardown set.
+  Cleanup removes every duplicate guard jump and strictly detaches any
+  partial live-capture OUTPUT path before releasing the guard. The guarded-to-live
+  switch propagates xtables resource errors and also probes stale IPv6 guard chains
+  independently of the current IPv6 setting. The
+  pre-first-poll enrollment window remains tracked under #2013, and live source-capture
+  plus bind-collision verification remains #2038. The producer tears down only its own
+  rules on pod removal / config change / shutdown
   (graceful shutdown AWAITS the per-netns teardown). When Ambient UDP capture is
   disabled, mesh startup still runs a best-effort cleanup manager over the registry
   so stale pod-netns `FERRUM_MESH_UDP_*` rules from a prior enabled crash/kill are
