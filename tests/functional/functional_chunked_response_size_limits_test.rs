@@ -10,9 +10,12 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Request;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use std::error::Error;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+
+const STARTUP_ATTEMPTS: u32 = 3;
 
 struct ChunkedHarness {
     _gateway: TestGateway,
@@ -22,30 +25,65 @@ struct ChunkedHarness {
 
 impl ChunkedHarness {
     async fn new(response_body_mode: Option<&str>, max_response_bytes: &str) -> Self {
-        let backend_listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind backend");
-        let backend_port = backend_listener.local_addr().expect("backend addr").port();
-        let backend_task = tokio::spawn(run_chunked_backend(backend_listener));
+        let mut last_error = None;
+        for attempt in 1..=STARTUP_ATTEMPTS {
+            match Self::try_new(response_body_mode, max_response_bytes).await {
+                Ok(harness) => return harness,
+                Err(error) => {
+                    eprintln!(
+                        "chunked response harness startup attempt {attempt}/{STARTUP_ATTEMPTS} \
+                         failed: {error}"
+                    );
+                    last_error = Some(error);
+                    if attempt < STARTUP_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+
+        panic!(
+            "chunked response harness failed after {STARTUP_ATTEMPTS} attempts: {}",
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "no startup error recorded".to_string())
+        );
+    }
+
+    async fn try_new(
+        response_body_mode: Option<&str>,
+        max_response_bytes: &str,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let backend_port = backend_listener.local_addr()?.port();
 
         let gateway = TestGateway::builder()
             .mode_file(build_config(backend_port, response_body_mode))
             .log_level("warn")
             .env("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", max_response_bytes)
             .capture_output()
+            // Retry the complete harness below so every attempt receives a
+            // fresh backend listener as well as fresh gateway ports/config.
+            .max_attempts(1)
             .spawn()
-            .await
-            .expect("start gateway");
-        gateway
-            .wait_for_proxy_port(Duration::from_secs(10))
-            .await
-            .expect("proxy port ready");
+            .await?;
+        if let Err(error) = gateway.wait_for_proxy_port(Duration::from_secs(10)).await {
+            let logs = gateway.read_combined_captured_output().unwrap_or_default();
+            let diagnostics = if logs.is_empty() {
+                String::new()
+            } else {
+                format!("\n--- captured gateway output ---\n{logs}")
+            };
+            return Err(format!("{error}{diagnostics}").into());
+        }
 
-        Self {
+        let backend_task = tokio::spawn(run_chunked_backend(backend_listener));
+
+        Ok(Self {
             proxy_port: gateway.proxy_port,
             _gateway: gateway,
             backend_task,
-        }
+        })
     }
 }
 
