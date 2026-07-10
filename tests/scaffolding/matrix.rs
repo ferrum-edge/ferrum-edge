@@ -234,9 +234,10 @@ impl FrontendKind {
                 assert!(
                     r.stream_error.is_none(),
                     "[grpc] expected well-formed response but stream errored: \
-                     {err:?} (http_status={http})",
+                     {err:?} (http_status={http}, request_send_error={send:?})",
                     err = r.stream_error,
-                    http = r.http_status
+                    http = r.http_status,
+                    send = r.request_send_error
                 );
                 assert_ne!(
                     r.http_status, 0,
@@ -259,9 +260,11 @@ impl FrontendKind {
                     actual,
                     expected_grpc,
                     "[grpc] expected effective grpc-status {expected_grpc} (HTTP {expected_http}), \
-                     got {actual} (http_status={http}, stream_error={err:?})",
+                     got {actual} (http_status={http}, stream_error={err:?}, \
+                     request_send_error={send:?})",
                     http = r.http_status,
-                    err = r.stream_error
+                    err = r.stream_error,
+                    send = r.request_send_error
                 );
             }
             (kind, _) => panic!(

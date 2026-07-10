@@ -47,6 +47,12 @@ pub struct GrpcResponse {
     pub trailers: Option<HeaderMap>,
     /// Stream-level error if the response failed mid-stream.
     pub stream_error: Option<String>,
+    /// Error from the local h2 `send_data` of the request body, kept separate
+    /// from `stream_error` because it can legitimately coexist with a complete,
+    /// well-formed response: a fast Trailers-Only gateway error can close the
+    /// request direction before the client DATA write is observed locally.
+    /// Diagnostic only — response-shape assertions should use `stream_error`.
+    pub request_send_error: Option<String>,
 }
 
 impl GrpcResponse {
@@ -244,7 +250,15 @@ impl GrpcClient {
         framed.put_u8(0);
         framed.put_u32(body.len() as u32);
         framed.extend_from_slice(&body);
-        req_body.send_data(framed.freeze(), true)?;
+        // A fast Trailers-Only gateway error can close the request direction
+        // before this DATA write is observed locally. h2 then reports an
+        // `inactive stream`, but the response future can still carry the
+        // well-formed gRPC error that the caller needs to assert on. Preserve
+        // the write error for the no-response case and keep collecting.
+        let request_send_error = req_body
+            .send_data(framed.freeze(), true)
+            .err()
+            .map(|e| format!("request body error: {e}"));
 
         let response_result = tokio::time::timeout(Duration::from_secs(20), response_fut).await;
         let response: Response<h2::RecvStream> = match response_result {
@@ -253,24 +267,34 @@ impl GrpcClient {
                 // Stream-level error before headers arrived. Synthesize a
                 // response so the caller can inspect it.
                 conn_task.abort();
+                let stream_error = match request_send_error.as_deref() {
+                    Some(send_error) => format!("{send_error}; response error: {e}"),
+                    None => format!("response error: {e}"),
+                };
                 return Ok(GrpcResponse {
                     http_status: 0,
                     headers: HeaderMap::new(),
                     messages: Vec::new(),
                     raw_body_frames: Vec::new(),
                     trailers: None,
-                    stream_error: Some(format!("response error: {e}")),
+                    stream_error: Some(stream_error),
+                    request_send_error,
                 });
             }
             Err(_) => {
                 conn_task.abort();
+                let stream_error = match request_send_error.as_deref() {
+                    Some(send_error) => format!("{send_error}; response timed out"),
+                    None => "response timed out".to_string(),
+                };
                 return Ok(GrpcResponse {
                     http_status: 0,
                     headers: HeaderMap::new(),
                     messages: Vec::new(),
                     raw_body_frames: Vec::new(),
                     trailers: None,
-                    stream_error: Some("response timed out".into()),
+                    stream_error: Some(stream_error),
+                    request_send_error,
                 });
             }
         };
@@ -325,6 +349,7 @@ impl GrpcClient {
                         raw_body_frames: Vec::new(),
                         trailers: None,
                         stream_error: Some("body/trailers read timed out".into()),
+                        request_send_error,
                     });
                 }
             };
@@ -340,6 +365,7 @@ impl GrpcClient {
             raw_body_frames: raw_frames,
             trailers,
             stream_error,
+            request_send_error,
         })
     }
 }
@@ -537,6 +563,7 @@ mod tests {
             raw_body_frames: Vec::new(),
             trailers,
             stream_error: None,
+            request_send_error: None,
         }
     }
 
