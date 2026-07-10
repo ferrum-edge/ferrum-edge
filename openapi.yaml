@@ -15066,6 +15066,95 @@ components:
     AiToolGovernorConfig:
       type: object
       description: "Plugin: ai_tool_governor — Deterministic allow/deny/approval policy for AI tool/function calls. Inspects request tool definitions (tools[].function.name / functions[].name), buffered response tool calls (choices[].message.tool_calls[] and legacy function_call), streaming SSE tool-call deltas (held until complete and cleared by policy/approval, then released — or the stream is cut with an SSE error event, never leaking the held call), and optionally MCP tools/call and A2A JSON-RPC methods. Complements ai_semantic_firewall (which catches intent): every decision here is a deterministic function of names, arguments, JSON Schema, regexes, identity, and an optional approval webhook. In enforce mode, governed bodies the plugin cannot inspect fail closed: Content-Encoding'd, oversized (>4 MiB), non-UTF-8, or unparseable JSON request bodies are rejected when request inspection is enabled, oversized JSON responses are rejected, and streaming holds past the 4 MiB cap cut the stream. Does not execute tools or replace mcp_gateway/A2A routing. HTTP-family only."
+      allOf:
+        - if:
+            required: [enabled]
+            properties:
+              enabled:
+                const: false
+          then: {}
+          else:
+            allOf:
+              # Runtime defaults response_tool_calls to true. The only no-surface
+              # shape is therefore an explicit response_tool_calls=false with
+              # every other surface false or omitted.
+              - not:
+                  required: [inspect]
+                  properties:
+                    inspect:
+                      required: [response_tool_calls]
+                      properties:
+                        request_tool_definitions:
+                          const: false
+                        response_tool_calls:
+                          const: false
+                        streaming_response_tool_calls:
+                          const: false
+                        mcp_tool_calls:
+                          const: false
+                        a2a_methods:
+                          const: false
+              - if:
+                  required: [default_action]
+                  properties:
+                    default_action:
+                      const: allow
+                then:
+                  required: [tools]
+                  properties:
+                    tools:
+                      minProperties: 1
+              # In enforce mode, require a webhook only when an approval policy
+              # can reach a concrete-call surface. Name-only definition
+              # inspection blocks require_approval locally and needs no webhook.
+              - if:
+                  allOf:
+                    - not:
+                        required: [mode]
+                        properties:
+                          mode:
+                            const: dry_run
+                    - anyOf:
+                        - not:
+                            required: [inspect]
+                        - required: [inspect]
+                          properties:
+                            inspect:
+                              anyOf:
+                                - not:
+                                    required: [response_tool_calls]
+                                - required: [response_tool_calls]
+                                  properties:
+                                    response_tool_calls:
+                                      const: true
+                                - required: [streaming_response_tool_calls]
+                                  properties:
+                                    streaming_response_tool_calls:
+                                      const: true
+                                - required: [mcp_tool_calls]
+                                  properties:
+                                    mcp_tool_calls:
+                                      const: true
+                                - required: [a2a_methods]
+                                  properties:
+                                    a2a_methods:
+                                      const: true
+                    - anyOf:
+                        - required: [default_action]
+                          properties:
+                            default_action:
+                              const: require_approval
+                        - not:
+                            properties:
+                              tools:
+                                additionalProperties:
+                                  not:
+                                    required: [action]
+                                    properties:
+                                      action:
+                                        const: require_approval
+                then:
+                  required: [approval]
       properties:
         enabled:
           type: boolean
@@ -15107,7 +15196,9 @@ components:
               description: "Govern A2A JSON-RPC method names against the tools policy map (params carried as arguments)."
         tools:
           type: object
-          description: "Per-tool policy, keyed by exact tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name)."
+          propertyNames:
+            minLength: 1
+          description: "Per-tool policy, keyed by a non-empty exact tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name)."
           additionalProperties:
             type: object
             required: [action]
@@ -15149,9 +15240,11 @@ components:
                   properties:
                     name:
                       type: string
+                      minLength: 1
                       description: "Pattern identifier; substituted into redaction_placeholder {name}."
                     regex:
                       type: string
+                      minLength: 1
                       description: "Regex matched against the raw arguments string. Under a non-redact action a match denies; under redact_args a match is redacted."
                 description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args."
               json_schema:

@@ -75,7 +75,7 @@ fn access_control_schema_matches_runtime_validation() {
 }
 
 #[test]
-fn ai_tool_governor_schema_requires_redaction_patterns() {
+fn ai_tool_governor_schema_matches_runtime_invariants() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let schema = spec
@@ -86,6 +86,19 @@ fn ai_tool_governor_schema_requires_redaction_patterns() {
         .expect("AiToolGovernorConfig schema compiles");
 
     for config in [
+        json!({
+            "enabled": false,
+            "default_action": "allow",
+            "tools": {},
+            "inspect": {
+                "request_tool_definitions": false,
+                "response_tool_calls": false,
+                "streaming_response_tool_calls": false,
+                "mcp_tool_calls": false,
+                "a2a_methods": false
+            }
+        }),
+        json!({"default_action": "deny", "tools": {}}),
         json!({"tools": {"search": {"action": "allow"}}}),
         json!({
             "tools": {
@@ -95,6 +108,19 @@ fn ai_tool_governor_schema_requires_redaction_patterns() {
                 }
             }
         }),
+        json!({
+            "default_action": "allow",
+            "tools": {"deploy": {"action": "require_approval"}},
+            "inspect": {"request_tool_definitions": true, "response_tool_calls": false}
+        }),
+        json!({
+            "mode": "dry_run",
+            "tools": {"deploy": {"action": "require_approval"}}
+        }),
+        json!({
+            "tools": {"deploy": {"action": "require_approval"}},
+            "approval": {"endpoint_url": "https://approval.example/decide"}
+        }),
     ] {
         assert!(
             validator.validate(&config).is_ok(),
@@ -103,10 +129,41 @@ fn ai_tool_governor_schema_requires_redaction_patterns() {
     }
 
     for config in [
+        json!({
+            "tools": {"search": {"action": "allow"}},
+            "inspect": {
+                "request_tool_definitions": false,
+                "response_tool_calls": false,
+                "streaming_response_tool_calls": false,
+                "mcp_tool_calls": false,
+                "a2a_methods": false
+            }
+        }),
+        json!({"default_action": "allow"}),
+        json!({"default_action": "allow", "tools": {}}),
+        json!({"tools": {"": {"action": "deny"}}}),
         json!({"tools": {"search": {"action": "redact_args"}}}),
         json!({
             "tools": {"search": {"action": "redact_args", "blocked_arg_patterns": []}}
         }),
+        json!({
+            "tools": {
+                "search": {
+                    "action": "redact_args",
+                    "blocked_arg_patterns": [{"name": "", "regex": "secret"}]
+                }
+            }
+        }),
+        json!({
+            "tools": {
+                "search": {
+                    "action": "redact_args",
+                    "blocked_arg_patterns": [{"name": "secret", "regex": ""}]
+                }
+            }
+        }),
+        json!({"tools": {"deploy": {"action": "require_approval"}}}),
+        json!({"default_action": "require_approval", "tools": {}}),
     ] {
         assert!(
             validator.validate(&config).is_err(),
