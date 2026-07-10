@@ -2454,12 +2454,16 @@ async fn h3_native_grpc_server_streaming_preserves_frames_and_trailers() {
     };
 
     let logs = harness.captured_combined().unwrap_or_default();
+    let received = h3_backend.received_requests().await;
+    let backend_errors = h3_backend.step_errors().await;
     assert_eq!(resp.status.as_u16(), 200, "status; --- logs ---\n{logs}");
     assert_eq!(
-        resp.grpc_status(),
-        Some(0),
+        resp.trailer("grpc-status"),
+        Some("0"),
         "grpc-status trailer must be forwarded after the streamed frames; \
-         trailers: {:#?}\n--- logs ---\n{logs}",
+         headers: {:#?}\ntrailers: {:#?}\nbackend requests: {received:#?}\n\
+         backend errors: {backend_errors:#?}\n--- logs ---\n{logs}",
+        resp.headers,
         resp.trailers
     );
     assert_eq!(
@@ -2468,7 +2472,6 @@ async fn h3_native_grpc_server_streaming_preserves_frames_and_trailers() {
         "all server-streaming gRPC frames must be relayed in order, byte-for-byte"
     );
 
-    let received = h3_backend.received_requests().await;
     assert!(
         received
             .iter()
