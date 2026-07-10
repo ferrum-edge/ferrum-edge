@@ -20297,7 +20297,18 @@ async fn proxy_to_backend(
                         headers,
                         request,
                         plugins,
-                        response_decision_ctx,
+                        // A conservatively buffered response may normally be
+                        // released after its Content-Type is known. Do not
+                        // permit that direct-H2 downgrade when a stream
+                        // inspector is required: it would produce StreamingH2,
+                        // where inspectors are not attached. Keeping the body
+                        // buffered remains safe and preserves direct-H2 for
+                        // backend SNI overrides that reqwest cannot express.
+                        if requires_response_stream_inspection {
+                            None
+                        } else {
+                            response_decision_ctx
+                        },
                         stream_response,
                         client_ip,
                         xff_append_ip,
