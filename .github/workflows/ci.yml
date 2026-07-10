@@ -2815,6 +2815,9 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
+      # Chocolatey's mutable community feed has intermittently returned 406 for
+      # NASM before Cargo even starts. Download the official release and verify
+      # its content instead of depending on the community package feed.
       - name: Install protoc and NASM (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -2836,11 +2839,24 @@ jobs:
           $protocBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
           "PROTOC=$protocExe" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
-          choco install nasm -y --no-progress
-          "C:\Program Files\NASM" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
-          if (!(Test-Path "C:\Program Files\NASM\nasm.exe")) {
-            throw "nasm.exe was not found after Chocolatey install"
+          $nasmVersion = "3.02"
+          $nasmZip = Join-Path $env:RUNNER_TEMP "nasm-$nasmVersion-win64.zip"
+          $nasmRoot = Join-Path $env:RUNNER_TEMP "nasm"
+          Invoke-WebRequest `
+            -Uri "https://www.nasm.us/pub/nasm/releasebuilds/$nasmVersion/win64/nasm-$nasmVersion-win64.zip" `
+            -OutFile $nasmZip
+          $expectedNasmSha256 = "161d0bfaff53c2f9e9f3e69fd0672323ebabafd1268976a5cec11be92a19aee7"
+          $actualNasmSha256 = (Get-FileHash -Algorithm SHA256 $nasmZip).Hash.ToLowerInvariant()
+          if ($actualNasmSha256 -ne $expectedNasmSha256) {
+            throw "NASM archive SHA-256 mismatch: expected $expectedNasmSha256, got $actualNasmSha256"
           }
+          Expand-Archive -Path $nasmZip -DestinationPath $nasmRoot -Force
+          $nasmBin = Join-Path $nasmRoot "nasm-$nasmVersion"
+          $nasmExe = Join-Path $nasmBin "nasm.exe"
+          if (!(Test-Path $nasmExe)) {
+            throw "nasm.exe was not found after extracting $nasmZip"
+          }
+          $nasmBin | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
       - name: Install cross (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
