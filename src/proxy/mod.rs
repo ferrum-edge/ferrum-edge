@@ -1728,6 +1728,19 @@ pub(crate) fn can_dispatch_direct_http2_pool(
         && max_response_body_size_bytes == 0
 }
 
+/// Apply per-request exclusions to the direct HTTP/2 pool dispatch gate.
+///
+/// Response stream inspectors are currently wired only on the reqwest
+/// `ResponseBody::Streaming` arm. A request whose response must be inspected
+/// must therefore not dispatch through the direct-H2 pool, which would return
+/// `ResponseBody::StreamingH2` and bypass the inspector.
+pub(crate) fn can_dispatch_direct_http2_pool_for_request(
+    can_dispatch: bool,
+    requires_response_stream_inspection: bool,
+) -> bool {
+    can_dispatch && !requires_response_stream_inspection
+}
+
 /// Resolve whether plain-HTTPS dispatch should take the direct HTTP/2 pool,
 /// folding in the DestinationRule `connectionPool.http.h2UpgradePolicy`
 /// override on top of the capability-registry verdict.
@@ -20125,10 +20138,15 @@ async fn proxy_to_backend(
         // Fold the DestinationRule `connectionPool.http.h2UpgradePolicy` override
         // (projected onto the effective proxy) into the registry verdict. Scope
         // is strictly this plain-HTTPS h1-vs-h2 fork — gRPC (always H2) and
-        // HBONE/mesh-mTLS transports never reach here. See
+        // HBONE/mesh-mTLS transports never reach here. Requests that require a
+        // response stream inspector must stay on the reqwest path because the
+        // direct-H2 `StreamingH2` arm is not wired to those inspectors. See
         // `should_dispatch_direct_h2` for the exact policy interaction.
         let direct_h2_dispatch = should_dispatch_direct_h2(
-            direct_h2_can_dispatch,
+            can_dispatch_direct_http2_pool_for_request(
+                direct_h2_can_dispatch,
+                requires_response_stream_inspection,
+            ),
             direct_h2_supports,
             direct_h2_known_unsupported,
             requires_direct_h2_for_sni,
@@ -34220,6 +34238,22 @@ mod tests {
         assert!(
             matches!(effective, std::borrow::Cow::Borrowed(_)),
             "matching h2_upgrade_policy must avoid the owned clone"
+        );
+    }
+
+    #[test]
+    fn direct_h2_request_gate_blocks_response_stream_inspection() {
+        assert!(
+            can_dispatch_direct_http2_pool_for_request(true, false),
+            "ordinary eligible requests may use direct-H2"
+        );
+        assert!(
+            !can_dispatch_direct_http2_pool_for_request(true, true),
+            "stream-inspected responses must stay on reqwest so inspectors attach"
+        );
+        assert!(
+            !can_dispatch_direct_http2_pool_for_request(false, true),
+            "the request gate must not override the base dispatch gate"
         );
     }
 

@@ -2907,16 +2907,12 @@ impl Plugin for AiToolGovernor {
     /// DISPATCH LIMITATION (shared with `ai_semantic_firewall`'s `inspect`): the
     /// SSE inspector is wired only on the reqwest `ResponseBody::Streaming` arm,
     /// not `StreamingH2`/`StreamingH3`. `forces_reqwest_dispatch` excludes native
-    /// H3, and direct-H2/HBONE are excluded because the inspected request forces
-    /// request-body buffering. Two residual gaps therefore exist and are tracked
-    /// as a proxy-core follow-up, issue #2055 (they need the dispatch layer to route ALL
-    /// inspected-streaming requests through reqwest, or inspectors attached to
-    /// the StreamingH2/H3 arms): (1) a `request_transformer` that adds
-    /// `"stream": true` for a backend already classified H3-capable can dispatch
-    /// via native H3 before the final-body re-detection pins reqwest; (2) a
-    /// bodyless SSE request (e.g. GET with `Accept: text/event-stream`) is not
-    /// buffered, so a direct-H2 backend can answer `StreamingH2` uninspected.
-    /// Buffered responses and reqwest-path SSE remain governed.
+    /// H3 and direct-H2 for requests known to need inspected streaming responses.
+    /// A residual gap remains tracked as proxy-core issue #2055: a
+    /// `request_transformer` that adds `"stream": true` for a backend already
+    /// classified H3-capable can dispatch via native H3 before the final-body
+    /// re-detection pins reqwest. Buffered responses and reqwest-path SSE remain
+    /// governed.
     fn response_stream_inspector(
         &self,
         ctx: &RequestContext,
