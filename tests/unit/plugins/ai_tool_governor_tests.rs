@@ -1686,6 +1686,23 @@ async fn streaming_governance_forces_reqwest_dispatch_config_wide() {
     assert!(plugin.forces_reqwest_dispatch(&ctx));
 }
 
+#[test]
+fn streaming_dry_run_does_not_force_transport_fallback() {
+    let plugin = make(json!({
+        "mode": "dry_run",
+        "default_action": "deny",
+        "tools": { "x": { "action": "allow" } },
+        "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
+    }));
+    let ctx = json_post_ctx();
+
+    assert!(plugin.requires_response_stream_hooks());
+    assert!(
+        !plugin.forces_reqwest_dispatch(&ctx),
+        "dry-run observation must not reject routes that require HBONE, mesh mTLS, or direct H2"
+    );
+}
+
 #[tokio::test]
 async fn stream_markers_are_excluded_from_transaction_log_metadata() {
     let plugin = make(json!({

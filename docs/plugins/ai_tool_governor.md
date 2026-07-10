@@ -46,8 +46,8 @@ the batch clears — so an allowed multi-choice stream is never reordered, and a
 denied one cannot leak content that arrived after the held call. With
 multi-choice (`n > 1`) streams, a batch is finalized only once **every** choice
 holding tool calls has reported a `finish_reason` (or the stream ends), and
-later tool-call deltas form a new, independently governed batch. The plugin detects `"stream": true`
-in JSON POST bodies and pins those requests onto the reqwest dispatch path
+later tool-call deltas form a new, independently governed batch. In `enforce`
+mode the plugin detects `"stream": true` in JSON POST bodies and pins those requests onto the reqwest dispatch path
 where the SSE inspector is wired, so a client-sent streaming request cannot
 bypass streaming inspection by targeting a direct HTTP/2 or native HTTP/3
 backend; the narrow proxy-core edge cases where a response can still stream on
@@ -354,9 +354,10 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
   on a shared proxy would break unrelated routes.
 - The plugin governs tool calls; it does not execute tools, manage MCP sessions,
   or replace `mcp_gateway`/A2A routing.
-- Streaming inspection rides the proxy's reqwest dispatch arm. Because a
+- Enforced streaming inspection rides the proxy's reqwest dispatch arm. Because a
   successful SSE response label can activate the inspector even without a
-  request-side streaming marker, enabling `streaming_response_tool_calls` pins
+  request-side streaming marker, enabling `streaming_response_tool_calls` in
+  `mode: enforce` pins
   every eligible ordinary HTTP request on that proxy to reqwest; direct HTTP/2,
   native HTTP/3, HBONE, and sidecar mesh-mTLS streams do not run response
   inspectors. Mesh-tagged targets that require HBONE or sidecar mesh-mTLS
@@ -365,4 +366,9 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
   This config-wide dispatch cost is the price of covering provider-selected or
   response-labeled SSE without a policy bypass. A backend TLS SNI override that
   requires direct HTTP/2 conflicts with streaming inspection and fails closed
-  with 502 rather than bypassing governance or buffering an unbounded SSE body.
+  with 502 rather than bypassing governance or buffering an unbounded SSE body,
+  unless the route explicitly uses `response_body_mode: Buffer`; a permanently
+  buffered direct-H2 response is governed by the buffered response hooks and
+  cannot bypass into an uninspected stream. `mode: dry_run` never forces a
+  transport fallback or turns an HBONE/mesh-mTLS/SNI route into a 502; streams
+  on those non-reqwest transports remain pass-through during rollout.

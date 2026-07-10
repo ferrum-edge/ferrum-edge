@@ -1832,12 +1832,14 @@ pub(crate) fn can_dispatch_direct_http2_pool(
 /// inspection must therefore not dispatch through the direct-H2 pool. Even a
 /// conservative pre-header buffer decision can be released once an SSE
 /// Content-Type arrives; keeping it buffered instead would violate the
-/// unbounded-stream invariant.
+/// unbounded-stream invariant. An explicitly permanent buffered response is
+/// safe on direct H2 because its buffered body hooks still enforce policy.
 pub(crate) fn can_dispatch_direct_http2_pool_for_request(
     can_dispatch: bool,
     requires_response_stream_inspection: bool,
+    response_may_stream: bool,
 ) -> bool {
-    can_dispatch && !requires_response_stream_inspection
+    can_dispatch && !(requires_response_stream_inspection && response_may_stream)
 }
 
 /// Resolve whether plain-HTTPS dispatch should take the direct HTTP/2 pool,
@@ -20277,6 +20279,7 @@ async fn proxy_to_backend(
             can_dispatch_direct_http2_pool_for_request(
                 direct_h2_can_dispatch,
                 requires_response_stream_inspection,
+                stream_response || matches!(proxy.response_body_mode, ResponseBodyMode::Stream),
             ),
             direct_h2_supports,
             direct_h2_known_unsupported,
@@ -34598,15 +34601,19 @@ mod tests {
     #[test]
     fn direct_h2_request_gate_blocks_response_stream_inspection() {
         assert!(
-            can_dispatch_direct_http2_pool_for_request(true, false),
+            can_dispatch_direct_http2_pool_for_request(true, false, true),
             "ordinary eligible requests may use direct-H2"
         );
         assert!(
-            !can_dispatch_direct_http2_pool_for_request(true, true),
+            !can_dispatch_direct_http2_pool_for_request(true, true, true),
             "stream-inspected responses must stay on reqwest so inspectors attach"
         );
         assert!(
-            !can_dispatch_direct_http2_pool_for_request(false, true),
+            can_dispatch_direct_http2_pool_for_request(true, true, false),
+            "permanently buffered responses may use direct-H2 and run buffered body hooks"
+        );
+        assert!(
+            !can_dispatch_direct_http2_pool_for_request(false, true, false),
             "the request gate must not override the base dispatch gate"
         );
     }

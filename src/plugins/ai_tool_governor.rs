@@ -2945,7 +2945,7 @@ impl Plugin for AiToolGovernor {
     // --- Streaming response path ------------------------------------------
 
     fn requires_response_stream_hooks(&self) -> bool {
-        self.enabled && self.inspect.streaming_response_tool_calls
+        self.enabled && self.mode == Mode::Enforce && self.inspect.streaming_response_tool_calls
     }
 
     fn forces_reqwest_dispatch(&self, _ctx: &RequestContext) -> bool {

@@ -15194,7 +15194,7 @@ components:
             streaming_response_tool_calls:
               type: boolean
               default: false
-              description: "Govern OpenAI SSE tool-call deltas. Held tool-call frames are released only after policy/approval clears the call; a block cuts the stream with a terminal SSE error event. In streaming, a redact_args match fails closed (denies) since mid-stream surgical redaction of split-JSON arguments is out of scope."
+              description: "Govern OpenAI SSE tool-call deltas. Held tool-call frames are released only after policy/approval clears the call; a block cuts the stream with a terminal SSE error event. Enforce mode pins potentially streaming HTTP traffic to the reqwest inspector path unless the response is explicitly forced buffered; dry_run never forces a transport fallback, so non-reqwest HBONE/mesh-mTLS/direct-H2 streams remain pass-through. In streaming, a redact_args match fails closed (denies) since mid-stream surgical redaction of split-JSON arguments is out of scope."
             mcp_tool_calls:
               type: boolean
               default: false
