@@ -3176,9 +3176,9 @@ enum Finalize {
 /// releases it unchanged.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StreamBodyShape {
-    /// Too few bytes to classify yet (whitespace, a partial BOM, or a
-    /// still-incomplete first line that could yet become a valid SSE field
-    /// line): hold until the shape resolves.
+    /// Too few bytes to classify yet (whitespace, a partial BOM, an incomplete
+    /// field line, or only colonless extension fields so far): hold until the
+    /// shape resolves.
     Unknown,
     /// SSE-shaped: the normal SSE framing path.
     Sse,
@@ -3202,20 +3202,17 @@ enum StreamSniff {
 
 /// Sniff the body shape from the leading bytes. Real SSE always begins with a
 /// syntactically valid field or comment line after an optional UTF-8 BOM and
-/// leading whitespace: printable **ASCII** text with a `:` field separator
-/// before the first line ends. An SSE field name (`data`/`event`/`id`/`retry`,
-/// or empty for a `:comment`) is pure ASCII, so the prefix UP TO the first
-/// `:` must be ASCII too. The SSE spec ignores unknown field names, so
-/// legitimate providers open streams with extension/heartbeat lines like
-/// `ping: 1` — a fixed `data:`/`event:`/`id:`/`retry:`/`:` whitelist would
-/// misclassify those streams as opaque and cut them at EOF in enforce mode.
+/// leading whitespace. A field may omit `:` (its value is then empty), so
+/// printable ASCII extension fields such as `x` are skipped until a later
+/// colon-bearing or standard colonless field proves the body is SSE. An SSE
+/// field name (`data`/`event`/`id`/`retry`, or empty for a `:comment`) is pure
+/// ASCII, so every scanned field-name prefix must be ASCII too. The SSE spec
+/// ignores unknown field names, so legitimate providers may also open streams
+/// with extension/heartbeat lines like `ping: 1`.
 /// Leading bytes that are binary (gzip magic, control bytes, or a HIGH-BIT
-/// non-ASCII byte before the first `:`) or a COMPLETE first line with no `:`
-/// separator — and not opening a JSON object/array — can never yield a
-/// governable SSE event: treating them as [`StreamSniff::Sse`] would parse
-/// every "event" as `NoData` and forward a compressed/binary stream's denied
-/// tool calls ungoverned, so they are classified [`StreamSniff::Opaque`] and
-/// held. A high-bit byte before the colon is REQUIRED to opaque-classify (not
+/// non-ASCII byte before the first `:`) — and not opening a JSON object/array —
+/// can never yield a governable SSE event. A high-bit byte before the colon is
+/// REQUIRED to opaque-classify (not
 /// fall through as "text"): otherwise a `Content-Encoding`-stripped compressed
 /// stream whose first bytes happen to carry a `:` before any newline would
 /// pass uninspected in enforce. (Accepted consequence: colon-containing ASCII
@@ -3232,28 +3229,54 @@ fn sniff_stream_shape(buf: &[u8]) -> StreamSniff {
     let Some(start) = buf.iter().position(|b| !b.is_ascii_whitespace()) else {
         return StreamSniff::Inconclusive;
     };
-    let rest = &buf[start..];
-    if matches!(rest[0], b'{' | b'[') {
+    if matches!(buf[start], b'{' | b'[') {
         return StreamSniff::Json;
     }
-    for &b in rest {
-        match b {
-            // A field separator before the first line ends: a syntactically
-            // valid SSE field/comment line.
-            b':' => return StreamSniff::Sse,
-            // The first line completed without a `:` — not an SSE field line.
-            b'\r' | b'\n' => return StreamSniff::Opaque,
-            // Control/binary byte (gzip magic 0x1f, NUL, escape codes), or a
-            // HIGH-BIT non-ASCII byte (0x80..=0xFF) before the colon: never a
-            // valid SSE field name, so this is binary/non-ASCII — opaque, not
-            // text. `\t` (0x09) is legal inside field names/values.
-            0x00..=0x08 | 0x0B..=0x1F | 0x7F..=0xFF => return StreamSniff::Opaque,
-            _ => {}
+
+    let mut cursor = start;
+    while cursor < buf.len() {
+        let line_start = cursor;
+        while cursor < buf.len() {
+            match buf[cursor] {
+                // A field separator before the line ends proves SSE framing,
+                // including extension fields and comment lines.
+                b':' => return StreamSniff::Sse,
+                b'\r' | b'\n' => break,
+                // Control/binary or high-bit bytes cannot be an ASCII field
+                // name. `\t` (0x09) remains accepted for parity with the
+                // existing conservative shape detector.
+                0x00..=0x08 | 0x0B..=0x1F | 0x7F..=0xFF => {
+                    return StreamSniff::Opaque;
+                }
+                _ => cursor += 1,
+            }
+        }
+
+        if cursor == buf.len() {
+            // Still inside a printable line with no separator. It may be an
+            // unknown colonless prelude followed by an SSE field in a later
+            // chunk, so keep holding until more bytes arrive.
+            return StreamSniff::Inconclusive;
+        }
+
+        let field = &buf[line_start..cursor];
+        if matches!(field, b"data" | b"event" | b"id" | b"retry") {
+            return StreamSniff::Sse;
+        }
+
+        // Unknown colonless fields and blank event separators are valid SSE
+        // syntax but do not alone distinguish SSE from arbitrary text. Skip
+        // them and look for a later field that supplies positive evidence.
+        while cursor < buf.len() && matches!(buf[cursor], b'\r' | b'\n') {
+            cursor += 1;
+        }
+        if cursor < buf.len() && matches!(buf[cursor], b'{' | b'[') {
+            return StreamSniff::Opaque;
         }
     }
-    // Still inside a printable first line with no `:` yet: wait for more
-    // bytes. An unresolved shape keeps holding the body, bounded by the same
-    // hold cap as every held shape.
+
+    // Only colonless extension/blank lines have arrived so far. A later chunk
+    // can still provide an SSE field; the retained-body cap bounds the wait.
     StreamSniff::Inconclusive
 }
 
@@ -4417,9 +4440,10 @@ fn looks_like_json(body: &[u8]) -> bool {
 
 /// Whether a body is shaped like a Server-Sent Events stream: after an optional
 /// UTF-8 BOM and leading whitespace/blank lines, the first non-empty line is a
-/// syntactically valid SSE field or comment line — printable ASCII text with a
-/// `:` field separator (the prefix up to the colon must be ASCII: a valid SSE
-/// field name is pure ASCII, and a high-bit/binary prefix is opaque, not SSE).
+/// syntactically valid SSE field or comment line. Printable ASCII colonless
+/// extension fields are skipped until a later field provides positive SSE
+/// evidence; standard `data`/`event`/`id`/`retry` fields are evidence even when
+/// their value-separating `:` is omitted.
 /// The same tightened check as [`sniff_stream_shape`], so live and buffered
 /// classification agree: the SSE spec ignores unknown field names, and
 /// legitimate extension/heartbeat preludes like `ping: 1` or the standard
@@ -4429,35 +4453,9 @@ fn looks_like_json(body: &[u8]) -> bool {
 /// that relabels it, e.g. to `text/plain`) must not route a buffered SSE body
 /// with governed tool-call deltas past `govern_buffered_sse` uninspected. A
 /// JSON-opening body (`{`/`[`) is explicitly NOT SSE-shaped, so the two shape
-/// checks stay disjoint; binary/control-byte starts and colon-less first
-/// lines are not SSE-shaped either.
+/// checks stay disjoint; binary/control-byte starts are not SSE-shaped either.
 fn looks_like_sse(body: &[u8]) -> bool {
-    let body = body
-        .strip_prefix(b"\xEF\xBB\xBF".as_slice())
-        .unwrap_or(body);
-    let Some(start) = body.iter().position(|b| !b.is_ascii_whitespace()) else {
-        return false;
-    };
-    let rest = &body[start..];
-    if matches!(rest[0], b'{' | b'[') {
-        return false;
-    }
-    for &b in rest {
-        match b {
-            b':' => return true,
-            b'\r' | b'\n' => return false,
-            // Control/binary byte OR a HIGH-BIT non-ASCII byte (0x80..=0xFF)
-            // before the colon: not a valid SSE field name (which is pure
-            // ASCII), so this is binary/non-ASCII, not SSE. Matches the same
-            // tightening in `sniff_stream_shape` so live and buffered
-            // classification agree — a `Content-Encoding`-stripped compressed
-            // body with an early `:` is NOT accepted as SSE.
-            0x00..=0x08 | 0x0B..=0x1F | 0x7F..=0xFF => return false,
-            _ => {}
-        }
-    }
-    // The whole body is one colon-less printable ASCII line: no SSE framing.
-    false
+    matches!(sniff_stream_shape(body), StreamSniff::Sse)
 }
 
 /// Unambiguous correlated identity hash of a governed tool call. It hashes the

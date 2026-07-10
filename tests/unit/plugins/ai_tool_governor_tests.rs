@@ -5506,29 +5506,22 @@ async fn ping_field_prefixed_sse_stream_is_governed_not_opaque() {
 }
 
 /// The widened SSE-shape check still treats genuinely binary starts (control
-/// bytes) and a complete colon-less first line as opaque: held in full and
-/// cut at end-of-stream in enforce mode.
+/// bytes) as opaque: held in full and cut at end-of-stream in enforce mode.
 #[tokio::test]
-async fn binary_and_colonless_starts_remain_opaque_cut() {
-    for body in [
-        // Control-byte start (e.g. a raw binary/compressed stream).
-        format!("\x01\x02binary{SSE_DENIED_TOOL_BODY}").into_bytes(),
-        // A complete first line with no `:` separator is not an SSE field line.
-        format!("not an sse field line\n{SSE_DENIED_TOOL_BODY}").into_bytes(),
-    ] {
-        let plugin = make(streaming_config(
-            json!({ "report.read": { "action": "allow" } }),
-            "deny",
-        ));
-        let ctx = create_test_context();
-        let mut inspector = plugin
-            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
-            .expect("inspector");
-        let (out, terminated) = drive_stream(&mut inspector, &[&body]).await;
-        assert!(terminated, "opaque stream must be cut in enforce mode");
-        let text = String::from_utf8_lossy(&out);
-        assert!(!text.contains("kubectl.apply"), "held bytes leaked: {text}");
-    }
+async fn binary_starts_remain_opaque_cut() {
+    let body = format!("\x01\x02binary{SSE_DENIED_TOOL_BODY}").into_bytes();
+    let plugin = make(streaming_config(
+        json!({ "report.read": { "action": "allow" } }),
+        "deny",
+    ));
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[&body]).await;
+    assert!(terminated, "opaque stream must be cut in enforce mode");
+    let text = String::from_utf8_lossy(&out);
+    assert!(!text.contains("kubectl.apply"), "held bytes leaked: {text}");
 }
 
 /// `looks_like_sse` (the buffered fallback) agrees with the widened live
@@ -5559,6 +5552,50 @@ async fn ping_field_prefixed_unlabeled_buffered_sse_is_governed() {
             .on_response_body(&mut ctx, 200, &no_ct, allowed.as_bytes())
             .await,
     );
+}
+
+/// A colonless line is a valid SSE field with an empty value. An unknown
+/// colonless extension field must therefore be skipped while sniffing rather
+/// than making a missing/relabelled Content-Type bypass buffered governance.
+#[tokio::test]
+async fn colonless_prefixed_unlabeled_buffered_sse_is_governed() {
+    let plugin = make(json!({
+        "default_action": "deny",
+        "tools": { "report.read": { "action": "allow" } },
+        "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
+    }));
+    let denied = format!("x\n\n{SSE_DENIED_TOOL_BODY}");
+    let allowed = format!("x\n\n{SSE_ALLOWED_TOOL_BODY}");
+
+    // The live classifier shares the same shape detector. An allowed call
+    // distinguishes SSE classification from the enforce-mode opaque cutoff.
+    let ctx = create_test_context();
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let (out, terminated) = drive_stream(&mut inspector, &[allowed.as_bytes()]).await;
+    assert!(!terminated, "valid colonless-prefixed SSE must not be cut");
+    assert_eq!(out, allowed.as_bytes());
+
+    for headers in [
+        HashMap::new(),
+        HashMap::from([("content-type".to_string(), "text/plain".to_string())]),
+    ] {
+        let mut ctx = create_test_context();
+        assert_reject(
+            plugin
+                .on_response_body(&mut ctx, 200, &headers, denied.as_bytes())
+                .await,
+            Some(403),
+        );
+
+        let mut ctx = create_test_context();
+        assert_continue(
+            plugin
+                .on_response_body(&mut ctx, 200, &headers, allowed.as_bytes())
+                .await,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

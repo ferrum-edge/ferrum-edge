@@ -78,25 +78,26 @@ fn access_control_schema_matches_runtime_validation() {
 fn ai_tool_governor_schema_matches_runtime_invariants() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
-    let schema = spec
-        .pointer("/components/schemas/AiToolGovernorConfig")
-        .expect("missing AiToolGovernorConfig schema");
+    let mut schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/AiToolGovernorConfig"
+    });
+    schema
+        .as_object_mut()
+        .expect("schema should be object")
+        .insert("components".to_string(), spec["components"].clone());
     let validator = jsonschema::draft202012::options()
-        .build(schema)
+        .build(&schema)
         .expect("AiToolGovernorConfig schema compiles");
 
     for config in [
         json!({
             "enabled": false,
-            "default_action": "allow",
-            "tools": {},
-            "inspect": {
-                "request_tool_definitions": false,
-                "response_tool_calls": false,
-                "streaming_response_tool_calls": false,
-                "mcp_tool_calls": false,
-                "a2a_methods": false
-            }
+            "mode": "ignored-invalid-mode",
+            "default_action": "ignored-invalid-action",
+            "tools": {"": {"action": "ignored-invalid-action"}},
+            "inspect": "ignored-invalid-inspection",
+            "approval": "ignored-invalid-approval"
         }),
         json!({"default_action": "deny", "tools": {}}),
         json!({"tools": {"search": {"action": "allow"}}}),
@@ -104,6 +105,7 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
             "tools": {
                 "search": {
                     "action": "redact_args",
+                    "required_args": ["query"],
                     "blocked_arg_patterns": [{"name": "secret", "regex": "secret"}]
                 }
             }
@@ -164,6 +166,19 @@ fn ai_tool_governor_schema_matches_runtime_invariants() {
         }),
         json!({"tools": {"deploy": {"action": "require_approval"}}}),
         json!({"default_action": "require_approval", "tools": {}}),
+        json!({"tools": {"search": {"action": "allow", "required_args": [""]}}}),
+        json!({
+            "tools": {"deploy": {"action": "require_approval"}},
+            "approval": {"endpoint_url": ""}
+        }),
+        json!({
+            "tools": {"deploy": {"action": "require_approval"}},
+            "approval": {"endpoint_url": "ftp://approval.example/decide"}
+        }),
+        json!({
+            "tools": {"deploy": {"action": "require_approval"}},
+            "approval": {"endpoint_url": "https:///decide"}
+        }),
     ] {
         assert!(
             validator.validate(&config).is_err(),
