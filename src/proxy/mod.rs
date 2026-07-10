@@ -1731,14 +1731,16 @@ pub(crate) fn can_dispatch_direct_http2_pool(
 /// Apply per-request exclusions to the direct HTTP/2 pool dispatch gate.
 ///
 /// Response stream inspectors are currently wired only on the reqwest
-/// `ResponseBody::Streaming` arm. A request whose response must be inspected
-/// must therefore not dispatch through the direct-H2 pool, which would return
-/// `ResponseBody::StreamingH2` and bypass the inspector.
+/// `ResponseBody::Streaming` arm. A response that will stream and must be
+/// inspected must therefore not dispatch through the direct-H2 pool, which
+/// would return `ResponseBody::StreamingH2` and bypass the inspector. Buffered
+/// direct-H2 responses remain safe because they use the normal body hooks.
 pub(crate) fn can_dispatch_direct_http2_pool_for_request(
     can_dispatch: bool,
+    stream_response: bool,
     requires_response_stream_inspection: bool,
 ) -> bool {
-    can_dispatch && !requires_response_stream_inspection
+    can_dispatch && !(stream_response && requires_response_stream_inspection)
 }
 
 /// Resolve whether plain-HTTPS dispatch should take the direct HTTP/2 pool,
@@ -20142,12 +20144,13 @@ async fn proxy_to_backend(
         // (projected onto the effective proxy) into the registry verdict. Scope
         // is strictly this plain-HTTPS h1-vs-h2 fork — gRPC (always H2) and
         // HBONE/mesh-mTLS transports never reach here. Requests that require a
-        // response stream inspector must stay on the reqwest path because the
-        // direct-H2 `StreamingH2` arm is not wired to those inspectors. See
+        // streaming response inspector must stay on the reqwest path because
+        // the direct-H2 `StreamingH2` arm is not wired to those inspectors. See
         // `should_dispatch_direct_h2` for the exact policy interaction.
         let direct_h2_dispatch = should_dispatch_direct_h2(
             can_dispatch_direct_http2_pool_for_request(
                 direct_h2_can_dispatch,
+                stream_response,
                 requires_response_stream_inspection,
             ),
             direct_h2_supports,
@@ -34248,15 +34251,19 @@ mod tests {
     #[test]
     fn direct_h2_request_gate_blocks_response_stream_inspection() {
         assert!(
-            can_dispatch_direct_http2_pool_for_request(true, false),
+            can_dispatch_direct_http2_pool_for_request(true, true, false),
             "ordinary eligible requests may use direct-H2"
         );
         assert!(
-            !can_dispatch_direct_http2_pool_for_request(true, true),
+            !can_dispatch_direct_http2_pool_for_request(true, true, true),
             "stream-inspected responses must stay on reqwest so inspectors attach"
         );
         assert!(
-            !can_dispatch_direct_http2_pool_for_request(false, true),
+            can_dispatch_direct_http2_pool_for_request(true, false, true),
+            "buffered inspected responses remain safe on direct-H2"
+        );
+        assert!(
+            !can_dispatch_direct_http2_pool_for_request(false, true, true),
             "the request gate must not override the base dispatch gate"
         );
     }
