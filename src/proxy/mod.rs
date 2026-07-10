@@ -1731,16 +1731,16 @@ pub(crate) fn can_dispatch_direct_http2_pool(
 /// Apply per-request exclusions to the direct HTTP/2 pool dispatch gate.
 ///
 /// Response stream inspectors are currently wired only on the reqwest
-/// `ResponseBody::Streaming` arm. A response that will stream and must be
-/// inspected must therefore not dispatch through the direct-H2 pool, which
-/// would return `ResponseBody::StreamingH2` and bypass the inspector. Buffered
-/// direct-H2 responses remain safe because they use the normal body hooks.
+/// `ResponseBody::Streaming` arm. A request whose response may need stream
+/// inspection must therefore not dispatch through the direct-H2 pool. Even a
+/// conservative pre-header buffer decision can be released once an SSE
+/// Content-Type arrives; keeping it buffered instead would violate the
+/// unbounded-stream invariant.
 pub(crate) fn can_dispatch_direct_http2_pool_for_request(
     can_dispatch: bool,
-    stream_response: bool,
     requires_response_stream_inspection: bool,
 ) -> bool {
-    can_dispatch && !(stream_response && requires_response_stream_inspection)
+    can_dispatch && !requires_response_stream_inspection
 }
 
 /// Resolve whether plain-HTTPS dispatch should take the direct HTTP/2 pool,
@@ -20150,7 +20150,6 @@ async fn proxy_to_backend(
         let direct_h2_dispatch = should_dispatch_direct_h2(
             can_dispatch_direct_http2_pool_for_request(
                 direct_h2_can_dispatch,
-                stream_response,
                 requires_response_stream_inspection,
             ),
             direct_h2_supports,
@@ -20297,18 +20296,7 @@ async fn proxy_to_backend(
                         headers,
                         request,
                         plugins,
-                        // A conservatively buffered response may normally be
-                        // released after its Content-Type is known. Do not
-                        // permit that direct-H2 downgrade when a stream
-                        // inspector is required: it would produce StreamingH2,
-                        // where inspectors are not attached. Keeping the body
-                        // buffered remains safe and preserves direct-H2 for
-                        // backend SNI overrides that reqwest cannot express.
-                        if requires_response_stream_inspection {
-                            None
-                        } else {
-                            response_decision_ctx
-                        },
+                        response_decision_ctx,
                         stream_response,
                         client_ip,
                         xff_append_ip,
@@ -20341,8 +20329,9 @@ async fn proxy_to_backend(
                 backend_tls_sni = ?direct_h2_proxy.resolved_tls.sni,
                 retain_request_body = retain_request_body,
                 requires_request_body_buffering = requires_request_body_buffering,
+                requires_response_stream_inspection = requires_response_stream_inspection,
                 enable_http2 = pool_config.enable_http2,
-                "H2 pool required for backend TLS SNI override but request is not compatible with direct H2 dispatch"
+                "H2 pool required for backend TLS SNI override but request is not compatible with direct H2 dispatch (inspected streams cannot bypass inspection or be buffered unboundedly)"
             );
             return backend_dispatch_response(
                 backend_tls_sni_requires_direct_h2_response(resolved_ip.clone()),
@@ -34262,19 +34251,15 @@ mod tests {
     #[test]
     fn direct_h2_request_gate_blocks_response_stream_inspection() {
         assert!(
-            can_dispatch_direct_http2_pool_for_request(true, true, false),
+            can_dispatch_direct_http2_pool_for_request(true, false),
             "ordinary eligible requests may use direct-H2"
         );
         assert!(
-            !can_dispatch_direct_http2_pool_for_request(true, true, true),
+            !can_dispatch_direct_http2_pool_for_request(true, true),
             "stream-inspected responses must stay on reqwest so inspectors attach"
         );
         assert!(
-            can_dispatch_direct_http2_pool_for_request(true, false, true),
-            "buffered inspected responses remain safe on direct-H2"
-        );
-        assert!(
-            !can_dispatch_direct_http2_pool_for_request(false, true, true),
+            !can_dispatch_direct_http2_pool_for_request(false, true),
             "the request gate must not override the base dispatch gate"
         );
     }
