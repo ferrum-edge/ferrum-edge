@@ -3,9 +3,10 @@
 //! Plugins execute in priority order (lower number = runs first) through
 //! lifecycle phases: `on_request_received` → `authenticate` → `authorize` →
 //! `before_proxy` → `transform_request_body` → `on_final_request_body` →
-//! `backend_admission` → `after_proxy` → `on_response_body` → `transform_response_body` →
-//! `on_final_response_body` → `on_response_stream_terminated` (streamed responses only)
-//! → `log` → `on_ws_frame`.
+//! `backend_admission` → `after_proxy` → `normalize_response_body` →
+//! `on_response_body` → `transform_response_body` → `on_final_response_body` →
+//! `on_response_stream_terminated` (streamed responses only) → `log` →
+//! `on_ws_frame`.
 //!
 //! `backend_admission` runs last on the request side — after request-body
 //! transforms and `on_final_request_body`, immediately before the backend
@@ -1508,6 +1509,21 @@ pub enum ResponseStreamAction {
     Terminate(Option<bytes::Bytes>),
 }
 
+/// Semantic stage for a streaming-response inspector.
+///
+/// Protocol/provider adapters must run before policy inspectors regardless of
+/// the plugins' request-side priorities: a guardrail can only evaluate the
+/// representation the client will receive after provider-native framing has
+/// been normalized. Ordering remains stable inside each stage, so configured
+/// plugin priority and config order still control peers with the same role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ResponseStreamInspectorStage {
+    /// Convert provider/protocol-native bytes into the client-visible format.
+    Normalize,
+    /// Inspect, enforce, audit, or otherwise consume client-visible bytes.
+    Inspect,
+}
+
 /// A stateful, per-response inspector for a streaming (non-buffered) response
 /// body, created by [`Plugin::response_stream_inspector`]. It **owns** its
 /// window / accumulator state, so the same type works both inside the async H3
@@ -1516,6 +1532,13 @@ pub enum ResponseStreamAction {
 /// chunk-by-chunk and relays the returned [`ResponseStreamAction`] bytes.
 #[async_trait]
 pub trait ResponseStreamInspector: Send {
+    /// Stage used when composing multiple inspectors. Policy inspectors should
+    /// keep the default; protocol/provider adapters override with
+    /// [`ResponseStreamInspectorStage::Normalize`].
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        ResponseStreamInspectorStage::Inspect
+    }
+
     /// Inspect the next decoded chunk of the response body.
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction;
 
@@ -1536,16 +1559,54 @@ pub trait ResponseStreamInspector: Send {
 /// `ai_semantic_firewall` with different rules) runs them ALL, not just the
 /// first — matching how every other response hook runs for every plugin.
 ///
-/// `None` if the list is empty; the single inspector unchanged if there is one;
-/// otherwise a [`ChainedResponseStreamInspector`].
+/// Normalizers are stably ordered before inspectors; configured plugin order is
+/// preserved within each stage. `None` if the list is empty; the single
+/// inspector unchanged if there is one; otherwise a
+/// [`ChainedResponseStreamInspector`].
 pub fn chain_response_stream_inspectors(
     mut inspectors: Vec<Box<dyn ResponseStreamInspector>>,
 ) -> Option<Box<dyn ResponseStreamInspector>> {
     match inspectors.len() {
         0 => None,
         1 => inspectors.pop(),
-        _ => Some(Box::new(ChainedResponseStreamInspector { inspectors })),
+        _ => {
+            inspectors.sort_by_key(|inspector| inspector.stage());
+            Some(Box::new(ChainedResponseStreamInspector { inspectors }))
+        }
     }
+}
+
+/// Run buffered provider/protocol normalizers before response-body policy
+/// inspection. Returns whether any plugin replaced the bytes.
+///
+/// This is shared by the H1/H2 and all buffered H3 bridge/native paths so a
+/// frontend protocol cannot change which representation guardrails inspect.
+pub async fn normalize_response_body_for_inspection(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &mut RequestContext,
+    response_status: u16,
+    response_headers: &mut HashMap<String, String>,
+    response_body: &mut Vec<u8>,
+) -> bool {
+    let content_type = response_headers.get("content-type").cloned();
+    let mut normalized = false;
+    for plugin in plugins {
+        if let Some(body) = plugin
+            .normalize_response_body_with_context(
+                ctx,
+                response_status,
+                response_body,
+                content_type.as_deref(),
+                response_headers,
+            )
+            .await
+        {
+            response_headers.insert("content-length".to_string(), body.len().to_string());
+            *response_body = body;
+            normalized = true;
+        }
+    }
+    normalized
 }
 
 /// Pipes each chunk through a chain of [`ResponseStreamInspector`]s: inspector
@@ -2763,13 +2824,33 @@ pub trait Plugin: Send + Sync {
         self.should_buffer_response_body(ctx)
     }
 
+    /// Normalize a buffered provider/protocol-native response into the
+    /// client-visible representation before response guardrails inspect it.
+    ///
+    /// This is a distinct lifecycle phase from `transform_response_body`: use it
+    /// only for representation adapters whose output is the contract consumed by
+    /// downstream policy plugins (for example Anthropic SSE to OpenAI SSE).
+    /// Ordinary presentation transforms remain in `transform_response_body`,
+    /// after `on_response_body`. Return `Some(new_body)` to replace the body.
+    async fn normalize_response_body_with_context(
+        &self,
+        _ctx: &mut RequestContext,
+        _response_status: u16,
+        _body: &[u8],
+        _content_type: Option<&str>,
+        _response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+
     /// Called after the full response body has been received from the backend.
     ///
     /// Only invoked when `requires_response_body_buffering()` returns `true` for
     /// at least one active plugin on the proxy. Plugins that need to inspect,
     /// validate, or cache the response body should override this method.
     ///
-    /// The body bytes are the raw backend response body (before any response
+    /// The body bytes are the normalized backend response body (after
+    /// `normalize_response_body_with_context`, before ordinary response
     /// transformation). The response_status and response_headers are the values
     /// after the `after_proxy` phase.
     ///

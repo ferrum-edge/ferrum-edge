@@ -858,6 +858,50 @@ async fn allows_request_exposing_only_permitted_tools() {
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
 }
 
+#[tokio::test]
+async fn request_definition_dry_run_records_distinct_decision() {
+    let plugin = make(json!({
+        "default_action": "allow",
+        "tools": {
+            "report.read": { "action": "dry_run", "risk": "high" },
+            "status.read": { "action": "allow" }
+        },
+        "inspect": { "request_tool_definitions": true, "response_tool_calls": false }
+    }));
+    let mut ctx = json_post_ctx();
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        json!({
+            "tools": [
+                { "type": "function", "function": { "name": "report.read" } },
+                { "type": "function", "function": { "name": "status.read" } }
+            ]
+        })
+        .to_string(),
+    );
+    let mut headers = json_headers();
+
+    assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.decision")
+            .map(String::as_str),
+        Some("dry_run")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.tool_names")
+            .map(String::as_str),
+        Some("report.read")
+    );
+    assert_eq!(
+        ctx.metadata
+            .get("ai_tool_governor.risk")
+            .map(String::as_str),
+        Some("high")
+    );
+}
+
 // ---------------------------------------------------------------------------
 // MCP tools/call inspection
 // ---------------------------------------------------------------------------
@@ -3058,6 +3102,24 @@ async fn per_tool_dry_run_forwards_despite_failing_arg_checks() {
             .map(String::as_str),
         Some("dry_run")
     );
+}
+
+#[test]
+fn rejects_redact_args_without_blocked_patterns() {
+    for blocked_arg_patterns in [None, Some(json!([]))] {
+        let mut policy = json!({ "action": "redact_args" });
+        if let Some(patterns) = blocked_arg_patterns {
+            policy
+                .as_object_mut()
+                .expect("policy should be an object")
+                .insert("blocked_arg_patterns".to_string(), patterns);
+        }
+        let err = try_make(json!({ "tools": { "search": policy } }))
+            .err()
+            .expect("empty redact_args policy must be rejected");
+        assert!(err.contains("requires at least one"), "{err}");
+        assert!(err.contains("blocked_arg_patterns"), "{err}");
+    }
 }
 
 /// Approval uses the real serving provider recorded by `ai_federation` in

@@ -15111,6 +15111,17 @@ components:
           additionalProperties:
             type: object
             required: [action]
+            allOf:
+              - if:
+                  properties:
+                    action:
+                      const: redact_args
+                  required: [action]
+                then:
+                  required: [blocked_arg_patterns]
+                  properties:
+                    blocked_arg_patterns:
+                      minItems: 1
             properties:
               action:
                 type: string
@@ -15142,7 +15153,7 @@ components:
                     regex:
                       type: string
                       description: "Regex matched against the raw arguments string. Under a non-redact action a match denies; under redact_args a match is redacted."
-                description: "Named regexes screening tool arguments."
+                description: "Named regexes screening tool arguments. At least one entry is required when action=redact_args."
               json_schema:
                 type: object
                 description: "JSON Schema (validated with the jsonschema crate) the parsed arguments must satisfy, else deny."

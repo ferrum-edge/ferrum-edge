@@ -16303,6 +16303,14 @@ async fn handle_proxy_request_inner(
 
                 if !after_proxy_rejected {
                     let phase_start = Instant::now();
+                    crate::plugins::normalize_response_body_for_inspection(
+                        &plugins,
+                        &mut ctx,
+                        response_status,
+                        &mut plugin_response_headers,
+                        &mut response_body,
+                    )
+                    .await;
                     for plugin in plugins.iter() {
                         let result = plugin
                             .on_response_body(
@@ -17779,8 +17787,28 @@ async fn handle_proxy_request_inner(
         );
     }
 
+    // Provider/protocol normalizers run before response-body guardrails. This is
+    // a distinct lifecycle phase from ordinary presentation transforms, which
+    // intentionally remain after on_response_body.
+    if !after_proxy_rejected
+        && !plugins.is_empty()
+        && let ResponseBody::Buffered(ref mut data) = response_body
+    {
+        let phase_start = Instant::now();
+        crate::plugins::normalize_response_body_for_inspection(
+            &plugins,
+            &mut ctx,
+            response_status,
+            &mut response_headers,
+            data,
+        )
+        .await;
+        plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    }
+
     // on_response_body hooks — only for buffered responses, only when plugins exist.
-    // This phase sees the raw backend body before any response transformations.
+    // This phase sees the normalized backend body before ordinary response
+    // transformations, so guardrails inspect the client-visible protocol shape.
     // A Reject result replaces the response before it reaches the client.
     if !after_proxy_rejected
         && !plugins.is_empty()
@@ -18040,7 +18068,9 @@ async fn handle_proxy_request_inner(
         // status so error bodies are not inspected.
         let inspectors: Vec<_> = plugins
             .iter()
-            .filter_map(|p| p.response_stream_inspector(&ctx, response_status, content_type))
+            .filter_map(|plugin| {
+                plugin.response_stream_inspector(&ctx, response_status, content_type)
+            })
             .collect();
         crate::plugins::chain_response_stream_inspectors(inspectors)
     } else {
@@ -26494,6 +26524,8 @@ mod tests {
         should_buffer: bool,
     }
 
+    struct SyntheticNormalizationProbePlugin;
+
     struct RejectHeaderPlugin;
 
     struct CustomNoTransformHeaderPlugin;
@@ -26512,6 +26544,32 @@ mod tests {
 
         fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
             self.should_buffer
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for SyntheticNormalizationProbePlugin {
+        fn name(&self) -> &str {
+            "synthetic_normalization_probe"
+        }
+
+        fn requires_response_body_buffering(&self) -> bool {
+            true
+        }
+
+        fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+            true
+        }
+
+        async fn normalize_response_body_with_context(
+            &self,
+            _ctx: &mut RequestContext,
+            _response_status: u16,
+            _body: &[u8],
+            _content_type: Option<&str>,
+            _response_headers: &HashMap<String, String>,
+        ) -> Option<Vec<u8>> {
+            Some(b"incorrectly-normalized".to_vec())
         }
     }
 
@@ -26941,6 +26999,27 @@ mod tests {
             false,
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn synthetic_response_skips_backend_provider_normalization() {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(SyntheticNormalizationProbePlugin)];
+        let mut ctx = RequestContext::new(
+            "203.0.113.10".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        let body = b"data: {\"object\":\"chat.completion.chunk\"}\n\ndata: [DONE]\n\n";
+        let synthetic = PluginResult::RejectBinary {
+            status_code: 200,
+            body: bytes::Bytes::copy_from_slice(body),
+            headers: HashMap::from([("content-type".to_string(), "text/event-stream".to_string())]),
+        };
+
+        let response = normalize_synthetic_reject_for_test(&plugins, &mut ctx, synthetic).await;
+
+        assert_eq!(response.http_status, StatusCode::OK);
+        assert_eq!(response.body, body);
     }
 
     #[tokio::test]

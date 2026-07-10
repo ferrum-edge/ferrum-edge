@@ -177,16 +177,20 @@ Argument checks (`max_arg_bytes`, `required_args`, `json_schema`,
 `blocked_arg_patterns`) apply to the `allow`, `require_approval`, and
 `redact_args` actions. A blocked-pattern match denies under
 `allow`/`require_approval`, and is **redacted** under `redact_args` (buffered
-path). On paths where arguments cannot be redacted in place — the **streaming**
+path). A `redact_args` policy must configure at least one
+`blocked_arg_patterns` entry; an empty redaction policy is rejected rather than
+silently turning the tool into an allowlist entry. On paths where arguments
+cannot be redacted in place — the **streaming**
 path, the **request** body (no request-body transform), and the post-transform
 **final response** re-check — a `redact_args` match fails closed rather than
 forwarding an unredacted secret.
 
 A per-tool **`dry_run`** action is purely observational: it forwards the call
-and records the decision, and is evaluated **before** the argument checks
-above, so it never rejects — even for oversized args, a failing schema, or a
-blocked pattern. Use it to measure what a stricter action *would* do before
-enforcing. (This differs from global `mode: dry_run`, which makes every action
+and records `ai_tool_governor.decision=dry_run` for concrete calls and exposed
+request definitions. It is evaluated **before** the argument checks above, so
+it never rejects — even for oversized args, a failing schema, or a blocked
+pattern. Use it to measure what a stricter action *would* do before enforcing.
+(This differs from global `mode: dry_run`, which makes every action
 observational.)
 
 ## Examples

@@ -3288,7 +3288,7 @@ config:
 
 ## AI / LLM Plugins
 
-Nine plugins purpose-built for AI/LLM API gateway use cases. Response-parsing AI plugins auto-detect common provider JSON structures, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock** where applicable.
+Ferrum includes purpose-built AI/LLM API gateway plugins. Response-parsing AI plugins auto-detect common provider JSON structures, supporting **OpenAI** (and compatible), **Anthropic**, **Google Gemini**, **Cohere**, **Mistral**, and **AWS Bedrock** where applicable.
 
 ### Upgrade notes (breaking config validation changes)
 
@@ -3306,6 +3306,15 @@ Validation follows the same per-mode tolerance model as other file-dependent con
 - **File mode** — fatal at startup. The gateway refuses to start.
 - **Database mode** — warnings are logged, but the gateway keeps serving with the previous valid config.
 - **DP mode** — the config update from the CP is rejected and the DP continues with its previously applied config.
+
+### `ai_tool_governor`
+
+Deterministic allow, deny, argument-redaction, and approval policy for AI tool
+definitions and calls across buffered JSON, streaming SSE, MCP, and A2A
+surfaces. See the dedicated
+[`ai_tool_governor` configuration guide](plugins/ai_tool_governor.md) for the
+complete schema, fail-closed behavior, examples, observability contract, and
+documented lifecycle limitations.
 
 ### `ai_transcript_audit`
 
@@ -3434,7 +3443,7 @@ by `ai_rate_limiter` (not via `ai_federation`, which rejects streaming — see
 above), configure OpenAI-compatible callers with `stream_options.include_usage:
 true` so a final usage signal is emitted.
 
-**Synthetic-path hook ordering (known divergence).** On the synthetic short-circuit path (any plugin-generated 2xx surfaced via `RejectBinary`, including `ai_federation` / `ai_semantic_cache` / `response_mock` bodies) the response-**body** hooks (`on_response_body`, body transforms, `on_final_response_body`) run **before** the `after_proxy` reject hooks, whereas on the normal backend path `after_proxy` runs **before** the body transforms. This is a deliberate trade-off: the body hooks may *replace* the response when a guardrail rejects the synthetic body, so `after_proxy` must run exactly once and last — over the final response — to preserve one-shot response state (e.g. an `oidc_relying_party` rotated session cookie or a `response_transformer` route override) that would otherwise be consumed against a discarded synthetic 2xx. The consequence is that a body transform which depends on a header/metadata mutation made by an `after_proxy` hook (for example `response_transformer` rewriting `Content-Type` before its JSON body rules) can behave differently on a synthetic 2xx than on an equivalent backend 2xx. If you need such a transform applied identically, drive it from `before_proxy`/body-side configuration rather than from `after_proxy` header mutations on the synthetic path.
+**Synthetic-path hook ordering (known divergence).** On the synthetic short-circuit path (any plugin-generated 2xx surfaced via `RejectBinary`, including `ai_federation` / `ai_semantic_cache` / `response_mock` bodies) the response-**body** hooks (`on_response_body`, body transforms, `on_final_response_body`) run **before** the `after_proxy` reject hooks, whereas on the normal backend path `after_proxy` runs **before** the body transforms. Provider/protocol normalization is deliberately skipped: a synthetic body is owned by the short-circuiting plugin and is already in its client-visible representation, so request metadata left by an earlier provider router must not reinterpret it as backend-native bytes. This is a deliberate trade-off: the body hooks may *replace* the response when a guardrail rejects the synthetic body, so `after_proxy` must run exactly once and last — over the final response — to preserve one-shot response state (e.g. an `oidc_relying_party` rotated session cookie or a `response_transformer` route override) that would otherwise be consumed against a discarded synthetic 2xx. The consequence is that a body transform which depends on a header/metadata mutation made by an `after_proxy` hook (for example `response_transformer` rewriting `Content-Type` before its JSON body rules) can behave differently on a synthetic 2xx than on an equivalent backend 2xx. If you need such a transform applied identically, drive it from `before_proxy`/body-side configuration rather than from `after_proxy` header mutations on the synthetic path.
 
 **Multimodal content is explicit.** OpenAI Chat Completions content arrays may contain text plus non-text parts such as `image_url`. Provider configs accept `multimodal_mode`:
 

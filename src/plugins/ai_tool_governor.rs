@@ -368,6 +368,15 @@ enum PolicyOutcome {
     DryRun,
 }
 
+/// Name-only policy outcome for a tool definition exposed to the model.
+/// Approval cannot be resolved without concrete arguments, while a per-tool
+/// dry-run remains observable without blocking the request.
+enum DefinitionOutcome {
+    Allow,
+    DryRun(RiskLevel),
+    Deny(RiskLevel),
+}
+
 /// Correlation metadata attached to approval requests and audit logs.
 #[derive(Debug, Clone, Default)]
 struct CorrelationMeta {
@@ -630,11 +639,10 @@ impl GovernorEngine {
         (outcome, true, policy.risk)
     }
 
-    /// Risk for a blocked tool *definition* (name only, no arguments), or
-    /// `None` when the definition is allowed. `require_approval` cannot be
-    /// resolved for a bare definition because there are no concrete arguments
-    /// to send to the approval webhook.
-    fn definition_denial_risk(&self, name: &str) -> Option<RiskLevel> {
+    /// Govern a tool *definition* (name only, no arguments).
+    /// `require_approval` cannot be resolved for a bare definition because
+    /// there are no concrete arguments to send to the approval webhook.
+    fn definition_outcome(&self, name: &str) -> DefinitionOutcome {
         match self.tools.get(name) {
             Some(policy)
                 if matches!(
@@ -642,17 +650,20 @@ impl GovernorEngine {
                     ToolAction::Deny | ToolAction::RequireApproval
                 ) =>
             {
-                Some(policy.risk)
+                DefinitionOutcome::Deny(policy.risk)
             }
-            Some(_) => None,
+            Some(policy) if policy.action == ToolAction::DryRun => {
+                DefinitionOutcome::DryRun(policy.risk)
+            }
+            Some(_) => DefinitionOutcome::Allow,
             None if matches!(
                 self.default_action,
                 DefaultAction::Deny | DefaultAction::RequireApproval
             ) =>
             {
-                Some(RiskLevel::Low)
+                DefinitionOutcome::Deny(RiskLevel::Low)
             }
-            None => None,
+            None => DefinitionOutcome::Allow,
         }
     }
 
@@ -1531,16 +1542,17 @@ impl AiToolGovernor {
 
         // 1. Client tool definitions exposed to the model.
         if self.inspect.request_tool_definitions {
-            let denied: Vec<(String, RiskLevel)> = extract_request_tool_definitions(json)
-                .into_iter()
-                .filter_map(|name| {
-                    self.engine
-                        .definition_denial_risk(&name)
-                        .map(|risk| (name, risk))
-                })
-                .collect();
+            let mut denied = Vec::new();
+            let mut dry_run = Vec::new();
+            for name in extract_request_tool_definitions(json) {
+                match self.engine.definition_outcome(&name) {
+                    DefinitionOutcome::Deny(risk) => denied.push((name, risk)),
+                    DefinitionOutcome::DryRun(risk) => dry_run.push((name, risk)),
+                    DefinitionOutcome::Allow => {}
+                }
+            }
             if !denied.is_empty() {
-                self.write_definition_metadata(ctx, &denied);
+                self.write_definition_metadata(ctx, "deny", &denied);
                 if self.engine.mode == Mode::Enforce {
                     return PluginResult::Reject {
                         status_code: self.engine.response.deny_status_code,
@@ -1555,6 +1567,8 @@ impl AiToolGovernor {
                         headers: HashMap::new(),
                     };
                 }
+            } else if !dry_run.is_empty() {
+                self.write_definition_metadata(ctx, "dry_run", &dry_run);
             }
         }
 
@@ -1599,7 +1613,12 @@ impl AiToolGovernor {
         PluginResult::Continue
     }
 
-    fn write_definition_metadata(&self, ctx: &mut RequestContext, denied: &[(String, RiskLevel)]) {
+    fn write_definition_metadata(
+        &self,
+        ctx: &mut RequestContext,
+        label: &'static str,
+        definitions: &[(String, RiskLevel)],
+    ) {
         if !self.engine.observability.emit_metadata {
             return;
         }
@@ -1613,34 +1632,35 @@ impl AiToolGovernor {
             .get("ai_tool_governor.decision")
             .map(|value| label_rank(value))
             .unwrap_or(0);
-        let deny_rank = label_rank("deny");
-        set_decision_metadata(m, "deny");
-        let denied_names: Vec<&str> = denied.iter().map(|(name, _)| name.as_str()).collect();
+        let decision_rank = label_rank(label);
+        set_decision_metadata(m, label);
+        let definition_names: Vec<&str> =
+            definitions.iter().map(|(name, _)| name.as_str()).collect();
         set_ranked_csv_metadata(
             m,
             "ai_tool_governor.tool_names",
             previous_rank,
-            deny_rank,
-            &denied_names,
+            decision_rank,
+            &definition_names,
         );
-        let max_risk = denied
+        let max_risk = definitions
             .iter()
             .map(|(_, risk)| *risk)
             .max()
             .unwrap_or(RiskLevel::Low);
-        set_ranked_risk_metadata(m, previous_rank, deny_rank, max_risk);
+        set_ranked_risk_metadata(m, previous_rank, decision_rank, max_risk);
 
-        // A definition denial has no concrete-call correlation metadata. If it
-        // upgrades an earlier weaker decision, clear every decision-aligned
-        // field from that weaker call; at equal deny severity, the ranked
-        // helper preserves metadata emitted by sibling denied surfaces.
+        // A definition decision has no concrete-call correlation metadata. If
+        // it upgrades an earlier weaker decision, clear every decision-aligned
+        // field from that weaker call; at equal severity, the ranked helper
+        // preserves metadata emitted by sibling surfaces.
         for key in [
             "ai_tool_governor.policy_ids",
             "ai_tool_governor.approval_id",
             "ai_tool_governor.arguments_hashes",
             "ai_tool_governor.redacted_tools",
         ] {
-            set_ranked_csv_metadata(m, key, previous_rank, deny_rank, &[]);
+            set_ranked_csv_metadata(m, key, previous_rank, decision_rank, &[]);
         }
     }
 
@@ -4640,6 +4660,11 @@ fn parse_tool_policy(name: &str, spec: &Value) -> Result<ToolPolicy, String> {
                 regex,
             });
         }
+    }
+    if action == ToolAction::RedactArgs && blocked_arg_patterns.is_empty() {
+        return Err(format!(
+            "ai_tool_governor: tool '{name}' action 'redact_args' requires at least one 'blocked_arg_patterns' entry"
+        ));
     }
 
     let json_schema = match obj.get("json_schema") {

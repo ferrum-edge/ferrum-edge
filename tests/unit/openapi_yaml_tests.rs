@@ -74,6 +74,47 @@ fn access_control_schema_matches_runtime_validation() {
     }
 }
 
+#[test]
+fn ai_tool_governor_schema_requires_redaction_patterns() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiToolGovernorConfig")
+        .expect("missing AiToolGovernorConfig schema");
+    let validator = jsonschema::draft202012::options()
+        .build(schema)
+        .expect("AiToolGovernorConfig schema compiles");
+
+    for config in [
+        json!({"tools": {"search": {"action": "allow"}}}),
+        json!({
+            "tools": {
+                "search": {
+                    "action": "redact_args",
+                    "blocked_arg_patterns": [{"name": "secret", "regex": "secret"}]
+                }
+            }
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_ok(),
+            "config should be valid: {config}"
+        );
+    }
+
+    for config in [
+        json!({"tools": {"search": {"action": "redact_args"}}}),
+        json!({
+            "tools": {"search": {"action": "redact_args", "blocked_arg_patterns": []}}
+        }),
+    ] {
+        assert!(
+            validator.validate(&config).is_err(),
+            "config should be invalid: {config}"
+        );
+    }
+}
+
 fn plugin_config_schema_mapping(spec: &serde_json::Value) -> BTreeMap<String, String> {
     let all_of = spec
         .pointer("/components/schemas/PluginConfig/allOf")

@@ -52,7 +52,7 @@ use url::{Host, Url};
 use super::utils::body_transform::{is_event_stream_content_type, is_json_content_type};
 use super::{
     Plugin, PluginHttpClient, PluginResult, RequestContext, ResponseStreamAction,
-    ResponseStreamInspector,
+    ResponseStreamInspector, ResponseStreamInspectorStage,
 };
 use crate::config::types::{BackendScheme, BackendTlsConfig};
 
@@ -1185,9 +1185,10 @@ impl Plugin for AiStreamRouter {
         Some(Box::new(AnthropicSseNormalizer::new(model)))
     }
 
-    async fn transform_response_body_with_context(
+    async fn normalize_response_body_with_context(
         &self,
         ctx: &mut RequestContext,
+        response_status: u16,
         body: &[u8],
         content_type: Option<&str>,
         _response_headers: &HashMap<String, String>,
@@ -1196,6 +1197,11 @@ impl Plugin for AiStreamRouter {
             return None;
         }
         if ctx.metadata.get(META_NORMALIZED).map(String::as_str) != Some("true") {
+            return None;
+        }
+        // Match the streaming normalizer: provider error envelopes reach the
+        // client untouched even when a backend labels them as event streams.
+        if !(200..300).contains(&response_status) {
             return None;
         }
         if !content_type.is_some_and(is_event_stream_content_type) {
@@ -1540,6 +1546,10 @@ impl AnthropicSseNormalizer {
 
 #[async_trait]
 impl ResponseStreamInspector for AnthropicSseNormalizer {
+    fn stage(&self) -> ResponseStreamInspectorStage {
+        ResponseStreamInspectorStage::Normalize
+    }
+
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
         if self.done_emitted {
             return ResponseStreamAction::Forward(Bytes::new());

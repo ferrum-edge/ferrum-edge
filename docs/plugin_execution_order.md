@@ -46,25 +46,30 @@ Request In
              │
              ▼
 ┌─────────────────────────┐
-│ 7. on_response_body     │  Raw buffered backend body inspection
+│ 7. normalize_response_body │ Provider/protocol normalization
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 8. transform_response_body │ Buffered body rewrites
+│ 8. on_response_body     │  Normalized buffered body inspection
 └────────────┬────────────┘
              │
              ▼
 ┌─────────────────────────┐
-│ 9. on_final_response_body │ Final client-visible body validation/storage
+│ 9. transform_response_body │ Buffered presentation rewrites
 └────────────┬────────────┘
              │
-             │  Streamed non-buffered bodies skip phases 7-9 and call
+             ▼
+┌─────────────────────────┐
+│ 10. on_final_response_body │ Final client-visible body validation/storage
+└────────────┬────────────┘
+             │
+             │  Streamed non-buffered bodies skip phases 7-10 and call
              │  on_response_stream_terminated here when the body terminates.
              │
              ▼
 ┌─────────────────────────┐
-│ 10. log                 │  Logging & observability (fire-and-forget)
+│ 11. log                 │  Logging & observability (fire-and-forget)
 └─────────────────────────┘
 ```
 
@@ -309,7 +314,7 @@ Given all built-in plugins enabled, the execution order is:
 | 43 | `ai_request_guard` | 2975 | before_proxy, transform_request_body |
 | 44 | `ai_tool_governor` | 2978 | before_proxy, on_final_request_body, on_response_body, transform_response_body, on_final_response_body, response_stream_inspector |
 | 45 | `ai_semantic_cache` | 2980 | before_proxy, after_proxy, on_final_response_body |
-| 46 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, response_stream_inspector |
+| 46 | `ai_stream_router` | 2984 | before_proxy, transform_request_body, normalize_response_body, response_stream_inspector |
 | 47 | `mcp_gateway` | 2992 | before_proxy, transform_request_body |
 | 48 | `a2a_gateway` | 2993 | before_proxy, after_proxy, on_response_body |
 | 49 | `mesh_route_dispatch` | 2995 | before_proxy |
@@ -426,6 +431,14 @@ Rather than the buffered "terminate and respond" pattern, it rewrites the routin
 - `openai` / `openai_compatible`: request and response SSE are already OpenAI-shaped, so the stream passes through unchanged (optional `stream_options.include_usage` injection only). No response-stream inspector runs, so these requests stay on the fast dispatch path.
 - `anthropic`: the request is translated to the Anthropic Messages API streaming request, and a `ResponseStreamInspector` normalizes Anthropic SSE events (`content_block_delta` text/tool deltas, `message_delta` usage/stop) into OpenAI `chat.completion.chunk` SSE on the fly, emitting a final usage chunk and `data: [DONE]`. For these requests the plugin returns `true` from `forces_reqwest_dispatch` so the inspector is guaranteed to be wired.
 
+Streaming inspectors have semantic stages: provider/protocol `Normalize` stages
+run before policy/audit `Inspect` stages, while configured plugin priority and
+config order remain stable within each stage. Buffered responses use the
+matching `normalize_response_body` phase before `on_response_body`. This keeps
+guardrails on the same client-visible representation across H1/H2 and every
+buffered H3 path without changing `ai_stream_router`'s request-side priority
+(which must remain after `ai_semantic_cache`).
+
 Because `ai_stream_router` runs first, when it claims a request it sets `ctx.metadata["ai_stream_router_claimed"] = "true"`; `ai_federation` checks this at the top of its `before_proxy` and immediately continues, so the two plugins compose cleanly on the same proxy. Fallback across providers after the first downstream byte is out of scope — once bytes have streamed the provider cannot be switched (`ai_stream_router.fallback_attempts` is always `0`).
 
 ### Transforms after auth (3000+)
@@ -440,7 +453,7 @@ The `compression` plugin runs at priority 4050 — after `response_transformer` 
 
 ### Logging runs last (9000+)
 
-Logging plugins run in phase 7 (`log`) which is fire-and-forget after the response is sent to the client. They are outside the hot path and do not affect request latency. Their relative ordering within the logging band (9000–9300) does not impact behavior.
+Logging plugins run in phase 11 (`log`) which is fire-and-forget after the response is sent to the client. They are outside the hot path and do not affect request latency. Their relative ordering within the logging band (9000–9300) does not impact behavior.
 
 All logging plugins receive the `TransactionSummary` struct which includes an `error_class` field for failed transactions. This field classifies gateway-level errors (e.g., `ConnectionTimeout`, `TlsError`, `DnsLookupError`) to help operators quickly identify root causes. See [docs/error_classification.md](error_classification.md) for the full list of error classes and debugging guidance.
 
