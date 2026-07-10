@@ -364,18 +364,15 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
   [#2061](https://github.com/ferrum-edge/ferrum-edge/issues/2061).
 - The plugin governs tool calls; it does not execute tools, manage MCP sessions,
   or replace `mcp_gateway`/A2A routing.
-- Streaming inspection rides the proxy's reqwest dispatch arm (the same
-  mechanism `ai_semantic_firewall` uses): governed streaming requests are pinned
-  to it via `forces_reqwest_dispatch`, but a response streamed on the direct
-  HTTP/2 or native HTTP/3 arm is not inspected. Two proxy-core gaps remain:
-  a `request_transformer` that **adds** `stream: true` after the dispatch
-  decision on an HTTP/3-classified backend, and a request that stages no JSON
-  body whose backend nevertheless answers with tool-call SSE. Neither is
-  client-controllable against real AI providers — a client-sent `stream: true`
-  JSON POST is detected and pinned, and OpenAI/Anthropic/Gemini-shaped backends
-  do not emit tool-call streams for bodyless requests. Buffered responses and
-  reqwest-arm streams are always governed — including a stream-marked
-  request's plain-JSON SSE fallback delivered on the streaming path, which
-  the inspector now attaches to regardless of the response `Content-Type`.
-  Shared proxy-core follow-up:
-  [#2055](https://github.com/ferrum-edge/ferrum-edge/issues/2055).
+- Streaming inspection rides the proxy's reqwest dispatch arm. Because a
+  successful SSE response label can activate the inspector even without a
+  request-side streaming marker, enabling `streaming_response_tool_calls` pins
+  every eligible ordinary HTTP request on that proxy to reqwest; direct HTTP/2,
+  native HTTP/3, HBONE, and sidecar mesh-mTLS streams do not run response
+  inspectors. Mesh-tagged targets that require HBONE or sidecar mesh-mTLS
+  therefore fail closed with 502 while this policy is attached rather than
+  falling back to an unauthenticated direct dial or bypassing inspection.
+  This config-wide dispatch cost is the price of covering provider-selected or
+  response-labeled SSE without a policy bypass. A backend TLS SNI override that
+  requires direct HTTP/2 conflicts with streaming inspection and fails closed
+  with 502 rather than bypassing governance or buffering an unbounded SSE body.

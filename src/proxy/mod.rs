@@ -16867,12 +16867,11 @@ async fn handle_proxy_request_inner(
     // only on the reqwest streaming path, so a request that WILL be inspected must
     // be dispatched via reqwest — otherwise a native-H3 backend would return
     // `ResponseBody::StreamingH3` and bypass inspection. This is gated per request
-    // (a plugin returns `true` only for the specific requests it inspects, via
-    // `ctx` markers) so an inspect-mode proxy does NOT push its ordinary,
-    // never-inspected requests off the native-H3 fast path. (Direct-H2/HBONE are
-    // already excluded for these requests because `inspect`/`buffer` force
-    // request-body buffering, which disables those pools; native H3 does not gate
-    // on that, so it is excluded explicitly here.)
+    // Most plugins gate this per request via `ctx` markers. A response-label-
+    // driven inspector may conservatively return true for every request on its
+    // configured proxy because whether the backend will emit SSE is unknowable
+    // before dispatch. Every native H2/H3 streaming transport must honor the
+    // result because inspectors are attached only to reqwest streams.
     let requires_response_stream_inspection =
         plugins.iter().any(|p| p.forces_reqwest_dispatch(&ctx));
     let request_client_ip = ctx.client_ip.clone();
@@ -16918,6 +16917,7 @@ async fn handle_proxy_request_inner(
         .as_deref()
         .is_some_and(hbone_pool::target_hbone_enabled);
     let current_dispatch_hbone = !has_retry
+        && !requires_response_stream_inspection
         && can_use_hbone_pool(
             has_retry,
             requires_request_body_buffering,
@@ -16930,7 +16930,9 @@ async fn handle_proxy_request_inner(
             state.gateway_svid_bundle.load().is_some(),
         );
     if hbone_required && !current_dispatch_hbone {
-        let block_reason = if has_retry {
+        let block_reason = if requires_response_stream_inspection {
+            "response stream inspection requires reqwest dispatch"
+        } else if has_retry {
             "effective retry config disables HBONE dispatch"
         } else if requires_request_body_buffering {
             "request body buffering disables HBONE dispatch"
@@ -16944,6 +16946,7 @@ async fn handle_proxy_request_inner(
             upstream_target = ?upstream_target,
             has_retry,
             requires_request_body_buffering,
+            requires_response_stream_inspection,
             stream_request_body,
             block_reason,
             "mesh.hbone=true target requires HBONE dispatch; refusing direct-backend fallback"
@@ -16988,6 +16991,7 @@ async fn handle_proxy_request_inner(
         .as_deref()
         .is_some_and(mesh_mtls_pool::target_mesh_mtls_enabled);
     let current_dispatch_mesh_mtls = !has_retry
+        && !requires_response_stream_inspection
         && can_use_hbone_pool(
             has_retry,
             requires_request_body_buffering,
@@ -16995,7 +16999,9 @@ async fn handle_proxy_request_inner(
         )
         && supports_mesh_mtls_backend(&state, &proxy, upstream_target.as_deref());
     if mesh_mtls_required && !current_dispatch_mesh_mtls {
-        let block_reason = if has_retry {
+        let block_reason = if requires_response_stream_inspection {
+            "response stream inspection requires reqwest dispatch"
+        } else if has_retry {
             "effective retry config disables sidecar SVID-mTLS dispatch"
         } else if requires_request_body_buffering {
             "request body buffering disables sidecar SVID-mTLS dispatch"
@@ -17009,6 +17015,7 @@ async fn handle_proxy_request_inner(
             upstream_target = ?upstream_target,
             has_retry,
             requires_request_body_buffering,
+            requires_response_stream_inspection,
             stream_request_body,
             block_reason,
             "mesh.mtls=true target requires sidecar SVID-mTLS dispatch; refusing direct-backend fallback"

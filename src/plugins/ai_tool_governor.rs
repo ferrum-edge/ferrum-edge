@@ -2877,18 +2877,14 @@ impl Plugin for AiToolGovernor {
         self.enabled && self.inspect.streaming_response_tool_calls
     }
 
-    fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
-        // The stream inspector is only wired on the reqwest streaming path, so
-        // any request that may produce an inspected SSE response must dispatch
-        // via reqwest: an SSE `Accept` header, a shared streaming marker from
-        // an earlier plugin, or this plugin's own request-body detection of
-        // `"stream": true` (set in `before_proxy`) — the latter catches a
-        // plain POST to a direct H2/H3 backend that answers with SSE.
-        self.enabled
-            && self.inspect.streaming_response_tool_calls
-            && (is_sse_request(ctx)
-                || ctx.metadata.get("ai_request_streaming").map(String::as_str) == Some("true")
-                || ctx.metadata.get(STREAM_REQUESTED_KEY).map(String::as_str) == Some("true"))
+    fn forces_reqwest_dispatch(&self, _ctx: &RequestContext) -> bool {
+        // The inspector attaches to any successful SSE response, even when the
+        // request carried no streaming marker. Response headers are unknowable
+        // before transport selection, so complete tool-call governance requires
+        // every request on an enabled proxy to require the only streaming arm
+        // that wires inspectors (reqwest). Transports that cannot fall back to
+        // reqwest fail closed. This is intentionally config-wide.
+        self.enabled && self.inspect.streaming_response_tool_calls
     }
 
     /// The streaming inspector accumulates OpenAI-shaped SSE
@@ -2906,13 +2902,10 @@ impl Plugin for AiToolGovernor {
     ///
     /// DISPATCH LIMITATION (shared with `ai_semantic_firewall`'s `inspect`): the
     /// SSE inspector is wired only on the reqwest `ResponseBody::Streaming` arm,
-    /// not `StreamingH2`/`StreamingH3`. `forces_reqwest_dispatch` excludes native
-    /// H3 and direct-H2 for requests known to need inspected streaming responses.
-    /// A residual gap remains tracked as proxy-core issue #2055: a
-    /// `request_transformer` that adds `"stream": true` for a backend already
-    /// classified H3-capable can dispatch via native H3 before the final-body
-    /// re-detection pins reqwest. Buffered responses and reqwest-path SSE remain
-    /// governed.
+    /// not `StreamingH2`/`StreamingH3`. Because an SSE response label alone can
+    /// activate this inspector, `forces_reqwest_dispatch` pins all requests on a
+    /// streaming-governed proxy to require reqwest before transport selection;
+    /// mesh/SNI routes that mandate another transport fail closed.
     fn response_stream_inspector(
         &self,
         ctx: &RequestContext,

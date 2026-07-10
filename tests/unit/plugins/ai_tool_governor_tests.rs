@@ -1651,7 +1651,7 @@ async fn allows_json_rpc_batch_without_governed_calls() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn stream_true_request_forces_reqwest_dispatch() {
+async fn streaming_governance_forces_reqwest_dispatch_config_wide() {
     let plugin = make(streaming_config(
         json!({ "x": { "action": "allow" } }),
         "deny",
@@ -1664,8 +1664,8 @@ async fn stream_true_request_forces_reqwest_dispatch() {
         json!({ "model": "gpt-4o", "stream": true, "messages": [] }).to_string(),
     );
     assert!(
-        !plugin.forces_reqwest_dispatch(&ctx),
-        "no marker before before_proxy runs"
+        plugin.forces_reqwest_dispatch(&ctx),
+        "an SSE response can activate inspection before any request marker exists"
     );
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
     assert!(
@@ -1673,14 +1673,15 @@ async fn stream_true_request_forces_reqwest_dispatch() {
         "a detected stream:true body must pin the reqwest dispatch path"
     );
 
-    // A non-streaming body never leaves the fast path.
+    // Even a non-streaming request stays on reqwest because the backend may
+    // select SSE and response headers are unknown at dispatch time.
     let mut ctx = json_post_ctx();
     ctx.metadata.insert(
         "request_body".to_string(),
         json!({ "model": "gpt-4o", "messages": [] }).to_string(),
     );
     assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
-    assert!(!plugin.forces_reqwest_dispatch(&ctx));
+    assert!(plugin.forces_reqwest_dispatch(&ctx));
 }
 
 #[tokio::test]
@@ -3335,7 +3336,7 @@ async fn streaming_unnamed_tool_frames_released_in_dry_run() {
 // ---------------------------------------------------------------------------
 
 /// A `request_transformer` that adds `stream: true` after `before_proxy` must be
-/// re-detected on the final request body so the reqwest streaming path is pinned.
+/// re-detected so a mislabeled/plain-JSON streaming fallback is inspected.
 #[tokio::test]
 async fn final_request_body_redetects_transform_added_stream() {
     let plugin = make(json!({
@@ -3343,8 +3344,9 @@ async fn final_request_body_redetects_transform_added_stream() {
         "inspect": { "streaming_response_tool_calls": true, "response_tool_calls": false }
     }));
     let mut ctx = json_post_ctx();
-    // No streaming marker before this hook (the transform just added it).
-    assert!(!plugin.forces_reqwest_dispatch(&ctx));
+    // Dispatch is already pinned config-wide; the final hook must still add the
+    // marker used to inspect a mislabeled/plain-JSON streaming fallback.
+    assert!(plugin.forces_reqwest_dispatch(&ctx));
     let body = json!({ "stream": true, "model": "gpt-4o", "messages": [] }).to_string();
     assert_continue(
         plugin
@@ -6319,8 +6321,8 @@ async fn final_request_body_clears_stale_stream_marker_when_transform_disables_s
         "the dependent stream model must be cleared too"
     );
     assert!(
-        !plugin.forces_reqwest_dispatch(&ctx),
-        "cleared marker must no longer force reqwest dispatch"
+        plugin.forces_reqwest_dispatch(&ctx),
+        "streaming governance remains config-wide after a request marker is cleared"
     );
     // The plain-JSON response now stays on the buffered path (no SSE inspector).
     assert!(
@@ -6341,7 +6343,7 @@ async fn final_request_body_clears_stale_stream_marker_when_transform_disables_s
 }
 
 /// Fix 1 (round-14 regression guard): a transformer that ADDS `stream: true` on
-/// the final body still pins streaming — clearing must be strictly one-way
+/// the final body still marks streaming — clearing must be strictly one-way
 /// (only a parsed non-streaming body clears).
 #[tokio::test]
 async fn final_request_body_still_pins_stream_when_transform_adds_stream() {
@@ -6350,7 +6352,7 @@ async fn final_request_body_still_pins_stream_when_transform_adds_stream() {
         "inspect": { "response_tool_calls": false, "streaming_response_tool_calls": true }
     }));
     let mut ctx = json_post_ctx();
-    assert!(!plugin.forces_reqwest_dispatch(&ctx));
+    assert!(plugin.forces_reqwest_dispatch(&ctx));
     let body = json!({ "stream": true, "model": "gpt-4o", "messages": [] }).to_string();
     assert_continue(
         plugin
