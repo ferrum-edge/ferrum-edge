@@ -17112,6 +17112,7 @@ async fn handle_proxy_request_inner(
             &ctx,
             should_stream,
             requires_request_body_buffering,
+            requires_response_stream_inspection,
             stream_request_body,
             has_retry,
             &request_client_ip,
@@ -17444,6 +17445,7 @@ async fn handle_proxy_request_inner(
             &ctx,
             should_stream,
             requires_request_body_buffering,
+            requires_response_stream_inspection,
             stream_request_body,
             false, // no retry — don't retain body
             &request_client_ip,
@@ -19784,6 +19786,7 @@ async fn proxy_to_backend(
     request_ctx: &RequestContext,
     stream_response: bool,
     requires_request_body_buffering: bool,
+    requires_response_stream_inspection: bool,
     stream_request_body: bool,
     retain_request_body: bool,
     client_ip: &str,
@@ -28269,6 +28272,7 @@ mod tests {
                 &ctx,  // real read-only request context
                 false, // stream_response: WAF requested buffering pre-flight
                 false, // requires_request_body_buffering
+                false, // requires_response_stream_inspection
                 true,  // stream_request_body
                 false, // retain_request_body (non-retry -> downgrade active)
                 "127.0.0.1",
