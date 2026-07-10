@@ -457,6 +457,13 @@ async fn run_h3_script(
 
     let mut response_stream: Option<h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>> =
         None;
+    // A response can finish before the peer has finished uploading its request
+    // body. Keep finalized bidirectional stream handles alive until the script
+    // ends so dropping the response side does not race the peer's final DATA /
+    // FIN with an implicit STOP_SENDING. This is especially important for the
+    // native-H3 gRPC fixtures, which intentionally respond without consuming
+    // the request body themselves.
+    let mut finished_response_streams = Vec::new();
 
     for step in steps {
         match step {
@@ -627,9 +634,14 @@ async fn run_h3_script(
                     .finish()
                     .await
                     .map_err(|e| format!("finish after trailers: {e}"))?;
-                // Stream is finalized; drop the handle so the end-of-script
-                // `finish()` is skipped (a second finish would error).
-                response_stream = None;
+                // The response side is finalized, so remove it from the active
+                // slot to prevent the end-of-script `finish()` from running a
+                // second time. Retain the handle through any following
+                // `StallFor`, though: dropping a bidirectional request stream
+                // can stop the still-in-flight request direction.
+                if let Some(stream) = response_stream.take() {
+                    finished_response_streams.push(stream);
+                }
             }
             H3Step::SendStreamReset(code) => {
                 let stream = response_stream
@@ -665,6 +677,7 @@ async fn run_h3_script(
     if let Some(mut stream) = response_stream {
         let _ = stream.finish().await;
     }
+    drop(finished_response_streams);
     Ok(())
 }
 

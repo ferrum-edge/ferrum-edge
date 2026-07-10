@@ -244,7 +244,15 @@ impl GrpcClient {
         framed.put_u8(0);
         framed.put_u32(body.len() as u32);
         framed.extend_from_slice(&body);
-        req_body.send_data(framed.freeze(), true)?;
+        // A fast Trailers-Only gateway error can close the request direction
+        // before this DATA write is observed locally. h2 then reports an
+        // `inactive stream`, but the response future can still carry the
+        // well-formed gRPC error that the caller needs to assert on. Preserve
+        // the write error for the no-response case and keep collecting.
+        let request_send_error = req_body
+            .send_data(framed.freeze(), true)
+            .err()
+            .map(|e| format!("request body error: {e}"));
 
         let response_result = tokio::time::timeout(Duration::from_secs(20), response_fut).await;
         let response: Response<h2::RecvStream> = match response_result {
@@ -253,24 +261,31 @@ impl GrpcClient {
                 // Stream-level error before headers arrived. Synthesize a
                 // response so the caller can inspect it.
                 conn_task.abort();
+                let stream_error = match request_send_error {
+                    Some(send_error) => format!("{send_error}; response error: {e}"),
+                    None => format!("response error: {e}"),
+                };
                 return Ok(GrpcResponse {
                     http_status: 0,
                     headers: HeaderMap::new(),
                     messages: Vec::new(),
                     raw_body_frames: Vec::new(),
                     trailers: None,
-                    stream_error: Some(format!("response error: {e}")),
+                    stream_error: Some(stream_error),
                 });
             }
             Err(_) => {
                 conn_task.abort();
+                let stream_error = request_send_error
+                    .map(|send_error| format!("{send_error}; response timed out"))
+                    .unwrap_or_else(|| "response timed out".to_string());
                 return Ok(GrpcResponse {
                     http_status: 0,
                     headers: HeaderMap::new(),
                     messages: Vec::new(),
                     raw_body_frames: Vec::new(),
                     trailers: None,
-                    stream_error: Some("response timed out".into()),
+                    stream_error: Some(stream_error),
                 });
             }
         };
