@@ -14603,6 +14603,8 @@ async fn handle_proxy_request_inner(
     // admitted the request. This preserves the open-breaker behavior (no slow
     // upload drain or body-plugin I/O before the immediate 503) while still
     // updating response buffering and transport preference before dispatch.
+    // Do not acquire backend-admission permits here: adaptive-concurrency slots
+    // must cover backend dispatch only, not attacker-controlled upload time.
     let preparation_backend_host = upstream_target
         .as_deref()
         .map(|target| target.host.as_str())
@@ -14622,40 +14624,6 @@ async fn handle_proxy_request_inner(
         || backend_dispatch::direct_http_mesh_transport_refusal(upstream_target.as_deref())
             .is_some();
     if reevaluate_response_policy_after_request_body && !preparation_blocked_by_dispatch_policy {
-        if !backend_admission_plugins.is_empty() {
-            let admission_proxy =
-                resolve_effective_proxy_for_target(&proxy, upstream_target.as_deref());
-            let permits = match backend_dispatch::run_backend_admission_plugins(
-                backend_admission_plugins.as_ref(),
-                &ctx,
-                admission_proxy.as_ref(),
-                upstream_target.as_deref(),
-                ProxyProtocol::Http,
-            ) {
-                Ok(permits) => permits,
-                Err(rejection) => {
-                    release_circuit_breaker_probe_on_admission_reject(
-                        &state,
-                        &proxy,
-                        cb_target_key.as_deref(),
-                        cb_is_half_open_probe,
-                    );
-                    return Ok(handle_backend_admission_rejection(
-                        rejection,
-                        &plugins,
-                        &mut ctx,
-                        &state,
-                        start_time,
-                        plugin_execution_ns,
-                        Some(&original_request_path),
-                        is_grpc_request,
-                        grpc_web_response_content_type,
-                    )
-                    .await);
-                }
-            };
-            preacquired_backend_admission = PreacquiredBackendAdmission::acquired(permits);
-        }
         let hook_headers = owned_proxy_headers.as_ref().unwrap_or(&ctx.headers).clone();
         client_request_body = match client_request_body {
             ClientRequestBody::Streaming(request) => {
@@ -19891,12 +19859,10 @@ enum BackendDispatchResult {
     AdmissionRejected(backend_dispatch::BackendAdmissionRejection),
 }
 
-/// Backend-admission result acquired before request-body finalization.
+/// Backend-admission result supplied before entering the dispatch helper.
 ///
 /// The explicit `was_run` bit distinguishes "admission ran and no plugin
-/// returned a permit" from "admission has not run yet". This lets the narrow
-/// post-transform response-policy path preserve fail-fast admission without
-/// invoking admission plugins twice on accepted requests.
+/// returned a permit" from "admission has not run yet".
 #[derive(Default)]
 pub(crate) struct PreacquiredBackendAdmission {
     was_run: bool,
@@ -19904,13 +19870,6 @@ pub(crate) struct PreacquiredBackendAdmission {
 }
 
 impl PreacquiredBackendAdmission {
-    pub(crate) fn acquired(permits: Option<BackendAdmissionPermitSet>) -> Self {
-        Self {
-            was_run: true,
-            permits,
-        }
-    }
-
     pub(crate) fn take_if_acquired(&mut self) -> Option<Option<BackendAdmissionPermitSet>> {
         self.was_run.then(|| {
             self.was_run = false;
@@ -20200,10 +20159,8 @@ async fn proxy_to_backend(
     ctx_bytes_sent_observed: &Arc<std::sync::atomic::AtomicU64>,
     inbound_version: hyper::Version,
     // Out-parameter: reset immediately before the backend dial / send, after
-    // admission permits are available. A narrow response-policy reevaluation
-    // path may preacquire admission before body finalization to preserve
-    // fail-fast rejection; its client-upload/body-hook time must still stay out
-    // of the backend latency sample.
+    // admission permits are available. This keeps client-upload/body-hook time
+    // out of the backend latency sample.
     // Left at its incoming value (the caller's `backend_start`) on paths that
     // never reach admission, so the fallback is the pre-fix behavior.
     backend_admission_started_at: &mut Instant,

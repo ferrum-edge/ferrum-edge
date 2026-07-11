@@ -193,7 +193,6 @@ where
     pub ctx: &'a mut RequestContext,
     pub plugins: &'a [Arc<dyn Plugin>],
     pub backend_admission_plugins: &'a [Arc<dyn Plugin>],
-    pub preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
     pub requires_response_body_buffering: bool,
     pub requires_response_stream_hooks: bool,
     pub sticky_cookie_needed: bool,
@@ -521,7 +520,6 @@ where
         ctx,
         plugins,
         backend_admission_plugins,
-        preacquired_backend_admission,
         requires_response_body_buffering,
         requires_response_stream_hooks,
         sticky_cookie_needed,
@@ -619,7 +617,6 @@ where
                 ctx,
                 plugins,
                 backend_admission_plugins,
-                preacquired_backend_admission,
                 requires_response_body_buffering,
                 requires_response_stream_hooks,
                 sticky_cookie_needed,
@@ -1192,7 +1189,6 @@ async fn dispatch_plain<S>(
     ctx: &mut RequestContext,
     plugins: &[Arc<dyn Plugin>],
     backend_admission_plugins: &[Arc<dyn Plugin>],
-    mut preacquired_backend_admission: crate::proxy::PreacquiredBackendAdmission,
     requires_response_body_buffering: bool,
     requires_response_stream_hooks: bool,
     sticky_cookie_needed: bool,
@@ -1311,30 +1307,26 @@ where
 
                     let backend_admission_start = Instant::now();
                     let mut backend_admission_permits =
-                        if let Some(permits) = preacquired_backend_admission.take_if_acquired() {
-                            permits
-                        } else {
-                            match run_cross_protocol_backend_admission_or_reject(
-                                backend_admission_plugins,
-                                plugins,
-                                ctx,
-                                dispatch_proxy,
-                                current_target.as_deref(),
-                                HttpFlavor::Plain,
-                                stream,
-                                backend_start,
-                                bytes_sent,
-                                state,
-                                current_cb_target_key.as_deref(),
-                                cb_retry_probe_slot_available,
-                                Some(&mut pending_slot),
-                            )
-                            .await?
-                            {
-                                Ok(permits) => permits,
-                                // Probe release happens inside the helper, before the reject write.
-                                Err(outcome) => return Ok(outcome),
-                            }
+                        match run_cross_protocol_backend_admission_or_reject(
+                            backend_admission_plugins,
+                            plugins,
+                            ctx,
+                            dispatch_proxy,
+                            current_target.as_deref(),
+                            HttpFlavor::Plain,
+                            stream,
+                            backend_start,
+                            bytes_sent,
+                            state,
+                            current_cb_target_key.as_deref(),
+                            cb_retry_probe_slot_available,
+                            Some(&mut pending_slot),
+                        )
+                        .await?
+                        {
+                            Ok(permits) => permits,
+                            // Probe release happens inside the helper, before the reject write.
+                            Err(outcome) => return Ok(outcome),
                         };
                     record_cross_protocol_connection_start(
                         upstream_balancer,

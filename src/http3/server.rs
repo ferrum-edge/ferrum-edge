@@ -2019,7 +2019,6 @@ async fn handle_h3_request(
 
     let backend_admission_plugins = plugin_cache_view.backend_admission_plugins();
     let mut backend_admission_permits: Option<BackendAdmissionPermitSet>;
-    let mut preacquired_backend_admission = crate::proxy::PreacquiredBackendAdmission::default();
     let mut backend_admission_start: std::time::Instant;
 
     // H3 records the circuit-breaker outcome at header time (it does not defer the
@@ -2052,6 +2051,8 @@ async fn handle_h3_request(
     // Preserve fail-fast breaker behavior: only drain/transform an H3 request
     // body after the selected target's breaker admits it. Every local failure
     // below releases a HALF_OPEN probe before writing the client response.
+    // Backend-admission permits are intentionally acquired after body
+    // preparation so slow uploads cannot pin adaptive-concurrency slots.
     let preparation_backend_host = upstream_target
         .as_deref()
         .map(|target| target.host.as_str())
@@ -2076,29 +2077,6 @@ async fn handle_h3_request(
         )
         .is_some();
     if reevaluate_response_policy_after_request_body && !preparation_blocked_by_dispatch_policy {
-        if !backend_admission_plugins.is_empty() {
-            let permits = match run_h3_backend_admission_or_send_reject(
-                backend_admission_plugins.as_ref(),
-                &plugins,
-                &mut ctx,
-                &proxy,
-                upstream_target.as_deref(),
-                http_flavor,
-                &mut stream,
-                &state,
-                start_time,
-                plugin_execution_ns,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            )
-            .await?
-            {
-                Ok(permits) => permits,
-                Err(()) => return Ok(()),
-            };
-            preacquired_backend_admission =
-                crate::proxy::PreacquiredBackendAdmission::acquired(permits);
-        }
         let body_was_prebuffered = prebuffered_body_data.is_some();
         let mut body_data = prebuffered_body_data.take().unwrap_or_default();
         if !body_was_prebuffered {
@@ -2715,7 +2693,6 @@ async fn handle_h3_request(
                 ctx: &mut ctx,
                 plugins: &plugins,
                 backend_admission_plugins: backend_admission_plugins.as_ref(),
-                preacquired_backend_admission,
                 requires_response_body_buffering: maybe_requires_response_body_buffering,
                 requires_response_stream_hooks: stream_hooks_enabled,
                 sticky_cookie_needed,
@@ -3902,31 +3879,26 @@ async fn handle_h3_request(
     }
 
     backend_admission_start = std::time::Instant::now();
-    backend_admission_permits =
-        if let Some(permits) = preacquired_backend_admission.take_if_acquired() {
-            permits
-        } else {
-            match run_h3_backend_admission_or_send_reject(
-                backend_admission_plugins.as_ref(),
-                &plugins,
-                &mut ctx,
-                &proxy,
-                upstream_target.as_deref(),
-                http_flavor,
-                &mut stream,
-                &state,
-                start_time,
-                plugin_execution_ns,
-                cb_target_key.as_deref(),
-                cb_is_half_open_probe,
-            )
-            .await?
-            {
-                Ok(permits) => permits,
-                // Probe release happens inside the helper, before the reject write.
-                Err(()) => return Ok(()),
-            }
-        };
+    backend_admission_permits = match run_h3_backend_admission_or_send_reject(
+        backend_admission_plugins.as_ref(),
+        &plugins,
+        &mut ctx,
+        &proxy,
+        upstream_target.as_deref(),
+        http_flavor,
+        &mut stream,
+        &state,
+        start_time,
+        plugin_execution_ns,
+        cb_target_key.as_deref(),
+        cb_is_half_open_probe,
+    )
+    .await?
+    {
+        Ok(permits) => permits,
+        // Probe release happens inside the helper, before the reject write.
+        Err(()) => return Ok(()),
+    };
 
     // Track connection for least-connections LB (after all pre-dispatch rejects).
     // Placed here so the streaming-request path above handles its own tracking,
