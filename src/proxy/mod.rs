@@ -20914,17 +20914,14 @@ async fn proxy_to_backend(
                 //   2. Rejections from `run_final_request_body_hooks` still
                 //      surface the original on-wire size in the log summary.
                 // `fetch_max` preserves the largest observed value across
-                // retries where plugin transforms may shrink the body. The
-                // pre-dispatch finalization path already recorded the raw
-                // client length before replacing this buffer with transformed
-                // bytes, so do not let an expanding transform overwrite that
-                // on-wire count here.
-                if !request_body_prepared {
-                    ctx_bytes_sent_observed.fetch_max(
-                        body_bytes.len() as u64,
-                        std::sync::atomic::Ordering::Release,
-                    );
-                }
+                // retries where plugin transforms may shrink the body. Always
+                // include the dispatch buffer length as well: prepared bodies
+                // may have expanded during request-body transforms and billing
+                // counters must not undercount bytes forwarded to backends.
+                ctx_bytes_sent_observed.fetch_max(
+                    body_bytes.len() as u64,
+                    std::sync::atomic::Ordering::Release,
+                );
                 let body_bytes = if request_body_prepared {
                     body_bytes
                 } else {
@@ -24987,12 +24984,9 @@ async fn proxy_to_backend_http3(
     };
 
     // Prepared buffers have already contributed their raw client-visible
-    // length before transformation. The buffer here may be larger after a
-    // transform, so counting it again would turn bytes_sent into backend-wire
-    // bytes instead of client-wire bytes.
-    if !request_body_prepared {
-        ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
-    }
+    // length before transformation. Include the dispatch buffer length too so
+    // expanding request-body transforms cannot undercount backend-visible bytes.
+    ctx_bytes_sent_observed.fetch_max(request_body.len() as u64, Ordering::Release);
 
     let request_body = if request_body_prepared {
         request_body
