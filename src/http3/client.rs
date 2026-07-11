@@ -941,24 +941,21 @@ fn should_probe_selected_h3_cache_after_fast_path(fast_path_failed_pre_wire: boo
     !fast_path_failed_pre_wire
 }
 
-/// A native-H3 streaming request may reconnect after a cached-connection
-/// failure only while the request is still pre-wire. `do_request_streaming_body`
-/// does not poll the borrowed frontend body until `send_request` opens the
-/// backend stream, so a pre-wire failure leaves that body untouched and safe to
-/// forward on a fresh connection. Once `request_on_wire` is true, replay would
-/// risk double-executing a non-idempotent gRPC call.
-fn should_reconnect_streaming_body_after_cached_failure(error: &H3PoolError) -> bool {
-    !error.request_on_wire()
+/// Native-H3 streaming requests must not reconnect after a cached-connection
+/// failure. A `send_request` error can be reported before the frontend body is
+/// polled, but the vendored h3 client may already have opened a backend QUIC
+/// stream and queued the request HEADERS before surfacing that error. Retrying
+/// the same streaming request would therefore risk replaying non-idempotent
+/// gRPC/POST requests.
+fn should_reconnect_streaming_body_after_cached_failure(_error: &H3PoolError) -> bool {
+    false
 }
 
-/// Reconnect gate for the hyper-`Incoming` streaming variants, where the body
-/// is moved into `do_request_streaming_incoming_body` instead of borrowed:
-/// fall through to a fresh connection only when the cached-connection failure
-/// was pre-wire AND the callee handed the un-polled body back. The two
-/// conditions agree by construction, but requiring both means a mislabeled
-/// error can never replay a body that may already have reached the backend.
-fn incoming_body_for_reconnect<B>(error: &H3PoolError, recovered_body: Option<B>) -> Option<B> {
-    recovered_body.filter(|_| should_reconnect_streaming_body_after_cached_failure(error))
+/// Reconnect gate for the hyper-`Incoming` streaming variants. Even when the
+/// callee can hand the un-polled body back, a `send_request` error may have
+/// already put HEADERS on the backend wire, so replaying it is not safe.
+fn incoming_body_for_reconnect<B>(_error: &H3PoolError, _recovered_body: Option<B>) -> Option<B> {
+    None
 }
 
 /// Result of a streaming HTTP/3 request — headers received, body still in flight.
@@ -2484,10 +2481,9 @@ impl Http3ConnectionPool {
             .max(1);
         let start = self.conn_counter.fetch_add(1, Ordering::Relaxed) as usize % conns_per_backend;
 
-        // No thread-local fast path for streaming body. A post-wire failure may
-        // have consumed frontend bytes and cannot be replayed, but a cached
-        // connection that fails before `send_request` opens the backend stream
-        // leaves the borrowed frontend body untouched, so reconnecting is safe.
+        // No thread-local fast path for streaming body. Cached-connection
+        // failures are not replayed: even a `send_request` error can occur
+        // after h3 queued HEADERS on the backend stream.
         let key = self.pool_key_with_current_generation(proxy, start);
 
         if let Some(pooled) = self.pool.cached(&key) {
@@ -2517,17 +2513,14 @@ impl Http3ConnectionPool {
                     if !should_reconnect_streaming_body_after_cached_failure(&e) {
                         return Err(e);
                     }
-                    // `send_request` failed before opening a backend stream, so
-                    // `frontend_stream` has not been polled. Fall through to a
-                    // fresh connection instead of surfacing a spurious gRPC
-                    // UNAVAILABLE for a stale warmed pool entry.
+                    // Streaming requests are never replayed here: h3 may have
+                    // put HEADERS on the backend wire before returning an error.
                 }
             }
         }
 
-        // Create a new connection. Reaching here after a cached failure is safe
-        // only because the gate above proved it was pre-wire; therefore no sticky
-        // `request_on_wire` state needs to be promoted into this attempt.
+        // Create a new connection for cache misses. Cached streaming failures
+        // return above instead of replaying a possibly-on-wire request.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let pooled = self
@@ -2595,11 +2588,9 @@ impl Http3ConnectionPool {
                         e
                     );
                     self.pool.invalidate(&key);
-                    // A pre-wire failure hands the un-polled `Incoming` body
-                    // back; fall through to a fresh connection with it instead
-                    // of surfacing a spurious error for a stale warmed pool
-                    // entry. Post-wire failures may have consumed body bytes
-                    // and are never replayed.
+                    // Do not replay streaming requests: even with the body
+                    // recovered, h3 may have queued HEADERS before returning
+                    // a `send_request` error.
                     match incoming_body_for_reconnect(&e, recovered_body) {
                         Some(body) => frontend_body = body,
                         None => return Err(e),
@@ -2608,10 +2599,8 @@ impl Http3ConnectionPool {
             }
         }
 
-        // Create a new connection. Any cached failure that reached this point
-        // was pre-wire (the gate above recovered the un-polled body), so
-        // replay safety is preserved and no sticky `request_on_wire` state
-        // needs to be promoted into this attempt.
+        // Create a new connection for cache misses. Cached streaming failures
+        // return above instead of replaying a possibly-on-wire request.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let pooled = self
@@ -2705,14 +2694,14 @@ impl Http3ConnectionPool {
                     if !should_reconnect_streaming_body_after_cached_failure(&e) {
                         return Err(e);
                     }
-                    // Pre-wire means the borrowed frontend stream is still
-                    // untouched, so retry the same target on a fresh connection.
+                    // Streaming requests are never replayed here: h3 may have
+                    // put HEADERS on the backend wire before returning an error.
                 }
             }
         }
 
-        // Create a new connection. Any cached failure that reached this point
-        // was pre-wire, so replay safety is preserved.
+        // Create a new connection for cache misses. Cached streaming failures
+        // return above instead of replaying a possibly-on-wire request.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let pooled = self
@@ -2805,10 +2794,8 @@ impl Http3ConnectionPool {
             }
         }
 
-        // Create a new connection. Any cached failure that reached this point
-        // was pre-wire (the gate above recovered the un-polled body), so
-        // replay safety is preserved and no sticky `request_on_wire` state
-        // needs to be promoted into this attempt.
+        // Create a new connection for cache misses. Cached streaming failures
+        // return above instead of replaying a possibly-on-wire request.
         let tls_config = tls_config_fn().map_err(H3PoolError::pre_wire)?;
         let h3_config = super::config::Http3ServerConfig::from_env_config(&self.env_config);
         let pooled = self
@@ -3417,11 +3404,11 @@ mod h3_pool_error_tests {
     }
 
     #[test]
-    fn streaming_body_reconnects_only_before_request_reaches_wire() {
+    fn streaming_body_never_reconnects_after_cached_failure() {
         let pre_wire = H3PoolError::pre_wire(anyhow::anyhow!("cached send_request failed"));
         assert!(
-            should_reconnect_streaming_body_after_cached_failure(&pre_wire),
-            "pre-wire cached failure leaves the borrowed frontend body untouched"
+            !should_reconnect_streaming_body_after_cached_failure(&pre_wire),
+            "send_request errors may have queued HEADERS and must not replay"
         );
 
         let post_wire = H3PoolError::post_wire(anyhow::anyhow!("cached send_data failed"));
@@ -3432,15 +3419,15 @@ mod h3_pool_error_tests {
     }
 
     #[test]
-    fn incoming_streaming_body_reconnects_only_pre_wire_with_recovered_body() {
+    fn incoming_streaming_body_never_reconnects_after_cached_failure() {
         let pre_wire = H3PoolError::pre_wire(anyhow::anyhow!("cached send_request failed"));
         assert!(
-            incoming_body_for_reconnect(&pre_wire, Some(())).is_some(),
-            "pre-wire cached failure with the un-polled body recovered must replay on a fresh connection"
+            incoming_body_for_reconnect(&pre_wire, Some(())).is_none(),
+            "even with the body recovered, send_request may have queued HEADERS"
         );
         assert!(
             incoming_body_for_reconnect::<()>(&pre_wire, None).is_none(),
-            "without the recovered body there is nothing safe to replay, even for a pre-wire error"
+            "without the recovered body there is nothing safe to replay"
         );
 
         let post_wire = H3PoolError::post_wire(anyhow::anyhow!("cached send_data failed"));
