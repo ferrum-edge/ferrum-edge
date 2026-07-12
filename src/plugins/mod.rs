@@ -2950,6 +2950,17 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Returns `true` when a [`PluginResult::Reject`] from this plugin's
+    /// reject-path [`Self::after_proxy`] hook must replace the still-uncommitted
+    /// response.
+    ///
+    /// Most reject-path hooks only decorate headers and retain the historical
+    /// ignore-on-reject behavior. Fail-closed enforcement plugins may opt in at
+    /// the shared finalizer, before any response bytes are sent.
+    fn may_replace_rejection_response(&self) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin needs the entire response body buffered
     /// in memory before forwarding to the client. When any active plugin
     /// returns `true`, the gateway forces buffered mode for that proxy

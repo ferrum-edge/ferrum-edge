@@ -888,6 +888,17 @@ plugin_configs:
     enabled: true
 ```
 
+`backend_read_timeout_ms` defaults to `30000` (30 seconds). For HTTP and gRPC
+proxies it has two roles: it bounds backend response reads, and it is the total
+(not idle) deadline for collecting a client request body whenever retries or
+body-processing policy require Ferrum to buffer that upload before dispatch.
+Buffered uploads that take longer than the configured total deadline are
+deliberately rejected with HTTP `408 Request Timeout` or gRPC
+`DEADLINE_EXCEEDED`, even if the client is still making progress; increase the
+value for legitimate slow buffered uploads. Streaming pass-through uploads are
+unaffected. Set the value to `0` to disable both the backend read bound and this
+buffered-upload collection deadline.
+
 ### Stream Proxy (TCP/UDP/DTLS)
 
 Stream proxies use `listen_port` instead of `listen_path` and bind to dedicated ports:

@@ -51,7 +51,10 @@ use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
     ResponseStreamInspector, TransactionSummary,
 };
-use crate::proxy::{REJECTION_RESPONSE_METADATA_KEY, SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY};
+use crate::proxy::{
+    REJECTION_RESPONSE_METADATA_KEY, REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY,
+    SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY,
+};
 
 /// Schema version stamped onto every emitted record.
 const RECORD_VERSION: u32 = 1;
@@ -177,6 +180,10 @@ struct AuditStaging {
     request_model: Option<String>,
     tool_names: Vec<String>,
     commit_permit: Option<BatchingLoggerPermit<AuditRecord>>,
+    /// True only after the response path confirms that this transaction is
+    /// actively streaming. A pre-commit reservation alone is not sufficient:
+    /// requests abandoned before stream selection must remain TTL-collectable.
+    stream_active: bool,
 }
 
 /// Response bytes captured by the streaming inspector, handed to
@@ -672,14 +679,77 @@ impl AiTranscriptAudit {
         PluginResult::Continue
     }
 
+    fn stream_commit_selected(
+        &self,
+        ctx: &RequestContext,
+        _response_status: u16,
+        _content_type: Option<&str>,
+    ) -> bool {
+        if self.capture.streaming == StreamingCapture::Off
+            || !flag(&ctx.metadata, MD_CANDIDATE)
+            || !flag(&ctx.metadata, &self.stream_marker_key())
+        {
+            return false;
+        }
+
+        let sample_hit = self.staged_sample_hit(&ctx.metadata);
+        sample_hit
+            // A response-side streaming inspector can fire the guardrail only
+            // after headers commit. Reserve now for that possible terminal
+            // emission; the permit is released if the stream completes without
+            // an emission override.
+            || self.sampling.always_on_guardrail
+            // A 2xx stream can still terminate with a body error after headers
+            // commit. Reserve before commit whenever terminal errors override
+            // sampling so that later failure records remain fail-closed.
+            || self.sampling.always_on_error
+    }
+
+    fn stream_fail_closed_rejection(
+        &self,
+        ctx: &mut RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> PluginResult {
+        let content_type = response_headers.get("content-type").map(String::as_str);
+        if !self.stream_commit_selected(ctx, response_status, content_type) {
+            return PluginResult::Continue;
+        }
+
+        let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
+            return PluginResult::Continue;
+        };
+        let Some(mut staging) = self.staging.get_mut(&record_id) else {
+            return PluginResult::Continue;
+        };
+        if self.on_buffer_full == BufferFullPolicy::Reject && staging.commit_permit.is_none() {
+            let Some(permit) = self.logger.try_reserve() else {
+                ctx.metadata
+                    .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+                return reject_audit_unavailable();
+            };
+            staging.commit_permit = Some(permit);
+        }
+        if self.on_sink_error == SinkErrorPolicy::Reject
+            && !self.sink_healthy.load(Ordering::Relaxed)
+        {
+            ctx.metadata
+                .insert(MD_SINK_STATUS.to_string(), "rejected".to_string());
+            return reject_audit_unavailable();
+        }
+        PluginResult::Continue
+    }
+
     fn sweep_staging(&self) {
         if self.staging.len() < STAGING_SWEEP_THRESHOLD {
             return;
         }
         let now = Instant::now();
         let ttl = self.staging_ttl;
-        self.staging
-            .retain(|_, staging| now.duration_since(staging.captured_at) < ttl);
+        self.staging.retain(|_, staging| {
+            (staging.stream_active && staging.commit_permit.is_some())
+                || now.duration_since(staging.captured_at) < ttl
+        });
     }
 
     fn shape_body(&self, raw: &[u8], max_bytes: usize) -> (Option<String>, bool) {
@@ -786,6 +856,7 @@ impl AiTranscriptAudit {
                 request_model,
                 tool_names,
                 commit_permit: None,
+                stream_active: false,
             },
         );
     }
@@ -1277,6 +1348,10 @@ impl Plugin for AiTranscriptAudit {
         self.active
     }
 
+    fn may_replace_rejection_response(&self) -> bool {
+        self.active
+    }
+
     /// On a `before_proxy` short-circuit (no backend dispatch, so no final
     /// request-body hook), a later terminator can rewrite `request_body` after we
     /// staged the candidate — e.g. `ai_prompt_shield` redacts, then
@@ -1290,8 +1365,8 @@ impl Plugin for AiTranscriptAudit {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
-        _response_headers: &mut HashMap<String, String>,
+        response_status: u16,
+        response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if !self.active || !flag(&ctx.metadata, MD_CANDIDATE) {
             return PluginResult::Continue;
@@ -1302,15 +1377,34 @@ impl Plugin for AiTranscriptAudit {
             self.refresh_staged_request(ctx, body.as_bytes());
             ctx.metadata.insert("request_body".to_string(), body);
         }
+        if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY)
+            && !ctx
+                .metadata
+                .contains_key(REPLACEABLE_REJECTION_RESPONSE_METADATA_KEY)
+        {
+            // Proxy core cannot apply a fresh reject while replaying hooks over
+            // an already-fixed response. Only the explicitly replaceable pass
+            // may perform fail-closed admission here.
+            return PluginResult::Continue;
+        }
+        if self.capture.streaming != StreamingCapture::Off {
+            let stream_admission =
+                self.stream_fail_closed_rejection(ctx, response_status, response_headers);
+            if !matches!(stream_admission, PluginResult::Continue) {
+                return stream_admission;
+            }
+        }
         if flag(&ctx.metadata, MD_STREAM_REQUEST) {
+            // Stream admission above is selective: unsampled successful
+            // streams must not consume buffered-response capacity.
             PluginResult::Continue
-        } else if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY) {
-            // `apply_after_proxy_hooks_to_rejection` is replaying header hooks
-            // over an already-fixed response and ignores replacement rejects.
-            // Admission ran in `before_proxy` (or the normal backend
-            // `after_proxy` pass); do not stamp a new rejected verdict whose
-            // 503 cannot replace the response at this point.
-            PluginResult::Continue
+        } else if self.buffered_response_capture_wanted(ctx) {
+            // Streaming and buffered capture are independent policies. A
+            // response that remains JSON still needs the buffered path's
+            // admission even when streaming capture is also configured. Both
+            // checks reuse the same per-record permit when they select the
+            // same eventual audit record.
+            self.ensure_commit_admission(ctx)
         } else {
             self.ensure_commit_admission(ctx)
         }
@@ -1526,16 +1620,21 @@ impl Plugin for AiTranscriptAudit {
     fn on_response_stream_selected(
         &self,
         ctx: &RequestContext,
-        _response_status: u16,
-        _content_type: Option<&str>,
+        response_status: u16,
+        content_type: Option<&str>,
     ) {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID) else {
             return;
         };
-        // A streamed response cannot be rejected after its headers commit.
-        // Release capacity reserved by the conservative pre-header buffering
-        // decision for every content type and transport, including direct
-        // H2/H3 responses for which no chunk inspector attaches.
+        // Retain a slot reserved by the final pre-commit stream admission; the
+        // terminal hook or log fallback consumes it after the response ends.
+        // Other streams still release any conservative buffered-response slot.
+        if self.stream_commit_selected(ctx, response_status, content_type) {
+            if let Some(mut staging) = self.staging.get_mut(record_id) {
+                staging.stream_active = true;
+            }
+            return;
+        }
         if let Some(mut staging) = self.staging.get_mut(record_id) {
             staging.commit_permit.take();
         }
@@ -1615,6 +1714,12 @@ impl Plugin for AiTranscriptAudit {
         let Some((_, slot)) = self.pending_streams.remove(&record_id) else {
             return; // not a stream we teed
         };
+        // The response is no longer active. Normally this hook or the immediate
+        // log fallback consumes staging; clearing the marker also ensures an
+        // unexpectedly orphaned terminal record can be reclaimed after its TTL.
+        if let Some(mut staging) = self.staging.get_mut(&record_id) {
+            staging.stream_active = false;
+        }
         let downstream_terminated = slot.downstream_terminated.load(Ordering::Relaxed);
         let captured = slot.captured.lock().ok().and_then(|mut guard| guard.take());
         let sample_hit = self

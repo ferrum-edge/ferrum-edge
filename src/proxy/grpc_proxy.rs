@@ -1233,6 +1233,16 @@ pub enum GrpcProxyError {
     Internal(String),
 }
 
+/// Failure while collecting a buffered client gRPC request before dispatch.
+///
+/// `TimedOut` is kept separate from [`GrpcProxyError`] because it is a client
+/// upload deadline, not a backend exchange failure. Callers return
+/// DEADLINE_EXCEEDED and let their pre-dispatch probe guard settle neutrally.
+pub(crate) enum GrpcRequestBodyCollectError {
+    Proxy(GrpcProxyError),
+    TimedOut,
+}
+
 impl GrpcProxyError {
     /// Build a `BackendUnavailable` variant with no typed source.
     pub fn backend_unavailable(kind: GrpcBackendUnavailableKind, message: String) -> Self {
@@ -2174,36 +2184,53 @@ async fn proxy_grpc_streaming_dispatch(
 /// Collect the incoming gRPC request body and split the `Request<Incoming>` into
 /// its constituent parts for separate validation and dispatch.
 ///
-/// This is used when plugins require request body buffering for gRPC proxies
-/// (e.g., protobuf validation). The body bytes, method, and headers are returned
-/// so the caller can run plugin hooks before dispatching via `proxy_grpc_request_core`.
-pub async fn collect_grpc_request_body(
+/// This is used when plugins or retry replay require request body buffering for
+/// gRPC proxies. The body bytes, method, and headers are returned so the caller
+/// can run plugin hooks before dispatching via `proxy_grpc_request_core`.
+pub(crate) async fn collect_grpc_request_body(
     req: Request<Incoming>,
     max_grpc_recv_size_bytes: usize,
-) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcProxyError> {
+    request_body_read_timeout_ms: u64,
+) -> Result<(hyper::Method, hyper::HeaderMap, Bytes), GrpcRequestBodyCollectError> {
     let (parts, body) = req.into_parts();
     let body_bytes = if max_grpc_recv_size_bytes > 0 {
         let limited = http_body_util::Limited::new(body, max_grpc_recv_size_bytes);
-        match BodyExt::collect(limited).await {
+        let collected = super::collect_request_body_with_timeout(
+            BodyExt::collect(limited),
+            request_body_read_timeout_ms,
+        )
+        .await
+        .map_err(|_| GrpcRequestBodyCollectError::TimedOut)?;
+        match collected {
             Ok(collected) => collected.to_bytes(),
             Err(e) => {
                 if is_length_limit_error(e.as_ref()) {
-                    return Err(GrpcProxyError::ResourceExhausted(format!(
-                        "gRPC request payload size exceeds maximum of {} bytes",
-                        max_grpc_recv_size_bytes
-                    )));
+                    return Err(GrpcRequestBodyCollectError::Proxy(
+                        GrpcProxyError::ResourceExhausted(format!(
+                            "gRPC request payload size exceeds maximum of {} bytes",
+                            max_grpc_recv_size_bytes
+                        )),
+                    ));
                 }
-                return Err(GrpcProxyError::Internal(format!(
-                    "Failed to read request body: {}",
-                    e
-                )));
+                return Err(GrpcRequestBodyCollectError::Proxy(
+                    GrpcProxyError::Internal(format!("Failed to read request body: {}", e)),
+                ));
             }
         }
     } else {
-        BodyExt::collect(body)
-            .await
-            .map_err(|e| GrpcProxyError::Internal(format!("Failed to read request body: {}", e)))?
-            .to_bytes()
+        super::collect_request_body_with_timeout(
+            BodyExt::collect(body),
+            request_body_read_timeout_ms,
+        )
+        .await
+        .map_err(|_| GrpcRequestBodyCollectError::TimedOut)?
+        .map_err(|e| {
+            GrpcRequestBodyCollectError::Proxy(GrpcProxyError::Internal(format!(
+                "Failed to read request body: {}",
+                e
+            )))
+        })?
+        .to_bytes()
     };
     Ok((parts.method, parts.headers, body_bytes))
 }

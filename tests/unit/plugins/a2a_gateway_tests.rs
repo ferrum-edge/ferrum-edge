@@ -1,48 +1,13 @@
 use bytes::Bytes;
 use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, PluginResult, RequestContext, ResponseStreamAction, create_plugin,
+    HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, RequestContext, ResponseStreamAction, create_plugin,
+    create_response_stream_inspector,
+    utils::metadata_redaction::is_sensitive_metadata_key_with_extras,
 };
+use ferrum_edge::proxy::deferred_log::BodyOutcome;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::io;
-use std::sync::{Arc, Mutex};
-use tracing_subscriber::fmt::MakeWriter;
-
-#[derive(Clone, Default)]
-struct SharedWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedWriter {
-    fn contents(&self) -> String {
-        String::from_utf8(self.buffer.lock().unwrap().clone()).unwrap_or_default()
-    }
-}
-
-struct SharedGuard {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl io::Write for SharedGuard {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> MakeWriter<'a> for SharedWriter {
-    type Writer = SharedGuard;
-
-    fn make_writer(&'a self) -> Self::Writer {
-        SharedGuard {
-            buffer: Arc::clone(&self.buffer),
-        }
-    }
-}
+use std::sync::Arc;
 
 fn plugin(config: Value) -> std::sync::Arc<dyn ferrum_edge::plugins::Plugin> {
     create_plugin("a2a_gateway", &config)
@@ -1291,17 +1256,10 @@ async fn streaming_jsonrpc_does_not_force_response_buffering() {
     ));
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test]
 async fn streaming_jsonrpc_inspector_extracts_multichunk_sse_terminal_metadata() {
-    let writer = SharedWriter::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .without_time()
-        .with_writer(writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-
     let plugin = plugin(json!({}));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&plugin)];
     let (mut ctx, mut headers) = jsonrpc_ctx(json!({
         "jsonrpc": "2.0",
         "id": "req-stream",
@@ -1312,9 +1270,13 @@ async fn streaming_jsonrpc_inspector_extracts_multichunk_sse_terminal_metadata()
     assert!(plugin.requires_response_stream_hooks());
     assert!(plugin.forces_reqwest_dispatch(&ctx));
 
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 200, Some("text/event-stream; charset=utf-8"))
-        .expect("detected 2xx A2A SSE response should attach an inspector");
+    let mut inspector = create_response_stream_inspector(
+        &plugins,
+        &mut ctx,
+        200,
+        Some("text/event-stream; charset=utf-8"),
+    )
+    .expect("detected 2xx A2A SSE response should attach an inspector");
     let chunks: &[&[u8]] = &[
         b"data: {\"jsonrpc\":\"2.0\",\"result\":{\"taskId\":\"task-9\",\"contextId\":\"ctx-4\",\"status\":{\"state\":\"working\"}}}\n\nda",
         b"ta: {\"jsonrpc\":\"2.0\",\"result\":{\"taskId\":\"task-9\",\"contextId\":\"ctx-4\",\"status\":{\"state\":\"TASK_STATE_",
@@ -1330,21 +1292,44 @@ async fn streaming_jsonrpc_inspector_extracts_multichunk_sse_terminal_metadata()
     }
     let end = inspector.on_end().await;
     assert!(matches!(end, ResponseStreamAction::Forward(ref bytes) if bytes.is_empty()));
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
+        .await;
 
-    drop(guard);
-    let logs = writer.contents();
-    assert!(logs.contains("a2a.stream_events=2"), "logs: {logs}");
-    assert!(logs.contains("a2a.task_id=\"task-9\""), "logs: {logs}");
-    assert!(logs.contains("a2a.context_id=\"ctx-4\""), "logs: {logs}");
-    assert!(
-        logs.contains("a2a.task_state=\"completed\""),
-        "logs: {logs}"
+    assert_eq!(
+        ctx.metadata.get("a2a.stream_events").map(String::as_str),
+        Some("2")
     );
+    assert_eq!(
+        ctx.metadata.get("a2a.task_id").map(String::as_str),
+        Some("task-9")
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.context_id").map(String::as_str),
+        Some("ctx-4")
+    );
+    assert_eq!(
+        ctx.metadata.get("a2a.task_state").map(String::as_str),
+        Some("completed")
+    );
+
+    let extras = vec![
+        "a2a.task_id".to_string(),
+        "a2a.context_id".to_string(),
+        "a2a.task_state".to_string(),
+    ];
+    for key in ["a2a.task_id", "a2a.context_id", "a2a.task_state"] {
+        assert!(
+            is_sensitive_metadata_key_with_extras(key, &extras),
+            "central metadata serialization must redact {key}"
+        );
+    }
 }
 
 #[tokio::test]
-async fn streaming_jsonrpc_inspector_forwards_incomplete_event_without_holding() {
+async fn streaming_jsonrpc_termination_before_inspector_end_does_not_emit_metadata() {
     let plugin = plugin(json!({}));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&plugin)];
     let (mut ctx, mut headers) = jsonrpc_ctx(json!({
         "jsonrpc": "2.0",
         "id": "req-stream",
@@ -1353,9 +1338,92 @@ async fn streaming_jsonrpc_inspector_forwards_incomplete_event_without_holding()
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 
-    let mut inspector = plugin
-        .response_stream_inspector(&ctx, 206, Some("TEXT/EVENT-STREAM"))
-        .expect("detected 2xx A2A SSE response should attach an inspector");
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("detected 2xx A2A SSE response should attach an inspector");
+    let chunk = b"data: {\"result\":{\"taskId\":\"task-9\"}}\n\n";
+    assert!(matches!(
+        inspector.on_chunk(chunk).await,
+        ResponseStreamAction::Forward(_)
+    ));
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::client_disconnect(0))
+        .await;
+    assert!(!ctx.metadata.contains_key("a2a.stream_events"));
+    assert!(!ctx.metadata.contains_key("a2a.task_id"));
+
+    let end = inspector.on_end().await;
+    assert!(matches!(end, ResponseStreamAction::Forward(ref bytes) if bytes.is_empty()));
+}
+
+#[tokio::test]
+async fn streaming_jsonrpc_observation_omits_absent_optional_metadata() {
+    let plugin = plugin(json!({}));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&plugin)];
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-stream",
+        "method": "message/stream"
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 200, Some("text/event-stream"))
+            .expect("detected 2xx A2A SSE response should attach an inspector");
+    let chunk = b"data: {\"jsonrpc\":\"2.0\",\"result\":{}}\n\n";
+    assert!(matches!(
+        inspector.on_chunk(chunk).await,
+        ResponseStreamAction::Forward(_)
+    ));
+    let end = inspector.on_end().await;
+    assert!(matches!(end, ResponseStreamAction::Forward(ref bytes) if bytes.is_empty()));
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(chunk.len() as u64))
+        .await;
+    assert_eq!(
+        ctx.metadata.get("a2a.stream_events").map(String::as_str),
+        Some("1")
+    );
+    for key in ["a2a.task_id", "a2a.context_id", "a2a.task_state"] {
+        assert!(!ctx.metadata.contains_key(key));
+    }
+}
+
+#[tokio::test]
+async fn streaming_termination_is_a_noop_when_metadata_is_disabled() {
+    let plugin = plugin(json!({
+        "observability": {"emit_metadata": false}
+    }));
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/a2a".to_string(),
+    );
+
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(0))
+        .await;
+    assert!(ctx.metadata.is_empty());
+}
+
+#[tokio::test]
+async fn streaming_jsonrpc_inspector_forwards_incomplete_event_without_holding() {
+    let plugin = plugin(json!({}));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&plugin)];
+    let (mut ctx, mut headers) = jsonrpc_ctx(json!({
+        "jsonrpc": "2.0",
+        "id": "req-stream",
+        "method": "message/stream"
+    }));
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let mut inspector =
+        create_response_stream_inspector(&plugins, &mut ctx, 206, Some("TEXT/EVENT-STREAM"))
+            .expect("detected 2xx A2A SSE response should attach an inspector");
     let partial = b"data: {\"result\":{\"status\":{\"state\":\"work";
     let action = inspector.on_chunk(partial).await;
     let ResponseStreamAction::Forward(forwarded) = action else {

@@ -7,8 +7,10 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
+use dashmap::DashMap;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tracing::warn;
 use url::Url;
 
@@ -175,6 +177,16 @@ pub struct A2aGateway {
     discovery: A2aDiscoveryConfig,
     observability: A2aObservabilityConfig,
     policy: A2aPolicyConfig,
+    pending_stream_observations: Arc<DashMap<u64, A2aStreamObservationSlot>>,
+}
+
+type A2aStreamObservationSlot = Arc<Mutex<Option<A2aStreamObservation>>>;
+
+struct A2aStreamObservation {
+    stream_events: u64,
+    task_id: Option<String>,
+    context_id: Option<String>,
+    task_state: Option<String>,
 }
 
 /// Observe-only SSE parser for one A2A response.
@@ -196,11 +208,11 @@ struct A2aSseStreamInspector {
     task_id: Option<String>,
     context_id: Option<String>,
     task_state: Option<String>,
-    emitted: bool,
+    observation: A2aStreamObservationSlot,
 }
 
 impl A2aSseStreamInspector {
-    fn new(binding: Option<&'static str>) -> Self {
+    fn new(binding: Option<&'static str>, observation: A2aStreamObservationSlot) -> Self {
         Self {
             binding,
             line: Vec::new(),
@@ -213,7 +225,7 @@ impl A2aSseStreamInspector {
             task_id: None,
             context_id: None,
             task_state: None,
-            emitted: false,
+            observation,
         }
     }
 
@@ -322,49 +334,19 @@ impl A2aSseStreamInspector {
         }
     }
 
-    fn emit_observation(&mut self) {
-        if self.emitted {
-            return;
-        }
-        self.emitted = true;
-        let task_state = self.task_state.as_deref().unwrap_or("");
-        match (self.task_id.as_deref(), self.context_id.as_deref()) {
-            (Some(task_id), Some(context_id)) => tracing::info!(
-                target: "a2a_gateway",
-                {
-                    "a2a.stream_events" = self.stream_events,
-                    "a2a.task_id" = task_id,
-                    "a2a.context_id" = context_id,
-                    "a2a.task_state" = task_state
-                },
-                "observed A2A SSE response metadata"
-            ),
-            (Some(task_id), None) => tracing::info!(
-                target: "a2a_gateway",
-                {
-                    "a2a.stream_events" = self.stream_events,
-                    "a2a.task_id" = task_id,
-                    "a2a.task_state" = task_state
-                },
-                "observed A2A SSE response metadata"
-            ),
-            (None, Some(context_id)) => tracing::info!(
-                target: "a2a_gateway",
-                {
-                    "a2a.stream_events" = self.stream_events,
-                    "a2a.context_id" = context_id,
-                    "a2a.task_state" = task_state
-                },
-                "observed A2A SSE response metadata"
-            ),
-            (None, None) => tracing::info!(
-                target: "a2a_gateway",
-                {
-                    "a2a.stream_events" = self.stream_events,
-                    "a2a.task_state" = task_state
-                },
-                "observed A2A SSE response metadata"
-            ),
+    fn publish_observation(&mut self) {
+        let observation = A2aStreamObservation {
+            stream_events: self.stream_events,
+            task_id: self.task_id.take(),
+            context_id: self.context_id.take(),
+            task_state: self.task_state.take(),
+        };
+        let mut slot = self
+            .observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.is_none() {
+            *slot = Some(observation);
         }
     }
 }
@@ -378,7 +360,7 @@ impl ResponseStreamInspector for A2aSseStreamInspector {
 
     async fn on_end(&mut self) -> ResponseStreamAction {
         self.finish();
-        self.emit_observation();
+        self.publish_observation();
         ResponseStreamAction::Forward(Bytes::new())
     }
 }
@@ -407,6 +389,9 @@ impl A2aGateway {
             discovery,
             observability,
             policy,
+            pending_stream_observations: Arc::new(DashMap::with_shard_amount(
+                crate::util::sharding::pool_shard_amount(0),
+            )),
         })
     }
 
@@ -809,9 +794,53 @@ impl Plugin for A2aGateway {
         {
             return None;
         }
+        let stream_id = ctx.response_stream_id()?;
+        let observation = Arc::new(Mutex::new(None));
+        self.pending_stream_observations
+            .insert(stream_id, Arc::clone(&observation));
         Some(Box::new(A2aSseStreamInspector::new(
             ctx.a2a_gateway_binding,
+            observation,
         )))
+    }
+
+    async fn on_response_stream_terminated(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _outcome: &crate::proxy::deferred_log::BodyOutcome,
+    ) {
+        if !self.observability.emit_metadata {
+            return;
+        }
+        let Some(stream_id) = ctx.response_stream_id() else {
+            return;
+        };
+        let Some((_, slot)) = self.pending_stream_observations.remove(&stream_id) else {
+            return;
+        };
+        let observation = match slot.lock() {
+            Ok(mut slot) => slot.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
+        let Some(observation) = observation else {
+            return;
+        };
+        ctx.metadata.insert(
+            "a2a.stream_events".to_string(),
+            observation.stream_events.to_string(),
+        );
+        if let Some(task_id) = observation.task_id {
+            ctx.metadata.insert("a2a.task_id".to_string(), task_id);
+        }
+        if let Some(context_id) = observation.context_id {
+            ctx.metadata
+                .insert("a2a.context_id".to_string(), context_id);
+        }
+        if let Some(task_state) = observation.task_state {
+            ctx.metadata
+                .insert("a2a.task_state".to_string(), task_state);
+        }
     }
 
     async fn before_proxy(

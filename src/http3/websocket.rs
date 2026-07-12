@@ -478,11 +478,13 @@ async fn send_h3_backend_admission_rejection<S>(
 ) where
     S: h3::quic::RecvStream + h3::quic::SendStream<Bytes>,
 {
+    let mut rejection = rejection;
     let mut headers = rejection.headers;
-    crate::proxy::apply_after_proxy_hooks_to_rejection(
+    crate::proxy::apply_replaceable_after_proxy_hooks_to_rejection(
         plugins,
         ctx,
-        rejection.status_code,
+        &mut rejection.status_code,
+        &mut rejection.body,
         &mut headers,
     )
     .await;

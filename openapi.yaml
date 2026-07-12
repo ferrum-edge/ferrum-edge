@@ -5843,7 +5843,15 @@ components:
           format: uint64
           minimum: 0
           default: 30000
-          description: Backend read timeout in milliseconds. For HTTP/gRPC proxies, this is the response timeout. For TCP proxies, this is a per-direction inactivity timeout on the backend read path. 0 = disabled.
+          description: >-
+            Backend read timeout in milliseconds (default 30000). For HTTP/gRPC
+            proxies it bounds backend response reads and is also the total,
+            not idle, deadline for any client request upload that Ferrum must
+            buffer before backend dispatch. A buffered upload that exceeds the
+            deadline is rejected with HTTP 408 or gRPC DEADLINE_EXCEEDED;
+            streaming pass-through uploads are unaffected. For TCP proxies,
+            this is a per-direction inactivity timeout on the backend read
+            path. 0 disables these bounds.
         backend_write_timeout_ms:
           type: integer
           format: uint64
@@ -14246,12 +14254,12 @@ components:
               type: string
               enum: [drop, reject]
               default: drop
-              description: "drop: silently drop when the queue is full (never block). reject: fail the request 503 when a buffered-response record cannot be enqueued (fail-closed audit)."
+              description: "drop: silently drop when the queue is full (never block). reject: fail selected buffered or streaming audit records with 503 before response commit when a queue slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
             on_sink_error:
               type: string
               enum: [warn, reject]
               default: warn
-              description: "warn: log and drop on permanent sink failure. reject: fail buffered-response requests 503 while the sink is unhealthy. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
+              description: "warn: log and drop on permanent sink failure. reject: fail selected buffered or streaming audit records with 503 before response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
         privacy:
           type: object
           properties:
@@ -15621,7 +15629,7 @@ components:
             emit_metadata:
               type: boolean
               default: true
-              description: Emit a2a.* request and response metadata for downstream logging, tracing, authz, and chargeback plugins. When true (default), detected non-streaming A2A HTTP responses are buffered so response metadata (a2a.task_id, a2a.context_id, a2a.task_state, a2a.error) can be extracted; SSE and gRPC responses are never buffered. The buffer is bounded by the global FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES limit, not max_payload_size. Set false together with discovery.rewrite_agent_card_urls=false to keep responses fully streaming; request detection and method policy still apply.
+              description: Emit a2a.* request and response metadata for downstream logging, tracing, authz, and chargeback plugins. When true (default), detected non-streaming A2A HTTP responses are buffered so response metadata (a2a.task_id, a2a.context_id, a2a.task_state, a2a.error) can be extracted; SSE and gRPC responses are never buffered. Detected 2xx SSE streams are observed without buffering and write a2a.stream_events plus any observed a2a.task_id, a2a.context_id, and a2a.task_state into transaction metadata at stream termination, where key-based metadata redaction applies. The buffer is bounded by the global FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES limit, not max_payload_size. Set false together with discovery.rewrite_agent_card_urls=false to keep responses fully streaming; request detection and method policy still apply.
             log_payloads:
               type: boolean
               default: false

@@ -15,6 +15,7 @@ use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // ============================================================================
 // Controllable backend (specific to these tests — the shared echo helpers
@@ -216,6 +217,130 @@ async fn test_circuit_breaker_opens_and_recovers() {
         200,
         "Circuit should recover after timeout and successful probe"
     );
+}
+
+#[tokio::test]
+#[ignore]
+async fn stalled_buffered_upload_releases_half_open_probe_neutrally() {
+    let fail_flag = Arc::new(AtomicBool::new(false));
+    let request_count = Arc::new(AtomicU32::new(0));
+    let (backend_port, _backend) =
+        start_controllable_backend(fail_flag.clone(), request_count).await;
+
+    let gateway = spawn_gateway().await;
+    let client = reqwest::Client::new();
+    let auth = gateway.auth_header();
+    let proxy_id = "proxy-cb-stalled-buffer";
+    let proxy_data = json!({
+        "id": proxy_id,
+        "listen_path": "/cb-stalled-buffer",
+        "backend_scheme": "http",
+        "backend_host": "localhost",
+        "backend_port": backend_port,
+        "strip_listen_path": true,
+        "backend_read_timeout_ms": 100,
+        "retry": {
+            "max_retries": 1,
+            "retry_on_connect_failure": true,
+            "retryable_methods": ["POST"]
+        },
+        "circuit_breaker": {
+            "failure_threshold": 1,
+            "timeout_seconds": 1,
+            "success_threshold": 2,
+            "half_open_max_requests": 1,
+            "failure_status_codes": [500]
+        }
+    });
+
+    let create = client
+        .post(gateway.admin_url("/proxies"))
+        .header("Authorization", &auth)
+        .json(&proxy_data)
+        .send()
+        .await
+        .unwrap();
+    assert!(create.status().is_success(), "Failed to create proxy");
+
+    let ready = wait_for_proxy_route(
+        &client,
+        gateway.proxy_url("/cb-stalled-buffer/test"),
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(ready.status().as_u16(), 200);
+
+    fail_flag.store(true, Ordering::SeqCst);
+    let trip = client
+        .get(gateway.proxy_url("/cb-stalled-buffer/test"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(trip.status().as_u16(), 500);
+    let open = client
+        .get(gateway.proxy_url("/cb-stalled-buffer/test"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(open.status().as_u16(), 503);
+
+    fail_flag.store(false, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // A retry-enabled POST reaches proxy_to_backend's buffered Streaming
+    // catch-all after claiming the sole HALF_OPEN probe slot. Send only one of
+    // ten promised bytes so the real collector, not a helper-only unit test,
+    // must enforce backend_read_timeout_ms.
+    let mut stalled = tokio::net::TcpStream::connect(("127.0.0.1", gateway.proxy_port))
+        .await
+        .unwrap();
+    stalled
+        .write_all(
+            b"POST /cb-stalled-buffer/test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\nConnection: close\r\n\r\nx",
+        )
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stalled.read_to_end(&mut response))
+        .await
+        .expect("stalled upload should receive a bounded response")
+        .unwrap();
+    let response = String::from_utf8_lossy(&response);
+    assert!(
+        response.starts_with("HTTP/1.1 408"),
+        "stalled buffered upload should receive 408, got: {response}"
+    );
+
+    let status: serde_json::Value = client
+        .get(gateway.admin_url("/admin/metrics"))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let breaker = status["circuit_breakers"]
+        .as_array()
+        .and_then(|breakers| {
+            breakers
+                .iter()
+                .find(|breaker| breaker["proxy_id"] == proxy_id)
+        })
+        .expect("circuit breaker status entry");
+    assert_eq!(
+        breaker["state"], "half_open",
+        "client upload timeout must neither heal nor reopen the breaker"
+    );
+
+    // Immediate backend success proves the timeout released the only probe
+    // slot; a leaked slot would make this request a 503.
+    let next_probe = client
+        .get(gateway.proxy_url("/cb-stalled-buffer/test"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(next_probe.status().as_u16(), 200);
 }
 
 // ============================================================================
