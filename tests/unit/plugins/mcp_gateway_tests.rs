@@ -2168,7 +2168,7 @@ async fn aggregate_stale_resource_template_is_removed_by_selected_server_refresh
 }
 
 #[tokio::test]
-async fn aggregate_stale_resource_template_serves_stale_when_refresh_fails() {
+async fn aggregate_stale_resource_template_refresh_failure_fails_closed() {
     let server = start_mcp_catalog_server().await;
     let template_requests = Arc::new(AtomicUsize::new(0));
     let response_counter = Arc::clone(&template_requests);
@@ -2199,10 +2199,9 @@ async fn aggregate_stale_resource_template_serves_stale_when_refresh_fails() {
     let public_uri = reverse_mapped_tool_resource_uri(&plugin, &session_id, 37).await;
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
 
-    assert!(matches!(
-        route_resource_uri(&plugin, &session_id, 38, &public_uri).await,
-        PluginResult::Continue
-    ));
+    let result = route_resource_uri(&plugin, &session_id, 38, &public_uri).await;
+    let (_, body, _) = reject_json(result);
+    assert_eq!(body["error"]["code"], -32006);
     assert_eq!(template_requests.load(Ordering::SeqCst), 2);
 }
 

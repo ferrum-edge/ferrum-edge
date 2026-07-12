@@ -2610,15 +2610,26 @@ impl McpGateway {
                     Some((server_id, upstream_uri, catalog_version))
                 }
                 Some((server_id, _, _, true)) => {
-                    // The response-binding refresh path records a per-server
-                    // attempt before I/O, preventing repeated requests to an
-                    // unsupported or temporarily unavailable upstream. It is
-                    // deliberately fail-open here: this route was previously
-                    // discovered and remains safer than making a transient
-                    // discovery outage break a long-lived session. A successful
-                    // refresh still removes routes the upstream withdrew.
-                    self.prepare_response_resource_bindings(ctx, downstream_session_id, &server_id)
-                        .await;
+                    // Stale resource-template routes must be refreshed before
+                    // they remain routable. Catalog entries are session scoped
+                    // and can reflect upstream authorization or capability
+                    // state, so fail closed when the selected server cannot
+                    // confirm the template is still advertised.
+                    if let Err(error) = self
+                        .refresh_resource_templates_for_server(
+                            ctx,
+                            downstream_session_id,
+                            &server_id,
+                            &catalog_lock,
+                        )
+                        .await
+                    {
+                        return catalog_error_response(
+                            envelope.id.clone(),
+                            "MCP resource template catalog unavailable",
+                            McpCatalogError::Refresh(error),
+                        );
+                    }
                     let catalog = catalog_lock.read().await;
                     match resource_template_route(&catalog, &public_uri) {
                         Some((server_id, upstream_uri)) => {
