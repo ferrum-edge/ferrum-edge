@@ -436,9 +436,25 @@ impl Default for NodeAgentMetrics {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PodInfo {
     pub proxy_port: u16,
-    /// Reserved for future cgroup-aware BPF policy; current node-agent
-    /// enrollment writes `0` because IP-to-proxy-port capture is sufficient.
-    pub cgroup_id: u64,
+    /// Lifecycle flags encoded for the BPF pod-IP map. The low bits mirror
+    /// `ferrum_ebpf_common::POD_CAPTURE_FLAG_*`.
+    pub capture_flags: u32,
+}
+
+impl PodInfo {
+    pub fn for_capture(proxy_port: u16, udp_enabled: bool, udp_ready: bool) -> Self {
+        let mut capture_flags = 0_u32;
+        if udp_enabled {
+            capture_flags |= ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_ENABLED;
+        }
+        if udp_enabled && udp_ready {
+            capture_flags |= ferrum_ebpf_common::POD_CAPTURE_FLAG_UDP_READY;
+        }
+        Self {
+            proxy_port,
+            capture_flags,
+        }
+    }
 }
 
 /// State tracked per attached pod for graceful cleanup on removal.
@@ -1058,7 +1074,7 @@ mod tests {
         let ip6 = Ipv6Addr::LOCALHOST;
         let info = PodInfo {
             proxy_port: 15001,
-            cgroup_id: 42,
+            capture_flags: 42,
         };
 
         backend.update_pod_ip(ip, &info).unwrap();
@@ -1099,7 +1115,7 @@ mod tests {
                 Ipv4Addr::new(10, 0, 0, 1),
                 &PodInfo {
                     proxy_port: 15001,
-                    cgroup_id: 1,
+                    capture_flags: 1,
                 },
             )
             .unwrap();

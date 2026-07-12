@@ -35,6 +35,11 @@
 {{- $ambientUdpCaptureEnabled = has (lower (trim (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED")))) (list "true" "1") -}}
 {{- end -}}
 {{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
+{{- /* Keep registry/cleanup wiring active for every Ambient node-agent pair,
+       even when captureMode=iptables. The node-agent must then hit the Rust
+       fail-closed gate instead of silently omitting the eBPF pod watcher that
+       disabled cleanup requires. */ -}}
+{{- $ambientUdpLifecycle := and (eq $ambientTopology "ambient") .Values.nodeAgent.enabled -}}
 {{- /* Ambient UDP capture requires the node-agent publisher: it publishes the
        pod uid->cgroup registry the producer consumes (mirrors the NodeWaypoint
        validations). Without it the producer polls an empty hostPath forever and
@@ -47,9 +52,10 @@
 {{- fail "ambient FERRUM_MESH_CAPTURE_UDP_ENABLED=true requires nodeAgent.captureMode=ebpf so the node-agent enrolls pods and publishes the registry" -}}
 {{- end -}}
 {{- end -}}
-{{- /* In-netns capture (either NodeWaypoint TCP listeners or the Ambient UDP
-       producer) requires the registry mount, host cgroup/proc, and setns caps. */ -}}
-{{- $ambientInNetnsCapture := or $nodeWaypointRegistryEnabled $ambientUdpProducer -}}
+{{- /* In-netns capture (NodeWaypoint TCP, the Ambient UDP producer, or its
+       disabled stale-rule cleanup) requires the shared registry, host
+       cgroup/proc, tools-capable image, and setns caps. */ -}}
+{{- $ambientInNetnsCapture := or $nodeWaypointRegistryEnabled $ambientUdpLifecycle -}}
 {{- $nodeAgentProxyMode := replace "-" "_" (lower (toString .Values.nodeAgent.proxyMode)) -}}
 {{- $nodeAgentCaptureMode := lower (toString .Values.nodeAgent.captureMode) -}}
 {{- $ambientAdminPort := "9000" -}}
@@ -109,14 +115,13 @@
 {{- /* Select the tools-capable "-ebpf" runtime image (shell + iproute2 +
        iptables) instead of the default distroless image (`Dockerfile` FROM
        distroless/cc, no shell/`ip`/`iptables`) whenever this pod needs OS tools:
-       eBPF capture, the NodeWaypoint topology, OR the Ambient UDP producer
-       (#2013). The producer runs in-netns `sh -c` scripts calling `ip`/`iptables`
-       (`netns_udp_capture.rs` `preflight_capture_tools`) and hard-fails startup on
-       a distroless image, so without adding `$ambientUdpProducer` here the
-       documented `FERRUM_MESH_CAPTURE_UDP_ENABLED=true` path renders the default
-       image and crash-loops before the producer starts (codex). Mirrors the
+       eBPF capture, the NodeWaypoint topology, OR the Ambient UDP lifecycle
+       (#2013). Both the producer and disabled stale-rule cleanup run in-netns
+       `sh -c` scripts calling `ip`/`iptables`; without adding
+       `$ambientUdpLifecycle` here an enabled-to-disabled rollout would render the
+       default distroless image and could not clean predecessor rules. Mirrors the
        established auto-append convention (values.yaml image docs). */ -}}
-{{- if and (or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq $ambientTopology "node_waypoint") $ambientUdpProducer) (not (hasSuffix "-ebpf" $ambientImageTag)) -}}
+{{- if and (or (eq (lower (toString .Values.ambient.captureMode)) "ebpf") (eq $ambientTopology "node_waypoint") $ambientUdpLifecycle) (not (hasSuffix "-ebpf" $ambientImageTag)) -}}
 {{- $ambientImageTag = printf "%s-ebpf" $ambientImageTag -}}
 {{- end -}}
 {{- $ambientImage := printf "%s:%s" $ambientImageRepository $ambientImageTag -}}

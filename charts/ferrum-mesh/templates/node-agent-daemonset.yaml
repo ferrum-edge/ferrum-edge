@@ -63,8 +63,13 @@
 {{- if hasKey $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED" -}}
 {{- $ambientUdpCaptureEnabled = has (lower (trim (toString (index $ambientEnv "FERRUM_MESH_CAPTURE_UDP_ENABLED")))) (list "true" "1") -}}
 {{- end -}}
-{{- $ambientUdpProducer := and (eq $ambientTopology "ambient") $ambientUdpCaptureEnabled -}}
-{{- $nodeAgentPublishesRegistry := or $nodeWaypointRegistryEnabled $ambientUdpProducer -}}
+{{- /* Keep this lifecycle predicate in lock-step with ambient-daemonset.yaml.
+       Render the registry and topology even for captureMode=iptables so the
+       node-agent reaches its Rust fail-closed gate instead of silently starting
+       a fallback that cannot publish the pod registry. */ -}}
+{{- $ambientUdpLifecycle := and .Values.ambient.enabled (eq $ambientTopology "ambient") .Values.nodeAgent.enabled -}}
+{{- $ambientUdpProducer := and $ambientUdpLifecycle $ambientUdpCaptureEnabled -}}
+{{- $nodeAgentPublishesRegistry := or $nodeWaypointRegistryEnabled $ambientUdpLifecycle -}}
 {{- $nodeAgentManagedEnv := list
   "FERRUM_MODE"
   "FERRUM_MESH_CAPTURE_MODE"
@@ -78,6 +83,7 @@
   "FERRUM_NODE_AGENT_BPF_FS_PATH"
   "FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR"
   "FERRUM_MESH_CAPTURE_UDP_ENABLED"
+  "FERRUM_MESH_TOPOLOGY"
   "FERRUM_NODE_AGENT_ADMIN_ENABLED"
   "FERRUM_ADMIN_BIND_ADDRESS"
   "FERRUM_ADMIN_HTTP_PORT"
@@ -207,11 +213,15 @@ spec:
             - name: FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR
               value: {{ .Values.nodeAgent.podRegistryDir | quote }}
             {{- end }}
+            {{- if $ambientUdpLifecycle }}
+            {{- /* Propagate Ambient topology even while UDP is disabled so the
+                   node-agent keeps publishing the registry and re-derives
+                   disabled-cleanup acknowledgements. The capture flag remains
+                   producer-only, so disabled cleanup never arms readiness. */}}
+            - name: FERRUM_MESH_TOPOLOGY
+              value: "ambient"
+            {{- end }}
             {{- if $ambientUdpProducer }}
-            {{- /* Propagate the Ambient UDP producer flag (#2013) so the
-                   node-agent's capture config publishes the per-pod registry
-                   (should_publish_registry). The node-agent installs no UDP rules
-                   itself (host-netns emits none); it only writes the registry. */}}
             - name: FERRUM_MESH_CAPTURE_UDP_ENABLED
               value: "true"
             {{- end }}

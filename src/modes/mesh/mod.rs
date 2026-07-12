@@ -9531,14 +9531,17 @@ async fn serve_mesh_runtime(
                     env_config.udp_cleanup_interval_seconds,
                     env_config.udp_recvmmsg_batch_size,
                     env_config.pool_shard_amount,
-                    shutdown_tx.subscribe(),
                 );
                 let manager = crate::proxy::netns_udp_capture::NetnsUdpCaptureManager::new(
                     settings.udp_outbound_port,
                     source,
                     backend,
                     std::time::Duration::from_secs(2),
-                );
+                )
+                .with_ready_dir(Some(
+                    std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
+                        .join(".udp-ready"),
+                ));
                 let manager_shutdown = shutdown_tx.subscribe();
                 info!(
                     registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,
@@ -9558,7 +9561,11 @@ async fn serve_mesh_runtime(
                 source,
                 backend,
                 std::time::Duration::from_secs(2),
-            );
+            )
+            .with_ready_dir(Some(
+                std::path::Path::new(&env_config.mesh_node_waypoint_pod_registry_dir)
+                    .join(".udp-ready"),
+            ));
             let manager_shutdown = shutdown_tx.subscribe();
             info!(
                 registry_dir = %env_config.mesh_node_waypoint_pod_registry_dir,

@@ -12,6 +12,10 @@
 //! (>=32768).
 //! Explicitly configured local node source IPs can only bypass this guard with
 //! the relay mark, or for enrolled Kubernetes probe ports without the mark.
+//! The same classifier closes Ambient UDP enrollment: pod-IP metadata is
+//! inserted with UDP-not-ready before registry publication, so pod-originated
+//! UDP is dropped until the per-netns producer publishes readiness after its
+//! TPROXY socket and rules are live.
 
 use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_PIPE, TC_ACT_SHOT};
 use aya_ebpf::macros::classifier;
@@ -30,6 +34,9 @@ const ETH_P_IP: u16 = 0x0800;
 const ETH_P_IPV6: u16 = 0x86DD;
 const IPPROTO_TCP: u8 = 6;
 const IPPROTO_UDP: u8 = 17;
+const IPPROTO_FRAGMENT: u8 = 44;
+const IPPROTO_ESP: u8 = 50;
+const IPPROTO_AH: u8 = 51;
 const TCP_FLAG_SYN: u8 = 0x02;
 const TCP_FLAG_ACK: u8 = 0x10;
 const DNS_PORT: u16 = 53;
@@ -55,15 +62,32 @@ fn try_tc_inbound(ctx: &TcContext) -> Result<i32, i64> {
 
 #[inline(always)]
 fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
+    // Load `protocol` first and keep the pod-source UDP not-ready SHOT check
+    // ahead of the `dst` early-return (pod→external UDP must stay droppable
+    // during the enrollment window). Defer the `src_ip` load into the UDP arm so
+    // the common non-pod-destined TCP packet early-returns after a single
+    // `dst_ip` load — as it did before the readiness guard was added — instead
+    // of paying an unconditional source-IP load on every classified packet.
+    let protocol: u8 = ctx.load(ETH_HDR_LEN + 9).map_err(|_| -1i64)?;
+    if protocol == IPPROTO_UDP {
+        let src_ip: u32 = ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?;
+        if matches!(
+            unsafe { FERRUM_POD_IPS.get(&src_ip) },
+            Some(info) if info.udp_capture_not_ready()
+        ) {
+            return Ok(TC_ACT_SHOT);
+        }
+    }
+
     let dst_ip: u32 = ctx.load(ETH_HDR_LEN + 16).map_err(|_| -1i64)?;
     if unsafe { FERRUM_POD_IPS.get(&dst_ip) }.is_none() {
         return Ok(TC_ACT_OK);
     }
 
+    // Reaching here means the destination is enrolled; the source IP is needed
+    // for the node-source and authorization checks below on both protocols.
     let src_ip: u32 = ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?;
     let source_is_node = unsafe { FERRUM_NODE_IPS.get(&src_ip) }.is_some();
-
-    let protocol: u8 = ctx.load(ETH_HDR_LEN + 9).map_err(|_| -1i64)?;
     match protocol {
         IPPROTO_TCP => {
             let (dst_port, flags) = match tcp_dst_port_and_flags4(ctx) {
@@ -91,6 +115,32 @@ fn guard_ipv4(ctx: &TcContext) -> Result<i32, i64> {
 
 #[inline(always)]
 fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
+    let src_ip = CidrKey6 {
+        addr: [
+            ctx.load(ETH_HDR_LEN + 8).map_err(|_| -1i64)?,
+            ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?,
+            ctx.load(ETH_HDR_LEN + 16).map_err(|_| -1i64)?,
+            ctx.load(ETH_HDR_LEN + 20).map_err(|_| -1i64)?,
+        ],
+    };
+    let next_header: u8 = ctx.load(ETH_HDR_LEN + 6).map_err(|_| -1i64)?;
+    // Resolve bounded IPv6 extension chains before applying the source-side
+    // UDP readiness gate. Treating any first extension header as UDP would
+    // black-hole valid TCP/ICMPv6 with Hop-by-Hop/Routing/Destination Options;
+    // a malformed or overlong chain still fails closed for a not-ready source.
+    let source_is_udp = match ipv6_transport_protocol(ctx, next_header) {
+        Ok(protocol) => protocol == IPPROTO_UDP,
+        Err(_) => true,
+    };
+    if source_is_udp
+        && matches!(
+            unsafe { FERRUM_POD_IPS6.get(&src_ip) },
+            Some(info) if info.udp_capture_not_ready()
+        )
+    {
+        return Ok(TC_ACT_SHOT);
+    }
+
     let dst_ip = CidrKey6 {
         addr: [
             ctx.load(ETH_HDR_LEN + 24).map_err(|_| -1i64)?,
@@ -104,17 +154,7 @@ fn guard_ipv6(ctx: &TcContext) -> Result<i32, i64> {
         return Ok(TC_ACT_OK);
     }
 
-    let src_ip = CidrKey6 {
-        addr: [
-            ctx.load(ETH_HDR_LEN + 8).map_err(|_| -1i64)?,
-            ctx.load(ETH_HDR_LEN + 12).map_err(|_| -1i64)?,
-            ctx.load(ETH_HDR_LEN + 16).map_err(|_| -1i64)?,
-            ctx.load(ETH_HDR_LEN + 20).map_err(|_| -1i64)?,
-        ],
-    };
     let source_is_node = unsafe { FERRUM_NODE_IPS6.get(&src_ip) }.is_some();
-
-    let next_header: u8 = ctx.load(ETH_HDR_LEN + 6).map_err(|_| -1i64)?;
     match next_header {
         IPPROTO_TCP => {
             let (dst_port, flags) = match tcp_dst_port_and_flags6(ctx) {
@@ -244,6 +284,48 @@ fn ipv6_extension_header(next_header: u8) -> bool {
         next_header,
         0 | 43 | 44 | 50 | 51 | 60 | 135 | 139 | 140 | 253 | 254
     )
+}
+
+/// Resolve the transport protocol behind a bounded IPv6 extension chain.
+///
+/// Six headers comfortably cover legitimate chains while keeping verifier
+/// state bounded. ESP is opaque and is returned as non-UDP; malformed,
+/// truncated, or still-extended chains return an error so the readiness caller
+/// can fail closed without misclassifying valid extension-header TCP.
+#[inline(always)]
+fn ipv6_transport_protocol(ctx: &TcContext, first_header: u8) -> Result<u8, i64> {
+    let mut protocol = first_header;
+    let mut offset = ETH_HDR_LEN + 40;
+    let mut parsed = 0u8;
+    while parsed < 6 {
+        match protocol {
+            // Hop-by-Hop, Routing, Destination Options, Mobility, HIP, Shim6,
+            // and the two experimental extension-header values share the
+            // 8-octet-unit Hdr Ext Len shape.
+            0 | 43 | 60 | 135 | 139 | 140 | 253 | 254 => {
+                protocol = ctx.load(offset).map_err(|_| -1i64)?;
+                let extension_len: u8 = ctx.load(offset + 1).map_err(|_| -1i64)?;
+                offset += (extension_len as usize + 1) * 8;
+            }
+            IPPROTO_FRAGMENT => {
+                protocol = ctx.load(offset).map_err(|_| -1i64)?;
+                offset += 8;
+            }
+            IPPROTO_AH => {
+                protocol = ctx.load(offset).map_err(|_| -1i64)?;
+                let payload_len: u8 = ctx.load(offset + 1).map_err(|_| -1i64)?;
+                offset += (payload_len as usize + 2) * 4;
+            }
+            IPPROTO_ESP => return Ok(IPPROTO_ESP),
+            _ => return Ok(protocol),
+        }
+        parsed += 1;
+    }
+    if ipv6_extension_header(protocol) {
+        Err(-1i64)
+    } else {
+        Ok(protocol)
+    }
 }
 
 #[inline(always)]

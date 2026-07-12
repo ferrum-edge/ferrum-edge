@@ -240,11 +240,11 @@ nodeAgent:
   # Shared host-path directory for the per-pod (uid -> cgroup) registry the
   # node-agent publishes. Consumed by (a) the ambient NodeWaypoint proxy to open
   # per-pod in-netns TCP capture listeners (proxyMode=node_waypoint), and (b) the
-  # ambient per-pod-netns UDP capture producer (#2013) when the ambient topology
-  # has UDP capture enabled (set ambient.env.FERRUM_MESH_CAPTURE_UDP_ENABLED=true;
-  # the chart then mounts this dir into both DaemonSets and grants the ambient
-  # proxy the setns/NET_ADMIN capabilities it needs to install the in-netns UDP
-  # TPROXY rules).
+  # Ambient per-pod-netns UDP lifecycle (#2013): the enabled producer and the
+  # disabled stale-rule cleanup manager both consume it. For Ambient with an
+  # eBPF node-agent, the chart mounts this dir into both DaemonSets and grants
+  # the ambient proxy the setns/NET_ADMIN capabilities plus tools-capable image
+  # needed to install or remove in-netns UDP TPROXY rules.
   podRegistryDir: /run/ferrum/node-waypoint-pods
   cgroupRoot: /sys/fs/cgroup
   bpfFsPath: /sys/fs/bpf

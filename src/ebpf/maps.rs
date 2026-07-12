@@ -250,7 +250,7 @@ impl BpfMaps {
         let key = ipv4_to_nbo_key(ip);
         let value = BpfPodInfo {
             proxy_port: info.proxy_port as u32,
-            _pad: 0,
+            capture_flags: info.capture_flags,
         };
         let map = &mut self.pod_ips;
         map.insert(key, value, 0)
@@ -267,7 +267,7 @@ impl BpfMaps {
         let key = CidrKey6::host(ipv6_to_nbo_words(ip));
         let value = BpfPodInfo {
             proxy_port: info.proxy_port as u32,
-            _pad: 0,
+            capture_flags: info.capture_flags,
         };
         let map = &mut self.pod_ips6;
         map.insert(key, value, 0)

@@ -1785,6 +1785,50 @@ jobs:
           helm lint ./charts/ferrum-mesh
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             > "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set image.repository=example/ferrum-edge \
+            --set image.tag=udp-cleanup \
+            > "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-cleanup-rendered.yaml"
+          registry_refs="$(grep -c 'name: node-waypoint-pod-registry' "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-cleanup-rendered.yaml")"
+          if [ "$registry_refs" -lt 4 ]; then
+            echo "::error title=Ambient disabled cleanup registry missing::expected registry volume and mount in both Ambient and node-agent DaemonSets"
+            exit 1
+          fi
+          topology_refs="$(grep -A1 'name: FERRUM_MESH_TOPOLOGY' "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-cleanup-rendered.yaml" | grep -c 'ambient')"
+          if [ "$topology_refs" -lt 2 ]; then
+            echo "::error title=Ambient topology missing from node-agent::disabled cleanup requires both DaemonSets to render FERRUM_MESH_TOPOLOGY=ambient"
+            exit 1
+          fi
+          image_refs="$(grep -c 'example/ferrum-edge:udp-cleanup-ebpf' "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-cleanup-rendered.yaml")"
+          if [ "$image_refs" -lt 2 ]; then
+            echo "::error title=Ambient disabled cleanup image lacks tools::expected tools-capable -ebpf image for both DaemonSets"
+            exit 1
+          fi
+          if grep -q 'name: FERRUM_MESH_CAPTURE_UDP_ENABLED' "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-cleanup-rendered.yaml"; then
+            echo "::error title=Disabled Ambient UDP capture was armed::cleanup wiring must not render the producer enable flag"
+            exit 1
+          fi
+          helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
+            --set ambient.enabled=true \
+            --set nodeAgent.enabled=true \
+            --set nodeAgent.captureMode=iptables \
+            > "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-iptables-rendered.yaml"
+          iptables_registry_refs="$(grep -c 'name: node-waypoint-pod-registry' "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-iptables-rendered.yaml")"
+          if [ "$iptables_registry_refs" -lt 4 ]; then
+            echo "::error title=Ambient iptables fallback bypasses lifecycle gate::expected registry volume and mount in both DaemonSets so node-agent startup fails closed"
+            exit 1
+          fi
+          iptables_topology_refs="$(grep -A1 'name: FERRUM_MESH_TOPOLOGY' "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-iptables-rendered.yaml" | grep -c 'ambient')"
+          if [ "$iptables_topology_refs" -lt 2 ]; then
+            echo "::error title=Ambient iptables fallback bypasses topology gate::expected both DaemonSets to render FERRUM_MESH_TOPOLOGY=ambient so node-agent startup fails closed"
+            exit 1
+          fi
+          if grep -q 'name: FERRUM_MESH_CAPTURE_UDP_ENABLED' "$RUNNER_TEMP/ferrum-helm-results/ambient-udp-disabled-iptables-rendered.yaml"; then
+            echo "::error title=Disabled Ambient UDP capture was armed in iptables mode::lifecycle wiring must not render the producer enable flag"
+            exit 1
+          fi
           if grep -q 'ferrum-mesh-control-plane' "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"; then
             echo "::error title=Default chart rendered a control plane::controlPlane.enabled must default to false until required values are supplied"
             exit 1

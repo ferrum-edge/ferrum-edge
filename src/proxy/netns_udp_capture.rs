@@ -35,6 +35,7 @@
 //! live multi-pod node (the `netns-capture-live` follow-up).
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,9 +49,12 @@ use super::netns_capture::{PodCaptureSource, PodCaptureTarget};
 /// task then tears down that netns's UDP TPROXY rules once the loop exits.
 pub struct OpenedUdpCapture {
     stop: watch::Sender<bool>,
+    /// Production teardown mode: `true` retains the in-netns fail-closed guard
+    /// when the node-agent could not acknowledge that its BPF gate closed.
+    retain_guard: Option<watch::Sender<bool>>,
     /// Test-only close hook so a mock backend can record teardown. Production
     /// leaves this `None` — real teardown runs in the supervising task after `stop`.
-    on_close: Option<Box<dyn FnOnce() + Send>>,
+    on_close: Option<Box<dyn FnOnce(bool) + Send>>,
     /// The production backend's supervising task (capture loop → in-netns rule
     /// teardown). On graceful shutdown the manager awaits it (bounded) so the
     /// TPROXY/routing rules are actually removed from the pod netns before the
@@ -60,18 +64,24 @@ pub struct OpenedUdpCapture {
 
 impl OpenedUdpCapture {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn new(stop: watch::Sender<bool>, task: tokio::task::JoinHandle<()>) -> Self {
+    pub(crate) fn new(
+        stop: watch::Sender<bool>,
+        retain_guard: watch::Sender<bool>,
+        task: tokio::task::JoinHandle<()>,
+    ) -> Self {
         Self {
             stop,
+            retain_guard: Some(retain_guard),
             on_close: None,
             task: Some(task),
         }
     }
 
     #[cfg(test)]
-    fn with_on_close(stop: watch::Sender<bool>, on_close: Box<dyn FnOnce() + Send>) -> Self {
+    fn with_on_close(stop: watch::Sender<bool>, on_close: Box<dyn FnOnce(bool) + Send>) -> Self {
         Self {
             stop,
+            retain_guard: None,
             on_close: Some(on_close),
             task: None,
         }
@@ -82,10 +92,13 @@ impl OpenedUdpCapture {
     /// hook only. Dropping the returned handle does NOT abort the task — teardown
     /// still runs in the background (used on pod removal); the shutdown path awaits
     /// it instead.
-    fn close(mut self) -> Option<tokio::task::JoinHandle<()>> {
+    fn close(mut self, retain_guard: bool) -> Option<tokio::task::JoinHandle<()>> {
+        if let Some(tx) = &self.retain_guard {
+            let _ = tx.send(retain_guard);
+        }
         let _ = self.stop.send(true);
         if let Some(cb) = self.on_close.take() {
-            cb();
+            cb(retain_guard);
         }
         self.task.take()
     }
@@ -267,6 +280,127 @@ fn capture_is_still_justified(
     })
 }
 
+fn udp_ready_marker_path(dir: &Path, pod_uid: &str) -> Option<PathBuf> {
+    if pod_uid.is_empty()
+        || pod_uid == "."
+        || pod_uid == ".."
+        || pod_uid.contains('/')
+        || pod_uid.contains('\\')
+    {
+        return None;
+    }
+    Some(dir.join(pod_uid))
+}
+
+fn write_udp_ready_marker(dir: &Path, pod_uid: &str) {
+    let Some(path) = udp_ready_marker_path(dir, pod_uid) else {
+        return;
+    };
+    if path.is_file() {
+        return;
+    }
+    if let Err(error) = std::fs::create_dir_all(dir) {
+        warn!(pod_uid, dir = %dir.display(), %error, "Failed to create Ambient UDP readiness marker dir");
+        return;
+    }
+    if let Err(error) = std::fs::write(&path, b"") {
+        warn!(pod_uid, path = %path.display(), %error, "Failed to publish Ambient UDP readiness marker");
+    }
+}
+
+fn remove_udp_ready_marker(dir: &Path, pod_uid: &str) -> bool {
+    let Some(path) = udp_ready_marker_path(dir, pod_uid) else {
+        return false;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            warn!(pod_uid, path = %path.display(), %error, "Failed to remove Ambient UDP readiness marker");
+            false
+        }
+    }
+}
+
+fn udp_ack_required_dir(ready_dir: &Path) -> Option<PathBuf> {
+    ready_dir.parent().map(|dir| dir.join(".udp-ack-required"))
+}
+
+fn persist_udp_ack_requirement(ready_dir: &Path, pod_uid: &str) -> bool {
+    let Some(dir) = udp_ack_required_dir(ready_dir) else {
+        return false;
+    };
+    let Some(path) = udp_ready_marker_path(&dir, pod_uid) else {
+        return false;
+    };
+    if path.is_file() {
+        return true;
+    }
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        warn!(pod_uid, dir = %dir.display(), %error, "Failed to create durable Ambient UDP ack-requirement dir");
+        return false;
+    }
+    if let Err(error) = std::fs::write(&path, b"") {
+        warn!(pod_uid, path = %path.display(), %error, "Failed to persist Ambient UDP ack requirement");
+        return false;
+    }
+    true
+}
+
+fn remove_udp_handshake_marker(dir: &Path, pod_uid: &str, marker: &str) -> bool {
+    let Some(path) = udp_ready_marker_path(&dir.join(marker), pod_uid) else {
+        return false;
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            warn!(pod_uid, path = %path.display(), %error, "Failed to remove Ambient UDP handshake marker");
+            false
+        }
+    }
+}
+
+/// Durably record that a fresh node-agent close acknowledgement is required
+/// before retracting producer readiness. The durable marker lets a replacement
+/// cleanup process recover the handshake after this process exits. A stale ack
+/// is removed before readiness so it can never authorize this new handoff.
+fn request_udp_gate_close(ready_dir: &Path, pod_uids: &HashSet<String>) -> bool {
+    if !pod_uids
+        .iter()
+        .all(|uid| persist_udp_ack_requirement(ready_dir, uid))
+    {
+        return false;
+    }
+    let Some(registry_dir) = ready_dir.parent() else {
+        return false;
+    };
+    if !pod_uids
+        .iter()
+        .all(|uid| remove_udp_handshake_marker(registry_dir, uid, ".udp-not-ready"))
+    {
+        return false;
+    }
+    pod_uids
+        .iter()
+        .all(|uid| remove_udp_ready_marker(ready_dir, uid))
+}
+
+fn clear_udp_ack_requirement(ready_dir: &Path, pod_uids: &HashSet<String>) {
+    let Some(registry_dir) = ready_dir.parent() else {
+        return;
+    };
+    for uid in pod_uids {
+        remove_udp_handshake_marker(registry_dir, uid, ".udp-ack-required");
+    }
+}
+
+fn udp_ack_requirement_exists(ready_dir: &Path, pod_uid: &str) -> bool {
+    udp_ack_required_dir(ready_dir)
+        .and_then(|dir| udp_ready_marker_path(&dir, pod_uid))
+        .is_some_and(|path| path.is_file())
+}
+
 /// Reconciles per-pod-netns UDP capture producers against the enrolled-pod set.
 pub struct NetnsUdpCaptureManager<B: NetnsUdpBackend> {
     /// The UDP capture port bound (dual-stack `[::]`) inside each pod netns.
@@ -293,6 +427,9 @@ pub struct NetnsUdpCaptureManager<B: NetnsUdpBackend> {
     /// Last unresolved-netns reason per pod UID, so persistent cgroup/proc
     /// visibility failures stay clear without warning every poll.
     unresolved_reasons: HashMap<String, String>,
+    /// Producer-to-node-agent readiness handshake. The node-agent keeps its
+    /// host-veth UDP guard closed until this marker exists.
+    ready_dir: Option<PathBuf>,
 }
 
 impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
@@ -312,7 +449,26 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             pending_teardowns: HashMap::new(),
             last_registry_uids: HashSet::new(),
             unresolved_reasons: HashMap::new(),
+            ready_dir: None,
         }
+    }
+
+    pub fn with_ready_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.ready_dir = dir;
+        self
+    }
+
+    fn udp_not_ready_acknowledged(&self, pod_uids: &HashSet<String>) -> bool {
+        let Some(ready_dir) = &self.ready_dir else {
+            return true;
+        };
+        let Some(registry_dir) = ready_dir.parent() else {
+            return false;
+        };
+        let ack_dir = registry_dir.join(".udp-not-ready");
+        pod_uids
+            .iter()
+            .all(|uid| udp_ready_marker_path(&ack_dir, uid).is_some_and(|marker| marker.is_file()))
     }
 
     /// Poll-and-reconcile until `shutdown` flips to `true`, then close every
@@ -433,8 +589,52 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             })
             .map(|(netns, _)| *netns)
             .collect();
+        // Detach every gone producer and clear its ready markers FIRST, so the
+        // node-agent's next reconcile observes all of them as not-ready and can
+        // publish their acks together. Only then poll for acks against a single
+        // shared deadline: a sequential per-netns `await_udp_not_ready_ack` would
+        // cost up to 1s × N under a node drain / mass scale-down, stalling the
+        // reconcile loop (no new producers open until this pass returns) — mirror
+        // `shutdown_all`'s one-deadline poll so a delayed node-agent degrades to
+        // ~1s total instead. The ordering the handshake needs is preserved: marker
+        // removal precedes the ack wait, and `handle.close(retain_guard)` still
+        // runs only after the ack decision for that netns.
+        let mut closing: Vec<(u64, ActiveUdpCapture, bool)> = Vec::with_capacity(gone.len());
         for netns in gone {
             if let Some(active) = self.active.remove(&netns) {
+                let close_requested = self
+                    .ready_dir
+                    .as_ref()
+                    .is_none_or(|dir| request_udp_gate_close(dir, &active.pod_uids));
+                if !close_requested {
+                    warn!(
+                        netns_inode = netns,
+                        "Ambient UDP producer could not persist its close handshake; retaining the fail-closed guard"
+                    );
+                }
+                closing.push((netns, active, close_requested));
+            }
+        }
+        if !closing.is_empty() {
+            let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            while closing.iter().any(|(_, active, requested)| {
+                *requested && !self.udp_not_ready_acknowledged(&active.pod_uids)
+            }) && tokio::time::Instant::now() < ack_deadline
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            for (netns, active, close_requested) in closing {
+                let retain_guard =
+                    !close_requested || !self.udp_not_ready_acknowledged(&active.pod_uids);
+                if !retain_guard && let Some(dir) = &self.ready_dir {
+                    clear_udp_ack_requirement(dir, &active.pod_uids);
+                }
+                if retain_guard {
+                    warn!(
+                        netns_inode = netns,
+                        "Ambient UDP producer stop was not acknowledged by the node-agent; retaining fail-closed in-netns guard"
+                    );
+                }
                 // Close the producer (signal its loop to stop). Rather than drop
                 // the supervising task's handle fire-and-forget, RETAIN it keyed
                 // by netns so the open pass can await this teardown to completion
@@ -443,7 +643,7 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                 // netns) must not let this old teardown fire AFTER the new install
                 // and delete the fresh chains (codex fail-open race). The handle
                 // is `None` for the test mock (no supervising task).
-                if let Some(task) = active.handle.close() {
+                if let Some(task) = active.handle.close(retain_guard) {
                     // Defensive: an unlikely pre-existing pending teardown for the
                     // same netns is awaited first, so handles cannot accumulate.
                     if let Some(prior) = self.pending_teardowns.remove(&netns) {
@@ -513,7 +713,20 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                 .is_some_and(|active| active.source_identity == source_identity);
             if identity_unchanged {
                 if let Some(active) = self.active.get_mut(&netns) {
+                    if let Some(dir) = &self.ready_dir {
+                        for uid in active.pod_uids.difference(&pod_uids) {
+                            let _ = remove_udp_ready_marker(dir, uid);
+                        }
+                        for uid in pod_uids.difference(&active.pod_uids) {
+                            write_udp_ready_marker(dir, uid);
+                        }
+                    }
                     active.pod_uids = pod_uids;
+                    if let Some(dir) = &self.ready_dir {
+                        for uid in &active.pod_uids {
+                            write_udp_ready_marker(dir, uid);
+                        }
+                    }
                 }
                 if self.guarded.contains_key(&netns) {
                     let recovered = self
@@ -583,7 +796,11 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                 }
             }
             if let Some(active) = self.active.remove(&netns) {
-                if let Some(task) = active.handle.close() {
+                // The replacement guard above is verified and must remain in
+                // place while the fixed source-evidence producer is swapped.
+                // Closing in retain mode tears down the old capture rules but
+                // cannot reopen plaintext before the replacement is live.
+                if let Some(task) = active.handle.close(true) {
                     if let Some(prior) = self.pending_teardowns.remove(&netns) {
                         let _ = prior.await;
                     }
@@ -596,6 +813,22 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
             }
             if let Some(guarded) = self.guarded.get_mut(&netns) {
                 guarded.pod_uids = pod_uids.clone();
+            }
+            // A marker can survive an ungraceful predecessor. Close the
+            // node-agent's BPF gate before any guarded retry and republish only
+            // after the producer reaches `Opened` below.
+            if let Some(dir) = &self.ready_dir {
+                let mut readiness_retracted = true;
+                for uid in &pod_uids {
+                    readiness_retracted &= remove_udp_ready_marker(dir, uid);
+                }
+                if !readiness_retracted {
+                    warn!(
+                        netns_inode = netns,
+                        "Ambient UDP producer could not retract stale readiness; retrying before opening capture"
+                    );
+                    continue;
+                }
             }
             // Before installing fresh rules in this netns, await a prior
             // producer's teardown (registry flap: closed then reopened for the
@@ -634,9 +867,14 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                         ActiveUdpCapture {
                             handle,
                             source_identity,
-                            pod_uids,
+                            pod_uids: pod_uids.clone(),
                         },
                     );
+                    if let Some(dir) = &self.ready_dir {
+                        for uid in &pod_uids {
+                            write_udp_ready_marker(dir, uid);
+                        }
+                    }
                 }
                 NetnsUdpOpenResult::Guarded(handle) => {
                     match self.guarded.entry(netns) {
@@ -696,8 +934,37 @@ impl<B: NetnsUdpBackend> NetnsUdpCaptureManager<B> {
                 }
             });
         }
-        for (_, active) in self.active.drain() {
-            if let Some(handle) = active.handle.close() {
+        let ready_dir = self.ready_dir.clone();
+        let active_captures: Vec<_> = self
+            .active
+            .drain()
+            .map(|(netns, active)| {
+                let close_requested = ready_dir
+                    .as_ref()
+                    .is_none_or(|dir| request_udp_gate_close(dir, &active.pod_uids));
+                if !close_requested {
+                    warn!(
+                        netns_inode = netns,
+                        "Ambient UDP shutdown could not persist its close handshake; retaining the fail-closed guard"
+                    );
+                }
+                (netns, active, close_requested)
+            })
+            .collect();
+        let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        while active_captures.iter().any(|(_, active, requested)| {
+            *requested && !self.udp_not_ready_acknowledged(&active.pod_uids)
+        }) && tokio::time::Instant::now() < ack_deadline
+        {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        for (_, active, close_requested) in active_captures {
+            let retain_guard =
+                !close_requested || !self.udp_not_ready_acknowledged(&active.pod_uids);
+            if !retain_guard && let Some(dir) = &self.ready_dir {
+                clear_udp_ack_requirement(dir, &active.pod_uids);
+            }
+            if let Some(handle) = active.handle.close(retain_guard) {
                 tasks.spawn(async move {
                     let _ = handle.await;
                 });
@@ -738,6 +1005,14 @@ pub struct NetnsUdpCleanupManager<B: NetnsUdpCleanupBackend> {
     cleaned_netns: HashSet<u64>,
     last_registry_uids: HashSet<String>,
     unresolved_reasons: HashMap<String, String>,
+    /// Readiness published by a prior enabled producer. Stale rules may be
+    /// removed only after any observed ready marker is retracted and the
+    /// node-agent acknowledges that its host-veth gate is closed.
+    ready_dir: Option<PathBuf>,
+    /// Netns whose previously-observed ready marker was retracted but has not
+    /// yet received a closed-gate acknowledgement. This survives reconcile
+    /// retries after the marker itself has been removed.
+    pending_ack_netns: HashMap<u64, HashSet<String>>,
 }
 
 impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
@@ -749,7 +1024,27 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
             cleaned_netns: HashSet::new(),
             last_registry_uids: HashSet::new(),
             unresolved_reasons: HashMap::new(),
+            ready_dir: None,
+            pending_ack_netns: HashMap::new(),
         }
+    }
+
+    pub fn with_ready_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.ready_dir = dir;
+        self
+    }
+
+    fn udp_not_ready_acknowledged(&self, pod_uids: &HashSet<String>) -> bool {
+        let Some(ready_dir) = &self.ready_dir else {
+            return true;
+        };
+        let Some(registry_dir) = ready_dir.parent() else {
+            return false;
+        };
+        let ack_dir = registry_dir.join(".udp-not-ready");
+        pod_uids
+            .iter()
+            .all(|uid| udp_ready_marker_path(&ack_dir, uid).is_some_and(|path| path.is_file()))
     }
 
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
@@ -758,7 +1053,7 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
             "Ambient UDP disabled stale-rule cleanup manager started"
         );
         loop {
-            self.cleanup_once();
+            self.cleanup_once().await;
             tokio::select! {
                 _ = tokio::time::sleep(self.poll_interval) => {}
                 changed = shutdown.changed() => {
@@ -770,7 +1065,7 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
         }
     }
 
-    fn cleanup_once(&mut self) -> usize {
+    async fn cleanup_once(&mut self) -> usize {
         let targets = self.source.list_targets();
         let registry_uids: HashSet<String> = targets.iter().map(|t| t.pod_uid.clone()).collect();
         if registry_uids != self.last_registry_uids {
@@ -779,10 +1074,10 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
                 pod_uids = ?registry_uids,
                 "Ambient UDP disabled cleanup registry changed"
             );
-            self.last_registry_uids = registry_uids;
+            self.last_registry_uids = registry_uids.clone();
         }
 
-        let mut desired: HashMap<u64, &PodCaptureTarget> = HashMap::new();
+        let mut desired: HashMap<u64, (PodCaptureTarget, HashSet<String>)> = HashMap::new();
         let mut unresolved_uids = HashSet::new();
         for target in &targets {
             match self.backend.netns_key(target) {
@@ -795,7 +1090,10 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
                             "Ambient UDP disabled cleanup: pod netns resolved after retry"
                         );
                     }
-                    desired.entry(netns).or_insert(target);
+                    let entry = desired
+                        .entry(netns)
+                        .or_insert_with(|| (target.clone(), HashSet::new()));
+                    entry.1.insert(target.pod_uid.clone());
                 }
                 Err(error) => {
                     unresolved_uids.insert(target.pod_uid.clone());
@@ -826,13 +1124,78 @@ impl<B: NetnsUdpCleanupBackend> NetnsUdpCleanupManager<B> {
         let desired_netns: HashSet<u64> = desired.keys().copied().collect();
         self.cleaned_netns
             .retain(|netns| desired_netns.contains(netns));
+        // A transient cgroup/PID lookup miss omits the netns from `desired` but
+        // must not erase an already-started readiness handshake. Retain it while
+        // any owning UID is still in the registry; otherwise a later successful
+        // lookup would see no marker and could clean rules without an ack.
+        self.pending_ack_netns
+            .retain(|_, pod_uids| pod_uids.iter().any(|uid| registry_uids.contains(uid)));
 
-        let mut cleaned = 0;
-        for (netns, target) in desired {
+        // Retract every stale producer marker before deleting any rules. A
+        // marker observed here may have left the node-agent's BPF ready bit
+        // open across a rollout, so wait for the corresponding closed-gate ack
+        // against one shared deadline. Targets with no marker never advertised
+        // a live producer and need no handshake.
+        let mut candidates = Vec::new();
+        for (netns, (target, pod_uids)) in desired {
             if self.cleaned_netns.contains(&netns) {
                 continue;
             }
-            if self.backend.cleanup_udp_capture(target, netns) {
+            let mut requires_ack = self.pending_ack_netns.contains_key(&netns);
+            let mut marker_exists = false;
+            if let Some(dir) = &self.ready_dir {
+                for uid in &pod_uids {
+                    marker_exists |=
+                        udp_ready_marker_path(dir, uid).is_some_and(|marker| marker.is_file());
+                    requires_ack |= udp_ack_requirement_exists(dir, uid);
+                }
+            }
+            requires_ack |= marker_exists;
+            // A ready marker is the request edge: persist the requirement and
+            // invalidate any stale ack before retracting readiness. If that
+            // ordering cannot be completed, this pass is never allowed to trust
+            // an old ack or remove the retained guard.
+            let handshake_valid = !marker_exists
+                || self
+                    .ready_dir
+                    .as_ref()
+                    .is_some_and(|dir| request_udp_gate_close(dir, &pod_uids));
+            if requires_ack {
+                self.pending_ack_netns.insert(netns, pod_uids.clone());
+            }
+            candidates.push((netns, target, pod_uids, requires_ack, handshake_valid));
+        }
+        if candidates
+            .iter()
+            .any(|candidate| candidate.3 && candidate.4)
+        {
+            let ack_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            while candidates
+                .iter()
+                .any(|(_, _, pod_uids, requires_ack, valid)| {
+                    *requires_ack && *valid && !self.udp_not_ready_acknowledged(pod_uids)
+                })
+                && tokio::time::Instant::now() < ack_deadline
+            {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        let mut cleaned = 0;
+        for (netns, target, pod_uids, requires_ack, handshake_valid) in candidates {
+            if !handshake_valid || (requires_ack && !self.udp_not_ready_acknowledged(&pod_uids)) {
+                warn!(
+                    netns_inode = netns,
+                    pod_uid = %target.pod_uid,
+                    "Ambient UDP disabled cleanup was not acknowledged by the node-agent; preserving stale fail-closed rules and retrying"
+                );
+                continue;
+            }
+            self.pending_ack_netns.remove(&netns);
+            if let Some(dir) = &self.ready_dir {
+                clear_udp_ack_requirement(dir, &pod_uids);
+            }
+            if self.backend.cleanup_udp_capture(&target, netns) {
                 self.cleaned_netns.insert(netns);
                 cleaned += 1;
                 info!(
@@ -923,7 +1286,6 @@ pub struct ProxyNetnsUdpBackend {
     cleanup_interval_seconds: u64,
     recvmmsg_batch_size: usize,
     session_shard_amount: usize,
-    global_shutdown: watch::Receiver<bool>,
 }
 
 impl ProxyNetnsUdpBackend {
@@ -936,7 +1298,6 @@ impl ProxyNetnsUdpBackend {
         cleanup_interval_seconds: u64,
         recvmmsg_batch_size: usize,
         session_shard_amount: usize,
-        global_shutdown: watch::Receiver<bool>,
     ) -> Self {
         Self {
             state,
@@ -948,7 +1309,6 @@ impl ProxyNetnsUdpBackend {
             cleanup_interval_seconds,
             recvmmsg_batch_size,
             session_shard_amount,
-            global_shutdown,
         }
     }
 }
@@ -1236,6 +1596,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         let teardown_script = IptablesPlan::udp_teardown_script(include_v6);
         let capture_teardown_script = IptablesPlan::udp_capture_rules_teardown_script(include_v6);
         let fail_closed_script = IptablesPlan::udp_fail_closed_script(&self.capture_config);
+        let fail_closed_on_stop = fail_closed_script.clone();
         let fail_closed_teardown_script = IptablesPlan::udp_fail_closed_teardown_script();
         let capture_output_release_script = IptablesPlan::udp_capture_output_release_script();
 
@@ -1506,7 +1867,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
         };
 
         let (stop_tx, stop_rx) = watch::channel(false);
-        let global_shutdown = self.global_shutdown.clone();
+        let (retain_guard_tx, retain_guard_rx) = watch::channel(false);
         let pod_uid = target.pod_uid.clone();
         info!(
             pod_uid = %pod_uid,
@@ -1526,7 +1887,7 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
                 v6_origdst,
                 runtime,
                 stop_rx,
-                Some(global_shutdown),
+                None,
                 None,
             )
             .await;
@@ -1534,13 +1895,30 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             // netns's UDP rules. `setns` + `sh -c` are blocking, so run them off
             // the runtime. Best-effort: an already-gone pod netns is expected.
             let _ = tokio::task::spawn_blocking(move || {
-                teardown();
-                debug!(pod_uid = %pod_uid, "Ambient UDP producer: per-pod-netns UDP rules torn down");
+                if *retain_guard_rx.borrow() {
+                    let netns_for_guard = netns.clone();
+                    let guarded = super::netns_capture::run_in_netns(
+                        netns_for_guard.as_ref(),
+                        move || run_shell_script(&fail_closed_on_stop),
+                    );
+                    if guarded.is_ok() {
+                        teardown_capture_rules();
+                    } else if let Err(error) = guarded {
+                        warn!(
+                            pod_uid = %pod_uid,
+                            %error,
+                            "Ambient UDP producer could not retain fail-closed guard; preserving socketless capture rules"
+                        );
+                    }
+                } else {
+                    teardown();
+                }
+                debug!(pod_uid = %pod_uid, retain_guard = *retain_guard_rx.borrow(), "Ambient UDP producer: per-pod-netns UDP stop cleanup completed");
             })
             .await;
         });
 
-        NetnsUdpOpenResult::Opened(OpenedUdpCapture::new(stop_tx, task))
+        NetnsUdpOpenResult::Opened(OpenedUdpCapture::new(stop_tx, retain_guard_tx, task))
     }
 }
 
@@ -1572,7 +1950,6 @@ impl NetnsUdpBackend for ProxyNetnsUdpBackend {
             self.cleanup_interval_seconds,
             self.recvmmsg_batch_size,
             self.session_shard_amount,
-            &self.global_shutdown,
         );
         warn!("Ambient per-pod-netns UDP capture is Linux-only; not opening");
         NetnsUdpOpenResult::Failed
@@ -1627,6 +2004,7 @@ mod tests {
         open_netns_by_cgroup: Mutex<HashMap<String, Option<u64>>>,
         opened: Arc<Mutex<Vec<u64>>>,
         closed: Arc<Mutex<Vec<u64>>>,
+        retained_guards: Arc<Mutex<Vec<u64>>>,
         /// Ordered open/teardown log across all netns, used by the reopen-race
         /// regression test to prove a prior teardown completes before reinstall.
         events: Arc<Mutex<Vec<Event>>>,
@@ -1656,6 +2034,7 @@ mod tests {
                 open_netns_by_cgroup: Mutex::new(HashMap::new()),
                 opened: Arc::new(Mutex::new(Vec::new())),
                 closed: Arc::new(Mutex::new(Vec::new())),
+                retained_guards: Arc::new(Mutex::new(Vec::new())),
                 events: Arc::new(Mutex::new(Vec::new())),
                 fail_open: Mutex::new(HashSet::new()),
                 fail_guard_prepare: Mutex::new(HashSet::new()),
@@ -1824,6 +2203,7 @@ mod tests {
             self.events.lock().unwrap().push(Event::Opened(netns));
             let (stop_tx, mut stop_rx) = watch::channel(false);
             let closed = self.closed.clone();
+            let retained_guards = self.retained_guards.clone();
             let events = self.events.clone();
             if self.slow_teardown {
                 // Real supervising task, like production: wait for the stop
@@ -1836,11 +2216,15 @@ mod tests {
                     closed.lock().unwrap().push(netns);
                     events.lock().unwrap().push(Event::TornDown(netns));
                 });
-                NetnsUdpOpenResult::Opened(OpenedUdpCapture::new(stop_tx, task))
+                let (retain_guard_tx, _) = watch::channel(false);
+                NetnsUdpOpenResult::Opened(OpenedUdpCapture::new(stop_tx, retain_guard_tx, task))
             } else {
                 NetnsUdpOpenResult::Opened(OpenedUdpCapture::with_on_close(
                     stop_tx,
-                    Box::new(move || {
+                    Box::new(move |retain_guard| {
+                        if retain_guard {
+                            retained_guards.lock().unwrap().push(netns);
+                        }
                         closed.lock().unwrap().push(netns);
                         events.lock().unwrap().push(Event::TornDown(netns));
                     }),
@@ -1931,10 +2315,26 @@ mod tests {
     }
 
     fn cleanup_manager(
-        source: Arc<StaticSource>,
+        source: Arc<dyn PodCaptureSource>,
         backend: MockBackend,
     ) -> NetnsUdpCleanupManager<MockBackend> {
         NetnsUdpCleanupManager::new(source, backend, Duration::from_secs(2))
+    }
+
+    #[test]
+    fn close_propagates_fail_closed_guard_retention() {
+        let retained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = retained.clone();
+        let (stop_tx, _) = watch::channel(false);
+        let handle = OpenedUdpCapture::with_on_close(
+            stop_tx,
+            Box::new(move |retain_guard| {
+                observed.store(retain_guard, std::sync::atomic::Ordering::Release);
+            }),
+        );
+
+        assert!(handle.close(true).is_none());
+        assert!(retained.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test]
@@ -1959,6 +2359,33 @@ mod tests {
         // Idempotent: a second reconcile opens nothing new.
         assert_eq!(mgr.reconcile_once().await, 2);
         assert_eq!(opened.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn readiness_marker_is_post_open_idempotent_and_removed_before_close() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let ready_root = tempfile::tempdir().unwrap();
+        let ready_dir = ready_root.path().join(".udp-ready");
+        let mut mgr = manager(source.clone(), backend).with_ready_dir(Some(ready_dir.clone()));
+
+        assert_eq!(mgr.reconcile_once().await, 1);
+        assert!(
+            ready_dir.join("pod-a").is_file(),
+            "readiness is published only after open succeeds"
+        );
+        assert_eq!(mgr.reconcile_once().await, 1, "reconcile stays idempotent");
+        assert!(ready_dir.join("pod-a").is_file());
+
+        let ack_dir = ready_root.path().join(".udp-not-ready");
+        std::fs::create_dir_all(&ack_dir).unwrap();
+        std::fs::write(ack_dir.join("pod-a"), b"").unwrap();
+        source.0.lock().unwrap().clear();
+        assert_eq!(mgr.reconcile_once().await, 0);
+        assert!(
+            !ready_dir.join("pod-a").exists(),
+            "readiness closes before producer teardown"
+        );
     }
 
     #[tokio::test]
@@ -2002,6 +2429,73 @@ mod tests {
             mgr.active
                 .get(&100)
                 .is_some_and(|active| active.source_identity.is_some())
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_node_agent_ack_retains_fail_closed_guard_on_stop() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let retained = backend.retained_guards.clone();
+        let ready_root = tempfile::tempdir().unwrap();
+        let ready_dir = ready_root.path().join(".udp-ready");
+        let mut mgr = manager(source.clone(), backend).with_ready_dir(Some(ready_dir));
+
+        assert_eq!(mgr.reconcile_once().await, 1);
+        source.0.lock().unwrap().clear();
+        assert_eq!(mgr.reconcile_once().await, 0);
+        assert_eq!(
+            *retained.lock().unwrap(),
+            vec![100],
+            "producer teardown must retain the in-netns guard without BPF-close acknowledgement"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_pod_removal_awaits_acks_against_one_shared_deadline() {
+        // Node drain / mass scale-down: N pods in N distinct netns all go away in a
+        // single reconcile pass and the node-agent never acks. A per-netns 1s ack
+        // wait would cost ~N seconds; the shared-deadline poll must bound the whole
+        // gone pass to ~1s of virtual time while still retaining every fail-closed
+        // guard. This intentionally uses real time because this crate does not enable
+        // Tokio's `test-util` feature; the gap between ~1s and ~N seconds is wide.
+        const N: u64 = 8;
+        let initial: Vec<PodCaptureTarget> = (0..N)
+            .map(|i| target(&format!("pod-{i}"), &format!("/cg/{i}")))
+            .collect();
+        let netns_pairs: Vec<(String, Option<u64>)> = (0..N)
+            .map(|i| (format!("/cg/{i}"), Some(100 + i)))
+            .collect();
+        let backend_map: Vec<(&str, Option<u64>)> = netns_pairs
+            .iter()
+            .map(|(cg, ns)| (cg.as_str(), *ns))
+            .collect();
+        let source = Arc::new(StaticSource(Mutex::new(initial)));
+        let backend = MockBackend::new(&backend_map);
+        let retained = backend.retained_guards.clone();
+        let ready_root = tempfile::tempdir().unwrap();
+        let ready_dir = ready_root.path().join(".udp-ready");
+        let mut mgr = manager(source.clone(), backend).with_ready_dir(Some(ready_dir));
+
+        assert_eq!(mgr.reconcile_once().await, N as usize);
+        // Every pod leaves at once; no `.udp-not-ready` acks are ever published.
+        source.0.lock().unwrap().clear();
+
+        let start = tokio::time::Instant::now();
+        assert_eq!(mgr.reconcile_once().await, 0);
+        let elapsed = start.elapsed();
+
+        // One shared ~1s deadline, not N × 1s.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "batch removal must bound the ack wait to one shared deadline, took {elapsed:?}"
+        );
+        let mut got = retained.lock().unwrap().clone();
+        got.sort_unstable();
+        let expected: Vec<u64> = (0..N).map(|i| 100 + i).collect();
+        assert_eq!(
+            got, expected,
+            "every unacknowledged producer must retain its fail-closed guard"
         );
     }
 
@@ -2261,6 +2755,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_persists_ack_requirement_before_retracting_readiness() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let retained = backend.retained_guards.clone();
+        let registry_root = tempfile::tempdir().unwrap();
+        let ready_dir = registry_root.path().join(".udp-ready");
+        let mut mgr = manager(source, backend).with_ready_dir(Some(ready_dir.clone()));
+
+        assert_eq!(mgr.reconcile_once().await, 1);
+        mgr.shutdown_all().await;
+
+        assert!(!ready_dir.join("pod-a").exists());
+        assert!(
+            registry_root
+                .path()
+                .join(".udp-ack-required")
+                .join("pod-a")
+                .is_file(),
+            "shutdown must durably record the unacknowledged handoff before removing readiness"
+        );
+        assert_eq!(*retained.lock().unwrap(), vec![100]);
+    }
+
+    #[tokio::test]
     async fn shutdown_all_cleans_retained_guard() {
         let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
         let backend = MockBackend::new(&[("/cg/a", Some(100))]);
@@ -2361,12 +2879,16 @@ mod tests {
         let cleaned = backend.closed.clone();
         let mut mgr = cleanup_manager(source, backend);
 
-        assert_eq!(mgr.cleanup_once(), 2);
+        assert_eq!(mgr.cleanup_once().await, 2);
         let mut got = cleaned.lock().unwrap().clone();
         got.sort_unstable();
         assert_eq!(got, vec![100, 200], "cleanup runs once per netns");
 
-        assert_eq!(mgr.cleanup_once(), 0, "already-cleaned netns are skipped");
+        assert_eq!(
+            mgr.cleanup_once().await,
+            0,
+            "already-cleaned netns are skipped"
+        );
         let mut got = cleaned.lock().unwrap().clone();
         got.sort_unstable();
         assert_eq!(got, vec![100, 200]);
@@ -2380,12 +2902,68 @@ mod tests {
         let cleaned = backend.closed.clone();
         let mut mgr = cleanup_manager(source, backend);
 
-        assert_eq!(mgr.cleanup_once(), 0);
+        assert_eq!(mgr.cleanup_once().await, 0);
         assert!(cleaned.lock().unwrap().is_empty());
 
         mgr.backend.set_fail_open(100, false);
-        assert_eq!(mgr.cleanup_once(), 1);
+        assert_eq!(mgr.cleanup_once().await, 1);
         assert_eq!(*cleaned.lock().unwrap(), vec![100]);
+    }
+
+    #[tokio::test]
+    async fn disabled_cleanup_waits_for_closed_gate_ack_before_removing_rules() {
+        let source = Arc::new(StaticSource(Mutex::new(vec![target("pod-a", "/cg/a")])));
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let cleaned = backend.closed.clone();
+        let registry_root = tempfile::tempdir().unwrap();
+        let ready_dir = registry_root.path().join(".udp-ready");
+        std::fs::create_dir_all(&ready_dir).unwrap();
+        std::fs::write(ready_dir.join("pod-a"), b"").unwrap();
+        let ack_dir = registry_root.path().join(".udp-not-ready");
+        std::fs::create_dir_all(&ack_dir).unwrap();
+        std::fs::write(ack_dir.join("pod-a"), b"stale").unwrap();
+        let mut mgr = cleanup_manager(source, backend).with_ready_dir(Some(ready_dir.clone()));
+
+        assert_eq!(mgr.cleanup_once().await, 0);
+        assert!(
+            !ready_dir.join("pod-a").exists(),
+            "disabled cleanup must retract stale producer readiness first"
+        );
+        assert!(
+            cleaned.lock().unwrap().is_empty(),
+            "rules must remain fail closed while the host-veth gate closure is unverified"
+        );
+        assert!(
+            !ack_dir.join("pod-a").exists(),
+            "the durable handoff must invalidate a stale ack before retracting readiness"
+        );
+        assert!(
+            registry_root
+                .path()
+                .join(".udp-ack-required")
+                .join("pod-a")
+                .is_file(),
+            "the ack requirement must survive a cleanup-manager restart"
+        );
+
+        // Recreate the manager to prove the durable requirement, rather than its
+        // in-memory pending map, preserves the guard-handoff contract.
+        let source = mgr.source.clone();
+        let backend = MockBackend::new(&[("/cg/a", Some(100))]);
+        let restarted_cleaned = backend.closed.clone();
+        let mut mgr = cleanup_manager(source, backend).with_ready_dir(Some(ready_dir.clone()));
+
+        std::fs::write(ack_dir.join("pod-a"), b"").unwrap();
+        assert_eq!(mgr.cleanup_once().await, 1);
+        assert_eq!(*restarted_cleaned.lock().unwrap(), vec![100]);
+        assert!(
+            !registry_root
+                .path()
+                .join(".udp-ack-required")
+                .join("pod-a")
+                .exists(),
+            "a verified handoff clears the durable pending record"
+        );
     }
 
     #[test]

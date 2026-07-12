@@ -16,7 +16,7 @@ For the security posture of this mode (required Linux capabilities, mounts, secc
 | HBONE redirect port | `FERRUM_NODE_AGENT_HBONE_REDIRECT_PORT=15008` | The HBONE listener/redirect port carried in the same BPF config map for sidecarless topologies. Must match the mesh proxy HBONE listener (`15008` today). Node-agent startup automatically adds this port to outbound capture exclusions. |
 | Unix socket | `/run/ferrum/node-agent.sock` | Reserved IPC path for future node-agent/proxy coordination. Phase 1 treats this as inert contract metadata; no socket is created yet. |
 | BPF config map | `FERRUM_CAPTURE_CONFIG` | Singleton map keyed by `0`, containing outbound capture and HBONE redirect ports plus the NodeWaypoint inbound relay socket mark trusted by the pod-veth tc guard. |
-| BPF pod maps | `FERRUM_POD_IPS`, `FERRUM_POD_IPS6` | IPv4/IPv6 pod IP to proxy-port metadata for enrolled workloads. The tc guard treats these maps as the enrolled destination set. |
+| BPF pod maps | `FERRUM_POD_IPS`, `FERRUM_POD_IPS6` | IPv4/IPv6 pod IP to proxy-port and capture-lifecycle metadata for enrolled workloads. The tc guard treats these maps as the enrolled destination set and keeps pod-originated Ambient UDP closed until the producer-ready flag is set. |
 | BPF node/probe maps | `FERRUM_NODE_IPS`, `FERRUM_NODE_IPS6`, `FERRUM_NODE_PROBE_PORTS`, `FERRUM_NODE_PROBE_PORTS6` | Explicit trusted kubelet probe source IPs plus enrolled pod probe ports allowed through the NodeWaypoint direct-inbound guard. Helm does not infer host-interface addresses; set `nodeAgent.trustedKubeletProbeSourceIps` only to known kubelet probe source IPs, such as a CNI bridge gateway address. The node-agent derives probe ports from Kubernetes HTTP/TCP/gRPC liveness, readiness, and startup probes. |
 | BPF original destination maps | `FERRUM_ORIG_DST4`, `FERRUM_ORIG_DST6` | Socket-cookie keyed original destination records. The `connect4`/`connect6` hooks write them (stamped with the source pod's UID + SPIFFE hash from `FERRUM_WORKLOAD_IDENTITY`); the node-agent pins them at `/sys/fs/bpf/ferrum/orig_dst{4,6}`; the node-waypoint mesh-proxy's **orig-dst bridge** (`src/ebpf/orig_dst_bridge.rs`) mirrors each record into the `NodeWaypointIdentityResolver`. |
 | BPF workload identity map | `FERRUM_WORKLOAD_IDENTITY` | Per-cgroup source workload identity (`{pod_uid, workload_spiffe_hash}`), keyed by `bpf_get_current_cgroup_id`. The node-agent writes one entry per enrolled pod cgroup; the connect hooks read it to stamp orig-dst records. Absent entry → connect hooks store the all-zero sentinel, which node-waypoint resolution treats as fail-closed. |
@@ -204,9 +204,10 @@ maps:
 |---|---|---|
 | Pod registry dir | `FERRUM_MESH_NODE_WAYPOINT_POD_REGISTRY_DIR` (default `/run/ferrum/node-waypoint-pods`) | One file per enrolled pod. File **name** = pod UID; file **contents** = line 1 pod cgroup path, then optional `ipv4=<pod-ip>` / `ipv6=<pod-ip>` lines from Kubernetes `status.podIPs`. |
 
-Helm sets `nodeAgent.podRegistryDir` to that default and, when
-`nodeAgent.proxyMode=node_waypoint`, mounts it as the same writable hostPath in
-both the node-agent and ambient DaemonSets. If operators override the path,
+Helm sets `nodeAgent.podRegistryDir` to that default and mounts it as the same
+writable hostPath in both DaemonSets for NodeWaypoint or an Ambient eBPF
+node-agent, including the UDP-disabled stale-rule cleanup posture. If operators
+override the path,
 both processes must see the same host directory; a container-local directory
 lets both pods report Ready while no in-netns capture listener is attached for
 workloads. The chart rejects incomplete NodeWaypoint topologies at render time:
@@ -237,9 +238,15 @@ override or the pod-loopback peer.
 
 ### Also consumed by the Ambient UDP capture producer (#2013)
 
-The **same** registry is published for **Ambient** deployments when UDP capture
-is enabled (`FERRUM_MESH_CAPTURE_UDP_ENABLED=true`): the node-agent publish gate
-is `should_publish_registry = node_waypoint_in_netns || udp_capture_enabled`.
+The **same** registry is published for every **Ambient** deployment. The enabled
+producer consumes it when `FERRUM_MESH_CAPTURE_UDP_ENABLED=true`; when UDP is
+disabled, the stale-rule cleanup manager still needs current pod netns entries
+to repair an enabled-to-disabled rollout. The node-agent publish gate is
+`should_publish_registry = node_waypoint_in_netns || ambient_topology`, while
+the BPF UDP readiness guard remains separately gated on both the UDP flag and
+`FERRUM_MESH_TOPOLOGY=ambient`. Setting the shared UDP flag on a topology that
+starts no per-pod producer therefore does not arm a guard that could never
+become ready.
 The UDP term is deliberately **not** anded with `outbound_capture_enabled`: the
 Ambient UDP producer binds its own `FERRUM_MESH_CAPTURE_UDP_PORT` inside each
 pod netns and never uses the TCP `FERRUM_MESH_OUTBOUND_LISTEN_ADDR` listener, so
@@ -249,8 +256,8 @@ empty directory while pod UDP egress bypasses capture. Publishing for the
 Ambient-UDP case does **not** flip the NodeWaypoint ipv6-outbound-deny /
 connect4-deferral posture (that stays gated on `node_waypoint_in_netns`) — it
 only makes the per-pod `uid → cgroup` registry available so the Ambient mesh
-proxy's `NetnsUdpCaptureManager` (`src/proxy/netns_udp_capture.rs`) can discover
-enrolled pods. For each pod the producer enters the pod netns
+proxy's producer or disabled cleanup manager (`src/proxy/netns_udp_capture.rs`)
+can discover enrolled pods. For each pod the producer enters the pod netns
 (`setns(CLONE_NEWNET)` on a dedicated thread), installs a dedicated fail-closed
 OUTPUT guard, then binds the transparent capture socket and installs the UDP
 TPROXY rules while that guard remains active. The guard mirrors the operator's
@@ -266,13 +273,26 @@ duplicate jump, and always probes Ferrum-owned IPv6 guard chains left by an
 earlier IPv6-enabled run even when IPv6 capture is now disabled. The reply sockets
 are created in the same pod netns.
 
-The producer still writes **no** `.ready` markers. Note the narrower residual
-**enrollment window**: before the producer observes a newly or re-published
-registry entry and installs the guard, pod UDP egress passes **uncaptured**
-(fail-open for that pre-poll window). Closing that remaining window needs the
-producer→node-agent readiness handshake plus deny-before-enroll default tracked
-under issue #2013; the live bind-collision/source-capture verification remains
-part of #2038.
+Enrollment is fail-closed before the producer's first poll. The node-agent writes
+each pod's `FERRUM_POD_IPS` / `FERRUM_POD_IPS6` entry with UDP capture enabled but
+not ready before it publishes the registry entry. The host-veth tc classifier
+drops pod-originated UDP in that state. After the producer's in-netns guard,
+socket, and complete TPROXY ruleset are live, it publishes
+`<registry_dir>/.udp-ready/<pod_uid>`; the node-agent observes that marker and
+opens the BPF gate. A stale marker is removed before re-enrollment or a guarded
+producer retry, and marker/map updates are idempotent. Therefore the polling
+interval can delay UDP readiness, but it cannot create a plaintext bypass
+window. On producer stop, readiness is removed first and the producer waits for
+`<registry_dir>/.udp-not-ready/<pod_uid>`, which the node-agent writes only after
+the BPF ready bit is cleared or pod unenrollment has verifiably removed the BPF
+gate. In an explicitly disabled rollout, the new node-agent first re-applies the
+UDP-disabled pod-map flags from live pod state and then publishes the same ack;
+it never trusts a persisted ack from an older process generation. A failed map
+update/removal or classifier detach keeps capture degraded and withholds that
+acknowledgement; after a bounded wait
+the producer retains its in-netns fail-closed guard while releasing the producer
+tasks/netns handle instead of tearing down into plaintext. The live
+bind-collision/source-capture verification remains part of #2038.
 
 The Ambient UDP producer needs the same host access the NodeWaypoint in-netns
 listener needs — the read-only host cgroup mount + host `/proc` to resolve pod

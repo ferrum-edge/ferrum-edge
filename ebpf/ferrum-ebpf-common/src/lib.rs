@@ -174,7 +174,19 @@ impl ConnTuple6 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PodInfo {
     pub proxy_port: u32,
-    pub _pad: u32,
+    /// Per-pod capture lifecycle flags. Kept in the existing second word so the
+    /// map ABI remains eight bytes.
+    pub capture_flags: u32,
+}
+
+pub const POD_CAPTURE_FLAG_UDP_ENABLED: u32 = 1 << 0;
+pub const POD_CAPTURE_FLAG_UDP_READY: u32 = 1 << 1;
+
+impl PodInfo {
+    pub const fn udp_capture_not_ready(&self) -> bool {
+        self.capture_flags & POD_CAPTURE_FLAG_UDP_ENABLED != 0
+            && self.capture_flags & POD_CAPTURE_FLAG_UDP_READY == 0
+    }
 }
 
 /// Node-source kubelet probe exemption for IPv4 direct-inbound traffic.
@@ -582,6 +594,26 @@ mod tests {
     extern crate std;
     use super::*;
     use core::mem;
+
+    #[test]
+    fn pod_udp_capture_lifecycle_flags_fail_closed_until_ready() {
+        let disabled = PodInfo {
+            proxy_port: 15001,
+            capture_flags: 0,
+        };
+        let guarded = PodInfo {
+            proxy_port: 15001,
+            capture_flags: POD_CAPTURE_FLAG_UDP_ENABLED,
+        };
+        let ready = PodInfo {
+            proxy_port: 15001,
+            capture_flags: POD_CAPTURE_FLAG_UDP_ENABLED | POD_CAPTURE_FLAG_UDP_READY,
+        };
+
+        assert!(!disabled.udp_capture_not_ready());
+        assert!(guarded.udp_capture_not_ready());
+        assert!(!ready.udp_capture_not_ready());
+    }
 
     #[test]
     fn type_sizes_are_bpf_aligned() {
