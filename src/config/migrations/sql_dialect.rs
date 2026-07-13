@@ -122,6 +122,9 @@ impl V001SqlBuilder {
         sqlx::query(self.create_config_changes_sql())
             .execute(pool)
             .await?;
+        sqlx::query(self.create_consumer_identity_index_sql())
+            .execute(pool)
+            .await?;
         self.create_full_load_indexes(pool).await?;
         self.create_config_change_indexes(pool).await?;
         Ok(())
