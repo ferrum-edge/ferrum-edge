@@ -41,6 +41,7 @@ pub const DEFAULT_SENSITIVE_METADATA_KEYS: &[&str] = &[
     "x-auth-token",
     "x-csrf-token",
     "cache_request_headers_snapshot",
+    "claim_header.",
     "bearer",
     "password",
     "secret",

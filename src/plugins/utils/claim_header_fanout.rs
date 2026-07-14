@@ -47,7 +47,7 @@ pub fn parse_claim_headers(
     Ok(mappings)
 }
 
-pub fn emit_claim_headers_to_metadata(
+pub fn emit_claim_headers_to_context(
     ctx: &mut RequestContext,
     claims: &Value,
     mappings: &[ClaimHeaderMapping],
@@ -57,17 +57,18 @@ pub fn emit_claim_headers_to_metadata(
         let Some(value) = claim_value_for_header(claims, &mapping.claim_path, separator) else {
             continue;
         };
-        ctx.metadata.insert(mapping.metadata_key.clone(), value);
+        ctx.pending_claim_headers
+            .insert(mapping.metadata_key.clone(), value);
     }
 }
 
-pub fn apply_claim_headers_from_metadata(
+pub fn apply_claim_headers_from_context(
     ctx: &mut RequestContext,
     headers: &mut HashMap<String, String>,
     metadata_prefix: &str,
 ) {
     let keys: Vec<String> = ctx
-        .metadata
+        .pending_claim_headers
         .keys()
         .filter(|key| key.starts_with(metadata_prefix))
         .cloned()
@@ -76,7 +77,7 @@ pub fn apply_claim_headers_from_metadata(
         let Some(header_name) = key.strip_prefix(metadata_prefix) else {
             continue;
         };
-        if let Some(value) = ctx.metadata.remove(&key) {
+        if let Some(value) = ctx.pending_claim_headers.remove(&key) {
             headers.insert(header_name.to_string(), value);
         }
     }
@@ -175,18 +176,22 @@ mod tests {
             },
         ];
         let mut ctx = RequestContext::new("127.0.0.1".into(), "GET".into(), "/".into());
-        emit_claim_headers_to_metadata(
+        emit_claim_headers_to_context(
             &mut ctx,
             &json!({"email": "a@example.com", "roles": ["admin", "editor"]}),
             &mapping,
             ",",
         );
         assert_eq!(
-            ctx.metadata.get("p.x-user-email").map(String::as_str),
+            ctx.pending_claim_headers
+                .get("p.x-user-email")
+                .map(String::as_str),
             Some("a@example.com")
         );
         assert_eq!(
-            ctx.metadata.get("p.x-user-roles").map(String::as_str),
+            ctx.pending_claim_headers
+                .get("p.x-user-roles")
+                .map(String::as_str),
             Some("admin,editor")
         );
     }

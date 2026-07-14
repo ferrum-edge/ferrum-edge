@@ -10993,6 +10993,7 @@ components:
 
     JwksAuthConfig:
       type: object
+      additionalProperties: false
       description: "Plugin: jwks_auth — Multi-provider JWKS JWT validation with claim-based authorization."
       required: [providers]
       properties:
@@ -11000,10 +11001,11 @@ components:
           type: array
           items:
             type: object
+            additionalProperties: false
             properties:
               jwks_uri:
                 type: string
-                description: Direct URL to the IdP's JWKS endpoint
+                description: Direct URL to the IdP's JWKS endpoint. HTTPS is required except for literal loopback or localhost endpoints. URL userinfo is rejected.
               discovery_url:
                 type: string
                 description: >-
@@ -11011,7 +11013,8 @@ components:
                   jwks_uri must use the same origin as the discovery URL
                   (scheme, host, and effective port). For IdPs that serve JWKS
                   from a different origin than discovery, configure jwks_uri
-                  directly instead.
+                  directly instead. HTTPS is required except for literal
+                  loopback or localhost endpoints. URL userinfo is rejected.
               jwks:
                 oneOf:
                   - type: string
@@ -11032,6 +11035,7 @@ components:
                 type: array
                 items:
                   type: object
+                  additionalProperties: false
                   required: [name]
                   properties:
                     name:

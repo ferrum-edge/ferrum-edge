@@ -22,7 +22,7 @@ use crate::consumer_index::ConsumerIndex;
 use super::utils::PluginHttpClient;
 use super::utils::auth_flow::{VerifyOutcome, constant_time_eq};
 use super::utils::claim_header_fanout::{
-    ClaimHeaderMapping, apply_claim_headers_from_metadata, emit_claim_headers_to_metadata,
+    ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_context,
     parse_claim_headers,
 };
 use super::utils::claim_resolver::extract_claim_string;
@@ -1170,7 +1170,7 @@ impl OidcRelyingParty {
         ) {
             return reject(status, body);
         }
-        emit_claim_headers_to_metadata(ctx, &payload.claims, &self.provider.claim_headers, ",");
+        emit_claim_headers_to_context(ctx, &payload.claims, &self.provider.claim_headers, ",");
         let outcome = self.resolve_identity(&payload.claims, consumer_index);
         apply_verify_outcome(ctx, outcome)
     }
@@ -1602,7 +1602,7 @@ impl super::Plugin for OidcRelyingParty {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        apply_claim_headers_from_metadata(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
+        apply_claim_headers_from_context(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
         PluginResult::Continue
     }
     async fn after_proxy(
@@ -1660,6 +1660,12 @@ impl super::Plugin for OidcRelyingParty {
             .filter(|store| store.is_refreshable())
             .map(|store| vec![store.jwks_uri().to_string()])
             .unwrap_or_default()
+    }
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+        self.active_jwks_uris()
+            .into_iter()
+            .map(|uri| (uri, DEFAULT_JWKS_REFRESH_INTERVAL))
+            .collect()
     }
 }
 

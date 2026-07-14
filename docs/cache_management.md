@@ -222,7 +222,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Config field:** N/A (entry count equals configured provider count).
 
-**Cleanup mechanism:** TTL-based refresh (`cache_ttl_seconds` config field, default 3600s). Entries are refreshed in the background before expiry. The global JWKS store is keyed by provider URL, so duplicate URLs across plugin instances share a single cache entry.
+**Cleanup mechanism:** Periodic background refresh (`jwks_refresh_interval_secs`, default `900` seconds). The global JWKS store is keyed by provider URL, so duplicate URLs across plugin instances share a single cache entry and use the minimum interval requested by active consumers. See the [`jwks_auth` plugin reference](plugins.md#jwks_auth).
 
 ### TCP Connection Throttle
 
@@ -286,7 +286,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 | `soap_ws_security` | `nonce_replay_protection.cache_ttl_seconds` | `300` | Nonce expiry TTL |
 | `ldap_auth` | `max_cache_entries` | `10000` | Maximum cached LDAP bind results |
 | `ldap_auth` | `cache_ttl_seconds` | `0` | LDAP cache entry TTL (`0` = disabled; maximum `86400`) |
-| `jwks_auth` | `cache_ttl_seconds` | `3600` | JWKS key set refresh interval |
+| `jwks_auth` | `jwks_refresh_interval_secs` | `900` | JWKS key set refresh interval |
 | `api_chargeback` | `render_cache_ttl_seconds` | `60` | Rendered output cache TTL |
 | `prometheus_metrics` | `render_cache_ttl_seconds` | `60` | Rendered output cache TTL |
 

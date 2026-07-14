@@ -28,7 +28,7 @@ const MAX_JWKS_KEYS: usize = 256;
 const MAX_JWK_ID_BYTES: usize = 1024;
 const MAX_JWK_COMPONENT_BYTES: usize = 16 * 1024;
 
-fn redacted_jwks_uri(raw: &str) -> String {
+pub fn redacted_jwks_uri(raw: &str) -> String {
     let Ok(mut url) = Url::parse(raw) else {
         return "redacted-jwks-url".to_string();
     };
@@ -78,6 +78,8 @@ struct JwkKey {
     /// Key use: "sig" (signing) or "enc" (encryption).
     #[serde(rename = "use")]
     key_use: Option<String>,
+    /// Operations for which the key is intended (RFC 7517 section 4.3).
+    key_ops: Option<Vec<String>>,
 
     // RSA parameters
     /// RSA modulus (base64url-encoded).
@@ -115,6 +117,42 @@ fn validate_jwk_field_sizes(jwk: &JwkKey) -> Result<(), String> {
         if value.is_some_and(|value| value.len() > MAX_JWK_COMPONENT_BYTES) {
             return Err(format!("JWK {name} exceeds the supported length"));
         }
+    }
+    if let Some(key_ops) = jwk.key_ops.as_ref() {
+        if key_ops.len() > 16 {
+            return Err("JWK key_ops contains too many operations".to_string());
+        }
+        if key_ops
+            .iter()
+            .any(|operation| operation.len() > MAX_JWK_COMPONENT_BYTES)
+        {
+            return Err("JWK key_ops operation exceeds the supported length".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_jwk_verification_use(jwk: &JwkKey) -> Result<(), String> {
+    if let Some(key_use) = jwk.key_use.as_deref()
+        && key_use != "sig"
+    {
+        return Err(format!(
+            "JWK use '{key_use}' does not permit signature verification"
+        ));
+    }
+    if let Some(key_ops) = jwk.key_ops.as_ref()
+        && !key_ops.iter().any(|operation| operation == "verify")
+    {
+        return Err("JWK key_ops does not include 'verify'".to_string());
+    }
+    if jwk.key_use.as_deref() == Some("sig")
+        && jwk.key_ops.as_ref().is_some_and(|key_ops| {
+            key_ops
+                .iter()
+                .any(|operation| !matches!(operation.as_str(), "sign" | "verify"))
+        })
+    {
+        return Err("JWK use 'sig' conflicts with key_ops".to_string());
     }
     Ok(())
 }
@@ -259,23 +297,20 @@ impl JwksKeyStore {
         let mut new_keys = HashMap::new();
 
         for (idx, jwk) in jwks.keys.iter().enumerate() {
-            // Skip encryption keys — we only want signing keys
-            if jwk.key_use.as_deref() == Some("enc") {
-                continue;
-            }
-
-            let kid = jwk
-                .kid
-                .clone()
-                .unwrap_or_else(|| format!("__unnamed_{idx}"));
-
-            match validate_jwk_field_sizes(jwk).and_then(|()| Self::parse_jwk(jwk)) {
+            match validate_jwk_field_sizes(jwk)
+                .and_then(|()| validate_jwk_verification_use(jwk))
+                .and_then(|()| Self::parse_jwk(jwk))
+            {
                 Ok(cached) => {
+                    let kid = jwk
+                        .kid
+                        .clone()
+                        .unwrap_or_else(|| format!("__unnamed_{idx}"));
                     debug!("Cached JWKS key: kid={}, alg={:?}", kid, cached.algorithm);
                     new_keys.insert(kid, cached);
                 }
                 Err(e) => {
-                    warn!("Skipping JWKS key kid={}: {}", kid, e);
+                    warn!("Skipping JWKS key at index {}: {}", idx, e);
                 }
             }
         }

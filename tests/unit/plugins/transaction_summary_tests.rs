@@ -609,6 +609,10 @@ fn test_summary_redacts_default_sensitive_substring_keys() {
     summary
         .metadata
         .insert("session_token".to_string(), "stk".to_string());
+    summary.metadata.insert(
+        "jwks_auth.claim_header.x-user-email".to_string(),
+        "private@example.com".to_string(),
+    );
 
     let json = serde_json::to_string(&summary).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -618,9 +622,20 @@ fn test_summary_redacts_default_sensitive_substring_keys() {
     assert_eq!(parsed["metadata"]["user_password_hash"], "[REDACTED]");
     assert_eq!(parsed["metadata"]["api_secret"], "[REDACTED]");
     assert_eq!(parsed["metadata"]["session_token"], "[REDACTED]");
+    assert_eq!(
+        parsed["metadata"]["jwks_auth.claim_header.x-user-email"],
+        "[REDACTED]"
+    );
 
     // Raw values must not appear anywhere in the JSON.
-    for needle in ["sid=abc", "Bearer xyz", "argon2.value", "shhh", "stk"] {
+    for needle in [
+        "sid=abc",
+        "Bearer xyz",
+        "argon2.value",
+        "shhh",
+        "stk",
+        "private@example.com",
+    ] {
         assert!(
             !json.contains(needle),
             "Sensitive value {:?} leaked into output: {}",

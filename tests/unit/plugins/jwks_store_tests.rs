@@ -1,7 +1,7 @@
 //! Tests for JWKS key store module
 
 use ferrum_edge::plugins::utils::PluginHttpClient;
-use ferrum_edge::plugins::utils::jwks_store::JwksKeyStore;
+use ferrum_edge::plugins::utils::jwks_store::{JwksKeyStore, redacted_jwks_uri};
 use serde_json::json;
 
 #[test]
@@ -73,6 +73,84 @@ fn test_cloned_store_shares_keys() {
     assert_eq!(store.jwks_uri(), cloned.jwks_uri());
     assert!(!store.has_keys());
     assert!(!cloned.has_keys());
+}
+
+#[test]
+fn jwks_uri_redaction_removes_credentials_query_and_path() {
+    let redacted = redacted_jwks_uri(
+        "https://alice:super-secret@keys.example.com/private/jwks?signature=credential#fragment",
+    );
+    assert_eq!(redacted, "https://keys.example.com/");
+    for secret in [
+        "alice",
+        "super-secret",
+        "private",
+        "signature",
+        "credential",
+    ] {
+        assert!(!redacted.contains(secret));
+    }
+}
+
+#[test]
+fn jwk_key_ops_must_authorize_signature_verification() {
+    let jwks = |key_use: Option<&str>, key_ops: Option<serde_json::Value>| {
+        let mut key = json!({
+            "kty": "RSA",
+            "kid": "k1",
+            "alg": "RS256",
+            "n": "AQAB",
+            "e": "AQAB"
+        });
+        if let Some(key_use) = key_use {
+            key["use"] = json!(key_use);
+        }
+        if let Some(key_ops) = key_ops {
+            key["key_ops"] = key_ops;
+        }
+        json!({"keys": [key]}).to_string()
+    };
+
+    for accepted in [
+        jwks(None, None),
+        jwks(None, Some(json!(["verify"]))),
+        jwks(Some("sig"), None),
+        jwks(Some("sig"), Some(json!(["verify"]))),
+    ] {
+        let store = JwksKeyStore::from_inline_jwks(&accepted)
+            .expect("verification-capable key should be accepted");
+        assert!(store.get_key("k1").is_some());
+    }
+
+    for rejected in [
+        jwks(None, Some(json!([]))),
+        jwks(None, Some(json!(["encrypt"]))),
+        jwks(Some("enc"), None),
+        jwks(Some("enc"), Some(json!(["verify"]))),
+        jwks(Some("sig"), Some(json!(["verify", "encrypt"]))),
+    ] {
+        assert!(
+            JwksKeyStore::from_inline_jwks(&rejected).is_err(),
+            "non-verification or contradictory key_ops must fail closed"
+        );
+    }
+}
+
+#[test]
+fn oversized_jwk_component_is_rejected() {
+    let jwks = json!({
+        "keys": [{
+            "kty": "RSA",
+            "kid": "k1",
+            "use": "sig",
+            "alg": "RS256",
+            "n": "A".repeat(16 * 1024 + 1),
+            "e": "AQAB"
+        }]
+    })
+    .to_string();
+
+    assert!(JwksKeyStore::from_inline_jwks(&jwks).is_err());
 }
 
 /// A minimal but well-formed RSA JWKS with one signing key.
@@ -196,4 +274,32 @@ async fn test_oversized_jwks_response_is_rejected_without_populating_store() {
         .expect_err("oversized JWKS must be rejected");
     assert!(error.contains("response rejected"));
     assert!(!store.has_keys());
+}
+
+#[tokio::test]
+async fn test_oversized_refresh_retains_last_known_good_keys() {
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(populated_rsa_jwks()))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/jwks"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_bytes(vec![b' '; 1024 * 1024 + 1]),
+        )
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let store = JwksKeyStore::new(
+        format!("{}/jwks", server.uri()),
+        PluginHttpClient::default(),
+    );
+
+    assert_eq!(store.fetch_keys().await.expect("initial fetch"), 1);
+    assert!(store.fetch_keys().await.is_err());
+    assert!(store.get_key("k1").is_some());
 }

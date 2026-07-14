@@ -21,7 +21,7 @@ use crate::consumer_index::ConsumerIndex;
 use super::utils::PluginHttpClient;
 use super::utils::auth_flow::{ExtractedCredential, VerifyOutcome};
 use super::utils::claim_header_fanout::{
-    ClaimHeaderMapping, apply_claim_headers_from_metadata, emit_claim_headers_to_metadata,
+    ClaimHeaderMapping, apply_claim_headers_from_context, emit_claim_headers_to_context,
     parse_claim_headers,
 };
 use super::utils::claim_resolver::{extract_claim_string, parse_claim_path_value};
@@ -778,7 +778,7 @@ impl Oauth2Introspection {
         if provider.claim_headers.is_empty() {
             return;
         }
-        emit_claim_headers_to_metadata(ctx, claims, &provider.claim_headers, ",");
+        emit_claim_headers_to_context(ctx, claims, &provider.claim_headers, ",");
     }
 
     fn mark_original_token_stripping_metadata(
@@ -1195,7 +1195,7 @@ impl super::Plugin for Oauth2Introspection {
             ctx.metadata
                 .remove(&format!("{STRIP_HEADER_METADATA_PREFIX}{header}"));
         }
-        apply_claim_headers_from_metadata(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
+        apply_claim_headers_from_context(ctx, headers, CLAIM_HEADER_METADATA_PREFIX);
         PluginResult::Continue
     }
 

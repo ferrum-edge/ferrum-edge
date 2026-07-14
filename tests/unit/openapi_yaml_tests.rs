@@ -823,6 +823,37 @@ fn ldap_cache_documentation_and_openapi_defaults_match_runtime_constants() {
 }
 
 #[test]
+fn jwks_auth_schema_and_cache_guide_match_runtime_contract() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/JwksAuthConfig")
+        .expect("JwksAuthConfig exists");
+    assert_eq!(schema["additionalProperties"], json!(false));
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["from_headers"]["items"]["additionalProperties"],
+        json!(false)
+    );
+    assert_eq!(
+        schema["properties"]["jwks_refresh_interval_secs"]["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_JWKS_REFRESH_INTERVAL_SECS)
+    );
+    assert_eq!(
+        schema["properties"]["providers"]["items"]["properties"]["dpop_jti_cache_max_entries"]["default"],
+        json!(ferrum_edge::plugins::jwks_auth::DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES)
+    );
+
+    let guide = include_str!("../../docs/cache_management.md");
+    assert!(guide.contains("`jwks_refresh_interval_secs`, default `900` seconds"));
+    assert!(guide.contains("| `jwks_auth` | `jwks_refresh_interval_secs` | `900` |"));
+    assert!(!guide.contains("| `jwks_auth` | `cache_ttl_seconds`"));
+}
+
+#[test]
 fn ai_tool_governor_schema_matches_runtime_invariants() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

@@ -477,8 +477,10 @@ impl PluginHttpClient {
         // resolver they would use the OS resolver, bypassing execute_request's
         // literal-only guard and letting a hostname that resolves — or rebinds —
         // to a denied IP (e.g. 169.254.169.254) be dialed before the real
-        // runtime plugin is ever built. The fresh cache is cheap and short-lived
-        // (validation is a cold path), and mirrors the runtime client's screen.
+        // runtime plugin is ever built. (jwks_auth construction is now pure;
+        // other networked validators still need this protection.) The fresh
+        // cache is cheap and short-lived (validation is a cold path), and
+        // mirrors the runtime client's screen.
         let dns_cache = crate::dns::DnsCache::new(crate::dns::DnsConfig {
             backend_allow_ips: backend_allow_ips.clone(),
             ..Default::default()

@@ -18,12 +18,13 @@
 use arc_swap::ArcSwap;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::types::{GatewayConfig, PluginScope};
 use tracing::{error, warn};
 
 use crate::config::types::PluginConfig;
-use crate::plugins::utils::jwks_cache::retain_active_uris;
+use crate::plugins::utils::jwks_cache::retain_active_requirements;
 use crate::plugins::{
     Plugin, PluginFailurePolicy, PluginHttpClient, ProxyProtocol, create_plugin_with_http_client,
 };
@@ -462,6 +463,9 @@ impl Plugin for PriorityOverridePlugin {
     fn active_jwks_uris(&self) -> Vec<String> {
         self.inner.active_jwks_uris()
     }
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+        self.inner.active_jwks_refresh_requirements()
+    }
 }
 
 /// Try to create a plugin and apply `priority_override` from the plugin config.
@@ -741,20 +745,30 @@ fn build_protocol_snapshot(
 /// Collect all JWKS URIs actively referenced by `jwks_auth` plugin instances
 /// across all proxies and global plugins. Used to clean up stale JWKS cache
 /// entries (and abort their background refresh tasks) on config reload.
-fn collect_active_jwks_uris(
+fn collect_active_jwks_requirements(
     proxy_map: &ProxyPluginMap,
     globals: &[Arc<dyn Plugin>],
-) -> HashSet<String> {
-    let mut uris = HashSet::new();
+) -> HashMap<String, Duration> {
+    let mut requirements = HashMap::new();
     for plugins in proxy_map.values() {
         for plugin in plugins.iter() {
-            uris.extend(plugin.active_jwks_uris());
+            for (uri, interval) in plugin.active_jwks_refresh_requirements() {
+                requirements
+                    .entry(uri)
+                    .and_modify(|current| *current = (*current).min(interval))
+                    .or_insert(interval);
+            }
         }
     }
     for plugin in globals {
-        uris.extend(plugin.active_jwks_uris());
+        for (uri, interval) in plugin.active_jwks_refresh_requirements() {
+            requirements
+                .entry(uri)
+                .and_modify(|current| *current = (*current).min(interval))
+                .or_insert(interval);
+        }
     }
-    uris
+    requirements
 }
 
 fn start_background_tasks(
@@ -1101,8 +1115,9 @@ impl PluginCache {
     }
 
     pub(crate) fn retain_active_uris_for_inner(inner: &PluginCacheInner) {
-        let active_uris = collect_active_jwks_uris(&inner.proxy_plugins, &inner.global_plugins);
-        retain_active_uris(&active_uris);
+        let requirements =
+            collect_active_jwks_requirements(&inner.proxy_plugins, &inner.global_plugins);
+        retain_active_requirements(&requirements);
     }
 
     /// Build a request-scoped view of plugin-cache values for one proxy/protocol.

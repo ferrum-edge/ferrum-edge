@@ -465,6 +465,10 @@ pub struct RequestContext {
     pub timestamp_received: DateTime<Utc>,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
+    /// Claim-derived upstream headers staged by authentication plugins until
+    /// `before_proxy`. Kept out of `metadata` so authorization-phase rejection
+    /// logging can never serialize raw claim values.
+    pub(crate) pending_claim_headers: HashMap<String, String>,
     /// Semantic-cache embedding vector staged between `before_proxy` and
     /// `on_final_response_body`. Kept out of `metadata` so high-dimensional
     /// vectors cannot enter transaction logs.
@@ -759,6 +763,7 @@ impl RequestContext {
             auth_method: None,
             timestamp_received: Utc::now(),
             metadata: HashMap::new(),
+            pending_claim_headers: HashMap::new(),
             ai_semantic_cache_embedding: None,
             ai_semantic_cache_scope_key: None,
             openapi_validator_matches: HashMap::new(),
@@ -851,6 +856,10 @@ impl RequestContext {
                 .filter(|(k, _)| k.as_str() != "request_body")
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
+            // Claim-header staging stays on the real request context. Final
+            // body hooks never consume it, and copying raw claim values into a
+            // compatibility clone would extend their lifetime unnecessarily.
+            pending_claim_headers: HashMap::new(),
             ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
             ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
@@ -3585,6 +3594,13 @@ pub trait Plugin: Send + Sync {
     fn active_jwks_uris(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Returns the refresh interval required for each actively referenced
+    /// shared JWKS URI. The plugin cache reconciles duplicate consumers to the
+    /// minimum interval after every full or incremental publication.
+    fn active_jwks_refresh_requirements(&self) -> Vec<(String, Duration)> {
+        Vec::new()
+    }
 }
 
 /// Create a plugin instance from its name and configuration.
@@ -3615,12 +3631,11 @@ pub fn create_plugin_with_http_client(
     config: &Value,
     http_client: PluginHttpClient,
 ) -> Result<Option<Arc<dyn Plugin>>, String> {
-    // Fail CLOSED *before* constructing plugins that dial their OWN resolver —
-    // ldap_auth (ldap3), kafka_logging (librdkafka), ws_logging (tungstenite).
-    // These never go through this `PluginHttpClient` + `DnsCache`, and their
-    // constructors spawn the dial task immediately, so a denied literal endpoint
-    // must be rejected here, not merely warned at config-load. Because the
-    // production `PluginCache` is built with the real-policy client
+    // Fail CLOSED before constructing plugins with literal endpoints. Some
+    // (ldap_auth, kafka_logging, ws_logging) dial through their own resolver;
+    // jwks_auth uses the shared client but must still reject denied literals at
+    // config admission rather than installing a permanently keyless provider.
+    // The production `PluginCache` is built with the real-policy client
     // (`proxy/mod.rs` → `PluginHttpClient::new` → `with_http_client`), this also
     // makes a database-mode legacy row pointing at e.g. `169.254.169.254` exclude
     // the plugin instead of letting its background loop reach the metadata service
@@ -4007,24 +4022,48 @@ pub(crate) fn screen_redis_endpoint_egress(
     Ok(())
 }
 
-/// Screen the literal-IP endpoints of plugins that dial OUTSIDE the shared
-/// `PluginHttpClient` / `DnsCache`: `ldap_auth` (`ldap_url`, via the `ldap3`
-/// crate) and `kafka_logging` (`broker_list`, via librdkafka). Both perform
-/// their own DNS resolution and connect, so the HTTP-endpoint screen in
-/// [`validate_plugin_config_with_policy`] never sees them — a literal denied
-/// endpoint (`ldap://169.254.169.254:389`, `broker_list=169.254.169.254:9092`)
-/// would otherwise pass file/admin validation and reach the metadata service at
-/// runtime under the default baseline. Reject the literal at config-load.
+/// Screen literal-IP endpoints that require config-admission enforcement.
+/// `jwks_auth` retains the shared client's runtime DNS/IP backstop, while
+/// `ldap_auth` (`ldap_url`, via `ldap3`), `kafka_logging` (`broker_list`, via
+/// librdkafka), and `ws_logging` dial outside it. A denied literal endpoint
+/// would otherwise pass file/admin validation and either install a permanently
+/// keyless auth provider or reach the metadata service at runtime. Reject it at
+/// config-load.
 ///
-/// Hostname endpoints that later rebind to a denied address are an accepted
-/// limitation (the client resolves outside `DnsCache`), mirroring the
-/// `rediss://`-hostname case documented in `redis_rate_limiter`.
+/// For the clients outside `DnsCache`, hostname endpoints that later rebind to
+/// a denied address are an accepted limitation, mirroring the
+/// `rediss://`-hostname case documented in `redis_rate_limiter`. JWKS hostname
+/// resolution retains the shared client's runtime policy backstop.
 pub(crate) fn screen_direct_client_endpoint_egress(
     name: &str,
     config: &Value,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     match name {
+        // JWKS endpoints use the shared client (which keeps a runtime DNS/IP
+        // backstop), but literal denials must fail config admission before a
+        // provider can become permanently keyless and reject all tokens.
+        "jwks_auth" => {
+            if let Some(providers) = config.get("providers").and_then(Value::as_array) {
+                for (provider_idx, provider) in providers.iter().enumerate() {
+                    let Some(provider) = provider.as_object() else {
+                        continue;
+                    };
+                    for field in ["jwks_uri", "discovery_url"] {
+                        if let Some(url) = provider.get(field).and_then(Value::as_str)
+                            && let Ok(parsed) = url::Url::parse(url.trim())
+                            && let Some(host) = parsed.host_str()
+                            && let Some(ip) = crate::config::types::egress_literal_ip(host)
+                            && let Some(reason) = backend_allow_ips.deny_reason(&ip)
+                        {
+                            return Err(format!(
+                                "providers[{provider_idx}].{field} IP {ip} denied by backend egress policy: {reason}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         // ldap_url is a single ldap:// / ldaps:// URL.
         "ldap_auth" => {
             if let Some(url) = config.get("ldap_url").and_then(|v| v.as_str())
