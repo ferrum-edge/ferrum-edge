@@ -755,7 +755,7 @@ fn collect_active_jwks_requirements(
             for (uri, interval) in plugin.active_jwks_refresh_requirements() {
                 requirements
                     .entry(uri)
-                    .and_modify(|current| *current = (*current).min(interval))
+                    .and_modify(|current: &mut Duration| *current = (*current).min(interval))
                     .or_insert(interval);
             }
         }
@@ -764,7 +764,7 @@ fn collect_active_jwks_requirements(
         for (uri, interval) in plugin.active_jwks_refresh_requirements() {
             requirements
                 .entry(uri)
-                .and_modify(|current| *current = (*current).min(interval))
+                .and_modify(|current: &mut Duration| *current = (*current).min(interval))
                 .or_insert(interval);
         }
     }
