@@ -1121,6 +1121,8 @@ fn spawn_discovery_task(
                                 warn!(
                                     "jwks_auth OIDC: discovered replacement JWKS endpoint has no usable keys; retaining last-known-good store"
                                 );
+                                drop(store);
+                                retire_jwks_store_if_unreferenced(&uri);
                                 attempt = attempt.saturating_add(1);
                                 continue;
                             }
@@ -1129,6 +1131,8 @@ fn spawn_discovery_task(
                                     "jwks_auth OIDC: replacement JWKS fetch failed: {}; retaining last-known-good store",
                                     error
                                 );
+                                drop(store);
+                                retire_jwks_store_if_unreferenced(&uri);
                                 attempt = attempt.saturating_add(1);
                                 continue;
                             }

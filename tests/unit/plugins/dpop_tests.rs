@@ -350,6 +350,38 @@ fn full_replay_cache_fails_closed_until_an_entry_expires() {
     assert!(cache.check_and_insert("jkt-b", "jti-b", now + Duration::from_secs(61)));
 }
 
+#[test]
+fn concurrent_expired_evictions_admit_fresh_proofs_without_false_replays() {
+    const WORKERS: usize = 32;
+    let cache = Arc::new(DpopJtiCache::new(WORKERS, Duration::from_secs(1), 4));
+    let inserted_at = Instant::now();
+    for idx in 0..WORKERS {
+        assert!(cache.check_and_insert("jkt", &format!("expired-{idx}"), inserted_at));
+    }
+
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let workers = (0..WORKERS)
+        .map(|idx| {
+            let cache = Arc::clone(&cache);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                cache.check_and_insert(
+                    "jkt",
+                    &format!("fresh-{idx}"),
+                    inserted_at + Duration::from_secs(2),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        workers
+            .into_iter()
+            .all(|worker| worker.join().expect("worker should not panic"))
+    );
+}
+
 // ── minimal RSA public-key DER parsing (SPKI) for building the test JWK ─────
 
 fn der_from_pem(pem: &str) -> Vec<u8> {

@@ -729,6 +729,84 @@ async fn equivalent_discovery_generation_reuses_last_good_store_during_outage() 
     assert_eq!(ctx.authenticated_identity.as_deref(), Some("still-valid"));
 }
 
+#[tokio::test]
+async fn failed_discovery_replacement_retires_unpublished_candidate_store() {
+    use ferrum_edge::plugins::utils::jwks_cache::cached_refresh_state;
+
+    let _cache_guard = super::jwks_cache_tests::cache_test_lock().lock().await;
+    let public_key_pem = include_bytes!("../../../tests/fixtures/test_rsa_public.pem");
+    let server = wiremock::MockServer::start().await;
+    let original_path = unique_jwks_path("original-jwks");
+    let candidate_path = unique_jwks_path("candidate-jwks");
+    let original_uri = format!("{}{}", server.uri(), original_path);
+    let candidate_uri = format!("{}{}", server.uri(), candidate_path);
+    let discovery_path = "/.well-known/openid-configuration";
+    let discovery_url = format!("{}{discovery_path}", server.uri());
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(original_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(build_rsa_jwks_from_pem(public_key_pem)),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(candidate_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(503).set_delay(tokio::time::Duration::from_millis(150)),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(discovery_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"jwks_uri": original_uri.clone()})),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(discovery_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(json!({"jwks_uri": candidate_uri.clone()})),
+        )
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let config = json!({
+        "providers": [{"discovery_url": discovery_url}],
+        "jwks_refresh_interval_secs": 3600
+    });
+    let original = JwksAuth::new(&config, default_client()).unwrap();
+    start_background_tasks(&original);
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    while original.active_jwks_uris() != vec![original_uri.clone()] {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    original.warmup_jwks().await;
+
+    let replacement = JwksAuth::new(&config, default_client()).unwrap();
+    start_background_tasks(&replacement);
+    drop(original);
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+    while cached_refresh_state(&candidate_uri).is_none() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    while cached_refresh_state(&candidate_uri).is_some() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(replacement.active_jwks_uris(), vec![original_uri]);
+}
+
 /// Wait until the OIDC discovery endpoint has been hit at least once, proving
 /// the discovery flow actually ran (so a "no jwks fetch" assertion reflects
 /// validation rejecting the discovered URI, not discovery never executing).

@@ -232,11 +232,22 @@ fn forget_discovered_jwks_uri(jwks_uri: &str) {
     }
 }
 
-/// Remove a superseded discovery store once no plugin generation references
-/// it. Shared consumers keep it alive and the normal publication reconciliation
-/// will retire it later.
+/// Retire a superseded or rejected discovery store. A sole-owner cache entry
+/// is removed immediately; transient or shared owners keep it alive until the
+/// epoch-bound reaper can remove it safely. A committed active consumer revives
+/// the epoch during publication reconciliation.
 pub fn retire_jwks_store_if_unreferenced(jwks_uri: &str) {
     let cache = global_cache();
+    if let Some(entry) = cache.get(jwks_uri)
+        && Arc::strong_count(&entry.store) > 1
+    {
+        // A prior plugin generation or in-flight authentication still owns
+        // this superseded store. Reuse the epoch-bound reaper so its refresh
+        // task stops as soon as those transient owners finish; a concurrent
+        // active consumer revives the epoch and cancels this retirement.
+        schedule_retired_store_reaper(jwks_uri.to_string(), entry.value());
+        return;
+    }
     if let Some((_, stale)) =
         cache.remove_if(jwks_uri, |_, entry| Arc::strong_count(&entry.store) == 1)
     {

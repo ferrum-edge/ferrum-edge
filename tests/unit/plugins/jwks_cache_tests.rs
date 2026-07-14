@@ -1,7 +1,7 @@
 use ferrum_edge::plugins::PluginHttpClient;
 use ferrum_edge::plugins::utils::jwks_cache::{
     cached_refresh_state, clear_jwks_cache, get_or_create_jwks_store, retain_active_requirements,
-    retain_active_uris,
+    retain_active_uris, retire_jwks_store_if_unreferenced,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -185,6 +185,28 @@ async fn test_retired_store_revival_cancels_pending_reaper() {
 
     let still_cached = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
     assert!(Arc::ptr_eq(&revived, &still_cached));
+
+    clear_jwks_cache();
+}
+
+#[tokio::test]
+async fn superseded_store_is_reaped_after_transient_owner_drops() {
+    let server = wiremock::MockServer::start().await;
+    let uri = format!("{}/superseded/jwks.json", server.uri());
+    let _guard = cache_test_lock().lock().await;
+    clear_jwks_cache();
+    let in_flight_owner = get_or_create_jwks_store(&uri, &client(), Duration::from_secs(300));
+    let weak = Arc::downgrade(&in_flight_owner);
+
+    retire_jwks_store_if_unreferenced(&uri);
+    drop(in_flight_owner);
+    for _ in 0..20 {
+        if weak.upgrade().is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(weak.upgrade().is_none());
 
     clear_jwks_cache();
 }

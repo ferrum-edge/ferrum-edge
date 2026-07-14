@@ -81,22 +81,28 @@ impl DpopJtiCache {
     }
 
     fn evict_one_expired(&self, now: Instant) -> bool {
-        let victim = self
-            .entries
-            .iter()
-            .find_map(|entry| (entry.value().expires_at <= now).then(|| entry.key().clone()));
-        let Some(key) = victim else {
-            return false;
-        };
-        if self
-            .entries
-            .remove_if(&key, |_, entry| entry.expires_at <= now)
-            .is_some()
-        {
-            self.entry_count.fetch_sub(1, Ordering::AcqRel);
-            true
-        } else {
-            false
+        loop {
+            let victim = self
+                .entries
+                .iter()
+                .find_map(|entry| (entry.value().expires_at <= now).then(|| entry.key().clone()));
+            let Some(key) = victim else {
+                return false;
+            };
+            if self
+                .entries
+                .remove_if(&key, |_, entry| entry.expires_at <= now)
+                .is_some()
+            {
+                self.entry_count.fetch_sub(1, Ordering::AcqRel);
+                return true;
+            }
+            // Another request won the removal race. Retry admission when that
+            // request freed a slot, or scan again when other expired victims
+            // remain; only report full when every remaining marker is live.
+            if self.entry_count.load(Ordering::Acquire) < self.max_entries {
+                return true;
+            }
         }
     }
 
