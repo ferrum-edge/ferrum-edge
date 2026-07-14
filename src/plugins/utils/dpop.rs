@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -18,6 +19,7 @@ pub struct DpopJtiCache {
     max_entries: usize,
     ttl: Duration,
     entry_count: AtomicUsize,
+    admission_lock: Mutex<()>,
 }
 
 struct DpopJtiEntry {
@@ -31,11 +33,13 @@ impl DpopJtiCache {
             max_entries,
             ttl,
             entry_count: AtomicUsize::new(0),
+            admission_lock: Mutex::new(()),
         }
     }
 
     pub fn check_and_insert(&self, jkt: &str, jti: &str, now: Instant) -> bool {
         let mut key = format!("{jkt}|{jti}");
+        let mut admission_guard = None;
         loop {
             match self.entries.entry(key) {
                 Entry::Occupied(mut existing) => {
@@ -59,14 +63,22 @@ impl DpopJtiCache {
                         return true;
                     }
                     // Do not scan other shards while holding this vacant-entry
-                    // guard. At capacity we evict only expired entries; evicting
-                    // a live replay marker would make that proof reusable.
+                    // guard. After making room, the loop reacquires the entry
+                    // guard so the replay check and insertion stay atomic.
                     key = vacant.into_key();
                 }
             }
 
-            if !self.evict_one_expired(now) {
-                // Fail closed while every bounded slot protects a live proof.
+            if admission_guard.is_none() {
+                // Serialize only the full-cache path. Recheck the JTI under
+                // this guard before evicting: another request may have inserted
+                // it while this request waited, and a live duplicate must be
+                // rejected without displacing that replay marker.
+                admission_guard = Some(self.admission_guard());
+                continue;
+            }
+            if !self.evict_oldest() {
+                // A zero-capacity cache cannot admit any proof.
                 return false;
             }
         }
@@ -80,26 +92,37 @@ impl DpopJtiCache {
             .is_ok()
     }
 
-    fn evict_one_expired(&self, now: Instant) -> bool {
+    fn admission_guard(&self) -> MutexGuard<'_, ()> {
+        self.admission_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn evict_oldest(&self) -> bool {
         loop {
             let victim = self
                 .entries
                 .iter()
-                .find_map(|entry| (entry.value().expires_at <= now).then(|| entry.key().clone()));
-            let Some(key) = victim else {
-                return false;
+                // Every entry uses the same TTL, so expiry order is insertion
+                // order. The minimum also naturally prefers expired entries
+                // over live entries.
+                .min_by_key(|entry| entry.value().expires_at)
+                .map(|entry| (entry.key().clone(), entry.value().expires_at));
+            let Some((key, expires_at)) = victim else {
+                return self.entry_count.load(Ordering::Acquire) < self.max_entries;
             };
             if self
                 .entries
-                .remove_if(&key, |_, entry| entry.expires_at <= now)
+                // Match the observed expiry as well as the key so a concurrent
+                // remove-and-reinsert cannot make us evict the newer marker.
+                .remove_if(&key, |_, entry| entry.expires_at == expires_at)
                 .is_some()
             {
                 self.entry_count.fetch_sub(1, Ordering::AcqRel);
                 return true;
             }
-            // Another request won the removal race. Retry admission when that
-            // request freed a slot, or scan again when other expired victims
-            // remain; only report full when every remaining marker is live.
+            // Another request changed the victim. Retry admission when it made
+            // room, or select the current oldest entry while still full.
             if self.entry_count.load(Ordering::Acquire) < self.max_entries {
                 return true;
             }

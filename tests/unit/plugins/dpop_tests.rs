@@ -313,11 +313,12 @@ fn canonical_htu_from_url_rejects_userinfo() {
 }
 
 #[test]
-fn concurrent_identical_jti_admits_exactly_one_request() {
+fn concurrent_identical_jti_at_capacity_admits_exactly_one_request() {
     const WORKERS: usize = 32;
-    let cache = Arc::new(DpopJtiCache::new(64, Duration::from_secs(300), 4));
+    let cache = Arc::new(DpopJtiCache::new(1, Duration::from_secs(300), 4));
     let barrier = Arc::new(Barrier::new(WORKERS));
     let now = Instant::now();
+    assert!(cache.check_and_insert("old-jkt", "old-jti", now));
 
     let workers = (0..WORKERS)
         .map(|_| {
@@ -339,15 +340,16 @@ fn concurrent_identical_jti_admits_exactly_one_request() {
 }
 
 #[test]
-fn full_replay_cache_fails_closed_until_an_entry_expires() {
+fn full_replay_cache_rejects_live_duplicate_before_evicting() {
     let cache = DpopJtiCache::new(1, Duration::from_secs(60), 4);
     let now = Instant::now();
     assert!(cache.check_and_insert("jkt-a", "jti-a", now));
     assert!(
-        !cache.check_and_insert("jkt-b", "jti-b", now),
-        "a live replay marker must not be evicted to admit another proof"
+        !cache.check_and_insert("jkt-a", "jti-a", now + Duration::from_secs(1)),
+        "a live duplicate must be rejected before capacity eviction"
     );
-    assert!(cache.check_and_insert("jkt-b", "jti-b", now + Duration::from_secs(61)));
+    assert!(cache.check_and_insert("jkt-b", "jti-b", now + Duration::from_secs(1)));
+    assert!(!cache.check_and_insert("jkt-b", "jti-b", now + Duration::from_secs(2)));
 }
 
 #[test]
