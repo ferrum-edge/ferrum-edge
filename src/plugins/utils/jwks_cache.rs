@@ -142,8 +142,9 @@ pub fn retain_active_requirements(active_requirements: &HashMap<String, Duration
 /// Aborts the background refresh task for each removed entry so leaked tokio
 /// tasks don't accumulate across config reloads. Stores still owned by a
 /// retired plugin generation are reaped after their final external owner
-/// drops. Called by `PluginCache::rebuild()` and `PluginCache::apply_delta()`
-/// after the new plugin set is constructed.
+/// drops. External unit tests use this lower-level helper to exercise
+/// retirement independently from refresh-interval reconciliation.
+#[allow(dead_code)] // exercised by external unit tests
 pub fn retain_active_uris(active_uris: &HashSet<String>) {
     let cache = global_cache();
     cache.retain(|uri, entry| {
@@ -262,6 +263,7 @@ pub fn retire_jwks_store_if_unreferenced(jwks_uri: &str) {
 
 /// Return the current interval and task generation for diagnostics and tests.
 #[doc(hidden)]
+#[allow(dead_code)] // exercised by external unit tests
 pub fn cached_refresh_state(jwks_uri: &str) -> Option<(Duration, u64)> {
     global_cache().get(jwks_uri).map(|entry| {
         (

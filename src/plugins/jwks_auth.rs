@@ -1817,6 +1817,13 @@ fn string_scalar_or_array(value: &Value) -> Option<Vec<String>> {
     }
 }
 
+/// Extract the hostname from a URL string, if parseable.
+fn hostname_from_url(url: &str) -> Option<String> {
+    Url::parse(url)
+        .ok()
+        .and_then(|u| hostname_from_parsed_url(&u))
+}
+
 #[cfg(test)]
 mod configuration_tests {
     use super::*;
@@ -1841,11 +1848,4 @@ mod configuration_tests {
             .map(|cache| cache.max_entries());
         assert_eq!(capacity, Some(DEFAULT_DPOP_JTI_CACHE_MAX_ENTRIES));
     }
-}
-
-/// Extract the hostname from a URL string, if parseable.
-fn hostname_from_url(url: &str) -> Option<String> {
-    Url::parse(url)
-        .ok()
-        .and_then(|u| hostname_from_parsed_url(&u))
 }
