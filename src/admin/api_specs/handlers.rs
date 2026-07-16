@@ -2424,10 +2424,14 @@ pub async fn handle_post_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
-    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
-        return Ok(error_response(classify_db_error(error)));
-    }
-    match db.submit_api_spec_bundle(&bundle, &spec).await {
+    let persistence = match _namespace_config_admission_guard
+        .run_while_held(db.submit_api_spec_bundle(&bundle, &spec))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
+    match persistence {
         Ok(()) => {}
         Err(e) => return Ok(error_response(classify_db_error(e))),
     }
@@ -2607,10 +2611,14 @@ pub async fn handle_put_api_spec(
     // Preserve original created_at
     spec.created_at = existing_spec.created_at;
 
-    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
-        return Ok(error_response(classify_db_error(error)));
-    }
-    match db.replace_api_spec_bundle(&bundle, &spec).await {
+    let persistence = match _namespace_config_admission_guard
+        .run_while_held(db.replace_api_spec_bundle(&bundle, &spec))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
+    match persistence {
         Ok(()) => {}
         Err(e) => return Ok(error_response(classify_db_error(e))),
     }
@@ -2823,10 +2831,14 @@ pub async fn handle_delete_api_spec(
         }
     }
 
-    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
-        return Ok(error_response(classify_db_error(error)));
-    }
-    match db.delete_api_spec(namespace, id).await {
+    let persistence = match _namespace_config_admission_guard
+        .run_while_held(db.delete_api_spec(namespace, id))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
+    match persistence {
         Ok(true) => {
             let event = audit::AuditEvent::new(
                 actor,

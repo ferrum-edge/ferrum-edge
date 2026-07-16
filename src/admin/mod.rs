@@ -2851,14 +2851,20 @@ async fn persist_consumer_update(
     {
         return *response;
     }
-    if let Err(error) = admission_guard.ensure_held() {
-        return json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("Config admission unavailable: {error}")}),
-        );
-    }
     consumer.updated_at = Utc::now();
-    match db.update_consumer(&consumer).await {
+    let update = match admission_guard
+        .run_while_held(db.update_consumer(&consumer))
+        .await
+    {
+        Ok(update) => update,
+        Err(error) => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Config admission unavailable: {error}")}),
+            );
+        }
+    };
+    match update {
         // The consumer vanished between the namespace-scoped load and the
         // write (concurrent delete) — not-found, not a phantom success.
         Ok(false) => consumer_not_found_response(),
@@ -3292,6 +3298,27 @@ async fn finish_failed_restore(
     }
 
     json_response(StatusCode::INTERNAL_SERVER_ERROR, &response)
+}
+
+async fn finish_failed_restore_while_held(
+    admission_guard: &crud::NamespaceConfigAdmissionGuard,
+    state: &AdminState,
+    db: Arc<dyn DatabaseBackend>,
+    actor: &AuditActor,
+    namespace: &str,
+    restore_errors: Vec<String>,
+    snapshot: &RestoreSnapshot,
+) -> Result<Response<Full<Bytes>>, anyhow::Error> {
+    admission_guard
+        .run_while_held(finish_failed_restore(
+            state,
+            db,
+            actor,
+            namespace,
+            restore_errors,
+            snapshot,
+        ))
+        .await
 }
 
 /// Finalize a restore whose atomic clear definitively aborted.
@@ -4698,14 +4725,18 @@ async fn handle_batch_create(
         ));
     }
 
-    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
-        return Ok(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("Config admission unavailable: {error}")}),
-        ));
-    }
-
-    let (created, errors) = persist_payload_resources(db.as_ref(), &batch, true).await;
+    let (created, errors) = match _namespace_config_admission_guard
+        .run_while_held(persist_payload_resources(db.as_ref(), &batch, true))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Config admission unavailable: {error}")}),
+            ));
+        }
+    };
 
     let mut response = json!({
         "created": {
@@ -5175,16 +5206,21 @@ async fn handle_restore(
         }
     };
 
-    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
-        return Ok(json_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            &json!({"error": format!("Config admission unavailable: {error}")}),
-        ));
-    }
-
     // Phase 3: Delete all existing resources in the namespace (safe: payload is
     // validated and the prior state has been snapshotted from the primary above).
-    if let Err(e) = db.delete_all_resources(namespace).await {
+    let delete_result = match _namespace_config_admission_guard
+        .run_while_held(db.delete_all_resources(namespace))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Config admission unavailable: {error}")}),
+            ));
+        }
+    };
+    if let Err(e) = delete_result {
         error!("Restore: failed to delete existing resources: {}", e);
         if e.mode().is_atomic() {
             if e.has_unknown_commit_result() {
@@ -5202,7 +5238,8 @@ async fn handle_restore(
                         verification,
                     ) {
                         AtomicClearVerification::ClearCommitted => {
-                            finish_failed_restore(
+                            match finish_failed_restore_while_held(
+                                &_namespace_config_admission_guard,
                                 state,
                                 db.clone(),
                                 actor,
@@ -5211,6 +5248,13 @@ async fn handle_restore(
                                 &snapshot,
                             )
                             .await
+                            {
+                                Ok(response) => response,
+                                Err(error) => json_response(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                    &json!({"error": format!("Config admission unavailable during restore rollback: {error}")}),
+                                ),
+                            }
                         }
                         AtomicClearVerification::PriorConfigIntact => {
                             finish_atomic_delete_failure(
@@ -5249,7 +5293,8 @@ async fn handle_restore(
         // Non-atomic clear (standalone Mongo deletes collections one-by-one) can
         // leave the namespace in a mixed state, so attempt the same best-effort
         // rollback the import-failure path uses.
-        return Ok(finish_failed_restore(
+        return Ok(match finish_failed_restore_while_held(
+            &_namespace_config_admission_guard,
             state,
             db.clone(),
             actor,
@@ -5257,7 +5302,14 @@ async fn handle_restore(
             vec![format!("failed to clear existing config: {}", e)],
             &snapshot,
         )
-        .await);
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Config admission unavailable during restore rollback: {error}")}),
+            ),
+        });
     }
 
     info!("Restore: cleared existing config, beginning import");
@@ -5265,7 +5317,58 @@ async fn handle_restore(
     // Phase 3: Import resources in dependency order.
     // Each batch_create_* method internally chunks into 1,000-record
     // transactions to keep WAL/redo size bounded.
-    let (created, errors) = persist_payload_resources(db.as_ref(), &payload, false).await;
+    let (created, errors) = match _namespace_config_admission_guard
+        .run_while_held(persist_payload_resources(db.as_ref(), &payload, false))
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            error!(
+                namespace = %namespace,
+                %error,
+                "Restore: namespace admission was lost during import; reacquiring for rollback"
+            );
+            drop(_namespace_config_admission_guard);
+            let rollback_guard = match crud::lock_namespace_config_admission(db.clone(), namespace)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(rollback_error) => {
+                    return Ok(json_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        &json!({
+                            "error": format!(
+                                "Config admission was lost during restore and could not be reacquired for rollback: {rollback_error}"
+                            ),
+                            "restore_errors": [error.to_string()],
+                        }),
+                    ));
+                }
+            };
+            let rollback = finish_failed_restore(
+                state,
+                db.clone(),
+                actor,
+                namespace,
+                vec![format!(
+                    "namespace admission was lost during restore import: {error}"
+                )],
+                &snapshot,
+            );
+            return Ok(match rollback_guard.run_while_held(rollback).await {
+                Ok(response) => response,
+                Err(rollback_error) => json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": format!(
+                            "Config admission was lost while rolling back a cancelled restore: {rollback_error}"
+                        ),
+                        "restore_errors": [error.to_string()],
+                    }),
+                ),
+            });
+        }
+    };
 
     info!(
         "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
@@ -5287,8 +5390,19 @@ async fn handle_restore(
             namespace,
             errors.join("; ")
         );
+        let rollback =
+            finish_failed_restore(state, db.clone(), actor, namespace, errors, &snapshot);
         return Ok(
-            finish_failed_restore(state, db.clone(), actor, namespace, errors, &snapshot).await,
+            match _namespace_config_admission_guard
+                .run_while_held(rollback)
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({"error": format!("Config admission unavailable during restore rollback: {error}")}),
+                ),
+            },
         );
     }
 

@@ -56,6 +56,95 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("renew_namespace_config_admission_lease("));
     assert!(crud_source.contains("release_namespace_config_admission_lease("));
     assert!(crud_source.contains("guard.ensure_held()"));
+    assert!(crud_source.contains("Some(guard) => guard.run_while_held(future).await,"));
+    assert!(crud_source.contains("valid_until_millis: AtomicU64"));
+    assert!(crud_source.contains("sleep_until(tokio::time::Instant::from_std(valid_until))"));
+    let guard_drop = crud_source
+        .find("impl Drop for NamespaceConfigAdmissionGuard")
+        .map(|position| &crud_source[position..])
+        .expect("namespace admission guard drop implementation must exist");
+    let drop_invalidation = guard_drop
+        .find("self.lease_state.lose_ownership()")
+        .expect("dropping the guard must invalidate its local lease state");
+    let drop_stop_signal = guard_drop
+        .find("self.stop_tx.take()")
+        .expect("dropping the guard must stop lease renewal");
+    assert!(drop_invalidation < drop_stop_signal);
+    let durable_release = guard_drop
+        .find("release_namespace_config_admission_lease(&namespace, &owner)")
+        .expect("dropping the guard must release the owner-qualified durable lease");
+    let local_unlock = guard_drop
+        .find("drop(local);")
+        .expect("the local writer lock must be released explicitly");
+    assert!(
+        durable_release < local_unlock,
+        "the local writer must remain excluded until durable release finishes"
+    );
+
+    let handle_write = crud_source
+        .find("async fn handle_write<R: AdminResource>(")
+        .map(|position| &crud_source[position..])
+        .expect("direct CRUD write handler must exist");
+    let create_persistence = handle_write
+        .find("R::db_create(db, &resource),")
+        .expect("direct create persistence dispatch must exist");
+    let create_fence = handle_write[..create_persistence]
+        .rfind("run_db_write_while_held(")
+        .expect("direct create persistence must remain fenced for its full lifetime");
+    let update_persistence = handle_write
+        .find("R::db_update(db, &resource),")
+        .expect("direct update persistence dispatch must exist");
+    let update_fence = handle_write[..update_persistence]
+        .rfind("run_db_write_while_held(")
+        .expect("direct update persistence must remain fenced for its full lifetime");
+    let timestamping = handle_write
+        .find("resource.set_updated_at(now);")
+        .expect("server-side timestamping must precede persistence");
+    assert!(
+        timestamping < create_fence && timestamping < update_fence,
+        "the persistence fences must follow validation, preparation, and timestamping"
+    );
+    assert!(create_fence < create_persistence);
+    assert!(update_fence < update_persistence);
+    assert!(
+        handle_write[create_persistence..update_fence]
+            .contains("Err(error) => return Ok(R::map_precheck_db_error(&error))"),
+        "lease loss during create must retain the pre-persistence 503 contract"
+    );
+    let post_write = handle_write
+        .find("R::after_write(db, state, namespace, &resource, existing.as_ref(), action),")
+        .expect("generic post-write persistence hook must exist");
+    let post_write_fence = handle_write[..post_write]
+        .rfind("run_db_write_while_held(")
+        .expect("post-write persistence must remain fenced for its full lifetime");
+    assert!(update_persistence < post_write_fence);
+    assert!(post_write_fence < post_write);
+    assert!(
+        handle_write[update_persistence..post_write_fence]
+            .contains("Err(error) => return Ok(R::map_precheck_db_error(&error))"),
+        "lease loss during update must retain the pre-persistence 503 contract"
+    );
+
+    let delete_handler = crud_source
+        .find("pub(crate) async fn handle_delete<R: AdminResource>(")
+        .map(|position| &crud_source[position..])
+        .expect("delete handler must exist");
+    let delete_validation = delete_handler
+        .find("R::before_delete(db, state, namespace, &existing, &validation_ctx).await")
+        .expect("delete prospective validation must exist");
+    let delete_fence = delete_handler
+        .find("run_db_write_while_held(")
+        .expect("delete persistence must remain fenced for its full lifetime");
+    let delete_persistence = delete_handler
+        .find("R::db_delete(db, namespace, id),")
+        .expect("delete persistence dispatch must exist");
+    assert!(delete_validation < delete_fence);
+    assert!(delete_fence < delete_persistence);
+    assert!(
+        delete_handler[delete_persistence..]
+            .contains("Err(error) => return Ok(R::map_precheck_db_error(&error))"),
+        "lease loss during delete must retain the pre-persistence 503 contract"
+    );
 
     let graph_validation = crud_source
         .rfind("validate_transaction_log_schema_candidates(")
@@ -95,16 +184,145 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         "credential, batch, and restore mutations must share namespace admission"
     );
     assert!(
-        batch_source.contains("admission_guard.ensure_held()"),
-        "credential persistence must recheck namespace admission after async validation"
+        batch_source.matches(".run_while_held(").count() >= 5,
+        "credential, batch, restore, and compensating persistence must remain fenced"
     );
+    let credential_persistence = batch_source
+        .find("async fn persist_consumer_update(")
+        .map(|position| &batch_source[position..])
+        .expect("credential persistence helper must exist");
+    let hmac_validation = credential_persistence
+        .find("ensure_hmac_consumer_candidate(")
+        .expect("final asynchronous credential validation must exist");
+    let credential_fence = credential_persistence
+        .find(".run_while_held(")
+        .expect("credential persistence fence must exist");
+    let consumer_update = credential_persistence
+        .find("db.update_consumer(&consumer))")
+        .expect("credential persistence dispatch must exist");
+    assert!(hmac_validation < credential_fence);
+    assert!(credential_fence < consumer_update);
+    for handler_name in [
+        "async fn handle_update_credentials(",
+        "async fn handle_delete_credentials(",
+        "async fn handle_append_credential(",
+        "async fn handle_delete_credential_by_index(",
+    ] {
+        let handler = batch_source
+            .find(handler_name)
+            .map(|position| &batch_source[position..])
+            .unwrap_or_else(|| panic!("credential handler must exist: {handler_name}"));
+        let persistence = handler
+            .find("persist_consumer_update(")
+            .expect("credential handler must use the fenced persistence helper");
+        let persistence_end = handler[persistence..]
+            .find(".await")
+            .map(|position| position + persistence)
+            .expect("credential persistence helper must be awaited");
+        assert!(
+            handler[persistence..persistence_end]
+                .contains("&_namespace_config_admission_guard"),
+            "credential handler must pass its namespace guard: {handler_name}"
+        );
+    }
+    let batch_persistence = batch_source
+        .find("persist_payload_resources(db.as_ref(), &batch, true))")
+        .expect("batch persistence dispatch must exist");
+    let batch_fence = batch_source[..batch_persistence]
+        .rfind(".run_while_held(")
+        .expect("batch persistence must remain fenced for its full lifetime");
+    assert!(batch_fence < batch_persistence);
+    let restore_persistence = batch_source[restore_handler..]
+        .find("db.delete_all_resources(namespace))")
+        .map(|position| position + restore_handler)
+        .expect("restore destructive persistence dispatch must exist");
+    let restore_fence = batch_source[..restore_persistence]
+        .rfind(".run_while_held(")
+        .expect("restore clear must remain fenced for its full lifetime");
+    assert!(restore_fence < restore_persistence);
+    let restore_import = batch_source[restore_persistence..]
+        .find("persist_payload_resources(db.as_ref(), &payload, false))")
+        .map(|position| position + restore_persistence)
+        .expect("restore import persistence dispatch must exist");
+    let restore_import_fence = batch_source[..restore_import]
+        .rfind(".run_while_held(")
+        .expect("restore import must remain fenced for its full lifetime");
+    assert!(restore_persistence < restore_import_fence);
+    assert!(restore_import_fence < restore_import);
+    let restore_rollback = batch_source
+        .find(".run_while_held(finish_failed_restore(")
+        .expect("restore compensation must remain fenced for its full lifetime");
+    assert!(restore_rollback < restore_handler);
+    let restore_handler_source = &batch_source[restore_handler..];
+    assert!(
+        restore_handler_source
+            .matches("finish_failed_restore_while_held(")
+            .count()
+            >= 2,
+        "atomic-commit and non-atomic clear failures must compensate under the lease"
+    );
+    let loss_marker = restore_handler_source
+        .find("namespace admission was lost during import")
+        .expect("restore import lease-loss recovery must exist");
+    let recovery = &restore_handler_source[loss_marker..];
+    let drop_invalid_guard = recovery
+        .find("drop(_namespace_config_admission_guard);")
+        .expect("the invalid restore guard must be dropped before reacquisition");
+    let reacquire = recovery
+        .find("crud::lock_namespace_config_admission(db.clone(), namespace)")
+        .expect("restore compensation must reacquire namespace admission");
+    let rollback = recovery
+        .find("let rollback = finish_failed_restore(")
+        .expect("restore compensation must be constructed under the replacement guard");
+    let rollback_fence = recovery
+        .find("rollback_guard.run_while_held(rollback).await")
+        .expect("restore compensation must run under the replacement guard");
+    assert!(drop_invalid_guard < reacquire);
+    assert!(reacquire < rollback);
+    assert!(rollback < rollback_fence);
     let sql_store_source = include_str!("../../../src/config/db_loader.rs");
     assert!(sql_store_source.contains("config_admission_locks"));
     assert!(sql_store_source.contains("config_admission_lease_now_sql"));
     assert!(sql_store_source.contains("self.batch_create_plugin_configs_chunk(configs).await?"));
+    assert!(sql_store_source.contains("for chunk in configs.chunks(Self::BATCH_CHUNK_SIZE)"));
+    assert!(sql_store_source.contains("expires_at > {now}"));
+    assert!(sql_store_source.contains(
+        "DELETE FROM config_admission_locks WHERE namespace = ? AND owner = ?"
+    ));
+    let graph_batch_persistence = sql_store_source
+        .find("pub async fn batch_create_plugin_configs(")
+        .map(|position| &sql_store_source[position..])
+        .expect("SQL plugin batch persistence must exist");
+    let graph_single_transaction = graph_batch_persistence
+        .find("self.batch_create_plugin_configs_chunk(configs).await?")
+        .expect("graph-aware batches must use one transaction");
+    let unrelated_chunking = graph_batch_persistence
+        .find("for chunk in configs.chunks(Self::BATCH_CHUNK_SIZE)")
+        .expect("unrelated plugin batches must retain bounded chunks");
+    assert!(graph_single_transaction < unrelated_chunking);
     let mongo_store_source = include_str!("../../../src/config/mongo_store.rs");
     assert!(mongo_store_source.contains("config_admission_locks"));
     assert!(mongo_store_source.contains("server_time_lease_acquire_pipeline"));
+    assert!(mongo_store_source.contains("$$NOW"));
+    assert!(mongo_store_source.contains("lease_server_time().await?"));
+    assert!(mongo_store_source.contains(
+        "delete_one(doc! { \"_id\": namespace, \"owner\": owner })"
+    ));
+    let mongo_graph_batch = mongo_store_source
+        .find("async fn batch_create_plugin_configs(")
+        .map(|position| &mongo_store_source[position..])
+        .expect("Mongo plugin batch persistence must exist");
+    let next_mongo_batch = mongo_graph_batch
+        .find("async fn batch_create_upstreams(")
+        .expect("Mongo upstream batch persistence must follow plugin persistence");
+    let mongo_graph_batch = &mongo_graph_batch[..next_mongo_batch];
+    assert!(mongo_graph_batch.contains(".start_transaction()"));
+    assert!(mongo_graph_batch.contains(".insert_many(docs.clone())"));
+    assert!(mongo_graph_batch.contains("rollback_standalone_created_documents("));
+    assert!(
+        !mongo_graph_batch.contains("configs.chunks("),
+        "Mongo graph-aware batches must not split across an admission boundary"
+    );
 
     let pipeline_source = include_str!("../../../src/config/validation_pipeline.rs");
     assert!(pipeline_source.contains("transaction_log_schema::validate_config_graph("));
@@ -127,29 +345,41 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .expect("POST admission guard");
     let post_persist = api_spec_source
-        .find("db.submit_api_spec_bundle(&bundle, &spec).await")
+        .find("db.submit_api_spec_bundle(&bundle, &spec))")
         .expect("POST persistence");
     assert!(post_lock < post_persist);
+    let post_fence = api_spec_source[..post_persist]
+        .rfind(".run_while_held(")
+        .expect("POST full-lifetime persistence fence");
+    assert!(post_lock < post_fence);
     let put_lock = api_spec_source[post_lock + 1..]
         .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .map(|position| position + post_lock + 1)
         .expect("PUT admission guard");
     let put_persist = api_spec_source
-        .find("db.replace_api_spec_bundle(&bundle, &spec).await")
+        .find("db.replace_api_spec_bundle(&bundle, &spec))")
         .expect("PUT persistence");
     assert!(put_lock < put_persist);
+    let put_fence = api_spec_source[..put_persist]
+        .rfind(".run_while_held(")
+        .expect("PUT full-lifetime persistence fence");
+    assert!(put_lock < put_fence);
     let delete_lock = api_spec_source[put_lock + 1..]
         .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .map(|position| position + put_lock + 1)
         .expect("DELETE admission guard");
     let delete_persist = api_spec_source
-        .find("db.delete_api_spec(namespace, id).await")
+        .find("db.delete_api_spec(namespace, id))")
         .expect("DELETE persistence");
     let delete_validation = api_spec_source
         .find("validate_transaction_log_schema_api_spec_deletion_candidate(")
         .expect("DELETE prospective graph validation");
+    let delete_fence = api_spec_source[..delete_persist]
+        .rfind(".run_while_held(")
+        .expect("DELETE full-lifetime persistence fence");
     assert!(delete_lock < delete_validation);
-    assert!(delete_validation < delete_persist);
+    assert!(delete_validation < delete_fence);
+    assert!(delete_fence < delete_persist);
 }
 
 #[test]
