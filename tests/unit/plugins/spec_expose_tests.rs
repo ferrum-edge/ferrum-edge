@@ -113,8 +113,8 @@ fn test_creation_valid_config() {
     assert_eq!(plugin.priority(), 210);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(!plugin.modifies_request_headers());
-    assert!(plugin.applies_after_proxy_on_reject());
-    assert!(plugin.may_replace_rejection_response());
+    assert!(!plugin.applies_after_proxy_on_reject());
+    assert!(!plugin.may_replace_rejection_response());
     assert!(!plugin.is_auth_plugin());
 }
 
@@ -748,7 +748,7 @@ async fn test_specz_request_fetches_mocked_spec_and_preserves_content_type() {
 }
 
 #[tokio::test]
-async fn test_head_fetches_get_representation_then_reuses_it_without_a_body() {
+async fn test_head_fetches_get_representation_without_rejection_replacement() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -796,16 +796,15 @@ async fn test_head_fetches_get_representation_then_reuses_it_without_a_body() {
         Some("nosniff")
     );
 
-    // The full GET representation survives the body-hook phase. The plugin's
-    // reject-path after_proxy hook suppresses it only at finalization.
-    let (suppressed_status, suppressed_body, suppressed_headers) = reject_parts(
+    // The plugin retains the full GET representation for response-body hooks
+    // and does not enter the warning-producing rejection-replacement path.
+    // The shared finalizer suppresses the finalized HEAD wire body.
+    assert!(matches!(
         plugin
             .after_proxy(&mut head_ctx, head_status, &mut head_headers)
             .await,
-    );
-    assert_eq!(suppressed_status, head_status);
-    assert!(suppressed_body.is_empty());
-    assert_eq!(suppressed_headers, head_headers);
+        PluginResult::Continue
+    ));
 
     let mut get_ctx = make_ctx("GET", "/api/specz?download=true", "/api/");
     let (get_status, get_body, get_headers) =
@@ -816,7 +815,7 @@ async fn test_head_fetches_get_representation_then_reuses_it_without_a_body() {
 }
 
 #[tokio::test]
-async fn test_head_failure_has_get_metadata_and_no_body() {
+async fn test_head_failure_has_get_metadata_without_rejection_replacement() {
     let plugin = SpecExpose::new(
         &json!({ "spec_url": "http://127.0.0.1:1/private?token=secret" }),
         PluginHttpClient::default(),
@@ -840,10 +839,10 @@ async fn test_head_failure_has_get_metadata_and_no_body() {
     );
     assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
 
-    let (_, suppressed_body, suppressed_headers) =
-        reject_parts(plugin.after_proxy(&mut ctx, status, &mut headers).await);
-    assert!(suppressed_body.is_empty());
-    assert_eq!(suppressed_headers, headers);
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, status, &mut headers).await,
+        PluginResult::Continue
+    ));
 }
 
 /// Finding #68: an attacker-controllable upstream must not be able to make the

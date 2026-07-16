@@ -13638,6 +13638,14 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         strip_websocket_transport_managed_response_header_map(headers);
     }
 
+    // HEAD owns the same selected representation as GET, so keep the full
+    // body through every synthetic response transform, guard, and exceptional
+    // rejection replacement above. Suppress only the finalized wire body,
+    // retaining representation headers such as Content-Length and ETag.
+    if ctx.method == "HEAD" {
+        body.clear();
+    }
+
     // Observe every client-visible rejection that flows through this finalizer —
     // synthetic short-circuits, gRPC rejects, non-2xx rejects, empty-body rejects
     // — only after final-body validators, rejection replacement, and the

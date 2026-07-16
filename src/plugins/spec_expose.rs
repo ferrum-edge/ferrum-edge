@@ -83,11 +83,6 @@ const FAILURE_BACKOFF_MAX_SECONDS: u64 = 30;
 const FETCH_BUSY_BODY: &[u8] =
     br#"{"error":"API specification fetch is busy; retry after the indicated delay"}"#;
 const FETCH_BUSY_BODY_LENGTH: &str = "76";
-/// Private request marker kept only until the rejection-response hook phase.
-/// It ensures HEAD carries the full GET representation through body policy and
-/// suppresses it only after those hooks have established the final metadata.
-const HEAD_RESPONSE_MARKER: &str = "ferrum:spec_expose_head_response";
-
 const CONFIG_KEYS: [&str; 5] = [
     "spec_url",
     "content_type",
@@ -740,13 +735,6 @@ impl Plugin for SpecExpose {
             return PluginResult::Continue;
         }
 
-        if is_head {
-            ctx.metadata
-                .insert(HEAD_RESPONSE_MARKER.to_string(), "true".to_string());
-        } else {
-            ctx.metadata.remove(HEAD_RESPONSE_MARKER);
-        }
-
         // Fast paths are lock-free. A cached failure is the completion state
         // shared by every caller during the backoff window.
         if let Some(entry) = self.cached_spec() {
@@ -800,34 +788,6 @@ impl Plugin for SpecExpose {
             Ok(entry) => spec_response(entry),
             Err(failure) => failure.into_plugin_result(),
         }
-    }
-
-    async fn after_proxy(
-        &self,
-        ctx: &mut RequestContext,
-        response_status: u16,
-        response_headers: &mut HashMap<String, String>,
-    ) -> PluginResult {
-        if ctx.metadata.remove(HEAD_RESPONSE_MARKER).as_deref() != Some("true") {
-            return PluginResult::Continue;
-        }
-
-        // Synthetic response-body transforms and guards have already run when
-        // reject-path after_proxy hooks execute. Replace only the wire body now
-        // while retaining their final GET status and representation metadata.
-        PluginResult::RejectBinary {
-            status_code: response_status,
-            body: Bytes::new(),
-            headers: response_headers.clone(),
-        }
-    }
-
-    fn applies_after_proxy_on_reject(&self) -> bool {
-        true
-    }
-
-    fn may_replace_rejection_response(&self) -> bool {
-        true
     }
 }
 
