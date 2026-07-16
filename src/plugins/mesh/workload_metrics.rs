@@ -1828,6 +1828,7 @@ mod tests {
         StreamConnectionContext {
             client_ip: "10.0.0.2".to_string(),
             direct_client_ip: "10.0.0.2".to_string(),
+            canonical_client_ip: Default::default(),
             proxy_id: "mesh-stream".to_string(),
             proxy_name: Some(proxy_name.to_string()),
             listen_port: 5432,

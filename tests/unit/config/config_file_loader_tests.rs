@@ -897,6 +897,51 @@ fn test_file_config_rejects_unknown_adaptive_concurrency_policy_keys() {
 }
 
 #[test]
+fn test_file_config_rejects_ip_restriction_typos_and_null_lists() {
+    for (id, config) in [
+        (
+            "ip-allow-typo",
+            serde_json::json!({
+                "alow": ["10.0.0.0/8"],
+                "deny": ["192.0.2.0/24"]
+            }),
+        ),
+        (
+            "ip-null-allow",
+            serde_json::json!({
+                "allow": null,
+                "deny": ["192.0.2.0/24"]
+            }),
+        ),
+    ] {
+        let document = serde_json::json!({
+            "version": "1",
+            "proxies": [],
+            "consumers": [],
+            "plugin_configs": [{
+                "id": id,
+                "plugin_name": "ip_restriction",
+                "config": config,
+                "scope": "global",
+                "enabled": true
+            }]
+        });
+        let mut file = NamedTempFile::with_suffix(".json").unwrap();
+        write!(file, "{document}").unwrap();
+
+        let error = load_config_from_file(
+            file.path().to_str().unwrap(),
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        )
+        .expect_err("file-mode load must reject broadened ip_restriction policy");
+        let message = format!("{error:#}");
+        assert!(message.contains("1 plugin config error(s)"), "{message}");
+    }
+}
+
+#[test]
 fn test_optional_fail_open_plugin_validation_is_non_fatal_in_file_mode() {
     let yaml = r#"
 version: "1"

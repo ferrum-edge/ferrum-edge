@@ -19,6 +19,7 @@ fn create_stream_context(
     ferrum_edge::plugins::StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("TCP Proxy".to_string()),
         listen_port: 5432,

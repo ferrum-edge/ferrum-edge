@@ -62,7 +62,7 @@ impl RetryPolicy {
     /// With `jitter`, returns a uniform random value in `[0, capped]` (full
     /// jitter). The jitter uses a lightweight counter-based PRNG — it does not
     /// need cryptographic quality — mirroring `crate::retry::retry_delay`.
-    fn backoff_delay(&self, attempt: u32) -> Duration {
+    pub(crate) fn backoff_delay(&self, attempt: u32) -> Duration {
         let base_ms = self.delay.as_millis().min(u128::from(MAX_TOKIO_SLEEP_MS)) as u64;
         let cap_ms = self
             .max_delay

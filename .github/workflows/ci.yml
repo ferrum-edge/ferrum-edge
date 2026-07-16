@@ -3068,6 +3068,7 @@ jobs:
           set -euo pipefail
 
           run_benchmark=true
+          run_ip_restriction_benchmark=false
           reason="Performance regression checks always run for ${EVENT_NAME} events."
           changed_files=""
 
@@ -3118,6 +3119,10 @@ jobs:
             fi
           fi
 
+          if [ "${EVENT_NAME}" != "pull_request" ] || grep -Eq '^(src/plugins/(ip_restriction\.rs|mod\.rs)|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ip_restriction\.rs)|\.github/scripts/verify_ip_restriction_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
+            run_ip_restriction_benchmark=true
+          fi
+
           if [ -n "${changed_files}" ]; then
             printf '%s\n' "${changed_files}" > "${RUNNER_TEMP}/performance-regression-changed-files.txt"
           else
@@ -3126,13 +3131,23 @@ jobs:
 
           {
             echo "run=${run_benchmark}"
+            echo "run_ip_restriction_benchmark=${run_ip_restriction_benchmark}"
             echo "reason=${reason}"
           } >> "${GITHUB_OUTPUT}"
 
       - uses: ./.github/actions/setup-rust-ci
-        if: steps.perf_changes.outputs.run == 'true'
+        if: steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true'
         with:
           shared-key: "ci-perf"
+
+      - name: Run IP restriction worst-case microbenchmark
+        if: steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true'
+        run: |
+          cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench ip_restriction
+          python3 .github/scripts/verify_ip_restriction_benchmark.py \
+            --criterion-root tests/performance/mesh/target/criterion \
+            --max-scaling-ratio 8 \
+            --max-ns-per-instance 10000
 
       - name: Build release binaries
         if: steps.perf_changes.outputs.run == 'true'
@@ -3208,26 +3223,35 @@ jobs:
           kill "${GATEWAY_PID:-}" 2>/dev/null || true
 
       - name: Upload performance results
-        if: always() && steps.perf_changes.outputs.run == 'true'
+        if: always() && (steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: performance-results
-          path: tests/performance/ci_results/
+          path: |
+            tests/performance/ci_results/
+            tests/performance/mesh/target/criterion/ip_restriction_lookup/
           retention-days: 30
 
       - name: Post performance summary
         if: always()
         env:
           RUN: ${{ steps.perf_changes.outputs.run }}
+          RUN_IP_RESTRICTION: ${{ steps.perf_changes.outputs.run_ip_restriction_benchmark }}
           REASON: ${{ steps.perf_changes.outputs.reason }}
         run: |
           {
             echo "## Performance Regression Check"
             echo ""
           } >> "${GITHUB_STEP_SUMMARY}"
+          if [ "${RUN_IP_RESTRICTION}" = "true" ]; then
+            {
+              echo "IP restriction lookup guard executed: 10,000/100-rule mean ratio <= 8x and 10,000-rule mean <= 10 microseconds per plugin instance."
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
           if [ "${RUN}" != "true" ]; then
             {
-              echo "Skipped expensive benchmark: ${REASON}"
+              echo "Skipped self-relative gateway benchmark: ${REASON}"
               echo ""
               echo "Relevant paths:"
               echo "- Shared runtime infrastructure: every top-level \`src/*.rs\` module (request epoch, overload, load balancing, pooling, adaptive concurrency, metrics, startup — all consumed on or beside the measured request path)."

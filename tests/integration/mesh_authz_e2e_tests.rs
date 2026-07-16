@@ -1452,6 +1452,7 @@ fn inbound_stream_ctx(listen_port: u16, peer_spiffe: &str) -> StreamConnectionCo
     let mut ctx = StreamConnectionContext {
         client_ip: "10.0.0.7".to_string(),
         direct_client_ip: "10.0.0.7".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "__mesh-in-tcp-relay-default-redis-6379".to_string(),
         proxy_name: Some("mesh raw-tcp inbound".to_string()),
         listen_port,

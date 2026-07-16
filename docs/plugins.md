@@ -1051,24 +1051,34 @@ UDP sessions are logged when the session is cleaned up after idle timeout.
 **Phases**: `log`, `on_stream_disconnect`
 **Protocols**: All (HTTP, gRPC, WebSocket, TCP, UDP)
 
-Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push`). Entries are batched asynchronously and grouped by label set for efficient ingestion. Supports gzip compression (enabled by default), static and dynamic labels, custom headers for multi-tenant Loki (`X-Scope-OrgID`), and authentication via `Authorization` header.
+Ships transaction logs to Grafana Loki via the push API (`POST /loki/api/v1/push`). Entries are batched asynchronously and grouped by label set for efficient ingestion. Supports gzip compression (enabled by default), static and dynamic labels, custom headers for multi-tenant Loki (`X-Scope-OrgID`), and authentication via `Authorization` header. Config admission is strict: unknown top-level fields and explicit `null` values are rejected. Nested `labels` and `custom_headers` remain dynamic maps.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `endpoint_url` | string | (required) | Loki push API URL |
-| `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic) |
-| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`) |
-| `labels` | object | `{"service":"ferrum-edge"}` | Static labels applied to every log stream |
+| `endpoint_url` | string | (required) | HTTP(S) Loki push API URL; URL user information is rejected |
+| `authorization_header` | string | (none) | `Authorization` header value (Bearer/Basic); leading/trailing whitespace is rejected |
+| `custom_headers` | object | `{}` | Extra HTTP headers (e.g., `X-Scope-OrgID`); names use HTTP token syntax and are at most 65,535 bytes |
+| `labels` | object | `{"service":"ferrum-edge"}` | Static labels; names beginning `__` and reserved `ferrum_emitter` are rejected; names are at most 1,024 characters and values at most 2,048 characters |
 | `include_proxy_id_label` | bool | `true` | Add `proxy_id` as a label |
 | `include_status_class_label` | bool | `true` | Add `status_class` (2xx/3xx/4xx/5xx) as a label |
 | `gzip` | bool | `true` | Gzip-compress request bodies |
-| `batch_size` | integer | `100` | Max entries per batch |
+| `batch_size` | integer | `100` | Max entries per batch (1–10,000) |
 | `flush_interval_ms` | integer | `1000` | Flush timer interval (minimum 100) |
-| `buffer_capacity` | integer | `10000` | Channel buffer capacity |
-| `max_retries` | integer | `3` | Retry attempts on failure |
-| `retry_delay_ms` | integer | `1000` | Delay between retries |
+| `buffer_capacity` | integer | `10000` | Channel buffer capacity (1–1,000,000) |
+| `max_entry_bytes` | integer | `65536` | Maximum retained bytes for one JSON line plus labels (1,024–1,048,576); the configured serializer's minimum HTTP and stream lines plus static, reserved, and worst-case dynamic label values must fit |
+| `buffer_max_bytes` | integer | `16777216` | Per-plugin retained-content budget across queued, batched, and retrying entries (1,024–268,435,456; at least `max_entry_bytes`) |
+| `max_retries` | integer | `3` | Retries after the initial attempt (0–10) |
+| `retry_delay_ms` | integer | `1000` | Initial exponential-backoff delay (1–60,000 ms) |
+| `schema` | object | (none) | Inline transaction-log schema |
+| `schema_ref` | string | (none) | Named `transaction_log_schema` reference; mutually exclusive with `schema` |
 
-Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, `authorization_header`, or tenant header rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests, which Loki uses for ingestion throttling) are transient signals and are retried within the configured budget.
+HTTP **204 No Content** is Loki's canonical delivery success. A received 204 is treated as committed even if the best-effort response drain is incomplete, because retrying after the sink accepted the batch can duplicate entries. Other 2xx responses from Loki-compatible receivers or intermediaries are accepted only when their response drains completely and is empty. Loki's blocked-ingestion status **260**, non-empty or anomalously drained compatible-success responses, 3xx, and non-retryable 4xx responses are terminal; transport failures, 408, 429, and 5xx retry with capped exponential backoff and full jitter. Response bodies are never logged or retained: they are discarded with a 1 MiB cap and a one-second timeout, and diagnostics contain only status and bounded size/drain classifications.
+
+The outer Loki timestamp is assigned in the plugin's single flush order and is strictly increasing across batches. The original request/session timestamps remain in the structured JSON line, so completion-order batching does not invent event chronology. Ferrum Edge adds a unique `ferrum_emitter` label to each plugin instance; independently ordered replicas and reload generations therefore do not share a Loki stream. Reusing an emitter across generations would be unsafe because old and new cache generations can flush concurrently. Consequently, every replica and every rebuilt Loki plugin generation creates one active Loki stream per remaining label combination until the prior stream ages out. Operators with frequent file/DP/mesh/global reloads should monitor tenant stream utilization, avoid unnecessary rebuilds, and size Loki `max_streams_per_user` (or equivalent compatible-receiver limits) for replica count × generation overlap × label combinations; 429 responses are retried but sustained limit pressure still drops batches after the configured attempts.
+
+Compatibility note: earlier Ferrum Edge releases treated every 2xx status, including Loki's blocked-ingestion 260, as success. This release makes 260 and non-empty/anomalous non-204 2xx responses terminal and accepts empty non-204 2xx responses for compatible receivers. Receivers should prefer the Loki-standard 204 contract.
+
+The channel slot is reserved before serialization. Serialization is capped by `max_entry_bytes`, and retained entry content remains charged to `buffer_max_bytes` until delivery, terminal loss, or shutdown drain completes. Construction reserves the configured serializer's smallest HTTP/stream shape plus maximum admitted proxy-ID and other dynamic label values; request-shaped fields can still make an individual JSON line exceed the configured per-entry limit, in which case that entry is dropped. Pressure drops are non-blocking and diagnostics never contain entry content. Operational logs show only the endpoint scheme/host/port; path, query, authorization, and all custom-header values are redacted from audit records and non-admin config reads. Shared plugin HTTP clients ignore ambient proxy environment variables, while preserving configured DNS, TLS, redirect, and backend-egress policy.
 
 ### `transaction_debugger`
 
@@ -2123,11 +2133,11 @@ config:
 
 ### `ip_restriction`
 
-Restricts access based on client IP address or CIDR range. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP — via both `on_request_received` (HTTP-family) and `on_stream_connect` (TCP/UDP).
+Restricts access based on client IP address or CIDR range. Runs on every protocol — HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP/TLS, and UDP/DTLS — via both `on_request_received` (HTTP-family) and `on_stream_connect` (stream-family).
 
 **Priority:** 150
 
-**Supported protocols:** All (HTTP, gRPC, WebSocket, TCP, UDP)
+**Supported protocols:** All (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP/TLS, UDP/DTLS)
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
@@ -2137,7 +2147,9 @@ Restricts access based on client IP address or CIDR range. Runs on every protoco
 
 At least one of `allow` or `deny` must be configured. Empty config or both lists empty rejects plugin creation.
 
-Rules are validated and pre-parsed at config load time into integer bitmasks; invalid IP/CIDR entries reject plugin creation instead of being silently ignored. The hot path is pure integer comparison — no per-request string parsing. Supports IPv4 (`/0`–`/32`) and IPv6 (`/0`–`/128`); IPv6 zone identifiers (e.g. `%eth0`) on rules or client IPs are stripped before matching so a malformed `X-Forwarded-For` entry never silently bypasses a deny rule.
+The config must be an object containing only `allow`, `deny`, and `mode`. Unknown or misspelled properties, explicit `null` values, malformed arrays, and non-string/empty rules reject the candidate configuration. File/admin/database/CP-DP admission therefore cannot publish a typo as a broader effective policy, and a rejected reload keeps the last-known-good plugin generation.
+
+Rules are validated and compiled at config load time into sorted, merged numeric intervals; duplicates, overlaps, and adjacent ranges collapse without changing inclusive CIDR boundaries. Invalid IP/CIDR entries reject plugin creation instead of being silently ignored. IPv4 rule octets must use canonical unsigned decimal notation, so ambiguous forms such as `010.1.2.3` and `+10.1.2.3` are rejected. Request-time lookup is allocation-free, lock-free, and O(log n) in the number of non-overlapping intervals rather than a scan of configured rules. The authoritative client IP is parsed and canonicalized once per request, TCP connection, or UDP/DTLS session and the typed value is reused by every attached `ip_restriction` instance. IPv4-mapped IPv6 identities normalize to IPv4 before policy; mapped CIDR rules therefore accept only `/96`–`/128`, which map to IPv4 `/0`–`/32`, while shorter mapped prefixes are rejected as ambiguous. Native IPv6 CIDRs accept `/0`–`/128`; IPv6 zone identifiers (e.g. `%eth0`) on rules or client IPs are stripped before matching. A malformed authoritative client IP always fails closed. Debug-level construction logs expose only the selected mode and effective IPv4/IPv6 interval counts, never configured addresses.
 
 When both `allow` and `deny` are configured, `deny` always overrides a matching `allow`; `mode` only controls which list is checked first for non-overlapping entries.
 

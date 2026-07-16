@@ -17,7 +17,7 @@ duration, build profile, and comparison baseline.
 | CI HTTP overhead gate | `ci_overhead_bench.py` | Short HTTP overhead regression check used by `ci.yml`. | CI artifacts under `tests/performance/ci_results/`. |
 | Multi-protocol matrix | [`multi_protocol/`](multi_protocol/) | HTTP/1.1, HTTPS, HTTP/2, HTTP/3, WebSocket, gRPC, TCP, TCP+TLS, UDP, and UDP+DTLS through Ferrum and direct backend baselines. Also includes Envoy comparison and connection saturation harnesses. | [`multi_protocol/README.md`](multi_protocol/README.md). |
 | Payload-size matrix | [`payload_size/`](payload_size/) | Content-type and payload-size sweeps across HTTP, gRPC, WebSocket, TCP, UDP, and TLS variants. | [`payload_size/README.md`](payload_size/README.md). |
-| Mesh hot-path microbenches | [`mesh/`](mesh/) | Criterion microbenches for mesh authorization, slice apply, and xDS translation hot/cold paths. | [`mesh/README.md`](mesh/README.md) and `mesh/baseline.md`. |
+| In-process hot-path microbenches | [`mesh/`](mesh/) | Criterion microbenches for indexed IP restriction lookup plus mesh authorization, slice apply, and xDS translation paths. | [`mesh/README.md`](mesh/README.md) and `mesh/baseline.md`. |
 | Mesh DNS E2E | [`mesh-dns-e2e/`](mesh-dns-e2e/) | End-to-end transparent mesh DNS proxy latency/throughput over UDP and TCP. | [`mesh-dns-e2e/README.md`](mesh-dns-e2e/README.md). |
 | Mesh HBONE E2E | [`mesh-hbone-e2e/`](mesh-hbone-e2e/) | Gateway-to-mesh HBONE outbound throughput over H2 CONNECT/mTLS. | [`mesh-hbone-e2e/README.md`](mesh-hbone-e2e/README.md). |
 

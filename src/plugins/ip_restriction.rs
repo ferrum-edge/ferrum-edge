@@ -4,64 +4,129 @@
 //! authentication. Supports exact IPs, CIDR notation, and IPv6.
 //! Operates in either allow-first or deny-first mode.
 //!
-//! All IP rules are pre-parsed at config load time into integer bitmasks,
-//! so request-time matching is pure integer comparison with zero parsing.
+//! Rules are compiled on the cold path into sorted, merged numeric intervals.
+//! Request matching is allocation-free, lock-free, and O(log n) in the number
+//! of non-overlapping intervals. The authoritative client IP is parsed and
+//! canonicalized once by the request/stream context and reused by every
+//! `ip_restriction` instance.
 
 use async_trait::async_trait;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::net::Ipv6Addr;
-use tracing::warn;
+use std::net::IpAddr;
+use tracing::{debug, warn};
 
 use super::{Plugin, PluginResult, RequestContext};
 
-#[derive(Debug, Clone, PartialEq)]
+const CONFIG_KEYS: &[&str] = &["allow", "deny", "mode"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     AllowFirst,
     DenyFirst,
 }
 
-/// A pre-parsed IP rule — parsed once at config load, matched with integer ops at request time.
-#[derive(Debug, Clone)]
-pub(super) enum ParsedRule {
-    /// Exact IPv4 address (stored as 32-bit integer).
-    ExactV4(u32),
-    /// IPv4 CIDR range (network & mask pre-computed).
-    CidrV4 { network: u32, mask: u32 },
-    /// Exact IPv6 address (stored as 128-bit integer).
-    ExactV6(u128),
-    /// IPv6 CIDR range (network & mask pre-computed).
-    CidrV6 { network: u128, mask: u128 },
+impl Mode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AllowFirst => "allow_first",
+            Self::DenyFirst => "deny_first",
+        }
+    }
 }
 
-/// The client IP parsed once per request for matching against all rules.
-#[derive(Debug)]
-pub(super) enum ParsedClientIp {
-    V4(u32),
-    V6(u128),
-    /// Unparseable client IP string — never matches validated rules.
-    Unknown,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IpFamily {
+    V4,
+    V6,
+}
+
+/// Inclusive numeric address interval, compiled from one exact-IP/CIDR rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParsedRule {
+    family: IpFamily,
+    start: u128,
+    end: u128,
+}
+
+impl ParsedRule {
+    fn matches(self, client_ip: IpAddr) -> bool {
+        let (family, value) = ip_key(client_ip);
+        self.family == family && self.start <= value && value <= self.end
+    }
+}
+
+/// Immutable lookup index built at plugin construction/reload.
+///
+/// Overlapping, duplicate, and adjacent ranges are merged. A request performs
+/// one binary search in its address family, so lookup does not scan configured
+/// rules and requires no request-time allocation or synchronization.
+#[derive(Debug, Default)]
+struct IpRangeSet {
+    v4: Box<[ParsedRule]>,
+    v6: Box<[ParsedRule]>,
+}
+
+impl IpRangeSet {
+    fn compile(rules: Vec<ParsedRule>) -> Self {
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        for rule in rules {
+            match rule.family {
+                IpFamily::V4 => v4.push(rule),
+                IpFamily::V6 => v6.push(rule),
+            }
+        }
+        Self {
+            v4: merge_ranges(v4).into_boxed_slice(),
+            v6: merge_ranges(v6).into_boxed_slice(),
+        }
+    }
+
+    fn contains(&self, client_ip: IpAddr) -> bool {
+        let (family, value) = ip_key(client_ip);
+        let ranges = match family {
+            IpFamily::V4 => &self.v4,
+            IpFamily::V6 => &self.v6,
+        };
+        range_binary_search(ranges, value)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.v4.is_empty() && self.v6.is_empty()
+    }
 }
 
 pub struct IpRestriction {
-    allow: Vec<ParsedRule>,
-    deny: Vec<ParsedRule>,
+    allow: IpRangeSet,
+    deny: IpRangeSet,
     mode: Mode,
 }
 
 impl IpRestriction {
     pub fn new(config: &Value) -> Result<Self, String> {
-        let allow = Self::parse_rule_list(config, "allow")?;
-        let deny = Self::parse_rule_list(config, "deny")?;
+        let object = config
+            .as_object()
+            .ok_or_else(|| "ip_restriction: config must be an object".to_string())?;
+        if let Some(unknown) = object
+            .keys()
+            .find(|key| !CONFIG_KEYS.contains(&key.as_str()))
+        {
+            return Err(format!(
+                "ip_restriction: unknown configuration field '{unknown}'; allowed fields: allow, deny, mode"
+            ));
+        }
 
+        let allow = IpRangeSet::compile(Self::parse_rule_list(object, "allow")?);
+        let deny = IpRangeSet::compile(Self::parse_rule_list(object, "deny")?);
         if allow.is_empty() && deny.is_empty() {
             return Err(
                 "ip_restriction: at least one 'allow' or 'deny' rule is required".to_string(),
             );
         }
 
-        let mode = match config.get("mode") {
-            None | Some(Value::Null) => Mode::AllowFirst,
+        let mode = match object.get("mode") {
+            None => Mode::AllowFirst,
             Some(Value::String(mode)) if mode == "allow_first" => Mode::AllowFirst,
             Some(Value::String(mode)) if mode == "deny_first" => Mode::DenyFirst,
             Some(other) => {
@@ -71,22 +136,26 @@ impl IpRestriction {
             }
         };
 
+        debug!(
+            plugin = "ip_restriction",
+            mode = mode.as_str(),
+            allow_intervals = allow.v4.len() + allow.v6.len(),
+            allow_ipv4_intervals = allow.v4.len(),
+            allow_ipv6_intervals = allow.v6.len(),
+            deny_intervals = deny.v4.len() + deny.v6.len(),
+            deny_ipv4_intervals = deny.v4.len(),
+            deny_ipv6_intervals = deny.v6.len(),
+            "compiled IP restriction policy"
+        );
+
         Ok(Self { allow, deny, mode })
     }
 
-    /// Check whether a client IP is allowed by the restriction rules.
-    fn check_ip(&self, client_ip_str: &str) -> PluginResult {
-        let client_ip = parse_client_ip(client_ip_str);
-
-        // Fail closed when the client IP cannot be determined. An `Unknown`
-        // address matches no rule, so a deny-only config (no allow list) would
-        // otherwise fall through to `Continue` and silently bypass a deny rule
-        // — a fail-open. Rejecting here makes the plugin deny rather than permit
-        // for every allow/deny/mode combination, matching its stated intent of
-        // not letting unparseable client IPs bypass matching.
-        if matches!(client_ip, ParsedClientIp::Unknown) {
+    /// Check a context-cached, canonical client IP against the compiled policy.
+    fn check_ip(&self, client_ip: Option<IpAddr>, client_ip_label: &str) -> PluginResult {
+        let Some(client_ip) = client_ip else {
             warn!(
-                client_ip = %client_ip_str,
+                client_ip = %client_ip_label,
                 plugin = "ip_restriction",
                 reason = "unparseable_client_ip",
                 "client IP could not be parsed; denying"
@@ -96,73 +165,46 @@ impl IpRestriction {
                 body: r#"{"error":"client IP could not be determined"}"#.to_string(),
                 headers: HashMap::new(),
             };
-        }
+        };
 
         match self.mode {
             Mode::AllowFirst => {
-                if !self.allow.is_empty()
-                    && !self.allow.iter().any(|rule| rule_matches(&client_ip, rule))
-                {
-                    warn!(client_ip = %client_ip_str, plugin = "ip_restriction", reason = "not_in_allow_list", "IP address not in allow list");
-                    return PluginResult::Reject {
-                        status_code: 403,
-                        body: r#"{"error":"IP address not allowed"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
+                if !self.allow.is_empty() && !self.allow.contains(client_ip) {
+                    return reject_not_allowed(client_ip_label);
                 }
-                if self.deny.iter().any(|rule| rule_matches(&client_ip, rule)) {
-                    warn!(client_ip = %client_ip_str, plugin = "ip_restriction", reason = "ip_denied", "IP address denied");
-                    return PluginResult::Reject {
-                        status_code: 403,
-                        body: r#"{"error":"IP address denied"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
+                if self.deny.contains(client_ip) {
+                    return reject_denied(client_ip_label);
                 }
             }
             Mode::DenyFirst => {
-                if self.deny.iter().any(|rule| rule_matches(&client_ip, rule)) {
-                    warn!(client_ip = %client_ip_str, plugin = "ip_restriction", reason = "ip_denied", "IP address denied");
-                    return PluginResult::Reject {
-                        status_code: 403,
-                        body: r#"{"error":"IP address denied"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
+                if self.deny.contains(client_ip) {
+                    return reject_denied(client_ip_label);
                 }
-                if !self.allow.is_empty()
-                    && !self.allow.iter().any(|rule| rule_matches(&client_ip, rule))
-                {
-                    warn!(client_ip = %client_ip_str, plugin = "ip_restriction", reason = "not_in_allow_list", "IP address not in allow list");
-                    return PluginResult::Reject {
-                        status_code: 403,
-                        body: r#"{"error":"IP address not allowed"}"#.to_string(),
-                        headers: HashMap::new(),
-                    };
+                if !self.allow.is_empty() && !self.allow.contains(client_ip) {
+                    return reject_not_allowed(client_ip_label);
                 }
             }
         }
         PluginResult::Continue
     }
 
-    /// Parse a JSON array of IP/CIDR strings into pre-computed rules at config load time.
-    fn parse_rule_list(config: &Value, key: &str) -> Result<Vec<ParsedRule>, String> {
+    /// Parse one rule array on the cold configuration path.
+    fn parse_rule_list(config: &Map<String, Value>, key: &str) -> Result<Vec<ParsedRule>, String> {
         let Some(value) = config.get(key) else {
             return Ok(Vec::new());
         };
-        if value.is_null() {
-            return Ok(Vec::new());
-        }
-        let Value::Array(arr) = value else {
+        let Value::Array(values) = value else {
             return Err(format!(
                 "ip_restriction: '{key}' must be an array of IP/CIDR strings"
             ));
         };
 
-        let mut rules = Vec::with_capacity(arr.len());
-        for value in arr {
+        let mut rules = Vec::with_capacity(values.len());
+        for value in values {
             let rule = value
                 .as_str()
-                .ok_or_else(|| format!("ip_restriction: '{key}' entries must be strings"))?;
-            let rule = rule.trim();
+                .ok_or_else(|| format!("ip_restriction: '{key}' entries must be strings"))?
+                .trim();
             if rule.is_empty() {
                 return Err(format!(
                     "ip_restriction: '{key}' entries must be non-empty strings"
@@ -194,192 +236,181 @@ impl Plugin for IpRestriction {
         &self,
         ctx: &mut super::StreamConnectionContext,
     ) -> super::PluginResult {
-        self.check_ip(&ctx.client_ip)
+        self.check_ip(ctx.canonical_client_ip(), &ctx.client_ip)
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
-        self.check_ip(&ctx.client_ip)
+        self.check_ip(ctx.canonical_client_ip(), &ctx.client_ip)
     }
 }
 
-// ── Pre-parsing (config load time) ──────────────────────────────────
+fn reject_not_allowed(client_ip: &str) -> PluginResult {
+    warn!(client_ip = %client_ip, plugin = "ip_restriction", reason = "not_in_allow_list", "IP address not in allow list");
+    PluginResult::Reject {
+        status_code: 403,
+        body: r#"{"error":"IP address not allowed"}"#.to_string(),
+        headers: HashMap::new(),
+    }
+}
 
-/// Parse a single rule string into a `ParsedRule` at config load time.
-pub(super) fn parse_rule(rule: &str) -> Option<ParsedRule> {
-    if let Some((network_str, prefix_str)) = rule.split_once('/') {
-        // CIDR rule
-        let prefix_len: u8 = match prefix_str.parse() {
-            Ok(p) => p,
-            Err(_) => return None,
-        };
+fn reject_denied(client_ip: &str) -> PluginResult {
+    warn!(client_ip = %client_ip, plugin = "ip_restriction", reason = "ip_denied", "IP address denied");
+    PluginResult::Reject {
+        status_code: 403,
+        body: r#"{"error":"IP address denied"}"#.to_string(),
+        headers: HashMap::new(),
+    }
+}
 
-        // Try IPv4 CIDR
-        if let Some(octets) = parse_ipv4(network_str) {
-            if prefix_len > 32 {
-                return None;
-            }
-            let network = u32::from_be_bytes(octets);
-            let mask = if prefix_len == 0 {
-                0
-            } else {
-                !0u32 << (32 - prefix_len)
-            };
-            return Some(ParsedRule::CidrV4 {
-                network: network & mask,
-                mask,
-            });
+fn merge_ranges(mut ranges: Vec<ParsedRule>) -> Vec<ParsedRule> {
+    ranges.sort_unstable_by_key(|rule| (rule.start, rule.end));
+    let mut merged: Vec<ParsedRule> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        if let Some(previous) = merged.last_mut()
+            && range.start <= previous.end.saturating_add(1)
+        {
+            previous.end = previous.end.max(range.end);
+        } else {
+            merged.push(range);
         }
+    }
+    merged
+}
 
-        // Try IPv6 CIDR
-        if let Some(parts) = parse_ipv6(network_str) {
-            if prefix_len > 128 {
-                return None;
-            }
+fn range_binary_search(ranges: &[ParsedRule], client: u128) -> bool {
+    let mut low = 0;
+    let mut high = ranges.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        if ranges[middle].start <= client {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    low > 0 && client <= ranges[low - 1].end
+}
 
-            if let Some(v4_bits) = ipv6_parts_to_ipv4_mapped_u32(&parts)
-                && prefix_len >= 96
-            {
-                let v4_prefix_len = prefix_len - 96;
-                let mask = if v4_prefix_len == 0 {
-                    0u32
-                } else {
-                    !0u32 << (32 - v4_prefix_len)
-                };
-                return Some(ParsedRule::CidrV4 {
-                    network: v4_bits & mask,
-                    mask,
+fn ip_key(client_ip: IpAddr) -> (IpFamily, u128) {
+    match client_ip.to_canonical() {
+        IpAddr::V4(ip) => (IpFamily::V4, u128::from(u32::from(ip))),
+        IpAddr::V6(ip) => (IpFamily::V6, u128::from(ip)),
+    }
+}
+
+/// Parse one exact-IP/CIDR rule into an inclusive numeric interval.
+fn parse_rule(rule: &str) -> Option<ParsedRule> {
+    if let Some((network, prefix)) = rule.split_once('/') {
+        let prefix: u8 = prefix.parse().ok()?;
+        return parse_cidr_rule(network, prefix);
+    }
+
+    match parse_rule_ip(rule)? {
+        IpAddr::V4(ip) => {
+            let value = u128::from(u32::from(ip));
+            Some(ParsedRule {
+                family: IpFamily::V4,
+                start: value,
+                end: value,
+            })
+        }
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                let value = u128::from(u32::from(mapped));
+                return Some(ParsedRule {
+                    family: IpFamily::V4,
+                    start: value,
+                    end: value,
                 });
             }
+            let value = u128::from(ip);
+            Some(ParsedRule {
+                family: IpFamily::V6,
+                start: value,
+                end: value,
+            })
+        }
+    }
+}
 
-            let network = ipv6_to_u128(&parts);
-            let mask = if prefix_len == 0 {
+fn parse_cidr_rule(network: &str, prefix: u8) -> Option<ParsedRule> {
+    match parse_rule_ip(network)? {
+        IpAddr::V4(ip) => v4_range(u32::from(ip), prefix),
+        IpAddr::V6(ip) => {
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                let v4_prefix = prefix.checked_sub(96)?;
+                return v4_range(u32::from(mapped), v4_prefix);
+            }
+            if prefix > 128 {
+                return None;
+            }
+            let value = u128::from(ip);
+            let mask = if prefix == 0 {
                 0
             } else {
-                !0u128 << (128 - prefix_len)
+                u128::MAX << (128 - prefix)
             };
-            return Some(ParsedRule::CidrV6 {
-                network: network & mask,
-                mask,
-            });
+            let start = value & mask;
+            Some(ParsedRule {
+                family: IpFamily::V6,
+                start,
+                end: start | !mask,
+            })
         }
-
-        None
-    } else {
-        // Exact IP rule
-        if let Some(octets) = parse_ipv4(rule) {
-            return Some(ParsedRule::ExactV4(u32::from_be_bytes(octets)));
-        }
-        if let Some(parts) = parse_ipv6(rule) {
-            if let Some(v4_bits) = ipv6_parts_to_ipv4_mapped_u32(&parts) {
-                return Some(ParsedRule::ExactV4(v4_bits));
-            }
-            return Some(ParsedRule::ExactV6(ipv6_to_u128(&parts)));
-        }
-        None
     }
 }
 
-/// Parse a client IP string once per request.
-pub(super) fn parse_client_ip(ip: &str) -> ParsedClientIp {
-    if let Some(octets) = parse_ipv4(ip) {
-        return ParsedClientIp::V4(u32::from_be_bytes(octets));
-    }
-    if let Some(parts) = parse_ipv6(ip) {
-        let v6_bits = ipv6_to_u128(&parts);
-        if let Some(v4) = Ipv6Addr::from(parts).to_ipv4_mapped() {
-            return ParsedClientIp::V4(u32::from(v4));
-        }
-        return ParsedClientIp::V6(v6_bits);
-    }
-    ParsedClientIp::Unknown
-}
-
-// ── Request-time matching (integer ops only) ────────────────────────
-
-/// Match a pre-parsed client IP against a pre-parsed rule. Pure integer comparison.
-pub(super) fn rule_matches(client: &ParsedClientIp, rule: &ParsedRule) -> bool {
-    match (client, rule) {
-        // IPv4 exact
-        (ParsedClientIp::V4(client_bits), ParsedRule::ExactV4(rule_bits)) => {
-            client_bits == rule_bits
-        }
-        // IPv4 CIDR
-        (ParsedClientIp::V4(client_bits), ParsedRule::CidrV4 { network, mask }) => {
-            (client_bits & mask) == *network
-        }
-        // IPv6 exact
-        (ParsedClientIp::V6(client_bits), ParsedRule::ExactV6(rule_bits)) => {
-            client_bits == rule_bits
-        }
-        // IPv6 CIDR
-        (ParsedClientIp::V6(client_bits), ParsedRule::CidrV6 { network, mask }) => {
-            (client_bits & mask) == *network
-        }
-        // Unknown or cross-family typed rules never match.
-        _ => false,
-    }
-}
-
-// ── Backwards-compatible public API ─────────────────────────────────
-
-/// Check if an IP address matches a rule (supports exact IPs, CIDR notation, and IPv6).
-///
-/// This is the string-based API preserved for external callers and tests.
-/// Internally, the plugin uses pre-parsed rules for zero-parse request-time matching.
-#[allow(dead_code)]
-pub fn ip_matches(client_ip: &str, rule: &str) -> bool {
-    let parsed_client = parse_client_ip(client_ip);
-    parse_rule(rule)
-        .map(|parsed_rule| rule_matches(&parsed_client, &parsed_rule))
-        .unwrap_or(false)
-}
-
-// ── IP parsing helpers ──────────────────────────────────────────────
-
-fn parse_ipv4(ip: &str) -> Option<[u8; 4]> {
-    // Allocation-free — iterate without collecting the Vec.
-    let mut parts = ip.split('.');
-    let a: u8 = parts.next()?.parse().ok()?;
-    let b: u8 = parts.next()?.parse().ok()?;
-    let c: u8 = parts.next()?.parse().ok()?;
-    let d: u8 = parts.next()?.parse().ok()?;
-    if parts.next().is_some() {
-        // Too many octets, e.g. "1.2.3.4.5".
+fn v4_range(value: u32, prefix: u8) -> Option<ParsedRule> {
+    if prefix > 32 {
         return None;
     }
-    Some([a, b, c, d])
-}
-
-fn parse_ipv6(ip: &str) -> Option<[u16; 8]> {
-    // Strip surrounding brackets if present (e.g. from URL-style "[::1]").
-    let ip = ip
-        .strip_prefix('[')
-        .and_then(|rest| rest.strip_suffix(']'))
-        .unwrap_or(ip);
-
-    // Strip a zone identifier suffix like "%eth0" — IPv6 zones are interface
-    // scope hints and are not part of the address itself (RFC 6874). They never
-    // exist on canonical `IpAddr::to_string()` output, but a malformed
-    // X-Forwarded-For entry from upstream could contain one. Stripping prevents
-    // unparseable client IPs from silently bypassing matching by being treated
-    // as `Unknown`.
-    let ip = match ip.find('%') {
-        Some(idx) => &ip[..idx],
-        None => ip,
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
     };
-
-    ip.parse::<Ipv6Addr>().ok().map(|ip| ip.segments())
+    let start = value & mask;
+    Some(ParsedRule {
+        family: IpFamily::V4,
+        start: u128::from(start),
+        end: u128::from(start | !mask),
+    })
 }
 
-fn ipv6_parts_to_ipv4_mapped_u32(parts: &[u16; 8]) -> Option<u32> {
-    let v6 = Ipv6Addr::from(*parts);
-    v6.to_ipv4_mapped().map(u32::from)
-}
-
-fn ipv6_to_u128(parts: &[u16; 8]) -> u128 {
-    let mut result: u128 = 0;
-    for &part in parts {
-        result = (result << 16) | (part as u128);
+fn parse_rule_ip(ip: &str) -> Option<IpAddr> {
+    match super::parse_client_ip_literal(ip)? {
+        IpAddr::V4(ipv4) if is_canonical_ipv4_literal(ip, ipv4) => Some(IpAddr::V4(ipv4)),
+        IpAddr::V4(_) => None,
+        IpAddr::V6(ipv6) => Some(IpAddr::V6(ipv6)),
     }
-    result
+}
+
+fn is_canonical_ipv4_literal(literal: &str, ipv4: std::net::Ipv4Addr) -> bool {
+    let mut parts = literal.split('.');
+    for expected in ipv4.octets() {
+        let Some(part) = parts.next() else {
+            return false;
+        };
+        if part.is_empty()
+            || (part.len() > 1 && part.starts_with('0'))
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+            || part.parse::<u8>().ok() != Some(expected)
+        {
+            return false;
+        }
+    }
+    parts.next().is_none()
+}
+
+/// Check if an IP address matches one exact-IP/CIDR rule.
+///
+/// This string-based API is preserved for external callers and tests. Runtime
+/// plugin hooks use the context-cached typed client IP and compiled range set.
+#[allow(dead_code)]
+pub fn ip_matches(client_ip: &str, rule: &str) -> bool {
+    let client_ip = super::parse_client_ip_literal(client_ip).map(|ip| ip.to_canonical());
+    match (client_ip, parse_rule(rule)) {
+        (Some(client_ip), Some(rule)) => rule.matches(client_ip),
+        _ => false,
+    }
 }

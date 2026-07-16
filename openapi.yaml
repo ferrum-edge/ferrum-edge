@@ -3025,7 +3025,10 @@ paths:
         Returns successful admin API mutation events for the selected namespace.
         Requires an admin-role JWT. Each event includes actor, action, resource
         identity, timestamp, and a JSON diff. Consumer credential data is
-        redacted before it is written to the audit log. Basic credential
+        redacted before it is written to the audit log. Sensitive plugin
+        configuration is redacted as well; Loki endpoint paths/queries,
+        authorization, and all custom-header values are never persisted in
+        the diff. Basic credential
         mutations remain visible by type and action, but values, entry fields,
         shape, and count are replaced by one stable `[REDACTED]` marker.
       tags: [Audit]
@@ -5833,6 +5836,9 @@ components:
             Redacted JSON diff for the successful mutation. Basic credential
             changes expose only the credential type, action, and a stable
             `[REDACTED]` marker, never values, entry fields, shape, or count.
+            Sensitive plugin configuration is also redacted; loki_logging
+            endpoint paths/queries, authorization, and custom-header values
+            are never persisted.
 
     AuditEventListResponse:
       type: object
@@ -6647,7 +6653,11 @@ components:
             without construction, allowing secret-dependent plugins such as
             `basic_auth` to be staged before their runtime secret is provisioned.
             Enabling performs full validation. See `PluginConfigs` section for
-            per-plugin schema definitions.
+            per-plugin schema definitions. Viewer/operator responses use the
+            audit-safe projection while admin responses remain raw. For
+            loki_logging, that projection preserves only endpoint
+            scheme/host/port and redacts the path, query, authorization, and
+            every custom-header value.
         scope:
           $ref: "#/components/schemas/PluginScope"
         proxy_id:
@@ -10444,28 +10454,69 @@ components:
 
     LokiLoggingConfig:
       type: object
-      description: "Plugin: loki_logging — Ships transaction logs to Grafana Loki via the push API in batched, label-grouped streams. Supports gzip compression, multi-tenant headers, and bearer/basic auth."
+      additionalProperties: false
+      description: >-
+        Plugin: loki_logging — Ships transaction logs to Grafana Loki via the
+        push API in bounded, label-grouped streams. HTTP 204 is the canonical
+        success response; other 2xx responses are accepted only when their body
+        drains completely and is empty. Loki's blocked-ingestion status 260,
+        non-empty/anomalous compatible-success responses, and every other
+        non-retryable response are terminal; 408, 429, and 5xx responses use
+        bounded exponential backoff with jitter. Explicit nulls and unknown
+        top-level fields are rejected.
       required:
         - endpoint_url
       properties:
         endpoint_url:
           type: string
-          description: Loki push API URL (e.g. http://loki:3100/loki/api/v1/push). Must be http:// or https://
+          format: uri
+          pattern: '^[hH][tT][tT][pP][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#]\S*)?$'
+          description: >-
+            Loki push API URL (for example,
+            http://loki:3100/loki/api/v1/push). URL user information is
+            rejected; use authorization_header or custom_headers instead.
+            Path and query components are redacted from operational and
+            non-admin diagnostics.
         authorization_header:
           type: string
-          description: Full Authorization header value (e.g. "Bearer <token>" or "Basic <b64>")
+          minLength: 1
+          pattern: '^[\u0021-\u007E](?:[\u0009\u0020-\u007E]*[\u0021-\u007E])?$'
+          description: >-
+            Full Authorization header value (e.g. "Bearer <token>" or
+            "Basic <b64>"). Leading and trailing whitespace is rejected.
         custom_headers:
           type: object
+          propertyNames:
+            type: string
+            minLength: 1
+            maxLength: 65535
+            pattern: "^[!#$%&'*+.^_`|~0-9A-Za-z-]+$"
           additionalProperties:
             type: string
-          description: Extra HTTP headers (e.g. X-Scope-OrgID for multi-tenant Loki)
+            pattern: '^[\u0009\u0020-\u007E]*$'
+          description: >-
+            Extra HTTP headers (for example, X-Scope-OrgID for multi-tenant
+            Loki). Names use HTTP token syntax and are at most 65,535 ASCII
+            bytes. All values are redacted from audit records and non-admin
+            config reads.
         labels:
           type: object
+          propertyNames:
+            pattern: '^(?!__)(?!ferrum_emitter$)[a-zA-Z_][a-zA-Z0-9_]{0,1023}$'
           additionalProperties:
             type: string
+            maxLength: 2048
           default:
             service: ferrum-edge
-          description: Static labels merged into every Loki stream. Keep cardinality low — labels are indexed
+          description: >-
+            Static labels merged into every Loki stream. Keep cardinality low
+            because labels are indexed. Names beginning with __ and the
+            reserved ferrum_emitter label are rejected. Ferrum Edge adds a
+            unique ferrum_emitter value per plugin instance so independently
+            ordered emitters never share a Loki stream. Each replica and each
+            rebuilt plugin generation therefore consumes a distinct active
+            stream for every other label combination; size Loki
+            max_streams_per_user limits and reload cadence accordingly.
         include_proxy_id_label:
           type: boolean
           default: true
@@ -10482,6 +10533,7 @@ components:
           type: integer
           default: 100
           minimum: 1
+          maximum: 10000
           description: Number of entries to buffer before sending a batch
         flush_interval_ms:
           type: integer
@@ -10491,16 +10543,45 @@ components:
         max_retries:
           type: integer
           default: 3
-          description: Retry attempts on failed batch delivery. 4xx other than 408/429 aborts immediately
+          minimum: 0
+          maximum: 10
+          description: >-
+            Retries after the initial delivery attempt. Only transport
+            failures, 408, 429, and 5xx retry. A received 204 is committed even
+            when its best-effort body drain is anomalous, avoiding duplicates.
         retry_delay_ms:
           type: integer
           default: 1000
-          description: Delay in milliseconds between retry attempts
+          minimum: 1
+          maximum: 60000
+          description: Initial exponential-backoff delay in milliseconds
         buffer_capacity:
           type: integer
           default: 10000
           minimum: 1
+          maximum: 1000000
           description: Channel capacity — new entries are dropped when full
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1024
+          maximum: 1048576
+          description: >-
+            Maximum retained bytes for one serialized JSON line plus its Loki
+            labels. Configuration is rejected unless the configured
+            serializer's minimum HTTP and stream lines plus static, reserved,
+            and worst-case dynamic label values fit this budget. Request-shaped
+            fields can still make an individual serialized line exceed the
+            budget; those oversized entries are dropped before enqueue.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 1024
+          maximum: 268435456
+          description: >-
+            Per-plugin retained-content byte budget across queued, batched,
+            and retrying entries. Must be at least max_entry_bytes; entries
+            are dropped non-blockingly when the budget is exhausted.
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -13647,6 +13728,7 @@ components:
 
     IpRestrictionConfig:
       type: object
+      additionalProperties: false
       anyOf:
         - required: [allow]
           properties:
@@ -13658,17 +13740,28 @@ components:
               minItems: 1
       description: >-
         Plugin: ip_restriction — IP/CIDR allow/deny enforcement. Rules are
-        validated and pre-parsed at config load time; invalid IPv4/IPv6
-        addresses or CIDR prefixes reject plugin creation. Supports IPv4 exact
-        and CIDR (`/0`-`/32`) and IPv6 exact and CIDR (`/0`-`/128`); IPv6 zone
-        identifiers (e.g. `%eth0`) on rules or client IPs are stripped before
-        matching. Runs on every protocol — HTTP, gRPC, WebSocket, TCP, UDP.
-        At least one of `allow` or `deny` is required.
+        validated and compiled at config load time into sorted, merged numeric
+        intervals; invalid IPv4/IPv6 addresses or CIDR prefixes reject plugin
+        creation. Request lookup is allocation-free, lock-free, and logarithmic
+        in the number of non-overlapping intervals. The authoritative client IP
+        is parsed/canonicalized once per request or stream session and reused by
+        every plugin instance. IPv4 octets must use canonical unsigned decimal
+        notation (for example, `010.1.2.3` and `+10.1.2.3` are rejected).
+        Supports IPv4 exact and CIDR (`/0`-`/32`) and native IPv6 exact and CIDR
+        (`/0`-`/128`). IPv4-mapped IPv6 rules normalize to IPv4, so mapped CIDRs
+        accept only `/96`-`/128` (equivalent to IPv4 `/0`-`/32`); shorter mapped
+        prefixes are rejected as ambiguous. IPv6 zone identifiers (e.g. `%eth0`)
+        on rules or client IPs are stripped before matching. Runs on every
+        protocol — HTTP, gRPC, WebSocket, TCP, UDP, and DTLS. Config must be an
+        object, unknown properties and null values are rejected, and at least
+        one of `allow` or `deny` must be non-empty.
       properties:
         allow:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: '.*\S.*'
           default: []
           description: >-
             Allowed IP addresses or CIDR ranges (IPv4 or IPv6). Empty list
@@ -13677,6 +13770,8 @@ components:
           type: array
           items:
             type: string
+            minLength: 1
+            pattern: '.*\S.*'
           default: []
           description: >-
             Denied IP addresses or CIDR ranges (IPv4 or IPv6). Always takes

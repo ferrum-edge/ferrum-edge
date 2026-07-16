@@ -24,7 +24,7 @@ use ferrum_edge::config::types::{
     PluginConfig, PluginScope, Proxy, Upstream, UpstreamTarget,
 };
 use ferrum_edge::dns::{DnsCache, DnsConfig};
-use ferrum_edge::plugins::ProxyProtocol;
+use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext};
 use ferrum_edge::proxy::{ConfigApplyOutcome, ProxyState};
 
 /// Minimal test proxy with safe defaults.
@@ -551,6 +551,61 @@ async fn security_headers_unknown_key_reload_keeps_last_known_good_policy() {
             .iter()
             .any(|plugin| plugin.name() == "security_headers"),
         "rejected reload must retain the last-known-good plugin cache"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ip_restriction_typo_reload_keeps_last_known_good_policy() {
+    let state = empty_proxy_state();
+    let mut plugin = test_plugin_config("ip-policy", true);
+    plugin.plugin_name = "ip_restriction".to_string();
+    plugin.config = serde_json::json!({"allow": ["10.0.0.0/8"]});
+    let valid = GatewayConfig {
+        proxies: vec![test_proxy("p1", "/api")],
+        plugin_configs: vec![plugin],
+        loaded_at: Utc::now(),
+        ..GatewayConfig::default()
+    };
+    assert_eq!(
+        state.update_config(valid.clone()),
+        ConfigApplyOutcome::Applied
+    );
+
+    let mut invalid = valid;
+    invalid.plugin_configs[0].config = serde_json::json!({
+        "alow": ["192.0.2.0/24"],
+        "deny": ["203.0.113.0/24"]
+    });
+    invalid.plugin_configs[0].updated_at += Duration::milliseconds(1);
+    let ConfigApplyOutcome::Rejected { errors } = state.update_config(invalid) else {
+        panic!("misspelled ip_restriction allow list must reject reload");
+    };
+    assert!(errors.iter().any(|error| {
+        error.contains("ip_restriction") && error.contains("unknown configuration field 'alow'")
+    }));
+    assert_eq!(
+        state.config.load().plugin_configs[0].config,
+        serde_json::json!({"allow": ["10.0.0.0/8"]})
+    );
+
+    let request_view = state.plugin_cache.request_view("p1", ProxyProtocol::Http);
+    let mut ctx = RequestContext::new(
+        "198.51.100.44".to_string(),
+        "GET".to_string(),
+        "/api".to_string(),
+    );
+    let result = request_view.plugins()[0]
+        .on_request_received(&mut ctx)
+        .await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 403,
+                ..
+            }
+        ),
+        "rejected candidate must not replace the last-known-good allow policy"
     );
 }
 

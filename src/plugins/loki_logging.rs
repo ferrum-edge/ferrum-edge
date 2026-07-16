@@ -6,7 +6,8 @@
 //!
 //! Loki-specific features:
 //! - **Labels**: Low-cardinality indexed labels (service, environment, proxy
-//!   listen path, status class) configurable via `labels` map in plugin config.
+//!   ID, status class, per-instance emitter) configurable via `labels` map in
+//!   plugin config.
 //! - **Structured log lines**: Full transaction details serialized as JSON
 //!   strings inside Loki `values` entries.
 //! - **Batching by label set**: Entries are grouped by their label fingerprint
@@ -20,40 +21,208 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
+use ring::rand::{SecureRandom, SystemRandom};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::io::Write;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
+use crate::config::types::MAX_ID_LENGTH;
+
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
+use super::utils::response_body::{BoundedReadError, measure_response_body_bounded};
 use super::utils::{
-    BatchConfig, BatchConfigDefaults, BatchingLogger, PluginHttpClient, RetryPolicy,
-    build_batch_config, handle_http_batch_response, parse_custom_headers, parse_http_endpoint,
+    BatchConfig, BatchConfigDefaults, BatchingLogger, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY,
+    PluginHttpClient, RetryPolicy, build_batch_config, parse_custom_headers, parse_http_endpoint,
     validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
+
+pub const LOKI_LOGGING_CONFIG_KEYS: &[&str] = &[
+    "authorization_header",
+    "batch_size",
+    "buffer_capacity",
+    "buffer_max_bytes",
+    "custom_headers",
+    "endpoint_url",
+    "flush_interval_ms",
+    "gzip",
+    "include_proxy_id_label",
+    "include_status_class_label",
+    "labels",
+    "max_entry_bytes",
+    "max_retries",
+    "retry_delay_ms",
+    "schema",
+    "schema_ref",
+];
+
+pub const LOKI_DEFAULT_MAX_ENTRY_BYTES: usize = 64 * 1024;
+pub const LOKI_MAX_MAX_ENTRY_BYTES: usize = 1024 * 1024;
+pub const LOKI_DEFAULT_BUFFER_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub const LOKI_MAX_BUFFER_MAX_BYTES: usize = 256 * 1024 * 1024;
+pub const LOKI_MAX_RETRIES: u64 = 10;
+pub const LOKI_MAX_RETRY_DELAY_MS: u64 = 60_000;
+pub const LOKI_MAX_CUSTOM_HEADER_NAME_BYTES: usize = u16::MAX as usize;
+
+const LOKI_MIN_RESOURCE_BYTES: usize = 1024;
+const LOKI_MAX_LABEL_NAME_CHARS: usize = 1024;
+const LOKI_MAX_LABEL_VALUE_CHARS: usize = 2048;
+const LOKI_RESPONSE_BODY_LIMIT: usize = 1024 * 1024;
+const LOKI_RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const LOKI_DROP_WARN_EVERY: u64 = 100;
+const LOKI_EMITTER_LABEL: &str = "ferrum_emitter";
+// Random prefix (32 hex bytes), separator, and fixed-width u64 counter (16 hex bytes).
+// A fixed width keeps construction-time and runtime label accounting identical.
+const LOKI_EMITTER_VALUE_BYTES: usize = 16 * 2 + 1 + std::mem::size_of::<u64>() * 2;
+const LOKI_MIN_PROXY_ID: &str = "0";
+const LOKI_WORST_CASE_STREAM_PROTOCOL: &str = "dtls";
+const LOKI_MIN_TIMESTAMP: &str = "1970-01-01T00:00:00+00:00";
+
+static LOKI_EMITTER_PREFIX: LazyLock<Result<[u8; 16], ()>> = LazyLock::new(|| {
+    let mut bytes = [0_u8; 16];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map(|()| bytes)
+        .map_err(|_| ())
+});
+static NEXT_LOKI_EMITTER_ID: AtomicU64 = AtomicU64::new(0);
 
 /// A log entry with pre-computed labels and a JSON log line.
 #[derive(Clone)]
 struct LokiEntry {
     /// Sorted label key-value pairs (deterministic ordering for grouping).
-    labels: BTreeMap<String, String>,
-    /// Nanosecond epoch timestamp as a string.
-    timestamp_ns: String,
+    labels: Arc<BTreeMap<String, String>>,
     /// JSON-serialized log line.
-    line: String,
+    line: Arc<str>,
+    /// Keeps the retained-content byte reservation alive through retries.
+    _lease: Arc<LokiByteLease>,
 }
 
 #[derive(Clone)]
 struct LokiFlushConfig {
     endpoint_url: String,
+    endpoint_url_for_logs: String,
     authorization_header: Option<HeaderValue>,
     custom_headers: Vec<(HeaderName, HeaderValue)>,
     http_client: PluginHttpClient,
     gzip: bool,
     retry: RetryPolicy,
+    last_timestamp_ns: Arc<AtomicU64>,
+}
+
+struct LokiByteLease {
+    used_bytes: Arc<AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for LokiByteLease {
+    fn drop(&mut self) {
+        self.used_bytes.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+struct LokiByteBudget {
+    used_bytes: Arc<AtomicUsize>,
+    max_bytes: usize,
+    dropped_count: AtomicU64,
+}
+
+impl LokiByteBudget {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            used_bytes: Arc::new(AtomicUsize::new(0)),
+            max_bytes,
+            dropped_count: AtomicU64::new(0),
+        }
+    }
+
+    fn try_acquire(&self, bytes: usize) -> Option<Arc<LokiByteLease>> {
+        let reserved = self
+            .used_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|next| *next <= self.max_bytes)
+            });
+        if reserved.is_err() {
+            self.record_drop("retained-content byte budget exhausted");
+            return None;
+        }
+
+        Some(Arc::new(LokiByteLease {
+            used_bytes: Arc::clone(&self.used_bytes),
+            bytes,
+        }))
+    }
+
+    fn record_drop(&self, reason: &str) {
+        let dropped = self.dropped_count.fetch_add(1, Ordering::Relaxed) + 1;
+        if dropped == 1 || dropped.is_multiple_of(LOKI_DROP_WARN_EVERY) {
+            warn!(
+                plugin = "loki_logging",
+                "Loki logging: dropping entry because {} ({} dropped total; logging every {} drops)",
+                reason,
+                dropped,
+                LOKI_DROP_WARN_EVERY,
+            );
+        }
+    }
+}
+
+struct BoundedJsonWriter {
+    bytes: Vec<u8>,
+    max_bytes: usize,
+    limit_exceeded: bool,
+}
+
+#[derive(Default)]
+struct CountingJsonWriter {
+    bytes: usize,
+}
+
+impl Write for CountingJsonWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buf.len())
+            .ok_or_else(|| std::io::Error::other("serialized Loki entry size overflowed"))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl BoundedJsonWriter {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(max_bytes.min(4096)),
+            max_bytes,
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.len() > self.max_bytes.saturating_sub(self.bytes.len()) {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::other(
+                "serialized Loki entry exceeded its byte limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Static labels applied to every log entry, from plugin config.
@@ -67,21 +236,67 @@ struct LabelConfig {
     include_status_class: bool,
 }
 
+impl LabelConfig {
+    fn build_http_labels(&self, summary: &TransactionSummary) -> BTreeMap<String, String> {
+        let mut labels = self.static_labels.clone();
+        if self.include_proxy_id
+            && let Some(ref proxy_id) = summary.proxy_id
+        {
+            labels.insert("proxy_id".to_string(), proxy_id.clone());
+        }
+        if self.include_status_class {
+            labels.insert(
+                "status_class".to_string(),
+                status_class(summary.response_status_code),
+            );
+        }
+        labels
+    }
+
+    fn build_stream_labels(&self, summary: &StreamTransactionSummary) -> BTreeMap<String, String> {
+        let mut labels = self.static_labels.clone();
+        if self.include_proxy_id {
+            labels.insert("proxy_id".to_string(), summary.proxy_id.clone());
+        }
+        labels.insert("protocol".to_string(), summary.protocol.clone());
+        labels
+    }
+}
+
 pub struct LokiLogging {
     logger: BatchingLogger<LokiEntry>,
     endpoint_hostname: String,
     label_config: LabelConfig,
     schema: Option<Arc<SummarySchema>>,
+    byte_budget: Arc<LokiByteBudget>,
+    max_entry_bytes: usize,
 }
 
 impl LokiLogging {
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
-        if !config.is_object() {
+        let Some(config_object) = config.as_object() else {
             return Err("loki_logging: config must be an object".to_string());
+        };
+
+        if config_object.contains_key("include_listen_path_label") {
+            return Err(
+                "loki_logging: 'include_listen_path_label' was removed; use 'include_proxy_id_label'"
+                    .to_string(),
+            );
         }
+        validate_known_config_fields(config_object)?;
 
         let (endpoint_url, endpoint_hostname) =
             parse_http_endpoint(config, "loki_logging", http_client.backend_allow_ips())?;
+        let parsed_endpoint = url::Url::parse(&endpoint_url)
+            .map_err(|_| "loki_logging: invalid 'endpoint_url'".to_string())?;
+        if !parsed_endpoint.username().is_empty() || parsed_endpoint.password().is_some() {
+            return Err(
+                "loki_logging: 'endpoint_url' must not contain user information; use authorization_header or custom_headers"
+                    .to_string(),
+            );
+        }
+        let endpoint_url_for_logs = redacted_endpoint_url(&parsed_endpoint);
         let gzip = optional_bool(config, "gzip")?.unwrap_or(true);
 
         // Parse static labels from config.
@@ -91,12 +306,15 @@ impl LokiLogging {
                 .as_object()
                 .ok_or_else(|| "loki_logging: 'labels' must be an object".to_string())?;
             for (key, value) in labels_obj {
-                if !is_valid_loki_label_name(key) {
-                    return Err(format!("loki_logging: invalid label name '{key}'"));
-                }
+                validate_loki_label_name(key)?;
                 let label = value
                     .as_str()
                     .ok_or_else(|| format!("loki_logging: 'labels.{key}' must be a string"))?;
+                if label.chars().count() > LOKI_MAX_LABEL_VALUE_CHARS {
+                    return Err(format!(
+                        "loki_logging: 'labels.{key}' must be at most {LOKI_MAX_LABEL_VALUE_CHARS} characters"
+                    ));
+                }
                 static_labels.insert(key.clone(), label.to_string());
             }
         }
@@ -104,12 +322,7 @@ impl LokiLogging {
             static_labels.insert("service".to_string(), "ferrum-edge".to_string());
         }
 
-        if config.get("include_listen_path_label").is_some() {
-            return Err(
-                "loki_logging: 'include_listen_path_label' was removed; use 'include_proxy_id_label'"
-                    .to_string(),
-            );
-        }
+        static_labels.insert(LOKI_EMITTER_LABEL.to_string(), next_loki_emitter_id()?);
         let include_proxy_id = optional_bool(config, "include_proxy_id_label")?.unwrap_or(true);
         let include_status_class =
             optional_bool(config, "include_status_class_label")?.unwrap_or(true);
@@ -120,6 +333,7 @@ impl LokiLogging {
             include_status_class,
         };
 
+        validate_custom_header_name_lengths(config)?;
         let custom_headers = parse_custom_headers(config, "loki_logging")?;
 
         let authorization_header = match optional_non_empty_string(config, "authorization_header")?
@@ -142,14 +356,21 @@ impl LokiLogging {
             retry_delay_ms: 1000,
         };
         validate_batch_config(config, "loki_logging", batch_defaults)?;
-        let batch_config = build_batch_config(config, "loki_logging", batch_defaults);
+        let (max_entry_bytes, buffer_max_bytes, retry) =
+            validate_loki_resource_config(config, batch_defaults)?;
+        let schema = resolve_schema(config, "loki_logging", SchemaCapabilities::BASE)?;
+        validate_minimum_entry_budget(&label_config, schema.as_deref(), max_entry_bytes)?;
+        let mut batch_config = build_batch_config(config, "loki_logging", batch_defaults);
+        batch_config.retry = retry;
         let flush_config = LokiFlushConfig {
             endpoint_url,
+            endpoint_url_for_logs,
             authorization_header,
             custom_headers,
             http_client,
             gzip,
             retry: batch_config.retry,
+            last_timestamp_ns: Arc::new(AtomicU64::new(0)),
         };
         let logger = BatchingLogger::spawn(
             // Loki retries inside `send_batch` so we can reuse the same
@@ -164,61 +385,71 @@ impl LokiLogging {
             },
         );
 
-        let schema = resolve_schema(config, "loki_logging", SchemaCapabilities::BASE)?;
         Ok(Self {
             logger,
             endpoint_hostname,
             label_config,
             schema,
+            byte_budget: Arc::new(LokiByteBudget::new(buffer_max_bytes)),
+            max_entry_bytes,
         })
     }
 
-    fn queue_entry<T: serde::Serialize>(
-        &self,
-        value: &T,
-        labels: BTreeMap<String, String>,
-        timestamp: &str,
-        kind: &str,
-    ) {
-        let line = match serde_json::to_string(value) {
-            Ok(line) => line,
-            Err(error) => {
+    fn queue_entry<T, F>(&self, value: &T, kind: &str, build_labels: F)
+    where
+        T: serde::Serialize,
+        F: FnOnce() -> BTreeMap<String, String>,
+    {
+        let Some(permit) = self.logger.try_reserve() else {
+            return;
+        };
+
+        let mut writer = BoundedJsonWriter::new(self.max_entry_bytes);
+        if let Err(error) = serde_json::to_writer(&mut writer, value) {
+            if writer.limit_exceeded {
+                self.byte_budget
+                    .record_drop("serialized entry exceeded max_entry_bytes");
+            } else {
                 warn!("Loki logging: failed to serialize {kind}: {error}");
+            }
+            return;
+        }
+        let labels = build_labels();
+        let Some(retained_bytes) = retained_entry_bytes(writer.bytes.len(), &labels) else {
+            self.byte_budget
+                .record_drop("entry and labels exceeded byte accounting range");
+            return;
+        };
+        if retained_bytes > self.max_entry_bytes {
+            self.byte_budget
+                .record_drop("entry and labels exceeded max_entry_bytes");
+            return;
+        }
+        let Some(lease) = self.byte_budget.try_acquire(retained_bytes) else {
+            return;
+        };
+        let line = match String::from_utf8(writer.bytes) {
+            Ok(line) => Arc::<str>::from(line),
+            Err(error) => {
+                warn!("Loki logging: serialized {kind} was not UTF-8: {error}");
                 return;
             }
         };
-        self.logger.try_send(LokiEntry {
-            labels,
-            timestamp_ns: timestamp_nanos_from_rfc3339(timestamp),
+        permit.send(LokiEntry {
+            labels: Arc::new(labels),
             line,
+            _lease: lease,
         });
     }
 
     /// Build labels for an HTTP/gRPC/WebSocket transaction.
     fn build_http_labels(&self, summary: &TransactionSummary) -> BTreeMap<String, String> {
-        let mut labels = self.label_config.static_labels.clone();
-        if self.label_config.include_proxy_id
-            && let Some(ref proxy_id) = summary.proxy_id
-        {
-            labels.insert("proxy_id".to_string(), proxy_id.clone());
-        }
-        if self.label_config.include_status_class {
-            labels.insert(
-                "status_class".to_string(),
-                status_class(summary.response_status_code),
-            );
-        }
-        labels
+        self.label_config.build_http_labels(summary)
     }
 
     /// Build labels for a TCP/UDP stream transaction.
     fn build_stream_labels(&self, summary: &StreamTransactionSummary) -> BTreeMap<String, String> {
-        let mut labels = self.label_config.static_labels.clone();
-        if self.label_config.include_proxy_id {
-            labels.insert("proxy_id".to_string(), summary.proxy_id.clone());
-        }
-        labels.insert("protocol".to_string(), summary.protocol.clone());
-        labels
+        self.label_config.build_stream_labels(summary)
     }
 }
 
@@ -237,15 +468,187 @@ fn optional_non_empty_string(config: &Value, key: &str) -> Result<Option<String>
         Some(value) => {
             let value = value
                 .as_str()
-                .ok_or_else(|| format!("loki_logging: '{key}' must be a string"))?
-                .trim();
-            if value.is_empty() {
+                .ok_or_else(|| format!("loki_logging: '{key}' must be a string"))?;
+            if value.trim().is_empty() {
                 return Err(format!("loki_logging: '{key}' must not be empty"));
+            }
+            if value.trim() != value {
+                return Err(format!(
+                    "loki_logging: '{key}' must not have leading or trailing whitespace"
+                ));
             }
             Ok(Some(value.to_string()))
         }
         None => Ok(None),
     }
+}
+
+fn validate_custom_header_name_lengths(config: &Value) -> Result<(), String> {
+    let Some(headers) = config.get("custom_headers") else {
+        return Ok(());
+    };
+    let headers = headers
+        .as_object()
+        .ok_or_else(|| "loki_logging: 'custom_headers' must be an object".to_string())?;
+    if let Some(name) = headers
+        .keys()
+        .find(|name| name.len() > LOKI_MAX_CUSTOM_HEADER_NAME_BYTES)
+    {
+        return Err(format!(
+            "loki_logging: custom_headers name is {} bytes; maximum is {LOKI_MAX_CUSTOM_HEADER_NAME_BYTES}",
+            name.len()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_known_config_fields(config: &serde_json::Map<String, Value>) -> Result<(), String> {
+    let mut unknown = config
+        .keys()
+        .filter(|key| !LOKI_LOGGING_CONFIG_KEYS.contains(&key.as_str()))
+        .collect::<Vec<_>>();
+    unknown.sort_unstable();
+    if let Some(key) = unknown.first() {
+        return Err(format!(
+            "loki_logging: unknown configuration field 'config.{key}'"
+        ));
+    }
+    Ok(())
+}
+
+fn bounded_u64(
+    config: &Value,
+    key: &str,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+) -> Result<u64, String> {
+    let value = match config.get(key) {
+        None => default,
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("loki_logging: '{key}' must be an integer"))?,
+    };
+    if !(minimum..=maximum).contains(&value) {
+        return Err(format!(
+            "loki_logging: '{key}' must be between {minimum} and {maximum}"
+        ));
+    }
+    Ok(value)
+}
+
+fn validate_loki_resource_config(
+    config: &Value,
+    defaults: BatchConfigDefaults,
+) -> Result<(usize, usize, RetryPolicy), String> {
+    bounded_u64(
+        config,
+        defaults.batch_size_key,
+        defaults.batch_size,
+        1,
+        MAX_BATCH_SIZE as u64,
+    )?;
+    bounded_u64(
+        config,
+        "flush_interval_ms",
+        defaults.flush_interval_ms,
+        defaults.min_flush_interval_ms,
+        u64::MAX,
+    )?;
+    bounded_u64(
+        config,
+        "buffer_capacity",
+        defaults.buffer_capacity,
+        1,
+        MAX_BUFFER_CAPACITY as u64,
+    )?;
+    let max_retries = bounded_u64(
+        config,
+        "max_retries",
+        defaults.max_retries,
+        0,
+        LOKI_MAX_RETRIES,
+    )?;
+    let retry_delay_ms = bounded_u64(
+        config,
+        "retry_delay_ms",
+        defaults.retry_delay_ms,
+        1,
+        LOKI_MAX_RETRY_DELAY_MS,
+    )?;
+    let max_entry_bytes = bounded_u64(
+        config,
+        "max_entry_bytes",
+        LOKI_DEFAULT_MAX_ENTRY_BYTES as u64,
+        LOKI_MIN_RESOURCE_BYTES as u64,
+        LOKI_MAX_MAX_ENTRY_BYTES as u64,
+    )? as usize;
+    let buffer_max_bytes = bounded_u64(
+        config,
+        "buffer_max_bytes",
+        LOKI_DEFAULT_BUFFER_MAX_BYTES as u64,
+        LOKI_MIN_RESOURCE_BYTES as u64,
+        LOKI_MAX_BUFFER_MAX_BYTES as u64,
+    )? as usize;
+    if buffer_max_bytes < max_entry_bytes {
+        return Err(
+            "loki_logging: 'buffer_max_bytes' must be greater than or equal to 'max_entry_bytes'"
+                .to_string(),
+        );
+    }
+
+    let delay = Duration::from_millis(retry_delay_ms);
+    Ok((
+        max_entry_bytes,
+        buffer_max_bytes,
+        RetryPolicy {
+            max_attempts: (max_retries as u32).saturating_add(1),
+            delay,
+            max_delay: Duration::from_millis(
+                retry_delay_ms
+                    .saturating_mul(8)
+                    .min(LOKI_MAX_RETRY_DELAY_MS),
+            ),
+            jitter: true,
+        },
+    ))
+}
+
+fn next_loki_emitter_id() -> Result<String, String> {
+    let prefix = LOKI_EMITTER_PREFIX.as_ref().map_err(|_| {
+        "loki_logging: failed to generate the per-instance emitter label".to_string()
+    })?;
+    let instance_id = NEXT_LOKI_EMITTER_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| "loki_logging: emitter label counter exhausted".to_string())?;
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut value = String::with_capacity(LOKI_EMITTER_VALUE_BYTES);
+    for &byte in prefix {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    value.push('-');
+    for byte in instance_id.to_be_bytes() {
+        value.push(HEX[(byte >> 4) as usize] as char);
+        value.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Ok(value)
+}
+
+pub(crate) fn redacted_endpoint_url(endpoint: &url::Url) -> String {
+    let host = match endpoint.host() {
+        Some(url::Host::Domain(host)) => host.to_string(),
+        Some(url::Host::Ipv4(host)) => host.to_string(),
+        Some(url::Host::Ipv6(host)) => format!("[{host}]"),
+        None => "redacted-host".to_string(),
+    };
+    let port = endpoint
+        .port()
+        .map(|port| format!(":{port}"))
+        .unwrap_or_default();
+    format!("{}://{}{}/redacted", endpoint.scheme(), host, port)
 }
 
 fn is_valid_loki_label_name(name: &str) -> bool {
@@ -257,6 +660,122 @@ fn is_valid_loki_label_name(name: &str) -> bool {
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+fn validate_loki_label_name(name: &str) -> Result<(), String> {
+    if name.chars().count() > LOKI_MAX_LABEL_NAME_CHARS
+        || !is_valid_loki_label_name(name)
+        || name.starts_with("__")
+        || name == LOKI_EMITTER_LABEL
+    {
+        return Err(format!(
+            "loki_logging: invalid or reserved label name '{name}'"
+        ));
+    }
+    Ok(())
+}
+
+fn retained_entry_bytes(line_bytes: usize, labels: &BTreeMap<String, String>) -> Option<usize> {
+    labels.iter().try_fold(line_bytes, |total, (key, value)| {
+        total.checked_add(key.len())?.checked_add(value.len())
+    })
+}
+
+fn serialized_entry_bytes<T: serde::Serialize>(value: &T, kind: &str) -> Result<usize, String> {
+    let mut writer = CountingJsonWriter::default();
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|error| format!("loki_logging: failed to measure minimum {kind}: {error}"))?;
+    Ok(writer.bytes)
+}
+
+fn minimum_http_summary() -> TransactionSummary {
+    TransactionSummary {
+        namespace: LOKI_MIN_PROXY_ID.to_string(),
+        timestamp_received: LOKI_MIN_TIMESTAMP.to_string(),
+        client_ip: "::".to_string(),
+        http_method: "A".to_string(),
+        request_path: "/".to_string(),
+        proxy_id: Some(LOKI_MIN_PROXY_ID.to_string()),
+        response_status_code: u16::MAX,
+        ..TransactionSummary::default()
+    }
+}
+
+fn minimum_stream_summary() -> StreamTransactionSummary {
+    StreamTransactionSummary {
+        namespace: LOKI_MIN_PROXY_ID.to_string(),
+        proxy_id: LOKI_MIN_PROXY_ID.to_string(),
+        proxy_name: None,
+        client_ip: "::".to_string(),
+        consumer_username: None,
+        auth_method: None,
+        backend_target: "a:1".to_string(),
+        backend_resolved_ip: None,
+        protocol: LOKI_WORST_CASE_STREAM_PROTOCOL.to_string(),
+        listen_port: 1,
+        duration_ms: 0.0,
+        bytes_sent: 0,
+        bytes_received: 0,
+        connection_error: None,
+        error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
+        timestamp_connected: LOKI_MIN_TIMESTAMP.to_string(),
+        timestamp_disconnected: LOKI_MIN_TIMESTAMP.to_string(),
+        sni_hostname: None,
+        metadata: HashMap::new(),
+    }
+}
+
+fn validate_minimum_entry_budget(
+    label_config: &LabelConfig,
+    schema: Option<&SummarySchema>,
+    max_entry_bytes: usize,
+) -> Result<(), String> {
+    let http_summary = minimum_http_summary();
+    let http_line_bytes = match schema.filter(|schema| schema.applies_to_http()) {
+        Some(schema) => serialized_entry_bytes(
+            &SchemaView {
+                summary: &http_summary,
+                schema,
+            },
+            "HTTP entry",
+        )?,
+        None => serialized_entry_bytes(&http_summary, "HTTP entry")?,
+    };
+    let mut http_label_summary = http_summary.clone();
+    http_label_summary.proxy_id = Some("a".repeat(MAX_ID_LENGTH));
+    let http_labels = label_config.build_http_labels(&http_label_summary);
+    let http_retained_bytes = retained_entry_bytes(http_line_bytes, &http_labels);
+
+    let stream_summary = minimum_stream_summary();
+    let stream_line_bytes = match schema.filter(|schema| schema.applies_to_stream()) {
+        Some(schema) => serialized_entry_bytes(
+            &SchemaView {
+                summary: &stream_summary,
+                schema,
+            },
+            "stream entry",
+        )?,
+        None => serialized_entry_bytes(&stream_summary, "stream entry")?,
+    };
+    let mut stream_label_summary = stream_summary.clone();
+    stream_label_summary.proxy_id = "a".repeat(MAX_ID_LENGTH);
+    let stream_labels = label_config.build_stream_labels(&stream_label_summary);
+    let stream_retained_bytes = retained_entry_bytes(stream_line_bytes, &stream_labels);
+
+    let minimum_retained_bytes = http_retained_bytes
+        .zip(stream_retained_bytes)
+        .map(|(http, stream)| http.max(stream))
+        .ok_or_else(|| {
+            "loki_logging: minimum entry retained-byte accounting overflowed".to_string()
+        })?;
+    if minimum_retained_bytes > max_entry_bytes {
+        return Err(format!(
+            "loki_logging: 'max_entry_bytes' must fit a minimum serialized HTTP and stream entry plus configured, reserved, and worst-case dynamic label values (requires at least {minimum_retained_bytes} bytes, configured {max_entry_bytes})"
+        ));
+    }
+    Ok(())
+}
+
 /// Map an HTTP status code to its class string (low cardinality).
 fn status_class(status: u16) -> String {
     match status {
@@ -265,23 +784,6 @@ fn status_class(status: u16) -> String {
         400..=499 => "4xx".to_string(),
         500..=599 => "5xx".to_string(),
         _ => "other".to_string(),
-    }
-}
-
-/// Parse an RFC3339 timestamp string into a nanosecond epoch string for Loki.
-/// Falls back to the current time if parsing fails.
-fn timestamp_nanos_from_rfc3339(ts: &str) -> String {
-    use chrono::DateTime;
-    match DateTime::parse_from_rfc3339(ts) {
-        Ok(dt) => {
-            let secs = dt.timestamp();
-            let nanos = dt.timestamp_subsec_nanos();
-            format!("{}{:09}", secs, nanos)
-        }
-        Err(_) => {
-            let now = chrono::Utc::now();
-            format!("{}{:09}", now.timestamp(), now.timestamp_subsec_nanos())
-        }
     }
 }
 
@@ -300,30 +802,28 @@ impl Plugin for LokiLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        let labels = self.build_stream_labels(summary);
-        let ts = &summary.timestamp_disconnected;
         match self.schema.as_ref().filter(|s| s.applies_to_stream()) {
-            Some(schema) => self.queue_entry(
-                &SchemaView { summary, schema },
-                labels,
-                ts,
-                "stream summary",
-            ),
-            None => self.queue_entry(summary, labels, ts, "stream summary"),
+            Some(schema) => {
+                self.queue_entry(&SchemaView { summary, schema }, "stream summary", || {
+                    self.build_stream_labels(summary)
+                })
+            }
+            None => self.queue_entry(summary, "stream summary", || {
+                self.build_stream_labels(summary)
+            }),
         }
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        let labels = self.build_http_labels(summary);
-        let ts = &summary.timestamp_received;
         match self.schema.as_ref().filter(|s| s.applies_to_http()) {
             Some(schema) => self.queue_entry(
                 &SchemaView { summary, schema },
-                labels,
-                ts,
                 "transaction summary",
+                || self.build_http_labels(summary),
             ),
-            None => self.queue_entry(summary, labels, ts, "transaction summary"),
+            None => self.queue_entry(summary, "transaction summary", || {
+                self.build_http_labels(summary)
+            }),
         }
     }
 
@@ -333,12 +833,15 @@ impl Plugin for LokiLogging {
 }
 
 /// Group entries by label set and build the Loki push payload.
-fn build_loki_payload(batch: &[LokiEntry]) -> Value {
+fn build_loki_payload(batch: &[LokiEntry], last_timestamp_ns: &AtomicU64) -> Result<Value, String> {
     let mut streams: HashMap<BTreeMap<String, String>, Vec<(String, String)>> = HashMap::new();
 
     for entry in batch {
-        let stream = streams.entry(entry.labels.clone()).or_default();
-        stream.push((entry.timestamp_ns.clone(), entry.line.clone()));
+        let stream = streams.entry(entry.labels.as_ref().clone()).or_default();
+        stream.push((
+            next_loki_timestamp_ns(last_timestamp_ns)?,
+            entry.line.to_string(),
+        ));
     }
 
     let streams_array: Vec<Value> = streams
@@ -355,19 +858,63 @@ fn build_loki_payload(batch: &[LokiEntry]) -> Value {
         })
         .collect();
 
-    serde_json::json!({ "streams": streams_array })
+    Ok(serde_json::json!({ "streams": streams_array }))
+}
+
+fn next_loki_timestamp_ns(last_timestamp_ns: &AtomicU64) -> Result<String, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "Loki logging: system clock is before the Unix epoch".to_string())?;
+    let now = u64::try_from(now.as_nanos())
+        .map_err(|_| "Loki logging: system clock exceeds Loki timestamp range".to_string())?;
+    let mut previous = last_timestamp_ns.load(Ordering::Acquire);
+    loop {
+        let next =
+            now.max(previous.checked_add(1).ok_or_else(|| {
+                "Loki logging: monotonic timestamp counter exhausted".to_string()
+            })?);
+        match last_timestamp_ns.compare_exchange_weak(
+            previous,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok(next.to_string()),
+            Err(observed) => previous = observed,
+        }
+    }
 }
 
 /// Send a batch of entries to Loki.
 async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), String> {
     let entry_count = batch.len();
-    let (body_bytes, content_encoding) = build_loki_body(cfg, &batch);
+    let (body_bytes, content_encoding) = match build_loki_body(cfg, &batch) {
+        Ok(body) => body,
+        Err(error) => {
+            warn!(
+                plugin = "loki_logging",
+                "Loki logging: batch discarded before delivery ({} entries lost): {}",
+                entry_count,
+                error,
+            );
+            return Ok(());
+        }
+    };
     let attempts = cfg.retry.max_attempts.max(1);
 
     for attempt in 1..=attempts {
-        match send_batch_once(cfg, entry_count, body_bytes.clone(), content_encoding).await {
-            Ok(()) => return Ok(()),
-            Err(error) if attempt < attempts => {
+        match send_batch_once(cfg, body_bytes.clone(), content_encoding).await {
+            LokiAttemptOutcome::Delivered => return Ok(()),
+            LokiAttemptOutcome::Terminal(error) => {
+                warn!(
+                    plugin = "loki_logging",
+                    "Loki logging: batch discarded after terminal delivery failure ({} entries lost): {}",
+                    entry_count,
+                    error,
+                );
+                return Ok(());
+            }
+            LokiAttemptOutcome::Retryable(error) if attempt < attempts => {
                 warn!(
                     plugin = "loki_logging",
                     "Loki logging: batch flush failed (attempt {}/{}): {}",
@@ -375,9 +922,9 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), 
                     attempts,
                     error,
                 );
-                tokio::time::sleep(cfg.retry.delay).await;
+                tokio::time::sleep(cfg.retry.backoff_delay(attempt)).await;
             }
-            Err(error) => {
+            LokiAttemptOutcome::Retryable(error) => {
                 warn!(
                     plugin = "loki_logging",
                     "Loki logging: batch discarded after {} attempts ({} entries lost): {}",
@@ -393,38 +940,81 @@ async fn send_batch(cfg: &LokiFlushConfig, batch: Vec<LokiEntry>) -> Result<(), 
     Ok(())
 }
 
-fn build_loki_body(cfg: &LokiFlushConfig, batch: &[LokiEntry]) -> (Bytes, Option<&'static str>) {
-    let payload = build_loki_payload(batch);
+fn build_loki_body(
+    cfg: &LokiFlushConfig,
+    batch: &[LokiEntry],
+) -> Result<(Bytes, Option<&'static str>), String> {
+    let payload = build_loki_payload(batch, &cfg.last_timestamp_ns)?;
 
     if cfg.gzip {
         match gzip_json(&payload) {
-            Ok(compressed) => (Bytes::from(compressed), Some("gzip")),
+            Ok(compressed) => Ok((Bytes::from(compressed), Some("gzip"))),
             Err(error) => {
                 warn!("Loki logging: gzip compression failed, sending uncompressed: {error}");
-                (Bytes::from(json_payload_bytes(&payload)), None)
+                Ok((Bytes::from(json_payload_bytes(&payload)?), None))
             }
         }
     } else {
-        (Bytes::from(json_payload_bytes(&payload)), None)
+        Ok((Bytes::from(json_payload_bytes(&payload)?), None))
     }
 }
 
-fn json_payload_bytes(payload: &Value) -> Vec<u8> {
-    match serde_json::to_vec(payload) {
-        Ok(raw) => raw,
-        Err(error) => {
-            warn!("Loki logging: failed to serialize payload: {error}");
-            Vec::new()
+fn json_payload_bytes(payload: &Value) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(payload)
+        .map_err(|error| format!("Loki logging: failed to serialize payload: {error}"))
+}
+
+enum LokiAttemptOutcome {
+    Delivered,
+    Retryable(String),
+    Terminal(String),
+}
+
+enum LokiDrainOutcome {
+    Complete(u64),
+    LimitExceeded,
+    Timeout,
+    TransportFailure,
+}
+
+impl LokiDrainOutcome {
+    fn diagnostic(&self) -> String {
+        match self {
+            Self::Complete(bytes) => format!("{bytes} response bytes discarded"),
+            Self::LimitExceeded => {
+                format!("response body exceeded the {LOKI_RESPONSE_BODY_LIMIT}-byte drain limit")
+            }
+            Self::Timeout => "response body drain timed out".to_string(),
+            Self::TransportFailure => "response body drain had a transport failure".to_string(),
         }
+    }
+}
+
+async fn drain_loki_response(response: reqwest::Response) -> LokiDrainOutcome {
+    if response
+        .content_length()
+        .is_some_and(|length| length > LOKI_RESPONSE_BODY_LIMIT as u64)
+    {
+        return LokiDrainOutcome::LimitExceeded;
+    }
+    match tokio::time::timeout(
+        LOKI_RESPONSE_DRAIN_TIMEOUT,
+        measure_response_body_bounded(response, LOKI_RESPONSE_BODY_LIMIT),
+    )
+    .await
+    {
+        Err(_) => LokiDrainOutcome::Timeout,
+        Ok(Ok(bytes)) => LokiDrainOutcome::Complete(bytes),
+        Ok(Err(BoundedReadError::LimitExceeded { .. })) => LokiDrainOutcome::LimitExceeded,
+        Ok(Err(BoundedReadError::Stream(_))) => LokiDrainOutcome::TransportFailure,
     }
 }
 
 async fn send_batch_once(
     cfg: &LokiFlushConfig,
-    entry_count: usize,
     body_bytes: Bytes,
     content_encoding: Option<&'static str>,
-) -> Result<(), String> {
+) -> LokiAttemptOutcome {
     let mut req = cfg
         .http_client
         .get()
@@ -442,11 +1032,56 @@ async fn send_batch_once(
         req = req.header(key.clone(), value.clone());
     }
 
-    handle_http_batch_response(
-        "Loki logging",
-        entry_count,
-        cfg.http_client.execute(req, "loki_logging").await,
-    )
+    let response = match cfg
+        .http_client
+        .execute_redacted(req, "loki_logging", &cfg.endpoint_url_for_logs)
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return LokiAttemptOutcome::Retryable(error),
+    };
+    let status = response.status();
+    let drain = drain_loki_response(response).await;
+    classify_loki_response(status, drain)
+}
+
+fn classify_loki_response(status: http::StatusCode, drain: LokiDrainOutcome) -> LokiAttemptOutcome {
+    if status.as_u16() == 204 {
+        // A received 204 is Loki's committed success signal. Retrying merely
+        // because connection cleanup failed can duplicate an already-ingested
+        // batch, so the bounded drain is best-effort after this status.
+        return LokiAttemptOutcome::Delivered;
+    }
+    let drain_diagnostic = drain.diagnostic();
+    if status.as_u16() == 260 {
+        return LokiAttemptOutcome::Terminal(format!(
+            "Loki blocked ingestion with status 260; {drain_diagnostic}"
+        ));
+    }
+    if status.as_u16() == 408 || status.as_u16() == 429 || status.is_server_error() {
+        return LokiAttemptOutcome::Retryable(format!(
+            "Loki returned retryable status {}; {drain_diagnostic}",
+            status.as_u16()
+        ));
+    }
+    if status.is_success() {
+        return match drain {
+            LokiDrainOutcome::Complete(0) => LokiAttemptOutcome::Delivered,
+            LokiDrainOutcome::Complete(bytes) => LokiAttemptOutcome::Terminal(format!(
+                "Loki-compatible receiver returned status {} with an unexpected non-empty response ({bytes} bytes discarded)",
+                status.as_u16()
+            )),
+            _ => LokiAttemptOutcome::Terminal(format!(
+                "Loki-compatible receiver returned status {} but an empty response could not be confirmed: {drain_diagnostic}",
+                status.as_u16()
+            )),
+        };
+    }
+
+    LokiAttemptOutcome::Terminal(format!(
+        "Loki returned non-success status {}; {drain_diagnostic}",
+        status.as_u16()
+    ))
 }
 
 /// Gzip-compress a JSON value.
@@ -550,6 +1185,19 @@ mod tests {
         assert!(!is_valid_loki_label_name(""));
         assert!(!is_valid_loki_label_name("1env"));
         assert!(!is_valid_loki_label_name("bad-label"));
+        assert!(validate_loki_label_name("__internal").is_err());
+        assert!(validate_loki_label_name(LOKI_EMITTER_LABEL).is_err());
+    }
+
+    #[test]
+    fn committed_204_is_delivered_after_transport_drain_failure() {
+        assert!(matches!(
+            classify_loki_response(
+                http::StatusCode::NO_CONTENT,
+                LokiDrainOutcome::TransportFailure,
+            ),
+            LokiAttemptOutcome::Delivered
+        ));
     }
 
     #[test]
@@ -562,23 +1210,28 @@ mod tests {
         labels_b.insert("service".to_string(), "ferrum-edge".to_string());
         labels_b.insert("proxy_id".to_string(), "p-2".to_string());
 
-        let payload = build_loki_payload(&[
-            LokiEntry {
-                labels: labels_a.clone(),
-                timestamp_ns: "1000".to_string(),
-                line: r#"{"a":1}"#.to_string(),
-            },
-            LokiEntry {
-                labels: labels_a,
-                timestamp_ns: "1001".to_string(),
-                line: r#"{"a":2}"#.to_string(),
-            },
-            LokiEntry {
-                labels: labels_b,
-                timestamp_ns: "2000".to_string(),
-                line: r#"{"b":1}"#.to_string(),
-            },
-        ]);
+        let budget = LokiByteBudget::new(4096);
+        let payload = build_loki_payload(
+            &[
+                LokiEntry {
+                    labels: Arc::new(labels_a.clone()),
+                    line: Arc::from(r#"{"a":1}"#),
+                    _lease: budget.try_acquire(10).expect("test byte lease"),
+                },
+                LokiEntry {
+                    labels: Arc::new(labels_a),
+                    line: Arc::from(r#"{"a":2}"#),
+                    _lease: budget.try_acquire(10).expect("test byte lease"),
+                },
+                LokiEntry {
+                    labels: Arc::new(labels_b),
+                    line: Arc::from(r#"{"b":1}"#),
+                    _lease: budget.try_acquire(10).expect("test byte lease"),
+                },
+            ],
+            &AtomicU64::new(0),
+        )
+        .expect("payload");
 
         let Some(streams) = payload["streams"].as_array() else {
             panic!("payload should include streams array");

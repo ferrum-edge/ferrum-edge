@@ -2290,6 +2290,25 @@ mod virtual_service_cors {
     }
 
     #[test]
+    fn noncanonical_exact_origin_is_rejected_to_preserve_literal_matching() {
+        for noncanonical in [
+            "https://example.com:443",
+            "HTTPS://EXAMPLE.COM",
+            "https://bücher.example",
+        ] {
+            let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
+                noncanonical.into(),
+            )])]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("canonical browser serialization")),
+                "exact `{noncanonical}` must be rejected: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
     fn uncompilable_regex_rejected() {
         let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Regex("(".into())])]);
         assert!(

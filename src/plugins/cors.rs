@@ -1074,9 +1074,11 @@ fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
 /// Validate and canonicalize an exact origin on the config/reload path.
 /// Request matching remains an allocation-free ASCII comparison against this
 /// browser-serialized form; no request-time URL parse is introduced.
-/// `pub(crate)` because it is the shared admission/serialization gate for the
-/// K8s translator (defer non-translatable literal exacts) and native/file mesh
-/// validation (reject them fail-closed). Do not fork this predicate.
+/// `pub(crate)` because this is the shared admission gate for the K8s Istio
+/// translator and native/file mesh validation as well as direct plugin
+/// configuration. Callers that preserve literal Istio `StringMatch.exact`
+/// semantics additionally require the returned serialization to equal the
+/// source value. Do not fork this predicate.
 pub(crate) fn canonicalize_exact_origin(origin: &str) -> Result<String, String> {
     if origin.contains(char::is_whitespace) {
         return Err(format!(

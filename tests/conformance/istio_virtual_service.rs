@@ -260,6 +260,20 @@ fn vs_cors_policy_preserves_unmatched_modes_and_exact_wildcard() {
         .is_none(),
         "a malformed allowCredentials value must remain deferred"
     );
+
+    assert!(
+        cors_plugin_for(&[virtual_service(json!({
+            "hosts": ["api.example.com"],
+            "http": [{
+                "route": [{"destination": {"host": "echo.default.svc.cluster.local", "port": {"number": 8080}}}],
+                "corsPolicy": {
+                    "allowOrigins": [{"exact": "https://app.example.com:443"}]
+                }
+            }]
+        }))])
+        .is_none(),
+        "a noncanonical literal exact must remain deferred rather than widen"
+    );
 }
 
 /// A `corsPolicy` `regex` origin matcher that does not compile cannot be

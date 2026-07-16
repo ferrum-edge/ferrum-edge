@@ -45,6 +45,7 @@ fn empty_stream_ctx(cert_der: Option<Vec<u8>>) -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: "127.0.0.1".to_string(),
         direct_client_ip: "127.0.0.1".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("tcp".to_string()),
         listen_port: 5432,

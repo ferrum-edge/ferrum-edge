@@ -24,6 +24,7 @@ fn make_ctx(proxy_id: &str, ip: &str, consumer: Option<&str>) -> StreamConnectio
     StreamConnectionContext {
         client_ip: ip.to_string(),
         direct_client_ip: ip.to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: proxy_id.to_string(),
         proxy_name: Some(format!("TCP Proxy {proxy_id}")),
         listen_port: 5432,

@@ -1430,8 +1430,57 @@ fn plugin_config_audit_body(resource: &PluginConfig) -> Value {
     let mut body = json!(resource);
     if let Some(config) = body.get_mut("config") {
         redact_sensitive_plugin_config_fields(config);
+        if resource.plugin_name == "loki_logging" {
+            redact_loki_logging_config_projection(config);
+        }
     }
     body
+}
+
+fn redact_loki_logging_config_projection(config: &mut Value) {
+    let marker = crate::plugins::utils::metadata_redaction::REDACTED_PLACEHOLDER;
+    let Some(config) = config.as_object_mut() else {
+        *config = json!(marker);
+        return;
+    };
+
+    if let Some(endpoint) = config.get_mut("endpoint_url")
+        && !endpoint.is_null()
+    {
+        *endpoint = match endpoint
+            .as_str()
+            .and_then(|value| url::Url::parse(value).ok())
+        {
+            Some(endpoint) => {
+                json!(crate::plugins::loki_logging::redacted_endpoint_url(
+                    &endpoint
+                ))
+            }
+            None => json!(marker),
+        };
+    }
+    if let Some(authorization) = config.get_mut("authorization_header")
+        && !authorization.is_null()
+    {
+        *authorization = json!(marker);
+    }
+    if let Some(custom_headers) = config.get_mut("custom_headers") {
+        redact_loki_custom_header_values(custom_headers, marker);
+    }
+}
+
+fn redact_loki_custom_header_values(value: &mut Value, marker: &str) {
+    match value {
+        Value::Object(headers) => {
+            for value in headers.values_mut() {
+                if !value.is_null() {
+                    *value = json!(marker);
+                }
+            }
+        }
+        Value::Null => {}
+        _ => *value = json!(marker),
+    }
 }
 
 fn upstream_audit_body(resource: &Upstream) -> Value {

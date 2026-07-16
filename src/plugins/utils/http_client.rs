@@ -14,6 +14,8 @@
 //! - **No redirect following**: outbound calls reach only the configured
 //!   endpoint; server-chosen 3xx targets (e.g. a cloud metadata IP) are never
 //!   followed — SSRF defense-in-depth
+//! - **No ambient proxies**: `HTTP_PROXY`, `HTTPS_PROXY`, and related process
+//!   variables cannot redirect plugin traffic around gateway egress policy
 //!
 //! # Usage for plugin authors
 //!
@@ -215,16 +217,18 @@ impl PluginTlsPosture {
 /// bundle to platform/webpki roots.
 ///
 /// If even this minimal builder fails, build a no-DNS fallback that still keeps
-/// redirects disabled and applies the caller's TLS posture. If that cannot be
-/// constructed either, keep redirects disabled while dropping custom TLS posture
-/// before the final exceptional `reqwest::Client::new()` escape hatch.
+/// redirects and ambient proxies disabled and applies the caller's TLS posture.
+/// If that cannot be constructed either, drop custom TLS posture but retain
+/// those two non-negotiable egress controls.
 fn build_dns_cached_fallback_client(
     dns_cache: Option<DnsCache>,
     tls_posture: &PluginTlsPosture,
 ) -> reqwest::Client {
     // Never auto-follow redirects on a shared outbound client (SSRF posture,
     // matches src/connection_pool.rs and the configured clients above).
-    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
     if let Some(dns_cache) = dns_cache {
         let resolver = DnsCacheResolver::new(dns_cache);
         builder = builder.dns_resolver(Arc::new(resolver));
@@ -237,8 +241,11 @@ fn build_dns_cached_fallback_client(
              TLS posture as a last resort.",
             e
         );
-        let builder = tls_posture
-            .apply(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()));
+        let builder = tls_posture.apply(
+            reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none()),
+        );
         match builder.build() {
             Ok(client) => client,
             Err(e2) => {
@@ -248,15 +255,22 @@ fn build_dns_cached_fallback_client(
                     e2
                 );
                 reqwest::Client::builder()
+                    .no_proxy()
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .unwrap_or_else(|e3| {
-                        tracing::error!(
-                            "Failed to build no-redirect fallback plugin client: {}. \
-                             Using reqwest::Client::new() as an exceptional last resort.",
-                            e3
-                        );
-                        reqwest::Client::new()
+                        // The production gateway builds this shared client
+                        // before its initial plugin cache. Full and delta
+                        // cache rebuilds clone that existing client and never
+                        // re-enter this builder.
+                        //
+                        // Invariant: a bare reqwest builder with no custom
+                        // resolver, TLS material, proxy, or redirect policy
+                        // has no fallible operator input. If reqwest ever
+                        // breaks that invariant, aborting client construction
+                        // is safer than silently re-enabling ambient proxy
+                        // routing.
+                        panic!("Failed to build fail-closed minimal plugin HTTP client: {e3}")
                     })
             }
         }
@@ -301,6 +315,7 @@ impl PluginHttpClient {
         let tls_posture = PluginTlsPosture::from_config(tls_no_verify, tls_ca_bundle_path);
 
         let mut builder = reqwest::Client::builder()
+            .no_proxy()
             .pool_max_idle_per_host(pool_config.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(pool_config.idle_timeout_seconds))
             .connect_timeout(Duration::from_secs(30))
@@ -396,6 +411,7 @@ impl PluginHttpClient {
     /// to share the gateway's DNS cache across all plugins.
     pub fn from_pool_config(config: &PoolConfig) -> Self {
         let mut builder = reqwest::Client::builder()
+            .no_proxy()
             .pool_max_idle_per_host(config.max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(config.idle_timeout_seconds))
             .connect_timeout(Duration::from_secs(30))

@@ -166,6 +166,7 @@ pub(crate) async fn handle_mesh_tcp_inbound(
         // plain mTLS-HTTP or raw TCP over mesh tunnels, not PROXY protocol).
         // direct_client_ip always equals client_ip for mesh inbound connections.
         direct_client_ip: client_ip.clone(),
+        canonical_client_ip: Default::default(),
         proxy_id: proxy.id.clone(),
         proxy_name: proxy.name.clone(),
         // Authorize on the captured app port, not the capture listener.

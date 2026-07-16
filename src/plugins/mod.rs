@@ -114,7 +114,9 @@ use http::HeaderMap;
 use percent_encoding::percent_decode_str;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::config::types::{
@@ -634,6 +636,74 @@ pub struct WsDisconnectContext {
     pub metadata: HashMap<String, String>,
 }
 
+/// One-request/session cache for the authoritative, canonical client IP.
+///
+/// Client-IP resolution is complete before policy hooks run. The first policy
+/// that needs a typed address parses that final string, canonicalizes
+/// IPv4-mapped IPv6, and publishes the result here. Every later plugin instance
+/// performs only the lock-free `OnceLock::get_or_init` fast path. `None` is
+/// cached as well, preserving fail-closed behavior for malformed identities.
+#[derive(Debug, Clone, Default)]
+pub struct CanonicalClientIpCache {
+    value: OnceLock<Option<IpAddr>>,
+}
+
+impl CanonicalClientIpCache {
+    fn get_or_parse(&self, client_ip: &str) -> Option<IpAddr> {
+        *self
+            .value
+            .get_or_init(|| parse_canonical_client_ip(client_ip))
+    }
+
+    /// Whether a policy has already resolved the typed address.
+    ///
+    /// This is exposed for external regression tests that verify multiple
+    /// plugin instances share one parse. Runtime policy should call the context
+    /// accessors instead.
+    #[doc(hidden)]
+    pub fn is_initialized(&self) -> bool {
+        self.value.get().is_some()
+    }
+}
+
+fn parse_canonical_client_ip(client_ip: &str) -> Option<IpAddr> {
+    parse_client_ip_literal(client_ip).map(|ip| ip.to_canonical())
+}
+
+/// Parse the legacy client/rule literal forms without allocation.
+///
+/// IPv4 accepts the same four decimal-octet grammar used by the original
+/// `ip_restriction` matcher. Brackets and zone identifiers remain IPv6-only;
+/// accepting them on IPv4 would broaden the established policy grammar.
+fn parse_client_ip_literal(client_ip: &str) -> Option<IpAddr> {
+    if let Some(ipv4) = parse_ipv4_client_ip_literal(client_ip) {
+        return Some(IpAddr::V4(ipv4));
+    }
+
+    let unbracketed = client_ip
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(client_ip);
+    let without_zone = unbracketed
+        .find('%')
+        .map_or(unbracketed, |index| &unbracketed[..index]);
+    without_zone.parse::<Ipv6Addr>().ok().map(IpAddr::V6)
+}
+
+fn parse_ipv4_client_ip_literal(client_ip: &str) -> Option<Ipv4Addr> {
+    let mut octets = client_ip.split('.');
+    let ipv4 = [
+        octets.next()?.parse::<u8>().ok()?,
+        octets.next()?.parse::<u8>().ok()?,
+        octets.next()?.parse::<u8>().ok()?,
+        octets.next()?.parse::<u8>().ok()?,
+    ];
+    if octets.next().is_some() {
+        return None;
+    }
+    Some(Ipv4Addr::from(ipv4))
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -653,6 +723,7 @@ pub struct RequestContext {
     /// resolution. Mesh authz uses this for Istio `source.ip` so forwarded
     /// `remote.ip` cannot masquerade as the direct peer.
     pub direct_client_ip: String,
+    canonical_client_ip: CanonicalClientIpCache,
     pub method: String,
     pub path: String,
     /// Canonical client-request authority for authentication mechanisms that
@@ -1074,6 +1145,7 @@ impl RequestContext {
         Self {
             direct_client_ip: client_ip.clone(),
             client_ip,
+            canonical_client_ip: CanonicalClientIpCache::default(),
             method,
             path,
             request_authority: None,
@@ -1165,6 +1237,20 @@ impl RequestContext {
         self.response_stream_id
     }
 
+    /// Return the authoritative client IP as a canonical typed address.
+    ///
+    /// The value is parsed at most once after trusted-forwarding resolution and
+    /// reused by every policy instance attached to this request.
+    pub fn canonical_client_ip(&self) -> Option<IpAddr> {
+        self.canonical_client_ip.get_or_parse(&self.client_ip)
+    }
+
+    /// Whether [`Self::canonical_client_ip`] has initialized the shared cache.
+    #[doc(hidden)]
+    pub fn canonical_client_ip_is_initialized(&self) -> bool {
+        self.canonical_client_ip.is_initialized()
+    }
+
     pub(crate) fn mark_gateway_response_compression(&mut self, algorithm: &'static str) {
         self.gateway_response_compression_algorithm = Some(algorithm);
     }
@@ -1223,6 +1309,7 @@ impl RequestContext {
         Self {
             client_ip: self.client_ip.clone(),
             direct_client_ip: self.direct_client_ip.clone(),
+            canonical_client_ip: self.canonical_client_ip.clone(),
             method: self.method.clone(),
             path: self.path.clone(),
             request_authority: self.request_authority.clone(),
@@ -2785,6 +2872,9 @@ pub struct StreamConnectionContext {
     /// `mesh_authz` to populate Istio's `source.ip` principal (socket peer)
     /// separately from `remote.ip` (forwarded/resolved address).
     pub direct_client_ip: String,
+    /// Shared typed-client-IP cache for stream policy instances.
+    #[doc(hidden)]
+    pub canonical_client_ip: CanonicalClientIpCache,
     pub proxy_id: String,
     pub proxy_name: Option<String>,
     pub listen_port: u16,
@@ -2842,6 +2932,20 @@ pub struct StreamConnectionContext {
 }
 
 impl StreamConnectionContext {
+    /// Return the authoritative stream client IP as a canonical typed address.
+    ///
+    /// The value is parsed at most once per TCP connection or UDP/DTLS session
+    /// and reused by every attached policy instance.
+    pub fn canonical_client_ip(&self) -> Option<IpAddr> {
+        self.canonical_client_ip.get_or_parse(&self.client_ip)
+    }
+
+    /// Whether [`Self::canonical_client_ip`] has initialized the shared cache.
+    #[doc(hidden)]
+    pub fn canonical_client_ip_is_initialized(&self) -> bool {
+        self.canonical_client_ip.is_initialized()
+    }
+
     /// Return the stable authenticated identity for stream policies. A mapped
     /// Consumer username takes precedence over any external authenticated identity.
     pub fn effective_identity(&self) -> Option<&str> {

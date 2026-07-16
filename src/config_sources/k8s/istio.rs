@@ -3690,9 +3690,11 @@ fn plain_exact_origin_translatable(exact: &str) -> bool {
     {
         return false;
     }
-    trimmed == "*"
-        || crate::plugins::cors::canonicalize_exact_origin(exact)
-            .is_ok_and(|canonical| canonical.as_str() == exact)
+    if trimmed == "*" {
+        return true;
+    }
+
+    crate::plugins::cors::canonicalize_exact_origin(exact).is_ok_and(|canonical| canonical == exact)
 }
 
 /// Map one Istio `allowOrigins[]` `StringMatch` entry to the `cors` plugin's

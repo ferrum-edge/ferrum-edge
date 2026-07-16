@@ -2390,6 +2390,7 @@ fn stream_ctx(first_bytes: &[u8], kind: StreamBytesKind) -> StreamConnectionCont
     StreamConnectionContext {
         client_ip: "203.0.113.10".to_string(),
         direct_client_ip: "203.0.113.10".to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "tcp-proxy".to_string(),
         proxy_name: Some("TCP Proxy".to_string()),
         listen_port: 9000,

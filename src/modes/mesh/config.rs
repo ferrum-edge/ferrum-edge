@@ -2206,6 +2206,8 @@ pub struct MeshCorsPolicy {
     /// Preflight cache lifetime (Istio `maxAge`, seconds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_age_seconds: Option<u64>,
+    /// Credentialed CORS is unrepresentable with an exact `*` origin because
+    /// the native plugin's wildcard response cannot safely retain credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_credentials: Option<bool>,
     /// Preserve the Istio source field's presence and value. Omission and

@@ -6,8 +6,84 @@ use tokio::net::TcpListener;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+struct ProxyEnvGuard {
+    saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl ProxyEnvGuard {
+    fn point_all_at(proxy_url: &str) -> Self {
+        const PROXY_KEYS: &[&str] = &[
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ];
+        let saved = PROXY_KEYS
+            .iter()
+            .map(|&key| (key, std::env::var_os(key)))
+            .collect();
+        for &key in &PROXY_KEYS[..6] {
+            // SAFETY: this test holds the repository-wide ENV_LOCK until the
+            // guard restores every proxy variable.
+            unsafe { std::env::set_var(key, proxy_url) };
+        }
+        for &key in &PROXY_KEYS[6..] {
+            // SAFETY: serialized by the same repository-wide ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for ProxyEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            // SAFETY: the caller still holds ENV_LOCK while this guard drops.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(*key, value),
+                    None => std::env::remove_var(*key),
+                }
+            }
+        }
+    }
+}
+
 fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn plugin_http_client_ignores_ambient_proxy_environment() {
+    let proxy = MockServer::start().await;
+    let client = {
+        let _env_lock = crate::unit::env_lock::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _proxy_env = ProxyEnvGuard::point_all_at(&proxy.uri());
+
+        // Reqwest snapshots the system proxy configuration while building the
+        // client. Restore the process environment before any async operation;
+        // the constructed client retains the proxy posture under test.
+        default_client()
+    };
+
+    let _ = client
+        .get()
+        .get("http://198.51.100.1:9/no-proxy-canary")
+        .timeout(Duration::from_millis(200))
+        .send()
+        .await;
+
+    assert_eq!(
+        proxy.received_requests().await.unwrap_or_default().len(),
+        0,
+        "ambient proxy variables must not receive plugin traffic"
+    );
 }
 
 async fn start_connection_drop_server(

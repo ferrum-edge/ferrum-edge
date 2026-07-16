@@ -67,6 +67,7 @@ impl CapturedMeshEgressLifecycle {
         let mut stream_ctx = StreamConnectionContext {
             client_ip: client_ip.clone(),
             direct_client_ip: client_ip.clone(),
+            canonical_client_ip: Default::default(),
             proxy_id: proxy.id.clone(),
             proxy_name: Some(destination_service.to_string()),
             listen_port: destination_port,
@@ -354,6 +355,7 @@ mod tests {
         StreamConnectionContext {
             client_ip: "10.0.0.2".to_string(),
             direct_client_ip: "10.0.0.2".to_string(),
+            canonical_client_ip: Default::default(),
             proxy_id: "mesh-egress".to_string(),
             proxy_name: Some("orders.default.svc.cluster.local".to_string()),
             listen_port: 5432,

@@ -1388,6 +1388,7 @@ async fn run_tcp_accept_loop(
                         // `direct_client_ip` is always the raw socket peer. When PROXY
                         // protocol is active `client_ip` may differ (forwarded source IP).
                         direct_client_ip: direct_client_ip.clone(),
+                        canonical_client_ip: Default::default(),
                         proxy_id: proxy_id.to_string(),
                         proxy_name: base_proxy.and_then(|p| p.name.clone()),
                         listen_port: port,

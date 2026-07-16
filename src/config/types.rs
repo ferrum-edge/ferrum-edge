@@ -18,7 +18,7 @@ use std::io::Cursor;
 use std::sync::LazyLock;
 
 /// Maximum length for resource IDs.
-const MAX_ID_LENGTH: usize = 254;
+pub(crate) const MAX_ID_LENGTH: usize = 254;
 
 // ---- Field length limits (aligned with DB schema VARCHAR widths) ----
 

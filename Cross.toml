@@ -3,6 +3,7 @@ image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:0.2.5"
 pre-build = [
     "dpkg --add-architecture $CROSS_DEB_ARCH",
     "apt-get update && apt-get install --assume-yes perl make libcurl4-openssl-dev:$CROSS_DEB_ARCH cmake software-properties-common wget gnupg unzip",
+    "multiarch=$(dpkg-architecture -a$CROSS_DEB_ARCH -qDEB_HOST_MULTIARCH) && ln -sfn /usr/include/$multiarch/curl /usr/$multiarch/include/curl",
     "wget -qO /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip && unzip -o /tmp/protoc.zip -d /usr/local bin/protoc && chmod +x /usr/local/bin/protoc && rm /tmp/protoc.zip",
     "wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | apt-key add -",
     "add-apt-repository 'deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-6.0 main'",

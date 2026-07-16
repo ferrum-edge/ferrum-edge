@@ -98,6 +98,31 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     if let Err(found) = config.validate_plugin_references() {
         errors.extend(found);
     }
+    // Serving modes reject malformed fail-closed plugins while staging the
+    // PluginCache. CP mode has no runtime PluginCache, so validate the
+    // security-critical ip_restriction shape here as well before a database
+    // snapshot or delta can be accepted and broadcast. This intentionally
+    // invokes the same side-effect-free constructor used by file/admin/DP
+    // admission rather than duplicating its allowed-key contract.
+    //
+    // Do not generalize this from PluginFailurePolicy::FailClosed alone. That
+    // policy describes data-plane cache publication, not a pure CP schema
+    // contract: some registered constructors intentionally depend on node-local
+    // resources (for example geo_restriction's MMDB), while adaptive_concurrency
+    // requires gateway/cache state. Broader CP parity needs explicit shape-only
+    // validators and mode/resource contracts for each such plugin.
+    for plugin_config in &config.plugin_configs {
+        if plugin_config.enabled
+            && plugin_config.plugin_name == "ip_restriction"
+            && let Err(error) =
+                crate::plugins::ip_restriction::IpRestriction::new(&plugin_config.config)
+        {
+            errors.push(format!(
+                "Plugin 'ip_restriction' (id={}): {error}",
+                plugin_config.id
+            ));
+        }
+    }
     if let Err(found) = crate::plugin_cache::validate_hmac_request_transform_candidate(
         config,
         &crate::plugins::PluginHttpClient::default(),
@@ -625,6 +650,31 @@ mod tests {
         };
 
         assert_single_rejecting_error(config, "non-existent plugin_config 'missing-plugin'");
+    }
+
+    #[test]
+    fn rejecting_runtime_contract_includes_invalid_ip_restriction_shape() {
+        let config = GatewayConfig {
+            plugin_configs: vec![PluginConfig {
+                id: "broadened-ip-policy".to_string(),
+                namespace: default_namespace(),
+                plugin_name: "ip_restriction".to_string(),
+                config: json!({
+                    "alow": ["10.0.0.0/8"],
+                    "deny": ["192.0.2.0/24"]
+                }),
+                scope: PluginScope::Global,
+                proxy_id: None,
+                enabled: true,
+                priority_override: None,
+                api_spec_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }],
+            ..Default::default()
+        };
+
+        assert_single_rejecting_error(config, "unknown configuration field 'alow'");
     }
 
     #[test]

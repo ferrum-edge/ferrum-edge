@@ -3,6 +3,7 @@ use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Plugin, RequestContext, StreamConnectionContext, priority,
 };
 use serde_json::json;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use super::plugin_utils;
@@ -15,6 +16,7 @@ fn create_stream_context_with_ip(ip: &str) -> StreamConnectionContext {
     StreamConnectionContext {
         client_ip: ip.to_string(),
         direct_client_ip: ip.to_string(),
+        canonical_client_ip: Default::default(),
         proxy_id: "test-proxy".to_string(),
         proxy_name: Some("Test Proxy".to_string()),
         listen_port: 8080,
@@ -635,6 +637,16 @@ fn ipv4_too_many_octets_is_rejected() {
     assert!(result.is_err());
 }
 
+#[test]
+fn ipv6_only_literal_decorations_do_not_broaden_ipv4_rules() {
+    use ferrum_edge::plugins::ip_restriction::ip_matches;
+
+    assert!(!ip_matches("[192.0.2.1]", "192.0.2.1"));
+    assert!(!ip_matches("192.0.2.1%eth0", "192.0.2.1"));
+    assert!(!ip_matches("192.0.2.1", "[192.0.2.1]"));
+    assert!(!ip_matches("192.0.2.1", "192.0.2.1%eth0"));
+}
+
 #[tokio::test]
 async fn ipv4_rule_matches_ipv4_mapped_ipv6_client() {
     let plugin = IpRestriction::new(&json!({
@@ -698,6 +710,70 @@ async fn deny_mode_ipv4_mapped_ipv6_cidr_rule_rejects_canonicalized_ipv4_client(
     let mut ctx = create_context_with_ip("192.168.1.42");
     let result = plugin.on_request_received(&mut ctx).await;
     plugin_utils::assert_reject(result, Some(403));
+}
+
+#[test]
+fn mapped_ipv6_cidr_prefixes_below_96_reject_construction() {
+    for prefix in [0, 64, 95] {
+        let config = json!({"allow": [format!("::ffff:192.0.2.44/{prefix}")]});
+        let error = IpRestriction::new(&config)
+            .err()
+            .expect("mapped IPv6 CIDRs below /96 must be rejected");
+        assert!(error.contains("invalid allow rule"), "{error}");
+    }
+}
+
+#[tokio::test]
+async fn mapped_ipv6_cidr_prefix_boundaries_map_to_ipv4() {
+    let all_ipv4 = IpRestriction::new(&json!({
+        "allow": ["::ffff:192.0.2.44/96"]
+    }))
+    .unwrap();
+    let mut ipv4 = create_context_with_ip("203.0.113.9");
+    plugin_utils::assert_continue(all_ipv4.on_request_received(&mut ipv4).await);
+    let mut ipv6 = create_context_with_ip("2001:db8::1");
+    plugin_utils::assert_reject(all_ipv4.on_request_received(&mut ipv6).await, Some(403));
+
+    let exact_ipv4 = IpRestriction::new(&json!({
+        "allow": ["::ffff:192.0.2.44/128"]
+    }))
+    .unwrap();
+    let mut exact = create_context_with_ip("192.0.2.44");
+    plugin_utils::assert_continue(exact_ipv4.on_request_received(&mut exact).await);
+    let mut adjacent = create_context_with_ip("192.0.2.45");
+    plugin_utils::assert_reject(
+        exact_ipv4.on_request_received(&mut adjacent).await,
+        Some(403),
+    );
+}
+
+#[test]
+fn noncanonical_ipv4_rule_literals_reject_construction() {
+    for rule in [
+        "010.1.2.3",
+        "+10.1.2.3",
+        "10.01.2.3",
+        "10.1.2.03",
+        "010.1.2.3/24",
+        "+10.1.2.3/24",
+    ] {
+        let config = json!({"deny": [rule]});
+        assert!(
+            IpRestriction::new(&config).is_err(),
+            "non-canonical IPv4 rule must be rejected: {rule}"
+        );
+    }
+}
+
+#[test]
+fn canonical_ipv4_rule_literals_remain_valid() {
+    for rule in ["0.0.0.0", "10.1.2.3", "255.255.255.255/32"] {
+        let config = json!({"deny": [rule]});
+        assert!(
+            IpRestriction::new(&config).is_ok(),
+            "canonical IPv4 rule must remain valid: {rule}"
+        );
+    }
 }
 
 // ── Fail closed on unparseable client IP (finding #10) ──────────────
@@ -880,4 +956,193 @@ fn ip_matches_zero_cidr_is_family_scoped() {
     assert!(ip_matches("fe80::1", "::/0"));
     assert!(!ip_matches("not-an-ip", "0.0.0.0/0"));
     assert!(!ip_matches("not-an-ip", "::/0"));
+}
+
+// ── Strict configuration contract ──────────────────────────────────
+
+#[test]
+fn config_must_be_an_object() {
+    for config in [json!(null), json!([]), json!(true), json!("allow all")] {
+        let error = IpRestriction::new(&config)
+            .err()
+            .expect("non-object config must be rejected");
+        assert!(error.contains("config must be an object"), "{error}");
+    }
+}
+
+#[test]
+fn unknown_keys_are_rejected_even_when_another_policy_list_is_valid() {
+    for config in [
+        json!({"alow": ["10.0.0.0/8"], "deny": ["192.0.2.0/24"]}),
+        json!({"allow": ["10.0.0.0/8"], "denny": ["192.0.2.0/24"]}),
+        json!({"allow": ["10.0.0.0/8"], "mod": "deny_first"}),
+    ] {
+        let error = IpRestriction::new(&config)
+            .err()
+            .expect("unknown key must be rejected");
+        assert!(error.contains("unknown configuration field"), "{error}");
+        assert!(error.contains("allow, deny, mode"), "{error}");
+    }
+}
+
+#[test]
+fn shared_admin_and_config_admission_rejects_broadened_policy_shape() {
+    let config = json!({
+        "alow": ["10.0.0.0/8"],
+        "deny": ["192.0.2.0/24"]
+    });
+    let error = ferrum_edge::plugins::validate_plugin_config("ip_restriction", &config)
+        .expect_err("shared plugin admission must reject the typo");
+    assert!(
+        error.contains("unknown configuration field 'alow'"),
+        "{error}"
+    );
+}
+
+#[test]
+fn null_and_malformed_rule_arrays_are_rejected() {
+    for config in [
+        json!({"allow": null, "deny": ["192.0.2.0/24"]}),
+        json!({"allow": ["10.0.0.0/8"], "deny": null}),
+        json!({"allow": {"cidr": "10.0.0.0/8"}}),
+        json!({"deny": ["192.0.2.1", null]}),
+        json!({"allow": ["10.0.0.1", 7]}),
+    ] {
+        assert!(
+            IpRestriction::new(&config).is_err(),
+            "malformed rule array must be rejected: {config}"
+        );
+    }
+}
+
+#[test]
+fn explicit_null_mode_is_rejected() {
+    let error = IpRestriction::new(&json!({
+        "allow": ["10.0.0.0/8"],
+        "mode": null
+    }))
+    .err()
+    .expect("null mode must not silently select allow_first");
+    assert!(error.contains("mode"));
+}
+
+#[test]
+fn one_empty_list_is_allowed_only_when_the_other_list_enforces_policy() {
+    assert!(IpRestriction::new(&json!({"allow": [], "deny": ["192.0.2.0/24"]})).is_ok());
+    assert!(IpRestriction::new(&json!({"allow": ["10.0.0.0/8"], "deny": []})).is_ok());
+    assert!(IpRestriction::new(&json!({"allow": [], "deny": []})).is_err());
+}
+
+// ── Compiled range-index regressions ───────────────────────────────
+
+fn sparse_ipv4_rules(count: u32) -> Vec<String> {
+    (0..count)
+        .map(|index| Ipv4Addr::from(0x0a00_0001_u32 + index * 2).to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn ten_thousand_rule_miss_and_high_address_match_preserve_decisions() {
+    let rules = sparse_ipv4_rules(10_000);
+    let high_match = rules
+        .last()
+        .expect("large fixture has a final rule")
+        .clone();
+    let plugin = IpRestriction::new(&json!({"allow": rules})).unwrap();
+
+    let mut miss = create_context_with_ip("203.0.113.250");
+    plugin_utils::assert_reject(plugin.on_request_received(&mut miss).await, Some(403));
+
+    let mut high = create_context_with_ip(&high_match);
+    plugin_utils::assert_continue(plugin.on_request_received(&mut high).await);
+}
+
+#[tokio::test]
+async fn ten_thousand_rule_deny_miss_continues() {
+    let plugin = IpRestriction::new(&json!({
+        "deny": sparse_ipv4_rules(10_000),
+        "mode": "deny_first"
+    }))
+    .unwrap();
+    let mut miss = create_context_with_ip("203.0.113.250");
+    plugin_utils::assert_continue(plugin.on_request_received(&mut miss).await);
+}
+
+#[tokio::test]
+async fn duplicate_and_overlapping_ranges_keep_deny_precedence() {
+    let plugin = IpRestriction::new(&json!({
+        "allow": [
+            "10.0.0.0/8",
+            "10.0.0.0/8",
+            "10.1.0.0/16",
+            "10.1.2.3",
+            "10.1.2.3"
+        ],
+        "deny": ["10.1.2.128/25", "10.1.2.192/26", "10.1.2.200"]
+    }))
+    .unwrap();
+
+    let mut allowed_overlap = create_context_with_ip("10.1.2.127");
+    plugin_utils::assert_continue(plugin.on_request_received(&mut allowed_overlap).await);
+
+    for denied in ["10.1.2.128", "10.1.2.200", "10.1.2.255"] {
+        let mut ctx = create_context_with_ip(denied);
+        plugin_utils::assert_reject(plugin.on_request_received(&mut ctx).await, Some(403));
+    }
+}
+
+#[tokio::test]
+async fn merged_prefix_boundaries_remain_inclusive_and_family_scoped() {
+    let plugin = IpRestriction::new(&json!({
+        "allow": ["192.0.2.0/31", "2001:db8::/127"]
+    }))
+    .unwrap();
+
+    for allowed in ["192.0.2.0", "192.0.2.1", "2001:db8::", "2001:db8::1"] {
+        let mut ctx = create_context_with_ip(allowed);
+        plugin_utils::assert_continue(plugin.on_request_received(&mut ctx).await);
+    }
+    for outside in ["192.0.2.2", "2001:db8::2"] {
+        let mut ctx = create_context_with_ip(outside);
+        plugin_utils::assert_reject(plugin.on_request_received(&mut ctx).await, Some(403));
+    }
+}
+
+// ── Typed client-IP reuse across instances ─────────────────────────
+
+#[tokio::test]
+async fn multiple_http_instances_share_one_canonical_client_ip() {
+    let deny_other = IpRestriction::new(&json!({"deny": ["198.51.100.0/24"]})).unwrap();
+    let allow_client = IpRestriction::new(&json!({"allow": ["192.0.2.0/24"]})).unwrap();
+    let mut ctx = create_context_with_ip("::ffff:192.0.2.44");
+
+    assert!(!ctx.canonical_client_ip_is_initialized());
+    plugin_utils::assert_continue(deny_other.on_request_received(&mut ctx).await);
+    assert!(ctx.canonical_client_ip_is_initialized());
+    assert!(matches!(ctx.canonical_client_ip(), Some(IpAddr::V4(_))));
+    plugin_utils::assert_continue(allow_client.on_request_received(&mut ctx).await);
+}
+
+#[tokio::test]
+async fn multiple_stream_instances_share_one_canonical_client_ip() {
+    let deny_other = IpRestriction::new(&json!({"deny": ["2001:db8:ffff::/48"]})).unwrap();
+    let allow_client = IpRestriction::new(&json!({"allow": ["2001:db8::/32"]})).unwrap();
+    let mut ctx = create_stream_context_with_ip("2001:db8::44");
+
+    assert!(!ctx.canonical_client_ip_is_initialized());
+    plugin_utils::assert_continue(deny_other.on_stream_connect(&mut ctx).await);
+    assert!(ctx.canonical_client_ip_is_initialized());
+    plugin_utils::assert_continue(allow_client.on_stream_connect(&mut ctx).await);
+}
+
+#[tokio::test]
+async fn malformed_client_ip_is_cached_and_fails_closed_for_every_instance() {
+    let first = IpRestriction::new(&json!({"deny": ["10.0.0.0/8"]})).unwrap();
+    let second = IpRestriction::new(&json!({"deny": ["192.168.0.0/16"]})).unwrap();
+    let mut ctx = create_context_with_ip("not-an-ip");
+
+    plugin_utils::assert_reject(first.on_request_received(&mut ctx).await, Some(403));
+    assert!(ctx.canonical_client_ip_is_initialized());
+    assert_eq!(ctx.canonical_client_ip(), None);
+    plugin_utils::assert_reject(second.on_request_received(&mut ctx).await, Some(403));
 }
