@@ -1324,13 +1324,15 @@ fn uri_component_contains_sequence(candidate: &str, sensitive: &str) -> bool {
     }
     candidate.match_indices(sensitive).any(|(index, _)| {
         let end = index + sensitive.len();
-        let starts_at_boundary = index == 0
+        let starts_at_boundary = sensitive.starts_with('/')
+            || index == 0
             || candidate
                 .as_bytes()
                 .get(index - 1)
                 .copied()
                 .is_some_and(is_uri_component_boundary);
-        let ends_at_boundary = end == candidate.len()
+        let ends_at_boundary = sensitive.ends_with('/')
+            || end == candidate.len()
             || candidate
                 .as_bytes()
                 .get(end)
