@@ -905,7 +905,16 @@ fn unambiguous_query_params(
 ) -> Result<serde_json::Map<String, Value>, InvocationFailure> {
     let mut ordered = BTreeMap::new();
     if let Some(raw_query) = ctx.raw_query_string() {
-        for pair in raw_query.split('&').filter(|pair| !pair.is_empty()) {
+        // Authentication plugins retain the original raw query for security
+        // inspection but mark hidden credentials for removal before backend
+        // dispatch. Apply that same removal before parsing the function
+        // payload so policy egress cannot resurrect a credential that the
+        // backend will not receive.
+        let effective_query = crate::proxy::query_string_after_plugin_strips(ctx, raw_query);
+        for pair in effective_query
+            .split('&')
+            .filter(|pair| !pair.is_empty())
+        {
             let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
             if raw_key.contains('+') || raw_value.contains('+') {
                 return Err(InvocationFailure::governed_input(
@@ -1148,12 +1157,12 @@ impl FunctionDestination {
     /// secret in a value, providers can place credential material in a query
     /// key even when that key also has a value (for example
     /// `?SIGNED_TOKEN=1`). Choosing only one side would let a redirect copy the
-    /// other into a renamed key, value, path, or fragment.
+    /// other into a renamed key, value, path, or fragment. Slashes are data in
+    /// these decoded scalars and must remain intact for exact comparison.
     fn sensitive_query_scalars(&self) -> impl Iterator<Item = &str> {
         self.sensitive_query_pairs
             .iter()
             .flat_map(|(key, value)| [key.as_str(), value.as_str()])
-            .map(|component| component.trim_matches('/'))
             .filter(|component| !component.is_empty())
     }
 
@@ -1313,7 +1322,6 @@ fn path_contains_segment_sequence(candidate: &str, sensitive: &str) -> bool {
 }
 
 fn uri_component_contains_sequence(candidate: &str, sensitive: &str) -> bool {
-    let sensitive = sensitive.trim_matches('/');
     if sensitive.is_empty() {
         return false;
     }

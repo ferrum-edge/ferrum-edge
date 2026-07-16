@@ -15320,8 +15320,10 @@ components:
         of every configured query pair are protected credential scalars: a key
         remains protected whether it is key-only (`?SIGNED_TOKEN=`) or paired
         with a value (`?SIGNED_TOKEN=1`), and a non-empty value is protected
-        independently. Each scalar remains protected if copied into either side
-        of another query pair or into decoded paths at URI-component
+        independently. Leading and trailing slashes remain part of each scalar;
+        a slash-only scalar remains protected and makes ambiguous URL-path
+        surfaces fail closed. Each scalar remains protected if copied into
+        either side of another query pair or into decoded paths at URI-component
         boundaries (including path-parameter/query delimiters), and decoded fragments are checked
         directly at URI-component boundaries even when they are scalar rather
         than URI-shaped. Query comparison
@@ -15417,7 +15419,7 @@ components:
         forward_query_params:
           type: boolean
           default: false
-          description: "Include decoded query parameters in the function payload. Duplicate decoded names, invalid percent-encoded UTF-8, raw '+' ambiguity, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
+          description: "Include decoded query parameters in the function payload after omitting credentials that an earlier auth plugin marked for backend stripping. Duplicate decoded names, invalid percent-encoded UTF-8, raw '+' ambiguity, and parameters lacking their original encoded representation are rejected before invocation even when on_error=continue."
         timeout_ms:
           type: integer
           format: uint64

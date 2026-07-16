@@ -1290,6 +1290,10 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "valued-query-key-copied-key",
         "valued-query-key-path",
         "valued-query-key-fragment",
+        "valued-query-key-slash-boundaries",
+        "query-value-trailing-slash",
+        "query-value-slash-only",
+        "query-value-slash-only-root-path",
         "literal-plus-encoded-candidate",
         "encoded-plus-literal-candidate",
         "fragment-query-scalar",
@@ -1307,6 +1311,7 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-query-path-lookalike",
         "benign-query-path-parameter-lookalike",
         "benign-key-only-query-lookalike",
+        "benign-trailing-slash-scalar-without-slash",
         "benign-plus-space-distinct",
         "benign-fragment-lookalike",
         "benign-fragment-label",
@@ -1341,6 +1346,15 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             | "valued-query-key-path"
             | "valued-query-key-fragment" => {
                 format!("{}/signed%2Ftrigger?SIGNED_TOKEN=1", server.uri())
+            }
+            "valued-query-key-slash-boundaries" => {
+                format!("{}/signed%2Ftrigger?%2FSIGNED%2F=1", server.uri())
+            }
+            "query-value-trailing-slash" | "benign-trailing-slash-scalar-without-slash" => {
+                format!("{}/signed%2Ftrigger?code=secret%2F", server.uri())
+            }
+            "query-value-slash-only" | "query-value-slash-only-root-path" => {
+                format!("{}/signed%2Ftrigger?code=%2F", server.uri())
             }
             _ => format!("{}/signed%2Ftrigger?code=secret%2Fvalue", server.uri()),
         };
@@ -1421,6 +1435,16 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "valued-query-key-fragment" => {
                 "https://redirect.example/#leak=SIGNED_TOKEN".to_string()
             }
+            "valued-query-key-slash-boundaries" => {
+                "https://redirect.example/next?leak=%2FSIGNED%2F".to_string()
+            }
+            "query-value-trailing-slash" => {
+                "https://redirect.example/next?leak=secret%2F".to_string()
+            }
+            "query-value-slash-only" => {
+                "https://redirect.example/next?leak=%2F".to_string()
+            }
+            "query-value-slash-only-root-path" => "https://redirect.example/".to_string(),
             "literal-plus-encoded-candidate" => {
                 "https://redirect.example/next?leak=token%2Bpart".to_string()
             }
@@ -1455,6 +1479,9 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-key-only-query-lookalike" => {
                 "https://redirect.example/next?leak=SIGNED_TOKEN_EXTRA".to_string()
+            }
+            "benign-trailing-slash-scalar-without-slash" => {
+                "https://redirect.example/next;leak=secret".to_string()
             }
             "benign-plus-space-distinct" => {
                 "https://redirect.example/next?leak=token+part".to_string()
@@ -1656,6 +1683,9 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
         "link-multiple-targets",
         "link-target-budget",
         "link-malformed",
+        "content-location-query-trailing-slash",
+        "refresh-query-trailing-slash",
+        "link-query-trailing-slash",
         "benign-content-location",
         "benign-refresh",
         "benign-refresh-bare-target",
@@ -1666,7 +1696,11 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
         "benign-link-path-lookalike",
     ] {
         let server = MockServer::start().await;
-        let function_url = format!("{}/signed%2Ftrigger?code=secret%2Fvalue", server.uri());
+        let function_url = if case.ends_with("query-trailing-slash") {
+            format!("{}/signed%2Ftrigger?code=secret%2F", server.uri())
+        } else {
+            format!("{}/signed%2Ftrigger?code=secret%2Fvalue", server.uri())
+        };
         let encoded_function_url: String =
             url::form_urlencoded::byte_serialize(function_url.as_bytes()).collect();
         let (header, value, should_strip) = match case {
@@ -1733,6 +1767,21 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
             "link-malformed" => (
                 "link",
                 format!("</safe>; title=\"unterminated, <{function_url}>; rel=next"),
+                true,
+            ),
+            "content-location-query-trailing-slash" => (
+                "content-location",
+                "https://redirect.example/safe?leak=secret%2F".to_string(),
+                true,
+            ),
+            "refresh-query-trailing-slash" => (
+                "refresh",
+                "0; url=https://redirect.example/safe?leak=secret%2F".to_string(),
+                true,
+            ),
+            "link-query-trailing-slash" => (
+                "link",
+                "<https://redirect.example/safe?leak=secret%2F>; rel=\"next\"".to_string(),
                 true,
             ),
             "benign-content-location" => {
@@ -2134,6 +2183,85 @@ async fn test_unambiguous_query_is_decoded_once_for_function_payload() {
     let payload: Value = serde_json::from_slice(&requests[0].body).unwrap();
     assert_eq!(payload["query_params"]["name"], "alice bob");
     assert_eq!(payload["query_params"]["literal"], "+");
+}
+
+#[tokio::test]
+async fn test_query_forwarding_omits_only_credentials_marked_for_backend_stripping() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let plugin = ServerlessFunction::new(
+        &json!({
+            "provider": "azure_functions",
+            "function_url": format!("{}/func", server.uri()),
+            "forward_query_params": true
+        }),
+        default_client(),
+    )
+    .unwrap();
+    let mut ctx = create_test_context();
+    ctx.set_raw_query_string(
+        "api_key=first-secret&keep=visible%20value&API_KEY=case-visible&api%5Fkey=second-secret&api_key_suffix=visible-suffix&note=api_key&flag"
+            .to_string(),
+    );
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut HashMap::new()).await,
+        PluginResult::Continue
+    ));
+    let requests = server.received_requests().await.unwrap();
+    let payload: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let serialized_payload = serde_json::to_string(&payload).unwrap();
+    assert!(!serialized_payload.contains("first-secret"));
+    assert!(!serialized_payload.contains("second-secret"));
+    let params = payload["query_params"].as_object().unwrap();
+    assert_eq!(params.len(), 5);
+    assert_eq!(
+        params.get("keep").and_then(Value::as_str),
+        Some("visible value")
+    );
+    assert_eq!(
+        params.get("API_KEY").and_then(Value::as_str),
+        Some("case-visible")
+    );
+    assert_eq!(
+        params.get("api_key_suffix").and_then(Value::as_str),
+        Some("visible-suffix")
+    );
+    assert_eq!(
+        params.get("note").and_then(Value::as_str),
+        Some("api_key")
+    );
+    assert_eq!(params.get("flag").and_then(Value::as_str), Some(""));
+    assert!(!params.contains_key("api_key"));
+
+    let mut duplicate_ctx = create_test_context();
+    duplicate_ctx.set_raw_query_string(
+        "api_key=hidden&role=user&api%5Fkey=also-hidden&r%6Fle=admin".to_string(),
+    );
+    duplicate_ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+    match plugin
+        .before_proxy(&mut duplicate_ctx, &mut HashMap::new())
+        .await
+    {
+        PluginResult::Reject { body, .. } => {
+            assert!(body.contains("duplicate_query_parameter"));
+        }
+        other => panic!("allowed duplicate names must still fail closed, got {other:?}"),
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
