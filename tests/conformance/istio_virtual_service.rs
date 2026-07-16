@@ -89,8 +89,8 @@ fn cors_plugin_for(translation_input: &[K8sObject]) -> Option<PluginConfig> {
 /// when its origins are representable (`allowOrigins[]` `exact`/`prefix`/`regex`
 /// `StringMatch` / legacy `allowOrigin`). GA: this is the common-case CORS
 /// surface Istio operators set on a route. Malformed/unknown origin matchers,
-/// un-compilable regexes, and credentialed exact `*` combinations are left
-/// unprojected (deferred), not silently approximated.
+/// un-compilable regexes, and credentialed matchers with Envoy allow-all
+/// semantics are left unprojected (deferred), not silently approximated.
 #[test]
 fn vs_cors_policy_translated() {
     register_feature!(
@@ -98,7 +98,7 @@ fn vs_cors_policy_translated() {
         feature = "http[].corsPolicy",
         status = Status::Supported,
         maturity = Maturity::Ga,
-        notes = "Translated to a proxy-scoped `cors` plugin (allowOrigins[] exact/prefix/regex StringMatch / legacy allowOrigin, allowMethods/allowHeaders/exposeHeaders/maxAge/allowCredentials/unmatchedPreflights). Omitted unmatchedPreflights preserves Istio FORWARD; uncredentialed exact `*` preserves allow-all, while credentialed exact `*` stays deferred instead of losing credentials.",
+        notes = "Translated to a proxy-scoped `cors` plugin (allowOrigins[] exact/prefix/regex StringMatch / legacy allowOrigin, allowMethods/allowHeaders/exposeHeaders/maxAge/allowCredentials/unmatchedPreflights). Omitted unmatchedPreflights preserves Istio FORWARD; uncredentialed matchers satisfying Envoy's literal-* probe preserve allow-all, while credentialed forms stay deferred instead of losing credentials.",
     );
     let cors = cors_plugin_for(&[virtual_service(json!({
         "hosts": ["api.example.com"],

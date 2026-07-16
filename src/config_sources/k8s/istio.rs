@@ -3624,21 +3624,21 @@ fn cors_unmatched_preflights(cors: &Value) -> Result<IstioUnmatchedPreflights, (
 /// Extract CORS allowed origins from an Istio `corsPolicy`, mapped to the
 /// `cors` plugin's `allowed_origins` form (a JSON array). Supports the full
 /// Istio `allowOrigins[]` `StringMatch` set — `exact` (emitted as a plain
-/// string, byte-identical to the prior exact-only projection), `prefix`
-/// (emitted as `{"prefix": ...}`), and `regex` (emitted as `{"regex": ...}`) —
-/// plus the legacy `allowOrigin` string list (exact strings). The extended
-/// `cors` plugin matches these the same way Ferrum matches Istio `StringMatch`
-/// elsewhere (literal prefix; RE2 full match for regex).
+/// string), `prefix` (emitted as `{"prefix": ...}`), and `regex` (emitted as
+/// `{"regex": ...}`) — plus the legacy `allowOrigin` string list (exact
+/// strings). Any matcher that matches Envoy's literal `*` probe is normalized
+/// to the plugin's plain-string wildcard. Other matchers retain Istio
+/// StringMatch behavior (literal prefix; RE2 full match for regex).
 ///
 /// Returns `None` (policy left unprojected, surfaced as a `deferred_fields`
 /// entry by the status writer) when there is no origin list, when any entry is
 /// not a single-key `exact`/`prefix`/`regex` `StringMatch` (an unknown or
-/// multi-key matcher is fail-closed, not approximated), when a string is empty,
-/// or when a `regex` matcher does not compile — so a policy this returns `Some`
-/// for is ALWAYS projectable into a valid `cors` plugin config (no
-/// translate-then-silently-drop gap). `cors_policy_translatable` and the actual
-/// projection both go through here, so the predicate and the emitted config can
-/// never disagree on which shapes are representable.
+/// multi-key matcher is fail-closed, not approximated), when an exact or regex
+/// string is empty, or when a `regex` matcher does not compile — so a policy
+/// this returns `Some` for is ALWAYS projectable into a valid `cors` plugin
+/// config (no translate-then-silently-drop gap). `cors_policy_translatable` and
+/// the actual projection both go through here, so the predicate and the emitted
+/// config can never disagree on which shapes are representable.
 fn cors_allowed_origins(cors: &Value) -> Option<Vec<Value>> {
     if let Some(arr) = cors.get("allowOrigins").and_then(Value::as_array) {
         let mut origins = Vec::with_capacity(arr.len());
@@ -3695,8 +3695,9 @@ fn plain_exact_origin_translatable(exact: &str) -> bool {
 /// `exact` / `prefix` / `regex` string, when a `regex` fails to compile, or
 /// when an `exact` is an unsupported wildcard shape, whitespace-padded, or not
 /// a valid `scheme://host[:port]` origin (the plugin's own exact-origin
-/// admission — see `plugins::cors::validate_exact_origin`). Exact `*` is the
-/// documented Istio allow-all value and projects to native wildcard.
+/// admission — see `plugins::cors::validate_exact_origin`). Envoy first probes
+/// every matcher against the literal `*`; any exact/prefix/regex matcher that
+/// succeeds has allow-all semantics and projects to native wildcard.
 /// `regex` is compiled here (cold path) purely to gate translatability — the
 /// plugin re-compiles it at config time as the runtime matcher; an invalid
 /// pattern is never reflected into a header.
@@ -3726,7 +3727,11 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
             plain_exact_origin_translatable(exact).then(|| Value::String(exact.to_string()))
         }
         (None, Some(prefix), None) => {
-            (!prefix.is_empty()).then(|| serde_json::json!({ "prefix": prefix }))
+            if "*".starts_with(prefix) {
+                Some(Value::String("*".to_string()))
+            } else {
+                Some(serde_json::json!({ "prefix": prefix }))
+            }
         }
         (None, None, Some(regex)) => {
             if regex.is_empty() {
@@ -3735,8 +3740,13 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
             // Only translatable if it compiles — otherwise the projected plugin
             // config would fail validation and be silently dropped, defeating
             // the route's CORS policy. Keep it deferred instead.
-            regex::Regex::new(&crate::config::types::anchor_regex_pattern(regex)).ok()?;
-            Some(serde_json::json!({ "regex": regex }))
+            let matcher =
+                regex::Regex::new(&crate::config::types::anchor_regex_pattern(regex)).ok()?;
+            if matcher.is_match("*") {
+                Some(Value::String("*".to_string()))
+            } else {
+                Some(serde_json::json!({ "regex": regex }))
+            }
         }
         _ => None,
     }
@@ -3750,13 +3760,13 @@ fn cors_origin_matcher_value(entry: &Value) -> Option<Value> {
 /// (`allowOrigins[]` `exact`/`prefix`/`regex` `StringMatch` — `regex` must
 /// compile — or the legacy `allowOrigin` exact list), any `maxAge` parses as a
 /// duration, and every `allowMethods`/`allowHeaders`/`exposeHeaders` entry
-/// passes the plugin's own method/header-name admission. Credentialed exact `*`
-/// is deferred because the native wildcard representation cannot emit the
-/// concrete request origin required for credentialed CORS. A malformed/unknown
-/// origin matcher, an un-compilable `regex`, or an invalid method/header token
-/// likewise makes the policy non-translatable so it is left unprojected
-/// (deferred) rather than silently approximated or failing `CorsPlugin`
-/// construction after translation.
+/// passes the plugin's own method/header-name admission. A credentialed matcher
+/// with Envoy allow-all semantics is deferred because the native wildcard
+/// representation cannot emit the concrete request origin required for
+/// credentialed CORS. A malformed/unknown origin matcher, an un-compilable
+/// `regex`, or an invalid method/header token likewise makes the policy
+/// non-translatable so it is left unprojected (deferred) rather than silently
+/// approximated or failing `CorsPlugin` construction after translation.
 pub(crate) fn cors_policy_translatable(cors: &Value) -> bool {
     let allowed_origins = cors_allowed_origins(cors);
     let origins_ok = allowed_origins.is_some();
@@ -3988,8 +3998,8 @@ fn route_cors_plugin(object: &K8sObject, http: &Value, proxy_id: &str) -> Option
             "VirtualService http[].corsPolicy is not faithfully translatable (allowOrigins[] \
              must be exact/prefix/regex StringMatch with a compilable regex, or the legacy \
              allowOrigin exact list, plus well-typed methods, headers, credentials, \
-             unmatched-preflight mode, and maxAge; credentialed exact '*' cannot be \
-             represented safely); leaving it unprojected. \
+             unmatched-preflight mode, and maxAge; a credentialed matcher with Envoy \
+             allow-all semantics cannot be represented safely); leaving it unprojected. \
              Configure the `cors` plugin directly."
         );
         return None;

@@ -2236,6 +2236,21 @@ pub enum MeshCorsOriginMatch {
     Regex(String),
 }
 
+/// Envoy treats any CORS origin StringMatcher that matches the literal `*` as
+/// allow-all before testing it against the request Origin. Keep native/file
+/// mesh projection aligned with that probe, including prefix/regex shapes that
+/// do not otherwise match a syntactically valid browser Origin.
+fn mesh_cors_origin_matches_wildcard(origin: &MeshCorsOriginMatch) -> bool {
+    match origin {
+        MeshCorsOriginMatch::Exact(value) => value == "*",
+        MeshCorsOriginMatch::Prefix(value) => "*".starts_with(value),
+        MeshCorsOriginMatch::Regex(pattern) => {
+            regex::Regex::new(&crate::config::types::anchor_regex_pattern(pattern))
+                .is_ok_and(|matcher| matcher.is_match("*"))
+        }
+    }
+}
+
 impl Serialize for MeshCorsOriginMatch {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
@@ -2278,20 +2293,27 @@ impl<'de> Deserialize<'de> for MeshCorsOriginMatch {
 }
 
 /// Project the typed policy onto the `cors` plugin's config schema
-/// (`src/plugins/cors.rs`): exact origins are plain strings, prefix/regex are
-/// single-key matcher objects — byte-for-byte the shape the K8s translator's
-/// gateway-side `route_cors_plugin` emits, pinned by a unit test so the two
-/// projections can never drift. The synthesized config always carries
-/// `unmatched_preflights`, which selects Istio semantics without changing the
-/// defaults of operator-authored direct plugin configurations.
+/// (`src/plugins/cors.rs`): exact origins are plain strings and prefix/regex are
+/// single-key matcher objects, except that any matcher satisfying Envoy's
+/// literal `*` probe is normalized to the plain-string wildcard. This is the
+/// same shape the K8s translator's gateway-side `route_cors_plugin` emits,
+/// pinned by a unit test so the two projections cannot drift. The synthesized
+/// config always carries `unmatched_preflights`, which selects Istio semantics
+/// without changing the defaults of operator-authored direct plugin
+/// configurations.
 pub fn cors_plugin_config_from_mesh_policy(policy: &MeshCorsPolicy) -> serde_json::Value {
     let origins: Vec<serde_json::Value> = policy
         .allowed_origins
         .iter()
-        .map(|origin| match origin {
-            MeshCorsOriginMatch::Exact(value) => serde_json::Value::String(value.clone()),
-            MeshCorsOriginMatch::Prefix(value) => serde_json::json!({ "prefix": value }),
-            MeshCorsOriginMatch::Regex(value) => serde_json::json!({ "regex": value }),
+        .map(|origin| {
+            if mesh_cors_origin_matches_wildcard(origin) {
+                return serde_json::Value::String("*".to_string());
+            }
+            match origin {
+                MeshCorsOriginMatch::Exact(value) => serde_json::Value::String(value.clone()),
+                MeshCorsOriginMatch::Prefix(value) => serde_json::json!({ "prefix": value }),
+                MeshCorsOriginMatch::Regex(value) => serde_json::json!({ "regex": value }),
+            }
         })
         .collect();
     let mut config = serde_json::Map::new();
@@ -2753,6 +2775,17 @@ fn validate_virtual_service_cors_policies(
                     }
                 }
             }
+        }
+        if policy.cors.allow_credentials == Some(true)
+            && policy
+                .cors
+                .allowed_origins
+                .iter()
+                .any(mesh_cors_origin_matches_wildcard)
+        {
+            errors.push(format!(
+                "{context}: cors.allow_credentials=true cannot be combined with an origin matcher that has Envoy allow-all semantics by matching the literal `*`"
+            ));
         }
         // Method/header lists are copied verbatim into the synthesized `cors`
         // plugin config, whose construction rejects padded/empty values,

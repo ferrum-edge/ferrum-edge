@@ -853,10 +853,11 @@ fn virtual_service_deferred_fields(spec: &Value) -> Vec<&'static str> {
     // `StringMatch` (regex must compile) or the legacy `allowOrigin` exact
     // list, plus a parseable maxAge. It remains a deferred field when an origin
     // matcher is malformed/unknown, a `regex` does not compile, maxAge is
-    // unparseable, or credentials are combined with exact `*` (the native
-    // wildcard representation cannot preserve that source behavior). The
-    // shared `cors_policy_translatable` predicate keeps the translator and this
-    // report in lockstep.
+    // unparseable, or credentials are combined with any matcher satisfying
+    // Envoy's literal-`*` allow-all probe (the native wildcard representation
+    // cannot preserve that source behavior). The shared
+    // `cors_policy_translatable` predicate keeps the translator and this report
+    // in lockstep.
     let http_routes = spec.get("http").and_then(Value::as_array);
     if http_routes.is_some_and(|routes| {
         routes.iter().any(|route| {

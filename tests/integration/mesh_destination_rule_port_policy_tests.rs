@@ -1814,6 +1814,97 @@ fn virtual_service_cors_policy_exact_star_projects_but_other_wildcards_defer() {
 }
 
 #[test]
+fn virtual_service_cors_policy_envoy_wildcard_probe_covers_prefix_and_regex() {
+    for matcher in [
+        serde_json::json!({"prefix": ""}),
+        serde_json::json!({"prefix": "*"}),
+        serde_json::json!({"regex": r"\*"}),
+        serde_json::json!({"regex": ".*"}),
+    ] {
+        let translated = translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-envoy-wildcard-probe",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [{
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {"allowOrigins": [matcher.clone()]}
+                    }]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("Envoy wildcard matcher translates");
+        let gateway_plugin = translated
+            .config
+            .plugin_configs
+            .iter()
+            .find(|plugin| plugin.plugin_name == "cors")
+            .expect("Envoy wildcard matcher projects a gateway CORS plugin");
+        assert_eq!(
+            gateway_plugin.config["allowed_origins"],
+            serde_json::json!(["*"]),
+            "matcher {matcher} must use Envoy's literal-* allow-all probe"
+        );
+        let mesh_policy = &translated
+            .config
+            .mesh
+            .as_ref()
+            .expect("mesh block")
+            .virtual_service_cors_policies[0]
+            .cors;
+        assert_eq!(
+            cors_plugin_config_from_mesh_policy(mesh_policy)["allowed_origins"],
+            serde_json::json!(["*"]),
+            "gateway and mesh projection must agree for matcher {matcher}"
+        );
+
+        let credentialed = translate_k8s_objects(
+            &[k8s_object(
+                "VirtualService",
+                "vs-credentialed-envoy-wildcard",
+                serde_json::json!({
+                    "hosts": ["svc.default.svc.cluster.local"],
+                    "http": [{
+                        "route": [{"destination": {
+                            "host": "svc.default.svc.cluster.local",
+                            "port": {"number": 8080}
+                        }}],
+                        "corsPolicy": {
+                            "allowOrigins": [matcher.clone()],
+                            "allowCredentials": true
+                        }
+                    }]
+                }),
+            )],
+            k8s_options(),
+        )
+        .expect("credentialed Envoy wildcard leaves routing translated");
+        assert!(
+            !credentialed
+                .config
+                .plugin_configs
+                .iter()
+                .any(|plugin| plugin.plugin_name == "cors"),
+            "credentialed Envoy wildcard {matcher} must stay deferred"
+        );
+        assert!(
+            credentialed
+                .config
+                .mesh
+                .as_ref()
+                .map(|mesh| mesh.virtual_service_cors_policies.is_empty())
+                .unwrap_or(true),
+            "credentialed Envoy wildcard {matcher} must not ride the mesh slice"
+        );
+    }
+}
+
+#[test]
 fn virtual_service_cors_policy_skips_gateway_scoped_matches() {
     // http[0]'s CORS is scoped to an ingress gateway via match[].gateways —
     // it must neither donate its policy to the mesh slice nor suppress the

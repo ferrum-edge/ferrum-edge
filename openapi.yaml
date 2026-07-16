@@ -13230,8 +13230,10 @@ components:
             `UNSPECIFIED`, and `FORWARD` behavior; `ignore` returns a local 200
             without CORS authorization fields. Its presence also preserves
             omitted/empty method and header lists and omitted max age instead
-            of applying native direct-plugin defaults. It is mutually exclusive
-            with `preflight_continue`.
+            of applying native direct-plugin defaults. In a pure translated-Istio
+            chain, unmatched and no-Origin forwarding preserves backend
+            Access-Control fields; a matching policy sanitizes and rebuilds them.
+            It is mutually exclusive with `preflight_continue`.
 
     OpaPluginConfig:
       type: object
