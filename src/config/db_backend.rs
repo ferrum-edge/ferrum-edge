@@ -14,6 +14,38 @@ use std::collections::HashSet;
 pub const PROXY_ROUTE_CONFLICT_ERROR: &str =
     "A proxy with overlapping hosts and listen_path already exists";
 
+/// Stable admin-facing message for a namespace mutation that could not enter
+/// the datastore-backed admission critical section. Backend/topology details
+/// stay in server logs and the chained error only.
+pub const MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE: &str =
+    "Namespace mutation is temporarily unavailable; retry later";
+
+/// Marker for transient namespace-admission contention.
+///
+/// This is distinct from [`MtlsDnsIdentityConflict`]: contention means the
+/// caller should retry the same request later (HTTP 503), while an identity
+/// conflict means the candidate itself must change (HTTP 409).
+#[derive(Debug)]
+pub struct MtlsDnsAdmissionUnavailable;
+
+impl std::fmt::Display for MtlsDnsAdmissionUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE)
+    }
+}
+
+impl std::error::Error for MtlsDnsAdmissionUnavailable {}
+
+pub fn is_mtls_dns_admission_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<MtlsDnsAdmissionUnavailable>())
+}
+
+pub(crate) fn mark_mtls_dns_admission_unavailable(error: anyhow::Error) -> anyhow::Error {
+    error.context(MtlsDnsAdmissionUnavailable)
+}
+
 /// Whether a batch owns its namespace admission guard and whether it runs
 /// normal mTLS DNS validation.
 ///

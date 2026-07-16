@@ -43,9 +43,9 @@
 mod inner {
     use crate::config::db_backend::{
         ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend,
-        DeleteAllResourcesError, DeleteMode, IncrementalResult, MtlsDnsIdentityConflict,
-        NamespaceResourceCounts, NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
-        SnapshotDataIntegrityError, SortOrder,
+        DeleteAllResourcesError, DeleteMode, IncrementalResult, MtlsDnsAdmissionUnavailable,
+        MtlsDnsIdentityConflict, NamespaceResourceCounts, NamespacedResourceId,
+        PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
     };
     use crate::config::db_loader::{credential_value_hash, proxy_route_key_hash};
     use crate::config::types::{
@@ -1633,15 +1633,127 @@ mod inner {
             mutate: F,
         ) -> Result<(), anyhow::Error>
         where
-            F: FnOnce(&mut GatewayConfig),
+            F: Fn(&mut GatewayConfig),
         {
+            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, false)
+                .await
+        }
+
+        async fn validate_mtls_dns_repair_delete_candidate<F>(
+            &self,
+            namespace: &str,
+            mutate: F,
+        ) -> Result<(), anyhow::Error>
+        where
+            F: Fn(&mut GatewayConfig),
+        {
+            self.validate_mtls_dns_candidate_with_mode(namespace, mutate, true)
+                .await
+        }
+
+        async fn validate_mtls_dns_candidate_with_mode<F>(
+            &self,
+            namespace: &str,
+            mutate: F,
+            allow_existing_conflicts: bool,
+        ) -> Result<(), anyhow::Error>
+        where
+            F: Fn(&mut GatewayConfig),
+        {
+            // Most mutations cannot affect DNS-derived identities. Load the
+            // policy graph first and avoid decoding every consumer unless an
+            // enabled effective san_dns policy exists after the mutation.
+            let mut policy_candidate = self.load_mtls_dns_policy_candidate(namespace).await?;
+            mutate(&mut policy_candidate);
+            policy_candidate.normalize_fields();
+            if !policy_candidate.has_effective_mtls_dns_identity_policy() {
+                return Ok(());
+            }
+
             let mut candidate =
                 <Self as DatabaseBackend>::load_namespace_snapshot(self, namespace).await?;
+            let prior_conflicts = allow_existing_conflicts
+                .then(|| candidate.mtls_dns_identity_conflicts())
+                .unwrap_or_default();
             mutate(&mut candidate);
             candidate.normalize_fields();
-            candidate
-                .validate_unique_mtls_dns_identities()
-                .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
+            if allow_existing_conflicts
+                && !candidate.introduces_new_mtls_dns_identity_conflict(&prior_conflicts)
+            {
+                return Ok(());
+            }
+            match candidate.validate_unique_mtls_dns_identities() {
+                Ok(()) if allow_existing_conflicts => Err(anyhow::Error::new(
+                    MtlsDnsIdentityConflict::new(vec![
+                        "Mutation would introduce a new mTLS DNS identity ambiguity".to_string(),
+                    ]),
+                )),
+                Ok(()) => Ok(()),
+                Err(errors) => Err(anyhow::Error::new(MtlsDnsIdentityConflict::new(errors))),
+            }
+        }
+
+        async fn load_mtls_dns_policy_candidate(
+            &self,
+            namespace: &str,
+        ) -> Result<GatewayConfig, anyhow::Error> {
+            let loaded_at = Utc::now();
+            let (proxies, plugin_configs) = if self.replica_set_configured() {
+                let connection = self.connection();
+                let mut session = connection.client.start_session().await?;
+                session
+                    .start_transaction()
+                    .read_concern(ReadConcern::snapshot())
+                    .write_concern(WriteConcern::majority())
+                    .await?;
+
+                let loaded = async {
+                    let proxies = self
+                        .load_full_proxies_opt_session(
+                            namespace,
+                            Some((connection.as_ref(), &mut session)),
+                            true,
+                        )
+                        .await?;
+                    let plugin_configs = self
+                        .load_full_plugin_configs_opt_session(
+                            namespace,
+                            Some((connection.as_ref(), &mut session)),
+                            true,
+                        )
+                        .await?;
+                    Ok::<_, anyhow::Error>((proxies, plugin_configs))
+                }
+                .await;
+
+                match loaded {
+                    Ok(resources) => {
+                        session.commit_transaction().await?;
+                        resources
+                    }
+                    Err(error) => {
+                        let _ = session.abort_transaction().await;
+                        return Err(error);
+                    }
+                }
+            } else {
+                (
+                    self.load_full_proxies_opt_session(namespace, None, true)
+                        .await?,
+                    self.load_full_plugin_configs_opt_session(namespace, None, true)
+                        .await?,
+                )
+            };
+
+            let mut candidate = GatewayConfig {
+                version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+                proxies,
+                plugin_configs,
+                loaded_at,
+                ..Default::default()
+            };
+            candidate.normalize_fields();
+            Ok(candidate)
         }
 
         async fn acquire_durable_admission_lock(
@@ -1664,14 +1776,22 @@ mod inner {
             let lock_id = lock_id.to_string();
             let (connection, connection_generation_guard, persistent_outcome_uncertain) =
                 if guard_owner.is_some() {
-                    let persistent_pin = self.persistent_admission_pins.get(&owner).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "MongoDB {label} guard '{lock_id}' is not active in this admin process"
-                    )
-                })?;
+                    let persistent_pin = self
+                        .persistent_admission_pins
+                        .get(&owner)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "MongoDB {label} guard '{lock_id}' is not active in this admin process"
+                            )
+                        })?;
                     if persistent_pin.namespace != lock_id {
                         anyhow::bail!(
                             "MongoDB {label} guard '{lock_id}' belongs to a different namespace"
+                        );
+                    }
+                    if persistent_pin.uncertain_outcome.load(Ordering::Acquire) {
+                        anyhow::bail!(
+                            "MongoDB {label} guard '{lock_id}' retained because a prior protected mutation outcome is uncertain"
                         );
                     }
                     (
@@ -1767,13 +1887,13 @@ mod inner {
                 }
 
                 if tokio::time::Instant::now() >= deadline {
-                    anyhow::bail!(
+                    return Err(anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
                         "MongoDB {label} lock '{lock_id}' remained held for {} seconds; \
                          admission locks do not expire because reclaiming one could permit a \
                          stale writer, so verify the prior owner is stopped before removing the \
                          lock document",
                         MONGO_ADMISSION_LOCK_WAIT_TIMEOUT.as_secs()
-                    );
+                    )));
                 }
                 tokio::time::sleep(MONGO_MIGRATION_LEASE_RETRY_INTERVAL).await;
             }
@@ -4814,7 +4934,7 @@ mod inner {
         async fn delete_proxy(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
-            self.validate_mtls_dns_candidate(namespace, |candidate| {
+            self.validate_mtls_dns_repair_delete_candidate(namespace, |candidate| {
                 candidate.proxies.retain(|proxy| proxy.id != id);
                 candidate
                     .plugin_configs
@@ -5665,7 +5785,7 @@ mod inner {
         async fn delete_consumer(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
-            self.validate_mtls_dns_candidate(namespace, |candidate| {
+            self.validate_mtls_dns_repair_delete_candidate(namespace, |candidate| {
                 candidate.consumers.retain(|consumer| consumer.id != id);
             })
             .await?;
@@ -6061,7 +6181,7 @@ mod inner {
         ) -> Result<bool, anyhow::Error> {
             let start = std::time::Instant::now();
             let mut mtls_lease = self.acquire_mtls_dns_admission_lease(namespace).await?;
-            self.validate_mtls_dns_candidate(namespace, |candidate| {
+            self.validate_mtls_dns_repair_delete_candidate(namespace, |candidate| {
                 candidate.plugin_configs.retain(|plugin| plugin.id != id);
                 for proxy in &mut candidate.proxies {
                     proxy
@@ -9601,7 +9721,7 @@ mod inner {
                 .as_ref()
                 .and_then(|d| d.get_str("proxy_id").ok())
                 .map(str::to_string);
-            self.validate_mtls_dns_candidate(namespace, |candidate| {
+            self.validate_mtls_dns_repair_delete_candidate(namespace, |candidate| {
                 if let Some(proxy_id) = proxy_id.as_deref() {
                     candidate.proxies.retain(|proxy| proxy.id != proxy_id);
                     candidate

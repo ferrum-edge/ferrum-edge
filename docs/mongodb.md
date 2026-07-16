@@ -260,10 +260,12 @@ non-expiring namespace mutex in `mtls_dns_admission_locks`. The connection
 bundle that acquires the mutex is pinned through the authoritative candidate
 read, protected mutation, and owner-qualified release; reconnect/failover is
 deferred while that generation is pinned. A cancelled, timed-out, or failed
-future after a mutation was dispatched has an uncertain write outcome, so
-Ferrum retains both the MongoDB mutex document and the process-local connection
-pin instead of deleting the fence from `Drop`. Verify the durable write outcome,
-stop or restart that admin process, and only then remove the exact
+future before any protected mutation is dispatched starts bounded,
+owner-qualified mutex cleanup and releases the generation pin when cleanup
+settles. A cancellation after a mutation was dispatched has an uncertain write
+outcome, so Ferrum retains both the MongoDB mutex document and the process-local
+connection pin instead of deleting the fence from `Drop`. Verify the durable
+write outcome, stop or restart that admin process, and only then remove the exact
 owner-qualified mutex document. Definitive server rejections (including a
 duplicate-key loser) and definitively aborted transactions explicitly settle
 and release the mutex; they do not create a permanent operator-recovery fence.

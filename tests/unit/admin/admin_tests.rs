@@ -3,16 +3,48 @@
 //! Tests for the Ferrum Edge Admin API including JWT authentication
 
 use chrono::Utc;
+use ferrum_edge::_test_support::{
+    admin_mtls_dns_admission_contention_response,
+    admin_mtls_dns_admission_drop_should_release,
+};
 use ferrum_edge::admin::{
     AdminState,
     jwt_auth::{AdminClaims, AdminRole, JwtConfig, JwtManager},
 };
+use http_body_util::BodyExt;
 use jsonwebtoken::{EncodingKey, Header, encode};
 use serde_json::json;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
+
+#[test]
+fn mtls_dns_admission_lifecycle_only_retains_uncertain_mutations() {
+    assert!(admin_mtls_dns_admission_drop_should_release(false, false));
+    assert!(admin_mtls_dns_admission_drop_should_release(true, true));
+    assert!(!admin_mtls_dns_admission_drop_should_release(true, false));
+}
+
+#[tokio::test]
+async fn mtls_dns_admission_contention_is_retryable_and_redacted() {
+    let raw_detail = "mysql topology secret-admission-owner";
+    let response = admin_mtls_dns_admission_contention_response(raw_detail);
+    assert_eq!(response.status(), hyper::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.headers()[hyper::header::RETRY_AFTER]
+            .to_str()
+            .unwrap(),
+        "1"
+    );
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert_eq!(
+        body,
+        r#"{"error":"Namespace mutation is temporarily unavailable; retry later"}"#
+    );
+    assert!(!body.contains(raw_detail));
+}
 
 /// Test configuration for admin API
 #[derive(Clone)]

@@ -2410,6 +2410,52 @@ fn mtls_dns_admission_mutations_document_conflict_responses() {
 }
 
 #[test]
+fn namespace_admission_contention_is_documented_as_retryable() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    for pointer in [
+        "/paths/~1batch/post/responses/503",
+        "/paths/~1proxies/post/responses/503",
+        "/paths/~1proxies~1{id}/put/responses/503",
+        "/paths/~1proxies~1{id}/delete/responses/503",
+        "/paths/~1consumers/post/responses/503",
+        "/paths/~1consumers~1{id}/put/responses/503",
+        "/paths/~1consumers~1{id}/delete/responses/503",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}/put/responses/503",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}/post/responses/503",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}/delete/responses/503",
+        "/paths/~1consumers~1{consumer_id}~1credentials~1{cred_type}~1{index}/delete/responses/503",
+        "/paths/~1plugins~1config/post/responses/503",
+        "/paths/~1plugins~1config~1{id}/put/responses/503",
+        "/paths/~1plugins~1config~1{id}/delete/responses/503",
+        "/paths/~1upstreams/post/responses/503",
+        "/paths/~1upstreams~1{id}/put/responses/503",
+        "/paths/~1upstreams~1{id}/delete/responses/503",
+        "/paths/~1api-specs/post/responses/503",
+        "/paths/~1api-specs~1{id}/put/responses/503",
+        "/paths/~1api-specs~1{id}/delete/responses/503",
+    ] {
+        assert_eq!(
+            spec.pointer(pointer)
+                .and_then(|value| value.get("$ref"))
+                .and_then(serde_json::Value::as_str),
+            Some("#/components/responses/NamespaceAdmissionUnavailable"),
+            "namespace mutation is missing retryable 503 response: {pointer}"
+        );
+    }
+
+    let response = spec
+        .pointer("/components/responses/NamespaceAdmissionUnavailable")
+        .expect("missing namespace-admission response component");
+    assert_eq!(response["headers"]["Retry-After"]["required"], false);
+    assert_eq!(response["headers"]["Retry-After"]["schema"]["example"], 1);
+    assert_eq!(
+        response["content"]["application/json"]["example"]["error"],
+        "Namespace mutation is temporarily unavailable; retry later"
+    );
+}
+
+#[test]
 fn oidc_relying_party_schema_matches_strict_runtime_surface() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");

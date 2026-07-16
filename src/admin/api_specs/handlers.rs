@@ -26,7 +26,7 @@ use crate::admin::spec_codec;
 use crate::admin::{AdminState, log_audit_enqueue_failure};
 use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, SortOrder,
-    is_mtls_dns_identity_conflict,
+    is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
 };
 use crate::config::types::{ApiSpec, PluginAssociation, Upstream};
 use crate::util::body_limit::is_length_limit_error;
@@ -64,6 +64,8 @@ enum ApiSpecError {
     Unprocessable(String),
     /// No DB configured (503)
     NoDatabase,
+    /// Namespace admission is currently fenced (503)
+    AdmissionUnavailable(String),
     /// Generic DB or internal error (500)
     Internal(String),
 }
@@ -80,6 +82,9 @@ struct ValidationFailure {
 // ---------------------------------------------------------------------------
 
 fn classify_db_error(e: anyhow::Error) -> ApiSpecError {
+    if is_mtls_dns_admission_unavailable(&e) {
+        return ApiSpecError::AdmissionUnavailable(e.to_string());
+    }
     if is_mtls_dns_identity_conflict(&e) {
         return ApiSpecError::Conflict(e.to_string());
     }
@@ -198,6 +203,13 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": "No database configured"}),
         ),
+        ApiSpecError::AdmissionUnavailable(detail) => {
+            tracing::warn!(
+                "api-spec namespace admission temporarily unavailable: {}",
+                detail
+            );
+            crate::admin::mtls_dns_admission_unavailable_response()
+        }
         ApiSpecError::Internal(msg) => {
             tracing::error!("api-specs internal error: {}", msg);
             json_resp(

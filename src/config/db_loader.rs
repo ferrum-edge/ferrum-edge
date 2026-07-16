@@ -40,7 +40,7 @@ use sha2::{Digest, Sha256};
 use sqlx::Executor;
 use sqlx::Row;
 use sqlx::{AnyPool, any::AnyPoolOptions, any::AnyRow};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -51,10 +51,15 @@ use uuid::Uuid;
 #[allow(unused_imports)]
 pub use crate::config::db_backend::{
     ApiSpecListFilter, ApiSpecSortBy, BatchConfigWriteMode, DatabaseBackend, IncrementalResult,
-    MtlsDnsIdentityConflict, NamespaceResourceCounts, NamespacedResourceId,
-    PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError, SortOrder,
-    extract_db_hostname, redact_url,
+    MtlsDnsAdmissionUnavailable, MtlsDnsIdentityConflict, NamespaceResourceCounts,
+    NamespacedResourceId, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult, SnapshotDataIntegrityError,
+    SortOrder, extract_db_hostname, redact_url,
 };
+
+pub(crate) const MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL: &str =
+    "INSERT INTO mtls_dns_admission_locks \
+     (namespace, updated_at) VALUES (?, ?) \
+     ON DUPLICATE KEY UPDATE updated_at = mtls_dns_admission_locks.updated_at";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FullLoadPurpose {
@@ -687,9 +692,12 @@ impl DatabaseStore {
 
     fn mtls_dns_admission_lock_insert_sql(&self) -> String {
         match self.db_type.as_str() {
-            "mysql" => "INSERT IGNORE INTO mtls_dns_admission_locks \
-                 (namespace, updated_at) VALUES (?, ?)"
-                .to_string(),
+            // INSERT IGNORE takes a shared duplicate-key lock before the
+            // SELECT ... FOR UPDATE below tries to upgrade it. Two contenders
+            // can deadlock on that S->X upgrade. The no-op duplicate-key UPDATE
+            // acquires the row exclusively up front, so same-namespace writers
+            // serialize before the SELECT instead of mutually upgrading.
+            "mysql" => MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL.to_string(),
             "sqlite" => "INSERT OR IGNORE INTO mtls_dns_admission_locks \
                  (namespace, updated_at) VALUES (?, ?)"
                 .to_string(),
@@ -912,9 +920,11 @@ impl DatabaseStore {
         match (restore_owner.as_deref(), allowed_restore_owner) {
             (None, None) => {}
             (Some(actual), Some(allowed)) if actual == allowed => {}
-            (Some(_), _) => anyhow::bail!(
-                "mTLS DNS admission is blocked while a guarded operation owns namespace '{namespace}'"
-            ),
+            (Some(_), _) => {
+                return Err(anyhow::Error::new(MtlsDnsAdmissionUnavailable).context(format!(
+                    "mTLS DNS admission is blocked while a guarded operation owns namespace '{namespace}'"
+                )));
+            }
             (None, Some(_)) => anyhow::bail!(
                 "mTLS DNS admission guard ownership was lost for namespace '{namespace}'"
             ),
@@ -970,6 +980,39 @@ impl DatabaseStore {
         Ok(())
     }
 
+    /// Load the policy graph first and avoid reading every Consumer when no
+    /// enabled effective `san_dns` policy exists. The caller already owns the
+    /// namespace lock, so the graph and optional Consumer load describe one
+    /// serialized transaction candidate.
+    async fn load_mtls_dns_admission_candidate_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+    ) -> Result<Option<GatewayConfig>, anyhow::Error> {
+        let proxies = self
+            .load_proxies_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .await?;
+        let plugin_configs = self
+            .load_plugin_configs_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .await?;
+        let mut candidate = GatewayConfig {
+            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+            proxies,
+            plugin_configs,
+            loaded_at: Utc::now(),
+            ..Default::default()
+        };
+        candidate.normalize_fields();
+        if !candidate.has_effective_mtls_dns_identity_policy() {
+            return Ok(None);
+        }
+        candidate.consumers = self
+            .load_consumers_tx(namespace, FullLoadPurpose::Runtime, tx)
+            .await?;
+        candidate.normalize_fields();
+        Ok(Some(candidate))
+    }
+
     /// Validate the exact transaction candidate after its resource mutations
     /// but before its change record and commit. Because every relevant writer
     /// first holds [`Self::lock_mtls_dns_admission_tx`], the snapshot cannot be
@@ -979,27 +1022,58 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
-        let proxies = self
-            .load_proxies_tx(namespace, FullLoadPurpose::Runtime, tx)
-            .await?;
-        let consumers = self
-            .load_consumers_tx(namespace, FullLoadPurpose::Runtime, tx)
-            .await?;
-        let plugin_configs = self
-            .load_plugin_configs_tx(namespace, FullLoadPurpose::Runtime, tx)
-            .await?;
-        let mut candidate = GatewayConfig {
-            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
-            proxies,
-            consumers,
-            plugin_configs,
-            loaded_at: Utc::now(),
-            ..Default::default()
+        let Some(candidate) = self
+            .load_mtls_dns_admission_candidate_tx(tx, namespace)
+            .await?
+        else {
+            return Ok(());
         };
-        candidate.normalize_fields();
         candidate
             .validate_unique_mtls_dns_identities()
             .map_err(|errors| anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)))
+    }
+
+    async fn mtls_dns_identity_conflicts_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+    ) -> Result<BTreeMap<String, BTreeSet<String>>, anyhow::Error> {
+        Ok(self
+            .load_mtls_dns_admission_candidate_tx(tx, namespace)
+            .await?
+            .map(|candidate| candidate.mtls_dns_identity_conflicts())
+            .unwrap_or_default())
+    }
+
+    /// Deletes are repair-safe when every remaining ambiguity was already
+    /// present with the same (or a smaller) owner set. This permits operators
+    /// to remove unrelated or conflicting resources from a restored/out-of-band
+    /// ambiguous namespace, while still rejecting a delete that exposes a new
+    /// effective `san_dns` policy collision.
+    async fn validate_mtls_dns_repair_delete_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Any>,
+        namespace: &str,
+        prior_conflicts: &BTreeMap<String, BTreeSet<String>>,
+    ) -> Result<(), anyhow::Error> {
+        let Some(candidate) = self
+            .load_mtls_dns_admission_candidate_tx(tx, namespace)
+            .await?
+        else {
+            return Ok(());
+        };
+        if candidate.introduces_new_mtls_dns_identity_conflict(prior_conflicts) {
+            let errors = candidate
+                .validate_unique_mtls_dns_identities()
+                .err()
+                .unwrap_or_else(|| {
+                    vec![
+                        "Mutation would introduce a new mTLS DNS identity ambiguity".to_string(),
+                    ]
+                });
+            return Err(anyhow::Error::new(MtlsDnsIdentityConflict::new(errors)));
+        }
+        Ok(())
     }
 
     async fn ensure_proxy_route_unique_tx(
@@ -2513,6 +2587,9 @@ impl DatabaseStore {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
+        let prior_mtls_dns_conflicts = self
+            .mtls_dns_identity_conflicts_tx(&mut tx, namespace)
+            .await?;
 
         // Look up the proxy's current upstream_id before deleting so we can
         // cascade-delete that upstream if it becomes orphaned. Also capture the
@@ -2619,7 +2696,11 @@ impl DatabaseStore {
                 .await?;
         }
 
-        self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+        self.validate_mtls_dns_repair_delete_tx(
+            &mut tx,
+            namespace,
+            &prior_mtls_dns_conflicts,
+        )
             .await?;
         self.record_config_change_tx(&mut tx, namespace, "proxy", id, "delete")
             .await?;
@@ -2938,6 +3019,9 @@ impl DatabaseStore {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
+        let prior_mtls_dns_conflicts = self
+            .mtls_dns_identity_conflicts_tx(&mut tx, namespace)
+            .await?;
         // Scope the existence check to the caller's namespace (issue #2122):
         // consumer ids are only unique per namespace.
         let existing: Option<AnyRow> =
@@ -2962,7 +3046,11 @@ impl DatabaseStore {
             .bind(namespace)
             .execute(&mut *tx)
             .await?;
-        self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+        self.validate_mtls_dns_repair_delete_tx(
+            &mut tx,
+            namespace,
+            &prior_mtls_dns_conflicts,
+        )
             .await?;
         self.record_config_change_tx(&mut tx, namespace, "consumer", id, "delete")
             .await?;
@@ -3112,6 +3200,9 @@ impl DatabaseStore {
         let start = Instant::now();
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
+        let prior_mtls_dns_conflicts = self
+            .mtls_dns_identity_conflicts_tx(&mut tx, namespace)
+            .await?;
         // Scope the existence check to the caller's namespace (issue #2122) so
         // a tenant cannot delete a same-id plugin config in another namespace.
         let existing: Option<AnyRow> =
@@ -3161,7 +3252,11 @@ impl DatabaseStore {
                 .bind(namespace)
                 .execute(&mut *tx)
                 .await?;
-        self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+        self.validate_mtls_dns_repair_delete_tx(
+            &mut tx,
+            namespace,
+            &prior_mtls_dns_conflicts,
+        )
             .await?;
         self.record_config_change_tx(&mut tx, namespace, "plugin_config", id, "delete")
             .await?;
@@ -7319,6 +7414,9 @@ impl DatabaseStore {
     pub async fn delete_api_spec(&self, namespace: &str, id: &str) -> Result<bool, anyhow::Error> {
         let mut tx = self.pool().begin().await?;
         self.lock_mtls_dns_admission_tx(&mut tx, namespace).await?;
+        let prior_mtls_dns_conflicts = self
+            .mtls_dns_identity_conflicts_tx(&mut tx, namespace)
+            .await?;
         self.use_delete_capture_snapshot_tx(&mut tx).await?;
 
         // Find the proxy_id for this spec.
@@ -7423,7 +7521,11 @@ impl DatabaseStore {
             .bind(namespace)
             .execute(&mut *tx)
             .await?;
-        self.validate_mtls_dns_admission_tx(&mut tx, namespace)
+        self.validate_mtls_dns_repair_delete_tx(
+            &mut tx,
+            namespace,
+            &prior_mtls_dns_conflicts,
+        )
             .await?;
         self.record_config_change_tx(&mut tx, namespace, "proxy", &proxy_id, "delete")
             .await?;

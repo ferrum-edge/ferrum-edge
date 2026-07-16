@@ -15,6 +15,7 @@ use crate::admin::audit::{self, AuditActor, AuditEvent};
 use crate::admin::jwt_auth::AdminRole;
 use crate::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, PROXY_ROUTE_CONFLICT_ERROR, PaginatedResult,
+    MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE, is_mtls_dns_admission_unavailable,
     is_mtls_dns_identity_conflict,
 };
 use crate::config::db_loader::is_proxy_plugin_association_load_error;
@@ -466,6 +467,9 @@ pub(crate) trait AdminResource:
         error: &anyhow::Error,
         _action: WriteAction<'_>,
     ) -> Response<Full<Bytes>> {
+        if is_mtls_dns_admission_unavailable(error) {
+            return super::mtls_dns_admission_unavailable_response();
+        }
         // Unique-constraint violations at persist time are conflicts, not
         // server faults: the admission prechecks are namespace-scoped and
         // raceable, so the DB constraint is the authoritative backstop (e.g.
@@ -485,7 +489,9 @@ pub(crate) trait AdminResource:
     }
 
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
-        if is_mtls_dns_identity_conflict(error) {
+        if is_mtls_dns_admission_unavailable(error) {
+            super::mtls_dns_admission_unavailable_response()
+        } else if is_mtls_dns_identity_conflict(error) {
             super::json_response(StatusCode::CONFLICT, &json!({"error": error.to_string()}))
         } else {
             super::json_response(
@@ -796,6 +802,9 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
     if config_update_target_was_not_found(error) {
         return not_found_response::<Consumer>();
     }
+    if is_mtls_dns_admission_unavailable(error) {
+        return super::mtls_dns_admission_unavailable_response();
+    }
     let unique_conflict = is_mtls_dns_identity_conflict(error)
         || super::is_unique_constraint_violation(&error.to_string());
     let message = consumer_persist_error_message(error);
@@ -812,7 +821,9 @@ pub(crate) fn consumer_persist_error_response(error: &anyhow::Error) -> Response
 /// values; callers need the conflict disposition, never credential or index
 /// metadata.
 pub(crate) fn consumer_persist_error_message(error: &anyhow::Error) -> String {
-    if is_mtls_dns_identity_conflict(error) {
+    if is_mtls_dns_admission_unavailable(error) {
+        MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
+    } else if is_mtls_dns_identity_conflict(error) {
         error.to_string()
     } else if super::is_unique_constraint_violation(&error.to_string()) {
         "Consumer identity or credential conflicts with another Consumer in the namespace"
@@ -1655,6 +1666,9 @@ impl AdminResource for Upstream {
     }
 
     fn map_delete_db_error(error: &anyhow::Error) -> Response<Full<Bytes>> {
+        if is_mtls_dns_admission_unavailable(error) {
+            return super::mtls_dns_admission_unavailable_response();
+        }
         let error_text = error.to_string();
         if error_text.contains("referenced by one or more proxies")
             || error_text.contains("referenced by mesh_route_dispatch plugin_config")
@@ -2349,6 +2363,9 @@ impl AdminResource for Proxy {
         error: &anyhow::Error,
         _action: WriteAction<'_>,
     ) -> Response<Full<Bytes>> {
+        if is_mtls_dns_admission_unavailable(error) {
+            return super::mtls_dns_admission_unavailable_response();
+        }
         let message = error.to_string();
         if message.contains(PROXY_ROUTE_CONFLICT_ERROR) {
             return super::json_response(

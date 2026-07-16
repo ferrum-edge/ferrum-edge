@@ -794,6 +794,35 @@ pub mod _test_support {
         )
     }
 
+    pub fn admin_mtls_dns_admission_drop_should_release(
+        mutation_started: bool,
+        outcome_settled: bool,
+    ) -> bool {
+        crate::admin::mtls_dns_admission_drop_should_release_for_test(
+            mutation_started,
+            outcome_settled,
+        )
+    }
+
+    pub fn admin_mtls_dns_admission_contention_response(
+        raw_backend_detail: &str,
+    ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+        let error = crate::config::db_backend::mark_mtls_dns_admission_unavailable(
+            anyhow::anyhow!(raw_backend_detail.to_string()),
+        );
+        crate::admin::crud::consumer_persist_error_response(&error)
+    }
+
+    pub fn mysql_mtls_dns_admission_lock_insert_sql() -> &'static str {
+        crate::config::db_loader::MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL
+    }
+
+    pub fn mtls_dns_policy_requires_consumer_load(
+        config: &crate::config::types::GatewayConfig,
+    ) -> bool {
+        config.has_effective_mtls_dns_identity_policy()
+    }
+
     pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
         crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
     }

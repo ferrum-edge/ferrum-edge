@@ -13,7 +13,7 @@
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Cursor;
 use std::sync::LazyLock;
 
@@ -3772,28 +3772,7 @@ impl GatewayConfig {
     /// Reject case-variant identities before publishing the lower-cased DNS
     /// lookup index. Exact-match mTLS policies remain case-sensitive.
     pub fn validate_unique_mtls_dns_identities(&self) -> Result<(), Vec<String>> {
-        let is_dns_identity_plugin = |plugin: &PluginConfig| {
-            plugin.enabled
-                && plugin.plugin_name == "mtls_auth"
-                && plugin
-                    .config
-                    .get("cert_field")
-                    .and_then(|value| value.as_str())
-                    == Some("san_dns")
-        };
-        // The plugin cache keeps globals as the fallback for every proxy ID
-        // absent from its association map, including synthesized mesh relays.
-        // Local associations can shadow a global on registered proxies, but
-        // cannot make that global dormant for unknown proxy IDs.
-        let dns_identity_matching_enabled =
-            self.plugin_configs.iter().any(|plugin| {
-                plugin.scope == PluginScope::Global && is_dns_identity_plugin(plugin)
-            }) || self
-                .effective_mtls_auth_plugins_by_proxy()
-                .into_iter()
-                .flat_map(|(_, plugins)| plugins)
-                .any(&is_dns_identity_plugin);
-        if !dns_identity_matching_enabled {
+        if !self.has_effective_mtls_dns_identity_policy() {
             return Ok(());
         }
 
@@ -3825,6 +3804,74 @@ impl GatewayConfig {
         } else {
             Err(duplicates)
         }
+    }
+
+    /// Whether the proxy/plugin graph can consume the case-folded DNS identity
+    /// index. Persistence uses this policy-only predicate before loading the
+    /// namespace's Consumers, which keeps ordinary guarded CRUD O(policy graph)
+    /// when no enabled `san_dns` policy exists.
+    pub(crate) fn has_effective_mtls_dns_identity_policy(&self) -> bool {
+        let is_dns_identity_plugin = |plugin: &PluginConfig| {
+            plugin.enabled
+                && plugin.plugin_name == "mtls_auth"
+                && plugin
+                    .config
+                    .get("cert_field")
+                    .and_then(|value| value.as_str())
+                    == Some("san_dns")
+        };
+        // The plugin cache keeps globals as the fallback for every proxy ID
+        // absent from its association map, including synthesized mesh relays.
+        // Local associations can shadow a global on registered proxies, but
+        // cannot make that global dormant for unknown proxy IDs.
+        self.plugin_configs.iter().any(|plugin| {
+            plugin.scope == PluginScope::Global && is_dns_identity_plugin(plugin)
+        }) || self
+            .effective_mtls_auth_plugins_by_proxy()
+            .into_iter()
+            .flat_map(|(_, plugins)| plugins)
+            .any(&is_dns_identity_plugin)
+    }
+
+    /// Canonical DNS identity owners for every currently ambiguous key.
+    ///
+    /// Delete admission compares the post-delete map with the pre-delete map.
+    /// A delete may retain or reduce restored/out-of-band ambiguity, but it may
+    /// not add a canonical key or a new Consumer owner to one. This permits
+    /// repair-oriented and unrelated deletes without allowing an identity
+    /// collision to be enabled by a policy-graph change.
+    pub(crate) fn mtls_dns_identity_conflicts(&self) -> BTreeMap<String, BTreeSet<String>> {
+        if !self.has_effective_mtls_dns_identity_policy() {
+            return BTreeMap::new();
+        }
+
+        let mut owners: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for consumer in &self.consumers {
+            for entry in consumer.credential_entries("mtls_auth") {
+                let Some(identity) = entry.get("identity").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                owners
+                    .entry(identity.to_ascii_lowercase())
+                    .or_default()
+                    .insert(consumer.id.clone());
+            }
+        }
+        owners.retain(|_, consumers| consumers.len() > 1);
+        owners
+    }
+
+    pub(crate) fn introduces_new_mtls_dns_identity_conflict(
+        &self,
+        prior: &BTreeMap<String, BTreeSet<String>>,
+    ) -> bool {
+        self.mtls_dns_identity_conflicts()
+            .iter()
+            .any(|(identity, owners)| {
+                !prior
+                    .get(identity)
+                    .is_some_and(|prior_owners| owners.is_subset(prior_owners))
+            })
     }
 
     /// Validate that upstream names are unique when present.

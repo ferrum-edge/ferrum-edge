@@ -13,7 +13,10 @@ use ferrum_edge::_test_support::{
     mongo_migration_lease_duration_millis, mongo_migration_lease_renew_update_classic,
     mongo_mtls_dns_admission_drop_must_retain, mongo_mtls_dns_admission_lock_filter,
     mongo_mtls_dns_admission_lock_update, mongo_pipeline_update_unsupported,
+    mtls_dns_policy_requires_consumer_load,
 };
+use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
+use serde_json::json;
 
 const OWNER: &str = "test-owner-uuid";
 // Fixed client-clock instant so the builders are deterministic (no DateTime::now).
@@ -111,6 +114,30 @@ fn mtls_dns_admission_drop_retains_only_uncertain_mutations() {
         !mongo_mtls_dns_admission_drop_must_retain(true, true),
         "an explicit settled release may retry owner-qualified cleanup"
     );
+}
+
+#[test]
+fn mtls_dns_policy_gate_skips_consumers_until_san_dns_is_effective() {
+    let now = chrono::Utc::now();
+    let mut config = GatewayConfig {
+        plugin_configs: vec![PluginConfig {
+            id: "dns-mtls".to_string(),
+            namespace: "ferrum".to_string(),
+            plugin_name: "mtls_auth".to_string(),
+            enabled: false,
+            config: json!({"cert_field": "san_dns"}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        }],
+        ..Default::default()
+    };
+    assert!(!mtls_dns_policy_requires_consumer_load(&config));
+    config.plugin_configs[0].enabled = true;
+    assert!(mtls_dns_policy_requires_consumer_load(&config));
 }
 
 #[test]

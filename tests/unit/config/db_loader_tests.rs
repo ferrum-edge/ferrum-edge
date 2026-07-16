@@ -2,11 +2,11 @@ use ferrum_edge::_test_support::{
     DbPoolConfig, db_append_connect_timeout, db_code_is_transient, db_diff_removed,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
     db_wrap_mysql_isolation_read_error, is_config_validation_rejection, parse_auth_mode,
-    parse_scheme, statement_timeout_sql,
+    mysql_mtls_dns_admission_lock_insert_sql, parse_scheme, statement_timeout_sql,
 };
 use ferrum_edge::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, is_incremental_full_reload_required,
-    is_mtls_dns_identity_conflict,
+    is_mtls_dns_admission_unavailable, is_mtls_dns_identity_conflict,
 };
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::types::{
@@ -58,6 +58,17 @@ impl DatabaseError for TestDatabaseError {
     fn kind(&self) -> ErrorKind {
         ErrorKind::Other
     }
+}
+
+#[test]
+fn mysql_mtls_dns_lock_insert_takes_an_exclusive_duplicate_key_lock() {
+    let sql = mysql_mtls_dns_admission_lock_insert_sql();
+    assert!(sql.contains("ON DUPLICATE KEY UPDATE"), "{sql}");
+    assert!(
+        sql.contains("updated_at = mtls_dns_admission_locks.updated_at"),
+        "{sql}"
+    );
+    assert!(!sql.contains("INSERT IGNORE"), "{sql}");
 }
 
 fn make_upstream(id: &str) -> Upstream {
@@ -844,6 +855,7 @@ async fn persistent_admission_guard_blocks_other_sqlite_admin_writers_across_bat
         .create_consumer(&make_consumer("concurrent", "bob"))
         .await
         .expect_err("another admin process must remain blocked between replay batches");
+    assert!(is_mtls_dns_admission_unavailable(&blocked));
     assert!(
         blocked.to_string().contains("guarded operation owns"),
         "unexpected rollback-guard rejection: {blocked:#}"
@@ -852,6 +864,7 @@ async fn persistent_admission_guard_blocks_other_sqlite_admin_writers_across_bat
         .create_upstream(&make_upstream("concurrent-upstream"))
         .await
         .expect_err("another admin process must not mutate upstreams during restore");
+    assert!(is_mtls_dns_admission_unavailable(&blocked_upstream));
     assert!(
         blocked_upstream
             .to_string()
@@ -937,6 +950,127 @@ async fn mtls_uniqueness_falls_back_to_consumers_for_legacy_whitespace_index_row
             .to_string()
             .contains("failed to parse credentials JSON")
     );
+}
+
+#[tokio::test]
+async fn mtls_dns_admission_loads_consumers_only_for_effective_dns_policy() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("mtls_dns_policy_fast_path.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    store
+        .create_consumer(&make_consumer("malformed", "alice"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE consumers SET credentials = ? WHERE namespace = ? AND id = ?")
+        .bind("not-json")
+        .bind("ferrum")
+        .bind("malformed")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+    store
+        .create_consumer(&make_consumer("fast-path", "bob"))
+        .await
+        .expect("ordinary admission must not decode all Consumers without a DNS policy");
+
+    let now = chrono::Utc::now();
+    let error = store
+        .create_plugin_config(&PluginConfig {
+            id: "dns-mtls".to_string(),
+            plugin_name: "mtls_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({"cert_field": "san_dns"}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .expect_err("enabling san_dns must take the full Consumer validation path");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to parse credentials JSON"),
+        "unexpected full-path error: {error:#}"
+    );
+}
+
+#[tokio::test]
+async fn mtls_dns_repair_deletes_may_only_reduce_existing_ambiguity() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("mtls_dns_repair_delete.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut upper = make_consumer("upper", "alice");
+    upper.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "API.Example.COM"}]),
+    );
+    let mut lower = make_consumer("lower", "bob");
+    lower.credentials.insert(
+        "mtls_auth".to_string(),
+        json!([{"identity": "api.example.com"}]),
+    );
+    store.create_consumer(&upper).await.unwrap();
+    store.create_consumer(&lower).await.unwrap();
+    store
+        .create_consumer(&make_consumer("unrelated", "carol"))
+        .await
+        .unwrap();
+
+    let now = chrono::Utc::now();
+    store
+        .create_plugin_config(&PluginConfig {
+            id: "dns-mtls".to_string(),
+            plugin_name: "mtls_auth".to_string(),
+            namespace: "ferrum".to_string(),
+            config: json!({"cert_field": "san_dns"}),
+            scope: PluginScope::Global,
+            proxy_id: None,
+            enabled: false,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: now,
+            updated_at: now,
+        })
+        .await
+        .unwrap();
+    sqlx::query("UPDATE plugin_configs SET enabled = 1 WHERE namespace = ? AND id = ?")
+        .bind("ferrum")
+        .bind("dns-mtls")
+        .execute(&store.pool())
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .delete_consumer("ferrum", "unrelated")
+            .await
+            .expect("an unrelated delete must remain available as an operator repair action")
+    );
+    assert!(
+        store
+            .delete_consumer("ferrum", "upper")
+            .await
+            .expect("deleting one conflicting owner must repair the ambiguity")
+    );
+
+    let loaded = store.load_full_config("ferrum").await.unwrap();
+    assert_eq!(loaded.consumers.len(), 1);
+    loaded
+        .validate_unique_mtls_dns_identities()
+        .expect("repair delete must leave a valid DNS identity index");
 }
 
 #[tokio::test]

@@ -3138,7 +3138,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Backup & Restore ────────────────────────────────────────────────
   /backup:
@@ -3349,7 +3349,15 @@ paths:
             Restore aborted because the prior configuration could not be
             snapshotted for rollback (database/connectivity failure). Existing
             config was NOT deleted; retry once the database is reachable. Also
-            returned when the admin API is otherwise unavailable.
+            returned with the stable namespace-admission error when another
+            mutation or an intentionally retained uncertain operation holds the
+            namespace fence.
+          headers:
+            Retry-After:
+              description: Present as `1` for namespace-admission contention.
+              schema:
+                type: integer
+                minimum: 1
           content:
             application/json:
               schema:
@@ -3441,7 +3449,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /proxies/{id}:
     parameters:
@@ -3507,7 +3515,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deleteProxy
@@ -3525,7 +3533,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Consumers ───────────────────────────────────────────────────────
   /consumers:
@@ -3598,7 +3606,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /consumers/{id}:
     parameters:
@@ -3662,7 +3670,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deleteConsumer
@@ -3680,7 +3688,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /consumers/{consumer_id}/credentials/{cred_type}:
     parameters:
@@ -3745,7 +3753,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     post:
       operationId: appendConsumerCredential
@@ -3784,7 +3792,7 @@ paths:
         "500":
           $ref: "#/components/responses/InternalServerError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deleteConsumerCredentials
@@ -3802,7 +3810,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /consumers/{consumer_id}/credentials/{cred_type}/{index}:
     parameters:
@@ -3852,7 +3860,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Plugins ─────────────────────────────────────────────────────────
   /plugins:
@@ -4026,7 +4034,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /plugins/config/{id}:
     parameters:
@@ -4084,7 +4092,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deletePluginConfig
@@ -4102,7 +4110,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Upstreams ────────────────────────────────────────────────────────
   /upstreams:
@@ -4167,7 +4175,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /upstreams/{id}:
     parameters:
@@ -4223,7 +4231,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
     delete:
       operationId: deleteUpstream
       summary: Delete an upstream
@@ -4238,7 +4246,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   # ── Namespaces ──────────────────────────────────────────────────────
   /namespaces:
@@ -4564,7 +4572,7 @@ paths:
                   - $ref: "#/components/schemas/ApiSpecValidationError"
                   - $ref: "#/components/schemas/ApiSpecParseError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /api-specs/{id}:
     parameters:
@@ -4789,7 +4797,7 @@ paths:
                   - $ref: "#/components/schemas/ApiSpecValidationError"
                   - $ref: "#/components/schemas/ApiSpecParseError"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
     delete:
       operationId: deleteApiSpec
@@ -4832,7 +4840,7 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
         "503":
-          $ref: "#/components/responses/ServiceUnavailable"
+          $ref: "#/components/responses/NamespaceAdmissionUnavailable"
 
   /api-specs/by-proxy/{proxy_id}:
     parameters:
@@ -5085,6 +5093,28 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    NamespaceAdmissionUnavailable:
+      description: >-
+        The mutation is temporarily unavailable. For namespace contention, the
+        namespace is fenced by another mutation or an intentionally retained
+        uncertain operation; retry after the indicated delay. Operators must
+        recover a retained uncertain fence before retries can succeed.
+      headers:
+        Retry-After:
+          required: false
+          description: >-
+            Minimum delay in seconds before retrying; present for
+            namespace-admission contention.
+          schema:
+            type: integer
+            minimum: 1
+            example: 1
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error: Namespace mutation is temporarily unavailable; retry later
     NotImplemented:
       description: Capability is not available in this build
       content:

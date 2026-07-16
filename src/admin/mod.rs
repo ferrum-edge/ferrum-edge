@@ -15,6 +15,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
+use hyper::header::{HeaderValue, RETRY_AFTER};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -23,7 +24,7 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tracing::{debug, error, info, warn};
@@ -36,7 +37,8 @@ use crate::admin::backup::{
 use crate::admin::jwt_auth::{AdminRole, JwtError, JwtManager};
 use crate::config::db_backend::{
     AtomicClearVerification, BatchConfigWriteMode, DatabaseBackend, NamespaceResourceCounts,
-    SnapshotDataIntegrityError, classify_atomic_clear_verification,
+    MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE, SnapshotDataIntegrityError,
+    classify_atomic_clear_verification, is_mtls_dns_admission_unavailable,
 };
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, Upstream, max_credentials_per_type,
@@ -2840,6 +2842,7 @@ async fn persist_consumer_update(
     mut consumer: Consumer,
     success_status: StatusCode,
     mode: &BatchConfigWriteMode,
+    admission: &MtlsDnsAdmissionOperation,
 ) -> Response<Full<Bytes>> {
     // Every credential endpoint rewrites the complete Consumer and rebuilds
     // its credential index entries. Revalidate retained HMAC credentials even
@@ -2852,7 +2855,10 @@ async fn persist_consumer_update(
         return *response;
     }
     consumer.updated_at = Utc::now();
-    match db.update_consumer(&consumer, mode).await {
+    match admission
+        .run_mutation(db.update_consumer(&consumer, mode))
+        .await
+    {
         // The consumer vanished between the namespace-scoped load and the
         // write (concurrent delete) — not-found, not a phantom success.
         Ok(false) => consumer_not_found_response(),
@@ -2867,37 +2873,235 @@ async fn persist_consumer_update(
     }
 }
 
+const MTLS_DNS_ADMISSION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum MtlsDnsAdmissionMutationState {
+    NotStarted = 0,
+    InFlightOrUncertain = 1,
+    Settled = 2,
+}
+
+impl MtlsDnsAdmissionMutationState {
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::NotStarted,
+            1 => Self::InFlightOrUncertain,
+            2 => Self::Settled,
+            _ => Self::InFlightOrUncertain,
+        }
+    }
+
+    fn release_on_drop(self) -> bool {
+        matches!(self, Self::NotStarted | Self::Settled)
+    }
+}
+
+#[derive(Clone)]
+struct MtlsDnsAdmissionOperation {
+    guard_owner: String,
+    mutation_state: Arc<AtomicU8>,
+}
+
+impl MtlsDnsAdmissionOperation {
+    fn guard_owner(&self) -> &str {
+        &self.guard_owner
+    }
+
+    async fn run_mutation<T, F>(&self, mutation: F) -> T
+    where
+        F: std::future::Future<Output = T>,
+    {
+        self.mutation_state.store(
+            MtlsDnsAdmissionMutationState::InFlightOrUncertain as u8,
+            Ordering::Release,
+        );
+        let result = mutation.await;
+        self.mutation_state.store(
+            MtlsDnsAdmissionMutationState::Settled as u8,
+            Ordering::Release,
+        );
+        result
+    }
+}
+
+struct MtlsDnsAdmissionGuardLifecycle {
+    db: Arc<dyn DatabaseBackend>,
+    namespace: String,
+    guard_owner: String,
+    mutation_state: Arc<AtomicU8>,
+    armed: bool,
+}
+
+impl MtlsDnsAdmissionGuardLifecycle {
+    async fn acquire(
+        db: Arc<dyn DatabaseBackend>,
+        namespace: &str,
+    ) -> Result<Self, anyhow::Error> {
+        let namespace = namespace.to_string();
+        let acquire_db = db.clone();
+        let acquire_namespace = namespace.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let _acquire_task = tokio::spawn(async move {
+            let result = acquire_db
+                .acquire_mtls_dns_admission_guard(&acquire_namespace)
+                .await
+                .map(|guard_owner| Self::new(acquire_db, &acquire_namespace, guard_owner));
+            // If the request disappeared while acquisition was in flight, the
+            // undelivered lifecycle is dropped here and starts bounded cleanup.
+            let _ = result_tx.send(result);
+        });
+        result_rx.await.map_err(|_| {
+            anyhow::anyhow!("mTLS DNS admission guard acquisition task stopped unexpectedly")
+        })?
+    }
+
+    fn new(
+        db: Arc<dyn DatabaseBackend>,
+        namespace: &str,
+        guard_owner: String,
+    ) -> Self {
+        Self {
+            db,
+            namespace: namespace.to_string(),
+            guard_owner,
+            mutation_state: Arc::new(AtomicU8::new(
+                MtlsDnsAdmissionMutationState::NotStarted as u8,
+            )),
+            armed: true,
+        }
+    }
+
+    fn operation(&self) -> MtlsDnsAdmissionOperation {
+        MtlsDnsAdmissionOperation {
+            guard_owner: self.guard_owner.clone(),
+            mutation_state: self.mutation_state.clone(),
+        }
+    }
+
+    fn guard_owner(&self) -> &str {
+        &self.guard_owner
+    }
+
+    fn retain_uncertain(&self) {
+        self.mutation_state.store(
+            MtlsDnsAdmissionMutationState::InFlightOrUncertain as u8,
+            Ordering::Release,
+        );
+    }
+
+    async fn release(&mut self) -> Result<(), anyhow::Error> {
+        let result = self
+            .db
+            .release_mtls_dns_admission_guard(&self.namespace, &self.guard_owner)
+            .await;
+        if result.is_ok() {
+            self.armed = false;
+        }
+        result
+    }
+}
+
+impl Drop for MtlsDnsAdmissionGuardLifecycle {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let state = MtlsDnsAdmissionMutationState::from_u8(
+            self.mutation_state.load(Ordering::Acquire),
+        );
+        if !state.release_on_drop() {
+            warn!(
+                namespace = %self.namespace,
+                "mTLS DNS admission guard retained because a dispatched mutation has an uncertain outcome"
+            );
+            return;
+        }
+
+        let db = self.db.clone();
+        let namespace = self.namespace.clone();
+        let guard_owner = self.guard_owner.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let _cleanup_task = runtime.spawn(async move {
+                match tokio::time::timeout(
+                    MTLS_DNS_ADMISSION_CLEANUP_TIMEOUT,
+                    db.release_mtls_dns_admission_guard(&namespace, &guard_owner),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => error!(
+                        namespace = %namespace,
+                        error = %error,
+                        "mTLS DNS admission guard cancellation cleanup failed"
+                    ),
+                    Err(_) => error!(
+                        namespace = %namespace,
+                        "mTLS DNS admission guard cancellation cleanup timed out"
+                    ),
+                }
+            });
+        } else {
+            error!(
+                namespace = %namespace,
+                "mTLS DNS admission guard cancellation cleanup could not start during runtime shutdown"
+            );
+        }
+    }
+}
+
+pub(crate) fn mtls_dns_admission_unavailable_response() -> Response<Full<Bytes>> {
+    let mut response = json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &json!({"error": MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE}),
+    );
+    response
+        .headers_mut()
+        .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+    response
+}
+
+pub(crate) fn mtls_dns_admission_drop_should_release_for_test(
+    mutation_started: bool,
+    outcome_settled: bool,
+) -> bool {
+    let state = if outcome_settled {
+        MtlsDnsAdmissionMutationState::Settled
+    } else if mutation_started {
+        MtlsDnsAdmissionMutationState::InFlightOrUncertain
+    } else {
+        MtlsDnsAdmissionMutationState::NotStarted
+    };
+    state.release_on_drop()
+}
+
 /// Hold the datastore namespace guard across an admin read/modify/write
-/// sequence. If the future is cancelled, no release runs and the backend's
-/// non-expiring fence remains fail-closed.
+/// sequence. Cancellation before dispatch or after a definitive result starts
+/// a bounded owner-qualified cleanup task. Cancellation while a mutation may
+/// be in flight deliberately retains the non-expiring fail-closed fence.
 async fn with_mtls_dns_admission_guard<F, Fut>(
     db: Arc<dyn DatabaseBackend>,
     namespace: &str,
     operation: F,
 ) -> Response<Full<Bytes>>
 where
-    F: FnOnce(String) -> Fut,
+    F: FnOnce(MtlsDnsAdmissionOperation) -> Fut,
     Fut: std::future::Future<Output = Response<Full<Bytes>>>,
 {
-    let guard_owner = match db.acquire_mtls_dns_admission_guard(namespace).await {
-        Ok(owner) => owner,
+    let mut guard = match MtlsDnsAdmissionGuardLifecycle::acquire(db, namespace).await {
+        Ok(guard) => guard,
         Err(error) => {
-            return json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({
-                    "error": format!(
-                        "mTLS DNS admission guard could not be acquired: {}",
-                        error
-                    )
-                }),
+            warn!(
+                namespace = %namespace,
+                error = %error,
+                "mTLS DNS admission guard could not be acquired"
             );
+            return mtls_dns_admission_unavailable_response();
         }
     };
-    let response = operation(guard_owner.clone()).await;
-    if let Err(error) = db
-        .release_mtls_dns_admission_guard(namespace, &guard_owner)
-        .await
-    {
+    let response = operation(guard.operation()).await;
+    if let Err(error) = guard.release().await {
         error!(
             namespace = %namespace,
             error = %error,
@@ -3176,29 +3380,45 @@ async fn validate_batch_route_override_conflicts(
     Ok(())
 }
 
+fn payload_persist_error_message(error: &anyhow::Error) -> String {
+    if is_mtls_dns_admission_unavailable(error) {
+        MTLS_DNS_ADMISSION_UNAVAILABLE_MESSAGE.to_string()
+    } else {
+        error.to_string()
+    }
+}
+
 async fn persist_payload_resources(
     db: &dyn DatabaseBackend,
     payload: &RestorePayload,
     halt_on_error: bool,
     mode: &BatchConfigWriteMode,
-) -> (PersistCounts, Vec<String>) {
+) -> (PersistCounts, Vec<String>, bool) {
     let mut counts = PersistCounts::default();
     let mut errors = Vec::new();
+    let mut admission_unavailable = false;
     let should_continue = |errors: &[String]| !halt_on_error || errors.is_empty();
 
     if should_continue(&errors) && !payload.consumers.is_empty() {
         match db.batch_create_consumers(&payload.consumers, mode).await {
             Ok(n) => counts.consumers = n,
-            Err(e) => errors.push(format!(
-                "consumers: {}",
-                crud::consumer_persist_error_message(&e)
-            )),
+            Err(e) => {
+                admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+                errors.push(format!(
+                    "consumers: {}",
+                    crud::consumer_persist_error_message(&e)
+                ));
+            }
         }
     }
     if should_continue(&errors) && !payload.upstreams.is_empty() {
         match db.batch_create_upstreams(&payload.upstreams, mode).await {
             Ok(n) => counts.upstreams = n,
-            Err(e) => errors.push(format!("upstreams: {}", e)),
+            Err(e) => {
+                admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+                let message = payload_persist_error_message(&e);
+                errors.push(format!("upstreams: {message}"));
+            }
         }
     }
     if should_continue(&errors) && !payload.proxies.is_empty() {
@@ -3207,7 +3427,11 @@ async fn persist_payload_resources(
             .await
         {
             Ok(n) => counts.proxies = n,
-            Err(e) => errors.push(format!("proxies: {}", e)),
+            Err(e) => {
+                admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+                let message = payload_persist_error_message(&e);
+                errors.push(format!("proxies: {message}"));
+            }
         }
     }
     if should_continue(&errors) && !payload.plugin_configs.is_empty() {
@@ -3216,17 +3440,23 @@ async fn persist_payload_resources(
             .await
         {
             Ok(n) => counts.plugin_configs = n,
-            Err(e) => errors.push(format!("plugin_configs: {}", e)),
+            Err(e) => {
+                admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+                let message = payload_persist_error_message(&e);
+                errors.push(format!("plugin_configs: {message}"));
+            }
         }
     }
     if should_continue(&errors)
         && !payload.proxies.is_empty()
         && let Err(e) = db.batch_attach_proxy_plugins(&payload.proxies, mode).await
     {
-        errors.push(format!("proxy_plugins: {}", e));
+        admission_unavailable |= is_mtls_dns_admission_unavailable(&e);
+        let message = payload_persist_error_message(&e);
+        errors.push(format!("proxy_plugins: {message}"));
     }
 
-    (counts, errors)
+    (counts, errors, admission_unavailable)
 }
 
 async fn rollback_failed_restore(
@@ -3244,7 +3474,7 @@ async fn rollback_failed_restore(
             "failed to clear partially imported config: {error}"
         ));
     } else {
-        let (_, persist_errors) = persist_payload_resources(db, snapshot, false, &mode).await;
+        let (_, persist_errors, _) = persist_payload_resources(db, snapshot, false, &mode).await;
         errors.extend(persist_errors);
     }
     if errors.is_empty() {
@@ -3267,34 +3497,39 @@ async fn finish_failed_restore(
     namespace: &str,
     restore_errors: Vec<String>,
     snapshot: &RestoreSnapshot,
-    guard_owner: &str,
+    guard: &mut MtlsDnsAdmissionGuardLifecycle,
 ) -> Response<Full<Bytes>> {
-    let (mut rollback_status, mut rollback_errors) =
-        match rollback_failed_restore(db.as_ref(), namespace, &snapshot.payload, guard_owner).await
-        {
-            Ok(()) => ("completed", None),
-            Err(errors) => {
-                error!(
-                    "Restore: rollback failed for namespace '{}': {}",
-                    namespace,
-                    errors.join("; ")
-                );
-                ("incomplete", Some(errors))
-            }
-        };
-    if let Err(error) = db
-        .release_mtls_dns_admission_guard(namespace, guard_owner)
+    let guard_owner = guard.guard_owner().to_string();
+    let operation = guard.operation();
+    let (mut rollback_status, mut rollback_errors) = match operation
+        .run_mutation(rollback_failed_restore(
+            db.as_ref(),
+            namespace,
+            &snapshot.payload,
+            &guard_owner,
+        ))
         .await
     {
+        Ok(()) => ("completed", None),
+        Err(errors) => {
+            error!(
+                "Restore: rollback failed for namespace '{}': {}",
+                namespace,
+                errors.join("; ")
+            );
+            ("incomplete", Some(errors))
+        }
+    };
+    if let Err(error) = guard.release().await {
         error!(
             namespace = %namespace,
             error = %error,
             "Restore: rollback guard could not be released"
         );
         rollback_status = "incomplete";
-        rollback_errors.get_or_insert_with(Vec::new).push(format!(
-            "failed to release restore admission guard: {error}"
-        ));
+        rollback_errors
+            .get_or_insert_with(Vec::new)
+            .push("failed to release restore admission guard".to_string());
     }
 
     let event = audit::AuditEvent::new(
@@ -3357,12 +3592,9 @@ async fn finish_atomic_delete_failure(
     actor: &AuditActor,
     namespace: &str,
     delete_error: String,
-    guard_owner: &str,
+    guard: &mut MtlsDnsAdmissionGuardLifecycle,
 ) -> Response<Full<Bytes>> {
-    if let Err(error) = db
-        .release_mtls_dns_admission_guard(namespace, guard_owner)
-        .await
-    {
+    if let Err(error) = guard.release().await {
         error!(
             namespace = %namespace,
             error = %error,
@@ -3400,7 +3632,9 @@ async fn finish_unknown_atomic_delete_failure(
     actor: &AuditActor,
     namespace: &str,
     delete_error: String,
+    guard: &MtlsDnsAdmissionGuardLifecycle,
 ) -> Response<Full<Bytes>> {
+    guard.retain_uncertain();
     let event = audit::AuditEvent::new(
         actor,
         "restore",
@@ -3486,8 +3720,10 @@ async fn handle_update_credentials(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut cred_value) {
         return Ok(*resp);
     }
-    let response = with_mtls_dns_admission_guard(db.clone(), namespace, |guard_owner| async move {
-        let mode = BatchConfigWriteMode::GuardedAdmission { guard_owner };
+    let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        let mode = BatchConfigWriteMode::GuardedAdmission {
+            guard_owner: admission.guard_owner().to_string(),
+        };
         let mut consumer =
             match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
                 Ok(consumer) => consumer,
@@ -3520,8 +3756,14 @@ async fn handle_update_credentials(
         {
             return *resp;
         }
-        let response =
-            persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK, &mode).await;
+        let response = persist_consumer_update(
+            db.as_ref(),
+            consumer.clone(),
+            StatusCode::OK,
+            &mode,
+            &admission,
+        )
+        .await;
         if response.status().is_success() {
             let event = audit::AuditEvent::new(
                 actor,
@@ -3570,8 +3812,10 @@ async fn handle_delete_credentials(
     };
     let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
 
-    let response = with_mtls_dns_admission_guard(db.clone(), namespace, |guard_owner| async move {
-        let mode = BatchConfigWriteMode::GuardedAdmission { guard_owner };
+    let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        let mode = BatchConfigWriteMode::GuardedAdmission {
+            guard_owner: admission.guard_owner().to_string(),
+        };
         let mut consumer =
             match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
                 Ok(consumer) => consumer,
@@ -3579,9 +3823,14 @@ async fn handle_delete_credentials(
             };
         let before = consumer.clone();
         consumer.credentials.remove(cred_type);
-        let response =
-            persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::NO_CONTENT, &mode)
-                .await;
+        let response = persist_consumer_update(
+            db.as_ref(),
+            consumer.clone(),
+            StatusCode::NO_CONTENT,
+            &mode,
+            &admission,
+        )
+        .await;
         if response.status().is_success() {
             let event = audit::AuditEvent::new(
                 actor,
@@ -3645,8 +3894,10 @@ async fn handle_append_credential(
     if let Err(resp) = hash_credential_if_needed(cred_type, &mut new_cred) {
         return Ok(*resp);
     }
-    let response = with_mtls_dns_admission_guard(db.clone(), namespace, |guard_owner| async move {
-        let mode = BatchConfigWriteMode::GuardedAdmission { guard_owner };
+    let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        let mode = BatchConfigWriteMode::GuardedAdmission {
+            guard_owner: admission.guard_owner().to_string(),
+        };
         let mut consumer =
             match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
                 Ok(consumer) => consumer,
@@ -3700,8 +3951,14 @@ async fn handle_append_credential(
         {
             return *resp;
         }
-        let response =
-            persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK, &mode).await;
+        let response = persist_consumer_update(
+            db.as_ref(),
+            consumer.clone(),
+            StatusCode::OK,
+            &mode,
+            &admission,
+        )
+        .await;
         if response.status().is_success() {
             let event = audit::AuditEvent::new(
                 actor,
@@ -3763,8 +4020,10 @@ async fn handle_delete_credential_by_index(
     };
     let _mtls_admission_guard = crud::lock_mtls_admission(namespace).await;
 
-    let response = with_mtls_dns_admission_guard(db.clone(), namespace, |guard_owner| async move {
-        let mode = BatchConfigWriteMode::GuardedAdmission { guard_owner };
+    let response = with_mtls_dns_admission_guard(db.clone(), namespace, |admission| async move {
+        let mode = BatchConfigWriteMode::GuardedAdmission {
+            guard_owner: admission.guard_owner().to_string(),
+        };
         let mut consumer =
             match load_consumer_in_namespace(db.as_ref(), consumer_id, namespace).await {
                 Ok(consumer) => consumer,
@@ -3805,8 +4064,14 @@ async fn handle_delete_credential_by_index(
             }
         }
 
-        let response =
-            persist_consumer_update(db.as_ref(), consumer.clone(), StatusCode::OK, &mode).await;
+        let response = persist_consumer_update(
+            db.as_ref(),
+            consumer.clone(),
+            StatusCode::OK,
+            &mode,
+            &admission,
+        )
+        .await;
         if response.status().is_success() {
             let event = audit::AuditEvent::new(
                 actor,
@@ -4688,9 +4953,13 @@ async fn handle_batch_create(
         ));
     }
 
-    let (created, errors) =
+    let (created, errors, admission_unavailable) =
         persist_payload_resources(db.as_ref(), &batch, true, &BatchConfigWriteMode::Admission)
             .await;
+
+    if admission_unavailable && !created.any() {
+        return Ok(mtls_dns_admission_unavailable_response());
+    }
 
     let mut response = json!({
         "created": {
@@ -5084,22 +5353,20 @@ async fn handle_restore(
     // Acquire one datastore owner before the authoritative rollback snapshot
     // and retain it through clear, import, and any compensating replay. This is
     // the cross-process counterpart to the in-process admission mutex above.
-    let restore_guard_owner = match db.acquire_mtls_dns_admission_guard(namespace).await {
-        Ok(owner) => owner,
-        Err(error) => {
-            return Ok(json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &json!({
-                    "error": format!(
-                        "Restore aborted: the namespace admission guard could not be acquired: {}. Existing config was NOT deleted.",
-                        error
-                    )
-                }),
-            ));
-        }
-    };
+    let mut restore_guard =
+        match MtlsDnsAdmissionGuardLifecycle::acquire(db.clone(), namespace).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                warn!(
+                    namespace = %namespace,
+                    error = %error,
+                    "Restore: namespace admission guard could not be acquired"
+                );
+                return Ok(mtls_dns_admission_unavailable_response());
+            }
+        };
     let restore_mode = BatchConfigWriteMode::GuardedAdmission {
-        guard_owner: restore_guard_owner.clone(),
+        guard_owner: restore_guard.guard_owner().to_string(),
     };
 
     // Snapshot the namespace before deletion so a failure in any independently
@@ -5113,10 +5380,7 @@ async fn handle_restore(
     let snapshot = match snapshot_namespace_for_rollback(db.as_ref(), namespace).await {
         Ok(snapshot) => snapshot,
         Err(error) => {
-            if let Err(release_error) = db
-                .release_mtls_dns_admission_guard(namespace, &restore_guard_owner)
-                .await
-            {
+            if let Err(release_error) = restore_guard.release().await {
                 error!(
                     namespace = %namespace,
                     error = %release_error,
@@ -5154,10 +5418,19 @@ async fn handle_restore(
 
     // Phase 3: Delete all existing resources in the namespace (safe: payload is
     // validated and the prior state has been snapshotted from the primary above).
-    if let Err(e) = db.delete_all_resources(namespace, &restore_mode).await {
+    let delete_operation = restore_guard.operation();
+    if let Err(e) = delete_operation
+        .run_mutation(db.delete_all_resources(namespace, &restore_mode))
+        .await
+    {
         error!("Restore: failed to delete existing resources: {}", e);
         if e.mode().is_atomic() {
             if e.has_unknown_commit_result() {
+                // The server may have committed even though the client did not
+                // receive an acknowledgement. Retain the fence across
+                // cancellation until an owner-qualified verification resolves
+                // that ambiguity.
+                restore_guard.retain_uncertain();
                 let verification = db.count_namespace_resources(namespace).await;
                 if let Err(error) = &verification {
                     error!(
@@ -5179,7 +5452,7 @@ async fn handle_restore(
                                 namespace,
                                 vec![format!("failed to clear existing config: {}", e)],
                                 &snapshot,
-                                &restore_guard_owner,
+                                &mut restore_guard,
                             )
                             .await
                         }
@@ -5191,6 +5464,7 @@ async fn handle_restore(
                                 actor,
                                 namespace,
                                 e.to_string(),
+                                &restore_guard,
                             )
                             .await
                         }
@@ -5205,7 +5479,7 @@ async fn handle_restore(
                 actor,
                 namespace,
                 e.to_string(),
-                &restore_guard_owner,
+                &mut restore_guard,
             )
             .await);
         }
@@ -5219,18 +5493,30 @@ async fn handle_restore(
             namespace,
             vec![format!("failed to clear existing config: {}", e)],
             &snapshot,
-            &restore_guard_owner,
+            &mut restore_guard,
         )
         .await);
     }
+
+    // A cancelled restore after a successful clear is still an incomplete
+    // multi-phase mutation even though the clear itself settled. Keep the
+    // fence until import or compensating rollback reaches a definitive result.
+    restore_guard.retain_uncertain();
 
     info!("Restore: cleared existing config, beginning import");
 
     // Phase 3: Import resources in dependency order.
     // Each batch_create_* method internally chunks into 1,000-record
     // transactions to keep WAL/redo size bounded.
-    let (created, errors) =
-        persist_payload_resources(db.as_ref(), &payload, false, &restore_mode).await;
+    let import_operation = restore_guard.operation();
+    let (created, errors, _) = import_operation
+        .run_mutation(persist_payload_resources(
+            db.as_ref(),
+            &payload,
+            false,
+            &restore_mode,
+        ))
+        .await;
 
     info!(
         "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
@@ -5259,15 +5545,12 @@ async fn handle_restore(
             namespace,
             errors,
             &snapshot,
-            &restore_guard_owner,
+            &mut restore_guard,
         )
         .await);
     }
 
-    if let Err(error) = db
-        .release_mtls_dns_admission_guard(namespace, &restore_guard_owner)
-        .await
-    {
+    if let Err(error) = restore_guard.release().await {
         error!(
             namespace = %namespace,
             error = %error,
@@ -5277,7 +5560,7 @@ async fn handle_restore(
             StatusCode::INTERNAL_SERVER_ERROR,
             &json!({
                 "error": "Restore outcome requires manual verification; the namespace admission guard was retained",
-                "restore_errors": [error.to_string()],
+                "restore_errors": ["failed to release restore admission guard"],
             }),
         ));
     }
