@@ -2370,14 +2370,14 @@ Handles Cross-Origin Resource Sharing at the gateway level.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `allowed_origins` | (String \| Object)[] | required | Permitted origins. Use `["*"]` only for intentional allow-all. Exact origins are canonicalized at config load; `*.suffix.com` is the native wildcard-subdomain form. Istio objects use exactly one of `exact` / `prefix` / `regex`; exact `*` is Istio allow-all. |
+| `allowed_origins` | (String \| Object)[] | required | Permitted origins. Use `["*"]` only for intentional allow-all. Direct-plugin exact origins are canonicalized at config load; `*.suffix.com` is the native wildcard-subdomain form. Istio objects use exactly one of `exact` / `prefix` / `regex`; translation normalizes any matcher satisfying Envoy's literal-`*` probe to allow-all and defers/rejects noncanonical literal exacts rather than broadening them. |
 | `allowed_methods` | String[] | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only allowed methods; not evaluated on actual requests |
 | `allowed_headers` | String[] | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only allowed request headers; not evaluated on actual requests |
 | `exposed_headers` | String[] | `[]` | Response headers exposed to browser JavaScript |
 | `allow_credentials` | bool | `false` | Send `Access-Control-Allow-Credentials: true` |
 | `max_age` | u64 | `86400` | Preflight cache duration in seconds |
 | `preflight_continue` | bool | `false` | Pass allowed preflights to the backend while replacing its CORS fields with the complete gateway-authoritative policy. |
-| `unmatched_preflights` | `forward` \| `ignore` | — | Istio projection marker preserving unmatched and omitted-field semantics; mutually exclusive with `preflight_continue`. |
+| `unmatched_preflights` | `forward` \| `ignore` | — | Istio projection marker preserving unmatched and omitted-field semantics. In a pure translated-Istio chain, unmatched and no-Origin forwarding preserves backend `Access-Control-*` fields; a match sanitizes and rebuilds them. Mutually exclusive with `preflight_continue`. |
 
 The root config must be an object. Unknown keys, explicit `null`, malformed
 values, and an omitted `allowed_origins` policy fail startup/reload instead of

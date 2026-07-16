@@ -22,14 +22,14 @@ The CORS plugin is configured via the `plugin_configs` section in your YAML conf
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `allowed_origins` | `(string \| object)[]` | required | Origins permitted to make cross-origin requests. Use `"*"` only for intentional allow-all. Exact `scheme://host[:port]` values are URL-parsed and canonicalized once at config load (scheme/host case, default ports, IDNA, IPv4, and IPv6); request matching remains a direct comparison with no per-request URL parse/allocation. Native `"*.company.com"` matches subdomains. Istio-shaped objects carry exactly one of `exact` / `prefix` / `regex`; exact `*` is Istio allow-all, while prefix and regex retain literal source semantics. |
+| `allowed_origins` | `(string \| object)[]` | required | Origins permitted to make cross-origin requests. Use `"*"` only for intentional allow-all. Direct-plugin exact `scheme://host[:port]` values are URL-parsed and canonicalized once at config load (scheme/host case, default ports, IDNA, IPv4, and IPv6); request matching remains a direct comparison with no per-request URL parse/allocation. Native `"*.company.com"` matches subdomains. Istio-shaped objects carry exactly one of `exact` / `prefix` / `regex`; direct-plugin prefix and regex entries retain literal matcher semantics. During Istio translation, any matcher that matches Envoy's literal `*` probe is normalized to allow-all, while non-wildcard exact values must already equal their canonical browser serialization or the policy is deferred/rejected rather than broadened. |
 | `allowed_methods` | `string[]` | `["GET","HEAD","POST","PUT","PATCH","DELETE","OPTIONS"]` | Preflight-only policy returned in `Access-Control-Allow-Methods`. Native preflights for unlisted methods are rejected with 403; the list is not evaluated against an actual request's method. |
 | `allowed_headers` | `string[]` | `["Accept","Authorization","Content-Type","Origin","X-Requested-With"]` | Preflight-only policy returned in `Access-Control-Allow-Headers`. It is not evaluated against headers on the actual request. |
 | `exposed_headers` | `string[]` | `[]` | Response headers the browser is allowed to access via JavaScript, returned in `Access-Control-Expose-Headers`. |
 | `allow_credentials` | `bool` | `false` | When `true`, sends `Access-Control-Allow-Credentials: true`. Cannot be used with wildcard origins (see below). |
 | `max_age` | `u64` | `86400` | Number of seconds browsers should cache preflight results (`Access-Control-Max-Age`). |
 | `preflight_continue` | `bool` | `false` | When `true`, preflight requests are passed through to the backend instead of being short-circuited by the plugin. Useful if your backend needs to handle `OPTIONS` itself. |
-| `unmatched_preflights` | `forward` or `ignore` | not set | Translation marker used for Istio policies. `forward` represents omitted/`UNSPECIFIED`/`FORWARD`; `ignore` answers unmatched preflights locally with 200 and no CORS authorization fields. Its presence also preserves empty method/header lists and absent max age. Do not combine it with `preflight_continue`. |
+| `unmatched_preflights` | `forward` or `ignore` | not set | Translation marker used for Istio policies. `forward` represents omitted/`UNSPECIFIED`/`FORWARD`; `ignore` answers unmatched preflights locally with 200 and no CORS authorization fields. Its presence also preserves empty method/header lists and absent max age. For a pure translated-Istio chain, unmatched or no-Origin requests preserve backend `Access-Control-*` fields; a matching policy still sanitizes and rebuilds them. Do not combine it with `preflight_continue`. |
 
 The config root must be an object. Unknown keys, explicit `null`, invalid or
 whitespace-padded tokens, and an omitted/empty `allowed_origins` policy are
@@ -38,7 +38,7 @@ write `allowed_origins: ["*"]` when allow-all is intended.
 
 ### Credentials and Wildcard Origins
 
-Per the CORS specification, `Access-Control-Allow-Origin: *` cannot be combined with `Access-Control-Allow-Credentials: true`. If you configure `allow_credentials: true` with wildcard origins, the plugin logs a warning and automatically disables credentials. To use credentials, specify explicit origins.
+Per the CORS specification, `Access-Control-Allow-Origin: *` cannot be combined with `Access-Control-Allow-Credentials: true`. If you configure a direct plugin with `allow_credentials: true` and wildcard origins, the plugin logs a warning and automatically disables credentials. Istio translation instead leaves a credentialed Envoy allow-all matcher deferred, and native/file mesh admission rejects that carried shape fail-closed, so neither projection silently removes source credentials. To use credentials in a direct policy, specify explicit origins.
 
 ## Usage Examples
 
@@ -211,8 +211,20 @@ mesh slice with source behavior intact:
 - `IGNORE` unmatched preflights receive a local 200 without CORS authorization;
 - unmatched actual requests go to the backend and Ferrum adds no CORS fields;
 - omitted/empty method and header lists stay empty, and omitted `maxAge` stays
-  absent; and
-- `StringMatch.exact: "*"` and legacy `allowOrigin: ["*"]` mean allow-all.
+  absent;
+- pure translated-Istio chains preserve backend `Access-Control-*` fields on
+  unmatched and no-Origin forwarding, while matched policies sanitize and
+  rebuild those fields;
+- as in Envoy, any `StringMatch` that matches the literal `*` means allow-all.
+  This includes exact `*`, legacy `allowOrigin: ["*"]`, empty/`*` prefixes,
+  and regex matchers such as `regex: "\\*"` or `regex: ".*"`. Credentialed
+  forms stay deferred because Ferrum's wildcard response form cannot preserve
+  the source credential behavior safely; and
+- non-wildcard Istio exact values are projected only when they already equal
+  their canonical browser serialization. Values with an explicit default port,
+  uppercase/IDNA host spelling, or a noncanonical IP spelling stay deferred on
+  Kubernetes input and are rejected on native/file mesh input, preserving
+  literal `StringMatch.exact` behavior instead of broadening it.
 
 These rules do not alter operator-authored native direct-plugin behavior.
 

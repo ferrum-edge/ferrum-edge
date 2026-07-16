@@ -2236,6 +2236,21 @@ pub enum MeshCorsOriginMatch {
     Regex(String),
 }
 
+/// Envoy treats any CORS origin StringMatcher that matches the literal `*` as
+/// allow-all before testing it against the request Origin. Keep native/file
+/// mesh projection aligned with that probe, including prefix/regex shapes that
+/// do not otherwise match a syntactically valid browser Origin.
+fn mesh_cors_origin_matches_wildcard(origin: &MeshCorsOriginMatch) -> bool {
+    match origin {
+        MeshCorsOriginMatch::Exact(value) => value == "*",
+        MeshCorsOriginMatch::Prefix(value) => "*".starts_with(value),
+        MeshCorsOriginMatch::Regex(pattern) => {
+            regex::Regex::new(&crate::config::types::anchor_regex_pattern(pattern))
+                .is_ok_and(|matcher| matcher.is_match("*"))
+        }
+    }
+}
+
 impl Serialize for MeshCorsOriginMatch {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
@@ -2278,20 +2293,27 @@ impl<'de> Deserialize<'de> for MeshCorsOriginMatch {
 }
 
 /// Project the typed policy onto the `cors` plugin's config schema
-/// (`src/plugins/cors.rs`): exact origins are plain strings, prefix/regex are
-/// single-key matcher objects — byte-for-byte the shape the K8s translator's
-/// gateway-side `route_cors_plugin` emits, pinned by a unit test so the two
-/// projections can never drift. The synthesized config always carries
-/// `unmatched_preflights`, which selects Istio semantics without changing the
-/// defaults of operator-authored direct plugin configurations.
+/// (`src/plugins/cors.rs`): exact origins are plain strings and prefix/regex are
+/// single-key matcher objects, except that any matcher satisfying Envoy's
+/// literal `*` probe is normalized to the plain-string wildcard. This is the
+/// same shape the K8s translator's gateway-side `route_cors_plugin` emits,
+/// pinned by a unit test so the two projections cannot drift. The synthesized
+/// config always carries `unmatched_preflights`, which selects Istio semantics
+/// without changing the defaults of operator-authored direct plugin
+/// configurations.
 pub fn cors_plugin_config_from_mesh_policy(policy: &MeshCorsPolicy) -> serde_json::Value {
     let origins: Vec<serde_json::Value> = policy
         .allowed_origins
         .iter()
-        .map(|origin| match origin {
-            MeshCorsOriginMatch::Exact(value) => serde_json::Value::String(value.clone()),
-            MeshCorsOriginMatch::Prefix(value) => serde_json::json!({ "prefix": value }),
-            MeshCorsOriginMatch::Regex(value) => serde_json::json!({ "regex": value }),
+        .map(|origin| {
+            if mesh_cors_origin_matches_wildcard(origin) {
+                return serde_json::Value::String("*".to_string());
+            }
+            match origin {
+                MeshCorsOriginMatch::Exact(value) => serde_json::Value::String(value.clone()),
+                MeshCorsOriginMatch::Prefix(value) => serde_json::json!({ "prefix": value }),
+                MeshCorsOriginMatch::Regex(value) => serde_json::json!({ "regex": value }),
+            }
         })
         .collect();
     let mut config = serde_json::Map::new();
@@ -2716,31 +2738,37 @@ fn validate_virtual_service_cors_policies(
                         errors.push(format!(
                             "{context}: cors.allowed_origins[{index}] exact matcher must not have leading/trailing whitespace — Istio exact semantics match the literal string only"
                         ));
-                    } else if trimmed != "*"
-                        && let Err(err) = crate::plugins::cors::validate_exact_origin(value)
-                    {
-                        // Synthesis projects exacts into the cors plugin's
-                        // plain `allowed_origins` form, whose construction
-                        // rejects non-origin values (paths, query/fragment,
-                        // credentials, trailing slash, non-http(s) schemes,
-                        // non-URL strings). Reject at the config boundary
-                        // instead of failing later during plugin-cache
-                        // construction on the data plane — same shared gate
-                        // the K8s translator uses to defer such policies.
-                        errors.push(format!(
-                            "{context}: cors.allowed_origins[{index}] exact matcher is not a valid origin: {err}"
-                        ));
+                    } else if trimmed != "*" {
+                        match crate::plugins::cors::canonicalize_exact_origin(value) {
+                            Err(err) => {
+                                // Reject at the config boundary instead of
+                                // failing later during plugin-cache
+                                // construction on the data plane — the K8s
+                                // translator uses the same shared gate to defer.
+                                errors.push(format!(
+                                    "{context}: cors.allowed_origins[{index}] exact matcher is not a valid origin: {err}"
+                                ));
+                            }
+                            Ok(canonical) if canonical != value.as_str() => {
+                                // The synthesized plugin canonicalizes exact
+                                // origins. Requiring equality prevents that
+                                // cold-path normalization from widening an
+                                // Istio literal exact matcher.
+                                errors.push(format!(
+                                    "{context}: cors.allowed_origins[{index}] exact matcher must use canonical browser serialization `{canonical}` to preserve Istio literal semantics"
+                                ));
+                            }
+                            Ok(_) => {}
+                        }
                     }
                 }
-                MeshCorsOriginMatch::Prefix(value) => {
-                    if value.trim().is_empty() {
-                        errors.push(format!(
-                            "{context}: cors.allowed_origins[{index}] must not be empty"
-                        ));
-                    }
+                MeshCorsOriginMatch::Prefix(_) => {
+                    // Empty prefix is intentional Envoy allow-all via the
+                    // literal-`*` probe. Other values, including whitespace,
+                    // retain byte-literal prefix semantics.
                 }
                 MeshCorsOriginMatch::Regex(pattern) => {
-                    if pattern.trim().is_empty() {
+                    if pattern.is_empty() {
                         errors.push(format!(
                             "{context}: cors.allowed_origins[{index}] must not be empty"
                         ));
@@ -2753,6 +2781,17 @@ fn validate_virtual_service_cors_policies(
                     }
                 }
             }
+        }
+        if policy.cors.allow_credentials == Some(true)
+            && policy
+                .cors
+                .allowed_origins
+                .iter()
+                .any(mesh_cors_origin_matches_wildcard)
+        {
+            errors.push(format!(
+                "{context}: cors.allow_credentials=true cannot be combined with an origin matcher that has Envoy allow-all semantics by matching the literal `*`"
+            ));
         }
         // Method/header lists are copied verbatim into the synthesized `cors`
         // plugin config, whose construction rejects padded/empty values,

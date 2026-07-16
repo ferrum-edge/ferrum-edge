@@ -13094,7 +13094,10 @@ components:
       description: >-
         Exact HTTP(S) origin. The runtime URL parser additionally validates the
         host and port and canonicalizes scheme/host case, default ports, IDNA,
-        IPv4, and IPv6. Exact `*` is Istio's allow-all value.
+        IPv4, and IPv6 for direct plugin configurations. Istio translation
+        requires non-wildcard exacts to already equal that canonical browser
+        serialization so literal StringMatch semantics are not broadened.
+        Exact `*` is Istio's allow-all value.
 
     CorsAllowedOriginString:
       oneOf:
@@ -13230,8 +13233,10 @@ components:
             `UNSPECIFIED`, and `FORWARD` behavior; `ignore` returns a local 200
             without CORS authorization fields. Its presence also preserves
             omitted/empty method and header lists and omitted max age instead
-            of applying native direct-plugin defaults. It is mutually exclusive
-            with `preflight_continue`.
+            of applying native direct-plugin defaults. In a pure translated-Istio
+            chain, unmatched and no-Origin forwarding preserves backend
+            Access-Control fields; a matching policy sanitizes and rebuilds them.
+            It is mutually exclusive with `preflight_continue`.
 
     OpaPluginConfig:
       type: object

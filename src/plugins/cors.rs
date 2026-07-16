@@ -78,10 +78,13 @@ pub(crate) struct CorsRequestState {
     all_wildcard: bool,
     allow_credentials: bool,
     allowed_methods: Option<Arc<Vec<String>>>,
+    allowed_methods_header: Option<Arc<str>>,
     allowed_method_union: Option<Vec<String>>,
     allowed_headers: Option<Arc<Vec<String>>>,
+    allowed_headers_header: Option<Arc<str>>,
     allowed_header_union: Option<Vec<String>>,
     exposed_headers: Option<Arc<Vec<String>>>,
+    exposed_headers_header: Option<Arc<str>>,
     max_age: Option<Option<u64>>,
     forward_preflight: bool,
     ignore_preflight: bool,
@@ -106,17 +109,26 @@ impl CorsRequestState {
         self.sanitize_response = true;
         self.all_wildcard &= matches!(&plugin.allowed_origins, AllowedOrigins::Wildcard);
         self.allow_credentials &= plugin.allow_credentials;
-        intersect_only(&mut self.exposed_headers, &plugin.exposed_headers);
+        intersect_only(
+            &mut self.exposed_headers,
+            &mut self.exposed_headers_header,
+            &plugin.exposed_headers,
+            &plugin.exposed_headers_header,
+        );
         if is_preflight {
             intersect_values(
                 &mut self.allowed_methods,
+                &mut self.allowed_methods_header,
                 &mut self.allowed_method_union,
                 &plugin.allowed_methods,
+                &plugin.allowed_methods_header,
             );
             intersect_values(
                 &mut self.allowed_headers,
+                &mut self.allowed_headers_header,
                 &mut self.allowed_header_union,
                 &plugin.allowed_headers,
+                &plugin.allowed_headers_header,
             );
             self.max_age = Some(match self.max_age.take() {
                 None => plugin.max_age,
@@ -129,12 +141,21 @@ impl CorsRequestState {
     }
 }
 
-fn intersect_only(intersection: &mut Option<Arc<Vec<String>>>, values: &Arc<Vec<String>>) {
+fn intersect_only(
+    intersection: &mut Option<Arc<Vec<String>>>,
+    intersection_header: &mut Option<Arc<str>>,
+    values: &Arc<Vec<String>>,
+    values_header: &Arc<str>,
+) {
     match intersection.take() {
-        None => *intersection = Some(Arc::clone(values)),
+        None => {
+            *intersection = Some(Arc::clone(values));
+            *intersection_header = Some(Arc::clone(values_header));
+        }
         Some(existing) => {
             let mut narrowed = existing.as_ref().clone();
             narrowed.retain(|value| contains_ascii_case(values, value));
+            *intersection_header = Some(Arc::from(narrowed.join(", ")));
             *intersection = Some(Arc::new(narrowed));
         }
     }
@@ -148,11 +169,16 @@ fn contains_ascii_case(values: &[String], candidate: &str) -> bool {
 
 fn intersect_values(
     intersection: &mut Option<Arc<Vec<String>>>,
+    intersection_header: &mut Option<Arc<str>>,
     union: &mut Option<Vec<String>>,
     values: &Arc<Vec<String>>,
+    values_header: &Arc<str>,
 ) {
     match intersection.take() {
-        None => *intersection = Some(Arc::clone(values)),
+        None => {
+            *intersection = Some(Arc::clone(values));
+            *intersection_header = Some(Arc::clone(values_header));
+        }
         Some(existing) => {
             let union = union.get_or_insert_with(|| existing.as_ref().clone());
             for value in values.iter() {
@@ -162,6 +188,7 @@ fn intersect_values(
             }
             let mut narrowed = existing.as_ref().clone();
             narrowed.retain(|value| contains_ascii_case(values, value));
+            *intersection_header = Some(Arc::from(narrowed.join(", ")));
             *intersection = Some(Arc::new(narrowed));
         }
     }
@@ -209,8 +236,11 @@ enum AllowedOrigins {
 pub struct CorsPlugin {
     allowed_origins: AllowedOrigins,
     allowed_methods: Arc<Vec<String>>,
+    allowed_methods_header: Arc<str>,
     allowed_headers: Arc<Vec<String>>,
+    allowed_headers_header: Arc<str>,
     exposed_headers: Arc<Vec<String>>,
+    exposed_headers_header: Arc<str>,
     allow_credentials: bool,
     max_age: Option<u64>,
     preflight_continue: bool,
@@ -262,6 +292,7 @@ impl CorsPlugin {
             istio_semantics,
             validate_method,
         )?;
+        let allowed_methods_header: Arc<str> = Arc::from(allowed_methods.join(", "));
         let allowed_headers = Self::parse_string_array(
             config,
             "allowed_headers",
@@ -269,8 +300,10 @@ impl CorsPlugin {
             istio_semantics,
             validate_header_name,
         )?;
+        let allowed_headers_header: Arc<str> = Arc::from(allowed_headers.join(", "));
         let exposed_headers =
             Self::parse_string_array(config, "exposed_headers", &[], true, validate_header_name)?;
+        let exposed_headers_header: Arc<str> = Arc::from(exposed_headers.join(", "));
 
         let mut allow_credentials = bool_config(config, "allow_credentials", false)?;
         let max_age = match object.get("max_age") {
@@ -288,6 +321,12 @@ impl CorsPlugin {
 
         // Per CORS spec: Access-Control-Allow-Origin: * cannot be used with credentials.
         if allow_credentials && matches!(&allowed_origins, AllowedOrigins::Wildcard) {
+            if istio_semantics {
+                return Err(
+                    "cors: allow_credentials=true cannot be combined with wildcard origins for translated Istio policies"
+                        .to_string(),
+                );
+            }
             warn!(
                 "cors: allow_credentials=true is incompatible with wildcard origins; \
                  credentials will be disabled. Specify explicit origins to use credentials."
@@ -298,8 +337,11 @@ impl CorsPlugin {
         Ok(Self {
             allowed_origins,
             allowed_methods: Arc::new(allowed_methods),
+            allowed_methods_header,
             allowed_headers: Arc::new(allowed_headers),
+            allowed_headers_header,
             exposed_headers: Arc::new(exposed_headers),
+            exposed_headers_header,
             allow_credentials,
             max_age,
             preflight_continue,
@@ -923,34 +965,34 @@ fn cors_headers(ctx: &RequestContext, preflight: bool) -> HashMap<String, String
         );
     }
     if let Some(exposed) = state
-        .exposed_headers
-        .as_ref()
-        .filter(|values| !values.is_empty())
+        .exposed_headers_header
+        .as_deref()
+        .filter(|value| !value.is_empty())
     {
         headers.insert(
             "access-control-expose-headers".to_string(),
-            exposed.join(", "),
+            exposed.to_string(),
         );
     }
     if preflight {
         if let Some(methods) = state
-            .allowed_methods
-            .as_ref()
-            .filter(|values| !values.is_empty())
+            .allowed_methods_header
+            .as_deref()
+            .filter(|value| !value.is_empty())
         {
             headers.insert(
                 "access-control-allow-methods".to_string(),
-                methods.join(", "),
+                methods.to_string(),
             );
         }
         if let Some(allowed) = state
-            .allowed_headers
-            .as_ref()
-            .filter(|values| !values.is_empty())
+            .allowed_headers_header
+            .as_deref()
+            .filter(|value| !value.is_empty())
         {
             headers.insert(
                 "access-control-allow-headers".to_string(),
-                allowed.join(", "),
+                allowed.to_string(),
             );
         }
         if let Some(Some(max_age)) = state.max_age {
@@ -992,7 +1034,7 @@ fn merge_vary_tokens(existing: Option<&str>, required: &[&str]) -> String {
     merged
 }
 
-/// `pub(crate)` like [`validate_exact_origin`]: the K8s translator's
+/// `pub(crate)` like [`canonicalize_exact_origin`]: the K8s translator's
 /// `cors_policy_translatable` and the native/file mesh source's
 /// `validate_virtual_service_cors_policies` run the same method/header-name
 /// admission the plugin applies at construction, so a policy that passes those
@@ -1029,22 +1071,12 @@ fn validate_wildcard_origin(origin: &str) -> Result<String, String> {
     Ok(format!(".{}", suffix.to_ascii_lowercase()))
 }
 
-/// Validate one exact (plain-string, non-wildcard) allowed origin:
-/// `scheme://host[:port]` with an http(s) scheme and no path, query, fragment,
-/// or credentials. `pub(crate)` because it is the SHARED admission gate for
-/// every surface that projects Istio `StringMatch.exact` origins into this
-/// plugin's plain-string form — the K8s translator's
-/// `cors_origin_matcher_value` (defers non-translatable policies) and the
-/// native/file mesh source's `validate_virtual_service_cors_policies`
-/// (rejects the slice fail-closed) — so a value that passes those boundaries
-/// can never fail `CorsPlugin` construction later. Do not fork this predicate.
-pub(crate) fn validate_exact_origin(origin: &str) -> Result<(), String> {
-    canonicalize_exact_origin(origin).map(|_| ())
-}
-
 /// Validate and canonicalize an exact origin on the config/reload path.
 /// Request matching remains an allocation-free ASCII comparison against this
 /// browser-serialized form; no request-time URL parse is introduced.
+/// `pub(crate)` because it is the shared admission/serialization gate for the
+/// K8s translator (defer non-translatable literal exacts) and native/file mesh
+/// validation (reject them fail-closed). Do not fork this predicate.
 pub(crate) fn canonicalize_exact_origin(origin: &str) -> Result<String, String> {
     if origin.contains(char::is_whitespace) {
         return Err(format!(
@@ -1131,7 +1163,7 @@ fn u64_config(config: &Value, key: &str, default: u64) -> Result<u64, String> {
 
 fn origin_host(origin: &str) -> Option<&str> {
     let (scheme, rest) = origin.split_once("://")?;
-    // Enforce the same http(s) scheme allow-list that `validate_exact_origin`
+    // Enforce the same http(s) scheme allow-list that `canonicalize_exact_origin`
     // applies to exact origins, so wildcard-subdomain matching is not looser
     // than exact matching. Without this, an Origin like `ftp://app.company.com`
     // would satisfy a `*.company.com` rule and be reflected into

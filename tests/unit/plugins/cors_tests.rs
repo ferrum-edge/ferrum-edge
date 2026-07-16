@@ -265,6 +265,19 @@ fn test_constructor_rejects_non_integer_max_age() {
     assert!(err.contains("max_age"), "got: {err}");
 }
 
+#[test]
+fn test_constructor_rejects_translated_credentials_wildcard_conflict() {
+    let err = CorsPlugin::new(&json!({
+        "allowed_origins": ["*"],
+        "allow_credentials": true,
+        "unmatched_preflights": "forward"
+    }))
+    .err()
+    .expect("translated credentialed wildcard origins must fail closed");
+
+    assert!(err.contains("translated Istio policies"), "got: {err}");
+}
+
 #[tokio::test]
 async fn test_cors_plugin_credentials_wildcard_conflict() {
     // allow_credentials with wildcard origins should disable credentials
@@ -563,23 +576,56 @@ async fn test_istio_omitted_policy_fields_and_unmatched_modes_are_preserved() {
         forward.on_request_received(&mut unmatched_preflight).await,
         PluginResult::Continue
     ));
-    let mut upstream_headers = HashMap::from([("x-backend".to_string(), "ok".to_string())]);
+    let mut upstream_headers = HashMap::from([
+        ("x-backend".to_string(), "ok".to_string()),
+        (
+            "access-control-allow-origin".to_string(),
+            "https://backend.example".to_string(),
+        ),
+    ]);
     let _ = forward
         .after_proxy(&mut unmatched_preflight, 299, &mut upstream_headers)
         .await;
-    assert_eq!(upstream_headers.len(), 1);
+    assert_eq!(upstream_headers.len(), 2);
     assert_eq!(upstream_headers["x-backend"], "ok");
+    assert_eq!(
+        upstream_headers["access-control-allow-origin"],
+        "https://backend.example"
+    );
 
     let mut unmatched_actual = make_cors_ctx("DELETE", "https://other.example");
     assert!(matches!(
         forward.on_request_received(&mut unmatched_actual).await,
         PluginResult::Continue
     ));
-    let mut actual_headers = HashMap::new();
+    let mut actual_headers = HashMap::from([(
+        "access-control-allow-origin".to_string(),
+        "https://backend.example".to_string(),
+    )]);
     let _ = forward
         .after_proxy(&mut unmatched_actual, 200, &mut actual_headers)
         .await;
-    assert!(!actual_headers.contains_key("access-control-allow-origin"));
+    assert_eq!(
+        actual_headers["access-control-allow-origin"],
+        "https://backend.example"
+    );
+
+    let mut no_origin = make_ctx();
+    assert!(matches!(
+        forward.on_request_received(&mut no_origin).await,
+        PluginResult::Continue
+    ));
+    let mut no_origin_headers = HashMap::from([(
+        "access-control-allow-origin".to_string(),
+        "https://backend.example".to_string(),
+    )]);
+    let _ = forward
+        .after_proxy(&mut no_origin, 200, &mut no_origin_headers)
+        .await;
+    assert_eq!(
+        no_origin_headers["access-control-allow-origin"],
+        "https://backend.example"
+    );
 
     let mut matched_actual = make_cors_ctx("DELETE", "https://app.example");
     matched_actual
@@ -589,7 +635,10 @@ async fn test_istio_omitted_policy_fields_and_unmatched_modes_are_preserved() {
         forward.on_request_received(&mut matched_actual).await,
         PluginResult::Continue
     ));
-    let mut matched_actual_headers = HashMap::new();
+    let mut matched_actual_headers = HashMap::from([(
+        "access-control-allow-origin".to_string(),
+        "https://backend.example".to_string(),
+    )]);
     let _ = forward
         .after_proxy(&mut matched_actual, 200, &mut matched_actual_headers)
         .await;
@@ -1503,7 +1552,7 @@ async fn test_after_proxy_rejection_with_cors_origin_strips_stale_headers() {
 // ── Istio StringMatch object origin matchers (exact / prefix / regex) ────────
 //
 // These back the VirtualService `corsPolicy` `prefix`/`regex` origin
-// projection: a `corsPolicy.allowOrigins[]` StringMatch entry is emitted into
+// projection. Non-wildcard `StringMatch` entries are emitted into
 // `allowed_origins` as `{exact|prefix|regex}`, and the plugin reflects a
 // matching Origin into `Access-Control-Allow-Origin` and 403s a non-match.
 

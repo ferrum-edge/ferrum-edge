@@ -2048,7 +2048,6 @@ mod virtual_service_cors {
     fn empty_matcher_values_rejected() {
         for matcher in [
             MeshCorsOriginMatch::Exact("  ".into()),
-            MeshCorsOriginMatch::Prefix(String::new()),
             MeshCorsOriginMatch::Regex(String::new()),
         ] {
             let errors = validate(vec![policy(vec![matcher.clone()])]);
@@ -2081,6 +2080,84 @@ mod virtual_service_cors {
             "https://app.".into(),
         )])]);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn non_wildcard_matchers_retain_literal_semantics() {
+        for (matcher, projected) in [
+            (
+                MeshCorsOriginMatch::Prefix(" ".into()),
+                serde_json::json!({"prefix": " "}),
+            ),
+            (
+                MeshCorsOriginMatch::Regex(" ".into()),
+                serde_json::json!({"regex": " "}),
+            ),
+        ] {
+            let candidate = policy(vec![matcher]);
+            assert!(
+                validate(vec![candidate.clone()]).is_empty(),
+                "a nonempty matcher remains a literal Istio StringMatch"
+            );
+            assert_eq!(
+                cors_plugin_config_from_mesh_policy(&candidate.cors)["allowed_origins"],
+                serde_json::json!([projected])
+            );
+        }
+    }
+
+    #[test]
+    fn envoy_allow_all_matchers_project_as_wildcard_and_reject_credentials() {
+        for matcher in [
+            MeshCorsOriginMatch::Exact("*".into()),
+            MeshCorsOriginMatch::Prefix(String::new()),
+            MeshCorsOriginMatch::Prefix("*".into()),
+            MeshCorsOriginMatch::Regex(r"\*".into()),
+            MeshCorsOriginMatch::Regex(".*".into()),
+        ] {
+            let candidate = policy(vec![matcher.clone()]);
+            assert!(
+                validate(vec![candidate.clone()]).is_empty(),
+                "Envoy wildcard matcher {matcher:?} must pass native mesh validation"
+            );
+            assert_eq!(
+                cors_plugin_config_from_mesh_policy(&candidate.cors)["allowed_origins"],
+                serde_json::json!(["*"]),
+                "Envoy matcher {matcher:?} must retain its literal-* allow-all semantics"
+            );
+
+            let mut credentialed = candidate;
+            credentialed.cors.allow_credentials = Some(true);
+            let errors = validate(vec![credentialed]);
+            assert!(
+                errors.iter().any(|error| {
+                    error.contains("allow_credentials=true")
+                        && error.contains("matching the literal `*`")
+                }),
+                "credentialed Envoy wildcard {matcher:?} must fail closed: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn noncanonical_exact_origins_reject_instead_of_broadening() {
+        for exact in [
+            "https://example.com:443",
+            "HTTPS://EXAMPLE.COM",
+            "https://BÜCHER.EXAMPLE",
+            "http://[2001:0DB8:0:0:0:0:0:1]",
+        ] {
+            let errors = validate(vec![policy(vec![MeshCorsOriginMatch::Exact(
+                exact.into(),
+            )])]);
+            assert!(
+                errors.iter().any(|error| {
+                    error.contains("canonical browser serialization")
+                        && error.contains("preserve Istio literal semantics")
+                }),
+                "noncanonical literal exact {exact:?} must fail closed: {errors:?}"
+            );
+        }
     }
 
     #[test]
