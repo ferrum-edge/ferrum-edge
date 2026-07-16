@@ -2298,12 +2298,6 @@ impl Plugin for AiSemanticFirewall {
         if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
             return PluginResult::Continue;
         }
-        if is_partial_response(ctx, response_status, response_headers)
-            && response_content_encoding_value(ctx, response_headers).is_some()
-        {
-            return PluginResult::Continue;
-        }
-
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         let encoded_body = response_content_encoding_value(ctx, response_headers).is_some()
             && !gateway_response_compression_planned(ctx, response_headers);
@@ -2349,12 +2343,6 @@ impl Plugin for AiSemanticFirewall {
         if !(200..300).contains(&response_status) || matches!(response_status, 204 | 205) {
             return PluginResult::Continue;
         }
-        if is_partial_response(ctx, response_status, response_headers)
-            && response_content_encoding_value(ctx, response_headers).is_some()
-        {
-            return PluginResult::Continue;
-        }
-
         let content_type = header_value(response_headers, "content-type").unwrap_or("");
         let was_governed = self.response_hash(ctx).is_some();
         let type_candidate = response_content_type_is_inspection_candidate(content_type);
