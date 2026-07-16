@@ -56,6 +56,53 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("renew_namespace_config_admission_lease("));
     assert!(crud_source.contains("release_namespace_config_admission_lease("));
     assert!(crud_source.contains("guard.ensure_held()"));
+    assert!(crud_source.contains("valid_until_millis: AtomicU64"));
+    assert!(crud_source.contains("sleep_until(tokio::time::Instant::from_std(valid_until))"));
+
+    let handle_write = crud_source
+        .find("async fn handle_write<R: AdminResource>(")
+        .map(|position| &crud_source[position..])
+        .expect("direct CRUD write handler must exist");
+    let persistence_dispatch = handle_write
+        .find("if let Err(error) = R::db_create(db, &resource).await")
+        .expect("direct create persistence dispatch must exist");
+    let final_lease_check = handle_write[..persistence_dispatch]
+        .rfind("guard.ensure_held()")
+        .expect("direct writes must recheck the lease immediately before persistence");
+    let timestamping = handle_write
+        .find("resource.set_updated_at(now);")
+        .expect("server-side timestamping must precede persistence");
+    assert!(
+        timestamping < final_lease_check,
+        "the final fence must follow validation, preparation, and timestamping"
+    );
+    assert_eq!(
+        handle_write[..persistence_dispatch]
+            .matches("guard.ensure_held()")
+            .count(),
+        2,
+        "direct create/update must check after acquisition and again at persistence"
+    );
+    assert!(
+        !handle_write[final_lease_check..persistence_dispatch].contains(".await"),
+        "no asynchronous work may reopen the direct-write window after the final fence"
+    );
+
+    let delete_handler = crud_source
+        .find("pub(crate) async fn handle_delete<R: AdminResource>(")
+        .map(|position| &crud_source[position..])
+        .expect("delete handler must exist");
+    let delete_validation = delete_handler
+        .find("R::before_delete(db, state, namespace, &existing, &validation_ctx).await")
+        .expect("delete prospective validation must exist");
+    let delete_fence = delete_handler
+        .find("guard.ensure_held()")
+        .expect("delete persistence fence must remain present");
+    let delete_persistence = delete_handler
+        .find("R::db_delete(db, namespace, id).await")
+        .expect("delete persistence dispatch must exist");
+    assert!(delete_validation < delete_fence);
+    assert!(delete_fence < delete_persistence);
 
     let graph_validation = crud_source
         .rfind("validate_transaction_log_schema_candidates(")
@@ -94,6 +141,21 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
             >= 6,
         "credential, batch, and restore mutations must share namespace admission"
     );
+    let batch_persistence = batch_source
+        .find("let (created, errors) = persist_payload_resources(db.as_ref(), &batch, true).await")
+        .expect("batch persistence dispatch must exist");
+    let batch_fence = batch_source[..batch_persistence]
+        .rfind("_namespace_config_admission_guard.ensure_held()")
+        .expect("batch persistence fence must remain present");
+    assert!(batch_fence < batch_persistence);
+    let restore_persistence = batch_source[restore_handler..]
+        .find("if let Err(e) = db.delete_all_resources(namespace).await")
+        .map(|position| position + restore_handler)
+        .expect("restore destructive persistence dispatch must exist");
+    let restore_fence = batch_source[..restore_persistence]
+        .rfind("_namespace_config_admission_guard.ensure_held()")
+        .expect("restore persistence fence must remain present");
+    assert!(restore_fence < restore_persistence);
     let sql_store_source = include_str!("../../../src/config/db_loader.rs");
     assert!(sql_store_source.contains("config_admission_locks"));
     assert!(sql_store_source.contains("self.batch_create_plugin_configs_chunk(configs).await?"));
@@ -124,6 +186,10 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         .find("db.submit_api_spec_bundle(&bundle, &spec).await")
         .expect("POST persistence");
     assert!(post_lock < post_persist);
+    let post_fence = api_spec_source[..post_persist]
+        .rfind("_namespace_config_admission_guard.ensure_held()")
+        .expect("POST persistence fence");
+    assert!(post_lock < post_fence);
     let put_lock = api_spec_source[post_lock + 1..]
         .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .map(|position| position + post_lock + 1)
@@ -132,6 +198,10 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         .find("db.replace_api_spec_bundle(&bundle, &spec).await")
         .expect("PUT persistence");
     assert!(put_lock < put_persist);
+    let put_fence = api_spec_source[..put_persist]
+        .rfind("_namespace_config_admission_guard.ensure_held()")
+        .expect("PUT persistence fence");
+    assert!(put_lock < put_fence);
     let delete_lock = api_spec_source[put_lock + 1..]
         .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .map(|position| position + put_lock + 1)
@@ -142,8 +212,12 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     let delete_validation = api_spec_source
         .find("validate_transaction_log_schema_api_spec_deletion_candidate(")
         .expect("DELETE prospective graph validation");
+    let delete_fence = api_spec_source[..delete_persist]
+        .rfind("_namespace_config_admission_guard.ensure_held()")
+        .expect("DELETE persistence fence");
     assert!(delete_lock < delete_validation);
-    assert!(delete_validation < delete_persist);
+    assert!(delete_validation < delete_fence);
+    assert!(delete_fence < delete_persist);
 }
 
 #[test]

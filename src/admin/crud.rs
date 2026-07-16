@@ -6,7 +6,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::{HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, MutexGuard};
@@ -134,21 +134,117 @@ pub(crate) struct NamespaceConfigAdmissionGuard {
     owner: String,
     stop_tx: Option<tokio::sync::watch::Sender<bool>>,
     renew_task: Option<tokio::task::JoinHandle<()>>,
-    valid: Arc<AtomicBool>,
+    lease_state: Arc<NamespaceConfigAdmissionLeaseState>,
 }
 
-impl NamespaceConfigAdmissionGuard {
-    pub(crate) fn ensure_held(&self) -> Result<(), anyhow::Error> {
-        if self.valid.load(Ordering::Acquire) {
+/// Process-local half of the durable owner-qualified lease.
+///
+/// The deadline is monotonic and anchored before each datastore request. Once
+/// `valid` becomes false it never becomes true again, so a late renewal result,
+/// guard cancellation, or owner-qualified release cannot reopen a write window.
+pub(crate) struct NamespaceConfigAdmissionLeaseState {
+    lease_started_at: Instant,
+    lease_duration_millis: u64,
+    valid_until_millis: AtomicU64,
+    valid: AtomicBool,
+}
+
+impl NamespaceConfigAdmissionLeaseState {
+    pub(crate) fn new(lease_started_at: Instant, lease_duration: Duration) -> Self {
+        let lease_duration_millis =
+            u64::try_from(lease_duration.as_millis()).unwrap_or(0);
+        Self {
+            lease_started_at,
+            lease_duration_millis,
+            valid_until_millis: AtomicU64::new(lease_duration_millis),
+            valid: AtomicBool::new(true),
+        }
+    }
+
+    fn elapsed_millis_at(&self, now: Instant) -> u64 {
+        u64::try_from(
+            now.saturating_duration_since(self.lease_started_at)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
+    }
+
+    fn is_held_at(&self, now: Instant) -> bool {
+        if !self.valid.load(Ordering::Acquire) {
+            return false;
+        }
+        let elapsed_millis = self.elapsed_millis_at(now);
+        if elapsed_millis < self.valid_until_millis.load(Ordering::Acquire) {
+            return true;
+        }
+        self.lose_ownership();
+        false
+    }
+
+    pub(crate) fn ensure_held_at(&self, now: Instant) -> Result<(), anyhow::Error> {
+        if self.is_held_at(now) {
             Ok(())
         } else {
             anyhow::bail!("namespace config admission lease was lost before persistence")
         }
     }
+
+    fn valid_until(&self) -> Option<Instant> {
+        if !self.valid.load(Ordering::Acquire) {
+            return None;
+        }
+        let valid_until = self.lease_started_at.checked_add(Duration::from_millis(
+            self.valid_until_millis.load(Ordering::Acquire),
+        ));
+        if valid_until.is_none() {
+            self.lose_ownership();
+        }
+        valid_until
+    }
+
+    pub(crate) fn confirm_renewal(
+        &self,
+        renewal_started_at: Instant,
+        confirmed_at: Instant,
+    ) -> bool {
+        // The backend calculates its durable expiry before awaiting the query,
+        // so the local extension must use the same request-start boundary.
+        if !self.is_held_at(confirmed_at) {
+            return false;
+        }
+        let renewed_until_millis = self
+            .elapsed_millis_at(renewal_started_at)
+            .saturating_add(self.lease_duration_millis);
+        if renewed_until_millis <= self.elapsed_millis_at(confirmed_at) {
+            self.lose_ownership();
+            return false;
+        }
+        if !self.valid.load(Ordering::Acquire) {
+            return false;
+        }
+        self.valid_until_millis
+            .store(renewed_until_millis, Ordering::Release);
+        self.valid.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn lose_ownership(&self) {
+        self.valid.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn valid_until_millis(&self) -> u64 {
+        self.valid_until_millis.load(Ordering::Acquire)
+    }
+}
+
+impl NamespaceConfigAdmissionGuard {
+    pub(crate) fn ensure_held(&self) -> Result<(), anyhow::Error> {
+        self.lease_state.ensure_held_at(Instant::now())
+    }
 }
 
 impl Drop for NamespaceConfigAdmissionGuard {
     fn drop(&mut self) {
+        self.lease_state.lose_ownership();
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(true);
         }
@@ -184,45 +280,91 @@ pub(crate) async fn lock_namespace_config_admission(
 ) -> Result<NamespaceConfigAdmissionGuard, anyhow::Error> {
     let local = lock_local_namespace_config_admission(namespace).await;
     let owner = Uuid::new_v4().to_string();
-    loop {
+    let lease_state = loop {
+        let attempt_started_at = Instant::now();
         if db
             .try_acquire_namespace_config_admission_lease(namespace, &owner)
             .await?
         {
-            break;
+            let state = Arc::new(NamespaceConfigAdmissionLeaseState::new(
+                attempt_started_at,
+                CONFIG_ADMISSION_LEASE_DURATION,
+            ));
+            if state.ensure_held_at(Instant::now()).is_ok() {
+                break state;
+            }
+            if let Err(error) = db
+                .release_namespace_config_admission_lease(namespace, &owner)
+                .await
+            {
+                tracing::warn!(
+                    namespace = %namespace,
+                    %error,
+                    "Failed to release namespace config admission lease acquired after its local deadline"
+                );
+            }
         }
         tokio::time::sleep(CONFIG_ADMISSION_LEASE_RETRY_INTERVAL).await;
-    }
+    };
 
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let renew_db = db.clone();
     let renew_namespace = namespace.to_string();
     let renew_owner = owner.clone();
-    let valid = Arc::new(AtomicBool::new(true));
-    let renew_valid = valid.clone();
+    let renew_state = lease_state.clone();
     let renew_task = tokio::spawn(async move {
-        let mut valid_until = Instant::now() + CONFIG_ADMISSION_LEASE_DURATION;
         loop {
+            let Some(valid_until) = renew_state.valid_until() else {
+                return;
+            };
             tokio::select! {
-                changed = stop_rx.changed() => {
-                    if changed.is_err() || *stop_rx.borrow() {
-                        return;
-                    }
+                biased;
+                _ = stop_rx.changed() => return,
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(valid_until)) => {
+                    renew_state.lose_ownership();
+                    tracing::error!(
+                        namespace = %renew_namespace,
+                        "Namespace config admission lease expired before renewal"
+                    );
+                    return;
                 }
                 _ = tokio::time::sleep(CONFIG_ADMISSION_LEASE_RENEW_INTERVAL) => {}
             }
 
             loop {
-                match renew_db
-                    .renew_namespace_config_admission_lease(&renew_namespace, &renew_owner)
-                    .await
-                {
+                let Some(valid_until) = renew_state.valid_until() else {
+                    return;
+                };
+                let renewal_started_at = Instant::now();
+                let renewal_result = tokio::select! {
+                    biased;
+                    _ = stop_rx.changed() => return,
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(valid_until)) => {
+                        renew_state.lose_ownership();
+                        tracing::error!(
+                            namespace = %renew_namespace,
+                            "Namespace config admission lease expired while renewal was pending"
+                        );
+                        return;
+                    }
+                    result = renew_db.renew_namespace_config_admission_lease(
+                        &renew_namespace,
+                        &renew_owner,
+                    ) => result,
+                };
+                match renewal_result {
                     Ok(true) => {
-                        valid_until = Instant::now() + CONFIG_ADMISSION_LEASE_DURATION;
+                        if !renew_state.confirm_renewal(renewal_started_at, Instant::now()) {
+                            tracing::error!(
+                                namespace = %renew_namespace,
+                                "Namespace config admission lease renewal completed after local expiry"
+                            );
+                            return;
+                        }
                         break;
                     }
                     Ok(false) => {
-                        renew_valid.store(false, Ordering::Release);
+                        renew_state.lose_ownership();
                         tracing::error!(
                             namespace = %renew_namespace,
                             "Namespace config admission lease renewal lost ownership"
@@ -230,8 +372,19 @@ pub(crate) async fn lock_namespace_config_admission(
                         return;
                     }
                     Err(error) => {
-                        if Instant::now() + CONFIG_ADMISSION_LEASE_RETRY_INTERVAL >= valid_until {
-                            renew_valid.store(false, Ordering::Release);
+                        let Some(retry_at) = Instant::now()
+                            .checked_add(CONFIG_ADMISSION_LEASE_RETRY_INTERVAL)
+                        else {
+                            renew_state.lose_ownership();
+                            tracing::error!(
+                                namespace = %renew_namespace,
+                                %error,
+                                "Namespace config admission lease retry deadline overflowed"
+                            );
+                            return;
+                        };
+                        if retry_at >= valid_until {
+                            renew_state.lose_ownership();
                             tracing::error!(
                                 namespace = %renew_namespace,
                                 %error,
@@ -245,12 +398,18 @@ pub(crate) async fn lock_namespace_config_admission(
                             "Namespace config admission lease renewal failed; retrying before expiry"
                         );
                         tokio::select! {
-                            changed = stop_rx.changed() => {
-                                if changed.is_err() || *stop_rx.borrow() {
-                                    return;
-                                }
+                            biased;
+                            _ = stop_rx.changed() => return,
+                            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(valid_until)) => {
+                                renew_state.lose_ownership();
+                                tracing::error!(
+                                    namespace = %renew_namespace,
+                                    %error,
+                                    "Namespace config admission lease expired after renewal failure"
+                                );
+                                return;
                             }
-                            _ = tokio::time::sleep(CONFIG_ADMISSION_LEASE_RETRY_INTERVAL) => {}
+                            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at)) => {}
                         }
                     }
                 }
@@ -265,7 +424,7 @@ pub(crate) async fn lock_namespace_config_admission(
         owner,
         stop_tx: Some(stop_tx),
         renew_task: Some(renew_task),
-        valid,
+        lease_state,
     })
 }
 
@@ -3330,6 +3489,11 @@ async fn handle_write<R: AdminResource>(
         }
     }
 
+    if let Some(guard) = _namespace_config_admission_guard.as_ref()
+        && let Err(error) = guard.ensure_held()
+    {
+        return Ok(R::map_precheck_db_error(&error));
+    }
     match action {
         WriteAction::Create => {
             if let Err(error) = R::db_create(db, &resource).await {
