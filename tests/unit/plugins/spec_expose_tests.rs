@@ -1491,23 +1491,74 @@ async fn test_cancelled_fetch_creator_does_not_restart_origin_request() {
     ));
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::{mpsc, oneshot, watch};
 
-    let mock_server = MockServer::start().await;
-    Mock::given(method("GET"))
-        .and(path("/openapi.yaml"))
-        .respond_with(ResponseTemplate::new(500).set_delay(std::time::Duration::from_millis(250)))
-        .expect(1)
-        .mount(&mock_server)
-        .await;
+    const REQUEST_COUNT: usize = 96;
+    const ADMITTED_REQUESTS: usize = 32;
+    const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    // Hold the origin response behind an explicit gate so every request has
+    // reached admission before the failed completion is published. This uses
+    // real time for reqwest's loopback I/O and only a deadline as a failure
+    // guard; a paused Tokio clock can otherwise advance the request timeout
+    // before the independently spawned fetch worker reaches the mock server.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_addr = listener.local_addr().unwrap();
+    let (request_tx, mut request_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (release_tx, release_rx) = watch::channel(false);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+    let origin_server = tokio::spawn(async move {
+        let mut handlers = Vec::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (mut socket, _) = accepted.expect("accept origin connection");
+                    let request_tx = request_tx.clone();
+                    let mut release_rx = release_rx.clone();
+                    handlers.push(tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let mut buffer = [0_u8; 1024];
+                        loop {
+                            let read = socket.read(&mut buffer).await.expect("read origin request");
+                            assert!(read > 0, "origin connection closed before request headers");
+                            request.extend_from_slice(&buffer[..read]);
+                            assert!(request.len() <= 16 * 1024, "origin request headers too large");
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        request_tx.send(request).expect("record origin request");
+                        if !*release_rx.borrow() {
+                            release_rx
+                                .changed()
+                                .await
+                                .expect("origin response gate closed");
+                        }
+                        socket
+                            .write_all(
+                                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await
+                            .expect("write origin response");
+                    }));
+                }
+                _ = &mut shutdown_rx => break,
+            }
+        }
+        drop(request_tx);
+        for handler in handlers {
+            handler.await.expect("origin connection handler");
+        }
+    });
 
     let plugin = Arc::new(
         SpecExpose::new(
             &json!({
-                "spec_url": format!("{}/openapi.yaml", mock_server.uri()),
+                "spec_url": format!("http://{origin_addr}/openapi.yaml"),
                 "cache_ttl_seconds": 0
             }),
             PluginHttpClient::default(),
@@ -1515,51 +1566,131 @@ async fn test_failed_fetch_burst_is_single_flight_with_bounded_waiters() {
         .unwrap(),
     );
 
+    let (result_tx, mut result_rx) = mpsc::unbounded_channel();
     let mut handles = Vec::new();
-    for _ in 0..96 {
+    for _ in 0..REQUEST_COUNT {
         let plugin = Arc::clone(&plugin);
+        let result_tx = result_tx.clone();
         handles.push(tokio::spawn(async move {
             let mut ctx = make_ctx("GET", "/api/specz", "/api");
-            plugin.on_request_received(&mut ctx).await
+            let result = plugin.on_request_received(&mut ctx).await;
+            result_tx.send(result).expect("record plugin result");
         }));
     }
+    drop(result_tx);
 
-    let mut upstream_failures = 0;
-    let mut busy_rejections = 0;
-    for handle in handles {
-        let (status, body, headers) = reject_parts(handle.await.expect("request task"));
-        match status {
-            502 => upstream_failures += 1,
-            503 => {
-                busy_rejections += 1;
-                assert_eq!(
-                    body,
-                    br#"{"error":"API specification fetch is busy; retry after the indicated delay"}"#
-                );
-                assert_eq!(
-                    headers.get("content-type").map(String::as_str),
-                    Some("application/json")
-                );
-                assert_eq!(
-                    headers.get("content-length").map(String::as_str),
-                    Some("76")
-                );
-                assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
-            }
-            other => panic!("unexpected status {other}"),
+    let first_origin_request = tokio::time::timeout(WAIT_TIMEOUT, request_rx.recv())
+        .await
+        .expect("origin request deadline")
+        .expect("origin request channel closed");
+    assert!(
+        first_origin_request.starts_with(b"GET /openapi.yaml HTTP/1.1\r\n"),
+        "unexpected origin request: {}",
+        String::from_utf8_lossy(&first_origin_request)
+    );
+
+    // The origin is still gated, so only bounded-admission 503 responses can
+    // complete. Receiving all excess responses proves the admitted group is
+    // full before the shared failure is released.
+    let busy_results = tokio::time::timeout(WAIT_TIMEOUT, async {
+        let mut results = Vec::with_capacity(REQUEST_COUNT - ADMITTED_REQUESTS);
+        for _ in ADMITTED_REQUESTS..REQUEST_COUNT {
+            results.push(result_rx.recv().await.expect("busy result channel closed"));
         }
-        assert!(headers.contains_key("retry-after"));
+        results
+    })
+    .await
+    .expect("bounded waiters did not fail quickly");
+    for result in busy_results {
+        let (status, body, headers) = reject_parts(result);
+        assert_eq!(status, 503);
+        assert_eq!(
+            body,
+            br#"{"error":"API specification fetch is busy; retry after the indicated delay"}"#
+        );
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some("76")
+        );
+        assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
     }
-    assert!(upstream_failures > 0);
-    assert!(busy_rejections > 0, "excess waiters should fail quickly");
+
+    release_tx.send(true).expect("release origin failure");
+    let first_admitted_result = tokio::time::timeout(WAIT_TIMEOUT, result_rx.recv())
+        .await
+        .expect("first admitted waiter deadline")
+        .expect("admitted result channel closed");
+    // The first 502 proves the origin response and negative cache have been
+    // published. Freeze only now—after all real loopback I/O is complete—so
+    // metadata checks cannot race the one-second negative-cache window.
+    tokio::time::pause();
+    let admitted_results = tokio::time::timeout(WAIT_TIMEOUT, async {
+        let mut results = Vec::with_capacity(ADMITTED_REQUESTS);
+        results.push(first_admitted_result);
+        for _ in 1..ADMITTED_REQUESTS {
+            results.push(
+                result_rx
+                    .recv()
+                    .await
+                    .expect("admitted result channel closed"),
+            );
+        }
+        results
+    })
+    .await
+    .expect("admitted waiters did not receive the shared failure");
+
+    let mut shared_failure = None;
+    for result in admitted_results {
+        let (status, body, headers) = reject_parts(result);
+        assert_eq!(status, 502);
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        let expected_content_length = body.len().to_string();
+        assert_eq!(
+            headers.get("content-length").map(String::as_str),
+            Some(expected_content_length.as_str())
+        );
+        assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
+        if let Some((expected_body, expected_headers)) = &shared_failure {
+            assert_eq!(&body, expected_body);
+            assert_eq!(&headers, expected_headers);
+        } else {
+            shared_failure = Some((body, headers));
+        }
+    }
+    let shared_failure = shared_failure.expect("admitted callers must receive a failure");
+
+    for handle in handles {
+        handle.await.expect("request task");
+    }
+    assert!(result_rx.recv().await.is_none());
 
     // A request during the negative-cache window reuses the same failure and
     // does not generate another origin request.
     let mut cached_failure_ctx = make_ctx("GET", "/api/specz", "/api");
-    let (status, _, headers) =
+    let (status, body, headers) =
         reject_parts(plugin.on_request_received(&mut cached_failure_ctx).await);
     assert_eq!(status, 502);
     assert_eq!(headers.get("retry-after").map(String::as_str), Some("1"));
+    assert_eq!((body, headers), shared_failure);
+
+    shutdown_tx.send(()).expect("stop origin server");
+    tokio::time::timeout(WAIT_TIMEOUT, origin_server)
+        .await
+        .expect("origin server shutdown deadline")
+        .expect("origin server task");
+    let mut origin_request_count = 1;
+    while request_rx.recv().await.is_some() {
+        origin_request_count += 1;
+    }
+    assert_eq!(origin_request_count, 1, "fetch burst must be single-flight");
 }
 
 #[tokio::test(start_paused = true)]
