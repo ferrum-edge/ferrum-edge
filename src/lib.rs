@@ -81,7 +81,7 @@ pub mod _test_support {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use hyper::StatusCode;
 
@@ -326,6 +326,54 @@ pub mod _test_support {
         namespace: &str,
     ) -> tokio::sync::MutexGuard<'static, ()> {
         crate::admin::crud::lock_local_namespace_config_admission(namespace).await
+    }
+
+    pub struct NamespaceConfigAdmissionLeaseStateForTest {
+        state: crate::admin::crud::NamespaceConfigAdmissionLeaseState,
+        started_at: Instant,
+    }
+
+    impl NamespaceConfigAdmissionLeaseStateForTest {
+        pub fn new(lease_duration: Duration) -> Self {
+            let started_at = Instant::now();
+            Self {
+                state: crate::admin::crud::NamespaceConfigAdmissionLeaseState::new(
+                    started_at,
+                    lease_duration,
+                ),
+                started_at,
+            }
+        }
+
+        pub fn ensure_held_at(&self, elapsed: Duration) -> bool {
+            self.state
+                .ensure_held_at(self.started_at + elapsed)
+                .is_ok()
+        }
+
+        pub fn record_renewal_result(
+            &self,
+            renewal_started_after: Duration,
+            confirmed_after: Duration,
+            owner_confirmed: bool,
+        ) -> bool {
+            if !owner_confirmed {
+                self.state.lose_ownership();
+                return false;
+            }
+            self.state.confirm_renewal(
+                self.started_at + renewal_started_after,
+                self.started_at + confirmed_after,
+            )
+        }
+
+        pub fn lose_ownership(&self) {
+            self.state.lose_ownership();
+        }
+
+        pub fn valid_until_millis(&self) -> u64 {
+            self.state.valid_until_millis()
+        }
     }
 
     pub fn validate_plugin_configs_fatal_for_test(

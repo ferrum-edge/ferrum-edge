@@ -2388,7 +2388,7 @@ pub async fn handle_post_api_spec(
     // Keep the authoritative namespace snapshot used by plugin-graph admission
     // stable through bundle persistence. This is shared with direct CRUD,
     // batch, restore, and API-spec PUT/DELETE mutations.
-    let _namespace_config_admission_guard =
+    let mut namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(error) => return Ok(error_response(classify_db_error(error))),
@@ -2424,10 +2424,26 @@ pub async fn handle_post_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
-    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
+    if let Err(error) = namespace_config_admission_guard.ensure_held() {
         return Ok(error_response(classify_db_error(error)));
     }
-    match db.submit_api_spec_bundle(&bundle, &spec).await {
+    let content_hash = spec.content_hash.clone();
+    let spec_version = spec.spec_version.clone();
+    let persistence_db = db.clone();
+    let persistence_bundle = bundle;
+    let persistence_spec = spec;
+    let persist_result = match namespace_config_admission_guard
+        .run_persistence(async move {
+            persistence_db
+                .submit_api_spec_bundle(&persistence_bundle, &persistence_spec)
+                .await
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
+    match persist_result {
         Ok(()) => {}
         Err(e) => return Ok(error_response(classify_db_error(e))),
     }
@@ -2435,8 +2451,8 @@ pub async fn handle_post_api_spec(
     let resp_body = json!({
         "id": spec_id,
         "proxy_id": proxy_id,
-        "content_hash": spec.content_hash,
-        "spec_version": spec.spec_version,
+        "content_hash": content_hash,
+        "spec_version": spec_version,
     });
 
     let event = audit::AuditEvent::new(
@@ -2507,7 +2523,7 @@ pub async fn handle_put_api_spec(
     // Serialize every graph-relevant read below through replacement
     // persistence. Re-read the spec after acquiring the guard so a concurrent
     // API-spec delete cannot leave validation based on a stale owner row.
-    let _namespace_config_admission_guard =
+    let mut namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(error) => return Ok(error_response(classify_db_error(error))),
@@ -2607,10 +2623,26 @@ pub async fn handle_put_api_spec(
     // Preserve original created_at
     spec.created_at = existing_spec.created_at;
 
-    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
+    if let Err(error) = namespace_config_admission_guard.ensure_held() {
         return Ok(error_response(classify_db_error(error)));
     }
-    match db.replace_api_spec_bundle(&bundle, &spec).await {
+    let content_hash = spec.content_hash.clone();
+    let spec_version = spec.spec_version.clone();
+    let persistence_db = db.clone();
+    let persistence_bundle = bundle;
+    let persistence_spec = spec;
+    let persist_result = match namespace_config_admission_guard
+        .run_persistence(async move {
+            persistence_db
+                .replace_api_spec_bundle(&persistence_bundle, &persistence_spec)
+                .await
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
+    match persist_result {
         Ok(()) => {}
         Err(e) => return Ok(error_response(classify_db_error(e))),
     }
@@ -2618,8 +2650,8 @@ pub async fn handle_put_api_spec(
     let resp_body = json!({
         "id": id,
         "proxy_id": proxy_id,
-        "content_hash": spec.content_hash,
-        "spec_version": spec.spec_version,
+        "content_hash": content_hash,
+        "spec_version": spec_version,
     });
 
     let before = json!({
@@ -2784,7 +2816,7 @@ pub async fn handle_delete_api_spec(
         Err(e) => return Ok(error_response(e)),
     };
 
-    let _namespace_config_admission_guard =
+    let mut namespace_config_admission_guard =
         match crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(error) => return Ok(error_response(classify_db_error(error))),
@@ -2823,10 +2855,24 @@ pub async fn handle_delete_api_spec(
         }
     }
 
-    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
+    if let Err(error) = namespace_config_admission_guard.ensure_held() {
         return Ok(error_response(classify_db_error(error)));
     }
-    match db.delete_api_spec(namespace, id).await {
+    let persistence_db = db.clone();
+    let persistence_namespace = namespace.to_string();
+    let persistence_id = id.to_string();
+    let persist_result = match namespace_config_admission_guard
+        .run_persistence(async move {
+            persistence_db
+                .delete_api_spec(&persistence_namespace, &persistence_id)
+                .await
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return Ok(error_response(classify_db_error(error))),
+    };
+    match persist_result {
         Ok(true) => {
             let event = audit::AuditEvent::new(
                 actor,

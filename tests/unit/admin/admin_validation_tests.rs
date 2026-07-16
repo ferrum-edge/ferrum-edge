@@ -56,6 +56,37 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
     assert!(crud_source.contains("renew_namespace_config_admission_lease("));
     assert!(crud_source.contains("release_namespace_config_admission_lease("));
     assert!(crud_source.contains("guard.ensure_held()"));
+    assert!(crud_source.contains("pub(crate) async fn run_persistence<F, T>("));
+    assert!(crud_source.contains("self.persistence_task = Some(tokio::spawn(async move"));
+    assert!(
+        crud_source.matches(".run_persistence(async move").count() >= 2,
+        "generic guarded create/update and delete must own persistence futures"
+    );
+
+    let guard_drop = crud_source
+        .find("impl Drop for NamespaceConfigAdmissionGuard")
+        .map(|position| &crud_source[position..])
+        .expect("namespace admission guard Drop implementation");
+    let wait_for_persistence = guard_drop
+        .find("if let Some(task) = persistence_task")
+        .expect("Drop cleanup must await an in-flight persistence task");
+    let durable_release = guard_drop
+        .find(".release_namespace_config_admission_lease(&namespace, &owner)")
+        .expect("Drop cleanup must owner-qualify durable release");
+    let local_release = guard_drop
+        .find("drop(local);")
+        .expect("Drop cleanup must explicitly release the local mutex last");
+    assert!(wait_for_persistence < durable_release);
+    assert!(durable_release < local_release);
+    assert!(guard_drop.contains("store_namespace_config_admission_handoff("));
+    assert!(guard_drop.contains("handing ownership to the next local writer"));
+    assert!(crud_source.contains("NamespaceConfigAdmissionLeaseState"));
+    assert!(crud_source.contains("let mut renewal_task = tokio::spawn(async move"));
+    assert!(crud_source.contains(
+        "Namespace config admission lease renewal settled after local expiry"
+    ));
+    assert!(crud_source.contains("renewal completed after local expiry"));
+    assert!(crud_source.contains("let post_write_error = if matches!(&result, Ok(true))"));
 
     let graph_validation = crud_source
         .rfind("validate_transaction_log_schema_candidates(")
@@ -98,6 +129,18 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         batch_source.contains("admission_guard.ensure_held()"),
         "credential persistence must recheck namespace admission after async validation"
     );
+    assert!(
+        batch_source.matches(".run_persistence(async move").count() >= 3,
+        "credentials, batch, and restore must own their persistence futures"
+    );
+    let restore_owned_future = batch_source
+        .find("persist_restore_after_validation(")
+        .expect("restore persistence helper must exist");
+    let restore_run = batch_source
+        .rfind(".run_persistence(async move")
+        .expect("restore handler must run an owned persistence future");
+    assert!(restore_owned_future < restore_run);
+    assert!(batch_source.contains("rollback_failed_restore(db.as_ref(), namespace"));
     let sql_store_source = include_str!("../../../src/config/db_loader.rs");
     assert!(sql_store_source.contains("config_admission_locks"));
     assert!(sql_store_source.contains("config_admission_lease_now_sql"));
@@ -123,11 +166,16 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         3,
         "API-spec POST, PUT, and DELETE must serialize through persistence"
     );
+    assert_eq!(
+        api_spec_source.matches(".run_persistence(async move").count(),
+        3,
+        "API-spec POST, PUT, and DELETE must own persistence through completion"
+    );
     let post_lock = api_spec_source
         .find("crate::admin::crud::lock_namespace_config_admission(db.clone(), namespace).await")
         .expect("POST admission guard");
     let post_persist = api_spec_source
-        .find("db.submit_api_spec_bundle(&bundle, &spec).await")
+        .find(".submit_api_spec_bundle(&persistence_bundle, &persistence_spec)")
         .expect("POST persistence");
     assert!(post_lock < post_persist);
     let put_lock = api_spec_source[post_lock + 1..]
@@ -135,7 +183,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         .map(|position| position + post_lock + 1)
         .expect("PUT admission guard");
     let put_persist = api_spec_source
-        .find("db.replace_api_spec_bundle(&bundle, &spec).await")
+        .find(".replace_api_spec_bundle(&persistence_bundle, &persistence_spec)")
         .expect("PUT persistence");
     assert!(put_lock < put_persist);
     let delete_lock = api_spec_source[put_lock + 1..]
@@ -143,7 +191,7 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         .map(|position| position + put_lock + 1)
         .expect("DELETE admission guard");
     let delete_persist = api_spec_source
-        .find("db.delete_api_spec(namespace, id).await")
+        .find(".delete_api_spec(&persistence_namespace, &persistence_id)")
         .expect("DELETE persistence");
     let delete_validation = api_spec_source
         .find("validate_transaction_log_schema_api_spec_deletion_candidate(")

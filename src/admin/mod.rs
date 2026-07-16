@@ -2836,8 +2836,8 @@ async fn ensure_hmac_consumer_candidate(
 }
 
 async fn persist_consumer_update(
-    db: &dyn DatabaseBackend,
-    admission_guard: &crud::NamespaceConfigAdmissionGuard,
+    db: Arc<dyn DatabaseBackend>,
+    admission_guard: &mut crud::NamespaceConfigAdmissionGuard,
     mut consumer: Consumer,
     success_status: StatusCode,
 ) -> Response<Full<Bytes>> {
@@ -2847,7 +2847,7 @@ async fn persist_consumer_update(
     // out-of-band duplicates fail before the datastore uniqueness backstop.
     if !consumer.credential_entries("hmac_auth").is_empty()
         && let Err(response) =
-            ensure_hmac_consumer_candidate(db, &consumer.namespace, &consumer).await
+            ensure_hmac_consumer_candidate(db.as_ref(), &consumer.namespace, &consumer).await
     {
         return *response;
     }
@@ -2858,7 +2858,25 @@ async fn persist_consumer_update(
         );
     }
     consumer.updated_at = Utc::now();
-    match db.update_consumer(&consumer).await {
+    let persistence_db = db.clone();
+    let persistence_consumer = consumer.clone();
+    let update_result = match admission_guard
+        .run_persistence(async move {
+            persistence_db
+                .update_consumer(&persistence_consumer)
+                .await
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Config admission unavailable: {error}")}),
+            );
+        }
+    };
+    match update_result {
         // The consumer vanished between the namespace-scoped load and the
         // write (concurrent delete) — not-found, not a phantom success.
         Ok(false) => consumer_not_found_response(),
@@ -3221,7 +3239,7 @@ async fn rollback_failed_restore(
 /// with `503` before touching durable state when one cannot be captured — so
 /// there is no "rollback unavailable" branch.
 async fn finish_failed_restore(
-    state: &AdminState,
+    admin_audit_enabled: bool,
     db: Arc<dyn DatabaseBackend>,
     actor: &AuditActor,
     namespace: &str,
@@ -3252,7 +3270,7 @@ async fn finish_failed_restore(
             json!({"rollback": rollback_status}),
         ),
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+    if let Err(error) = audit::record(admin_audit_enabled, db.clone(), event) {
         log_audit_enqueue_failure(&error);
     }
 
@@ -3296,7 +3314,7 @@ async fn finish_failed_restore(
 
 /// Finalize a restore whose atomic clear definitively aborted.
 async fn finish_atomic_delete_failure(
-    state: &AdminState,
+    admin_audit_enabled: bool,
     db: Arc<dyn DatabaseBackend>,
     actor: &AuditActor,
     namespace: &str,
@@ -3313,7 +3331,7 @@ async fn finish_atomic_delete_failure(
             json!({"rollback": "not_needed"}),
         ),
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
+    if let Err(error) = audit::record(admin_audit_enabled, db.clone(), event) {
         log_audit_enqueue_failure(&error);
     }
 
@@ -3328,7 +3346,7 @@ async fn finish_atomic_delete_failure(
 }
 
 async fn finish_unknown_atomic_delete_failure(
-    state: &AdminState,
+    admin_audit_enabled: bool,
     db: Arc<dyn DatabaseBackend>,
     actor: &AuditActor,
     namespace: &str,
@@ -3345,7 +3363,7 @@ async fn finish_unknown_atomic_delete_failure(
             json!({"rollback": "unknown_outcome"}),
         ),
     );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db, event) {
+    if let Err(error) = audit::record(admin_audit_enabled, db, event) {
         log_audit_enqueue_failure(&error);
     }
 
@@ -3357,6 +3375,141 @@ async fn finish_unknown_atomic_delete_failure(
             "rollback": "unknown_outcome",
         }),
     )
+}
+
+/// Run the destructive restore, any compensating rollback, and its durable
+/// audit enqueue as one owned persistence future. The admission guard executes
+/// this helper in a detached task, so disconnect/cancellation cannot release
+/// the namespace while an SQL transaction, MongoDB transaction, or standalone
+/// MongoDB compensation sequence still has an unknown outcome.
+async fn persist_restore_after_validation(
+    db: Arc<dyn DatabaseBackend>,
+    admin_audit_enabled: bool,
+    actor: AuditActor,
+    namespace: String,
+    payload: RestorePayload,
+    snapshot: RestoreSnapshot,
+) -> Response<Full<Bytes>> {
+    if let Err(error) = db.delete_all_resources(&namespace).await {
+        error!("Restore: failed to delete existing resources: {}", error);
+        if error.mode().is_atomic() {
+            if error.has_unknown_commit_result() {
+                let verification = db.count_namespace_resources(&namespace).await;
+                if let Err(verification_error) = &verification {
+                    error!(
+                        namespace = %namespace,
+                        error = %verification_error,
+                        "Restore: failed to verify ambiguous atomic clear outcome"
+                    );
+                }
+                return match classify_atomic_clear_verification(
+                    snapshot.resource_counts(),
+                    verification,
+                ) {
+                    AtomicClearVerification::ClearCommitted => {
+                        finish_failed_restore(
+                            admin_audit_enabled,
+                            db,
+                            &actor,
+                            &namespace,
+                            vec![format!("failed to clear existing config: {error}")],
+                            &snapshot,
+                        )
+                        .await
+                    }
+                    AtomicClearVerification::PriorConfigIntact => {
+                        finish_atomic_delete_failure(
+                            admin_audit_enabled,
+                            db,
+                            &actor,
+                            &namespace,
+                            error.to_string(),
+                        )
+                        .await
+                    }
+                    AtomicClearVerification::UnknownOutcome => {
+                        finish_unknown_atomic_delete_failure(
+                            admin_audit_enabled,
+                            db,
+                            &actor,
+                            &namespace,
+                            error.to_string(),
+                        )
+                        .await
+                    }
+                };
+            }
+            return finish_atomic_delete_failure(
+                admin_audit_enabled,
+                db,
+                &actor,
+                &namespace,
+                error.to_string(),
+            )
+            .await;
+        }
+        return finish_failed_restore(
+            admin_audit_enabled,
+            db,
+            &actor,
+            &namespace,
+            vec![format!("failed to clear existing config: {error}")],
+            &snapshot,
+        )
+        .await;
+    }
+
+    info!("Restore: cleared existing config, beginning import");
+
+    let (created, errors) = persist_payload_resources(db.as_ref(), &payload, false).await;
+
+    info!(
+        "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
+        created.proxies, created.consumers, created.plugin_configs, created.upstreams
+    );
+
+    let response = json!({
+        "restored": {
+            "proxies": created.proxies,
+            "consumers": created.consumers,
+            "plugin_configs": created.plugin_configs,
+            "upstreams": created.upstreams,
+        }
+    });
+
+    if !errors.is_empty() {
+        error!(
+            "Restore: import failed; rolling back namespace '{}': {}",
+            namespace,
+            errors.join("; ")
+        );
+        return finish_failed_restore(
+            admin_audit_enabled,
+            db,
+            &actor,
+            &namespace,
+            errors,
+            &snapshot,
+        )
+        .await;
+    }
+
+    let event = audit::AuditEvent::new(
+        &actor,
+        "restore",
+        "gateway_config",
+        &namespace,
+        &namespace,
+        audit::update_diff(
+            json!({"replaced_namespace": namespace}),
+            response["restored"].clone(),
+        ),
+    );
+    if let Err(error) = audit::record(admin_audit_enabled, db, event) {
+        log_audit_enqueue_failure(&error);
+    }
+
+    json_response(StatusCode::OK, &response)
 }
 
 /// Allowed credential types for consumer authentication plugins.
@@ -3406,7 +3559,7 @@ async fn handle_update_credentials(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _namespace_config_admission_guard =
+    let mut namespace_config_admission_guard =
         match crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(error) => {
@@ -3459,8 +3612,8 @@ async fn handle_update_credentials(
         return Ok(*resp);
     }
     let response = persist_consumer_update(
-        db.as_ref(),
-        &_namespace_config_admission_guard,
+        db.clone(),
+        &mut namespace_config_admission_guard,
         consumer.clone(),
         StatusCode::OK,
     )
@@ -3508,7 +3661,7 @@ async fn handle_delete_credentials(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _namespace_config_admission_guard =
+    let mut namespace_config_admission_guard =
         match crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(error) => {
@@ -3526,8 +3679,8 @@ async fn handle_delete_credentials(
     let before = consumer.clone();
     consumer.credentials.remove(cred_type);
     let response = persist_consumer_update(
-        db.as_ref(),
-        &_namespace_config_admission_guard,
+        db.clone(),
+        &mut namespace_config_admission_guard,
         consumer.clone(),
         StatusCode::NO_CONTENT,
     )
@@ -3577,7 +3730,7 @@ async fn handle_append_credential(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _namespace_config_admission_guard =
+    let mut namespace_config_admission_guard =
         match crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(error) => {
@@ -3653,8 +3806,8 @@ async fn handle_append_credential(
         return Ok(*resp);
     }
     let response = persist_consumer_update(
-        db.as_ref(),
-        &_namespace_config_admission_guard,
+        db.clone(),
+        &mut namespace_config_admission_guard,
         consumer.clone(),
         StatusCode::OK,
     )
@@ -3715,7 +3868,7 @@ async fn handle_delete_credential_by_index(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _namespace_config_admission_guard =
+    let mut namespace_config_admission_guard =
         match crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(error) => {
@@ -3766,8 +3919,8 @@ async fn handle_delete_credential_by_index(
     }
 
     let response = persist_consumer_update(
-        db.as_ref(),
-        &_namespace_config_admission_guard,
+        db.clone(),
+        &mut namespace_config_admission_guard,
         consumer.clone(),
         StatusCode::OK,
     )
@@ -4167,7 +4320,7 @@ async fn handle_batch_create(
         Ok(db) => db,
         Err(resp) => return Ok(*resp),
     };
-    let _namespace_config_admission_guard =
+    let mut namespace_config_admission_guard =
         match crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(error) => {
@@ -4698,14 +4851,29 @@ async fn handle_batch_create(
         ));
     }
 
-    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
+    if let Err(error) = namespace_config_admission_guard.ensure_held() {
         return Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": format!("Config admission unavailable: {error}")}),
         ));
     }
 
-    let (created, errors) = persist_payload_resources(db.as_ref(), &batch, true).await;
+    let persistence_db = db.clone();
+    let persistence_batch = batch;
+    let (created, errors) = match namespace_config_admission_guard
+        .run_persistence(async move {
+            persist_payload_resources(persistence_db.as_ref(), &persistence_batch, true).await
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({"error": format!("Config admission unavailable: {error}")}),
+            ));
+        }
+    };
 
     let mut response = json!({
         "created": {
@@ -4940,7 +5108,7 @@ async fn handle_restore(
             }),
         ));
     }
-    let _namespace_config_admission_guard =
+    let mut namespace_config_admission_guard =
         match crud::lock_namespace_config_admission(db.clone(), namespace).await {
             Ok(guard) => guard,
             Err(error) => {
@@ -5175,139 +5343,42 @@ async fn handle_restore(
         }
     };
 
-    if let Err(error) = _namespace_config_admission_guard.ensure_held() {
+    if let Err(error) = namespace_config_admission_guard.ensure_held() {
         return Ok(json_response(
             StatusCode::SERVICE_UNAVAILABLE,
             &json!({"error": format!("Config admission unavailable: {error}")}),
         ));
     }
 
-    // Phase 3: Delete all existing resources in the namespace (safe: payload is
-    // validated and the prior state has been snapshotted from the primary above).
-    if let Err(e) = db.delete_all_resources(namespace).await {
-        error!("Restore: failed to delete existing resources: {}", e);
-        if e.mode().is_atomic() {
-            if e.has_unknown_commit_result() {
-                let verification = db.count_namespace_resources(namespace).await;
-                if let Err(error) = &verification {
-                    error!(
-                        namespace = %namespace,
-                        error = %error,
-                        "Restore: failed to verify ambiguous atomic clear outcome"
-                    );
-                }
-                return Ok(
-                    match classify_atomic_clear_verification(
-                        snapshot.resource_counts(),
-                        verification,
-                    ) {
-                        AtomicClearVerification::ClearCommitted => {
-                            finish_failed_restore(
-                                state,
-                                db.clone(),
-                                actor,
-                                namespace,
-                                vec![format!("failed to clear existing config: {}", e)],
-                                &snapshot,
-                            )
-                            .await
-                        }
-                        AtomicClearVerification::PriorConfigIntact => {
-                            finish_atomic_delete_failure(
-                                state,
-                                db.clone(),
-                                actor,
-                                namespace,
-                                e.to_string(),
-                            )
-                            .await
-                        }
-                        AtomicClearVerification::UnknownOutcome => {
-                            finish_unknown_atomic_delete_failure(
-                                state,
-                                db.clone(),
-                                actor,
-                                namespace,
-                                e.to_string(),
-                            )
-                            .await
-                        }
-                    },
-                );
-            }
-            // A definitive atomic abort retains the prior config, including
-            // api_specs. Preserve the short-circuit and do not re-clear it.
-            return Ok(finish_atomic_delete_failure(
-                state,
-                db.clone(),
-                actor,
-                namespace,
-                e.to_string(),
+    // Phase 3 runs in an owned task. Its SQL/Mongo transactions, standalone
+    // compensation, and rollback all settle before guard cleanup can release
+    // durable ownership or unlock the next local writer.
+    let persistence_db = db.clone();
+    let persistence_actor = actor.clone();
+    let persistence_audit_enabled = state.admin_audit_enabled;
+    let persistence_namespace = namespace.to_string();
+    let response = match namespace_config_admission_guard
+        .run_persistence(async move {
+            persist_restore_after_validation(
+                persistence_db,
+                persistence_audit_enabled,
+                persistence_actor,
+                persistence_namespace,
+                payload,
+                snapshot,
             )
-            .await);
-        }
-        // Non-atomic clear (standalone Mongo deletes collections one-by-one) can
-        // leave the namespace in a mixed state, so attempt the same best-effort
-        // rollback the import-failure path uses.
-        return Ok(finish_failed_restore(
-            state,
-            db.clone(),
-            actor,
-            namespace,
-            vec![format!("failed to clear existing config: {}", e)],
-            &snapshot,
-        )
-        .await);
-    }
-
-    info!("Restore: cleared existing config, beginning import");
-
-    // Phase 3: Import resources in dependency order.
-    // Each batch_create_* method internally chunks into 1,000-record
-    // transactions to keep WAL/redo size bounded.
-    let (created, errors) = persist_payload_resources(db.as_ref(), &payload, false).await;
-
-    info!(
-        "Restore: imported {} proxies, {} consumers, {} plugin_configs, {} upstreams",
-        created.proxies, created.consumers, created.plugin_configs, created.upstreams
-    );
-
-    let response = json!({
-        "restored": {
-            "proxies": created.proxies,
-            "consumers": created.consumers,
-            "plugin_configs": created.plugin_configs,
-            "upstreams": created.upstreams,
-        }
-    });
-
-    if !errors.is_empty() {
-        error!(
-            "Restore: import failed; rolling back namespace '{}': {}",
-            namespace,
-            errors.join("; ")
-        );
-        return Ok(
-            finish_failed_restore(state, db.clone(), actor, namespace, errors, &snapshot).await,
-        );
-    }
-
-    let event = audit::AuditEvent::new(
-        actor,
-        "restore",
-        "gateway_config",
-        namespace,
-        namespace,
-        audit::update_diff(
-            json!({"replaced_namespace": namespace}),
-            response["restored"].clone(),
+            .await
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"error": format!("Config admission unavailable: {error}")}),
         ),
-    );
-    if let Err(error) = audit::record(state.admin_audit_enabled, db.clone(), event) {
-        log_audit_enqueue_failure(&error);
-    }
+    };
 
-    Ok(json_response(StatusCode::OK, &response))
+    Ok(response)
 }
 
 fn parse_audit_filter(

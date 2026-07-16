@@ -157,6 +157,84 @@ async fn namespace_config_admission_serializes_same_namespace_mutations() {
 }
 
 #[test]
+fn stalled_namespace_lease_renewal_cannot_cross_expiry() {
+    let lease = ferrum_edge::_test_support::NamespaceConfigAdmissionLeaseStateForTest::new(
+        Duration::from_millis(120),
+    );
+
+    assert!(lease.ensure_held_at(Duration::from_millis(119)));
+    assert!(
+        !lease.ensure_held_at(Duration::from_millis(120)),
+        "the process-local fence must expire while a renewal future is still pending"
+    );
+    assert!(
+        !lease.record_renewal_result(
+            Duration::from_millis(30),
+            Duration::from_millis(121),
+            true,
+        ),
+        "a late renewal response must not reopen an expired write window"
+    );
+    assert_eq!(lease.valid_until_millis(), 120);
+}
+
+#[test]
+fn confirmed_namespace_lease_renewal_extends_from_attempt_start() {
+    let lease = ferrum_edge::_test_support::NamespaceConfigAdmissionLeaseStateForTest::new(
+        Duration::from_millis(120),
+    );
+
+    assert_eq!(lease.valid_until_millis(), 120);
+    assert!(lease.ensure_held_at(Duration::from_millis(90)));
+    assert!(lease.record_renewal_result(
+        Duration::from_millis(30),
+        Duration::from_millis(90),
+        true,
+    ));
+    assert_eq!(lease.valid_until_millis(), 150);
+    assert!(lease.ensure_held_at(Duration::from_millis(149)));
+    assert!(!lease.ensure_held_at(Duration::from_millis(150)));
+}
+
+#[test]
+fn namespace_lease_owner_loss_is_irreversible() {
+    let lease = ferrum_edge::_test_support::NamespaceConfigAdmissionLeaseStateForTest::new(
+        Duration::from_millis(120),
+    );
+
+    assert!(lease.ensure_held_at(Duration::from_millis(30)));
+    assert!(!lease.record_renewal_result(
+        Duration::from_millis(30),
+        Duration::from_millis(31),
+        false,
+    ));
+    assert!(!lease.ensure_held_at(Duration::from_millis(31)));
+    assert!(
+        !lease.record_renewal_result(
+            Duration::from_millis(32),
+            Duration::from_millis(33),
+            true,
+        ),
+        "a late owner-qualified response must not revive a lost lease"
+    );
+}
+
+#[test]
+fn canceled_namespace_lease_cannot_be_renewed() {
+    let lease = ferrum_edge::_test_support::NamespaceConfigAdmissionLeaseStateForTest::new(
+        Duration::from_millis(120),
+    );
+
+    lease.lose_ownership();
+    assert!(!lease.ensure_held_at(Duration::from_millis(1)));
+    assert!(!lease.record_renewal_result(
+        Duration::from_millis(2),
+        Duration::from_millis(3),
+        true,
+    ));
+}
+
+#[test]
 fn prospective_graph_rejects_duplicate_names_and_dangling_renames_or_deletes() {
     let duplicate = validate_graph(vec![
         graph_plugin(
