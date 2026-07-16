@@ -1286,6 +1286,12 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "key-only-query-copied-key",
         "key-only-query-path",
         "key-only-query-fragment",
+        "query-key-with-value-renamed-value",
+        "query-key-with-value-copied-key",
+        "query-key-with-value-path",
+        "query-key-with-value-fragment",
+        "query-key-with-value-nested",
+        "query-value-with-key-renamed-value",
         "literal-plus-encoded-candidate",
         "encoded-plus-literal-candidate",
         "fragment-query-scalar",
@@ -1303,6 +1309,8 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
         "benign-query-path-lookalike",
         "benign-query-path-parameter-lookalike",
         "benign-key-only-query-lookalike",
+        "benign-query-key-with-value-lookalike",
+        "benign-query-value-with-key-lookalike",
         "benign-plus-space-distinct",
         "benign-fragment-lookalike",
         "benign-fragment-label",
@@ -1331,6 +1339,16 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             | "key-only-query-fragment"
             | "benign-key-only-query-lookalike" => {
                 format!("{}/signed%2Ftrigger?SIGNED_TOKEN=", server.uri())
+            }
+            "query-key-with-value-renamed-value"
+            | "query-key-with-value-copied-key"
+            | "query-key-with-value-path"
+            | "query-key-with-value-fragment"
+            | "query-key-with-value-nested"
+            | "query-value-with-key-renamed-value"
+            | "benign-query-key-with-value-lookalike"
+            | "benign-query-value-with-key-lookalike" => {
+                format!("{}/signed%2Ftrigger?SIGNED_TOKEN=1", server.uri())
             }
             _ => format!("{}/signed%2Ftrigger?code=secret%2Fvalue", server.uri()),
         };
@@ -1397,8 +1415,31 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "key-only-query-copied-key" => {
                 "https://redirect.example/next?SIGNED_TOKEN=other".to_string()
             }
-            "key-only-query-path" => "https://redirect.example/next;leak=SIGNED_TOKEN".to_string(),
-            "key-only-query-fragment" => "https://redirect.example/#leak=SIGNED_TOKEN".to_string(),
+            "key-only-query-path" => {
+                "https://redirect.example/next;leak=SIGNED_TOKEN".to_string()
+            }
+            "key-only-query-fragment" => {
+                "https://redirect.example/#leak=SIGNED_TOKEN".to_string()
+            }
+            "query-key-with-value-renamed-value" => {
+                "https://redirect.example/next?leak=SIGNED_TOKEN".to_string()
+            }
+            "query-key-with-value-copied-key" => {
+                "https://redirect.example/next?SIGNED_TOKEN=other".to_string()
+            }
+            "query-key-with-value-path" => {
+                "https://redirect.example/next;leak=SIGNED_TOKEN".to_string()
+            }
+            "query-key-with-value-fragment" => {
+                "https://redirect.example/#leak=SIGNED_TOKEN".to_string()
+            }
+            "query-key-with-value-nested" => {
+                "https://redirect.example/next?next=https%3A%2F%2Fattacker.example%2F%3Fleak%3DSIGNED_TOKEN"
+                    .to_string()
+            }
+            "query-value-with-key-renamed-value" => {
+                "https://redirect.example/next?leak=1".to_string()
+            }
             "literal-plus-encoded-candidate" => {
                 "https://redirect.example/next?leak=token%2Bpart".to_string()
             }
@@ -1414,13 +1455,13 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             "malformed" => "http://[signed%2Ftrigger?code=secret%2Fvalue".to_string(),
             "userinfo" => "https://user:password@redirect.example/next".to_string(),
             "benign-relative" => "/next".to_string(),
-            "benign-same-origin" => format!("{}/safe?code=other", server.uri()),
-            "benign-external" => "https://redirect.example/next?code=other".to_string(),
+            "benign-same-origin" => format!("{}/safe?label=other", server.uri()),
+            "benign-external" => "https://redirect.example/next?label=other".to_string(),
             "benign-external-label" => {
                 "https://redirect.example/next?label=signed/trigger".to_string()
             }
             "benign-path-lookalike" => {
-                "https://redirect.example/signed/triggered?code=other".to_string()
+                "https://redirect.example/signed/triggered?label=other".to_string()
             }
             "benign-query-value-lookalike" => {
                 "https://redirect.example/next?leak=secret%2Fvalue-extra".to_string()
@@ -1433,6 +1474,12 @@ async fn test_terminate_strips_redirects_that_expose_signed_function_destination
             }
             "benign-key-only-query-lookalike" => {
                 "https://redirect.example/next?leak=SIGNED_TOKEN_EXTRA".to_string()
+            }
+            "benign-query-key-with-value-lookalike" => {
+                "https://redirect.example/next?leak=SIGNED_TOKEN_EXTRA".to_string()
+            }
+            "benign-query-value-with-key-lookalike" => {
+                "https://redirect.example/next?leak=10".to_string()
             }
             "benign-plus-space-distinct" => {
                 "https://redirect.example/next?leak=token+part".to_string()
@@ -1621,9 +1668,11 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
         "content-location-absolute",
         "content-location-relative",
         "content-location-encoded",
+        "content-location-query-key",
         "refresh-absolute",
         "refresh-relative",
         "refresh-encoded",
+        "refresh-query-key",
         "refresh-bare-absolute",
         "refresh-bare-relative",
         "refresh-bare-path-segment",
@@ -1631,6 +1680,7 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
         "refresh-malformed-target",
         "link-absolute",
         "link-relative",
+        "link-query-key",
         "link-multiple-targets",
         "link-target-budget",
         "link-malformed",
@@ -1659,6 +1709,11 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
             "content-location-encoded" => {
                 ("content-location", encoded_function_url.clone(), true)
             }
+            "content-location-query-key" => (
+                "content-location",
+                "https://redirect.example/next?leak=code".to_string(),
+                true,
+            ),
             "refresh-absolute" => {
                 ("refresh", format!("0; URL=\"{function_url}\""), true)
             }
@@ -1670,6 +1725,11 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
             "refresh-encoded" => {
                 ("refresh", format!("0; url={encoded_function_url}"), true)
             }
+            "refresh-query-key" => (
+                "refresh",
+                "0; url=https://redirect.example/next?leak=code".to_string(),
+                true,
+            ),
             "refresh-bare-absolute" => {
                 ("refresh", format!("0; {function_url}"), true)
             }
@@ -1695,6 +1755,11 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
                 "</signed%2Ftrigger?code=secret%2Fvalue>; rel=\"next\"".to_string(),
                 true,
             ),
+            "link-query-key" => (
+                "link",
+                "<https://redirect.example/next?leak=code>; rel=\"next\"".to_string(),
+                true,
+            ),
             "link-multiple-targets" => (
                 "link",
                 format!("</safe>; rel=\"prev\", <{function_url}>; rel=\"next\""),
@@ -1714,14 +1779,14 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
                 true,
             ),
             "benign-content-location" => {
-                ("content-location", "/safe?code=other".to_string(), false)
+                ("content-location", "/safe?label=other".to_string(), false)
             }
             "benign-refresh" => {
-                ("refresh", "5; URL = '/safe?code=other'".to_string(), false)
+                ("refresh", "5; URL = '/safe?label=other'".to_string(), false)
             }
             "benign-refresh-bare-target" => (
                 "refresh",
-                "5; https://redirect.example/safe?code=other".to_string(),
+                "5; https://redirect.example/safe?label=other".to_string(),
                 false,
             ),
             "benign-refresh-delay-only" => ("refresh", "5".to_string(), false),
@@ -1730,7 +1795,7 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
             }
             "benign-link-multiple-targets" => (
                 "link",
-                "</safe>; rel=\"prev\", <https://redirect.example/next?code=other>; rel=\"next\"; title=\"a,b\""
+                "</safe>; rel=\"prev\", <https://redirect.example/next?label=other>; rel=\"next\"; title=\"a,b\""
                     .to_string(),
                 false,
             ),
@@ -1741,7 +1806,7 @@ async fn test_terminate_strips_destination_exposure_from_url_valued_headers() {
             ),
             "benign-link-path-lookalike" => (
                 "link",
-                "<https://redirect.example/signed/triggered?code=other>; rel=\"next\""
+                "<https://redirect.example/signed/triggered?label=other>; rel=\"next\""
                     .to_string(),
                 false,
             ),
@@ -1918,7 +1983,7 @@ async fn test_forward_body_is_binary_safe_for_non_post_methods() {
 }
 
 #[tokio::test]
-async fn test_forward_body_uses_active_hook_content_type_representation() {
+async fn test_forward_body_preserves_exact_utf8_bytes_for_json_text_and_empty_bodies() {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1937,42 +2002,54 @@ async fn test_forward_body_uses_active_hook_content_type_representation() {
     )
     .unwrap();
 
-    let mut text_ctx = create_test_context();
-    text_ctx.method = "POST".to_string();
-    text_ctx
+    let governed_json = "{\n  \"dup\": 1,\n  \"dup\": 2,\n  \"number\": 1e+02\n}\n";
+    let mut json_ctx = create_test_context();
+    json_ctx.method = "PATCH".to_string();
+    json_ctx
         .headers
         .insert("content-type".to_string(), "text/plain".to_string());
-    text_ctx.request_body_bytes = Some(Bytes::from_static(br#"{"trusted":true}"#));
-    let mut transformed_headers = HashMap::new();
-    transformed_headers.insert("content-type".to_string(), "application/json".to_string());
+    json_ctx.request_body_bytes = Some(Bytes::copy_from_slice(governed_json.as_bytes()));
+    let mut active_headers = HashMap::new();
+    active_headers.insert("content-type".to_string(), "application/json".to_string());
     assert!(matches!(
         plugin
-            .before_proxy(&mut text_ctx, &mut transformed_headers)
+            .before_proxy(&mut json_ctx, &mut active_headers)
             .await,
         PluginResult::Continue
     ));
 
-    let mut json_ctx = create_test_context();
-    json_ctx.method = "POST".to_string();
-    json_ctx.headers.insert(
-        "content-type".to_string(),
-        "application/problem+json; charset=utf-8".to_string(),
-    );
-    json_ctx.request_body_bytes = Some(Bytes::from_static(br#"{"trusted":true}"#));
-    let mut transformed_headers = HashMap::new();
-    transformed_headers.insert("content-type".to_string(), "text/plain".to_string());
+    let governed_text = "  preserve me exactly  \n";
+    let mut text_ctx = create_test_context();
+    text_ctx.method = "PUT".to_string();
+    text_ctx.request_body_bytes = Some(Bytes::copy_from_slice(governed_text.as_bytes()));
     assert!(matches!(
         plugin
-            .before_proxy(&mut json_ctx, &mut transformed_headers)
+            .before_proxy(&mut text_ctx, &mut HashMap::new())
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut empty_ctx = create_test_context();
+    empty_ctx.method = "POST".to_string();
+    empty_ctx.request_body_bytes = Some(Bytes::new());
+    assert!(matches!(
+        plugin
+            .before_proxy(&mut empty_ctx, &mut HashMap::new())
             .await,
         PluginResult::Continue
     ));
 
     let requests = server.received_requests().await.unwrap();
-    let text_payload: Value = serde_json::from_slice(&requests[0].body).unwrap();
-    let json_payload: Value = serde_json::from_slice(&requests[1].body).unwrap();
-    assert_eq!(text_payload["body"], json!({"trusted": true}));
-    assert_eq!(json_payload["body"], r#"{"trusted":true}"#);
+    let json_payload: Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let text_payload: Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let empty_payload: Value = serde_json::from_slice(&requests[2].body).unwrap();
+    assert_eq!(json_payload["body"], governed_json);
+    assert_eq!(json_payload["body_encoding"], "utf8");
+    assert!(json_payload["body"].is_string());
+    assert_eq!(text_payload["body"], governed_text);
+    assert_eq!(text_payload["body_encoding"], "utf8");
+    assert_eq!(empty_payload["body"], "");
+    assert_eq!(empty_payload["body_encoding"], "utf8");
 }
 
 #[tokio::test]

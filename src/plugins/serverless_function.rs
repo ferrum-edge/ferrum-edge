@@ -73,7 +73,6 @@ use tracing::{debug, info, warn};
 use url::{Host, Url};
 
 use super::utils::aws_sigv4;
-use super::utils::body_transform::is_json_content_type;
 use super::utils::response_body::{
     BoundedReadError, parse_max_response_body_bytes, read_response_body_bounded,
 };
@@ -577,17 +576,16 @@ impl ServerlessFunction {
                     "governed request body was unavailable before function invocation",
                 ));
             };
-            // Interpret the bytes according to the active hook headers. On the
-            // no-clone hot path the gateway temporarily moves ctx.headers into
-            // this map, so consulting ctx.headers here would miss even the
-            // original Content-Type and Content-Encoding values.
-            let content_type = proxy_headers.get("content-type");
-            if content_type.is_some_and(|content_type| is_json_content_type(content_type))
-                && let Ok(json_body) = serde_json::from_slice::<Value>(body)
-            {
-                payload.insert("body".into(), json_body);
-            } else if let Ok(text) = std::str::from_utf8(body) {
+            // `body` is the authoritative representation of the exact bytes
+            // that remain eligible for backend dispatch. Keep JSON as text:
+            // parsing it here would collapse duplicate keys and normalize
+            // whitespace or lexical number forms before the external decision
+            // while the unchanged bytes continue downstream. The explicit
+            // encoding makes every UTF-8, binary, and empty representation
+            // unambiguous without retaining a second structured body copy.
+            if let Ok(text) = std::str::from_utf8(body) {
                 payload.insert("body".into(), Value::String(text.to_string()));
+                payload.insert("body_encoding".into(), Value::String("utf8".into()));
             } else {
                 payload.insert(
                     "body".into(),
@@ -1139,18 +1137,15 @@ impl FunctionDestination {
 
     /// Credential-bearing scalar components from the configured query.
     ///
-    /// Ordinary signed URLs carry the secret in a non-empty value. A key-only
-    /// form such as `?SIGNED_TOKEN` or `?SIGNED_TOKEN=` carries it in the key
-    /// instead; treating an empty value as "nothing sensitive" would let a
-    /// redirect copy that token into another key, value, path, or fragment.
+    /// Every non-empty key and value is independently sensitive. Selecting
+    /// only the value for an ordinary pair would let a credential-bearing key
+    /// escape under another name; selecting only the key for a key-only form
+    /// would create the inverse gap.
     fn sensitive_query_scalars(&self) -> impl Iterator<Item = &str> {
         self.sensitive_query_pairs
             .iter()
-            .filter_map(|(key, value)| {
-                let component = if value.is_empty() { key } else { value };
-                let component = component.trim_matches('/');
-                (!component.is_empty()).then_some(component)
-            })
+            .flat_map(|(key, value)| [key.as_str(), value.as_str()])
+            .filter(|component| !component.is_empty())
     }
 
     fn nested_reference_exposes_destination(&self, reference: Option<&str>, depth: usize) -> bool {
@@ -1309,12 +1304,19 @@ fn path_contains_segment_sequence(candidate: &str, sensitive: &str) -> bool {
 }
 
 fn uri_component_contains_sequence(candidate: &str, sensitive: &str) -> bool {
-    let sensitive = sensitive.trim_matches('/');
     if sensitive.is_empty() {
         return false;
     }
-    candidate.match_indices(sensitive).any(|(index, _)| {
-        let end = index + sensitive.len();
+    let component = sensitive.trim_matches('/');
+    if component.is_empty() {
+        // A non-empty configured scalar made entirely of slashes cannot be
+        // distinguished from URI structure after decoding. Match its exact
+        // slash sequence instead of silently dropping it from the sensitive
+        // set.
+        return candidate.contains(sensitive);
+    }
+    candidate.match_indices(component).any(|(index, _)| {
+        let end = index + component.len();
         let starts_at_boundary = index == 0
             || candidate
                 .as_bytes()

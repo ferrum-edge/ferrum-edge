@@ -15319,11 +15319,12 @@ components:
         when a relative, absolute, encoded, or nested target exposes the
         configured signed function path/query. Complete signed paths match at
         slash-delimited segment boundaries even with added prefix or descendant
-        segments, not inside arbitrary substrings. A non-empty query value is
-        the protected credential scalar; for a key-only form such as
-        `?SIGNED_TOKEN=`, the non-empty key is protected instead. That scalar
-        remains protected if copied into either side of another query pair or
-        into decoded paths at URI-component boundaries (including
+        segments, not inside arbitrary substrings. Every non-empty decoded key
+        and value in a configured query pair is independently protected,
+        including pairs where both components are non-empty and key-only forms
+        such as `?SIGNED_TOKEN=`. Each scalar remains protected if copied into
+        either side of another query pair or into decoded paths at
+        URI-component boundaries (including
         path-parameter/query delimiters), and decoded fragments are checked
         directly at URI-component boundaries even when they are scalar rather
         than URI-shaped. Query comparison
@@ -15410,7 +15411,7 @@ components:
         forward_body:
           type: boolean
           default: false
-          description: "Include the lossless request body in the function payload for every HTTP method. Representation follows the active hook Content-Type: JSON is structured when valid, UTF-8 bodies are strings, and other bytes are base64 with body_encoding=base64. The plugin buffers before invocation and fails closed if bytes are unavailable or the active request headers use a non-identity Content-Encoding. Candidate admission and runtime cache construction reject combination with a request-body transformer on the same protocol chain."
+          description: "Include the lossless request body in the function payload for every HTTP method. The body field is authoritative: exact UTF-8 bytes (including empty and JSON bodies) are a string with body_encoding=utf8, while other bytes use the existing base64 string with body_encoding=base64. JSON is never parsed or normalized before function egress, preserving duplicate keys, whitespace, and lexical number forms. The configured request-body limit bounds the single retained representation. The plugin buffers before invocation and fails closed if bytes are unavailable or the active request headers use a non-identity Content-Encoding. Candidate admission and runtime cache construction reject combination with a request-body transformer on the same protocol chain."
         forward_headers:
           type: array
           items:
