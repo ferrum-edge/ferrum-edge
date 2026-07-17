@@ -474,6 +474,11 @@ fn deadline_replacement_preserves_safe_decorators_and_strips_conflicting_fields(
                 ),
                 ("set-cookie".to_string(), "session=renewed".to_string()),
                 (
+                    "authorization".to_string(),
+                    "Bearer backend-secret".to_string(),
+                ),
+                ("x-internal-token".to_string(), "backend-secret".to_string()),
+                (
                     "strict-transport-security".to_string(),
                     "max-age=31536000".to_string(),
                 ),
@@ -496,7 +501,6 @@ fn deadline_replacement_preserves_safe_decorators_and_strips_conflicting_fields(
                 "traceparent",
                 "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
             ),
-            ("set-cookie", "session=renewed"),
             ("strict-transport-security", "max-age=31536000"),
         ] {
             assert_eq!(response.headers.get(name).map(String::as_str), Some(value));
@@ -508,6 +512,9 @@ fn deadline_replacement_preserves_safe_decorators_and_strips_conflicting_fields(
         assert!(!response.headers.contains_key("content-encoding"));
         assert!(!response.headers.contains_key("transfer-encoding"));
         assert!(!response.headers.contains_key("grpc-status-details-bin"));
+        assert!(!response.headers.contains_key("set-cookie"));
+        assert!(!response.headers.contains_key("authorization"));
+        assert!(!response.headers.contains_key("x-internal-token"));
 
         if let Some(content_type) = content_type {
             assert_eq!(

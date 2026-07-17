@@ -13698,11 +13698,10 @@ pub(crate) async fn log_rejected_request_with_path(
     crate::plugins::log_with_mirror_before_buffered_response(plugins, summary, ctx).await;
 }
 
-/// Keep already-applied response decorators while removing fields that describe
-/// the response representation, transport framing, cache state, or terminal
-/// gRPC outcome being replaced. `Vary: Origin` is retained explicitly because
-/// it is part of the CORS decorator contract rather than backend content
-/// negotiation for the discarded representation.
+/// Keep only known-safe response decorators when replacing an uncommitted
+/// response. The input can contain backend headers, so retaining unknown fields
+/// would risk forwarding sensitive metadata from the discarded response.
+/// `Vary: Origin` is retained explicitly as part of the CORS contract.
 fn retain_deadline_response_decorators(response_headers: &mut HashMap<String, String>) {
     let preserve_origin_vary = response_headers
         .iter()
@@ -13713,48 +13712,18 @@ fn retain_deadline_response_decorators(response_headers: &mut HashMap<String, St
                 .any(|token| token.trim().eq_ignore_ascii_case("origin"))
         });
     response_headers.retain(|name, _| {
-        ![
-            "accept-ranges",
-            "age",
-            "cache-control",
-            "cdn-cache-control",
-            "connection",
-            "content-encoding",
-            "content-digest",
-            "content-language",
-            "content-length",
-            "content-location",
-            "content-md5",
-            "content-range",
-            "content-type",
-            "digest",
-            "etag",
-            "expires",
-            "grpc-accept-encoding",
-            "grpc-encoding",
-            "grpc-message",
-            "grpc-previous-rpc-attempts",
-            "grpc-retry-pushback-ms",
-            "grpc-status",
-            "grpc-status-details-bin",
-            "keep-alive",
-            "last-modified",
-            "pragma",
-            "proxy-authenticate",
-            "proxy-connection",
-            "proxy-status",
-            "repr-digest",
-            "retry-after",
-            "surrogate-control",
-            "te",
-            "trailer",
-            "transfer-encoding",
-            "upgrade",
-            "vary",
-            "warning",
+        [
+            "access-control-allow-credentials",
+            "access-control-allow-origin",
+            "access-control-expose-headers",
+            "strict-transport-security",
+            "timing-allow-origin",
+            "traceparent",
+            "tracestate",
+            "x-correlation-id",
         ]
         .iter()
-        .any(|managed| name.eq_ignore_ascii_case(managed))
+        .any(|decorator| name.eq_ignore_ascii_case(decorator))
     });
     if preserve_origin_vary {
         response_headers.insert("vary".to_string(), "Origin".to_string());
