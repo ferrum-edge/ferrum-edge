@@ -903,6 +903,10 @@ ATTACK_PAYLOADS = {
 }
 
 STANDALONE_CROSS = re.compile(r"(?<![A-Za-z0-9_-])cross(?![A-Za-z0-9_-])")
+OPAQUE_CROSS_SUBCOMMAND = re.compile(
+    r"[\"']?(?<![A-Za-z0-9_-])cross(?![A-Za-z0-9_-])[\"']?"
+    r"\s+(?:build|check|test|run|rustc|clippy|doc|fmt|metadata|bench|clean|install)\b"
+)
 CROSS_ENVIRONMENT = re.compile(
     r"(?<![A-Za-z0-9_])(?:CROSS_[A-Z0-9_]*|DOCKER_OPTS|QEMU_STRACE|"
     r"CARGO_BUILD_TARGET)(?![A-Za-z0-9_])"
@@ -1018,6 +1022,12 @@ WRAPPED_LITERAL_CROSS = re.compile(
 SHELL_INTERPOLATION = re.compile(
     r"\$\{[^{}\n]*\}|`[^`\n]*`|"
     r"\$[A-Za-z_][A-Za-z0-9_]*|\$[0-9@*#?$!-]"
+)
+OPAQUE_EXECUTABLE_WITH_SUBCOMMAND = re.compile(
+    r"(?:^|[;&|({]\s*)[\"']?"
+    + rf"(?:{SHELL_INTERPOLATION.pattern})"
+    + r"[\"']?\s+"
+    r"(?:build|check|test|run|rustc|clippy|doc|fmt|metadata|bench|clean|install)\b"
 )
 WORKFLOW_FILENAME = re.compile(r"^[A-Za-z0-9._+@~ -]+\.(?:yml|yaml)$")
 PROTECTED_WORKFLOW_FILENAMES = frozenset({"ci.yml", "release.yml"})
@@ -6206,6 +6216,38 @@ def contains_literal_executable_cross(contents: str) -> bool:
         )
 
 
+def contains_opaque_executable_cross(contents: str) -> bool:
+    """Recognize shell interpolation variants that could execute Cross."""
+
+    logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
+    with shell_argv_dispatch_scope(logical_contents):
+        for line, shell_evaluated in logical_scan_lines(logical_contents):
+            if OPAQUE_EXECUTABLE_WITH_SUBCOMMAND.search(line) is None:
+                continue
+            literal_variants = set(
+                scan_variants(
+                    line,
+                    include_opaque_shell_executable=False,
+                    shell_evaluated=shell_evaluated,
+                )
+            )
+            for variant in scan_variants(
+                line,
+                include_opaque_shell_executable=True,
+                shell_evaluated=shell_evaluated,
+            ):
+                if variant in literal_variants:
+                    continue
+                if OPAQUE_CROSS_SUBCOMMAND.search(variant) is None:
+                    continue
+                if has_cross_command_context(
+                    variant,
+                    include_opaque_shell_executable=True,
+                ):
+                    return True
+    return False
+
+
 def is_dispatcher_manifest(name: str) -> bool:
     return PurePosixPath(name).name in DISPATCHER_MANIFEST_NAMES
 
@@ -8225,6 +8267,7 @@ def validate_automation_collection(
                 or OPAQUE_ARM_CROSS_EXECUTION.search(
                     re.sub(r"\\\r?\n[ \t]*", "", contents)
                 )
+                or contains_opaque_executable_cross(contents)
             )
         ):
             errors.append(
@@ -10023,6 +10066,22 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("safe referenced automation was rejected")
+    opaque_cross_automation = {
+        "scripts/safe.sh": (
+            "#!/bin/sh\n"
+            "cmd=$(printf '\\143\\162\\157\\163\\163')\n"
+            '"$cmd" build\n'
+        )
+    }
+    if not validate_automation_collection(
+        {"ci.yml": referenced_workflow},
+        {"setup/action.yml": safe_action},
+        opaque_cross_automation,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "trusted revalidation allowed an opaque automation Cross executable"
+        )
 
     interpreter_references = {
         "dash": "dash ci/unsafe.sh",
