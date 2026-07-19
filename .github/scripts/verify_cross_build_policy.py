@@ -6751,7 +6751,7 @@ def yaml_command_fields(
             else None
         )
         explicit_indent = (
-            field_indent + int(indent_digit) if indent_digit is not None else None
+            mapping_indent + int(indent_digit) if indent_digit is not None else None
         )
         block: list[str] = []
         index += 1
@@ -10345,6 +10345,22 @@ pre_build = []
     ):
         failures.append("custom repository shell template was not rejected")
 
+    explicit_indent_custom_shell_workflow = referenced_workflow.replace(
+        "      - run: bash scripts/safe.sh\n",
+        "      - run: |2\n"
+        "          cat <<EOF\n"
+        "        shell: ./ci/run-cross.sh {0}\n",
+    )
+    if not validate_automation_collection(
+        {"ci.yml": explicit_indent_custom_shell_workflow},
+        {"setup/action.yml": safe_action},
+        safe_automation,
+        "self-test automation directory",
+    ):
+        failures.append(
+            "explicit-indent run block swallowed custom repository shell template"
+        )
+
     dynamic_shell_workflow = referenced_workflow.replace(
         "      - run: bash scripts/safe.sh\n",
         "      - run: echo safe\n"
@@ -10360,7 +10376,7 @@ pre_build = []
 
     indented_block_workflow = referenced_workflow.replace(
         "run: bash scripts/safe.sh",
-        "run: |2-\n        bash ci/arm64.sh",
+        "run: |2-\n          bash ci/arm64.sh",
     )
     if not validate_automation_collection(
         {"ci.yml": indented_block_workflow},
