@@ -1011,6 +1011,18 @@ EXPLICIT_COMMAND_WORD_PREFIX = re.compile(
     + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
     r"(?:\(\s*)?$"
 )
+# The bare-line-start form is valid only after the caller has already established
+# that the line is shell-evaluated. Leading assignment words are still part of
+# the same simple command: `FOO=bar $cmd` dispatches the expanded word as the
+# executable, not as assignment data. Keep this separate from the explicit
+# matcher so prose and heredoc data do not regain a synthetic command start.
+BARE_COMMAND_WORD_PREFIX = re.compile(
+    r"^\s*"
+    r"(?:!\s*)?"
+    + WRAPPER_PREFIX
+    + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+    r"(?:\(\s*)?$"
+)
 WRAPPED_LITERAL_CROSS = re.compile(
     r"(?:\b(?:bash|sh)\s+-c\s+['\"][^'\"]*\bcross\s+|"
     r"(?:^|\s)(?:/[^\s'\"]+)+/cross\s+)"
@@ -4436,7 +4448,7 @@ def opaque_word_starts_command(
     prefix = line[:start].replace("\\`", "").replace("\\$", "")
     if EXPLICIT_COMMAND_WORD_PREFIX.search(prefix):
         return True
-    return starts_command and not prefix.strip()
+    return starts_command and BARE_COMMAND_WORD_PREFIX.fullmatch(prefix) is not None
 
 
 def opaque_executable_variants(
@@ -10952,6 +10964,22 @@ pre_build = []
         )
         if not surfaces and not errors:
             failures.append(f"{label} in a run block was not protected")
+
+    assignment_prefixed_commands = {
+        "assignment-prefixed composite action input": "FOO=bar ${{ inputs.cmd }}",
+        "assignment-prefixed command substitution": "FOO=bar $(plan)",
+    }
+    for label, body in assignment_prefixed_commands.items():
+        surfaces, errors = generic_workflow_cross_surfaces(
+            run_block_workflow.replace("BODY", body),
+            "self-test assignment-prefixed run block workflow",
+            include_opaque_shell_executable=True,
+        )
+        if not surfaces and not errors:
+            failures.append(f"{label} in a run block was not protected")
+
+    for label, body in assignment_prefixed_commands.items():
+        shell_automation_escapes(label, body)
 
     # The same text inside a block scalar the runner never executes is prose,
     # not a command word, and must leave the file editable.
