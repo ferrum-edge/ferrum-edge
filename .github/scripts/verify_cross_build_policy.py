@@ -1325,14 +1325,15 @@ CROSS_CAPABLE_ACTION_INPUTS = frozenset(
     }
 )
 # Isolating a release download to an exact artifact name requires naming the
-# protected target in that artifact name. `actions/upload-artifact` and
-# `actions/download-artifact` only move files between jobs and cannot start a
-# build, so — and only when pinned to a full commit SHA — the target string in
-# an artifact `name`/`path`/`pattern` is not a build-execution surface. The
-# Cross image, a `cross` executable token, and every Cross-enabling input key
-# remain surfaces for these actions like any other.
+# protected target in that artifact name. `actions/download-artifact` only
+# selects an already-published artifact for the current job; unlike
+# `actions/upload-artifact`, it does not control the artifact identity later
+# consumed by release publishing. Therefore, and only when pinned to a full
+# commit SHA, the target string in a download artifact `name`/`path`/`pattern`
+# input is not a build-execution surface. Upload artifact publication names and
+# paths remain protected surfaces like any other remote-action input.
 ARTIFACT_TRANSFER_ACTION = re.compile(
-    r"^actions/(?:up|down)load-artifact@[0-9a-f]{40}$"
+    r"^actions/download-artifact@[0-9a-f]{40}$"
 )
 ARTIFACT_INPUT_KEYS = frozenset({"name", "path", "pattern"})
 # `with:` only introduces the input mapping, so it does not itself widen the
@@ -5673,12 +5674,11 @@ def remote_action_surface_lines(
                     reason = f"input:{cross_input}"
                 continue
             if artifact_transfer and artifact_only_input_line(keys):
-                # An artifact name or path is not an execution argument. These
-                # two SHA-pinned first-party actions only move files between
-                # jobs, so naming the protected target in an artifact name
-                # cannot start a build. Everything else about them, including a
-                # `cross` executable token and every Cross-enabling input key,
-                # is still a surface.
+                # A SHA-pinned download artifact name or path is a selector for an
+                # already-published artifact, not an execution argument or a
+                # publication identity. Upload artifact names and paths are not
+                # matched by this carve-out because they can collide with, or
+                # overwrite, trusted artifact names consumed by release jobs.
                 if reason is None and any(
                     EXPECTED_IMAGE in variant or STANDALONE_CROSS.search(variant)
                     for variant in (text, decoded_yaml_text(text))
@@ -11587,12 +11587,31 @@ pre_build = []
         return surfaces
 
     if artifact_surface(artifact_action, "name", f"binary-{TARGET}"):
-        failures.append("exact ARM64 artifact name was rejected")
+        failures.append("exact ARM64 download artifact name was rejected")
     if artifact_surface(artifact_action, "path", f"downloaded/binary-{TARGET}"):
-        failures.append("exact ARM64 artifact path was rejected")
+        failures.append("exact ARM64 download artifact path was rejected")
+    upload_action = "actions/upload-artifact@" + ("a" * 40)
     for carve_label, carve_uses, carve_key, carve_value in (
-        ("unpinned artifact action", "actions/download-artifact@v8", "name", f"binary-{TARGET}"),
-        ("non-artifact action", "some/other-action@" + ("b" * 40), "name", f"binary-{TARGET}"),
+        (
+            "unpinned artifact action",
+            "actions/download-artifact@v8",
+            "name",
+            f"binary-{TARGET}",
+        ),
+        ("pinned upload artifact name", upload_action, "name", f"binary-{TARGET}"),
+        ("pinned upload artifact path", upload_action, "path", f"fake/{TARGET}"),
+        (
+            "pinned upload artifact pattern",
+            upload_action,
+            "pattern",
+            f"fake/{TARGET}/*",
+        ),
+        (
+            "non-artifact action",
+            "some/other-action@" + ("b" * 40),
+            "name",
+            f"binary-{TARGET}",
+        ),
         ("artifact action Cross token", artifact_action, "name", "cross"),
         ("artifact action Cross image", artifact_action, "name", EXPECTED_IMAGE),
         ("artifact action non-artifact key", artifact_action, "args", TARGET),
