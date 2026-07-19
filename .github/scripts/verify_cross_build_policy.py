@@ -932,10 +932,12 @@ CASE_ARM_CONTEXT = r"(?:\bin|;;)\s+\(?\s*[^\s;&|()]+(?:\s*\|\s*[^\s;&|()]+)*\)\s
 # line, or immediately inside a function body/group. `{` matters because a
 # one-line function such as `f(){ cross build ...; }` places the executable
 # directly after the brace with no other separator. Bash requires blank space
-# after that brace, and requiring it here keeps ordinary `{"cross": ...}` data
-# out of the executable slot. A bare `(` is deliberately still not a context: a
-# real subshell is already covered by the optional `\(` that follows each
-# context, whereas a bare `(` also appears literally inside quoted prose.
+# after a brace group opener, but `f(){( cross build ... );}` is also valid
+# because the brace is followed by a subshell opener; requiring either blank
+# space or a following `(` keeps ordinary `{"cross": ...}` data out of the
+# executable slot. A bare `(` is deliberately still not a context: a real
+# subshell is covered by the opener sequence that follows each context, whereas
+# a bare `(` also appears literally inside quoted prose.
 # `$(`, a backtick, and `<(`/`>(` are unambiguous executable slots, so an
 # assignment such as `out=$(cross build ...)` is one.
 # Every context except a bare line start names the executable slot explicitly,
@@ -943,7 +945,7 @@ CASE_ARM_CONTEXT = r"(?:\bin|;;)\s+\(?\s*[^\s;&|()]+(?:\s*\|\s*[^\s;&|()]+)*\)\s
 # all. A bare line start only means "command word" once the line is known to be
 # shell the runner evaluates, which `shell_evaluated_lines` decides.
 EXPLICIT_COMMAND_START_CONTEXT = (
-    r"(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|"
+    r"(?:run|shell):\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{(?:\s+|\s*(?=\())|"
     r"\$\(\s*|`\s*|[<>]\(\s*|"
     rf"{CASE_ARM_CONTEXT}|{SHELL_C_CONTEXT}|"
     r"\b(?:if|elif|while|until|then|do|else)\s+"
@@ -999,7 +1001,7 @@ CROSS_COMMAND_CONTEXT = re.compile(
     COMMAND_START_CONTEXT
     + WRAPPER_PREFIX
     + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
-    r"(?:\(\s*)?"
+    r"(?:\(\s+)*"
     + CROSS_EXECUTABLE
 )
 # The same command slot, matched against the text that precedes a word instead
@@ -1009,7 +1011,7 @@ EXPLICIT_COMMAND_WORD_PREFIX = re.compile(
     r"(?:!\s*)?"
     + WRAPPER_PREFIX
     + r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
-    r"(?:\(\s*)?$"
+    r"(?:\(\s+)*$"
 )
 WRAPPED_LITERAL_CROSS = re.compile(
     r"(?:\b(?:bash|sh)\s+-c\s+['\"][^'\"]*\bcross\s+|"
@@ -1181,8 +1183,8 @@ OPAQUE_EXPANSION = (
     r"\$\([^()\n]*\)|`[^`\n]*`)"
 )
 OPAQUE_ARM_CROSS_EXECUTION = re.compile(
-    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|\b(?:then|do|else)\s+)"
-    r"(?:\(\s*)?['\"]?"
+    r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{(?:\s+|\s*(?=\())|\b(?:then|do|else)\s+)"
+    r"(?:\(\s+)*['\"]?"
     rf"(?:[A-Za-z]*{OPAQUE_EXPANSION}['\"]?)+[A-Za-z]*['\"]?\s+"
     r"(?:\+[^\s]+\s+)?(?:build|rustc|run|test|check|clippy|doc|bench)\b"
     r"[^\n]*--target(?:=|\s+)aarch64-unknown-linux-gnu\b",
@@ -8776,6 +8778,30 @@ def self_test() -> list[str]:
     }
     if validate_cross_configuration(valid_cross):
         failures.append("valid complete Cross.toml policy was rejected")
+
+    nested_subshell_cross_forms = {
+        "nested literal subshell": (
+            "( ( cross build --target aarch64-unknown-linux-gnu ) )"
+        ),
+        "function-body subshell": (
+            "f(){( cross build --target aarch64-unknown-linux-gnu );}"
+        ),
+    }
+    for name, command in nested_subshell_cross_forms.items():
+        if not has_cross_command_context(command):
+            failures.append(f"{name} Cross executable was not recognized")
+
+    nested_opaque_cross = (
+        "cmd=$(printf '\\143\\162\\157\\163\\163'); "
+        "( ( $cmd build --target aarch64-unknown-linux-gnu ) )"
+    )
+    if not OPAQUE_ARM_CROSS_EXECUTION.search(nested_opaque_cross):
+        failures.append("nested opaque Cross executable was not recognized")
+
+    if has_cross_command_context(
+        '{"cross": "build --target aarch64-unknown-linux-gnu"}'
+    ):
+        failures.append("JSON object was mistaken for a Cross executable")
 
     cross_bypasses = {
         "global build configuration": {**valid_cross, "build": {"xargo": True}},
