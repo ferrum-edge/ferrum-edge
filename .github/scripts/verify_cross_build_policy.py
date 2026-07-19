@@ -3537,6 +3537,27 @@ def shell_invocation_mode(
     return None, False, True
 
 
+def interpreted_operand_is_inline_source(
+    interpreter: str,
+    interpreter_options: str,
+) -> bool:
+    """Return whether a matched interpreted operand is inline program source."""
+
+    executable = tool_name(interpreter.split()[-1])
+    if executable in SHELL_INTERPRETER_NAMES:
+        tokens = shell_tokens(f"{executable}{interpreter_options} __ferrum_operand__")
+        if tokens is None:
+            return False
+        command_program, _, _ = shell_invocation_mode(tokens, 0)
+        return command_program == "__ferrum_operand__"
+    return bool(
+        re.search(
+            r"(?:^|\s)--?(?:c|lc|ec|e|[cC]ommand|[eE]val)(?:\s|$)",
+            interpreter_options,
+        )
+    )
+
+
 def interpolated_inline_source(value: str) -> bool:
     """Return whether inline program source is assembled by the shell.
 
@@ -7917,8 +7938,8 @@ def block_automation_references(
 
             for match in LOCAL_COMMAND_REFERENCE.finditer(normalized_line):
                 inline_options = match.group("interpreter_options") or ""
-                if match.group("interpreted") and re.search(
-                    r"(?:^|\s)--?(?:c|lc|ec|e|[cC]ommand|[eE]val)(?:\s|$)",
+                if match.group("interpreted") and interpreted_operand_is_inline_source(
+                    match.group("interpreter") or "",
                     inline_options,
                 ):
                     # The following word is inline source code, not a repository
@@ -13190,6 +13211,12 @@ pre_build = []
         "      - {run: ./scripts/safe.sh}\n"
     )[0]:
         failures.append("flow-spelled run script was not followed")
+    for shell_errexit in ("bash -e ci/unsafe.sh", "sh -e ci/unsafe.sh"):
+        if not reference_result(f"      - run: {shell_errexit}\n")[2]:
+            failures.append(
+                f"{shell_errexit!r} was accepted as inline source instead of a "
+                "repository script"
+            )
 
     # `defaults: {run: {shell: python}}` selects the same interpreter the block
     # spelling selects, so a non-shell body cannot hide behind it.
