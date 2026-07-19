@@ -6607,6 +6607,12 @@ def quote_aware_heredoc_starts(line: str) -> tuple[tuple[int, str], ...]:
             index += 1
             continue
         if quote != "'" and line.startswith("$(", index):
+            # ``$((`` starts arithmetic expansion, not command substitution.
+            # Keep the surrounding quote state so ``<<EOF`` inside arithmetic
+            # is not mistaken for a heredoc opener.
+            if line.startswith("$((", index):
+                index += 3
+                continue
             substitutions.append(quote)
             quote = None
             index += 2
@@ -11014,6 +11020,27 @@ pre_build = []
         "substitution alone after a heredoc terminator",
         "cat <<EOF > config.yaml\nkey: value\nEOF\n$(plan)",
     )
+
+    # Arithmetic expansion uses ``<<`` as a shift operator, not a heredoc
+    # opener. Do not let a fake delimiter hide following executable lines.
+    arithmetic_heredoc_bypass = (
+        'EOF() { :; }\n'
+        'echo "$((1 <<EOF))"\n'
+        '${{ github.event.pull_request.title }}\n'
+        'EOF\n'
+    )
+    if quote_aware_heredoc_starts('echo "$((1 <<EOF))"'):
+        failures.append("arithmetic expansion was parsed as a heredoc opener")
+    arithmetic_workflow = run_block_workflow.replace(
+        "BODY", arithmetic_heredoc_bypass
+    )
+    surfaces, errors = generic_workflow_cross_surfaces(
+        arithmetic_workflow,
+        "self-test arithmetic heredoc workflow",
+        include_opaque_shell_executable=True,
+    )
+    if not surfaces and not errors:
+        failures.append("arithmetic shift expression hid a whole-command expression")
 
     # Markdown in a report is not a command slot. A backtick inside a heredoc
     # body is data, and an escaped backtick is literal text even in a real
