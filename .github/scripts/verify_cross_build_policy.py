@@ -1182,7 +1182,12 @@ OPAQUE_EXPANSION = (
 )
 OPAQUE_ARM_CROSS_EXECUTION = re.compile(
     r"(?:^\s*|(?:&&|\|\||;;|;|&|\|)\s*|\{\s+|\b(?:then|do|else)\s+)"
-    r"(?:\(\s*)?['\"]?"
+    r"(?:!\s*)?"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*"
+    r"(?:\(\s*)?"
+    + WRAPPER_PREFIX
+    + ENV_PREFIX
+    + r"?['\"]?"
     rf"(?:[A-Za-z]*{OPAQUE_EXPANSION}['\"]?)+[A-Za-z]*['\"]?\s+"
     r"(?:\+[^\s]+\s+)?(?:build|rustc|run|test|check|clippy|doc|bench)\b"
     r"[^\n]*--target(?:=|\s+)aarch64-unknown-linux-gnu\b",
@@ -9343,6 +9348,22 @@ pre_build = []
         protected_trigger_hash,
     ):
         failures.append("trusted revalidation allowed an opaque Cross executable")
+    changed_env_wrapped_shell_variable_cross = benign_workflow.replace(
+        "echo unrelated-edit",
+        "|\n          cmd=$(printf '\\143\\162\\157\\163\\163')\n"
+        '          env -i "$cmd" build --target aarch64-unknown-linux-gnu',
+    )
+    if not validate_workflow_contract(
+        changed_env_wrapped_shell_variable_cross,
+        "self-test workflow",
+        "protected-arm",
+        protected_hash,
+        protected_env_hash,
+        protected_trigger_hash,
+    ):
+        failures.append(
+            "trusted revalidation allowed an env-wrapped opaque Cross executable"
+        )
     changed_parenthesized_shell_cross = benign_workflow.replace(
         "echo unrelated-edit",
         "|\n          cmd=$(printf '\\143\\162\\157\\163\\163')\n"
