@@ -422,11 +422,14 @@ boundary therefore uses a complete allowlist rather than a field denylist:
   to a named command, or that is only data, does not occupy a command word and
   stays editable. Substituting a whole command needs both a line a shell
   evaluates and a slot on it. A raw line scan also reads a workflow's non-`run`
-  block scalars and a script's heredoc bodies, and those are never evaluated, so
-  no slot on them counts: an expression inside a `prompt: |` block, a `cat <<EOF`
-  configuration body, or a `python3 <<'PYEOF'` body is data the runner never
-  dispatches, backticks there being Markdown rather than substitutions. On a line
-  a shell does evaluate, an explicit executable slot — `run:`, a statement
+  block scalars and a script's heredoc bodies. Prose block scalars and quoted
+  heredoc bodies are not shell-evaluated, so no slot on them counts: an
+  expression inside a `prompt: |` block or a `python3 <<'PYEOF'` body is data the
+  runner never dispatches, backticks there being Markdown rather than
+  substitutions. Unquoted heredoc bodies are data at line start, but the shell
+  still evaluates command-substitution slots while constructing their input, so
+  `$()` and backticks there fail closed. On a line a shell does evaluate, an
+  explicit executable slot — `run:`, a statement
   separator, `$(`, a backtick, a conditional keyword — counts, and so does a bare
   line start, so the same expression alone on its own line inside a `run: |`
   block still fails closed. A raw source line that a backslash continuation

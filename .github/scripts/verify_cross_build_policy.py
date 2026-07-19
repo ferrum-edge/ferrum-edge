@@ -4804,11 +4804,16 @@ def literal_command_text_has_cross(
 
     logical_text = re.sub(r"\\\r?\n[ \t]*", "", text)
     evaluated = shell_evaluated_lines(logical_text)
+    non_command_starts = shell_non_command_start_lines(logical_text)
     return any(
         has_cross_command_context(variant)
         or (not executable_only and CROSS_ENVIRONMENT.search(variant))
         for index, line in enumerate(logical_text.splitlines())
-        for variant in scan_variants(line, shell_evaluated=index in evaluated)
+        for variant in scan_variants(
+            line,
+            shell_evaluated=index in evaluated,
+            starts_command=index not in non_command_starts,
+        )
     )
 
 
@@ -5012,28 +5017,33 @@ def shell_evaluated_lines(contents: str) -> frozenset[int]:
             cursor += 1
         index = cursor
 
-    delimiters: list[str] = []
+    delimiters: list[tuple[str, bool]] = []
     for cursor, line in enumerate(lines):
         if delimiters:
-            if line.strip() == delimiters[0]:
+            delimiter, quoted = delimiters[0]
+            if line.strip() == delimiter:
                 delimiters.pop(0)
             else:
-                evaluated.discard(cursor)
+                if quoted:
+                    evaluated.discard(cursor)
             continue
         delimiters.extend(
-            delimiter for _, delimiter in quote_aware_heredoc_starts(line)
+            (delimiter, quoted)
+            for _, delimiter, quoted in quote_aware_heredoc_start_details(line)
         )
     return frozenset(evaluated)
 
 
-def shell_continuation_lines(contents: str) -> frozenset[int]:
-    """Return the raw lines a backslash continuation joins onto a previous one.
+def shell_non_command_start_lines(contents: str) -> frozenset[int]:
+    """Return raw lines whose start is not a command slot.
 
     A shell reads the logical line a trailing backslash builds, not the source
     line. `$(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)` under
     ``docker buildx imagetools create ... \\`` is that command's last argument,
     so the bare line start that would otherwise let the substitution stand for
-    a whole command is not a command slot at all.
+    a whole command is not a command slot at all. Heredoc body line starts are
+    data passed to the receiving command, even when an unquoted heredoc still
+    evaluates command substitutions and backticks in that body.
 
     Only that bare-line-start allowance is withdrawn, exactly as in
     `shell_evaluated_lines`. An explicit executable slot on the continuation
@@ -5044,12 +5054,30 @@ def shell_continuation_lines(contents: str) -> frozenset[int]:
     a continuation, so `printf 'a\\\\'` does not swallow the next line.
     """
 
+    lines = contents.splitlines()
     continuations: set[int] = set()
-    for index, line in enumerate(contents.splitlines()):
+    for index, line in enumerate(lines):
         trailing = len(line) - len(line.rstrip("\\"))
         if trailing % 2 == 1:
             continuations.add(index + 1)
+    delimiters: list[str] = []
+    for cursor, line in enumerate(lines):
+        if delimiters:
+            if line.strip() == delimiters[0]:
+                delimiters.pop(0)
+            else:
+                continuations.add(cursor)
+            continue
+        delimiters.extend(
+            delimiter for _, delimiter in quote_aware_heredoc_starts(line)
+        )
     return frozenset(continuations)
+
+
+def shell_continuation_lines(contents: str) -> frozenset[int]:
+    """Return the raw lines a backslash continuation joins onto a previous one."""
+
+    return shell_non_command_start_lines(contents)
 
 
 def block_scalar_body_lines(lines: list[str]) -> frozenset[int]:
@@ -5083,7 +5111,7 @@ def block_scalar_body_lines(lines: list[str]) -> frozenset[int]:
     return frozenset(body)
 
 
-def logical_scan_lines(contents: str) -> tuple[tuple[str, bool], ...]:
+def logical_scan_lines(contents: str) -> tuple[tuple[str, bool, bool], ...]:
     """Return every command line to scan with whether a shell evaluates it.
 
     Alias and shim expansions are synthesized command text rather than source
@@ -5091,13 +5119,14 @@ def logical_scan_lines(contents: str) -> tuple[tuple[str, bool], ...]:
     """
 
     evaluated = shell_evaluated_lines(contents)
+    non_command_starts = shell_non_command_start_lines(contents)
     return (
         *(
-            (line, index in evaluated)
+            (line, index in evaluated, index not in non_command_starts)
             for index, line in enumerate(contents.splitlines())
         ),
-        *((line, True) for line in shell_alias_variants(contents)),
-        *((line, True) for line in cross_shim_variants(contents)),
+        *((line, True, True) for line in shell_alias_variants(contents)),
+        *((line, True, True) for line in cross_shim_variants(contents)),
     )
 
 
@@ -5120,11 +5149,14 @@ def contains_cross_surface(
                 include_opaque_shell_executable=include_opaque_shell_executable,
             )
             or CROSS_ENVIRONMENT.search(variant)
-            for line, shell_evaluated in logical_scan_lines(logical_contents)
+            for line, shell_evaluated, starts_command in logical_scan_lines(
+                logical_contents
+            )
             for variant in scan_variants(
                 line,
                 include_opaque_shell_executable=include_opaque_shell_executable,
                 shell_evaluated=shell_evaluated,
+                starts_command=starts_command,
             )
         )
 
@@ -5145,7 +5177,7 @@ def cross_surface_line_report(
     # Alias and shim expansions follow the source lines and are synthesized
     # rather than located, so they are reported without a line number.
     source_line_count = len(logical_contents.splitlines())
-    for number, (line, shell_evaluated) in enumerate(
+    for number, (line, shell_evaluated, starts_command) in enumerate(
         logical_scan_lines(logical_contents),
         start=1,
     ):
@@ -5153,6 +5185,7 @@ def cross_surface_line_report(
             line,
             include_opaque_shell_executable=include_opaque_shell_executable,
             shell_evaluated=shell_evaluated,
+            starts_command=starts_command,
         ):
             if has_cross_command_context(
                 variant,
@@ -5870,13 +5903,14 @@ def unprotected_cross_surfaces(
             job_reasons[name] = "opaque inline shell"
             continue
         with shell_argv_dispatch_scope(logical_contents):
-            for logical_line, shell_evaluated in logical_scan_lines(
+            for logical_line, shell_evaluated, starts_command in logical_scan_lines(
                 logical_contents
             ):
                 for variant in scan_variants(
                     logical_line,
                     include_opaque_shell_executable=include_opaque_shell_executable,
                     shell_evaluated=shell_evaluated,
+                    starts_command=starts_command,
                 ):
                     if has_cross_command_context(
                         variant,
@@ -6157,13 +6191,14 @@ def generic_action_cross_surfaces(
                     include_opaque_shell_executable=include_opaque_shell_executable,
                 )
                 or CROSS_ENVIRONMENT.search(variant)
-                for line, shell_evaluated in logical_scan_lines(
+                for line, shell_evaluated, starts_command in logical_scan_lines(
                     logical_contents
                 )
                 for variant in scan_variants(
                     line,
                     include_opaque_shell_executable=include_opaque_shell_executable,
                     shell_evaluated=shell_evaluated,
+                    starts_command=starts_command,
                 )
             )
         )
@@ -6197,11 +6232,14 @@ def contains_literal_executable_cross(contents: str) -> bool:
     with shell_argv_dispatch_scope(logical_contents):
         return any(
             has_cross_command_context(variant) or CROSS_ENVIRONMENT.search(variant)
-            for line, shell_evaluated in logical_scan_lines(logical_contents)
+            for line, shell_evaluated, starts_command in logical_scan_lines(
+                logical_contents
+            )
             for variant in scan_variants(
                 line,
                 include_opaque_shell_executable=False,
                 shell_evaluated=shell_evaluated,
+                starts_command=starts_command,
             )
         )
 
@@ -6588,7 +6626,18 @@ def repository_command_line(line: str) -> str:
 def quote_aware_heredoc_starts(line: str) -> tuple[tuple[int, str], ...]:
     """Find real shell heredoc openers without matching quoted prose."""
 
-    starts: list[tuple[int, str]] = []
+    return tuple(
+        (start, delimiter)
+        for start, delimiter, _ in quote_aware_heredoc_start_details(line)
+    )
+
+
+def quote_aware_heredoc_start_details(
+    line: str,
+) -> tuple[tuple[int, str, bool], ...]:
+    """Find real shell heredoc openers and whether their delimiter is quoted."""
+
+    starts: list[tuple[int, str, bool]] = []
     quote: str | None = None
     # A command substitution re-enters shell context, so quoting resets inside
     # it. `apply_configmap "$ctx" name "$(cat <<YAML` really does open a
@@ -6651,7 +6700,7 @@ def quote_aware_heredoc_starts(line: str) -> tuple[tuple[int, str], ...]:
                 index += 2
                 continue
             cursor += 1
-        starts.append((index, value))
+        starts.append((index, value, delimiter_quote is not None))
         index = cursor
     return tuple(starts)
 
@@ -10977,15 +11026,15 @@ pre_build = []
         if surfaces or errors:
             failures.append(f"{label} in a prose block scalar was rejected")
 
-    # A heredoc body is data the shell hands to the reader, so an expansion
-    # standing alone there is not a command word either. The `cat` form is the
-    # generated-configuration shape real automation uses.
+    # A heredoc body line start is data the shell hands to the reader, so an
+    # expansion standing alone there is not a command word either. Quoted
+    # heredoc bodies suppress substitution entirely.
     heredoc_data_scripts = {
         "expansion alone in a heredoc body": (
             'cat <<EOF > config.yaml\nkey: value\n$block\nEOF\n'
         ),
         "substitution alone in a heredoc body": (
-            'cat <<EOF > config.yaml\nkey: value\n$(render_block)\nEOF\n'
+            "cat <<'EOF' > config.yaml\nkey: value\n$(render_block)\nEOF\n"
         ),
     }
     for label, body in heredoc_data_scripts.items():
@@ -11014,10 +11063,14 @@ pre_build = []
         "substitution alone after a heredoc terminator",
         "cat <<EOF > config.yaml\nkey: value\nEOF\n$(plan)",
     )
+    shell_automation_escapes(
+        "substitution slot inside an unquoted heredoc body",
+        "cat <<EOF > config.yaml\nkey: value\n$(${{ inputs.cmd }})\nEOF\n",
+    )
 
-    # Markdown in a report is not a command slot. A backtick inside a heredoc
-    # body is data, and an escaped backtick is literal text even in a real
-    # `run:` block, so neither may stand in for a whole command.
+    # Markdown in a report is not a command slot. A backtick inside a quoted
+    # heredoc body is data, and an escaped backtick is literal text even in a
+    # real `run:` block, so neither may stand in for a whole command.
     markdown_workflow = (
         "name: Report\n"
         "on: [push]\n"
@@ -12343,11 +12396,14 @@ pre_build = []
             logical_benign = re.sub(r"\\\r?\n[ \t]*", "", benign_contents)
             matching_variants = [
                 variant
-                for line, shell_evaluated in logical_scan_lines(logical_benign)
+                for line, shell_evaluated, starts_command in logical_scan_lines(
+                    logical_benign
+                )
                 for variant in scan_variants(
                     line,
                     include_opaque_shell_executable=True,
                     shell_evaluated=shell_evaluated,
+                    starts_command=starts_command,
                 )
                 if has_cross_command_context(
                     variant,
