@@ -5052,6 +5052,32 @@ def shell_continuation_lines(contents: str) -> frozenset[int]:
     return frozenset(continuations)
 
 
+def shell_continuation_command_starts(contents: str) -> frozenset[int]:
+    """Return continuation lines whose first word is still executable argv.
+
+    Most backslash continuations make the following raw line an ordinary
+    argument to the previous command, so an opaque word at that raw line's
+    indentation is not allowed to stand for a whole command. Process wrappers
+    are different: `env \\` or `sudo \\` have not consumed the executable operand
+    yet, so the next physical line provides the argv the wrapper dispatches.
+    """
+
+    command_starts: set[int] = set()
+    evaluated_lines = shell_evaluated_lines(contents)
+    lines = contents.splitlines()
+    for index, line in enumerate(lines):
+        trailing = len(line) - len(line.rstrip("\\"))
+        if trailing % 2 != 1 or index not in evaluated_lines:
+            continue
+        tokens = shell_tokens(line.rstrip("\\"))
+        if tokens is None:
+            continue
+        position, executes = executable_index(tokens)
+        if executes and position >= len(tokens):
+            command_starts.add(index + 1)
+    return frozenset(command_starts)
+
+
 def block_scalar_body_lines(lines: list[str]) -> frozenset[int]:
     """Return every line that is block-scalar content rather than YAML syntax.
 
@@ -5107,6 +5133,26 @@ def contains_cross_surface(
     include_opaque_shell_executable: bool = False,
 ) -> bool:
     """Return whether lexical normalization exposes a Cross-controlled input."""
+
+    continuation_command_starts = shell_continuation_command_starts(contents)
+    raw_lines = contents.splitlines()
+    if any(
+        has_cross_command_context(
+            variant,
+            include_opaque_shell_executable=include_opaque_shell_executable,
+        )
+        or CROSS_ENVIRONMENT.search(variant)
+        for index in continuation_command_starts
+        if index < len(raw_lines)
+        for line in [raw_lines[index]]
+        for variant in scan_variants(
+            line,
+            include_opaque_shell_executable=include_opaque_shell_executable,
+            shell_evaluated=True,
+            starts_command=True,
+        )
+    ):
+        return True
 
     logical_contents = re.sub(r"\\\r?\n[ \t]*", "", contents)
     if OPAQUE_INLINE_SHELL.search(logical_contents) or (
@@ -5819,6 +5865,7 @@ def unprotected_cross_surfaces(
     lines = outside.splitlines(keepends=True)
     evaluated_lines = shell_evaluated_lines(outside)
     continuation_lines = shell_continuation_lines(outside)
+    continuation_command_starts = shell_continuation_command_starts(outside)
     jobs_index = next(
         index
         for index, line in enumerate(lines)
@@ -5910,7 +5957,10 @@ def unprotected_cross_surfaces(
             line,
             include_opaque_shell_executable=include_opaque_shell_executable,
             shell_evaluated=index in evaluated_lines,
-            starts_command=index not in continuation_lines,
+            starts_command=(
+                index not in continuation_lines
+                or index in continuation_command_starts
+            ),
         ):
             normalized = re.sub(r"\s+", " ", variant).strip()
             if has_cross_command_context(
@@ -11100,6 +11150,27 @@ pre_build = []
         failures.append(
             "a whole-command substitution after a separator on a continuation "
             "line was not protected"
+        )
+
+    # A continuation after a process wrapper is still executable argv, not a
+    # passive argument: the wrapper dispatches the next word as its command.
+    wrapper_continuation_surfaces, wrapper_continuation_errors = (
+        generic_workflow_cross_surfaces(
+            continuation_workflow.replace(
+                "          docker buildx imagetools create \\\n"
+                "            -t ferrumedge/ferrum-edge:latest \\\n"
+                "            $(printf 'ferrumedge/ferrum-edge@sha256:%s ' *)\n",
+                "          env \\\n"
+                "          ${{ inputs.cmd }}\n",
+            ),
+            "self-test wrapper continuation workflow",
+            include_opaque_shell_executable=True,
+        )
+    )
+    if not wrapper_continuation_surfaces and not wrapper_continuation_errors:
+        failures.append(
+            "a whole-command substitution after a wrapper continuation was not "
+            "protected"
         )
 
     # A block-scalar body is one string value. Prose in it declares no mapping
