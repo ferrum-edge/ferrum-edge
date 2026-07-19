@@ -3336,11 +3336,23 @@ def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
     if producer == "echo":
         while arguments and arguments[0] in {"-e", "-E", "-n"}:
             arguments.pop(0)
+        # Shell echo behavior varies and `echo -e` may decode escapes before a
+        # stdin-consuming shell sees the program, so keep escaped output opaque.
+        if any("\\" in argument for argument in arguments):
+            return None
         return " ".join(arguments)
     if producer != "printf" or not arguments:
         return None
     if arguments[0] in {"%s", "%s\\n"}:
+        # The `%s` forms print their operands as data; escaped operands are
+        # still opaque because the scanner does not model producer semantics.
+        if any("\\" in argument for argument in arguments[1:]):
+            return None
         return "".join(arguments[1:])
+    # Literal printf formats decode backslash escapes (`\x63ross` -> `cross`),
+    # so treating an escaped format as readable source would miss execution.
+    if "\\" in arguments[0]:
+        return None
     if "%" not in arguments[0]:
         return arguments[0]
     return None
@@ -12304,6 +12316,24 @@ pre_build = []
         "literal pipeline shell stdin after shell options",
         f"printf 'cross {arm_target}' | bash --norc",
     )
+    for escaped_label, escaped_body in {
+        "escaped printf pipeline shell stdin after shell options": (
+            f"printf '\\x63ross {arm_target}' | bash --norc"
+        ),
+        "escaped echo pipeline shell stdin after shell options": (
+            f"echo -e '\\x63ross {arm_target}' | bash --norc"
+        ),
+    }.items():
+        if not compare_pr_automation_collection(
+            {"ci.yml": referenced_workflow},
+            {"ci.yml": referenced_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            safe_automation,
+            {"scripts/safe.sh": f"#!/bin/sh\n{escaped_body}\n"},
+            "self-test automation directory",
+        ):
+            failures.append(f"{escaped_label} was not rejected by PR comparison")
     shell_automation_escapes(
         "literal here-string shell stdin",
         f"bash <<< 'cross {arm_target}'",
