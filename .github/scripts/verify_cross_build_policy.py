@@ -3315,12 +3315,23 @@ def xargs_command_index(tokens: tuple[str, ...], index: int) -> int:
 def command_has_argument(tokens: tuple[str, ...], index: int) -> bool:
     """Return whether an executable has a real operand before shell syntax."""
 
-    if index + 1 >= len(tokens):
-        return False
-    following = tokens[index + 1]
-    return following not in {"&", "&&", ")", ";", ";;", "|", "||", "}"} and (
-        not redirection_token(following)
-    )
+    index += 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"&", "&&", ")", ";", ";;", "|", "||", "}"}:
+            return False
+        if token.isdigit() and index + 1 < len(tokens) and redirection_token(
+            tokens[index + 1]
+        ):
+            index += 1
+            token = tokens[index]
+        if redirection_token(token):
+            index += 1
+            if index < len(tokens):
+                index += 1
+            continue
+        return True
+    return False
 
 
 def literal_producer_output(tokens: tuple[str, ...]) -> str | None:
