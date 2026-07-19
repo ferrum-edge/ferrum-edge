@@ -1131,11 +1131,13 @@ LOCAL_COMMAND_REFERENCE = re.compile(
     r"ps1)))|"
     r"(?P<direct>(?:'\./[A-Za-z0-9._+@~ /-]+'|"
     r"\"\./[A-Za-z0-9._+@~ /-]+\"|\./[A-Za-z0-9._+@~/-]+))|"
-    r"(?P<bare>(?:'[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|"
-    r"js|mjs|cjs|ts|ps1)'|\"[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|"
-    r"awk|php|R|js|mjs|cjs|ts|ps1)\"|[A-Za-z0-9._+@~-]+"
-    r"(?:/[A-Za-z0-9._+@~-]+)+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|js|mjs|"
-    r"cjs|ts|ps1))))"
+    r"(?P<bare>(?:'(?:[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|"
+    r"js|mjs|cjs|ts|ps1)|(?:ci|bin|build|tool|tools|dev|hack)/[A-Za-z0-9._+@~ /-]+)'|"
+    r"\"(?:[A-Za-z0-9._+@~ /-]+\.(?:sh|bash|pyc|pyo|py|rb|pl|awk|php|R|js|mjs|"
+    r"cjs|ts|ps1)|(?:ci|bin|build|tool|tools|dev|hack)/[A-Za-z0-9._+@~ /-]+)\"|"
+    r"[A-Za-z0-9._+@~-]+(?:/[A-Za-z0-9._+@~-]+)+\.(?:sh|bash|pyc|pyo|py|rb|pl|"
+    r"awk|php|R|js|mjs|cjs|ts|ps1)|"
+    r"(?:ci|bin|build|tool|tools|dev|hack)/[A-Za-z0-9._+@~-]+(?:/[A-Za-z0-9._+@~-]+)*)))"
 )
 YAML_RUN_FIELD = re.compile(
     r"^(?P<indent> *)(?:-\s*)?"
@@ -7714,7 +7716,11 @@ def automation_command_scripts(
         ], []
     language = automation_language(source, contents)
     if language == "python":
-        commands, errors = python_command_scripts(contents, source)
+        commands, errors = python_command_scripts(
+            contents,
+            source,
+            reject_dynamic_commands=True,
+        )
         return [("shell", command) for command in commands], errors
     if language == "shell":
         return [("shell", contents)], []
@@ -8257,6 +8263,7 @@ def validate_automation_collection(
             process_commands, process_failures = python_command_scripts(
                 contents,
                 f"{source}/{name}",
+                reject_dynamic_commands=True,
             )
             errors.extend(process_failures)
             if any(
@@ -10038,6 +10045,7 @@ pre_build = []
         "Bun": "bun ci/unsafe.ts",
         "BusyBox shell": "busybox sh ci/unsafe.sh",
         "nested shell interpreter": "sh -c 'dash ci/unsafe.sh'",
+        "extensionless bare executable": "ci/unsafe",
     }
     for interpreter_label, command in interpreter_references.items():
         interpreter_workflow = referenced_workflow.replace(
@@ -10777,6 +10785,21 @@ pre_build = []
         "run = subprocess.run\n"
         f"run(['sh', '-c', 'cross build --target {TARGET}'])\n",
     )
+
+    indirect_python_repository_command = {
+        "scripts/safe.py": (
+            "import subprocess\n"
+            "cmd = ['python3', 'ci/unsafe.py']\n"
+            "subprocess.run(cmd, check=True)\n"
+        ),
+    }
+    if not validate_automation_collection(
+        {"ci.yml": python_workflow},
+        {"setup/action.yml": safe_action},
+        indirect_python_repository_command,
+        "self-test automation directory",
+    ):
+        failures.append("indirect Python repository command was not rejected")
 
     benign_python = {
         "scripts/safe.py": (
