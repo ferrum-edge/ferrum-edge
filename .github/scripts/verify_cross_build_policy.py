@@ -2856,17 +2856,26 @@ def word_splitting_variants(value: str) -> tuple[str, ...]:
         # executable or subcommand out of literal text that is already present.
         return ()
     spans = [match.span() for match in WORD_SPLIT_EXPANSION.finditer(value)]
-    if not spans or len(spans) > MAXIMUM_WORD_SPLIT_EXPANSIONS:
+    if not spans:
         return ()
+
+    all_split_parts: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        all_split_parts.extend((value[cursor:start], " "))
+        cursor = end
+    all_split_parts.append(value[cursor:])
+    all_split_variant = "".join(all_split_parts)
+
+    if len(spans) > MAXIMUM_WORD_SPLIT_EXPANSIONS:
+        # The cap is only for the one-at-a-time variants. Returning no variants
+        # here would fail open for a line padded with harmless expansions before
+        # a Cross-containing split word, so keep the conservative all-split view.
+        return (all_split_variant,)
+
     variants = [value[:start] + " " + value[end:] for start, end in spans]
     if len(spans) > 1:
-        parts: list[str] = []
-        cursor = 0
-        for start, end in spans:
-            parts.extend((value[cursor:start], " "))
-            cursor = end
-        parts.append(value[cursor:])
-        variants.append("".join(parts))
+        variants.append(all_split_variant)
     return tuple(
         dict.fromkeys(variant for variant in variants if variant != value)
     )
@@ -9662,6 +9671,11 @@ pre_build = []
         ),
         "command-substitution word split": (
             "cross$(printf ' ')build --target aarch64-unknown-linux-gnu"
+        ),
+        "capped word-split padding": (
+            ": x$A0 x$A1 x$A2 x$A3 x$A4 x$A5 x$A6 x$A7 "
+            "x$A8 x$A9 x$A10 x$A11 x$A12 x$A13 x$A14 x$A15; "
+            "cross${IFS}build --target aarch64-unknown-linux-gnu"
         ),
     }
     for label, command in word_splitting_bypasses.items():
