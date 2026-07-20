@@ -7454,6 +7454,7 @@ def contains_direct_trusted_shell_cross_surface(contents: str) -> bool:
         # code without putting a Cross word in the surrounding shell command.
         # Reuse their token model here so reached trusted shell scripts enforce
         # the same boundary as workflow `run:` fields.
+        or shell_inline_interpreter_has_cross(command_text)
         or any(
             shell_inline_interpreter_has_cross(line)
             for line, shell_evaluated, _ in logical_scan_lines(command_text)
@@ -17158,6 +17159,21 @@ pre_build = []
             "quoted heredoc data was reported as a generated inline shell "
             "surface"
         )
+    multiline_inline_interpreters = {
+        "Ruby": "ruby -e '\nsystem(\"cross build\")\n'\n",
+        "Python": (
+            "python3 -c '\n"
+            "import subprocess\n"
+            "subprocess.run([\"cross\", \"build\"])\n"
+            "'\n"
+        ),
+    }
+    for label, program in multiline_inline_interpreters.items():
+        if not contains_direct_trusted_shell_cross_surface(program):
+            failures.append(
+                f"a multiline {label} inline interpreter Cross surface was missed"
+            )
+
     # The discriminating control puts the identical words on a real command
     # line, where the inline shell really is generated and must fail closed.
     if not contains_direct_trusted_shell_cross_surface('bash -c "$(render)"\n'):
