@@ -7652,6 +7652,9 @@ def automation_file_cross_surfaces(
         or (language is None and PurePosixPath(name).suffix == "")
         or is_dispatcher_manifest(name)
     )
+    if not shell_reading and CROSS_ENVIRONMENT.search(contents):
+        digest = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+        surfaces.append(f"cross-environment:{digest}")
     if heredoc_shell_reading:
         heredoc_programs, heredoc_failures = executable_heredocs(contents, name)
         heredoc_sensitive, heredoc_runtime_failures = runtime_program_cross_surface(
@@ -17327,6 +17330,33 @@ pre_build = []
                 f"wrapped literal={bool(WRAPPED_LITERAL_CROSS.search(logical_benign))!r}"
             )
 
+    def python_automation_surface_change_is_rejected(label: str, body: str) -> None:
+        proposed = {"scripts/safe.py": body}
+        if not compare_pr_automation_collection(
+            {"ci.yml": python_workflow},
+            {"ci.yml": python_workflow},
+            {"setup/action.yml": safe_action},
+            {"setup/action.yml": safe_action},
+            python_baseline,
+            proposed,
+            "self-test automation directory",
+        ):
+            failures.append(f"{label} was not rejected by PR comparison")
+
+    python_automation_surface_change_is_rejected(
+        "Python Cross environment assignment",
+        "import os\n"
+        "import subprocess\n"
+        "os.environ['CROSS_CONTAINER_IN_CONTAINER'] = '1'\n"
+        "subprocess.run(['cargo', 'build', '--locked'])\n",
+    )
+    python_automation_surface_change_is_rejected(
+        "Python Docker options assignment",
+        "import os\n"
+        "import subprocess\n"
+        "os.environ['DOCKER_OPTS'] = '--privileged'\n"
+        "subprocess.run(['cargo', 'build', '--locked'])\n",
+    )
     python_automation_escapes(
         "literal subprocess shell input",
         "import subprocess\n"
