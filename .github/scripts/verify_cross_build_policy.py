@@ -7619,14 +7619,17 @@ def automation_file_cross_surfaces(
     """
 
     language = automation_language(name, contents)
-    # A known Python or PowerShell file is not POSIX shell text. Its dedicated
-    # interpreter scanner below is authoritative unless a call site also runs
-    # it through a shell, in which case provenance deliberately adds that
-    # second reading. Scanning Python source as shell made benign calls such as
-    # `run(['bash'], input='cargo test')` into synthetic shell syntax and froze
-    # an otherwise empty Cross surface.
-    shell_reading = language not in {"python", "powershell"} or (
-        "shell" in interpreters
+    # Suffixless automation can be consumed as generated shell by a caller
+    # (`eval "$(./scripts/build)"`) without that output-to-shell edge appearing
+    # in the interpreter provenance model. Keep explicit Python/PowerShell
+    # scanners authoritative for suffixed files, but preserve the conservative
+    # shell surface scan for suffixless files so generated Cross shell cannot be
+    # hidden behind an automation shebang.
+    suffixless_automation = PurePosixPath(name).suffix == ""
+    shell_reading = (
+        language not in {"python", "powershell"}
+        or suffixless_automation
+        or "shell" in interpreters
     )
     surfaces = (
         list(
@@ -7642,14 +7645,14 @@ def automation_file_cross_surfaces(
         if shell_reading
         else []
     )
-    # Nested heredocs belong to this reading too. A suffixless file only needs
-    # the fallback shell interpretation when its own contents name no language;
-    # an explicit Python/PowerShell shebang remains authoritative unless the
-    # call graph supplies shell provenance.
+    # Nested heredocs belong to this reading too. A suffixless file keeps this
+    # conservative shell reading even with an explicit automation shebang, since
+    # callers can execute its stdout as shell without recording shell
+    # interpreter provenance for the file itself.
     heredoc_shell_reading = shell_reading and (
         language == "shell"
         or "shell" in interpreters
-        or (language is None and PurePosixPath(name).suffix == "")
+        or suffixless_automation
         or is_dispatcher_manifest(name)
     )
     if heredoc_shell_reading:
@@ -10650,8 +10653,7 @@ def validate_automation_collection(
             and (
                 language == "shell"
                 or (
-                    language is None
-                    and PurePosixPath(name).suffix == ""
+                    PurePosixPath(name).suffix == ""
                     and not is_dispatcher_manifest(name)
                 )
             )
@@ -10695,14 +10697,13 @@ def validate_automation_collection(
                     f"{source}/{name} contains an unprotected literal Python "
                     "Cross process call"
                 )
-        # A file whose own evidence names no language is still read as shell by
-        # the extensionless branch above. When an invocation identified it as
-        # Python, that reading is additionally performed here rather than
-        # replacing the shell one: the two are a union, so nothing a prior class
-        # already rejected stops being rejected, and `python3 ci/unsafe` no
-        # longer hides `subprocess.run(cmd)` behind a missing suffix. A Python
-        # shebang is its own evidence and does not receive the fallback shell
-        # reading unless a call site explicitly supplies shell provenance.
+        # A suffixless automation file is still read as shell by the
+        # extensionless branch above, even when its own shebang names Python or
+        # PowerShell: callers can execute generated stdout via shell constructs
+        # such as `eval "$(./scripts/build)"`, and that output-to-shell edge is
+        # not represented in interpreter provenance. When an invocation also
+        # identified it as Python, that reading is additionally performed here
+        # rather than replacing the shell one: the readings are a union.
         if (
             contents is not None
             and language != "python"
@@ -17439,10 +17440,12 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append("benign extensionless Python automation was rejected")
-    # A suffixless file with an explicit Python shebang is Python source, not a
-    # POSIX-shell polyglot. Heredoc-looking text inside a Python string is data
-    # unless a call site separately invokes the file through a shell. Exact-tree
-    # validation and PR surface comparison must make the same decision.
+    # A suffixless file with an explicit Python shebang can still generate shell
+    # that the workflow executes later with constructs such as
+    # `eval "$(./scripts/build)"`. Because provenance tracks how the file is
+    # invoked, not how stdout is consumed, exact-tree validation and PR surface
+    # comparison conservatively keep the fallback shell surface scan for
+    # suffixless automation.
     extensionless_python_template = {
         "scripts/build": (
             "#!/usr/bin/env -S python3 -I\n"
@@ -17453,16 +17456,16 @@ pre_build = []
             "print(template)\n"
         )
     }
-    if validate_automation_collection(
+    if not validate_automation_collection(
         {"ci.yml": extensionless_workflow},
         {"setup/action.yml": safe_action},
         extensionless_python_template,
         "self-test automation directory",
     ):
         failures.append(
-            "heredoc-looking data in extensionless Python was read as shell"
+            "generated shell Cross in extensionless Python was accepted"
         )
-    if compare_pr_automation_collection(
+    if not compare_pr_automation_collection(
         {"ci.yml": extensionless_workflow},
         {"ci.yml": extensionless_workflow},
         {"setup/action.yml": safe_action},
@@ -17472,7 +17475,7 @@ pre_build = []
         "self-test automation directory",
     ):
         failures.append(
-            "heredoc-looking extensionless Python data changed the PR Cross surface"
+            "generated shell Cross in extensionless Python did not change the PR Cross surface"
         )
     for label, proposed in (
         ("extensionless Python", extensionless_python_cross),
