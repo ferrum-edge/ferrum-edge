@@ -57,6 +57,22 @@ impl Algorithm {
     }
 }
 
+/// Outcome of `Accept-Encoding` negotiation for one response (RFC 9110
+/// §12.5.3). Compared against every representation Ferrum can produce —
+/// each configured algorithm and the uncoded (identity) representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodingSelection {
+    /// Compress the backend's identity response with the selected algorithm.
+    Compress(Algorithm),
+    /// Send the representation without a content coding: identity is the
+    /// most preferred acceptable representation, or the only acceptable one.
+    Identity,
+    /// Every available representation, including identity, has quality zero —
+    /// the client refused all of them (for example `identity;q=0` combined
+    /// with `gzip;q=0, br;q=0`, or `*;q=0` without an identity override).
+    NotAcceptable,
+}
+
 /// Default MIME types eligible for compression (matches Envoy's defaults + common API types).
 const DEFAULT_CONTENT_TYPES: &[&str] = &[
     "application/json",
@@ -226,29 +242,45 @@ impl CompressionPlugin {
         })
     }
 
-    /// Parse `Accept-Encoding` and select the best algorithm from our configured set.
+    /// Parse `Accept-Encoding` and negotiate the representation coding among
+    /// the configured algorithms and `identity` (RFC 9110 §12.5.3).
     ///
-    /// Selection: highest q-value wins. Ties broken by server preference order
-    /// (the `algorithms` config array). Wildcard `*` matches all configured
-    /// algorithms at whatever q-value `*` carries, but per RFC 9110 §12.5.3 a
-    /// more specific entry takes precedence over `*` — so an explicit
-    /// `gzip;q=0` excludes gzip even when `*` is present with `q>0`.
+    /// Selection: highest q-value wins across every representation Ferrum can
+    /// produce, including the uncoded (identity) representation. Ties are
+    /// broken by server preference order (the `algorithms` config array), so
+    /// an algorithm tied with identity still compresses. Wildcard `*` matches
+    /// every coding not explicitly listed — including identity — at whatever
+    /// q-value `*` carries, but a more specific entry takes precedence over
+    /// `*` — so an explicit `gzip;q=0` excludes gzip even when `*` is present
+    /// with `q>0`, and an explicit `identity` entry overrides a wildcard
+    /// identity quality. Identity weights use the strict RFC 9110 §12.4.2
+    /// qvalue grammar: a malformed identity or wildcard qvalue is ignored
+    /// rather than read as a refusal of identity, matching the shared
+    /// identity-acceptability predicate in `response_representation`.
+    ///
+    /// Identity is special per RFC 9110 §12.5.3: it is acceptable by default
+    /// (q=1) unless explicitly refused with `identity;q=0` or with `*;q=0`
+    /// without a more-specific identity entry. An unlisted configured
+    /// algorithm is instead unacceptable (q=0) unless the wildcard assigns it
+    /// a quality.
     ///
     /// This is a two-pass parse rather than a single fused loop: pass 1 records
     /// each codec's explicit q-value (when its exact token appears, capturing
-    /// `q=0` refusals) and the wildcard q-value; pass 2 resolves each configured
-    /// algorithm's effective q (explicit wins over wildcard) and applies the
-    /// `q <= 0` not-acceptable gate and the highest-q / server-preference
-    /// tie-break.
-    fn select_algorithm(&self, accept_encoding: &str) -> Option<Algorithm> {
-        // Pass 1: scan every token once, recording the explicit q-value for each
-        // codec we support and the wildcard q-value. `None` means "no explicit
-        // entry for this codec". Later duplicate tokens overwrite earlier ones
-        // (last value wins), matching the previous single-loop behaviour for
-        // repeated identical tokens.
+    /// `q=0` refusals) and the wildcard q-value; pass 2 resolves each
+    /// candidate's effective q (explicit wins over wildcard), compares it
+    /// against identity's effective q, and applies the `q <= 0`
+    /// not-acceptable gate and the highest-q / server-preference tie-break.
+    fn select_algorithm(&self, accept_encoding: &str) -> CodingSelection {
+        // Pass 1: scan every token once, recording the explicit q-value for
+        // each codec we negotiate and the wildcard q-value. `None` means "no
+        // explicit entry for this codec". Later duplicate tokens overwrite
+        // earlier ones (last value wins), matching the previous single-loop
+        // behaviour for repeated identical tokens.
         let mut explicit_gzip: Option<f32> = None;
         let mut explicit_br: Option<f32> = None;
+        let mut explicit_identity: Option<f32> = None;
         let mut wildcard: Option<f32> = None;
+        let mut wildcard_identity: Option<f32> = None;
 
         for part in accept_encoding.split(',') {
             let part = part.trim();
@@ -261,13 +293,30 @@ impl CompressionPlugin {
                 explicit_gzip = Some(quality);
             } else if encoding.eq_ignore_ascii_case("br") {
                 explicit_br = Some(quality);
+            } else if encoding.eq_ignore_ascii_case("identity") {
+                // A malformed identity qvalue is ignored, never read as a
+                // refusal: only a well-formed `q=0` weight may forbid
+                // identity (mirrors the shared identity-acceptability
+                // predicate in `response_representation`).
+                if let Some(q) = rfc9110_entry_quality(part) {
+                    explicit_identity = Some(q);
+                }
             } else if encoding == "*" {
                 wildcard = Some(quality);
+                if let Some(q) = rfc9110_entry_quality(part) {
+                    wildcard_identity = Some(q);
+                }
             }
         }
 
+        // Identity is acceptable by default; an explicit identity entry or a
+        // well-formed wildcard weight (in that precedence) can lower or
+        // refuse it.
+        let identity_q = explicit_identity.or(wildcard_identity).unwrap_or(1.0);
+
         // Pass 2: resolve each configured algorithm's effective q (its explicit
-        // entry wins over the wildcard) and pick the best one.
+        // entry wins over the wildcard; unlisted without wildcard means
+        // unacceptable) and pick the best one.
         let mut best: Option<(Algorithm, f32, usize)> = None; // (algo, q, server_pref_index)
         for (pref_idx, &algo) in self.config.algorithms.iter().enumerate() {
             let explicit = match algo {
@@ -275,10 +324,7 @@ impl CompressionPlugin {
                 Algorithm::Brotli => explicit_br,
             };
             // Explicit entry takes precedence over the wildcard fallback.
-            let effective_q = match explicit.or(wildcard) {
-                Some(q) => q,
-                None => continue,
-            };
+            let effective_q = explicit.or(wildcard).unwrap_or(0.0);
             if effective_q <= 0.0 {
                 continue;
             }
@@ -291,7 +337,17 @@ impl CompressionPlugin {
             }
         }
 
-        best.map(|(algo, _, _)| algo)
+        match best {
+            // A configured algorithm beats or ties identity: server preference
+            // keeps compressing on ties, preserving prior behavior.
+            Some((algo, q, _)) if q >= identity_q => CodingSelection::Compress(algo),
+            // Identity is the most preferred acceptable representation, or the
+            // only acceptable one.
+            _ if identity_q > 0.0 => CodingSelection::Identity,
+            // Every representation Ferrum can produce — every configured
+            // algorithm and identity — has quality zero.
+            _ => CodingSelection::NotAcceptable,
+        }
     }
 
     /// Check if the content type is eligible for compression.
@@ -566,6 +622,46 @@ fn parse_encoding_quality(token: &str) -> (&str, f32) {
     } else {
         (token.trim(), 1.0)
     }
+}
+
+/// Parse one `Accept-Encoding` member's qvalue under the RFC 9110 §12.4.2
+/// grammar (`qvalue = ( "0" [ "." *3DIGIT ] ) / ( "1" [ "." *3"0" ] )`).
+///
+/// Returns the member's effective quality, defaulting to 1.0 when no `q`
+/// parameter is present. Returns `None` when a `q` parameter is present but
+/// malformed, so callers can ignore the entry rather than read it as a
+/// refusal: only a well-formed `q=0` weight may forbid a coding. Reading
+/// unparseable input as `q=0` would turn otherwise-servable traffic into a
+/// negotiation error — the same fail-safe posture as the shared
+/// identity-acceptability predicate in `response_representation`.
+fn rfc9110_entry_quality(token: &str) -> Option<f32> {
+    let Some(semi_idx) = token.find(';') else {
+        return Some(1.0);
+    };
+    for param in token[semi_idx + 1..].split(';') {
+        let Some((name, value)) = param.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("q") {
+            continue;
+        }
+        let value = value.trim();
+        // Grammar check before numeric conversion: `0[.0*3DIGIT]` or
+        // `1[.0*3("0")]` — anything else (extra fraction digits, signs,
+        // exponents, out-of-range weights) is malformed.
+        let (units, fraction) = value.split_once('.').unwrap_or((value, ""));
+        let well_formed = fraction.len() <= 3
+            && match units {
+                "0" => fraction.bytes().all(|b| b.is_ascii_digit()),
+                "1" => fraction.bytes().all(|b| b == b'0'),
+                _ => false,
+            };
+        if !well_formed {
+            return None;
+        }
+        return value.parse::<f32>().ok().filter(|q| q.is_finite());
+    }
+    Some(1.0)
 }
 
 fn request_no_transform(ctx: &RequestContext, headers: &HashMap<String, String>) -> bool {
@@ -964,9 +1060,27 @@ impl Plugin for CompressionPlugin {
             .get(REQUEST_ACCEPT_ENCODING_METADATA_KEY)
             .or_else(|| ctx.headers.get("accept-encoding"));
 
-        let algorithm = match accept_encoding.and_then(|ae| self.select_algorithm(ae)) {
-            Some(algo) => algo,
-            None => return PluginResult::Continue,
+        let algorithm = match accept_encoding.map(|ae| self.select_algorithm(ae)) {
+            Some(CodingSelection::Compress(algo)) => algo,
+            // No Accept-Encoding field, or identity is the most preferred /
+            // only acceptable representation: forward the uncoded response.
+            Some(CodingSelection::Identity) | None => return PluginResult::Continue,
+            // The client refused identity and every configured algorithm
+            // (RFC 9110 §12.5.3). The response is eligible for gateway
+            // compression, but no representation Ferrum can produce is
+            // acceptable — fail the negotiation instead of sending an
+            // explicitly excluded identity representation. No compression
+            // fields or body transforms are committed on this path.
+            Some(CodingSelection::NotAcceptable) => {
+                return PluginResult::Reject {
+                    status_code: 406,
+                    body: "{\"error\":\"not acceptable: no available content coding matches the request Accept-Encoding\"}".to_string(),
+                    headers: HashMap::from([
+                        ("content-type".to_string(), "application/json".to_string()),
+                        ("vary".to_string(), "Accept-Encoding".to_string()),
+                    ]),
+                };
+            }
         };
 
         // Record authoritative ownership outside public plugin metadata so

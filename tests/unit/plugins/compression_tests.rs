@@ -371,6 +371,222 @@ async fn test_q_zero_rejects_algorithm() {
     assert_eq!(resp_headers.get("content-encoding").unwrap(), "br");
 }
 
+// ────────────────────── Identity negotiation (RFC 9110 §12.5.3) ──────────────────────
+
+#[tokio::test]
+async fn test_higher_identity_quality_sends_uncoded_response() {
+    // identity;q=1 beats gzip;q=0.2: the uncoded representation is the most
+    // preferred acceptable one, so the gateway must not compress.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("identity;q=1, gzip;q=0.2"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!resp_headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_identity_tie_keeps_server_compression_preference() {
+    // gzip and identity tied at q=1: server preference order keeps the
+    // existing behavior of compressing.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip, identity;q=1"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+}
+
+#[tokio::test]
+async fn test_identity_refusal_with_acceptable_algorithm_still_compresses() {
+    // identity;q=0 excludes the uncoded representation, but gzip;q=0.5 is
+    // acceptable and is the only acceptable representation Ferrum can produce.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("identity;q=0, gzip;q=0.5"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+}
+
+#[tokio::test]
+async fn test_refused_algorithms_without_identity_exclusion_send_identity() {
+    // gzip/br refused but identity not excluded: identity is acceptable by
+    // default (RFC 9110 §12.5.3), so the response is sent uncoded.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip;q=0, br;q=0"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!resp_headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_wildcard_refusal_with_identity_override_sends_identity() {
+    // `*;q=0` refuses every coding including identity, but the more-specific
+    // identity entry overrides the wildcard (RFC 9110 §12.5.3).
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("*;q=0, identity;q=1"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!resp_headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_wildcard_quality_applies_to_unlisted_algorithms_and_identity() {
+    // `*;q=0.3` assigns q=0.3 to unlisted gzip/br; identity;q=0 refuses the
+    // uncoded representation. The wildcard algorithm is the only acceptable
+    // representation, so the gateway compresses with its preferred algorithm.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("identity;q=0, *;q=0.3"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+}
+
+#[tokio::test]
+async fn test_no_acceptable_representation_returns_406() {
+    // Every representation Ferrum can produce has quality zero: identity and
+    // all configured algorithms are refused. The negotiation must fail with
+    // 406 instead of sending an explicitly excluded identity representation,
+    // and no compression fields may be committed (RFC 9110 §12.5.3).
+    for accept_encoding in [
+        "gzip;q=0, br;q=0, identity;q=0",
+        "zstd, identity;q=0",
+        "*;q=0",
+    ] {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_ctx(Some(accept_encoding));
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "application/json".to_string());
+        resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+        let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        match result {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
+                assert_eq!(status_code, 406, "Accept-Encoding: {accept_encoding}");
+                assert!(body.contains("not acceptable"));
+                assert!(!headers.contains_key("content-encoding"));
+                assert_eq!(headers.get("vary").map(String::as_str), Some("Accept-Encoding"));
+            }
+            other => panic!("expected 406 for {accept_encoding:?}, got {other:?}"),
+        }
+        // No compression fields were committed to the backend response.
+        assert!(!resp_headers.contains_key("content-encoding"));
+    }
+}
+
+#[tokio::test]
+async fn test_malformed_identity_qvalue_is_not_a_refusal() {
+    // A malformed identity qvalue cannot express a refusal: only a
+    // well-formed RFC 9110 §12.4.2 `q=0` weight forbids identity. Unparseable
+    // input leaves identity acceptable, so the request is served uncoded
+    // instead of producing a 406 (parity with the shared
+    // `identity_coding_is_acceptable` predicate in `response_representation`).
+    for accept_encoding in [
+        "gzip;q=0, br;q=0, identity;q=bogus",
+        // Four fraction digits fall outside the qvalue grammar.
+        "gzip;q=0, br;q=0, identity;q=0.0000",
+        "zstd, *;q=bogus",
+    ] {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_ctx(Some(accept_encoding));
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "application/json".to_string());
+        resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+        let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "malformed identity qvalue must not produce a 406: {accept_encoding}"
+        );
+        assert!(!resp_headers.contains_key("content-encoding"));
+    }
+}
+
+#[tokio::test]
+async fn test_406_not_applied_to_compression_ineligible_response() {
+    // The negotiation failure only applies when the response is eligible for
+    // gateway compression. A non-whitelisted content type cannot be recoded
+    // by Ferrum at all, so it is forwarded as the only available (identity)
+    // representation rather than replaced by a gateway negotiation error.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("*;q=0"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "image/png".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!resp_headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_empty_accept_encoding_value_sends_identity() {
+    // An empty field value makes only the identity coding acceptable
+    // (RFC 9110 §12.5.3); the response is forwarded uncoded.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some(""));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!resp_headers.contains_key("content-encoding"));
+}
+
 // ────────────────────── Skip conditions ──────────────────────
 
 #[tokio::test]
@@ -1861,12 +2077,14 @@ async fn test_malformed_q_value_does_not_outrank_valid_codec() {
 /// (q=0) so it neither wins selection nor poisons the highest-q tie-break math.
 #[tokio::test]
 async fn test_nan_q_value_does_not_poison_selection() {
-    // gzip;q=NaN must be excluded; br;q=0.5 is the only acceptable codec.
+    // gzip;q=NaN must be excluded. br;q=0.5 is the only acceptable configured
+    // codec, but it still loses to identity, which is acceptable by default at
+    // q=1 (RFC 9110 §12.5.3) — so no gateway encoding is applied and the
+    // response is sent uncoded.
     let selected = negotiate_encoding(json!(["gzip", "br"]), "gzip;q=NaN, br;q=0.5").await;
     assert_eq!(
-        selected.as_deref(),
-        Some("br"),
-        "NaN q must be treated as not acceptable and must not dominate the tie-break"
+        selected, None,
+        "NaN q must be treated as not acceptable, and br;q=0.5 loses to the default identity quality"
     );
 
     // And when NaN is the only entry for the only codec, nothing is applied.

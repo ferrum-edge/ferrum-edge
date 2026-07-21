@@ -2974,7 +2974,7 @@ config:
 
 ### `compression`
 
-On-the-fly response compression and request decompression. Negotiates the best algorithm via the client's `Accept-Encoding` header (RFC 9110 §12.5.3). Supports gzip and brotli.
+On-the-fly response compression and request decompression. Negotiates the best algorithm via the client's `Accept-Encoding` header (RFC 9110 §12.5.3), including the `identity` (uncoded) representation. Supports gzip and brotli.
 
 **Priority:** 4050
 
@@ -3009,7 +3009,9 @@ On-the-fly response compression and request decompression. Negotiates the best a
 6. Response has a strong `ETag` validator. Weak validators (`W/"..."`) remain eligible for compression
 7. Response `Content-Type` is not in the whitelist
 8. Response `Content-Length` is below `min_content_length`
-9. Client did not send `Accept-Encoding` with a supported algorithm
+9. Client did not send `Accept-Encoding` with a supported algorithm, or the `identity` (uncoded) representation is the most preferred acceptable one
+
+**Content negotiation (RFC 9110 §12.5.3):** The gateway compares every representation it can produce — each configured algorithm and the uncoded (`identity`) representation — and serves the most preferred acceptable one. Identity is acceptable by default (q=1) unless the client refuses it with `identity;q=0` or with `*;q=0` without a more-specific `identity` entry; an unlisted configured algorithm is unacceptable unless the wildcard assigns it a quality. Explicit entries take precedence over the wildcard, and the `algorithms` server preference order breaks ties (so an algorithm tied with identity still compresses). Only a well-formed `q=0` weight can forbid identity: a malformed qvalue on an `identity` entry — or on the wildcard entry as it applies to identity — is ignored rather than read as a refusal. When the response is eligible for gateway compression but the client refuses identity and every configured algorithm (for example `gzip;q=0, br;q=0, identity;q=0`, `zstd, identity;q=0`, or `*;q=0`), no representation Ferrum can produce is acceptable and the plugin rejects the response with `406 Not Acceptable` (`Vary: Accept-Encoding`) instead of sending an explicitly excluded identity representation. Responses that are not compression-eligible (skip conditions above) are the only available representation and are forwarded as-is.
 
 **Behavior:**
 - Strips `Accept-Encoding` from backend requests (configurable) so the backend sends uncompressed responses for the gateway to compress
