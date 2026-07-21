@@ -352,8 +352,7 @@ async fn h3_zero_operator_timeout_still_honors_native_grpc_absolute_deadline() {
     // but a native gRPC request's `grpc-timeout` absolute deadline must still
     // cap the request_mirror pre-before_proxy body drain.
     let (backend_port, _backend) = spawn_ok_backend().await;
-    let (mut gateway, https_port) =
-        spawn_h3_gateway(early_body_proxy_yaml(backend_port, 0)).await;
+    let (mut gateway, https_port) = spawn_h3_gateway(early_body_proxy_yaml(backend_port, 0)).await;
     gateway
         .wait_for_proxy_port(Duration::from_secs(10))
         .await
@@ -362,19 +361,16 @@ async fn h3_zero_operator_timeout_still_honors_native_grpc_absolute_deadline() {
     let url = format!("https://127.0.0.1:{https_port}/upload");
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, https_port));
     let started = Instant::now();
-    let response = h3_post_stalled_body(
-        &url,
-        "localhost",
-        addr,
-        "application/grpc",
-        Some("100m"),
-    )
-    .await
-    .expect("deadline-capped native gRPC H3 upload");
+    let response = h3_post_stalled_body(&url, "localhost", addr, "application/grpc", Some("100m"))
+        .await
+        .expect("deadline-capped native gRPC H3 upload");
     let elapsed = started.elapsed();
     assert_eq!(response.status, StatusCode::OK);
     assert_eq!(
-        response.headers.get("grpc-status").and_then(|value| value.to_str().ok()),
+        response
+            .headers
+            .get("grpc-status")
+            .and_then(|value| value.to_str().ok()),
         Some("4"),
         "native gRPC deadline rejection must be trailers-only DEADLINE_EXCEEDED"
     );
@@ -478,10 +474,9 @@ async fn h3_slow_cancelled_stream_does_not_block_independent_sibling_stream() {
     let get_url = upload_url.clone();
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, https_port));
 
-    let stalled =
-        tokio::spawn(async move {
-            h3_post_stalled_body(&upload_url, "localhost", addr, "application/json", None).await
-        });
+    let stalled = tokio::spawn(async move {
+        h3_post_stalled_body(&upload_url, "localhost", addr, "application/json", None).await
+    });
 
     // Independent GET has no early body phase and should reach the OK backend
     // promptly while the sibling POST is still parked in the early drain.
