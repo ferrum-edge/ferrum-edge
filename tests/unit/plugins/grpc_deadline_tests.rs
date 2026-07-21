@@ -4479,10 +4479,8 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
     let mut ctx = create_grpc_context_with_timeout(None);
     set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
 
-    let mut request_headers = HashMap::from([(
-        "content-type".to_string(),
-        "application/grpc".to_string(),
-    )]);
+    let mut request_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
     assert!(matches!(
         after_proxy_plugins[0]
             .before_proxy(&mut ctx, &mut request_headers)
