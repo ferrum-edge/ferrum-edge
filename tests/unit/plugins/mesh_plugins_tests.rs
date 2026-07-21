@@ -2048,6 +2048,70 @@ async fn mesh_authz_collapses_conflicting_header_policy_keys() {
 }
 
 #[tokio::test]
+async fn mesh_authz_ignores_raw_reserved_header_when_materialized_map_filtered() {
+    let mut policy = allow_client_policy(PolicyAction::Allow);
+    policy.rules[0].when = vec![ConditionMatch {
+        key: "request.headers[x-consumer-username]".to_string(),
+        values: vec!["admin".to_string()],
+        not_values: Vec::new(),
+    }];
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "x-consumer-username",
+        "admin".parse().expect("header value"),
+    );
+    ctx.set_raw_headers(headers);
+    ctx.materialize_headers();
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert!(body.contains("Mesh authorization denied"));
+        }
+        other => panic!("expected implicit deny for spoofed reserved header, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mesh_authz_ignores_raw_reserved_path_param_header() {
+    let mut policy = allow_client_policy(PolicyAction::Allow);
+    policy.rules[0].when = vec![ConditionMatch {
+        key: "request.headers[x-path-param-user]".to_string(),
+        values: vec!["admin".to_string()],
+        not_values: Vec::new(),
+    }];
+    let plugin = MeshAuthz::new(&json!({
+        "mesh_policies": [policy]
+    }))
+    .expect("plugin config");
+    let mut ctx = request_context(Some("spiffe://cluster.local/ns/default/sa/client"));
+    let mut headers = http::HeaderMap::new();
+    headers.insert("x-path-param-user", "admin".parse().expect("header value"));
+    ctx.set_raw_headers(headers);
+
+    let result = plugin.authorize(&mut ctx).await;
+
+    match result {
+        PluginResult::Reject {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert!(body.contains("Mesh authorization denied"));
+        }
+        other => panic!("expected implicit deny for spoofed path-param header, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn mesh_authz_skips_header_materialization_without_header_rules() {
     let plugin = MeshAuthz::new(&json!({
         "mesh_policies": [allow_client_policy(PolicyAction::Allow)]

@@ -848,6 +848,9 @@ fn http_header_attribute(
     if let Some(value) = ctx.headers.get(&lower).or_else(|| ctx.headers.get(name)) {
         return Some(value.clone());
     }
+    if RequestContext::is_reserved_gateway_assertion_header(&lower) {
+        return None;
+    }
     ctx.raw_header_get(&lower)
         .or_else(|| ctx.raw_header_get(name))
         .map(str::to_string)

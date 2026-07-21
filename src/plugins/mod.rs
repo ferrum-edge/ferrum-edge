@@ -3306,6 +3306,16 @@ impl RequestContext {
             .map(|value| value.as_bytes())
     }
 
+    /// Whether a header name is reserved for gateway-asserted metadata and
+    /// must not be trusted from client-supplied wire headers.
+    #[inline]
+    pub fn is_reserved_gateway_assertion_header(name: &str) -> bool {
+        matches!(
+            name,
+            "x-consumer-username" | "x-consumer-custom-id" | "x-geo-country"
+        ) || name.starts_with("x-path-param-")
+    }
+
     /// Convert the raw `http::HeaderMap` into `self.headers` (`HashMap<String,
     /// String>`). This is a one-time operation — subsequent calls are no-ops.
     /// The raw map is retained so plugins can evaluate multi-value and
@@ -3330,11 +3340,7 @@ impl RequestContext {
                 // clients. Identity headers are injected after
                 // authentication; path-param headers are injected after
                 // route matching from regex captures.
-                if matches!(
-                    key,
-                    "x-consumer-username" | "x-consumer-custom-id" | "x-geo-country"
-                ) || key.starts_with("x-path-param-")
-                {
+                if Self::is_reserved_gateway_assertion_header(key) {
                     continue;
                 }
                 let separator = repeated_request_header_separator(key);
