@@ -1047,7 +1047,29 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
 }
 ```
 
-Rejected requests have `backend_target: null` (no backend was contacted), latency fields at -1.0, and `metadata.rejection_phase` indicating which plugin phase rejected the request. Possible `rejection_phase` values: `authenticate`, `authorize`, `before_proxy`, `grpc_backend_error`, `websocket_backend_error`. Gateway-generated gRPC errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log sinks can distinguish gRPC failures even though the downstream HTTP status is `200`.
+Gateway admission rejections that occur before backend selection, including
+`allowed_methods`, have `backend_target: null`. Other rejection summaries may
+retain the matched proxy's configured target for attribution, but backend
+latency fields remain `-1.0`; a configured target in such a record is not proof
+that Ferrum contacted it. `metadata.rejection_phase` identifies the plugin
+phase or gateway admission gate that rejected the request. Possible values
+include `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
+`grpc_backend_error`, and `websocket_backend_error`. Gateway-generated gRPC
+errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log
+sinks can distinguish gRPC failures even though the downstream HTTP status is
+`200`.
+
+##### Pre-plugin routing and method failures in transaction logs
+
+Terminal transaction logging is independent of ordinary request hooks:
+
+| Outcome | Status | Transaction log | Ordinary request hooks (`on_request_received`, auth, transform, mirror, …) |
+| --- | --- | --- | --- |
+| Unmatched route | 404 | Not emitted (no matched proxy / plugin-cache view) | Not run |
+| Matched proxy, method absent from `allowed_methods` | 405 (+ authoritative `Allow`) | Emitted once with `rejection_phase: "allowed_methods"`, matched proxy/namespace, method/path, and client identity available at that phase | Not run |
+| Matched native gRPC with non-`POST` method | protocol reject (typically 400 / gRPC `INVALID_ARGUMENT`) | Not emitted by the method-admission gate today | Not run |
+
+H1, H2, and H3 share this contract. The matched-proxy 405 path selects protocol-appropriate terminal logging/mirror hooks from one immutable plugin-cache generation and does not double-count with a later success path.
 
 #### Example: TCP Stream
 
@@ -3659,7 +3681,7 @@ Mirror response metadata (status code, response size, latency) is logged as a se
 | `mirror_host` | String | **(required)** | Hostname or IP of the mirror target |
 | `mirror_port` | Integer | 80/443 | Port of the mirror target (default based on protocol) |
 | `mirror_protocol` | String | `"http"` | `"http"` or `"https"` |
-| `mirror_path` | String | _(none)_ | Override the request path for the mirror. When unset, uses the backend-effective authorized path if backend-path policy is active; otherwise uses the original request path |
+| `mirror_path` | String | _(none)_ | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, uses the backend-effective authorized path if backend-path policy is active; otherwise uses the original request path |
 | `percentage` | Float | `100.0` | Percentage of requests to mirror (0.0–100.0) |
 | `mirror_request_body` | Boolean | `true` | Whether to include the request body in the mirror request |
 | `max_response_body_bytes` | Integer | `1048576` | Cap on bytes read from a mirror response when sizing it. Only consulted when the response has no `content-length` header — streaming aborts as soon as the limit is crossed and the truncated count is recorded. The mirror task discards the bytes after sizing, so this only bounds memory pressure from a misbehaving mirror endpoint streaming an unbounded body to a fire-and-forget task. Default is 1 MiB |
@@ -3673,6 +3695,10 @@ enforcement. This prevents a rewritten, unauthorized client method from being
 replayed to the shadow destination. An explicit `mirror_path` remains an
 operator override, and proxies without backend-path policy retain the original
 request path default.
+
+**Outbound header boundary:** Mirror requests reuse Ferrum's canonical secondary-request sanitizer (the same backend-request strip predicates as primary dispatch — secondary builders call those predicates directly, so new strip arms are honored automatically). The filter snapshots RFC 9110 `Connection`-listed tokens before removing `Connection`, strips hop-by-hop / framing / `Trailer` / Ferrum request-only markers (`x-ferrum-original-content-encoding`, `x-grpc-web-mode`), drops client-supplied proxy-owned forwarding identity (`X-Forwarded-*`), and omits client `Host` so reqwest derives authority from the mirror URL. Forwarding identity is not regenerated for mirror traffic, so the mirror receives no Ferrum-authored `X-Forwarded-*` fields; this intentionally favors the off-mesh privacy/trust boundary over primary-vs-shadow identity-header parity. Reserved load-testing control headers are excluded defensively. On native gRPC mirrors (`application/grpc`, `application/grpc+…`, or parameters — not prefix-smuggled types such as `application/grpcfoo` / `application/grpc-web`), `te: trailers` is re-synthesised after the generic strip. Native gRPC mirror targets must support HTTP/2; HTTP/1.1 is not a supported native-gRPC mirror transport.
+
+**Query fidelity:** The mirror request-target prefers the original raw query string after the same auth credential strips primary dispatch applies (`auth.strip_query_param.*`), preserving repeated pairs, pair order, flag and empty parameters, `+`, encoded delimiters, percent escapes, and non-ASCII encoded bytes. The materialised single-value `query_params` map is used only when no raw query is available. Decoded `request_transformer` query-map mutations are not re-serialized onto the mirror URL, matching primary backend URL construction.
 
 ```yaml
 plugin_name: request_mirror
@@ -3700,7 +3726,7 @@ For multi-node deployments, `gateway_addresses` fans out once from the originati
 
 For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: true`. A resolved gateway port of `0` (Ferrum's disabled-listener sentinel from `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`) is rejected at admission. Since the gateway's frontend cert typically won't match `127.0.0.1`, `gateway_tls_no_verify` defaults to `true` when TLS is enabled. This only affects the loopback connection — backend TLS uses the normal CA trust chain.
 
-**Request fidelity:** Matching triggers buffer the request body (binary-safe via `request_body_bytes`) and replay the exact buffered bytes for every accepted method that supplied a body (including DELETE/OPTIONS/extension methods — never silently rewritten to GET). Replay bodies have a hard 10 MiB plugin-local ceiling even when the global request-body limit is unlimited, and active local/fan-out replay work shares a 64 MiB process-wide retained-body budget; the strictest applicable limit wins. The original raw query string is preserved on every synthetic and fan-out request. Decoded query-map transforms are deliberately not serialized into the replay: the synthetic request re-enters the ordinary plugin pipeline, so configured query transforms apply exactly once without losing duplicate pairs or encoding. Requests with no key or a wrong key stay on the ordinary no-buffer hot path. Synthetic/fan-out headers snapshot RFC 9110 `Connection`-listed tokens before filtering, strip those names plus Ferrum's canonical backend/proxy-generated forwarding sets, and keep `Host` for host-based routing; client framing (`Content-Length` / `Transfer-Encoding`) is never copied — reqwest derives exact `Content-Length` from the attached body.
+**Request fidelity:** Matching triggers buffer the request body (binary-safe via `request_body_bytes`) and replay the exact buffered bytes for every accepted method that supplied a body (including DELETE/OPTIONS/extension methods — never silently rewritten to GET). Replay bodies have a hard 10 MiB plugin-local ceiling even when the global request-body limit is unlimited, and active local/fan-out replay work shares a 64 MiB process-wide retained-body budget; the strictest applicable limit wins. The original raw query string is preserved on every synthetic and fan-out request. Decoded query-map transforms are deliberately not serialized into the replay: the synthetic request re-enters the ordinary plugin pipeline, so configured query transforms apply exactly once without losing duplicate pairs or encoding. Requests with no key or a wrong key stay on the ordinary no-buffer hot path. Synthetic/fan-out headers reuse Ferrum's canonical secondary-request sanitizer shared with `request_mirror` and primary backend dispatch: snapshot RFC 9110 `Connection`-listed tokens before filtering, strip those names plus Ferrum's hop-by-hop / framing / `Trailer` / request-only marker / proxy-generated forwarding sets, and keep `Host` for host-based routing; client framing (`Content-Length` / `Transfer-Encoding`) is never copied — reqwest derives exact `Content-Length` from the attached body.
 
 **Completion metrics:** The finish log reports unambiguous counters — `attempted_requests`, `responses_received`, `responses_completed`, `responses_truncated`, `response_body_errors`, `request_timeouts`, non-timeout `transport_errors`, HTTP status classes, `worker_failures`, `cancelled_workers`, and separate `completed_requests_per_second` / `attempted_requests_per_second`. Cooperative cancellation counts affected workers instead of disappearing into a successful result. Outcome is `Success`, `Degraded`, `Failed`, or `Cancelled`. Attempt-only loops are never labeled as completed throughput. Consecutive request-build, transport, timeout, and response-stream errors use a cancellation-aware exponential backoff from 10 ms to 250 ms; a completed or cap-truncated response resets the backoff so valid load is not throttled.
 

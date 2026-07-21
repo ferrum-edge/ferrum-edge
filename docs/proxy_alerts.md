@@ -139,7 +139,7 @@ Fires when at least `threshold_count` requests with a status in `status_codes` o
 - `backend_total_ms` — HTTP only; `latency_backend_total_ms` from the transaction summary
 - `backend_ttfb_ms` — HTTP only
 - `total_ms` — HTTP only
-- `stream_duration_ms` — TCP/UDP/WebSocket session summaries
+- `stream_duration_ms` — TCP/UDP/DTLS/WebSocket session summaries. Upstream producers measure elapsed duration on a process-monotonic clock (`Instant` / coarse monotonic counter), not UTC wall time. Connect/disconnect RFC3339 timestamps remain civil-clock values for human-readable logs and may diverge from `duration_ms` after NTP or administrator clock corrections. UDP/DTLS idle expiry uses the same monotonic base, so wall-clock jumps neither freeze nor prematurely expire sessions.
 
 Percentiles are estimated with fixed log-scale buckets (boundaries 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000, 120000, 300000 ms). Alert messages display the upper bound of the bucket containing the percentile rank, and threshold comparisons fire when that upper bound is strictly greater than `threshold_ms`. This keeps thresholds exactly on a bucket boundary from firing on samples in the previous bucket, while non-boundary thresholds can still fire when the percentile lands in a bucket that spans the threshold. Adequate for alerting; not a substitute for a precise histogram. `threshold_ms` must be at most 300000 so only the overflow bucket can breach the largest finite threshold. Negative latency values (sentinel `-1.0` used during streaming responses) are ignored without clearing an already-breached latency window.
 

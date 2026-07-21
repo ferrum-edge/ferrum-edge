@@ -12494,7 +12494,7 @@ components:
             metric:
               type: string
               enum: [backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms]
-              description: Latency metric to observe. `stream_duration_ms` applies to TCP/UDP/WebSocket sessions; the others apply to HTTP-family summaries.
+              description: Latency metric to observe. `stream_duration_ms` applies to TCP/UDP/DTLS/WebSocket sessions and is measured on a process-monotonic clock (not UTC wall time); connect/disconnect timestamps remain civil-clock values for rendering. The other metrics apply to HTTP-family summaries.
             percentile:
               type: integer
               minimum: 1
@@ -16881,7 +16881,10 @@ components:
         Omitted optional fields select defaults; runtime also treats explicit
         null on optional fields as omitted. Matching replay bodies have a hard
         10 MiB plugin-local ceiling and active local/fan-out replay work shares
-        a 64 MiB process-wide retained-body budget.
+        a 64 MiB process-wide retained-body budget. Synthetic and fan-out
+        headers reuse the canonical secondary-request sanitizer shared with
+        request_mirror (Connection-listed hop-by-hop, Trailer, framing, Ferrum
+        markers, proxy-owned X-Forwarded-*), preserving Host for routing.
       required:
         - key
         - concurrent_clients
@@ -16978,7 +16981,16 @@ components:
         for the mirror response and mirror failures never propagate to the
         client. Mirror response metadata (status, size, latency) is captured
         via a `tokio::sync::watch` channel and surfaced through transaction
-        logs.
+        logs. Outbound mirror headers use Ferrum's canonical secondary-request
+        sanitizer (Connection-listed hop-by-hop, Trailer, framing, Ferrum
+        request-only markers, and proxy-owned X-Forwarded-* identity); these
+        forwarding fields are stripped rather than regenerated, so mirrors do
+        not receive Ferrum-authored X-Forwarded-* identity. Host is derived from
+        the mirror URL. Native gRPC mirrors require HTTP/2 and re-synthesise te:
+        trailers. The mirror request-target preserves the raw query (after the
+        same auth credential strips as primary) including repeated pairs,
+        order, flags, empty values, +, percent escapes, and non-ASCII encoded
+        bytes.
       required:
         - mirror_host
       properties:
@@ -16998,7 +17010,8 @@ components:
           description: "Transport protocol used for the mirror request."
         mirror_path:
           type: string
-          description: "Override path used for the mirror request. When omitted, the original request path is used."
+          pattern: '^$|^/[^?#]*$'
+          description: "Override path used for the mirror request. Must start with `/` and cannot contain a query or fragment. Empty is treated as omitted; when omitted, the original request path is used."
         percentage:
           type: number
           format: double

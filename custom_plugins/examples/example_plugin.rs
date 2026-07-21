@@ -184,7 +184,8 @@ impl Plugin for ExamplePlugin {
     /// Called after a route matches and its allowed-method check succeeds.
     /// Native gRPC requests must also use `POST` before this hook runs.
     /// On H1, H2, and H3, unmatched 404 and matched-proxy 405 responses invoke
-    /// neither global nor scoped instances of this hook.
+    /// neither global nor scoped instances of this hook. Matched-proxy 405
+    /// responses still emit terminal transaction logging separately.
     /// Return `PluginResult::Reject` to short-circuit with an error response.
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {
         // Example: you could reject requests here based on custom logic.
