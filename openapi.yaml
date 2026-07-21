@@ -18196,8 +18196,11 @@ components:
           description: Enable TLS for Redis connection
         redis_key_prefix:
           type: string
-          default: "ferrum:ai_semantic_cache"
-          description: Redis key namespace prefix
+          description: >-
+            Redis key namespace prefix. When omitted, the runtime derives
+            `{FERRUM_NAMESPACE}:ai_cache` (for example `ferrum:ai_cache` when
+            the namespace is `ferrum`). No static OpenAPI default is advertised
+            because the value depends on the gateway namespace.
         redis_pool_size:
           type: integer
           format: uint64
