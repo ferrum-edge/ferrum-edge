@@ -7507,6 +7507,86 @@ fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
 }
 
 #[test]
+fn ai_semantic_cache_openapi_redis_key_prefix_matches_runtime_namespace_default() {
+    use ferrum_edge::config::types::DEFAULT_NAMESPACE;
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::ai_semantic_cache::AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX;
+    use ferrum_edge::plugins::utils::redis_rate_limiter::RedisConfig;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let prop = spec
+        .pointer("/components/schemas/AiSemanticCacheConfig/properties/redis_key_prefix")
+        .expect("AiSemanticCacheConfig.redis_key_prefix exists");
+
+    // Namespace dependence cannot be expressed as a static OpenAPI default;
+    // advertising one previously caused schema-driven clients to send
+    // `ferrum:ai_semantic_cache` while omitted configs used `ferrum:ai_cache`.
+    assert!(
+        prop.get("default").is_none(),
+        "redis_key_prefix must not advertise a static OpenAPI default; got {:?}",
+        prop.get("default")
+    );
+
+    let description = prop["description"]
+        .as_str()
+        .expect("redis_key_prefix description");
+    assert!(
+        description.contains("{FERRUM_NAMESPACE}:ai_cache"),
+        "OpenAPI must document the namespace-derived runtime default"
+    );
+    assert!(
+        description.contains("ferrum:ai_cache"),
+        "OpenAPI must state the default-namespace example accurately"
+    );
+    assert!(
+        !description.contains("ai_semantic_cache"),
+        "stale OpenAPI prefix ferrum:ai_semantic_cache must not remain in the description"
+    );
+
+    let http_client = PluginHttpClient::default();
+    let namespace = http_client.namespace();
+    assert_eq!(namespace, DEFAULT_NAMESPACE);
+    assert_eq!(AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX, "ai_cache");
+    let expected_default = format!("{namespace}:{AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX}");
+    assert_eq!(expected_default, "ferrum:ai_cache");
+
+    let redis = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0"
+        }),
+        &expected_default,
+    )
+    .expect("valid redis config")
+    .expect("redis mode enabled");
+    assert_eq!(
+        redis.key_prefix, expected_default,
+        "omitted redis_key_prefix must use the namespace-derived default"
+    );
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `ai_semantic_cache`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("ai_semantic_cache docs section");
+    assert!(
+        section.contains("`\"{FERRUM_NAMESPACE}:ai_cache\"`")
+            || section.contains("`{FERRUM_NAMESPACE}:ai_cache`"),
+        "docs/plugins.md must keep the namespace-derived redis_key_prefix default"
+    );
+    assert!(
+        section.contains("`ferrum:ai_cache`") || section.contains("ferrum:ai_cache"),
+        "docs/plugins.md must keep the default-namespace redis_key_prefix example"
+    );
+    assert!(
+        !section.contains("ferrum:ai_semantic_cache"),
+        "docs must not advertise the stale OpenAPI prefix"
+    );
+}
+
+#[test]
 fn api_chargeback_schema_closes_unknown_keys() {
     use ferrum_edge::plugins::api_chargeback::API_CHARGEBACK_CONFIG_KEYS;
 

@@ -8490,9 +8490,12 @@ components:
         exhausted, the plugin sends a WebSocket close frame (RFC 6455 close code
         1008 — Policy Violation) to both client and backend. Both directions
         (client→backend and backend→client) consume from the same per-connection
-        bucket. Supports centralized Redis-backed mode for cross-instance
-        coordination of frame counters. Counter storage supports only local
-        memory and Redis; database-backed counters are intentionally unsupported.
+        bucket. Redis mode (`sync_mode: "redis"`) externalizes those
+        per-connection counters under a per-plugin/gateway-instance key
+        namespace; it does not coordinate a portable frame budget across
+        gateway instances, reconnects, or plugin rebuilds. Counter storage
+        supports only local memory and Redis; database-backed counters are
+        intentionally unsupported.
       properties:
         frames_per_second:
           type: integer
@@ -8521,7 +8524,11 @@ components:
           type: string
           enum: [local, redis]
           default: local
-          description: "Frame counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported. Any RESP-compatible server works."
+          description: >-
+            Frame counter storage: 'local' (in-memory) or 'redis' (externalized
+            per-connection counters namespaced per plugin/gateway instance; not
+            a portable cross-instance budget). Database-backed counters are
+            unsupported. Any RESP-compatible server works.
         redis_url:
           type: string
           description: "Redis connection URL. Required when sync_mode is 'redis'."
@@ -18208,8 +18215,11 @@ components:
           description: Enable TLS for Redis connection
         redis_key_prefix:
           type: string
-          default: "ferrum:ai_semantic_cache"
-          description: Redis key namespace prefix
+          description: >-
+            Redis key namespace prefix. When omitted, the runtime derives
+            `{FERRUM_NAMESPACE}:ai_cache` (for example `ferrum:ai_cache` when
+            the namespace is `ferrum`). No static OpenAPI default is advertised
+            because the value depends on the gateway namespace.
         redis_pool_size:
           type: integer
           format: uint64
