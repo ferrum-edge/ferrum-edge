@@ -1039,9 +1039,7 @@ async fn test_head_wire_omits_body_and_keeps_content_length() {
 
     let mut ctx = make_ctx("HEAD", "/api/head", "/api");
     let mut request_headers = HashMap::new();
-    let rejection = plugin
-        .before_proxy(&mut ctx, &mut request_headers)
-        .await;
+    let rejection = plugin.before_proxy(&mut ctx, &mut request_headers).await;
     let PluginResult::Reject {
         status_code,
         body,

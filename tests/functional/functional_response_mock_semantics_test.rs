@@ -273,7 +273,10 @@ async fn functional_response_mock_head_and_no_body_statuses_across_h1_h2_h3() {
         h3_head.body_bytes.is_empty(),
         "H3 HEAD must not receive DATA/content bytes"
     );
-    assert_eq!(h3_content_length(&h3_head.headers), Some(representation_len));
+    assert_eq!(
+        h3_content_length(&h3_head.headers),
+        Some(representation_len)
+    );
 
     let h3_head_rule = h3_request_until_ready(&h3, &h3_head_path, Method::HEAD).await;
     assert_eq!(h3_head_rule.status, StatusCode::OK);

@@ -413,10 +413,7 @@ impl Plugin for ResponseMock {
             // of emitting an informational-only response on ordinary HTTP.
             if rule.status_code == 101 && !ctx.has_websocket_response_boundary() {
                 let mut headers = HashMap::new();
-                headers.insert(
-                    "content-type".to_string(),
-                    "application/json".to_string(),
-                );
+                headers.insert("content-type".to_string(), "application/json".to_string());
                 return PluginResult::Reject {
                     status_code: 500,
                     body: r#"{"error":"response_mock status 101 requires a WebSocket handshake"}"#
