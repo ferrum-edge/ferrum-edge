@@ -1436,7 +1436,9 @@ fn validate_spool_dir_shape(path: &Path) -> Result<(), String> {
     // Reject obviously unusable relative placeholders without touching the FS.
     let display = path.to_string_lossy();
     if display.contains('\0') {
-        return Err(format!("{PLUGIN_NAME}: spool.dir must not contain NUL bytes"));
+        return Err(format!(
+            "{PLUGIN_NAME}: spool.dir must not contain NUL bytes"
+        ));
     }
     Ok(())
 }

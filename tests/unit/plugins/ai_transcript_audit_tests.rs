@@ -1146,7 +1146,7 @@ async fn sampling_rate_zero_captures_reject_guardrail_markers() {
             json!({ "sampling": { "rate": 0.0, "always_capture_on_guardrail": true } }),
         );
         let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
-    plugin.start_background_tasks().expect("live start");
+        plugin.start_background_tasks().expect("live start");
         let mut ctx = make_ctx();
         let headers = json_headers();
         plugin
@@ -3266,7 +3266,7 @@ async fn request_derived_model_and_tool_names_are_redacted() {
             loopback_http_client(),
         )
         .expect("valid config");
-    plugin.start_background_tasks().expect("live start");
+        plugin.start_background_tasks().expect("live start");
         let mut ctx = make_ctx();
         let headers = json_headers();
         plugin

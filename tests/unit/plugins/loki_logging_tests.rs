@@ -658,7 +658,7 @@ async fn test_loki_retries_408_429_and_5xx() {
         let mut config = delivery_config(format!("{}/loki/api/v1/push", server.uri()));
         config["max_retries"] = json!(1);
         let plugin = LokiLogging::new(&config, default_client()).unwrap();
-    plugin.start_background_tasks().expect("live start");
+        plugin.start_background_tasks().expect("live start");
         plugin.log(&create_test_transaction_summary()).await;
         wait_for_requests(&server, 2).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);

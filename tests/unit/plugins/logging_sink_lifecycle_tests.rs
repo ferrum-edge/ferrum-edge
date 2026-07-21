@@ -108,11 +108,7 @@ fn all_sink_cases(tmp: &tempfile::TempDir) -> Vec<(&'static str, Value)> {
 
 fn malformed_sink_cases() -> Vec<(&'static str, Value, &'static str)> {
     vec![
-        (
-            "http_logging",
-            json!({"endpoint_url": ""}),
-            "endpoint_url",
-        ),
+        ("http_logging", json!({"endpoint_url": ""}), "endpoint_url"),
         ("tcp_logging", json!({"host": "127.0.0.1"}), "port"),
         ("udp_logging", json!({"port": 9}), "host"),
         ("statsd_logging", json!({"host": ""}), "host"),
@@ -205,9 +201,8 @@ fn file_mode_validate_pipeline_accepts_each_worker_backed_sink() {
     for (name, config) in all_sink_cases(&tmp) {
         let spec_path = tmp.path().join(format!("{name}-ok.json"));
         write_file_mode_spec(&spec_path, name, &config);
-        load_file_mode_spec(&spec_path).unwrap_or_else(|error| {
-            panic!("{name}: file-mode validate pipeline failed: {error}")
-        });
+        load_file_mode_spec(&spec_path)
+            .unwrap_or_else(|error| panic!("{name}: file-mode validate pipeline failed: {error}"));
     }
 
     assert!(
@@ -330,7 +325,10 @@ async fn kafka_generation_id_allocated_only_on_activation() {
         .start_background_tasks()
         .expect("kafka start under tokio");
     let first_id = first.snapshot().generation_id;
-    assert!(first_id >= 1, "activation must allocate a live generation id");
+    assert!(
+        first_id >= 1,
+        "activation must allocate a live generation id"
+    );
     assert!(first.snapshot().accepting);
     first.finalize().await;
 
@@ -339,9 +337,7 @@ async fn kafka_generation_id_allocated_only_on_activation() {
     assert_eq!(pending.snapshot().generation_id, 0);
 
     let second = KafkaLogging::new(&kafka_sink_config(), &client()).expect("kafka");
-    second
-        .start_background_tasks()
-        .expect("second kafka start");
+    second.start_background_tasks().expect("second kafka start");
     let second_id = second.snapshot().generation_id;
     assert!(
         second_id > first_id,
@@ -428,7 +424,8 @@ async fn logging_sink_live_construction_starts_workers_idempotently() {
 
     let http = HttpLogging::new(&http_sink_config(), client()).expect("http");
     http.start_background_tasks().expect("http start");
-    http.start_background_tasks().expect("http start idempotent");
+    http.start_background_tasks()
+        .expect("http start idempotent");
 
     let tcp = TcpLogging::new(&tcp_sink_config(), client()).expect("tcp");
     tcp.start_background_tasks().expect("tcp start");
@@ -446,7 +443,8 @@ async fn logging_sink_live_construction_starts_workers_idempotently() {
 
     let loki = LokiLogging::new(&loki_sink_config(), client()).expect("loki");
     loki.start_background_tasks().expect("loki start");
-    loki.start_background_tasks().expect("loki start idempotent");
+    loki.start_background_tasks()
+        .expect("loki start idempotent");
 
     let ws = WsLogging::new(&ws_sink_config(), client()).expect("ws");
     ws.start_background_tasks().expect("ws start");

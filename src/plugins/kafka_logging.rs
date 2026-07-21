@@ -1985,9 +1985,10 @@ impl Plugin for KafkaLogging {
             "kafka_logging: start_background_tasks requires a Tokio runtime".to_string()
         })?;
         let pending = {
-            let mut guard = self.pending.lock().map_err(|_| {
-                "kafka_logging: pending activation lock poisoned".to_string()
-            })?;
+            let mut guard = self
+                .pending
+                .lock()
+                .map_err(|_| "kafka_logging: pending activation lock poisoned".to_string())?;
             guard.take().ok_or_else(|| {
                 "kafka_logging: pending activation already consumed without a live generation"
                     .to_string()

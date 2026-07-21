@@ -102,10 +102,11 @@ impl Plugin for HttpLogging {
         let flush_config = self.flush_config.clone();
         // Config remains `max_retries`; the shared retry policy counts the
         // initial attempt plus those retries.
-        self.logger.start("http_logging", self.batch_config, move |batch| {
-            let flush_config = flush_config.clone();
-            async move { send_batch(&flush_config, batch).await }
-        })
+        self.logger
+            .start("http_logging", self.batch_config, move |batch| {
+                let flush_config = flush_config.clone();
+                async move { send_batch(&flush_config, batch).await }
+            })
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
