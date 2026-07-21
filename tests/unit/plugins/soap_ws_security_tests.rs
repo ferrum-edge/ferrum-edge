@@ -368,10 +368,10 @@ fn openapi_soap_ws_security_describes_exclusive_c14n_contract() {
     let root = spec["components"]["schemas"]["SoapWsSecurityConfig"]["description"]
         .as_str()
         .expect("SoapWsSecurityConfig description");
-    let saml = spec["components"]["schemas"]["SoapWsSecurityConfig"]["properties"]["saml"]
-        ["description"]
-        .as_str()
-        .expect("SoapWsSecurityConfig.saml description");
+    let saml =
+        spec["components"]["schemas"]["SoapWsSecurityConfig"]["properties"]["saml"]["description"]
+            .as_str()
+            .expect("SoapWsSecurityConfig.saml description");
     let plugins_doc = include_str!("../../../docs/plugins.md");
 
     for (label, text) in [("root", root), ("saml", saml)] {
