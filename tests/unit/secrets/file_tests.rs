@@ -45,7 +45,7 @@ fn read_secret_reads_file_content() {
 #[test]
 fn read_secret_detached_reads_ordinary_file() {
     let mut tmp = tempfile::NamedTempFile::new().unwrap();
-    write!(tmp, "detached-secret\n").unwrap();
+    writeln!(tmp, "detached-secret").unwrap();
     let path = tmp.path().to_str().unwrap().to_string();
 
     let rt = tokio::runtime::Builder::new_current_thread()
