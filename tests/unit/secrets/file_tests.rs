@@ -20,7 +20,7 @@ fn file_secret_reads_use_detached_os_thread_not_spawn_blocking() {
         file_src.contains("drop(join_handle)"),
         "JoinHandle must be dropped explicitly so the OS thread detaches"
     );
-    let file_code_lines = file_src.lines().filter(|line| {
+    let mut file_code_lines = file_src.lines().filter(|line| {
         let trimmed = line.trim_start();
         !trimmed.starts_with("//")
     });
