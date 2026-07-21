@@ -604,10 +604,7 @@ impl SoapWsSecurity {
 
     // ── UsernameToken validation ────────────────────────────────────────
 
-    fn validate_username_token(
-        &self,
-        security_block: &str,
-    ) -> Result<String, UsernameTokenError> {
+    fn validate_username_token(&self, security_block: &str) -> Result<String, UsernameTokenError> {
         let ut_block = find_element_block(security_block, "UsernameToken").ok_or_else(|| {
             UsernameTokenError::Structural("WS-Security: missing UsernameToken element".to_string())
         })?;
@@ -715,9 +712,8 @@ impl SoapWsSecurity {
                     .map_err(UsernameTokenError::Structural)?;
 
                 // Compute expected digest: SHA-1(nonce + created + password)
-                let mut data = Vec::with_capacity(
-                    nonce_bytes.len() + created.len() + password_material.len(),
-                );
+                let mut data =
+                    Vec::with_capacity(nonce_bytes.len() + created.len() + password_material.len());
                 data.extend_from_slice(&nonce_bytes);
                 data.extend_from_slice(created.as_bytes());
                 data.extend_from_slice(password_material.as_bytes());
@@ -1635,8 +1631,7 @@ impl Plugin for SoapWsSecurity {
                 Err(UsernameTokenError::Structural(detail)) => {
                     warn!(
                         failure_class = UsernameTokenError::STRUCTURAL_CLASS,
-                        "soap_ws_security: UsernameToken validation failed: {}",
-                        detail
+                        "soap_ws_security: UsernameToken validation failed: {}", detail
                     );
                     return PluginResult::Reject {
                         status_code: 401,
