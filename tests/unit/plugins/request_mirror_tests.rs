@@ -1490,8 +1490,7 @@ async fn test_mirror_h2_h3_parity_and_grpc_te_resynthesis() {
     assert_eq!(observed.get("x-keep").map(String::as_str), Some("ok"));
 }
 
-#[tokio::test]
-async fn test_mirror_preserves_raw_duplicate_query_semantics() {
+async fn capture_mirror_request_line(ctx: &mut RequestContext) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
@@ -1529,29 +1528,78 @@ async fn test_mirror_preserves_raw_duplicate_query_semantics() {
         &json!({
             "mirror_host": addr.ip().to_string(),
             "mirror_port": addr.port(),
-            "mirror_request_body": false
+            "mirror_request_body": false,
+            "percentage": 100.0
         }),
         PluginHttpClient::default(),
     )
     .unwrap();
-
-    let mut ctx = make_ctx_with_proxy();
-    ctx.set_raw_query_string("tag=red&tag=blue&q=a+b&flag".to_string());
-    // Materialised map would collapse duplicates; raw query must win.
-    ctx.query_params
-        .insert("tag".to_string(), "only-one".to_string());
     let mut headers = HashMap::new();
-    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    let result = plugin.before_proxy(ctx, &mut headers).await;
     plugin_utils::assert_continue(result);
     let _ = ctx.collect_mirror_result().await;
+    rx.await.expect("mirror request line")
+}
 
-    let request_line = rx.await.expect("mirror request line");
+#[tokio::test]
+async fn test_mirror_preserves_raw_query_edge_cases() {
+    // Issue #2444: repeated pairs, order, flags, empty values, `+`, encoded
+    // delimiters, percent escapes, and non-ASCII encoded bytes must survive.
+    const RAW: &str =
+        "tag=red&tag=blue&b=1&a=2&flag&empty=&q=a+b&path=%2Froot&k=a%26b&key=a%2Fb&name=%E2%9C%93";
+
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string(RAW.to_string());
+    // Materialised map would collapse duplicates and re-encode; raw query must win.
+    ctx.query_params
+        .insert("tag".to_string(), "only-one".to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
     assert!(
-        request_line.contains("tag=red&tag=blue&q=a+b&flag"),
-        "mirror must preserve raw duplicate query semantics: {request_line}"
+        request_line.contains(RAW),
+        "mirror must preserve raw query edge cases: {request_line}"
     );
     assert!(
         !request_line.contains("only-one"),
         "materialised query map must not replace raw query: {request_line}"
+    );
+}
+
+#[tokio::test]
+async fn test_mirror_applies_auth_query_strips_like_primary() {
+    // Intentional query mutation parity with primary:
+    // `query_string_after_plugin_strips` removes auth-marked credential params.
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("api_key=secret&tag=red&tag=blue&keep=1".to_string());
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains("tag=red&tag=blue&keep=1"),
+        "mirror must keep non-credential raw pairs: {request_line}"
+    );
+    assert!(
+        !request_line.contains("api_key="),
+        "mirror must strip auth-marked query credentials like primary: {request_line}"
+    );
+}
+
+#[tokio::test]
+async fn test_mirror_rejects_grpc_prefix_smuggling_for_te_resynthesis() {
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpcfoo".to_string(),
+    );
+    headers.insert("te".to_string(), "gzip".to_string());
+
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    assert!(
+        !observed.contains_key("te"),
+        "prefix-smuggled content-type must not re-synthesise te: {observed:?}"
     );
 }

@@ -18,9 +18,11 @@
 //! Outbound mirror headers cross the same canonical secondary-request boundary
 //! as primary backend dispatch (Connection-listed hop-by-hop, Trailer, framing,
 //! Ferrum request-only markers, and proxy-owned `X-Forwarded-*`). Client `Host`
-//! is omitted so authority comes from the mirror URL; gRPC content-types
-//! re-synthesise `te: trailers`. Raw query strings are preferred so duplicate
-//! keys survive.
+//! is omitted so authority comes from the mirror URL; native gRPC content-types
+//! re-synthesise `te: trailers`. The mirror request-target prefers the original
+//! raw query (after the same auth credential strips the primary backend uses)
+//! so duplicate keys, order, flags, `+`, percent escapes, and encoded bytes
+//! match the primary contract.
 //!
 //! The mirror request uses the gateway's shared `PluginHttpClient`, which means
 //! it inherits the gateway's DNS cache, connection pool keepalive, and TLS
@@ -208,9 +210,11 @@ impl RequestMirror {
 
     /// Build the full mirror URL from the configured or gateway-selected path.
     ///
-    /// Prefer the original raw query string when present so duplicate keys and
-    /// encoding survive. Fall back to the materialised `query_params` map only
-    /// when no raw query is available (tests / already-decoded contexts).
+    /// Prefer the effective raw query string (original wire query after the same
+    /// auth credential strips primary dispatch applies) so duplicate keys,
+    /// ordering, flags, empty values, `+`, percent escapes, and non-ASCII
+    /// encoded bytes survive. Fall back to the materialised `query_params` map
+    /// only when no raw query is available (tests / already-decoded contexts).
     fn build_mirror_url(
         &self,
         original_path: &str,
@@ -406,7 +410,16 @@ impl Plugin for RequestMirror {
         // final authorization. Falling back to the ordinary client path keeps
         // the established behavior for proxies without that policy boundary.
         let mirror_path = ctx.authorized_backend_path().unwrap_or(&ctx.path);
-        let mirror_url = self.build_mirror_url(mirror_path, ctx.raw_query_string(), &ctx.query_params);
+        // Match primary backend query construction: start from the retained raw
+        // query, then apply auth credential strips marked on the context.
+        // Decoded `request_transformer` query-map mutations are intentionally
+        // not re-serialized here — primary dispatch likewise keeps the raw
+        // (auth-stripped) wire query.
+        let effective_query = ctx
+            .raw_query_string()
+            .map(|raw| crate::proxy::query_string_after_plugin_strips(ctx, raw));
+        let mirror_url =
+            self.build_mirror_url(mirror_path, effective_query.as_deref(), &ctx.query_params);
         let method = ctx.method.clone();
 
         // Mirror destinations are an egress boundary just like the primary
@@ -644,5 +657,36 @@ mod tests {
             ),
             "https://[2001:db8::10]:8443/shadow?tag=red&tag=blue&q=a+b"
         );
+    }
+
+    #[test]
+    fn build_mirror_url_preserves_raw_query_edge_cases_byte_for_byte() {
+        let plugin = RequestMirror::new(
+            &json!({ "mirror_host": "mirror.example", "mirror_port": 8080 }),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
+        let collapsed = HashMap::from([("tag".to_string(), "only-one".to_string())]);
+        for raw in [
+            "tag=red&tag=blue",
+            "b=1&a=2",
+            "flag",
+            "empty=",
+            "q=a+b",
+            "path=%2Froot&k=a%26b",
+            "key=a%2Fb",
+            "name=%E2%9C%93&q=%C3%A9",
+            "tag=red&tag=blue&q=a+b&flag&empty=&path=%2Froot&key=a%2Fb&name=%E2%9C%93",
+        ] {
+            let url = plugin.build_mirror_url("/api", Some(raw), &collapsed);
+            assert!(
+                url.ends_with(&format!("?{raw}")),
+                "raw query must be preserved exactly: got {url}"
+            );
+            assert!(
+                !url.contains("only-one"),
+                "lossy query map must not replace raw query: {url}"
+            );
+        }
     }
 }

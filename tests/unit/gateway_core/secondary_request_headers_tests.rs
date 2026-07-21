@@ -1,20 +1,25 @@
-//! Parity guards for the shared secondary-request header sanitizer used by
-//! `request_mirror` and `load_testing`.
+//! Structural reuse guards for the shared secondary-request header sanitizer
+//! used by `request_mirror` and `load_testing`.
+//!
+//! Secondary builders call the canonical strip predicates directly. The
+//! `*_NAMES` inventories below are generated from the same source as those
+//! predicates; these tests exercise the filter against that inventory rather
+//! than maintaining a duplicate allowlist.
 
 use ferrum_edge::proxy::headers::{
     BACKEND_REQUEST_STRIP_HEADER_NAMES, PROXY_GENERATED_FORWARDING_HEADER_NAMES,
-    SecondaryRequestHostPolicy, filter_secondary_request_headers, is_backend_request_strip_header,
-    is_proxy_generated_forwarding_header, synthesize_grpc_te_trailers_if_needed,
+    SecondaryRequestHostPolicy, filter_secondary_request_headers,
+    synthesize_grpc_te_trailers_if_needed,
 };
 use std::collections::{HashMap, HashSet};
 
 #[test]
-fn secondary_filter_honors_every_canonical_backend_and_forwarding_name() {
+fn secondary_filter_strips_every_canonical_backend_and_forwarding_name() {
+    // Structural reuse: filter_secondary_request_headers →
+    // is_secondary_request_strip_header → is_backend_request_strip_header /
+    // is_proxy_generated_forwarding_header. Enumerating the shared inventory
+    // proves the filter path honors every documented name.
     for &name in BACKEND_REQUEST_STRIP_HEADER_NAMES {
-        assert!(
-            is_backend_request_strip_header(name),
-            "predicate drift for `{name}`"
-        );
         let mut headers = HashMap::new();
         headers.insert(name.to_string(), "x".to_string());
         headers.insert("x-keep".to_string(), "ok".to_string());
@@ -28,7 +33,6 @@ fn secondary_filter_honors_every_canonical_backend_and_forwarding_name() {
     }
 
     for &name in PROXY_GENERATED_FORWARDING_HEADER_NAMES {
-        assert!(is_proxy_generated_forwarding_header(name));
         let mut headers = HashMap::new();
         headers.insert(name.to_string(), "spoofed".to_string());
         headers.insert("x-keep".to_string(), "ok".to_string());
@@ -151,4 +155,57 @@ fn secondary_filter_host_policy_and_extra_excludes() {
         .iter()
         .any(|(k, _)| k.eq_ignore_ascii_case("x-loadtesting-key")));
     assert!(preserved.iter().any(|(k, _)| k == "x-custom"));
+}
+
+#[test]
+fn synthesize_grpc_te_accepts_native_family_and_rejects_prefix_smuggling() {
+    // Positive: exact, +suffix, parameters, trailing OWS, mixed case.
+    for content_type in [
+        "application/grpc",
+        "APPLICATION/GRPC",
+        "application/grpc+proto",
+        "Application/Grpc+Json",
+        "application/grpc;charset=utf-8",
+        "application/grpc ; charset=utf-8",
+        "application/grpc ",
+        "application/grpc\t",
+    ] {
+        let mut headers = vec![
+            ("content-type".to_string(), content_type.to_string()),
+            ("te".to_string(), "gzip".to_string()),
+            ("x-keep".to_string(), "ok".to_string()),
+        ];
+        synthesize_grpc_te_trailers_if_needed(&mut headers);
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("te"))
+                .map(|(_, v)| v.as_str()),
+            Some("trailers"),
+            "native gRPC content-type `{content_type}` must re-synthesise te: trailers: {headers:?}"
+        );
+        assert!(headers.iter().any(|(k, _)| k == "x-keep"));
+    }
+
+    // Negative: prefix smuggling and gRPC-Web must not inject te: trailers.
+    for content_type in [
+        "application/grpcfoo",
+        "application/grpc-malicious",
+        "application/grpc-web",
+        "application/grpc-web+proto",
+        "application/json",
+        "text/plain",
+    ] {
+        let mut headers = vec![
+            ("content-type".to_string(), content_type.to_string()),
+            ("x-keep".to_string(), "ok".to_string()),
+        ];
+        synthesize_grpc_te_trailers_if_needed(&mut headers);
+        assert!(
+            !headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("te")),
+            "non-native content-type `{content_type}` must not inject te: trailers: {headers:?}"
+        );
+    }
 }

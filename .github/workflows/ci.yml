@@ -925,6 +925,7 @@ jobs:
               functional_cors_protocol_test
               functional_grpc_test
               functional_key_auth_query_test
+              functional_request_mirror_query_parity_test
               functional_load_testing_replay_test
               functional_passthrough_test
               functional_sse_test
