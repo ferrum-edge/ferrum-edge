@@ -3415,6 +3415,87 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
     }
 }
 
+#[test]
+fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_runtime() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let property = spec
+        .pointer("/components/schemas/BodyValidatorConfig/properties/grpc_max_decompressed_size_bytes")
+        .expect("BodyValidatorConfig must publish grpc_max_decompressed_size_bytes");
+    assert_eq!(property["type"], json!("integer"));
+    assert_eq!(property["format"], json!("uint64"));
+    assert_eq!(property["minimum"], json!(0));
+    assert_eq!(property["default"], json!(10485760));
+
+    let description = property["description"]
+        .as_str()
+        .expect("grpc_max_decompressed_size_bytes description");
+    for contract in [
+        "`0` disables the decompressed cap",
+        "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
+        "parses as an unsigned integer",
+        "10 MiB",
+        "request and response",
+    ] {
+        assert!(
+            description.contains(contract),
+            "BodyValidatorConfig.grpc_max_decompressed_size_bytes description missing `{contract}`"
+        );
+    }
+
+    assert_component_validity(
+        &spec,
+        "BodyValidatorConfig",
+        &json!({"grpc_max_decompressed_size_bytes": 0}),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "BodyValidatorConfig",
+        &json!({"grpc_max_decompressed_size_bytes": -1}),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "BodyValidatorConfig",
+        &json!({"grpc_max_decompressed_size_bytes": "10"}),
+        false,
+    );
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let docs = plugin_docs
+        .split("### `body_validator`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("body_validator docs section");
+    assert!(
+        docs.contains("`grpc_max_decompressed_size_bytes`"),
+        "docs/plugins.md body_validator section missing `grpc_max_decompressed_size_bytes`"
+    );
+    for contract in [
+        "`0` disables the decompressed cap",
+        "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
+        "parses as an unsigned integer",
+        "10 MiB",
+        "request and response",
+    ] {
+        assert!(
+            docs.contains(contract),
+            "docs/plugins.md body_validator section missing `{contract}`"
+        );
+    }
+
+    let runtime = include_str!("../../src/plugins/body_validator.rs");
+    assert!(
+        runtime.contains("optional_usize(config, \"grpc_max_decompressed_size_bytes\")?"),
+        "runtime must keep accepting grpc_max_decompressed_size_bytes"
+    );
+    assert!(
+        runtime.contains("fn default_grpc_max_decompressed_size_bytes"),
+        "runtime must keep environment-derived omission fallback"
+    );
+}
+
 fn assert_component_validity(
     spec: &serde_json::Value,
     component: &str,
