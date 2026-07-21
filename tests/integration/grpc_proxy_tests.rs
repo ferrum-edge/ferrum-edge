@@ -1706,7 +1706,11 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
                     // gRPC error response (HTTP 200 + `application/grpc`) instead of
                     // the plugin-transformed response.
                     let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
-                        Ok(Frame::data(Bytes::from_static(b"grpc-payload"))),
+                        // One valid uncompressed gRPC DATA message: flag 0x00,
+                        // 12-byte big-endian payload length, then `grpc-payload`.
+                        Ok(Frame::data(Bytes::from_static(
+                            b"\x00\x00\x00\x00\x0cgrpc-payload",
+                        ))),
                         Ok(Frame::trailers(trailers)),
                     ];
                     let body = StreamBody::new(tokio_stream::iter(frames));

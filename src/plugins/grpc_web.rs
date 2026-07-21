@@ -783,9 +783,7 @@ fn ensure_vary_accept(headers: &mut HashMap<String, String>) {
                 || existing
                     .split(',')
                     .any(|token| token.trim().eq_ignore_ascii_case("accept")) =>
-        {
-            return;
-        }
+        {}
         Some(existing) => {
             let mut merged = String::with_capacity(existing.len() + ", Accept".len());
             merged.push_str(existing);
@@ -1065,6 +1063,7 @@ pub fn request_is_grpc_web_translated(ctx: &RequestContext) -> bool {
 /// have used). On Accept failure the request Content-Type canonical form is
 /// retained so other gateway errors still have a browser-safe shape; the
 /// `grpc_web` plugin itself fails closed with `406` when translation is enabled.
+#[allow(dead_code)] // Called through `_test_support` in special test-hook builds.
 pub(crate) fn retain_client_content_type_for_errors(ctx: &mut RequestContext, content_type: &str) {
     if !is_grpc_web_content_type(content_type) {
         return;
