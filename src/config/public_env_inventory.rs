@@ -452,20 +452,3 @@ pub const PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS: &[&str] = &[
     // Compatibility alias of `FERRUM_TLS_KEY_EXCHANGE_GROUPS` (canonical).
     "FERRUM_TLS_CURVES",
 ];
-
-/// Returns the complete public DOC-03 inventory.
-pub fn public_ferrum_env_settings() -> &'static [&'static str] {
-    PUBLIC_FERRUM_ENV_SETTINGS
-}
-
-/// Returns coverage exemptions for compatibility-only aliases.
-pub fn public_ferrum_env_coverage_exemptions() -> &'static [&'static str] {
-    PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS
-}
-
-/// True when `key` is an explicit coverage exemption.
-pub fn is_public_ferrum_env_coverage_exempt(key: &str) -> bool {
-    PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS
-        .binary_search(&key)
-        .is_ok()
-}
