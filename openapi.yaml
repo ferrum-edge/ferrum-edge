@@ -14463,7 +14463,7 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers request bodies with SOAP content types (text/xml, application/soap+xml, application/xml). At least one security feature must be enabled. Note: signature paths verify against the wire bytes of SignedInfo / referenced elements and do not yet apply Exclusive XML Canonicalization (xml-exc-c14n#); operators integrating with IdPs that strictly canonicalize should validate end-to-end."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers request bodies with SOAP content types (text/xml, application/soap+xml, application/xml). At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported)."
       properties:
         reject_missing_security_header:
           type: boolean
@@ -14562,24 +14562,26 @@ components:
                  More than one `<Assertion>` inside the WS-Security block is
                  rejected outright.
               2. Resolve the signing algorithm and confirm it is in `allowed_signature_algorithms`.
-              3. Verify each `<Reference>` digest against the assertion with its own
-                 `<Signature>` element removed (XMLDSIG enveloped-signature transform).
+              3. Verify each `<Reference>` digest after the supported transform chain
+                 (XMLDSIG enveloped-signature followed by Exclusive XML Canonicalization
+                 `xml-exc-c14n#`, including `InclusiveNamespaces PrefixList`).
                  The digest algorithm must be in `allowed_digest_algorithms`. At
                  least one Reference must target the enclosing Assertion ID.
               4. Match the signing certificate from `KeyInfo/X509Data/X509Certificate`
                  against `trusted_signing_certs` by SHA-256 fingerprint of the full DER
                  (leaf-cert trust — no CA chain validation; operators supply the IdP's
                  actual signing certificate(s) as published in IdP metadata).
-              5. Verify `<SignatureValue>` over the `<SignedInfo>` bytes using the matched
-                 cert's RSA public key.
+              5. Verify `<SignatureValue>` over exclusive-canonicalized `<SignedInfo>`
+                 (`xml-exc-c14n#`, including `InclusiveNamespaces PrefixList`) using the
+                 matched cert's RSA public key.
               6. Validate Issuer (must match `trusted_issuers`), NotBefore /
                  NotOnOrAfter (with `clock_skew_seconds` tolerance), and Audience
                  (if `audience` is configured).
               7. Extract the Subject NameID into `ctx.metadata["soap_ws_saml_subject"]`
                  for downstream plugins.
-            On any failure the request is rejected with HTTP 401. Signature paths use the
-            wire bytes of `SignedInfo` / referenced elements and do not currently apply
-            Exclusive XML Canonicalization (xml-exc-c14n#).
+            On any failure the request is rejected with HTTP 401. Unsupported
+            canonicalization or transform algorithms fail closed; inclusive c14n,
+            comments, XPath, XSLT, and other XMLDSIG transforms are not supported.
           properties:
             enabled:
               type: boolean
