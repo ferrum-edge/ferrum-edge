@@ -1799,18 +1799,12 @@ async fn run_two_instance_response_chain(
 
 #[tokio::test]
 async fn test_two_instances_binary_translate_once_and_union_expose_headers() {
-    let first = create_plugin(
-        "grpc_web",
-        &json!({"expose_headers": ["x-request-id"]}),
-    )
-    .unwrap()
-    .unwrap();
-    let second = create_plugin(
-        "grpc_web",
-        &json!({"expose_headers": ["x-trace-id"]}),
-    )
-    .unwrap()
-    .unwrap();
+    let first = create_plugin("grpc_web", &json!({"expose_headers": ["x-request-id"]}))
+        .unwrap()
+        .unwrap();
+    let second = create_plugin("grpc_web", &json!({"expose_headers": ["x-trace-id"]}))
+        .unwrap()
+        .unwrap();
 
     let mut data = vec![0x00u8];
     data.extend_from_slice(&5u32.to_be_bytes());
@@ -1840,23 +1834,20 @@ async fn test_two_instances_text_decode_and_encode_exactly_once() {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
-    let first = create_plugin(
-        "grpc_web",
-        &json!({"expose_headers": ["x-a"]}),
-    )
-    .unwrap()
-    .unwrap();
-    let second = create_plugin(
-        "grpc_web",
-        &json!({"expose_headers": ["x-b"]}),
-    )
-    .unwrap()
-    .unwrap();
+    let first = create_plugin("grpc_web", &json!({"expose_headers": ["x-a"]}))
+        .unwrap()
+        .unwrap();
+    let second = create_plugin("grpc_web", &json!({"expose_headers": ["x-b"]}))
+        .unwrap()
+        .unwrap();
 
     let mut ctx = create_grpc_web_context("application/grpc-web-text");
     first.on_request_received(&mut ctx).await;
     second.on_request_received(&mut ctx).await;
-    assert_eq!(ctx.metadata.get("grpc_web_mode").map(String::as_str), Some("text"));
+    assert_eq!(
+        ctx.metadata.get("grpc_web_mode").map(String::as_str),
+        Some("text")
+    );
     assert!(ctx.metadata.contains_key("grpc_web.owner"));
 
     let mut grpc_frame = vec![0x00u8];
@@ -1913,7 +1904,10 @@ async fn test_two_instances_text_decode_and_encode_exactly_once() {
     let expose = headers
         .get("access-control-expose-headers")
         .expect("expose headers");
-    assert!(expose.contains("x-a") && expose.contains("x-b"), "got {expose}");
+    assert!(
+        expose.contains("x-a") && expose.contains("x-b"),
+        "got {expose}"
+    );
 }
 
 #[tokio::test]
@@ -1921,18 +1915,12 @@ async fn test_two_instances_priority_order_first_owner_wins() {
     // Simulate distinct priority_override ordering: lower effective priority
     // runs first and must own translation; the later instance only unions
     // expose_headers.
-    let early = create_plugin(
-        "grpc_web",
-        &json!({"expose_headers": ["x-early"]}),
-    )
-    .unwrap()
-    .unwrap();
-    let late = create_plugin(
-        "grpc_web",
-        &json!({"expose_headers": ["x-late"]}),
-    )
-    .unwrap()
-    .unwrap();
+    let early = create_plugin("grpc_web", &json!({"expose_headers": ["x-early"]}))
+        .unwrap()
+        .unwrap();
+    let late = create_plugin("grpc_web", &json!({"expose_headers": ["x-late"]}))
+        .unwrap()
+        .unwrap();
 
     let mut ctx = create_grpc_web_context("application/grpc-web");
     early.on_request_received(&mut ctx).await;
@@ -1961,12 +1949,9 @@ async fn test_two_instances_priority_order_first_owner_wins() {
 #[tokio::test]
 async fn test_follower_fails_closed_without_owner_staging_on_response_transform() {
     let owner = create_plugin_default();
-    let follower = create_plugin(
-        "grpc_web",
-        &json!({"expose_headers": ["x-follower"]}),
-    )
-    .unwrap()
-    .unwrap();
+    let follower = create_plugin("grpc_web", &json!({"expose_headers": ["x-follower"]}))
+        .unwrap()
+        .unwrap();
 
     let mut ctx = create_grpc_web_context("application/grpc-web");
     owner.on_request_received(&mut ctx).await;

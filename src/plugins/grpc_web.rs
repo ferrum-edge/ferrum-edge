@@ -1137,8 +1137,10 @@ impl Plugin for GrpcWebPlugin {
 
         // Canonical shared markers for proxy/H3 consumers, plus namespaced
         // per-instance staging so siblings cannot collide on mode state.
-        ctx.metadata
-            .insert(META_GRPC_WEB_OWNER.to_string(), self.instance_id_str.clone());
+        ctx.metadata.insert(
+            META_GRPC_WEB_OWNER.to_string(),
+            self.instance_id_str.clone(),
+        );
         ctx.metadata
             .insert(META_GRPC_WEB_MODE.to_string(), mode.to_string());
         ctx.metadata
@@ -1494,10 +1496,7 @@ impl Plugin for GrpcWebPlugin {
         if !self.is_translation_owner(ctx) {
             return None;
         }
-        if ctx
-            .metadata
-            .contains_key(META_GRPC_WEB_RESPONSE_TRANSLATED)
-        {
+        if ctx.metadata.contains_key(META_GRPC_WEB_RESPONSE_TRANSLATED) {
             return None;
         }
         // Fail closed: do not invent a gRPC-Web body from content-type alone
