@@ -719,6 +719,13 @@ pub mod _test_support {
         )
     }
 
+    pub fn soap_decode_xml_body_for_test(
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<String, String> {
+        crate::plugins::soap_ws_security::decode_soap_xml_body_for_test(bytes, content_type)
+    }
+
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)

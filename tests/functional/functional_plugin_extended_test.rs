@@ -1036,3 +1036,259 @@ async fn test_plugin_soap_ws_security_missing_header() {
         resp.status()
     );
 }
+
+#[tokio::test]
+#[ignore]
+async fn test_plugin_soap_ws_security_utf16le_username_token() {
+    let harness = PluginExtTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_echo_backend(backend_port).await.unwrap();
+
+    let client = reqwest::Client::new();
+
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-soap-utf16le",
+        "/soap-utf16le",
+        backend_port,
+        vec![json!({
+            "id": "plugin-soap-utf16le",
+            "plugin_name": "soap_ws_security",
+            "scope": "proxy",
+            "proxy_id": "proxy-soap-utf16le",
+            "enabled": true,
+            "config": {
+                "username_token": {
+                    "enabled": true,
+                    "password_type": "PasswordText",
+                    "credentials": [
+                        {"username": "testuser", "password": "testpass"}
+                    ]
+                },
+                "timestamp": {
+                    "require": false
+                }
+            }
+        })],
+    )
+    .await
+    .unwrap();
+
+    harness.wait_for_poll().await;
+
+    let soap_body = r#"<?xml version="1.0" encoding="UTF-16"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+    <soap:Header>
+        <wsse:Security>
+            <wsse:UsernameToken>
+                <wsse:Username>testuser</wsse:Username>
+                <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">testpass</wsse:Password>
+            </wsse:UsernameToken>
+        </wsse:Security>
+    </soap:Header>
+    <soap:Body>
+        <GetData xmlns="http://example.com"><id>123</id></GetData>
+    </soap:Body>
+</soap:Envelope>"#;
+
+    let mut utf16le = vec![0xFF, 0xFE];
+    for unit in soap_body.encode_utf16() {
+        utf16le.extend_from_slice(&unit.to_le_bytes());
+    }
+
+    let resp = client
+        .post(format!("{}/soap-utf16le/service", harness.proxy_base_url))
+        .header("Content-Type", "application/soap+xml; charset=utf-16")
+        .header("SOAPAction", "GetData")
+        .body(utf16le)
+        .send()
+        .await
+        .expect("Request failed");
+
+    let status = resp.status().as_u16();
+    let response_body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 200,
+        "UTF-16LE SOAP UsernameToken should be proxied, got {status}: {response_body}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_plugin_soap_ws_security_utf16be_username_token() {
+    let harness = PluginExtTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_echo_backend(backend_port).await.unwrap();
+
+    let client = reqwest::Client::new();
+
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-soap-utf16be",
+        "/soap-utf16be",
+        backend_port,
+        vec![json!({
+            "id": "plugin-soap-utf16be",
+            "plugin_name": "soap_ws_security",
+            "scope": "proxy",
+            "proxy_id": "proxy-soap-utf16be",
+            "enabled": true,
+            "config": {
+                "username_token": {
+                    "enabled": true,
+                    "password_type": "PasswordText",
+                    "credentials": [
+                        {"username": "testuser", "password": "testpass"}
+                    ]
+                },
+                "timestamp": {
+                    "require": false
+                }
+            }
+        })],
+    )
+    .await
+    .unwrap();
+
+    harness.wait_for_poll().await;
+
+    let soap_body = r#"<?xml version="1.0" encoding="UTF-16"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+    <soap:Header>
+        <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+            <wsse:UsernameToken>
+                <wsse:Username>testuser</wsse:Username>
+                <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">testpass</wsse:Password>
+            </wsse:UsernameToken>
+        </wsse:Security>
+    </soap:Header>
+    <soap:Body>
+        <GetData xmlns="http://example.com"><id>456</id></GetData>
+    </soap:Body>
+</soap:Envelope>"#;
+
+    let mut utf16be = vec![0xFE, 0xFF];
+    for unit in soap_body.encode_utf16() {
+        utf16be.extend_from_slice(&unit.to_be_bytes());
+    }
+
+    let resp = client
+        .post(format!("{}/soap-utf16be/service", harness.proxy_base_url))
+        .header("Content-Type", "text/xml; charset=utf-16be")
+        .header("SOAPAction", "GetData")
+        .body(utf16be)
+        .send()
+        .await
+        .expect("Request failed");
+
+    let status = resp.status().as_u16();
+    let response_body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 200,
+        "UTF-16BE SOAP UsernameToken should be proxied, got {status}: {response_body}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_plugin_soap_ws_security_utf16_charset_conflict_rejects() {
+    let harness = PluginExtTestHarness::new()
+        .await
+        .expect("Failed to create harness");
+
+    let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+    drop(backend_listener);
+    let _backend = start_echo_backend(backend_port).await.unwrap();
+
+    let client = reqwest::Client::new();
+
+    setup_proxy_with_plugins(
+        &harness,
+        &client,
+        "proxy-soap-utf16-conflict",
+        "/soap-utf16-conflict",
+        backend_port,
+        vec![json!({
+            "id": "plugin-soap-utf16-conflict",
+            "plugin_name": "soap_ws_security",
+            "scope": "proxy",
+            "proxy_id": "proxy-soap-utf16-conflict",
+            "enabled": true,
+            "config": {
+                "username_token": {
+                    "enabled": true,
+                    "password_type": "PasswordText",
+                    "credentials": [
+                        {"username": "testuser", "password": "testpass"}
+                    ]
+                },
+                "timestamp": {
+                    "require": false
+                }
+            }
+        })],
+    )
+    .await
+    .unwrap();
+
+    harness.wait_for_poll().await;
+
+    let soap_body = r#"<?xml version="1.0" encoding="UTF-16"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+    <soap:Header>
+        <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+            <wsse:UsernameToken>
+                <wsse:Username>testuser</wsse:Username>
+                <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">testpass</wsse:Password>
+            </wsse:UsernameToken>
+        </wsse:Security>
+    </soap:Header>
+    <soap:Body><GetData/></soap:Body>
+</soap:Envelope>"#;
+
+    let mut utf16le = vec![0xFF, 0xFE];
+    for unit in soap_body.encode_utf16() {
+        utf16le.extend_from_slice(&unit.to_le_bytes());
+    }
+
+    let resp = client
+        .post(format!(
+            "{}/soap-utf16-conflict/service",
+            harness.proxy_base_url
+        ))
+        // BOM says UTF-16LE; charset claims UTF-8 — must fail closed, not empty-body.
+        .header("Content-Type", "text/xml; charset=utf-8")
+        .body(utf16le)
+        .send()
+        .await
+        .expect("Request failed");
+
+    let status = resp.status().as_u16();
+    let response_body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 415,
+        "conflicting charset/BOM must return 415, got {status}: {response_body}"
+    );
+    assert!(
+        response_body.contains("conflicting") || response_body.contains("encoding"),
+        "response should describe the encoding conflict, got: {response_body}"
+    );
+    assert!(
+        !response_body.contains("empty"),
+        "must not misclassify UTF-16 as an empty body: {response_body}"
+    );
+}

@@ -11,6 +11,16 @@
 //! Runs in `before_proxy` with request body buffering. Priority 1500 places
 //! it in the AuthN band after HMAC auth.
 //!
+//! ## Request body character encoding
+//!
+//! Matching SOAP media types are buffered as raw bytes
+//! (`ctx.request_body_bytes`). Before XML/WS-Security validation the plugin
+//! decodes UTF-8 and UTF-16 (LE/BE) deterministically from the BOM and/or
+//! `Content-Type` charset, rejects charset/BOM/XML-declaration conflicts and
+//! malformed sequences fail-closed, and leaves the original wire bytes
+//! unchanged for the backend. Unsupported XML charsets are rejected with
+//! HTTP 415. Encoding diagnostics never log request bodies or credentials.
+//!
 //! ## XMLDSIG canonicalization (shared by X.509 and SAML signature paths)
 //!
 //! Both the WS-Security X.509 signature path and the SAML assertion signature
@@ -83,6 +93,13 @@ const MAX_XML_NODES: u32 = 65_536;
 const MAX_CANONICALIZATION_DEPTH: usize = 256;
 const MAX_INCLUSIVE_NAMESPACE_PREFIXES: usize = 64;
 const MAX_INCLUSIVE_PREFIX_LIST_BYTES: usize = 4_096;
+
+/// UTF-16→UTF-8 expansion is at most 1.5× for BMP code points. Cap decoded
+/// UTF-8 bytes relative to the (already globally bounded) wire payload so a
+/// hostile encoding cannot force an unbounded conversion buffer.
+const MAX_SOAP_DECODE_EXPANSION_NUMERATOR: usize = 3;
+const MAX_SOAP_DECODE_EXPANSION_DENOMINATOR: usize = 2;
+const MAX_SOAP_DECODE_EXPANSION_SLACK: usize = 16;
 
 // ── Config types ────────────────────────────────────────────────────────────
 
@@ -1456,6 +1473,19 @@ impl Plugin for SoapWsSecurity {
         true
     }
 
+    fn needs_request_body_bytes(&self) -> bool {
+        // SOAP may arrive as UTF-16 (or other non-UTF-8 XML encodings). The
+        // shared proxy handoff only populates metadata["request_body"] when
+        // std::str::from_utf8 succeeds, so this plugin must retain raw bytes.
+        true
+    }
+
+    fn needs_request_body_text(&self) -> bool {
+        // Decode from request_body_bytes with strict BOM/charset rules instead
+        // of relying on the UTF-8-only metadata copy.
+        false
+    }
+
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
         ctx.headers
             .get("content-type")
@@ -1475,10 +1505,11 @@ impl Plugin for SoapWsSecurity {
             _ => return PluginResult::Continue,
         };
 
-        // Get the buffered request body
-        let body = match ctx.metadata.get("request_body") {
-            Some(b) => b.clone(),
-            None => {
+        // Prefer bounded raw bytes (H1/H2/H3 handoff). Fall back to the UTF-8
+        // metadata key only for fixtures that pre-seed text without bytes.
+        let body = match resolve_soap_request_body(ctx, &content_type) {
+            Ok(Some(body)) => body,
+            Ok(None) => {
                 if self.reject_missing_security_header {
                     return PluginResult::Reject {
                         status_code: 400,
@@ -1487,6 +1518,20 @@ impl Plugin for SoapWsSecurity {
                     };
                 }
                 return PluginResult::Continue;
+            }
+            Err(err) => {
+                // Fail closed on hostile/unsupported encodings. Never log the
+                // body or credential material — only the stable error class.
+                warn!(
+                    content_type = %content_type,
+                    error_class = err.class(),
+                    "soap_ws_security: SOAP body encoding rejected"
+                );
+                return PluginResult::Reject {
+                    status_code: err.status_code(),
+                    body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(err.message())),
+                    headers: HashMap::new(),
+                };
             }
         };
 
@@ -2761,6 +2806,328 @@ fn extract_pem_der(pem: &str) -> Option<Vec<u8>> {
 fn contains_forbidden_xml_declaration(xml: &str) -> bool {
     contains_ascii_case_insensitive(xml, "<!doctype")
         || contains_ascii_case_insensitive(xml, "<!entity")
+}
+
+/// Encoding rejection at the SOAP hostile-input boundary.
+///
+/// Messages are stable and body-free so logs/responses never echo credentials
+/// or envelope contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoapBodyDecodeError {
+    UnsupportedCharset,
+    ConflictingCharset,
+    MalformedEncoding,
+    DecodeLimitExceeded,
+}
+
+impl SoapBodyDecodeError {
+    fn status_code(self) -> u16 {
+        match self {
+            Self::UnsupportedCharset | Self::ConflictingCharset => 415,
+            Self::MalformedEncoding | Self::DecodeLimitExceeded => 400,
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::UnsupportedCharset => "SOAP request uses an unsupported character encoding",
+            Self::ConflictingCharset => {
+                "SOAP request character encoding metadata is conflicting or ambiguous"
+            }
+            Self::MalformedEncoding => "SOAP request body is not valid for its character encoding",
+            Self::DecodeLimitExceeded => "SOAP request body exceeds the character decoding limit",
+        }
+    }
+
+    fn class(self) -> &'static str {
+        match self {
+            Self::UnsupportedCharset => "unsupported_charset",
+            Self::ConflictingCharset => "conflicting_charset",
+            Self::MalformedEncoding => "malformed_encoding",
+            Self::DecodeLimitExceeded => "decode_limit_exceeded",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoapXmlEncoding {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+}
+
+impl SoapXmlEncoding {
+    fn accepts_xml_decl_label(self, label: &str) -> bool {
+        match self {
+            Self::Utf8 => matches_utf8_label(label),
+            // XML declarations commonly say encoding="UTF-16" without endianness;
+            // the BOM / Content-Type already fixed the endian form.
+            Self::Utf16Le | Self::Utf16Be => {
+                matches_utf16_unspecified_label(label)
+                    || (self == Self::Utf16Le && matches_utf16le_label(label))
+                    || (self == Self::Utf16Be && matches_utf16be_label(label))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeclaredCharset {
+    Utf8,
+    Utf16Le,
+    Utf16Be,
+    /// `charset=utf-16` without an endian hint — BOM required.
+    Utf16Unspecified,
+}
+
+fn resolve_soap_request_body(
+    ctx: &RequestContext,
+    content_type: &str,
+) -> Result<Option<String>, SoapBodyDecodeError> {
+    if let Some(bytes) = ctx.request_body_bytes.as_ref() {
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        return decode_soap_xml_body(bytes, content_type).map(Some);
+    }
+    match ctx.metadata.get("request_body") {
+        Some(body) if body.is_empty() => Ok(None),
+        Some(body) => Ok(Some(body.clone())),
+        None => Ok(None),
+    }
+}
+
+/// Decode a buffered SOAP body into a UTF-8 string for XML validation.
+///
+/// The original wire bytes in `ctx.request_body_bytes` are left untouched so
+/// the backend still receives the client representation (including UTF-16).
+fn decode_soap_xml_body(
+    bytes: &[u8],
+    content_type: &str,
+) -> Result<String, SoapBodyDecodeError> {
+    let declared = parse_content_type_charset(content_type)?;
+    let (encoding, payload) = resolve_soap_xml_encoding(bytes, declared)?;
+    let decoded = decode_payload(encoding, payload)?;
+    validate_xml_declaration_encoding(&decoded, encoding)?;
+    Ok(decoded)
+}
+
+fn parse_content_type_charset(
+    content_type: &str,
+) -> Result<Option<DeclaredCharset>, SoapBodyDecodeError> {
+    let mut charset = None;
+    for part in content_type.split(';').skip(1) {
+        let part = part.trim();
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("charset") {
+            continue;
+        }
+        let raw = value.trim().trim_matches('"').trim_matches('\'');
+        if raw.is_empty() {
+            return Err(SoapBodyDecodeError::UnsupportedCharset);
+        }
+        if charset.is_some() {
+            // Duplicate charset parameters are hostile/ambiguous metadata.
+            return Err(SoapBodyDecodeError::ConflictingCharset);
+        }
+        charset = Some(normalize_declared_charset(raw)?);
+    }
+    Ok(charset)
+}
+
+fn normalize_declared_charset(raw: &str) -> Result<DeclaredCharset, SoapBodyDecodeError> {
+    if matches_utf8_label(raw) {
+        Ok(DeclaredCharset::Utf8)
+    } else if matches_utf16le_label(raw) {
+        Ok(DeclaredCharset::Utf16Le)
+    } else if matches_utf16be_label(raw) {
+        Ok(DeclaredCharset::Utf16Be)
+    } else if matches_utf16_unspecified_label(raw) {
+        Ok(DeclaredCharset::Utf16Unspecified)
+    } else {
+        Err(SoapBodyDecodeError::UnsupportedCharset)
+    }
+}
+
+fn matches_utf8_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case("utf-8")
+        || label.eq_ignore_ascii_case("utf8")
+        || label.eq_ignore_ascii_case("unicode-1-1-utf-8")
+}
+
+fn matches_utf16le_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case("utf-16le")
+        || label.eq_ignore_ascii_case("utf16le")
+        || label.eq_ignore_ascii_case("unicodefffe")
+}
+
+fn matches_utf16be_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case("utf-16be") || label.eq_ignore_ascii_case("utf16be")
+}
+
+fn matches_utf16_unspecified_label(label: &str) -> bool {
+    label.eq_ignore_ascii_case("utf-16") || label.eq_ignore_ascii_case("utf16")
+}
+
+fn detect_bom(bytes: &[u8]) -> Option<(SoapXmlEncoding, usize)> {
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        Some((SoapXmlEncoding::Utf8, 3))
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        Some((SoapXmlEncoding::Utf16Be, 2))
+    } else if bytes.starts_with(&[0xFF, 0xFE]) {
+        Some((SoapXmlEncoding::Utf16Le, 2))
+    } else {
+        None
+    }
+}
+
+fn resolve_soap_xml_encoding(
+    bytes: &[u8],
+    declared: Option<DeclaredCharset>,
+) -> Result<(SoapXmlEncoding, &[u8]), SoapBodyDecodeError> {
+    let bom = detect_bom(bytes);
+    match (bom, declared) {
+        (Some((encoding, skip)), None) => Ok((encoding, &bytes[skip..])),
+        (Some((encoding, skip)), Some(DeclaredCharset::Utf8)) => {
+            if encoding == SoapXmlEncoding::Utf8 {
+                Ok((encoding, &bytes[skip..]))
+            } else {
+                Err(SoapBodyDecodeError::ConflictingCharset)
+            }
+        }
+        (Some((encoding, skip)), Some(DeclaredCharset::Utf16Le)) => {
+            if encoding == SoapXmlEncoding::Utf16Le {
+                Ok((encoding, &bytes[skip..]))
+            } else {
+                Err(SoapBodyDecodeError::ConflictingCharset)
+            }
+        }
+        (Some((encoding, skip)), Some(DeclaredCharset::Utf16Be)) => {
+            if encoding == SoapXmlEncoding::Utf16Be {
+                Ok((encoding, &bytes[skip..]))
+            } else {
+                Err(SoapBodyDecodeError::ConflictingCharset)
+            }
+        }
+        (Some((encoding, skip)), Some(DeclaredCharset::Utf16Unspecified)) => {
+            if matches!(
+                encoding,
+                SoapXmlEncoding::Utf16Le | SoapXmlEncoding::Utf16Be
+            ) {
+                Ok((encoding, &bytes[skip..]))
+            } else {
+                Err(SoapBodyDecodeError::ConflictingCharset)
+            }
+        }
+        (None, Some(DeclaredCharset::Utf8)) | (None, None) => Ok((SoapXmlEncoding::Utf8, bytes)),
+        (None, Some(DeclaredCharset::Utf16Le)) => Ok((SoapXmlEncoding::Utf16Le, bytes)),
+        (None, Some(DeclaredCharset::Utf16Be)) => Ok((SoapXmlEncoding::Utf16Be, bytes)),
+        // charset=utf-16 without BOM/endian is ambiguous — fail closed.
+        (None, Some(DeclaredCharset::Utf16Unspecified)) => {
+            Err(SoapBodyDecodeError::ConflictingCharset)
+        }
+    }
+}
+
+fn decode_payload(
+    encoding: SoapXmlEncoding,
+    payload: &[u8],
+) -> Result<String, SoapBodyDecodeError> {
+    let max_decoded = payload
+        .len()
+        .saturating_mul(MAX_SOAP_DECODE_EXPANSION_NUMERATOR)
+        / MAX_SOAP_DECODE_EXPANSION_DENOMINATOR
+        + MAX_SOAP_DECODE_EXPANSION_SLACK;
+
+    let decoded = match encoding {
+        SoapXmlEncoding::Utf8 => std::str::from_utf8(payload)
+            .map(|s| s.to_string())
+            .map_err(|_| SoapBodyDecodeError::MalformedEncoding)?,
+        SoapXmlEncoding::Utf16Le => decode_utf16(payload, false)?,
+        SoapXmlEncoding::Utf16Be => decode_utf16(payload, true)?,
+    };
+
+    if decoded.len() > max_decoded {
+        return Err(SoapBodyDecodeError::DecodeLimitExceeded);
+    }
+    Ok(decoded)
+}
+
+fn decode_utf16(payload: &[u8], big_endian: bool) -> Result<String, SoapBodyDecodeError> {
+    if payload.len() % 2 != 0 {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    }
+    let units = payload
+        .chunks_exact(2)
+        .map(|pair| {
+            if big_endian {
+                u16::from_be_bytes([pair[0], pair[1]])
+            } else {
+                u16::from_le_bytes([pair[0], pair[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).map_err(|_| SoapBodyDecodeError::MalformedEncoding)
+}
+
+fn validate_xml_declaration_encoding(
+    xml: &str,
+    resolved: SoapXmlEncoding,
+) -> Result<(), SoapBodyDecodeError> {
+    let trimmed = xml.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
+    if !trimmed.as_bytes().starts_with(b"<?xml") {
+        return Ok(());
+    }
+    let Some(end) = trimmed.find("?>") else {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    };
+    let decl = &trimmed[..end + 2];
+    let Some(label) = extract_xml_decl_encoding(decl) else {
+        return Ok(());
+    };
+    if resolved.accepts_xml_decl_label(&label) {
+        Ok(())
+    } else if matches_utf8_label(&label)
+        || matches_utf16le_label(&label)
+        || matches_utf16be_label(&label)
+        || matches_utf16_unspecified_label(&label)
+    {
+        Err(SoapBodyDecodeError::ConflictingCharset)
+    } else {
+        // Unknown declaration encodings (e.g. iso-8859-1) are unsupported.
+        Err(SoapBodyDecodeError::UnsupportedCharset)
+    }
+}
+
+fn extract_xml_decl_encoding(decl: &str) -> Option<String> {
+    let lower = decl.to_ascii_lowercase();
+    let key = "encoding";
+    let idx = lower.find(key)?;
+    let after = decl[idx + key.len()..].trim_start();
+    let after = after.strip_prefix('=')?.trim_start();
+    let quote = after.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let rest = &after[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    let value = rest[..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+// Reached only via the lib target's `_test_support` shim (external unit tests).
+#[allow(dead_code)]
+pub(crate) fn decode_soap_xml_body_for_test(
+    bytes: &[u8],
+    content_type: &str,
+) -> Result<String, String> {
+    decode_soap_xml_body(bytes, content_type).map_err(|err| err.message().to_string())
 }
 
 fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
