@@ -1,7 +1,13 @@
+use super::plugin_utils::create_test_proxy;
+use ferrum_edge::_test_support::{
+    finalize_plugin_rejection_parts_for_test, run_after_proxy_hooks_reject_for_test,
+};
 use ferrum_edge::plugins::compression::{COMPRESSION_CONFIG_KEYS, CompressionPlugin};
+use ferrum_edge::plugins::response_caching::ResponseCaching;
 use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, validate_plugin_config};
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 fn make_plugin(config: serde_json::Value) -> CompressionPlugin {
     CompressionPlugin::new(&config).unwrap()
@@ -75,6 +81,8 @@ fn test_decompress_request_config() {
 fn test_applies_after_proxy_on_reject() {
     let plugin = make_plugin(json!({}));
     assert!(plugin.applies_after_proxy_on_reject());
+    assert!(plugin.may_replace_rejection_response());
+    assert!(!plugin.warn_on_rejection_response_replacement());
 }
 
 #[test]
@@ -369,6 +377,843 @@ async fn test_q_zero_rejects_algorithm() {
 
     plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     assert_eq!(resp_headers.get("content-encoding").unwrap(), "br");
+}
+
+// ────────────────────── Identity negotiation (RFC 9110 §12.5.3) ──────────────────────
+
+#[tokio::test]
+async fn test_higher_identity_quality_sends_uncoded_response() {
+    // identity;q=1 beats gzip;q=0.2: the uncoded representation is the most
+    // preferred acceptable one, so the gateway must not compress.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("identity;q=1, gzip;q=0.2"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!resp_headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_identity_tie_keeps_server_compression_preference() {
+    // gzip and identity tied at q=1: server preference order keeps the
+    // existing behavior of compressing.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip, identity;q=1"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+}
+
+#[tokio::test]
+async fn test_identity_refusal_with_acceptable_algorithm_still_compresses() {
+    // identity;q=0 excludes the uncoded representation, but gzip;q=0.5 is
+    // acceptable and is the only acceptable representation Ferrum can produce.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("identity;q=0, gzip;q=0.5"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+}
+
+#[tokio::test]
+async fn test_refused_algorithms_without_identity_exclusion_send_identity() {
+    // gzip/br refused but identity not excluded: identity is acceptable by
+    // default (RFC 9110 §12.5.3), so the response is sent uncoded.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip;q=0, br;q=0"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!resp_headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_wildcard_refusal_with_identity_override_sends_identity() {
+    // `*;q=0` refuses every coding including identity, but the more-specific
+    // identity entry overrides the wildcard (RFC 9110 §12.5.3).
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("*;q=0, identity;q=1"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!resp_headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_wildcard_quality_applies_to_unlisted_algorithms_not_identity() {
+    // `*;q=0.3` assigns q=0.3 to unlisted gzip/br only. Identity stays at its
+    // default q=1 unless explicitly refused (RFC 9110 §12.5.3), so with
+    // `identity;q=0` the wildcard algorithm is the only acceptable
+    // representation and the gateway compresses.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("identity;q=0, *;q=0.3"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+}
+
+#[tokio::test]
+async fn test_identity_wildcard_quality_semantics_table() {
+    // Distinguishes RFC 9110 §12.5.3 identity/wildcard semantics:
+    // nonzero wildcard must not lower default identity q=1; explicit identity
+    // overrides `*;q=0`; bare `*;q=0` refuses identity.
+    #[derive(Debug)]
+    enum Expect {
+        Identity,
+        Compress(&'static str),
+        NotAcceptable,
+    }
+    let cases = [
+        ("*;q=0.3", Expect::Identity),
+        ("gzip;q=0.2, *;q=0.3", Expect::Identity),
+        ("identity;q=0.8, *;q=0.3", Expect::Identity),
+        ("identity;q=0.2, gzip;q=0.8", Expect::Compress("gzip")),
+        ("*;q=0, identity;q=1", Expect::Identity),
+        ("identity;q=1, *;q=0", Expect::Identity),
+        ("*;q=0", Expect::NotAcceptable),
+        // First identity entry wins (parity with response_representation).
+        ("identity;q=0, identity;q=1", Expect::NotAcceptable),
+        ("identity;q=1, identity;q=0", Expect::Identity),
+    ];
+
+    for (accept_encoding, expect) in cases {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_ctx(Some(accept_encoding));
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "application/json".to_string());
+        resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+        let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        match expect {
+            Expect::Identity => {
+                assert!(
+                    matches!(result, PluginResult::Continue),
+                    "{accept_encoding}: expected identity continue, got {result:?}"
+                );
+                assert!(
+                    !resp_headers.contains_key("content-encoding"),
+                    "{accept_encoding}: identity must not set content-encoding"
+                );
+            }
+            Expect::Compress(encoding) => {
+                assert!(
+                    matches!(result, PluginResult::Continue),
+                    "{accept_encoding}: expected compress continue, got {result:?}"
+                );
+                assert_eq!(
+                    resp_headers.get("content-encoding").map(String::as_str),
+                    Some(encoding),
+                    "{accept_encoding}"
+                );
+            }
+            Expect::NotAcceptable => match result {
+                PluginResult::Reject {
+                    status_code,
+                    headers,
+                    ..
+                } => {
+                    assert_eq!(status_code, 406, "{accept_encoding}");
+                    assert!(!headers.contains_key("content-encoding"));
+                    assert!(!resp_headers.contains_key("content-encoding"));
+                }
+                other => panic!("{accept_encoding}: expected 406, got {other:?}"),
+            },
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_no_acceptable_representation_returns_406() {
+    // Every representation Ferrum can produce has quality zero: identity and
+    // all configured algorithms are refused. The negotiation must fail with
+    // 406 instead of sending an explicitly excluded identity representation,
+    // and no compression fields may be committed (RFC 9110 §12.5.3).
+    for accept_encoding in [
+        "gzip;q=0, br;q=0, identity;q=0",
+        "zstd, identity;q=0",
+        "*;q=0",
+    ] {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_ctx(Some(accept_encoding));
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "application/json".to_string());
+        resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+        let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        match result {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => {
+                assert_eq!(status_code, 406, "Accept-Encoding: {accept_encoding}");
+                assert!(body.contains("not acceptable"));
+                assert!(!headers.contains_key("content-encoding"));
+                assert_eq!(
+                    headers.get("vary").map(String::as_str),
+                    Some("Accept-Encoding")
+                );
+            }
+            other => panic!("expected 406 for {accept_encoding:?}, got {other:?}"),
+        }
+        // No compression fields were committed to the backend response.
+        assert!(!resp_headers.contains_key("content-encoding"));
+    }
+}
+
+#[tokio::test]
+async fn test_malformed_identity_qvalue_is_not_a_refusal() {
+    // A malformed identity qvalue cannot express a refusal: only a
+    // well-formed RFC 9110 §12.4.2 `q=0` weight forbids identity. Unparseable
+    // input leaves identity acceptable, so the request is served uncoded
+    // instead of producing a 406 (parity with the shared
+    // `identity_coding_is_acceptable` predicate in `response_representation`).
+    for accept_encoding in [
+        "gzip;q=0, br;q=0, identity;q=bogus",
+        // Four fraction digits fall outside the qvalue grammar.
+        "gzip;q=0, br;q=0, identity;q=0.0000",
+        "zstd, *;q=bogus",
+    ] {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_ctx(Some(accept_encoding));
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "application/json".to_string());
+        resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+        let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "malformed identity qvalue must not produce a 406: {accept_encoding}"
+        );
+        assert!(!resp_headers.contains_key("content-encoding"));
+    }
+}
+
+#[tokio::test]
+async fn test_406_fail_closed_when_ineligible_and_identity_unacceptable() {
+    // Once compression owns Accept-Encoding negotiation, a response that
+    // cannot be encoded (content-type / min size) must still 406 when identity
+    // is unacceptable — never forward the excluded identity body, and never
+    // partially mutate compression headers on the reject path.
+    for (accept_encoding, mut resp_headers) in [
+        ("*;q=0", {
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "image/png".to_string());
+            h.insert("content-length".to_string(), "1000".to_string());
+            h
+        }),
+        ("gzip;q=1, identity;q=0", {
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "application/json".to_string());
+            // Below default min_content_length (256).
+            h.insert("content-length".to_string(), "100".to_string());
+            h
+        }),
+        ("identity;q=0, *;q=0.3", {
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "image/png".to_string());
+            h.insert("content-length".to_string(), "5000".to_string());
+            h
+        }),
+    ] {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_ctx(Some(accept_encoding));
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let original = resp_headers.clone();
+        let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        match result {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers: reject_headers,
+            } => {
+                assert_eq!(status_code, 406, "{accept_encoding}");
+                assert!(body.contains("not acceptable"));
+                assert!(!reject_headers.contains_key("content-encoding"));
+                assert_eq!(
+                    reject_headers.get("vary").map(String::as_str),
+                    Some("Accept-Encoding")
+                );
+            }
+            other => panic!("expected 406 for {accept_encoding:?}, got {other:?}"),
+        }
+        // Backend response map must be untouched (no partial compression mutation).
+        assert_eq!(resp_headers, original, "{accept_encoding}");
+        assert!(!ctx.metadata.contains_key("compression:algorithm"));
+    }
+}
+
+#[tokio::test]
+async fn test_406_not_applied_to_nobody_or_already_encoded_responses() {
+    // Protocol-correct hard skips: no representation payload, or upstream
+    // already selected a coding. Do not invent a 406 for these.
+    for (status, accept_encoding, mut resp_headers) in [
+        (204, "*;q=0", {
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "application/json".to_string());
+            h
+        }),
+        (304, "identity;q=0", {
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "application/json".to_string());
+            h
+        }),
+        (200, "*;q=0", {
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "application/json".to_string());
+            h.insert("content-length".to_string(), "1000".to_string());
+            h.insert("content-encoding".to_string(), "gzip".to_string());
+            h
+        }),
+        // Already-coded range/delta remains a true protocol hard skip.
+        (206, "identity;q=0", {
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "application/json".to_string());
+            h.insert("content-length".to_string(), "100".to_string());
+            h.insert("content-range".to_string(), "bytes 0-99/5000".to_string());
+            h.insert("content-encoding".to_string(), "gzip".to_string());
+            h
+        }),
+    ] {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_ctx(Some(accept_encoding));
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let result = plugin
+            .after_proxy(&mut ctx, status, &mut resp_headers)
+            .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "status={status} ae={accept_encoding}: expected Continue, got {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_empty_accept_encoding_value_sends_identity() {
+    // An empty field value makes only the identity coding acceptable
+    // (RFC 9110 §12.5.3); the response is forwarded uncoded.
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some(""));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert!(!resp_headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_406_via_shared_after_proxy_chokepoint() {
+    // H1/H2, native H3, and H3 cross-protocol all invoke
+    // `proxy::run_after_proxy_hooks` for response negotiation. Prove that
+    // chokepoint selects compression and returns 406 with no Content-Encoding.
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(make_plugin(json!({})))];
+    let mut ctx = make_ctx(Some("*;q=0"));
+    let mut req_headers = HashMap::new();
+    plugins[0].before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    let (status, _body, headers) =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut resp_headers)
+            .await
+            .expect("shared after_proxy chokepoint must produce 406");
+    assert_eq!(status, 406);
+    assert_eq!(
+        headers.get("vary").map(String::as_str),
+        Some("Accept-Encoding")
+    );
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/json")
+    );
+    assert!(
+        !headers.contains_key("content-encoding"),
+        "406 path must not commit content-encoding"
+    );
+}
+
+#[test]
+fn test_h1_h2_h3_paths_reach_shared_after_proxy_chokepoint() {
+    // Behavioral coverage above exercises `run_after_proxy_hooks`. Pin that
+    // each real protocol surface reaches that helper rather than only flipping
+    // an HTTP Version on a Response builder.
+    let h1_h2 = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/server.rs");
+    let h3_cross = include_str!("../../../src/http3/cross_protocol.rs");
+
+    assert!(
+        h1_h2.contains("let after_proxy_reject = run_after_proxy_hooks(")
+            && h1_h2.contains("&mut plugin_response_headers,"),
+        "H1/H2 buffered path must call run_after_proxy_hooks"
+    );
+    assert!(
+        h1_h2.contains(
+            "run_after_proxy_hooks(&plugins, &mut ctx, response_status, &mut response_headers).await"
+        ),
+        "H1/H2 streaming path must call run_after_proxy_hooks"
+    );
+    // Main may wrap the reject in `let mut` for synthetic-body prep; pin the
+    // helper body itself (not a distant call site) still delegates to the
+    // shared chokepoint with the streaming-wrapper argument shape.
+    const H3_STREAMING_HELPER: &str = "async fn run_h3_streaming_after_proxy_hooks(";
+    const H3_STREAMING_DELEGATION: &str =
+        "run_after_proxy_hooks(plugins, ctx, response_status, response_headers).await";
+    let h3_helper = h3
+        .find(H3_STREAMING_HELPER)
+        .map(|start| &h3[start..h3.len().min(start.saturating_add(1200))])
+        .unwrap_or("");
+    assert!(
+        !h3_helper.is_empty() && h3_helper.contains(H3_STREAMING_DELEGATION),
+        "native H3 streaming path must delegate to run_after_proxy_hooks"
+    );
+    assert!(
+        h3.contains(
+            "run_after_proxy_hooks(&plugins, &mut ctx, response_status, &mut response_headers)"
+        ),
+        "native H3 buffered path must call run_after_proxy_hooks"
+    );
+    assert!(
+        h3_cross.contains("crate::proxy::run_after_proxy_hooks("),
+        "H3 cross-protocol path must call run_after_proxy_hooks"
+    );
+}
+
+#[tokio::test]
+async fn test_response_cache_hit_cannot_bypass_required_406() {
+    // Compose response_caching + compression. An identity variant cached
+    // without Vary: Accept-Encoding (#2355) must still be replaced by 406 when
+    // a later request refuses identity — the shared reject-path after_proxy
+    // negotiation must not be skipped on cache HIT.
+    let cache =
+        Arc::new(ResponseCaching::new(&json!({"ttl_seconds": 60})).unwrap()) as Arc<dyn Plugin>;
+    let compression = Arc::new(make_plugin(json!({}))) as Arc<dyn Plugin>;
+    let plugins = vec![cache, compression];
+
+    // Miss path: store an identity body with no Vary (the #2355 shape).
+    let mut store_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cache-406".to_string(),
+    );
+    store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    let mut store_headers = HashMap::new();
+    assert!(matches!(
+        plugins[0]
+            .before_proxy(&mut store_ctx, &mut store_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let mut store_resp = HashMap::new();
+    store_resp.insert("content-type".to_string(), "application/json".to_string());
+    store_resp.insert("cache-control".to_string(), "max-age=60".to_string());
+    // Deliberately omit Vary: Accept-Encoding (identity-variant gap in #2355).
+    plugins[0]
+        .after_proxy(&mut store_ctx, 200, &mut store_resp)
+        .await;
+    plugins[0]
+        .on_final_response_body(
+            &mut store_ctx,
+            200,
+            &store_resp,
+            br#"{"cached":"identity"}"#,
+        )
+        .await;
+
+    // Hit path: client refuses identity. Cache serves the identity body via
+    // before_proxy Reject and short-circuits later before_proxy hooks
+    // (compression never snapshots Accept-Encoding). Reject-path finalization
+    // must still negotiate from ctx.headers and replace the HIT with 406.
+    let mut hit_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cache-406".to_string(),
+    );
+    hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    hit_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "*;q=0".to_string());
+    let mut hit_headers = hit_ctx.headers.clone();
+
+    let (status, body, resp_headers) = match plugins[0]
+        .before_proxy(&mut hit_ctx, &mut hit_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body.into_bytes(), headers),
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body.to_vec(), headers),
+        other => panic!("expected cache HIT reject, got {other:?}"),
+    };
+    assert_eq!(status, 200);
+    assert_eq!(body, br#"{"cached":"identity"}"#);
+
+    let (final_status, final_body, final_headers) = finalize_plugin_rejection_parts_for_test(
+        &plugins,
+        &mut hit_ctx,
+        status,
+        body,
+        resp_headers,
+    )
+    .await;
+
+    assert_eq!(final_status, 406, "cache HIT must not bypass required 406");
+    assert!(
+        String::from_utf8_lossy(&final_body).contains("not acceptable"),
+        "406 body should replace the cached identity payload"
+    );
+    assert!(
+        !final_headers.contains_key("content-encoding"),
+        "406 path must not commit content-encoding"
+    );
+    assert_eq!(
+        final_headers.get("vary").map(String::as_str),
+        Some("Accept-Encoding")
+    );
+}
+
+#[tokio::test]
+async fn test_response_cache_hit_preserves_identity_when_acceptable() {
+    // Cache HIT + absent / identity-acceptable Accept-Encoding must keep the
+    // cached identity representation — replacement is only when identity is
+    // explicitly unacceptable.
+    let cache =
+        Arc::new(ResponseCaching::new(&json!({"ttl_seconds": 60})).unwrap()) as Arc<dyn Plugin>;
+    let compression = Arc::new(make_plugin(json!({}))) as Arc<dyn Plugin>;
+    let plugins = vec![cache, compression];
+
+    let mut store_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cache-identity-ok".to_string(),
+    );
+    store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    let mut store_headers = HashMap::new();
+    assert!(matches!(
+        plugins[0]
+            .before_proxy(&mut store_ctx, &mut store_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let mut store_resp = HashMap::new();
+    store_resp.insert("content-type".to_string(), "application/json".to_string());
+    store_resp.insert("cache-control".to_string(), "max-age=60".to_string());
+    plugins[0]
+        .after_proxy(&mut store_ctx, 200, &mut store_resp)
+        .await;
+    plugins[0]
+        .on_final_response_body(
+            &mut store_ctx,
+            200,
+            &store_resp,
+            br#"{"cached":"identity"}"#,
+        )
+        .await;
+
+    for accept_encoding in [None, Some("gzip"), Some("identity")] {
+        let mut hit_ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/cache-identity-ok".to_string(),
+        );
+        hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+        if let Some(ae) = accept_encoding {
+            hit_ctx
+                .headers
+                .insert("accept-encoding".to_string(), ae.to_string());
+        }
+        let mut hit_headers = hit_ctx.headers.clone();
+
+        let (status, body, resp_headers) = match plugins[0]
+            .before_proxy(&mut hit_ctx, &mut hit_headers)
+            .await
+        {
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            } => (status_code, body.into_bytes(), headers),
+            PluginResult::RejectBinary {
+                status_code,
+                body,
+                headers,
+            } => (status_code, body.to_vec(), headers),
+            other => panic!("expected cache HIT reject, got {other:?}"),
+        };
+        assert_eq!(status, 200);
+        assert_eq!(
+            hit_ctx.metadata.get("cache_status").map(String::as_str),
+            Some("HIT")
+        );
+
+        let (final_status, final_body, final_headers) = finalize_plugin_rejection_parts_for_test(
+            &plugins,
+            &mut hit_ctx,
+            status,
+            body,
+            resp_headers,
+        )
+        .await;
+
+        assert_eq!(
+            final_status, 200,
+            "ae={accept_encoding:?}: acceptable identity must keep cache HIT"
+        );
+        assert_eq!(final_body, br#"{"cached":"identity"}"#);
+        assert!(
+            !final_headers.contains_key("content-encoding"),
+            "ae={accept_encoding:?}: must not commit content-encoding on reject path"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_security_rejection_not_replaced_by_406() {
+    // `may_replace_rejection_response` is global opt-in, but compression must
+    // not mask unrelated auth/policy statuses when identity is unacceptable.
+    struct AuthRejectPlugin;
+    #[async_trait::async_trait]
+    impl Plugin for AuthRejectPlugin {
+        fn name(&self) -> &str {
+            "test_auth_reject"
+        }
+        fn priority(&self) -> u16 {
+            1000
+        }
+        async fn before_proxy(
+            &self,
+            _ctx: &mut RequestContext,
+            _headers: &mut HashMap<String, String>,
+        ) -> PluginResult {
+            PluginResult::Reject {
+                status_code: 401,
+                body: r#"{"error":"unauthorized"}"#.to_string(),
+                headers: HashMap::from([("www-authenticate".to_string(), "Bearer".to_string())]),
+            }
+        }
+    }
+
+    let plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(AuthRejectPlugin), Arc::new(make_plugin(json!({})))];
+    let mut ctx = make_ctx(Some("*;q=0"));
+    let mut headers = ctx.headers.clone();
+    let (status, body, resp_headers) = match plugins[0].before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body.into_bytes(), headers),
+        other => panic!("expected auth reject, got {other:?}"),
+    };
+    assert_eq!(status, 401);
+    // No cache_status marker — this is not a response_caching HIT.
+    assert!(!ctx.metadata.contains_key("cache_status"));
+
+    let (final_status, final_body, final_headers) =
+        finalize_plugin_rejection_parts_for_test(&plugins, &mut ctx, status, body, resp_headers)
+            .await;
+
+    assert_eq!(
+        final_status, 401,
+        "auth rejection must not be masked by compression 406"
+    );
+    assert_eq!(final_body, br#"{"error":"unauthorized"}"#);
+    assert_eq!(
+        final_headers.get("www-authenticate").map(String::as_str),
+        Some("Bearer")
+    );
+    assert!(!final_headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_identity_range_delta_continues_when_identity_acceptable() {
+    // Identity range/delta responses are non-transformable: forward unchanged
+    // when identity remains acceptable (including absent Accept-Encoding).
+    let plugin = make_plugin(json!({}));
+    for (status, accept_encoding, mut resp_headers) in [
+        (206, Some("gzip"), {
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "text/html".to_string());
+            h.insert("content-length".to_string(), "100".to_string());
+            h.insert("content-range".to_string(), "bytes 0-99/5000".to_string());
+            h
+        }),
+        (226, Some("identity"), {
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "text/html".to_string());
+            h.insert("content-length".to_string(), "100".to_string());
+            h.insert("im".to_string(), "vcdiff".to_string());
+            h.insert("delta-base".to_string(), "\"version-1\"".to_string());
+            h
+        }),
+        (200, None, {
+            let mut h = HashMap::new();
+            h.insert("content-type".to_string(), "text/html".to_string());
+            h.insert("content-length".to_string(), "100".to_string());
+            h.insert("content-range".to_string(), "bytes 0-99/5000".to_string());
+            h
+        }),
+    ] {
+        let mut ctx = make_ctx(accept_encoding);
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        let result = plugin
+            .after_proxy(&mut ctx, status, &mut resp_headers)
+            .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "status={status} ae={accept_encoding:?}: expected Continue, got {result:?}"
+        );
+        assert!(!ctx.metadata.contains_key("compression:algorithm"));
+        assert!(!resp_headers.contains_key("content-encoding"));
+        assert_eq!(resp_headers.get("content-length").unwrap(), "100");
+    }
+}
+
+#[tokio::test]
+async fn test_identity_range_delta_406_when_identity_unacceptable() {
+    // Identity range/delta cannot be safely re-encoded. When the client refuses
+    // identity, fail closed with 406 instead of forwarding an excluded identity
+    // representation (issue #2602).
+    let plugin = make_plugin(json!({}));
+    for (status, mut resp_headers, stamp_range_marker) in [
+        (
+            206,
+            {
+                let mut h = HashMap::new();
+                h.insert("content-type".to_string(), "application/json".to_string());
+                h.insert("content-length".to_string(), "1000".to_string());
+                h.insert("content-range".to_string(), "bytes 0-999/5000".to_string());
+                h
+            },
+            false,
+        ),
+        (
+            226,
+            {
+                let mut h = HashMap::new();
+                h.insert("content-type".to_string(), "application/json".to_string());
+                h.insert("content-length".to_string(), "1000".to_string());
+                h.insert("im".to_string(), "vcdiff".to_string());
+                h.insert("delta-base".to_string(), "\"version-1\"".to_string());
+                h
+            },
+            false,
+        ),
+        (
+            200,
+            {
+                let mut h = HashMap::new();
+                h.insert("content-type".to_string(), "application/json".to_string());
+                h.insert("content-length".to_string(), "1000".to_string());
+                h
+            },
+            true,
+        ),
+    ] {
+        for accept_encoding in ["*;q=0", "identity;q=0", "identity;q=0, gzip;q=0, br;q=0"] {
+            let mut ctx = make_ctx(Some(accept_encoding));
+            if stamp_range_marker {
+                ctx.metadata
+                    .insert("ferrum:range_response".to_string(), "true".to_string());
+            }
+            let mut headers = HashMap::new();
+            plugin.before_proxy(&mut ctx, &mut headers).await;
+
+            match plugin
+                .after_proxy(&mut ctx, status, &mut resp_headers)
+                .await
+            {
+                PluginResult::Reject {
+                    status_code,
+                    headers: reject_headers,
+                    ..
+                } => {
+                    assert_eq!(status_code, 406, "status={status} ae={accept_encoding}");
+                    assert!(
+                        !reject_headers.contains_key("content-encoding"),
+                        "status={status} ae={accept_encoding}: 406 must not commit encoding"
+                    );
+                    assert_eq!(
+                        reject_headers.get("vary").map(String::as_str),
+                        Some("Accept-Encoding")
+                    );
+                }
+                other => {
+                    panic!("status={status} ae={accept_encoding}: expected 406, got {other:?}")
+                }
+            }
+            assert!(
+                !ctx.metadata.contains_key("compression:algorithm"),
+                "must not commit algorithm metadata before 406"
+            );
+            assert!(
+                !resp_headers.contains_key("content-encoding"),
+                "must not mutate live response headers before 406"
+            );
+        }
+    }
 }
 
 // ────────────────────── Skip conditions ──────────────────────
@@ -1861,12 +2706,14 @@ async fn test_malformed_q_value_does_not_outrank_valid_codec() {
 /// (q=0) so it neither wins selection nor poisons the highest-q tie-break math.
 #[tokio::test]
 async fn test_nan_q_value_does_not_poison_selection() {
-    // gzip;q=NaN must be excluded; br;q=0.5 is the only acceptable codec.
+    // gzip;q=NaN must be excluded. br;q=0.5 is the only acceptable configured
+    // codec, but it still loses to identity, which is acceptable by default at
+    // q=1 (RFC 9110 §12.5.3) — so no gateway encoding is applied and the
+    // response is sent uncoded.
     let selected = negotiate_encoding(json!(["gzip", "br"]), "gzip;q=NaN, br;q=0.5").await;
     assert_eq!(
-        selected.as_deref(),
-        Some("br"),
-        "NaN q must be treated as not acceptable and must not dominate the tie-break"
+        selected, None,
+        "NaN q must be treated as not acceptable, and br;q=0.5 loses to the default identity quality"
     );
 
     // And when NaN is the only entry for the only codec, nothing is applied.

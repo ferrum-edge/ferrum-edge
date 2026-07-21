@@ -14493,7 +14493,14 @@ components:
               description: Clock skew tolerance (seconds) for timestamp validation
         username_token:
           type: object
-          description: WS-Security UsernameToken authentication
+          description: |
+            WS-Security UsernameToken authentication. Unknown usernames, wrong
+            PasswordText values, and wrong PasswordDigest values share one
+            generic HTTP 401 body (`{"error":"WS-Security: invalid credentials"}`)
+            and must not disclose whether the principal exists. Lookup misses
+            still perform PasswordText/PasswordDigest verification against
+            process-local dummy material. Structural token or policy failures
+            remain distinct.
           properties:
             enabled:
               type: boolean
@@ -15616,7 +15623,7 @@ components:
     CompressionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Honors request/response Cache-Control: no-transform by leaving payloads and representation headers unchanged, and preserves strong ETag validators by skipping compression. Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance."
+      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Content negotiation follows RFC 9110 §12.5.3 including the identity coding: an uncoded response is acceptable by default at q=1 unless refused with `identity;q=0` or `*;q=0` without a more-specific identity entry (a nonzero wildcard does not lower identity quality), the most preferred acceptable representation wins (server preference order breaks ties toward compression), and the response is rejected with 406 when identity is unacceptable and no acceptable coded representation can be produced — including size/content-type ineligibility, identity range/delta responses (206/226, Content-Range, or the internal range marker), and `response_caching` HIT paths. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable); no-body statuses and already-encoded upstream responses remain protocol hard skips. Reject-path 406 replacement is scoped to cache HITs so auth/policy rejection statuses are not masked. Honors request/response Cache-Control: no-transform and strong ETag validators by skipping compression (still 406 when that leaves no acceptable representation). Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance."
       properties:
         algorithms:
           type: array
@@ -18456,7 +18463,7 @@ components:
     AiPromptShieldConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_prompt_shield — PII detection and redaction in bare JSON AI prompts. Native protobuf/framed gRPC and gRPC-Web bodies are outside the JSON inspection scope."
+      description: "Plugin: ai_prompt_shield — HTTP-only PII detection and redaction in bare JSON AI prompts. Native gRPC is unsupported (not registered for the Grpc protocol view). Framed gRPC-Web bodies remain outside the JSON inspection scope and are skipped without decoding."
       anyOf:
         - not:
             required: [patterns]

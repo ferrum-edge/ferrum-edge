@@ -1,7 +1,8 @@
 //! Tests for ai_prompt_shield plugin
 
 use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, ai_prompt_shield::AiPromptShield, priority,
+    HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, ai_prompt_shield::AiPromptShield,
+    priority,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -50,7 +51,8 @@ async fn test_plugin_name_and_priority() {
     let plugin = AiPromptShield::new(&json!({})).unwrap();
     assert_eq!(plugin.name(), "ai_prompt_shield");
     assert_eq!(plugin.priority(), priority::AI_PROMPT_SHIELD);
-    assert_eq!(plugin.supported_protocols(), HTTP_GRPC_PROTOCOLS);
+    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert!(!plugin.supported_protocols().contains(&ProxyProtocol::Grpc));
     assert!(!plugin.requires_response_body_buffering());
     assert!(plugin.requires_request_body_buffering());
     assert!(plugin.requires_request_body_before_before_proxy());
@@ -1457,6 +1459,13 @@ async fn test_non_json_content_type_passes() {
     assert_continue(result);
 }
 
+#[test]
+fn test_native_grpc_is_explicitly_unsupported() {
+    let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
+    assert_eq!(plugin.supported_protocols(), &[ProxyProtocol::Http]);
+    assert!(!plugin.supported_protocols().contains(&ProxyProtocol::Grpc));
+}
+
 #[tokio::test]
 async fn test_framed_grpc_json_media_types_are_explicitly_skipped() {
     let plugin = AiPromptShield::new(&json!({"patterns": ["email"]})).unwrap();
@@ -1487,6 +1496,85 @@ async fn test_framed_grpc_json_media_types_are_explicitly_skipped() {
                 )
                 .await
                 .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_native_grpc_framed_inputs_are_not_buffered_or_inspected() {
+    // Under the HTTP-only contract, native gRPC is excluded from the Grpc
+    // protocol plugin list. These cases still prove the request-gate never
+    // pretends a length-prefixed / compressed / malformed / oversized frame is
+    // bare JSON if a framed content-type somehow reaches the HTTP hooks.
+    let plugin = AiPromptShield::new(&json!({
+        "action": "reject",
+        "patterns": ["email", "ssn"],
+        "max_scan_bytes": 64
+    }))
+    .unwrap();
+
+    let cases: &[(&str, &[u8])] = &[
+        // Unary-looking uncompressed frame carrying a JSON prompt with PII.
+        (
+            "application/grpc",
+            b"\x00\x00\x00\x00\x1e{\"prompt\":\"a@b.com\"}",
+        ),
+        (
+            "application/grpc+proto",
+            b"\x00\x00\x00\x00\x12\x0a\x10alice@example.com",
+        ),
+        // Compressed-message flag set (payload is opaque to this plugin).
+        (
+            "application/grpc",
+            b"\x01\x00\x00\x00\x08\x1f\x8b\x08\x00\x00\x00\x00\x00",
+        ),
+        // Malformed / truncated length prefix.
+        ("application/grpc", b"\x00\x00\x00"),
+        // Oversized declared length relative to max_scan_bytes.
+        (
+            "application/grpc+json",
+            &[
+                0x00, 0x00, 0x01, 0x00, 0x00, b'{', b'"', b'p', b'r', b'o', b'm', b'p', b't',
+                b'"', b':', b'"', b'a', b'@', b'b', b'.', b'c', b'o', b'm', b'"', b'}',
+            ],
+        ),
+        // Client-streaming style: two concatenated frames in one body.
+        (
+            "application/grpc+json",
+            b"\x00\x00\x00\x00\x12{\"prompt\":\"a@b.com\"}\x00\x00\x00\x00\x14{\"prompt\":\"c@d.com\"}",
+        ),
+    ];
+
+    for (content_type, body) in cases {
+        let mut ctx = create_test_context();
+        ctx.method = "POST".to_string();
+        ctx.headers
+            .insert("content-type".to_string(), (*content_type).to_string());
+        // Keep metadata UTF-8-safe for the before_proxy string path; binary
+        // bodies are still exercised through should_buffer + transform.
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            String::from_utf8_lossy(body).into_owned(),
+        );
+
+        assert!(
+            !plugin.should_buffer_request_body(&ctx),
+            "must not buffer framed native gRPC content-type {content_type}"
+        );
+
+        let mut headers = ctx.headers.clone();
+        assert_continue(plugin.before_proxy(&mut ctx, &mut headers).await);
+        assert!(
+            plugin
+                .transform_request_body(body, Some(content_type), &headers)
+                .await
+                .is_none(),
+            "must not rewrite framed native gRPC body for {content_type}"
+        );
+        assert_continue(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &headers, body)
+                .await,
         );
     }
 }
