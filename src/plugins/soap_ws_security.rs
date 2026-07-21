@@ -41,7 +41,7 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use ring::digest;
 use ring::signature as ring_sig;
 use roxmltree::{Document, Node, NodeId, ParsingOptions};
@@ -707,10 +707,6 @@ impl SoapWsSecurity {
                     )
                 })?;
 
-                // Check nonce replay for every digest attempt (known or unknown).
-                self.check_nonce_replay(&nonce_b64)
-                    .map_err(UsernameTokenError::Structural)?;
-
                 // Compute expected digest: SHA-1(nonce + created + password)
                 let mut data =
                     Vec::with_capacity(nonce_bytes.len() + created.len() + password_material.len());
@@ -726,6 +722,14 @@ impl SoapWsSecurity {
                 let matched =
                     constant_time_eq(password_value.trim().as_bytes(), expected_b64.as_bytes());
                 if username_known && matched {
+                    // Only a successfully verified principal may consume a
+                    // nonce. Recording attacker-controlled failed attempts
+                    // would let an unknown-user or wrong-password request
+                    // poison a victim's nonce before the legitimate request
+                    // arrives. The atomic entry check also prevents two
+                    // concurrent valid requests from both accepting it.
+                    self.check_nonce_replay(&nonce_b64)
+                        .map_err(UsernameTokenError::Structural)?;
                     Ok(username)
                 } else {
                     Err(UsernameTokenError::InvalidCredentials)
@@ -753,17 +757,18 @@ impl SoapWsSecurity {
 
         let now = Instant::now();
 
-        // Check if nonce was already seen
-        if let Some(entry) = self.nonce_cache.get(nonce) {
-            let age = now.duration_since(entry.inserted_at);
-            if age.as_secs() < self.nonce_cache_ttl_seconds {
-                return Err("WS-Security: nonce replay detected".to_string());
+        match self.nonce_cache.entry(nonce.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let age = now.duration_since(entry.get().inserted_at);
+                if age.as_secs() < self.nonce_cache_ttl_seconds {
+                    return Err("WS-Security: nonce replay detected".to_string());
+                }
+                entry.insert(NonceEntry { inserted_at: now });
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(NonceEntry { inserted_at: now });
             }
         }
-
-        // Record the nonce
-        self.nonce_cache
-            .insert(nonce.to_string(), NonceEntry { inserted_at: now });
 
         Ok(())
     }

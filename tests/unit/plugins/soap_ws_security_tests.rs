@@ -176,10 +176,19 @@ fn assert_username_token_invalid_credentials(result: &PluginResult, candidate_us
 }
 
 fn password_digest_token(username: &str, password: &str, nonce_bytes: &[u8]) -> String {
-    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
     let created = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
         .to_string();
+    password_digest_token_with_created(username, password, nonce_bytes, &created)
+}
+
+fn password_digest_token_with_created(
+    username: &str,
+    password: &str,
+    nonce_bytes: &[u8],
+    created: &str,
+) -> String {
+    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
 
     let mut data = Vec::new();
     data.extend_from_slice(nonce_bytes);
@@ -1050,6 +1059,60 @@ async fn test_nonce_replay_detected() {
     let result2 = plugin.before_proxy(&mut ctx2, &mut headers2).await;
     assert!(is_reject(&result2));
     assert!(reject_body(&result2).contains("nonce replay"));
+}
+
+#[tokio::test]
+async fn failed_digest_attempts_do_not_poison_a_valid_principals_nonce() {
+    // Failed pre-auth attempts must do the dummy digest work but must not
+    // reserve the nonce. Otherwise an attacker can race either an unknown
+    // username or a known username with a wrong digest ahead of the victim.
+    for (attempt_username, attempt_password, nonce_bytes) in [
+        ("eve-candidate", "anything", b"unknown-user-race".as_slice()),
+        ("alice", "wrongpassword", b"wrong-password-race".as_slice()),
+    ] {
+        let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+        let created = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+
+        let failed_token = password_digest_token_with_created(
+            attempt_username,
+            attempt_password,
+            nonce_bytes,
+            &created,
+        );
+        let failed_body = wrap_soap(&failed_token);
+        let mut failed_ctx = make_ctx_with_soap_body(&failed_body);
+        let mut failed_headers = soap_headers();
+        let failed = plugin
+            .before_proxy(&mut failed_ctx, &mut failed_headers)
+            .await;
+        assert_username_token_invalid_credentials(
+            &failed,
+            &[attempt_username, "alice", "eve-candidate"],
+        );
+
+        let valid_token =
+            password_digest_token_with_created("alice", "secret123", nonce_bytes, &created);
+        let valid_body = wrap_soap(&valid_token);
+        let mut valid_ctx = make_ctx_with_soap_body(&valid_body);
+        let mut valid_headers = soap_headers();
+        let valid = plugin
+            .before_proxy(&mut valid_ctx, &mut valid_headers)
+            .await;
+        assert!(
+            matches!(valid, PluginResult::Continue),
+            "failed attempt for {attempt_username} poisoned the legitimate nonce: {valid:?}"
+        );
+
+        let mut replay_ctx = make_ctx_with_soap_body(&valid_body);
+        let mut replay_headers = soap_headers();
+        let replay = plugin
+            .before_proxy(&mut replay_ctx, &mut replay_headers)
+            .await;
+        assert!(is_reject(&replay));
+        assert!(reject_body(&replay).contains("nonce replay"));
+    }
 }
 
 // ── SAML config tests ───────────────────────────────────────────────────────
