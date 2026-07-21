@@ -1887,6 +1887,17 @@ pub async fn run(
                                 // Fallback to full config load + full snapshot broadcast
                                 match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
                                     Ok((new_config, sequences)) => {
+                                        if !reconcile_plugin_migrations_after_cp_reconnect(
+                                            &db_poll,
+                                            &db_available_poll,
+                                            poll_auto_apply_plugin_migrations,
+                                            &mut plugin_migrations_need_reconcile,
+                                            "full fallback load after pool reconnect",
+                                        )
+                                        .await
+                                        {
+                                            continue;
+                                        }
                                         db_available_poll.store(true, Ordering::Relaxed);
                                         crate::modes::clear_config_rejected_after_accepted_full_reload(
                                             &config_rejected_poll,
@@ -1916,6 +1927,17 @@ pub async fn run(
                                         // config + admin writable and skip failover
                                         // (issue #2158).
                                         if crate::modes::is_poll_validation_rejection(&e2) {
+                                            if !reconcile_plugin_migrations_after_cp_reconnect(
+                                                &db_poll,
+                                                &db_available_poll,
+                                                poll_auto_apply_plugin_migrations,
+                                                &mut plugin_migrations_need_reconcile,
+                                                "validation-rejected full fallback load after pool reconnect",
+                                            )
+                                            .await
+                                            {
+                                                continue;
+                                            }
                                             crate::modes::record_config_validation_rejection(
                                                 &db_poll,
                                                 &db_available_poll,
@@ -2466,6 +2488,8 @@ mod tests {
             "DB DNS reconnect",
             "validation-rejected full load after DB DNS reconnect",
             "incremental load after pool reconnect",
+            "full fallback load after pool reconnect",
+            "validation-rejected full fallback load after pool reconnect",
             "database failover",
             "validation-rejected database failover load",
         ] {
