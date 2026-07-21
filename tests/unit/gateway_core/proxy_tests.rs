@@ -565,7 +565,7 @@ fn test_h1_h2_route_rejects_keep_websocket_precedence_and_grpc_web_headers() {
         .find("let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);")
         .expect("wire flavor classification must remain present");
     let websocket_precedence = handler
-        .find("let grpc_web_response_content_type = if flavor == HttpFlavor::WebSocket")
+        .find("let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket")
         .expect("WebSocket must suppress hostile gRPC-Web Content-Type promotion");
     let routed = handler
         .find("ctx.matched_proxy = Some(Arc::clone(&proxy));")
@@ -606,7 +606,7 @@ fn test_h1_h2_route_rejects_keep_websocket_precedence_and_grpc_web_headers() {
 /// before routing, so it records the client's immutable inbound representation
 /// rather than anything a hook could rewrite.
 #[test]
-fn test_h1_h2_retains_the_classified_grpc_web_representation_before_routing() {
+fn test_h1_h2_retains_the_negotiated_grpc_web_representation_before_routing() {
     let source = include_str!("../../../src/proxy/mod.rs");
     let handler = source
         .find("async fn handle_proxy_request_inner(")
@@ -614,14 +614,14 @@ fn test_h1_h2_retains_the_classified_grpc_web_representation_before_routing() {
         .expect("H1/H2 request handler must remain present");
 
     const RETENTION_CALL: &str =
-        "crate::plugins::grpc_web::retain_client_content_type_for_errors(&mut ctx, content_type);";
+        "crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);";
 
     let classification = handler
-        .find("let grpc_web_response_content_type = if flavor == HttpFlavor::WebSocket")
-        .expect("WebSocket-safe gRPC-Web classification must remain present");
+        .find("let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket")
+        .expect("WebSocket-safe gRPC-Web negotiation must remain present");
     let retention = handler
         .find(RETENTION_CALL)
-        .expect("H1/H2 must retain the classified client gRPC-Web representation");
+        .expect("H1/H2 must retain the negotiated client gRPC-Web representation");
     let routed = handler
         .find("ctx.matched_proxy = Some(Arc::clone(&proxy));")
         .expect("route selection must remain present");
