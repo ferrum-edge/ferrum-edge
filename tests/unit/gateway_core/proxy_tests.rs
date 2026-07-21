@@ -613,8 +613,7 @@ fn test_h1_h2_retains_the_negotiated_grpc_web_representation_before_routing() {
         .map(|start| &source[start..])
         .expect("H1/H2 request handler must remain present");
 
-    const RETENTION_CALL: &str =
-        "crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);";
+    const RETENTION_CALL: &str = "crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);";
 
     let classification = handler
         .find("let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket")
