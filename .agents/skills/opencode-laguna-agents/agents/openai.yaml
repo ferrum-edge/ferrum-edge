@@ -1,0 +1,4 @@
+interface:
+  display_name: "opencode laguna-s Agents"
+  short_description: "Orchestrate opencode laguna-s-2.1 coding agents"
+  default_prompt: "Use $opencode-agents to dispatch opencode laguna-s-2.1-free agents for this Ferrum Edge task."

@@ -1,7 +1,8 @@
 use ferrum_edge::_test_support::{
     StreamIoSide, bidirectional_copy_for_test, bidirectional_copy_for_test_with_timeouts,
     classify_stream_error, disconnect_cause_for_failure, tcp_fault_admission_retry_delays_for_test,
-    tcp_fault_admission_should_cancel_for_test, wait_for_tcp_peer_reset_for_test,
+    tcp_fault_admission_should_cancel_for_test, tcp_stream_summary_from_clocks_for_test,
+    wait_for_tcp_peer_reset_for_test,
 };
 use ferrum_edge::plugins::{Direction, DisconnectCause};
 use ferrum_edge::retry::ErrorClass;
@@ -9,7 +10,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 #[test]
@@ -2266,5 +2267,56 @@ async fn test_drain_path_denies_reclassification_when_no_bytes_transferred() {
     assert_eq!(
         result.bytes_backend_to_client, 0,
         "b2c write failed before counter increment"
+    );
+}
+
+#[test]
+fn tcp_stream_duration_uses_instant_not_wall_clock() {
+    // TCP is the parity baseline for issue #2624: Instant elapsed for
+    // duration_ms, civil clocks only for rendered timestamps. Backward and
+    // forward wall steps must not clamp or inflate duration.
+    let connected_mono = Instant::now();
+    let connected_wall = chrono::Utc::now() - chrono::TimeDelta::hours(1);
+    let disconnected_wall_rollback = chrono::Utc::now() - chrono::TimeDelta::hours(2);
+
+    let summary = tcp_stream_summary_from_clocks_for_test(
+        connected_mono,
+        connected_wall,
+        disconnected_wall_rollback,
+    );
+    assert!(
+        summary.duration_ms < 5_000.0,
+        "TCP duration_ms must follow Instant under wall rollback; got {}",
+        summary.duration_ms
+    );
+    assert!(
+        (disconnected_wall_rollback - connected_wall).num_milliseconds() < 0,
+        "fixture must keep a negative wall delta"
+    );
+    assert_eq!(
+        summary.timestamp_connected,
+        connected_wall.to_rfc3339(),
+        "wall connect preserved for rendering"
+    );
+    assert_eq!(
+        summary.timestamp_disconnected,
+        disconnected_wall_rollback.to_rfc3339(),
+        "wall disconnect preserved for rendering"
+    );
+
+    let disconnected_wall_forward = connected_wall + chrono::TimeDelta::hours(5);
+    let forward = tcp_stream_summary_from_clocks_for_test(
+        connected_mono,
+        connected_wall,
+        disconnected_wall_forward,
+    );
+    assert!(
+        forward.duration_ms < 5_000.0,
+        "TCP duration_ms must not inflate under forward wall skew; got {}",
+        forward.duration_ms
+    );
+    assert_eq!(
+        forward.timestamp_disconnected,
+        disconnected_wall_forward.to_rfc3339()
     );
 }

@@ -127,7 +127,7 @@ Plugin rejects for `application/grpc` must become trailers-only gRPC errors.
 - Override `supported_protocols()` when not HTTP-only. Use the existing protocol constants.
 - Register in `create_plugin_with_http_client()` with `?` on `new()` and add to `available_plugins()`.
 - Add unit tests for valid and invalid configs in `tests/unit/plugins/` and register the module.
-- Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`, and `openapi.yaml`.
+- Update `FEATURES.md`, `README.md`, `docs/plugin_execution_order.md`, `src/plugins/builtin_parity.rs` (`BUILTIN_PLUGIN_PARITY_META`), and `openapi.yaml`. CI enforces registry/order-table/protocol-matrix set parity via `tests/unit/plugins/plugin_doc_parity_tests.rs`.
 - All `new()` constructors return `Result<Self, String>`. Return `Err` for no-op config, invalid regex/enum/ranges, or impossible behavior.
 - Admin API validation uses `validate_plugin_config_definition()` and returns HTTP 400. File mode validation fails startup. DB mode warns for existing bad data.
 - Shared entrypoint is `plugins::validate_plugin_config(name, config)`.
