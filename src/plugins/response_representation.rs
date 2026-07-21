@@ -340,47 +340,26 @@ pub(crate) fn content_encoding_requires_decode_judgment(encoding: &str) -> bool 
 /// malformed must stay on the acceptable side — the grammar check is what keeps
 /// it there.
 ///
-/// Only the `"0"` production can be a zero weight. `"1"` is a maximal
-/// preference, and every other leading character (`-`, `+`, `.`, a digit, a
-/// letter) is outside the grammar. Within the `"0"` production the fractional
-/// part is at most three digits, and the weight is zero exactly when every one
-/// of them is `0` — so `0`, `0.`, `0.0`, `0.00`, and `0.000` refuse, while
-/// `0.001` does not and `0.0000` is malformed rather than a refusal.
-fn qvalue_is_explicit_zero(value: &str) -> bool {
-    // Only the `0[.0*3DIGIT]` production can carry a zero weight; `1[.0*3("0")]`
-    // is a maximal preference and anything else is outside the grammar.
-    let Some(fraction) = value.strip_prefix('0') else {
-        return false;
-    };
-    let digits = match fraction.strip_prefix('.') {
-        // A bare `0` with no decimal point.
-        None => return fraction.is_empty(),
-        Some(digits) => digits,
-    };
-    // `0*3DIGIT`, and zero exactly when every digit present is `0`. Testing for
-    // `'0'` rather than `is_ascii_digit()` covers both conditions at once: a
-    // non-digit is not `'0'`, and a nonzero digit is a real (nonzero) weight.
-    digits.len() <= 3 && digits.bytes().all(|digit| digit == b'0')
-}
-
 /// Whether the client will accept identity-coded (uncompressed) bytes.
 ///
 /// RFC 9110 §12.5.3: an absent `Accept-Encoding` places no constraint, an empty
 /// field value means only `identity` is acceptable, and identity becomes
 /// unacceptable only through an explicit `identity;q=0` or a `*;q=0` with no
-/// explicit non-zero `identity`. The most specific match wins, so an explicit
-/// `identity` entry settles the question regardless of any wildcard.
+/// explicit non-zero `identity`. Parsing — including first-`identity` /
+/// last-`*` duplicate handling and malformed-q fail-safe — is shared with
+/// compression negotiation via
+/// [`crate::plugins::compression::identity_coding_quality`].
 ///
 /// A malformed qvalue is read as acceptable rather than forbidden. This
 /// predicate can only ever turn an otherwise-servable response into an error,
 /// so inferring "the client refuses identity" from a field the gateway could not
 /// validate would break live traffic to protect nothing. Only a value matching
 /// the RFC 9110 §12.4.2 `qvalue` grammar can express a refusal, and the refusal
-/// is `q=0` (see [`qvalue_is_explicit_zero`]). A negative, out-of-range, or
-/// non-finite parameter (`identity;q=-1`, `*;q=-1`, `q=5`, `q=inf`) is malformed,
-/// and so is anything that is merely *float-parseable* as zero without matching
-/// the grammar (`q=0e0`, `q=.0`, `q=0.0000`). None of those is a zero weight, and
-/// none may be read as one.
+/// is `q=0`. A negative, out-of-range, or non-finite parameter
+/// (`identity;q=-1`, `*;q=-1`, `q=5`, `q=inf`) is malformed, and so is anything
+/// that is merely *float-parseable* as zero without matching the grammar
+/// (`q=0e0`, `q=.0`, `q=0.0000`). None of those is a zero weight, and none may
+/// be read as one.
 fn identity_coding_is_acceptable(ctx: &RequestContext) -> bool {
     // Read the pristine pre-hook snapshot first. Neither later source can be
     // trusted on its own: `request_transformer` (priority 3000) can remove or
@@ -401,27 +380,7 @@ fn identity_coding_is_acceptable(ctx: &RequestContext) -> bool {
         return true;
     };
 
-    let mut wildcard_forbids_identity = false;
-    for entry in accept_encoding.split(',') {
-        let mut parts = entry.split(';');
-        let coding = parts.next().unwrap_or("").trim();
-        if coding.is_empty() {
-            continue;
-        }
-        let q_is_zero = parts.any(|param| {
-            param
-                .split_once('=')
-                .filter(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
-                .is_some_and(|(_, value)| qvalue_is_explicit_zero(value.trim()))
-        });
-        if coding.eq_ignore_ascii_case("identity") {
-            return !q_is_zero;
-        }
-        if coding == "*" {
-            wildcard_forbids_identity = q_is_zero;
-        }
-    }
-    !wildcard_forbids_identity
+    crate::plugins::compression::identity_coding_quality(accept_encoding) > 0.0
 }
 
 /// The origin's non-identity `Content-Encoding`, from the pristine snapshot for
