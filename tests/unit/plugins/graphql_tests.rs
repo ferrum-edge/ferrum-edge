@@ -1,6 +1,4 @@
-use ferrum_edge::plugins::{
-    HTTP_ONLY_PROTOCOLS, PluginResult, RequestContext, create_plugin, priority,
-};
+use ferrum_edge::plugins::{PluginResult, ProxyProtocol, RequestContext, create_plugin, priority};
 use serde_json::json;
 use std::collections::HashMap;
 
@@ -47,7 +45,12 @@ fn test_graphql_plugin_creation() {
     let plugin = create_plugin("graphql", &config).unwrap().unwrap();
     assert_eq!(plugin.name(), "graphql");
     assert_eq!(plugin.priority(), priority::GRAPHQL);
-    assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
+    assert_eq!(
+        plugin.supported_protocols(),
+        &[ProxyProtocol::Http, ProxyProtocol::WebSocket]
+    );
+    assert!(!plugin.requires_websocket_framing());
+    assert!(!plugin.requires_ws_frame_hooks());
     assert!(plugin.requires_request_body_buffering());
     assert!(plugin.requires_request_body_before_before_proxy());
     assert!(!plugin.requires_response_body_buffering());
@@ -138,6 +141,7 @@ fn test_graphql_rejects_unknown_top_level_keys() {
         json!({"max_depth": 5, "limit_byy": "consumer"}),
         json!({"max_depth": 5, "redis_key_prefx": "ferrum:graphql"}),
         json!({"max_depth": 5, "type_rate_limit": {"query": {"max_requests": 1, "window_seconds": 60}}}),
+        json!({"max_depth": 5, "require_inspectable_transport": false}),
     ] {
         let err = create_plugin("graphql", &config)
             .err()
@@ -537,33 +541,165 @@ async fn test_consumer_rate_limiting_uses_authenticated_identity_fallback() {
     assert_continue(result);
 }
 
-// ── Non-GraphQL requests pass through ──
+// ── Uninspectable transports (GHSA-762h) ──
+
+fn assert_uninspectable_reject(result: PluginResult) {
+    match result {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 400, "uninspectable transport must be 400");
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+            let parsed: serde_json::Value =
+                serde_json::from_str(&body).expect("reject body must be JSON");
+            let message = parsed["errors"][0]["message"]
+                .as_str()
+                .expect("GraphQL error message");
+            assert!(!message.is_empty(), "reject message must be non-empty");
+        }
+        other => panic!("Expected Reject(400), got {other:?}"),
+    }
+}
 
 #[tokio::test]
-async fn test_get_request_passes_through() {
-    let config = json!({ "max_depth": 1 });
+async fn test_get_query_rejected_by_default() {
+    // GHSA-762h: GraphQL GET (?query=...) must not fail open.
+    let config = json!({ "max_depth": 10, "introspection_allowed": false });
     let plugin = create_plugin("graphql", &config).unwrap().unwrap();
 
     let mut ctx = create_test_context();
     ctx.method = "GET".to_string();
+    ctx.path =
+        "/graphql?query=%7B%20__schema%20%7B%20types%20%7B%20name%20%7D%20%7D%20%7D".to_string();
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+    assert_uninspectable_reject(result);
 }
 
 #[tokio::test]
-async fn test_non_json_passes_through() {
-    let config = json!({ "max_depth": 1 });
+async fn test_websocket_upgrade_rejected_before_uninspectable_frames() {
+    let plugin = create_plugin("graphql", &json!({"max_depth": 10}))
+        .unwrap()
+        .unwrap();
+    assert!(
+        plugin
+            .supported_protocols()
+            .contains(&ProxyProtocol::WebSocket)
+    );
+
+    let mut ctx = create_test_context();
+    ctx.method = "GET".to_string();
+    let mut headers = HashMap::from([
+        ("connection".to_string(), "Upgrade".to_string()),
+        ("upgrade".to_string(), "websocket".to_string()),
+        (
+            "sec-websocket-protocol".to_string(),
+            "graphql-transport-ws".to_string(),
+        ),
+    ]);
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_uninspectable_reject(result);
+}
+
+#[tokio::test]
+async fn test_application_graphql_rejected_by_default() {
+    let config = json!({ "max_depth": 10 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/graphql".to_string(),
+    );
+    ctx.metadata
+        .insert("request_body".to_string(), "{ user { id } }".to_string());
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/graphql".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_uninspectable_reject(result);
+}
+
+#[tokio::test]
+async fn test_json_batch_array_rejected_by_default() {
+    let config = json!({ "max_depth": 10 });
     let plugin = create_plugin("graphql", &config).unwrap().unwrap();
 
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
     ctx.headers
-        .insert("content-type".to_string(), "text/plain".to_string());
-    let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), "text/plain".to_string());
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        r#"[{"query":"{ user { id } }"},{"query":"{ post { id } }"}]"#.to_string(),
+    );
+    let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+    assert_uninspectable_reject(result);
+}
+
+#[tokio::test]
+async fn test_apq_envelope_without_query_rejected_by_default() {
+    let config = json!({ "max_depth": 10 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata.insert(
+        "request_body".to_string(),
+        r#"{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"abcdef"}}}"#.to_string(),
+    );
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_uninspectable_reject(result);
+}
+
+#[tokio::test]
+async fn test_non_json_body_under_json_content_type_rejected_by_default() {
+    let config = json!({ "max_depth": 10 });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.headers
+        .insert("content-type".to_string(), "application/json".to_string());
+    ctx.metadata
+        .insert("request_body".to_string(), "not-valid-json{{{".to_string());
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_uninspectable_reject(result);
+}
+
+#[tokio::test]
+async fn test_canonical_post_json_still_enforces_policy() {
+    // Canonical path must still apply introspection/depth policy.
+    let config = json!({
+        "max_depth": 2,
+        "introspection_allowed": false
+    });
+    let plugin = create_plugin("graphql", &config).unwrap().unwrap();
+
+    let mut ctx = create_graphql_context("{ __schema { types { name } } }", None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(403));
+
+    let deep = "{ user { posts { comments { text } } } }";
+    let mut ctx = create_graphql_context(deep, None);
+    let mut headers = make_graphql_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_reject(result, Some(400));
 }
 
 #[tokio::test]
@@ -599,7 +735,7 @@ async fn test_graphql_enforces_limits_for_json_substring_content_types() {
 }
 
 #[tokio::test]
-async fn test_no_query_field_passes_through() {
+async fn test_no_query_field_rejected_by_default() {
     let config = json!({ "max_depth": 1 });
     let plugin = create_plugin("graphql", &config).unwrap().unwrap();
 
@@ -613,7 +749,7 @@ async fn test_no_query_field_passes_through() {
     );
     let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert_continue(result);
+    assert_uninspectable_reject(result);
 }
 
 // ── Comments and strings in queries ──

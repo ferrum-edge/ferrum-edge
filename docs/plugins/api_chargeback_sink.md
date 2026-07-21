@@ -125,20 +125,37 @@ Spool files are written under:
 
 The sink writes failed batches and queue high-water overflow to disk. Files are
 created with private permissions, written as `*.tmp`, fsynced, and renamed into
-place. The background replayer scans files in lexicographic order and removes a
-file only after ClickHouse accepts the whole file as one insert. Unreadable
-spool files are renamed with a `.corrupt` suffix so newer files can continue to
-replay.
+place. The background replayer scans durable data files (`*.ndjson` /
+`*.ndjson.zst`) in lexicographic order and removes a file only after ClickHouse
+accepts the whole file as one insert. Unreadable spool files are renamed with a
+`.corrupt` suffix so newer files can continue to replay. Stale `*.tmp` files left
+by an interrupted atomic write are deleted at spool startup and after a failed
+write/rename so they cannot accumulate indefinitely.
+
+`spool.max_bytes` is a hard ceiling on **encoded** on-disk bytes owned by this
+sink under `<spool.dir>/<node_id>/` (after compression when `compression` is
+`zstd`). The budget and status/metrics count every retained file class:
+
+- active data files (`*.ndjson` / `*.ndjson.zst`)
+- in-progress atomic-write temps (`*.ndjson.tmp` / `*.ndjson.zst.tmp`)
+- quarantined files (`*.ndjson.corrupt` / `*.ndjson.zst.corrupt`)
+
+Pending writes are serialized/compressed and sized **before** quota admission.
+Admission holds the spool write lock with eviction so concurrent writers cannot
+over-admit. Existing owned bytes plus the incoming encoded file must stay within
+`max_bytes`; when space is short, the oldest owned file is dropped and
+`chargeback_sink_spool_drops_total` is incremented. If a single encoded batch
+still cannot fit after eviction (including on an empty spool), the write is
+**rejected** and the batch/event follows the existing spool-failure path
+(warned and not durably retained). The sink never silently exceeds the ceiling.
 
 Size `spool.max_bytes` for the longest ClickHouse outage you are willing to
-absorb:
+absorb, using **encoded** average event size (and headroom for any retained
+`.corrupt` quarantine files):
 
 ```text
-max_bytes >= peak_events_per_second * average_event_bytes * outage_seconds
+max_bytes >= peak_events_per_second * average_encoded_event_bytes * outage_seconds
 ```
-
-When the spool is full, the oldest file is dropped and
-`chargeback_sink_spool_drops_total` is incremented.
 
 When `spool.dir` is backed by persistent storage, set `FERRUM_NODE_ID` to a
 stable identity such as a StatefulSet ordinal. If the node ID changes across
@@ -179,8 +196,8 @@ size, replay timestamps, and export counters. `/metrics` includes:
 - `chargeback_sink_events_exported_total`
 - `chargeback_sink_export_failures_total{reason}`
 - `chargeback_sink_queue_depth`
-- `chargeback_sink_spool_bytes`
-- `chargeback_sink_spool_files`
+- `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, and quarantined)
+- `chargeback_sink_spool_files` (owned file count across those same classes)
 - `chargeback_sink_spool_drops_total`
 - `chargeback_sink_export_latency_seconds`
 - `chargeback_sink_snapshot_emits_total` in snapshot mode

@@ -191,10 +191,23 @@ mod azure {
             format!("{}/secrets/{}", self.server.uri(), name)
         }
 
+        /// Versioned reference URL (`/secrets/<name>/<version>`).
+        pub fn secret_version_url(&self, name: &str, version: &str) -> String {
+            format!("{}/secrets/{}/{}", self.server.uri(), name, version)
+        }
+
         fn secret_path_regex(name: &str) -> String {
             // The SDK requests `/secrets/{name}/` (empty version segment) plus an
             // `?api-version=` query, which `path_regex` ignores.
             format!("^/secrets/{}/?$", regex::escape(name))
+        }
+
+        fn secret_version_path_regex(name: &str, version: &str) -> String {
+            format!(
+                "^/secrets/{}/{}/?$",
+                regex::escape(name),
+                regex::escape(version)
+            )
         }
 
         /// Simple success: returns the secret on the first request regardless of
@@ -204,6 +217,19 @@ mod azure {
                 .and(path_regex(Self::secret_path_regex(name)))
                 .respond_with(
                     ResponseTemplate::new(200).set_body_json(self.secret_body(name, value)),
+                )
+                .mount(&self.server)
+                .await;
+        }
+
+        /// Success for a pinned version request. Only matches
+        /// `/secrets/{name}/{version}` so a latest-only mock cannot satisfy it.
+        pub async fn mock_secret_version(&self, name: &str, version: &str, value: &str) {
+            Mock::given(method("GET"))
+                .and(path_regex(Self::secret_version_path_regex(name, version)))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(self.secret_body_versioned(name, version, value)),
                 )
                 .mount(&self.server)
                 .await;
@@ -261,9 +287,18 @@ mod azure {
         }
 
         fn secret_body(&self, name: &str, value: &str) -> serde_json::Value {
+            self.secret_body_versioned(name, "0123456789abcdef", value)
+        }
+
+        fn secret_body_versioned(
+            &self,
+            name: &str,
+            version: &str,
+            value: &str,
+        ) -> serde_json::Value {
             serde_json::json!({
                 "value": value,
-                "id": format!("{}/secrets/{}/0123456789abcdef", self.server.uri(), name),
+                "id": format!("{}/secrets/{}/{}", self.server.uri(), name, version),
                 "attributes": { "enabled": true },
             })
         }
