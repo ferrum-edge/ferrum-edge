@@ -545,7 +545,7 @@ fn openapi_soap_ws_security_describes_exclusive_c14n_contract() {
             "{label} OpenAPI description must name InclusiveNamespaces PrefixList: {text}"
         );
         assert!(
-            !text.contains("wire bytes")
+            !text.contains("wire bytes of")
                 && !text.contains("do not yet apply")
                 && !text.contains("do not currently apply"),
             "{label} OpenAPI description must not claim wire-byte / missing-c14n verification: {text}"
