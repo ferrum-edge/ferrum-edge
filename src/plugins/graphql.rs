@@ -10,7 +10,12 @@
 //! - Introspection control (allow/deny __schema/__type queries)
 //!
 //! GraphQL requests are expected as POST with `application/json` body
-//! containing `{"query": "...", "operationName": "..."}`.
+//! containing `{"query": "...", "operationName": "..."}`. Other HTTP
+//! representations the plugin cannot inspect (GraphQL GET,
+//! `application/graphql`, JSON batch arrays, APQ hash-only envelopes,
+//! multipart `operations`, missing or unparseable bodies) fail closed.
+//! WebSocket GraphQL upgrades also fail closed during their HTTP handshake;
+//! the plugin never admits an upgraded frame stream it cannot inspect.
 //!
 //! The analyzer is a lightweight, allocation-light parser rather than a full
 //! GraphQL AST. It selects the operation to analyze using `operationName` (per
@@ -43,6 +48,8 @@ use crate::util::unknown_keys::reject_unknown_keys;
 /// Maximum rate-limit state entries before triggering stale eviction.
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
+const GRAPHQL_PROTOCOLS: &[super::ProxyProtocol] =
+    &[super::ProxyProtocol::Http, super::ProxyProtocol::WebSocket];
 
 /// GraphQL-specific top-level config keys (excludes shared Redis sync fields).
 const GRAPHQL_POLICY_CONFIG_KEYS: &[&str] = &[
@@ -1281,7 +1288,7 @@ impl Plugin for GraphqlPlugin {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_ONLY_PROTOCOLS
+        GRAPHQL_PROTOCOLS
     }
 
     fn tracked_keys_count(&self) -> Option<usize> {
@@ -1310,42 +1317,56 @@ impl Plugin for GraphqlPlugin {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Only process POST requests (standard GraphQL transport)
+        // Only inspect POST + JSON + object with string `query`. Other HTTP
+        // representations fail closed, including WebSocket GET upgrades.
         if ctx.method != "POST" {
-            return PluginResult::Continue;
+            return reject_uninspectable_transport(
+                "GraphQL request uses an unsupported HTTP method; \
+                 only POST with an inspectable JSON body is accepted",
+            );
         }
 
-        // Check content type
         if !headers
             .get("content-type")
             .is_some_and(|ct| is_graphql_json_content_type(ct))
         {
-            return PluginResult::Continue;
+            return reject_uninspectable_transport(
+                "GraphQL request uses an unsupported content type; \
+                 only JSON content types are inspectable",
+            );
         }
 
-        // Get request body
         let body = match ctx.metadata.get("request_body") {
             Some(b) if !b.is_empty() => b.as_str(),
             _ => {
                 debug!("graphql: no request body available");
-                return PluginResult::Continue;
+                return reject_uninspectable_transport(
+                    "GraphQL request body is missing or empty \
+                     and cannot be inspected",
+                );
             }
         };
 
-        // Parse the JSON body to extract the GraphQL query
         let parsed: Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(_) => {
                 debug!("graphql: request body is not valid JSON");
-                return PluginResult::Continue;
+                return reject_uninspectable_transport(
+                    "GraphQL request body is not valid JSON \
+                     and cannot be inspected",
+                );
             }
         };
 
         let query = match parsed.get("query").and_then(|q| q.as_str()) {
             Some(q) if !q.is_empty() => q,
             _ => {
-                // No query field — might be a persisted query or non-GraphQL request
-                return PluginResult::Continue;
+                // Batch arrays, APQ hash-only envelopes, empty/missing query.
+                return reject_uninspectable_transport(
+                    "GraphQL request must include an inspectable string \
+                     query field; batch arrays and persisted-query \
+                     envelopes without a query document are refused",
+                );
             }
         };
 
@@ -1503,6 +1524,15 @@ fn json_content_type_header() -> HashMap<String, String> {
     let mut h = HashMap::new();
     h.insert("content-type".to_string(), "application/json".to_string());
     h
+}
+
+/// Reject an HTTP GraphQL representation that cannot be inspected.
+fn reject_uninspectable_transport(message: &str) -> PluginResult {
+    PluginResult::Reject {
+        status_code: 400,
+        body: graphql_error_body(message),
+        headers: json_content_type_header(),
+    }
 }
 
 fn graphql_error_body(message: &str) -> String {
