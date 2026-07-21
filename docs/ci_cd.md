@@ -121,8 +121,8 @@ the sidecar deployment smoke, eBPF program builds, and eBPF/netns live suites.
 PRs outside those curated path sets skip the downstream job before GitHub
 allocates a runner. Pushes to `main` and manual runs force all of these gates on.
 Rust formatting and the integration-shard coverage contract also run as named
-steps in `CI Plan`, avoiding two additional runner allocations. The same job
-always runs the first-party Markdown link checker
+steps in `CI Plan`, avoiding two additional runner allocations. The dedicated
+`Markdown Links` job always runs the first-party Markdown link checker
 (`.github/scripts/check_markdown_links.py`), including in light mode, so
 docs-only PRs still validate relative file targets and GitHub heading slugs.
 

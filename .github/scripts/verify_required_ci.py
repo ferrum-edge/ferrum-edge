@@ -18,6 +18,7 @@ from pr_ci_plan import FULL_CI_DOCUMENTATION_PATHS
 
 REQUIRED_JOBS = {
     "ci-plan",
+    "markdown-links",
     "test-unit",
     "test-secrets",
     "test-service-integration",
@@ -439,9 +440,10 @@ def main() -> int:
         planner_errors.append(
             "jobs.ci-plan must run the integration shard-coverage gate"
         )
-    if "check_markdown_links.py" not in ci_plan_body:
+    markdown_links_body = extract_job_body(ci_yml, "markdown-links")
+    if markdown_links_body.count("check_markdown_links.py") < 2:
         planner_errors.append(
-            "jobs.ci-plan must run the first-party Markdown link-check gate"
+            "jobs.markdown-links must run the first-party Markdown link-check self-test and gate"
         )
 
     node_waypoint_yml = Path(
