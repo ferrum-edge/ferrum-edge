@@ -401,9 +401,7 @@ async fn kafka_generation_registers_only_after_commit() {
     // Never-committed staged instance: start owns a generation locally, but
     // Drop must leave no process-global registration behind.
     let staged = KafkaLogging::new(&kafka_sink_config(), &client()).expect("staged kafka");
-    staged
-        .start_background_tasks()
-        .expect("staged kafka start");
+    staged.start_background_tasks().expect("staged kafka start");
     let staged_id = staged.snapshot().generation_id;
     assert!(staged_id >= 1 && staged_id != generation_id);
     assert!(
