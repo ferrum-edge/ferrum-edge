@@ -10,7 +10,13 @@
 //! - Introspection control (allow/deny __schema/__type queries)
 //!
 //! GraphQL requests are expected as POST with `application/json` body
-//! containing `{"query": "...", "operationName": "..."}`.
+//! containing `{"query": "...", "operationName": "..."}`. By default
+//! (`require_inspectable_transport: true`) the plugin fails closed for other
+//! HTTP representations it cannot inspect (GraphQL GET, `application/graphql`,
+//! JSON batch arrays, APQ hash-only envelopes, multipart `operations`, missing
+//! or unparseable bodies). Set `require_inspectable_transport: false` to
+//! restore fail-open for those representations. WebSocket/SSE GraphQL are out
+//! of scope: this plugin is HTTP-only (`HTTP_ONLY_PROTOCOLS`).
 //!
 //! The analyzer is a lightweight, allocation-light parser rather than a full
 //! GraphQL AST. It selects the operation to analyze using `operationName` (per
@@ -50,6 +56,7 @@ const GRAPHQL_POLICY_CONFIG_KEYS: &[&str] = &[
     "max_complexity",
     "max_aliases",
     "introspection_allowed",
+    "require_inspectable_transport",
     "limit_by",
     "type_rate_limits",
     "operation_rate_limits",
@@ -65,6 +72,7 @@ pub const GRAPHQL_CONFIG_KEYS: &[&str] = &[
     "max_complexity",
     "max_aliases",
     "introspection_allowed",
+    "require_inspectable_transport",
     "limit_by",
     "type_rate_limits",
     "operation_rate_limits",
@@ -111,6 +119,9 @@ pub struct GraphqlPlugin {
     max_complexity: Option<u32>,
     max_aliases: Option<u32>,
     introspection_allowed: bool,
+    /// When true (default), refuse HTTP GraphQL representations that cannot
+    /// be inspected. When false, preserve fail-open for those transports.
+    require_inspectable_transport: bool,
     limit_by: String,
     /// Rate limits by operation type: "query", "mutation", "subscription"
     type_rate_limits: HashMap<String, RateSpec>,
@@ -155,6 +166,8 @@ impl GraphqlPlugin {
         let max_complexity = optional_u32(config, "max_complexity")?;
         let max_aliases = optional_u32(config, "max_aliases")?;
         let introspection_allowed = optional_bool(config, "introspection_allowed")?.unwrap_or(true);
+        let require_inspectable_transport =
+            optional_bool(config, "require_inspectable_transport")?.unwrap_or(true);
         // limit_by must be a recognized policy — silently treating "user" as "ip"
         // would be a security misconfiguration footgun.
         let limit_by = match config.get("limit_by") {
@@ -198,6 +211,7 @@ impl GraphqlPlugin {
             max_complexity,
             max_aliases,
             introspection_allowed,
+            require_inspectable_transport,
             limit_by,
             type_rate_limits,
             operation_rate_limits,
@@ -1310,33 +1324,56 @@ impl Plugin for GraphqlPlugin {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Only process POST requests (standard GraphQL transport)
+        // Only inspect POST + JSON + object with string `query`. Other HTTP
+        // representations are refuse-by-default (fail closed) unless the
+        // operator sets require_inspectable_transport: false.
         if ctx.method != "POST" {
+            if self.require_inspectable_transport {
+                return reject_uninspectable_transport(
+                    "GraphQL request uses an unsupported HTTP method; \
+                     only POST with an inspectable JSON body is accepted",
+                );
+            }
             return PluginResult::Continue;
         }
 
-        // Check content type
         if !headers
             .get("content-type")
             .is_some_and(|ct| is_graphql_json_content_type(ct))
         {
+            if self.require_inspectable_transport {
+                return reject_uninspectable_transport(
+                    "GraphQL request uses an unsupported content type; \
+                     only JSON content types are inspectable",
+                );
+            }
             return PluginResult::Continue;
         }
 
-        // Get request body
         let body = match ctx.metadata.get("request_body") {
             Some(b) if !b.is_empty() => b.as_str(),
             _ => {
                 debug!("graphql: no request body available");
+                if self.require_inspectable_transport {
+                    return reject_uninspectable_transport(
+                        "GraphQL request body is missing or empty \
+                         and cannot be inspected",
+                    );
+                }
                 return PluginResult::Continue;
             }
         };
 
-        // Parse the JSON body to extract the GraphQL query
         let parsed: Value = match serde_json::from_str(body) {
             Ok(v) => v,
             Err(_) => {
                 debug!("graphql: request body is not valid JSON");
+                if self.require_inspectable_transport {
+                    return reject_uninspectable_transport(
+                        "GraphQL request body is not valid JSON \
+                         and cannot be inspected",
+                    );
+                }
                 return PluginResult::Continue;
             }
         };
@@ -1344,7 +1381,14 @@ impl Plugin for GraphqlPlugin {
         let query = match parsed.get("query").and_then(|q| q.as_str()) {
             Some(q) if !q.is_empty() => q,
             _ => {
-                // No query field — might be a persisted query or non-GraphQL request
+                // Batch arrays, APQ hash-only envelopes, empty/missing query.
+                if self.require_inspectable_transport {
+                    return reject_uninspectable_transport(
+                        "GraphQL request must include an inspectable string \
+                         query field; batch arrays and persisted-query \
+                         envelopes without a query document are refused",
+                    );
+                }
                 return PluginResult::Continue;
             }
         };
@@ -1503,6 +1547,15 @@ fn json_content_type_header() -> HashMap<String, String> {
     let mut h = HashMap::new();
     h.insert("content-type".to_string(), "application/json".to_string());
     h
+}
+
+/// Reject an HTTP GraphQL representation that cannot be inspected.
+fn reject_uninspectable_transport(message: &str) -> PluginResult {
+    PluginResult::Reject {
+        status_code: 400,
+        body: graphql_error_body(message),
+        headers: json_content_type_header(),
+    }
 }
 
 fn graphql_error_body(message: &str) -> String {

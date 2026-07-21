@@ -17315,6 +17315,19 @@ components:
           description: >-
             Whether introspection queries are permitted. Setting this to `false`
             counts as an effective protection rule; the default `true` does not.
+        require_inspectable_transport:
+          type: boolean
+          default: true
+          description: >-
+            When true (default), refuse HTTP GraphQL representations that this
+            plugin cannot inspect: non-POST methods (including GraphQL GET with
+            `?query=`), non-JSON content types (including `application/graphql`),
+            missing or unparseable bodies, JSON batch arrays, automatic persisted
+            query (APQ) envelopes without an inline query document, and multipart
+            `operations` envelopes. Responses are GraphQL-style JSON errors with
+            HTTP 400. When false, those representations continue uninspected
+            (fail open). This plugin is HTTP-only and does not inspect WebSocket
+            or SSE GraphQL transports — operators must not rely on it for those.
         limit_by:
           type: string
           enum: [ip, consumer]

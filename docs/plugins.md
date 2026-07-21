@@ -3456,7 +3456,9 @@ Compression note:
 
 GraphQL-aware proxying with query analysis, depth/complexity limiting, and per-operation rate limiting.
 
-Request buffering is only enabled when at least one GraphQL policy is configured and the incoming request is a JSON `POST`.
+Request buffering is only enabled when at least one GraphQL policy is configured and the incoming request is a JSON `POST`. The inspectable transport is POST with a JSON content type and a JSON object body containing a non-empty string `query`. By default (`require_inspectable_transport: true`), other HTTP representations are refused with HTTP 400 GraphQL-style JSON errors: GraphQL GET (`?query=`), raw `application/graphql`, JSON batch arrays, automatic persisted query (APQ) hash-only envelopes, multipart `operations`, and missing/unparseable bodies. Set `require_inspectable_transport: false` to fail open for those representations.
+
+**Known limitation:** this plugin is HTTP-only (`HTTP_ONLY_PROTOCOLS`) and does not run on WebSocket or SSE GraphQL transports. Operators must not rely on it to enforce depth/complexity/introspection/rate policy for those protocols; protect them separately upstream or via a future transport-aware control.
 
 **Priority:** 2850
 
@@ -3466,6 +3468,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `max_complexity` | u32 (optional) | — | Maximum allowed field count |
 | `max_aliases` | u32 (optional) | — | Maximum allowed alias count |
 | `introspection_allowed` | bool | `true` | Whether introspection queries are permitted. Only `false` counts as an effective protection rule; the default `true` does not. |
+| `require_inspectable_transport` | bool | `true` | When `true` (default), refuse HTTP GraphQL representations that cannot be inspected (GET, `application/graphql`, batch arrays, APQ without inline `query`, multipart `operations`, missing/unparseable bodies). When `false`, those representations continue uninspected (fail open). Does not alone count as an effective protection rule. |
 | `limit_by` | String | `ip` | Rate limit key: exact lowercase `ip` or `consumer`. Other values are rejected at plugin load time. |
 | `type_rate_limits` | Object | `{}` | Rate limits by operation type. Only exact lowercase `query`, `mutation`, and `subscription` keys are accepted; unknown keys are rejected. |
 | `operation_rate_limits` | Object | `{}` | Rate limits by named operation. Keys must be valid GraphQL Names (`[_A-Za-z][_0-9A-Za-z]*`). |
