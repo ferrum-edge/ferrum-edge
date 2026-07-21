@@ -86,10 +86,10 @@ def is_excluded(rel_posix: str) -> bool:
 def first_party_markdown_files(root: Path = REPO_ROOT) -> list[Path]:
     """List first-party `*.md` files under root without process execution.
 
-    Trusted Cross / automation policy rejects dynamic process argv (for example
-    `git -C <computed-root> ls-files`), so discovery walks the tree with the
-    same explicit exclusions instead of shelling out. On a clean CI checkout
-    this matches the tracked first-party Markdown set. Excluded directories are
+    Repository automation avoids dynamic process argv (for example
+    `git -C <computed-root> ls-files`), so discovery walks the tree with
+    explicit exclusions instead of shelling out. On a clean CI checkout this
+    matches the tracked first-party Markdown set. Excluded directories are
     pruned rather than descended into.
     """
 
