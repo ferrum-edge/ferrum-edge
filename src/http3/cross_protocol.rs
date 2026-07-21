@@ -4472,7 +4472,6 @@ where
             // Keep policy state on `ctx` through body transforms so gRPC-Web
             // trailer framing sees BufferedInitialResponseHeaderPolicyState
             // outcomes; take it after transform for wire reconciliation.
-            let mut buffered_initial_response_header_policy_state = None;
             if let Some(reject) = after_proxy_reject {
                 let _ = ctx.take_buffered_initial_response_header_policy();
                 let reject_status = reject.status_code;
@@ -4768,7 +4767,7 @@ where
             // retiring stale compatibility-view trailers, so a policy-owned
             // initial header the backend also sent as a trailer is not mistaken
             // for a later intentional removal.
-            buffered_initial_response_header_policy_state =
+            let mut buffered_initial_response_header_policy_state =
                 ctx.take_buffered_initial_response_header_policy();
             if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
                 Arc::make_mut(policy_state)

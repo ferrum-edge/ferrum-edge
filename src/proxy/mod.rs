@@ -22131,7 +22131,6 @@ async fn handle_proxy_request_inner(
                 // BufferedInitialResponseHeaderPolicyState outcomes as native
                 // trailer reconciliation; it is taken after transform below.
                 let mut after_proxy_rejected = false;
-                let mut buffered_initial_response_header_policy_state = None;
                 {
                     let phase_start = Instant::now();
                     let after_proxy_reject = run_after_proxy_hooks(
@@ -22165,7 +22164,7 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
 
-                if !after_proxy_rejected {
+                let mut buffered_initial_response_header_policy_state = if !after_proxy_rejected {
                     let phase_start = Instant::now();
                     crate::plugins::normalize_response_body_for_inspection(
                         &plugins,
@@ -22284,11 +22283,8 @@ async fn handle_proxy_request_inner(
                     // sent as a trailer would look like a later intentional
                     // removal, and the policy would drop its desired value
                     // instead of replaying it into initial HEADERS.
-                    buffered_initial_response_header_policy_state =
-                        ctx.take_buffered_initial_response_header_policy();
-                    if let Some(policy_state) =
-                        buffered_initial_response_header_policy_state.as_mut()
-                    {
+                    let mut policy_state = ctx.take_buffered_initial_response_header_policy();
+                    if let Some(policy_state) = policy_state.as_mut() {
                         Arc::make_mut(policy_state)
                             .record_later_response_header_mutations(&mut plugin_response_headers);
                     }
@@ -22300,7 +22296,10 @@ async fn handle_proxy_request_inner(
                         );
                     }
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                }
+                    policy_state
+                } else {
+                    None
+                };
 
                 if !after_proxy_rejected && !response_body_rejected {
                     let phase_start = Instant::now();
@@ -22422,8 +22421,9 @@ async fn handle_proxy_request_inner(
                             .metadata
                             .get("grpc_web_http_status")
                             .and_then(|value| value.parse::<u16>().ok());
-                        let content_type =
-                            plugin_response_headers.get("content-type").map(String::as_str);
+                        let content_type = plugin_response_headers
+                            .get("content-type")
+                            .map(String::as_str);
                         if crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
                             &mut response_body,
                             content_type,
@@ -24113,7 +24113,6 @@ async fn handle_proxy_request_inner(
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     } else {
         let _ = ctx.take_buffered_initial_response_header_policy();
-        mesh_grpc_web_trailer_reconcile = None;
     }
 
     // on_final_response_body hooks — buffered responses after all body transforms.

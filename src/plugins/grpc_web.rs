@@ -1011,7 +1011,7 @@ pub fn capture_bridged_trailer_split_for_policy(
     let encoded_names = response_headers.get(HEADER_GRPC_WEB_TRAILER_NAMES)?;
     let shadowed = response_headers
         .get(HEADER_GRPC_WEB_SHADOWED_TRAILERS)
-        .and_then(decode_shadowed_trailers_payload)
+        .and_then(|encoded| decode_shadowed_trailers_payload(encoded.as_str()))
         .unwrap_or_default();
     let mut trailers = HashMap::new();
     let mut shadowed_keys = HashSet::new();
