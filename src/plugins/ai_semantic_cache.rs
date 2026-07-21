@@ -2251,8 +2251,9 @@ fn validate_semantic_embedding_endpoint(
 }
 
 fn default_redis_key_prefix(namespace: &str) -> String {
-    let mut prefix =
-        String::with_capacity(namespace.len() + 1 + AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX.len());
+    let mut prefix = String::with_capacity(
+        namespace.len() + 1 + AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX.len(),
+    );
     prefix.push_str(namespace);
     prefix.push(':');
     prefix.push_str(AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX);
