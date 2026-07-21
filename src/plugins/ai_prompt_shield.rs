@@ -8,11 +8,16 @@
 //!
 //! ## Inspection scope
 //!
-//! The shield inspects bare JSON AI request bodies. Native gRPC and gRPC-Web
-//! media types carry length-prefixed wire frames (and may carry protobuf or
-//! base64 payloads), even when the media type ends in `+json`; those framed
-//! bodies are explicitly outside this JSON policy's scope and are passed
-//! through without buffering or inspection.
+//! The shield inspects bare JSON AI request bodies on the HTTP protocol view
+//! only (`HTTP_ONLY_PROTOCOLS`). Native gRPC is intentionally unsupported:
+//! there is no bounded, schema-aware frame/protobuf prompt contract, so the
+//! plugin is not registered for `ProxyProtocol::Grpc` and must not be treated
+//! as a fail-closed control for unary or streaming native gRPC traffic.
+//!
+//! gRPC-Web still rides the composed HTTP/gRPC-Web view. Its framed
+//! `application/grpc-web*` bodies (including `+json` variants) remain outside
+//! this bare-JSON policy: they are not buffered, decoded, or rewritten, so
+//! message framing is never double-decoded or corrupted.
 //!
 //! ## Compressed request bodies
 //!
@@ -1088,7 +1093,12 @@ impl Plugin for AiPromptShield {
     }
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
-        super::HTTP_GRPC_PROTOCOLS
+        // Native gRPC protobuf/framed messages have no supported prompt-schema
+        // contract here. Advertise HTTP only so operators cannot attach this
+        // shield as an inert fail-closed control on ProxyProtocol::Grpc.
+        // gRPC-Web continues through the HTTP/gRPC-Web composed view, where
+        // framed bodies are explicitly skipped without decoding.
+        super::HTTP_ONLY_PROTOCOLS
     }
 
     fn modifies_request_body(&self) -> bool {
@@ -1127,9 +1137,10 @@ impl Plugin for AiPromptShield {
             return PluginResult::Continue;
         }
 
-        // `application/grpc+json` and gRPC-Web `+json` variants are framed wire
-        // formats, not bare JSON. Native protobuf/framed gRPC is intentionally
-        // outside this plugin's JSON inspection scope.
+        // Framed native gRPC / gRPC-Web bodies (including `+json` variants) are
+        // length-prefixed wire formats, not bare JSON. Skip without buffering
+        // or decoding so gRPC-Web framing is preserved; native gRPC requests
+        // should already be excluded via HTTP_ONLY_PROTOCOLS.
         if is_framed_grpc_content_type(content_type) {
             return PluginResult::Continue;
         }
