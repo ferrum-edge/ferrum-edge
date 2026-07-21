@@ -1293,10 +1293,16 @@ fn build_trailer_frame_with_full_provenance(
         else {
             continue;
         };
-        // Multi-value gRPC metadata is stored newline-joined in the string map
-        // (see `collect_buffered_grpc_trailers`). Emit each occurrence as its
-        // own trailer line; reject any occurrence that fails value safety so a
-        // single hostile duplicate cannot smuggle CR/LF past the filter.
+        // Multi-value gRPC metadata is stored LF-joined in the string map (see
+        // `collect_buffered_grpc_trailers`). A carriage return can only come
+        // from a malformed value, not that representation; reject the entire
+        // field before splitting so `line\r\ninjected` cannot turn its suffix
+        // into a second, apparently valid metadata occurrence.
+        if value.contains('\r') {
+            continue;
+        }
+        // Emit each occurrence as its own trailer line and retain the ordinary
+        // printable-ASCII check for every LF-separated value.
         for occurrence in value.split('\n') {
             if is_valid_trailer_value(occurrence) {
                 eligible.push((name.clone(), occurrence.to_owned()));
