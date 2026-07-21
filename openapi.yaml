@@ -17262,7 +17262,16 @@ components:
         required (`max_depth`, `max_complexity`, `max_aliases`,
         `introspection_allowed: false`, a non-empty `type_rate_limits`, or a
         non-empty `operation_rate_limits`). `introspection_allowed: true` alone is
-        not an effective rule. Unknown top-level keys are rejected. Rate-limit
+        not an effective rule. Unknown top-level keys are rejected. Unsupported
+        GraphQL HTTP representations fail closed with HTTP 400 GraphQL-style
+        JSON errors (non-POST methods including GraphQL GET/`?query=` and
+        GraphQL-over-SSE GET, non-JSON content types including
+        `application/graphql`, missing or unparseable bodies, JSON batch arrays,
+        APQ envelopes without an inline query document, and multipart
+        `operations`). The plugin attaches to HTTP and WebSocket proxies so
+        WebSocket upgrade handshakes are refused before uninspectable
+        GraphQL-over-WebSocket frames can be admitted; it does not inspect
+        post-upgrade frames. gRPC, TCP, and UDP are unsupported. Rate-limit
         counter storage supports only local memory and Redis; database-backed
         counters are intentionally unsupported. When `sync_mode` is `redis`,
         `redis_url` is required. Explicit Redis fields are validated even in
@@ -17315,19 +17324,6 @@ components:
           description: >-
             Whether introspection queries are permitted. Setting this to `false`
             counts as an effective protection rule; the default `true` does not.
-        require_inspectable_transport:
-          type: boolean
-          default: true
-          description: >-
-            When true (default), refuse HTTP GraphQL representations that this
-            plugin cannot inspect: non-POST methods (including GraphQL GET with
-            `?query=`), non-JSON content types (including `application/graphql`),
-            missing or unparseable bodies, JSON batch arrays, automatic persisted
-            query (APQ) envelopes without an inline query document, and multipart
-            `operations` envelopes. Responses are GraphQL-style JSON errors with
-            HTTP 400. When false, those representations continue uninspected
-            (fail open). This plugin is HTTP-only and does not inspect WebSocket
-            or SSE GraphQL transports — operators must not rely on it for those.
         limit_by:
           type: string
           enum: [ip, consumer]

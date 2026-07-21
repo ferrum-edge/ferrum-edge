@@ -1021,10 +1021,10 @@ fn test_http_grpc_plugins_complete_coverage() {
 
 #[test]
 fn test_http_only_plugins_complete_coverage() {
-    // response_caching and graphql missing from the base test
+    // response_caching missing from the base test. graphql is HTTP+WebSocket
+    // (upgrade handshake only) and is covered separately.
     let plugins = vec![
         ("response_caching", json!({"ttl_seconds": 60})),
-        ("graphql", json!({"max_depth": 100})),
         ("ai_token_metrics", json!({})),
         (
             "ai_semantic_firewall",
@@ -1055,4 +1055,38 @@ fn test_http_only_plugins_complete_coverage() {
             name
         );
     }
+}
+
+#[test]
+fn test_graphql_http_and_websocket_protocol_coverage() {
+    // GHSA-762h: graphql must attach to WebSocket proxies so the HTTP upgrade
+    // handshake can fail closed, but it must not claim frame inspection.
+    let plugin = make_plugin("graphql", json!({"max_depth": 100}));
+    assert!(plugin.is_some(), "Failed to create plugin: graphql");
+    let plugin = plugin.unwrap();
+    assert_eq!(
+        plugin.supported_protocols(),
+        &[ProxyProtocol::Http, ProxyProtocol::WebSocket],
+        "graphql should support HTTP and WebSocket"
+    );
+    assert!(
+        !plugin.supported_protocols().contains(&ProxyProtocol::Grpc),
+        "graphql must NOT support gRPC"
+    );
+    assert!(
+        !plugin.supported_protocols().contains(&ProxyProtocol::Tcp),
+        "graphql must NOT support TCP"
+    );
+    assert!(
+        !plugin.supported_protocols().contains(&ProxyProtocol::Udp),
+        "graphql must NOT support UDP"
+    );
+    assert!(
+        !plugin.requires_websocket_framing(),
+        "graphql must not require WebSocket framing/frame inspection"
+    );
+    assert!(
+        !plugin.requires_ws_frame_hooks(),
+        "graphql must not claim on_ws_frame inspection"
+    );
 }
