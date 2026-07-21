@@ -16847,7 +16847,10 @@ components:
         Omitted optional fields select defaults; runtime also treats explicit
         null on optional fields as omitted. Matching replay bodies have a hard
         10 MiB plugin-local ceiling and active local/fan-out replay work shares
-        a 64 MiB process-wide retained-body budget.
+        a 64 MiB process-wide retained-body budget. Synthetic and fan-out
+        headers reuse the canonical secondary-request sanitizer shared with
+        request_mirror (Connection-listed hop-by-hop, Trailer, framing, Ferrum
+        markers, proxy-owned X-Forwarded-*), preserving Host for routing.
       required:
         - key
         - concurrent_clients
@@ -16944,7 +16947,11 @@ components:
         for the mirror response and mirror failures never propagate to the
         client. Mirror response metadata (status, size, latency) is captured
         via a `tokio::sync::watch` channel and surfaced through transaction
-        logs.
+        logs. Outbound mirror headers use Ferrum's canonical secondary-request
+        sanitizer (Connection-listed hop-by-hop, Trailer, framing, Ferrum
+        request-only markers, and proxy-owned X-Forwarded-* identity); Host is
+        derived from the mirror URL; gRPC mirrors re-synthesise te: trailers;
+        raw query strings preserve duplicate keys.
       required:
         - mirror_host
       properties:

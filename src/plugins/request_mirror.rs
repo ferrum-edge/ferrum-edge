@@ -15,6 +15,13 @@
 //! mirror destination. The main request proceeds immediately — mirror latency
 //! has zero impact on client response time.
 //!
+//! Outbound mirror headers cross the same canonical secondary-request boundary
+//! as primary backend dispatch (Connection-listed hop-by-hop, Trailer, framing,
+//! Ferrum request-only markers, and proxy-owned `X-Forwarded-*`). Client `Host`
+//! is omitted so authority comes from the mirror URL; gRPC content-types
+//! re-synthesise `te: trailers`. Raw query strings are preferred so duplicate
+//! keys survive.
+//!
 //! The mirror request uses the gateway's shared `PluginHttpClient`, which means
 //! it inherits the gateway's DNS cache, connection pool keepalive, and TLS
 //! settings (CA bundle, skip-verify).
@@ -68,6 +75,10 @@ use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, parse_max_response_body_bytes,
 };
 use super::{MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult, RequestContext};
+use crate::proxy::headers::{
+    SecondaryRequestHostPolicy, filter_secondary_request_headers,
+    synthesize_grpc_te_trailers_if_needed,
+};
 
 /// Default cap on the size of mirror response bodies the gateway is willing
 /// to read. The body is discarded — only its length is reported in mirror
@@ -196,9 +207,14 @@ impl RequestMirror {
     }
 
     /// Build the full mirror URL from the configured or gateway-selected path.
+    ///
+    /// Prefer the original raw query string when present so duplicate keys and
+    /// encoding survive. Fall back to the materialised `query_params` map only
+    /// when no raw query is available (tests / already-decoded contexts).
     fn build_mirror_url(
         &self,
         original_path: &str,
+        raw_query: Option<&str>,
         query_params: &HashMap<String, String>,
     ) -> String {
         let path = self.mirror_path.as_deref().unwrap_or(original_path);
@@ -213,7 +229,10 @@ impl RequestMirror {
         let _ = write!(&mut url, "{}", self.mirror_port);
         url.push_str(path);
 
-        if !query_params.is_empty() {
+        if let Some(query) = raw_query.filter(|q| !q.is_empty()) {
+            url.push('?');
+            url.push_str(query);
+        } else if !query_params.is_empty() {
             url.push('?');
             let encoded: String = form_urlencoded::Serializer::new(String::new())
                 .extend_pairs(query_params.iter())
@@ -387,18 +406,22 @@ impl Plugin for RequestMirror {
         // final authorization. Falling back to the ordinary client path keeps
         // the established behavior for proxies without that policy boundary.
         let mirror_path = ctx.authorized_backend_path().unwrap_or(&ctx.path);
-        let mirror_url = self.build_mirror_url(mirror_path, &ctx.query_params);
+        let mirror_url = self.build_mirror_url(mirror_path, ctx.raw_query_string(), &ctx.query_params);
         let method = ctx.method.clone();
 
-        // Collect headers for the mirror request. Use the proxy headers (post-transform)
-        // which reflect any modifications from upstream plugins like request_transformer.
-        let mut mirror_headers: Vec<(String, String)> = headers
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
         // Mirror destinations are an egress boundary just like the primary
-        // backend. Apply the operator-configured baggage strip
+        // backend. Apply the canonical secondary-request sanitizer (hop-by-hop,
+        // Connection-listed, framing, proxy-owned forwarding identity, Host
+        // strip) before any mirror-specific exclusions.
+        let mut mirror_headers = filter_secondary_request_headers(
+            headers,
+            SecondaryRequestHostPolicy::Strip,
+            &[LOAD_TESTING_TRIGGER_HEADER, LOAD_TESTING_FANOUT_HEADER],
+        );
+        // gRPC mirrors need `te: trailers` after the generic strip removes `te`.
+        synthesize_grpc_te_trailers_if_needed(&mut mirror_headers);
+
+        // Apply the operator-configured baggage strip
         // (`FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`) so mesh-internal identity
         // claims like `source.principal` don't leak to mirror analytics /
         // auditing services that the operator considers off-mesh.
@@ -480,41 +503,12 @@ impl Plugin for RequestMirror {
                 req_builder = req_builder.timeout(t);
             }
 
-            // Forward all headers from the original (transformed) request
+            // Forward sanitized headers from the original (transformed) request.
+            // The canonical secondary-request filter already removed hop-by-hop,
+            // Connection-listed, framing, proxy-owned forwarding, Host, and the
+            // reserved load-testing controls.
             for (key, value) in &mirror_headers {
-                // Defense in depth for chains with a priority override: the
-                // reusable load-testing controls are never mirror data, even if
-                // request_mirror executes before load_testing strips them.
-                if key.eq_ignore_ascii_case(LOAD_TESTING_TRIGGER_HEADER)
-                    || key.eq_ignore_ascii_case(LOAD_TESTING_FANOUT_HEADER)
-                {
-                    continue;
-                }
-                // Skip hop-by-hop and connection-specific headers. Also skip
-                // `content-length`: when the body is not mirrored
-                // (`mirror_request_body = false`) or simply unavailable, no
-                // `.body()` is attached, so forwarding the original
-                // `content-length: N` would declare N body bytes with a
-                // zero-length body — a malformed request that makes many mirror
-                // servers block awaiting the bytes until timeout or reject it,
-                // wasting an in-flight permit / pooled connection and corrupting
-                // mirror analytics. Dropping it lets reqwest set the correct
-                // Content-Length from the actual mirror body (0 when no body is
-                // attached, exact length when one is).
-                match key.as_str() {
-                    "host"
-                    | "connection"
-                    | "keep-alive"
-                    | "transfer-encoding"
-                    | "te"
-                    | "upgrade"
-                    | "content-length"
-                    | "proxy-authorization"
-                    | "proxy-connection" => continue,
-                    _ => {
-                        req_builder = req_builder.header(key.as_str(), value.as_str());
-                    }
-                }
+                req_builder = req_builder.header(key.as_str(), value.as_str());
             }
 
             if let Some(body) = body_bytes {
@@ -639,8 +633,16 @@ mod tests {
         query_params.insert("page".to_string(), "1".to_string());
 
         assert_eq!(
-            plugin.build_mirror_url("/shadow", &query_params),
+            plugin.build_mirror_url("/shadow", None, &query_params),
             "https://[2001:db8::10]:8443/shadow?page=1"
+        );
+        assert_eq!(
+            plugin.build_mirror_url(
+                "/shadow",
+                Some("tag=red&tag=blue&q=a+b"),
+                &query_params
+            ),
+            "https://[2001:db8::10]:8443/shadow?tag=red&tag=blue&q=a+b"
         );
     }
 }

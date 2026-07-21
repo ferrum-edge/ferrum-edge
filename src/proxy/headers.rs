@@ -12,6 +12,30 @@
 //! pipeline lowercases keys at admission, so callers may match against these
 //! predicates without a separate normalisation step.
 
+/// Closed set of lowercase names stripped by
+/// [`is_backend_request_strip_header`]. Secondary-request builders
+/// (`request_mirror`, `load_testing`) and parity tests share this list with
+/// primary backend dispatch so plugin-private allowlists cannot drift.
+pub const BACKEND_REQUEST_STRIP_HEADER_NAMES: &[&str] = &[
+    "connection",
+    "content-length",
+    "keep-alive",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "x-ferrum-original-content-encoding",
+    "x-grpc-web-mode",
+];
+
+/// Closed set of lowercase proxy-owned forwarding identity headers stripped
+/// before Ferrum regenerates them on primary dispatch (and before secondary
+/// request builders copy the materialised map).
+pub const PROXY_GENERATED_FORWARDING_HEADER_NAMES: &[&str] =
+    &["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"];
+
 /// Returns `true` for headers that must NOT be forwarded on a backend
 /// request. This is the union of:
 ///
@@ -37,6 +61,8 @@
 /// `name` is expected to be lowercase.
 #[inline]
 pub fn is_backend_request_strip_header(name: &str) -> bool {
+    // Keep the match arms as the hot-path predicate; the const above is the
+    // documented closed set that secondary builders and parity tests consult.
     matches!(
         name,
         "connection"
@@ -66,6 +92,99 @@ pub fn is_proxy_generated_forwarding_header(name: &str) -> bool {
         name,
         "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host"
     )
+}
+
+/// Whether client `Host` / authority should survive secondary-request filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondaryRequestHostPolicy {
+    /// Drop client `Host` so the outbound HTTP client derives authority from
+    /// the target URL (shadow / mirror destinations).
+    Strip,
+    /// Keep `Host` for host-based routing when the synthetic request re-enters
+    /// the gateway (load-testing loopback and peer fan-out).
+    Preserve,
+}
+
+/// Returns `true` when a materialised request header must not be copied onto a
+/// Ferrum-generated secondary request (mirror, load-test synthetic/fan-out).
+///
+/// Applies the primary backend-request strip set, proxy-owned forwarding
+/// identity headers, RFC 9110 `Connection`-listed names (snapshot must be
+/// taken via [`parse_connection_listed_from_str_map`] before filtering), and
+/// the caller-selected [`SecondaryRequestHostPolicy`].
+///
+/// Comparison is ASCII case-insensitive so plugin-synthesised mixed-case keys
+/// cannot bypass the boundary.
+#[inline]
+pub fn is_secondary_request_strip_header(
+    name: &str,
+    connection_listed: &[String],
+    host_policy: SecondaryRequestHostPolicy,
+) -> bool {
+    let name_lower = name.to_ascii_lowercase();
+    if host_policy == SecondaryRequestHostPolicy::Strip && name_lower == "host" {
+        return true;
+    }
+    if connection_listed.iter().any(|listed| listed == &name_lower) {
+        return true;
+    }
+    is_backend_request_strip_header(&name_lower)
+        || is_proxy_generated_forwarding_header(&name_lower)
+}
+
+/// Filter a materialised request header map for a Ferrum-generated secondary
+/// request, honoring the same outbound protocol boundary as primary backend
+/// dispatch.
+///
+/// `extra_exclude` removes additional plugin-control names (for example
+/// load-testing trigger/fan-out headers) after the canonical strip. `Host`
+/// handling is selected via [`SecondaryRequestHostPolicy`].
+///
+/// Connection-listed names are snapshotted first so dynamic hop-by-hop tokens
+/// are removed even though `connection` itself is stripped by the static set.
+pub fn filter_secondary_request_headers(
+    headers: &std::collections::HashMap<String, String>,
+    host_policy: SecondaryRequestHostPolicy,
+    extra_exclude: &[&str],
+) -> Vec<(String, String)> {
+    let connection_listed = parse_connection_listed_from_str_map(headers);
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            if extra_exclude
+                .iter()
+                .any(|excluded| name.eq_ignore_ascii_case(excluded))
+            {
+                return false;
+            }
+            !is_secondary_request_strip_header(name, &connection_listed, host_policy)
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// After generic secondary-request stripping, re-synthesise gRPC's mandatory
+/// `te: trailers` when the outbound request is gRPC (`content-type` starts
+/// with `application/grpc`).
+///
+/// Mirrors [`strip_backend_request_headers_for_grpc`] for builders that work
+/// from a materialised `Vec<(String, String)>` rather than `http::HeaderMap`.
+pub fn synthesize_grpc_te_trailers_if_needed(headers: &mut Vec<(String, String)>) {
+    let is_grpc = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type") && content_type_is_grpc(value)
+    });
+    if !is_grpc {
+        return;
+    }
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("te"));
+    headers.push(("te".to_string(), "trailers".to_string()));
+}
+
+#[inline]
+fn content_type_is_grpc(value: &str) -> bool {
+    const PREFIX: &[u8] = b"application/grpc";
+    let bytes = value.as_bytes();
+    bytes.len() >= PREFIX.len() && bytes[..PREFIX.len()].eq_ignore_ascii_case(PREFIX)
 }
 
 /// Parse the lowercased header names listed in any `Connection` header(s),
@@ -505,6 +624,27 @@ mod tests {
         assert!(is_backend_request_strip_header(
             "x-ferrum-original-content-encoding"
         ));
+        assert!(is_backend_request_strip_header("x-grpc-web-mode"));
+    }
+
+    #[test]
+    fn backend_request_strip_const_matches_predicate() {
+        // Parity guard: every documented closed-set name must be honored by the
+        // hot-path predicate, and the const length must stay aligned with the
+        // known request-direction strip set.
+        assert_eq!(BACKEND_REQUEST_STRIP_HEADER_NAMES.len(), 11);
+        for name in BACKEND_REQUEST_STRIP_HEADER_NAMES {
+            assert!(
+                is_backend_request_strip_header(name),
+                "const entry `{name}` missing from is_backend_request_strip_header"
+            );
+        }
+        for name in PROXY_GENERATED_FORWARDING_HEADER_NAMES {
+            assert!(
+                is_proxy_generated_forwarding_header(name),
+                "const entry `{name}` missing from is_proxy_generated_forwarding_header"
+            );
+        }
     }
 
     #[test]
