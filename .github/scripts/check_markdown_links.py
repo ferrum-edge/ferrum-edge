@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate first-party Markdown relative links and GitHub heading slugs.
 
-Checks tracked `*.md` files for relative file targets and `#fragment` anchors
+Checks first-party `*.md` files for relative file targets and `#fragment` anchors
 using GitHub's heading-slug algorithm (GFM / html-pipeline TableOfContentsFilter):
 
 1. lowercase
@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import subprocess
 import sys
 import tempfile
 from collections.abc import Iterable
@@ -32,7 +31,10 @@ from urllib.parse import unquote, urlparse
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 # Explicit exclusions — keep this list intentional and greppable.
+# `.git/` is skipped so a local checkout never scans the object store; CI
+# checkouts otherwise match first-party tracked Markdown under the root.
 EXCLUDE_PREFIXES: tuple[str, ...] = (
+    ".git/",
     "vendor/",
     "target/",
     "node_modules/",
@@ -81,19 +83,34 @@ def is_excluded(rel_posix: str) -> bool:
     return any(rel_posix == prefix.rstrip("/") or rel_posix.startswith(prefix) for prefix in EXCLUDE_PREFIXES)
 
 
-def tracked_markdown_files(root: Path = REPO_ROOT) -> list[Path]:
-    raw = subprocess.check_output(
-        ["git", "-C", str(root), "ls-files", "-z", "--", "*.md"],
-        text=False,
-    )
+def first_party_markdown_files(root: Path = REPO_ROOT) -> list[Path]:
+    """List first-party `*.md` files under root without process execution.
+
+    Trusted Cross / automation policy rejects dynamic process argv (for example
+    `git -C <computed-root> ls-files`), so discovery walks the tree with the
+    same explicit exclusions instead of shelling out. On a clean CI checkout
+    this matches the tracked first-party Markdown set. Excluded directories are
+    pruned rather than descended into.
+    """
+
+    root = root.resolve()
     files: list[Path] = []
-    for entry in raw.split(b"\0"):
-        if not entry:
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = sorted(current.iterdir(), key=lambda entry: entry.name)
+        except OSError:
             continue
-        rel = entry.decode()
-        if is_excluded(rel):
-            continue
-        files.append(root / rel)
+        for entry in entries:
+            rel = entry.relative_to(root).as_posix()
+            if is_excluded(rel):
+                continue
+            if entry.is_dir():
+                stack.append(entry)
+                continue
+            if entry.is_file() and entry.suffix.lower() == ".md":
+                files.append(entry)
     return sorted(files)
 
 
@@ -256,7 +273,7 @@ def check_file(
 def check_repository(root: Path = REPO_ROOT) -> list[LinkError]:
     slug_cache: dict[Path, set[str]] = {}
     errors: list[LinkError] = []
-    for path in tracked_markdown_files(root):
+    for path in first_party_markdown_files(root):
         errors.extend(check_file(path, root=root, slug_cache=slug_cache))
     return errors
 
@@ -345,9 +362,9 @@ def main(argv: list[str] | None = None) -> int:
 
     errors = check_repository(root)
     if not errors:
-        tracked = len(tracked_markdown_files(root))
+        checked = len(first_party_markdown_files(root))
         print(
-            f"Checked {tracked} tracked Markdown files; "
+            f"Checked {checked} first-party Markdown files; "
             "all first-party relative links and GitHub heading slugs resolved."
         )
         return 0
