@@ -1718,3 +1718,293 @@ async fn test_spoofed_mode_header_cannot_mark_request_translated() {
     assert!(!request_is_grpc_web_translated(&ctx));
     assert!(!ctx.headers.contains_key("x-grpc-web-mode"));
 }
+
+// ── Multi-instance ownership (issue #2503) ──
+
+fn count_grpc_web_trailer_frames(body: &[u8]) -> usize {
+    use ferrum_edge::_test_support::{GRPC_FRAME_TRAILER, parse_grpc_frames};
+    parse_grpc_frames(body)
+        .into_iter()
+        .filter(|(flag, _)| *flag == GRPC_FRAME_TRAILER || *flag == 0x81)
+        .count()
+}
+
+async fn run_two_instance_response_chain(
+    first: &std::sync::Arc<dyn Plugin>,
+    second: &std::sync::Arc<dyn Plugin>,
+    request_ct: &str,
+    backend_body: &[u8],
+) -> (HashMap<String, String>, Vec<u8>) {
+    let mut ctx = create_grpc_web_context(request_ct);
+    assert!(matches!(
+        first.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut outgoing = HashMap::new();
+    assert!(matches!(
+        first.before_proxy(&mut ctx, &mut outgoing).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.before_proxy(&mut ctx, &mut outgoing).await,
+        PluginResult::Continue
+    ));
+    // Only the owner plants shared request staging.
+    assert_eq!(
+        outgoing.get("x-grpc-web-mode").map(String::as_str),
+        Some(if request_ct.contains("grpc-web-text") {
+            "text"
+        } else {
+            "binary"
+        })
+    );
+
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+    assert!(matches!(
+        first
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut body = backend_body.to_vec();
+    for plugin in [first, second] {
+        if let Some(next) = plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                response_headers.get("content-type").map(String::as_str),
+                &response_headers,
+            )
+            .await
+        {
+            body = next;
+        }
+    }
+    (response_headers, body)
+}
+
+#[tokio::test]
+async fn test_two_instances_binary_translate_once_and_union_expose_headers() {
+    let first = create_plugin(
+        "grpc_web",
+        &json!({"expose_headers": ["x-request-id"]}),
+    )
+    .unwrap()
+    .unwrap();
+    let second = create_plugin(
+        "grpc_web",
+        &json!({"expose_headers": ["x-trace-id"]}),
+    )
+    .unwrap()
+    .unwrap();
+
+    let mut data = vec![0x00u8];
+    data.extend_from_slice(&5u32.to_be_bytes());
+    data.extend_from_slice(b"hello");
+
+    let (headers, output) =
+        run_two_instance_response_chain(&first, &second, "application/grpc-web", &data).await;
+
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/grpc-web")
+    );
+    assert_eq!(count_grpc_web_trailer_frames(&output), 1);
+    assert_eq!(&output[..10], &data[..]);
+    assert_eq!(output[10], 0x80);
+
+    let expose = headers
+        .get("access-control-expose-headers")
+        .expect("expose headers");
+    assert!(expose.contains("x-request-id"), "got {expose}");
+    assert!(expose.contains("x-trace-id"), "got {expose}");
+    assert!(expose.contains("grpc-status"), "got {expose}");
+}
+
+#[tokio::test]
+async fn test_two_instances_text_decode_and_encode_exactly_once() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let first = create_plugin(
+        "grpc_web",
+        &json!({"expose_headers": ["x-a"]}),
+    )
+    .unwrap()
+    .unwrap();
+    let second = create_plugin(
+        "grpc_web",
+        &json!({"expose_headers": ["x-b"]}),
+    )
+    .unwrap()
+    .unwrap();
+
+    let mut ctx = create_grpc_web_context("application/grpc-web-text");
+    first.on_request_received(&mut ctx).await;
+    second.on_request_received(&mut ctx).await;
+    assert_eq!(ctx.metadata.get("grpc_web_mode").map(String::as_str), Some("text"));
+    assert!(ctx.metadata.contains_key("grpc_web.owner"));
+
+    let mut grpc_frame = vec![0x00u8];
+    grpc_frame.extend_from_slice(&5u32.to_be_bytes());
+    grpc_frame.extend_from_slice(b"hello");
+    let encoded = BASE64.encode(&grpc_frame);
+
+    let mut outgoing = HashMap::new();
+    first.before_proxy(&mut ctx, &mut outgoing).await;
+    second.before_proxy(&mut ctx, &mut outgoing).await;
+
+    let mut body = encoded.into_bytes();
+    for plugin in [&first, &second] {
+        if let Some(next) = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &outgoing,
+            )
+            .await
+        {
+            body = next;
+        }
+    }
+    assert_eq!(body, grpc_frame);
+    assert_eq!(
+        ctx.metadata
+            .get("grpc_web.request_decoded")
+            .map(String::as_str),
+        ctx.metadata.get("grpc_web.owner").map(String::as_str)
+    );
+
+    for plugin in [&first, &second] {
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &outgoing, &body)
+                .await,
+            PluginResult::Continue
+        ));
+    }
+
+    let mut data = vec![0x00u8];
+    data.extend_from_slice(&3u32.to_be_bytes());
+    data.extend_from_slice(b"abc");
+    let (headers, output) =
+        run_two_instance_response_chain(&first, &second, "application/grpc-web-text", &data).await;
+
+    // Fresh chain above re-claims; for the response-only assertion reuse the
+    // already-translated output path from this helper call.
+    let decoded = BASE64.decode(&output).expect("single base64 layer");
+    assert_eq!(count_grpc_web_trailer_frames(&decoded), 1);
+    assert_eq!(&decoded[..8], &data[..]);
+    let expose = headers
+        .get("access-control-expose-headers")
+        .expect("expose headers");
+    assert!(expose.contains("x-a") && expose.contains("x-b"), "got {expose}");
+}
+
+#[tokio::test]
+async fn test_two_instances_priority_order_first_owner_wins() {
+    // Simulate distinct priority_override ordering: lower effective priority
+    // runs first and must own translation; the later instance only unions
+    // expose_headers.
+    let early = create_plugin(
+        "grpc_web",
+        &json!({"expose_headers": ["x-early"]}),
+    )
+    .unwrap()
+    .unwrap();
+    let late = create_plugin(
+        "grpc_web",
+        &json!({"expose_headers": ["x-late"]}),
+    )
+    .unwrap()
+    .unwrap();
+
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    early.on_request_received(&mut ctx).await;
+    let owner = ctx
+        .metadata
+        .get("grpc_web.owner")
+        .cloned()
+        .expect("early instance claims ownership");
+    late.on_request_received(&mut ctx).await;
+    assert_eq!(
+        ctx.metadata.get("grpc_web.owner").map(String::as_str),
+        Some(owner.as_str()),
+        "later instance must not overwrite the owner marker"
+    );
+
+    let (headers, output) =
+        run_two_instance_response_chain(&early, &late, "application/grpc-web+proto", &[]).await;
+    assert_eq!(count_grpc_web_trailer_frames(&output), 1);
+    let expose = headers
+        .get("access-control-expose-headers")
+        .expect("expose headers");
+    assert!(expose.contains("x-early"), "got {expose}");
+    assert!(expose.contains("x-late"), "got {expose}");
+}
+
+#[tokio::test]
+async fn test_follower_fails_closed_without_owner_staging_on_response_transform() {
+    let owner = create_plugin_default();
+    let follower = create_plugin(
+        "grpc_web",
+        &json!({"expose_headers": ["x-follower"]}),
+    )
+    .unwrap()
+    .unwrap();
+
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    owner.on_request_received(&mut ctx).await;
+    // Corrupt shared mode staging while leaving ownership intact — owner must
+    // refuse speculative translation rather than invent frames from CT alone.
+    ctx.metadata
+        .insert("grpc_web_mode".to_string(), "not-a-mode".to_string());
+    // Clear the namespaced per-instance mode key as well.
+    let owner_id = ctx.metadata.get("grpc_web.owner").cloned().unwrap();
+    ctx.metadata
+        .remove(&format!("grpc_web.instance.{owner_id}.mode"));
+
+    let response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    )]);
+    assert!(
+        owner
+            .transform_response_body_with_context(
+                &mut ctx,
+                b"",
+                Some("application/grpc-web"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "malformed mode staging must fail closed"
+    );
+    assert!(
+        follower
+            .transform_response_body_with_context(
+                &mut ctx,
+                b"",
+                Some("application/grpc-web"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "non-owner must never translate the response body"
+    );
+}

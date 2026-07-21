@@ -17515,7 +17515,9 @@ components:
         trailer frame synthesizes status from the official HTTP-to-gRPC client
         mapping (400→13, 401→16, 403→7, 404→12, 429/502/503/504→14, others→2);
         a valid supplied grpc-status remains authoritative. The client-visible
-        HTTP status is not rewritten to 200 on this path.
+        HTTP status is not rewritten to 200 on this path. Multiple effective
+        instances are supported: the first in configured order owns body
+        translation exactly once; siblings union expose_headers only.
       properties:
         expose_headers:
           type: array
@@ -17524,7 +17526,8 @@ components:
           description: >-
             Additional response headers to include in
             Access-Control-Expose-Headers for browser CORS compatibility.
-            grpc-status and grpc-message are always exposed.
+            grpc-status and grpc-message are always exposed. Multiple grpc_web
+            instances union their lists in configured order.
 
     GrpcDeadlineConfig:
       type: object
