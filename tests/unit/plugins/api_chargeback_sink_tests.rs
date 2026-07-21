@@ -806,8 +806,10 @@ fn spool_reconcile_fails_closed_when_stale_tmp_cannot_be_removed() {
         replay_interval_secs: 60,
         compression: SpoolCompression::None,
     };
-    let err = SpoolManager::for_tests(settings, "node-a")
-        .expect_err("undeletable stale tmp must fail spool startup");
+    let err = match SpoolManager::for_tests(settings, "node-a") {
+        Ok(_) => panic!("undeletable stale tmp must fail spool startup"),
+        Err(err) => err,
+    };
     assert!(
         err.contains("failed to remove stale spool temp file"),
         "unexpected error: {err}"
