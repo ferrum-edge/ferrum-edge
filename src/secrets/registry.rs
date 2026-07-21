@@ -117,15 +117,15 @@ fn redact_source_reference(error: String, reference: &str, key: &str) -> String 
 ///
 /// The original reference is not always what the provider was asked for. Azure
 /// is the case that forces this: `parse_keyvault_reference` splits a Key Vault
-/// URL into `(vault_url, secret_name)` and deliberately *drops* a trailing
-/// `/<version>` segment, so a versioned reference like
-/// `https://vault/secrets/name/v1` produces a request against
-/// `https://vault` for `name`. An SDK error echoing that requested URL or
-/// secret name matches neither the versioned original nor its pre-`#` half, and
-/// would otherwise reach the operator intact. Adding the parsed components —
-/// and their recombined `<vault_url>/secrets/<secret_name>` form, so the
-/// longest-first pass replaces it as one span — closes that without touching
-/// reference parsing itself.
+/// URL into `(vault_url, secret_name, version)` and the SDK request is built
+/// from those components. An SDK error may echo the vault URL, the secret
+/// name, the unversioned `/secrets/<name>` path, or the versioned path — none
+/// of which necessarily equal the operator's original string (which may also
+/// carry a `#` suffix or a TLS `?version=` option). Adding the parsed
+/// components — and their recombined unversioned/versioned
+/// `<vault_url>/secrets/<secret_name>[/<version>]` forms, so the longest-first
+/// pass replaces each as one span — closes that without relying on the
+/// operator spelling alone.
 ///
 /// Parsing is attempted on every reference and simply yields nothing for the
 /// other providers: a Vault path, a GCP resource name, and an ARN are all
@@ -144,8 +144,14 @@ fn source_reference_candidates(reference: &str) -> Vec<String> {
         // URL parser would otherwise fold into the fragment.
         let bases: Vec<String> = candidates.clone();
         for base in bases {
-            if let Ok((vault_url, secret_name)) = azure::parse_keyvault_reference(&base, "") {
+            if let Ok((vault_url, secret_name, version)) =
+                azure::parse_keyvault_reference(&base, "")
+            {
                 candidates.push(format!("{vault_url}/secrets/{secret_name}"));
+                if let Some(version) = version {
+                    candidates.push(format!("{vault_url}/secrets/{secret_name}/{version}"));
+                    candidates.push(version);
+                }
                 candidates.push(vault_url);
                 candidates.push(secret_name);
             }
@@ -205,6 +211,9 @@ pub struct ResolvedSecret {
     /// Human-readable source description (e.g. "env", "file:/run/secrets/jwt").
     /// Never contains the secret value itself.
     pub source: String,
+    /// Provider version actually returned/fetched when the backend reports one
+    /// (for example an Azure Key Vault secret version). Not a configured label.
+    pub version: Option<String>,
 }
 
 /// The result of resolving all env-based secrets at startup.
@@ -861,6 +870,7 @@ pub async fn resolve_secret(key: &str) -> Result<Option<ResolvedSecret>, String>
     Ok(Some(ResolvedSecret {
         value,
         source: backend.source(&reference),
+        version: None,
     }))
 }
 
@@ -891,6 +901,27 @@ pub async fn resolve_external_reference(
         return Err(format!("Unsupported secret provider scheme '{}'", provider));
     };
 
+    // Azure reports the version actually returned by Key Vault. Take the
+    // richer fetch path so TLS inventory / materialization can stamp that
+    // version rather than a configured query label that was never sent.
+    #[cfg(feature = "secrets-azure")]
+    if provider == "azure" {
+        let secret = tokio::time::timeout(secret_fetch_timeout(), azure::fetch_secret(reference, key))
+            .await
+            .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))?
+            .map_err(|error| redact_source_reference(error, reference, key))?;
+
+        if backend.log_loaded() {
+            info!("Loaded {} from {}", key, backend.display_name());
+        }
+
+        return Ok(ResolvedSecret {
+            value: secret.value,
+            source: backend.source(reference),
+            version: secret.version,
+        });
+    }
+
     let value = tokio::time::timeout(secret_fetch_timeout(), backend.resolve_one(reference, key))
         .await
         .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))?
@@ -903,6 +934,7 @@ pub async fn resolve_external_reference(
     Ok(ResolvedSecret {
         value,
         source: backend.source(reference),
+        version: None,
     })
 }
 
@@ -1214,7 +1246,7 @@ impl SecretBackend for AzureBackend {
     }
 
     async fn resolve_one(&self, reference: &str, key: &str) -> Result<String, String> {
-        azure::fetch_secret(reference, key).await
+        Ok(azure::fetch_secret(reference, key).await?.value)
     }
 
     async fn resolve_many(
@@ -1228,7 +1260,11 @@ impl SecretBackend for AzureBackend {
             timeout,
             self.display_name(),
             &creds,
-            |creds, reference, key| Box::pin(creds.fetch_secret(reference, key)),
+            |creds, reference, key| {
+                Box::pin(async move {
+                    Ok(creds.fetch_secret(reference, key).await?.value)
+                })
+            },
         )
         .await
     }
@@ -1329,11 +1365,11 @@ mod tests {
 
     /// A source reference is not always what the provider was asked for.
     ///
-    /// `parse_keyvault_reference` drops a trailing `/<version>` segment, so a
-    /// versioned reference produces a request against the bare vault URL for
-    /// the bare secret name. An SDK error echoing *that* matches neither the
-    /// versioned original nor its pre-`#` half, so redacting only the operator's
-    /// string would let the vault URL and secret name through intact.
+    /// `parse_keyvault_reference` splits a versioned URL into vault/name/version
+    /// components. An SDK error may echo the unversioned request path, the
+    /// versioned path, or only the vault host / secret name — none of which
+    /// equal the operator string alone. Redaction must cover every normalized
+    /// component.
     ///
     /// Kept inline because `redact_source_reference` is private and the whole
     /// point of the boundary is that no caller can bypass it; exercising it
@@ -1343,11 +1379,11 @@ mod tests {
     fn redact_source_reference_covers_azure_normalized_components() {
         const REFERENCE: &str =
             "https://ferrum-vault-sentinel.vault.azure.net:8443/secrets/jwt-name-sentinel/v9abc";
-        // Shaped like an `azure_core` transport error, which echoes the URL it
-        // actually issued — version segment absent — plus the secret name.
+        // Shaped like an `azure_core` transport error, which may echo either the
+        // unversioned or versioned URL plus the secret name.
         let sdk_error = "Failed to get Azure secret for FERRUM_ADMIN_JWT_SECRET: \
              HTTP 404 from https://ferrum-vault-sentinel.vault.azure.net:8443\
-             /secrets/jwt-name-sentinel?api-version=7.4 (secret 'jwt-name-sentinel' \
+             /secrets/jwt-name-sentinel/v9abc?api-version=7.4 (secret 'jwt-name-sentinel' \
              in https://ferrum-vault-sentinel.vault.azure.net:8443)"
             .to_string();
 
@@ -1356,7 +1392,8 @@ mod tests {
         assert!(
             !redacted.contains("ferrum-vault-sentinel")
                 && !redacted.contains("jwt-name-sentinel")
-                && !redacted.contains("vault.azure.net"),
+                && !redacted.contains("vault.azure.net")
+                && !redacted.contains("v9abc"),
             "normalized Azure components must not survive redaction: {redacted}"
         );
         // Base key and failure class stay actionable.

@@ -1281,7 +1281,10 @@ impl RedactionPlan {
 // pre-acquired bearer token (no Entra ID round trip). `AzureCredentials`
 // carries `from_static_token()` for that injection.
 #[cfg(feature = "secrets-azure")]
-pub use azure::{AzureCredentials, parse_keyvault_reference as azure_parse_keyvault_reference};
+pub use azure::{
+    AzureCredentials, AzureSecret, apply_tls_version_option as azure_apply_tls_version_option,
+    parse_keyvault_reference as azure_parse_keyvault_reference,
+};
 
 /// Candidate derivation is deliberately private — the whole point of
 /// [`RedactionPlan`] is that no caller can hand it a different candidate set —
