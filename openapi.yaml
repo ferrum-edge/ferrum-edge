@@ -16743,8 +16743,12 @@ components:
         handshakes: a match short-circuits only the HTTP handshake response and
         does not establish or mock an upgraded WebSocket frame stream. Unknown
         top-level and per-rule keys are rejected; the free-form headers map
-        remains open for string-valued response headers. Runtime construction
-        is the authoritative final boundary.
+        remains open for string-valued response headers. Status codes must be
+        final (200–599) or 101 for a synthetic WebSocket handshake; other
+        informational statuses are rejected. HEAD omits content bytes while
+        keeping representation Content-Length; 204/205/304 omit body and
+        Content-Length on every frontend (H1/H2/H3). Runtime construction is
+        the authoritative final boundary.
       required:
         - rules
       properties:
@@ -16781,11 +16785,14 @@ components:
                 minimum: 100
                 maximum: 599
                 description: >-
-                  HTTP status code to return (default 200). Values outside
-                  100–599 are rejected. Status 101 on an HTTP/1.1 WebSocket
-                  upgrade, or a success-like 200 on HTTP/2 / HTTP/3 Extended
-                  CONNECT, is still only a synthetic HTTP handshake response;
-                  it does not create an upgraded frame stream.
+                  HTTP status code to return (default 200). Must be a final
+                  status 200–599, or 101 for a synthetic WebSocket handshake
+                  response. Other informational statuses (100, 102–199) and
+                  values outside 100–599 are rejected at construction rather
+                  than coerced. Status 101 on an HTTP/1.1 WebSocket upgrade, or
+                  a success-like 200 on HTTP/2 / HTTP/3 Extended CONNECT, is
+                  still only a synthetic HTTP handshake response; it does not
+                  create an upgraded frame stream.
               headers:
                 type: object
                 additionalProperties:
@@ -16793,7 +16800,12 @@ components:
                 description: Response headers (default content-type application/json)
               body:
                 type: string
-                description: Response body string
+                description: >-
+                  Response body string (default empty). On the wire, HEAD
+                  responses omit content bytes while keeping representation
+                  Content-Length. Statuses 204, 205, and 304 omit both the body
+                  and Content-Length even when this field is non-empty. Shared
+                  synthetic-response finalization keeps H1, H2, and H3 aligned.
               delay_ms:
                 type: integer
                 format: uint64

@@ -219,13 +219,28 @@ fn test_creation_rejects_unknown_rule_key() {
 
 #[test]
 fn test_creation_accepts_status_code_boundaries() {
-    for status_code in [100u64, 200, 599] {
+    for status_code in [101u64, 200, 599] {
         let plugin = ResponseMock::new(&json!({
             "rules": [{ "path": "/test", "status_code": status_code, "body": "ok" }]
         }));
         assert!(
             plugin.is_ok(),
             "status_code {status_code} should be accepted"
+        );
+    }
+}
+
+#[test]
+fn test_creation_rejects_unsupported_informational_status_codes() {
+    for status_code in [100u64, 102, 103, 199] {
+        let err = ResponseMock::new(&json!({
+            "rules": [{ "path": "/test", "status_code": status_code, "body": "ok" }]
+        }))
+        .err()
+        .unwrap_or_else(|| panic!("status_code {status_code} must be rejected"));
+        assert!(
+            err.contains("unsupported informational status"),
+            "status {status_code}: {err}"
         );
     }
 }
@@ -973,5 +988,131 @@ async fn test_strip_handles_multibyte_listen_path() {
     match plugin.before_proxy(&mut ctx, &mut headers).await {
         PluginResult::Reject { body, .. } => assert_eq!(body, "ok"),
         _ => panic!("Expected Reject"),
+    }
+}
+
+/// Issue #2445: HEAD keeps representation Content-Length but omits content
+/// bytes after shared synthetic-response finalization.
+#[tokio::test]
+async fn test_head_wire_omits_body_and_keeps_content_length() {
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{
+            "path": "/head",
+            "status_code": 200,
+            "headers": { "content-type": "text/plain" },
+            "body": "must-not-be-sent"
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx("HEAD", "/api/head", "/api");
+    let mut request_headers = HashMap::new();
+    let rejection = plugin
+        .before_proxy(&mut ctx, &mut request_headers)
+        .await;
+    let PluginResult::Reject {
+        status_code,
+        body,
+        headers,
+    } = rejection
+    else {
+        panic!("Expected Reject");
+    };
+    assert_eq!(status_code, 200);
+    assert_eq!(body, "must-not-be-sent");
+
+    let plugins: Vec<std::sync::Arc<dyn Plugin>> = vec![std::sync::Arc::new(plugin)];
+    let finalized = ferrum_edge::_test_support::finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        },
+    )
+    .await;
+
+    match finalized {
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 200);
+            assert!(body.is_empty(), "HEAD wire body must be empty");
+            assert_eq!(
+                headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, v)| v.as_str()),
+                Some("16"),
+                "HEAD Content-Length must match the configured representation"
+            );
+        }
+        other => panic!("Expected finalized RejectBinary, got {other:?}"),
+    }
+}
+
+/// Issue #2445: 204/205/304 suppress configured bodies and Content-Length.
+#[tokio::test]
+async fn test_no_body_statuses_suppress_configured_body_on_wire() {
+    for status in [204u16, 205, 304] {
+        let plugin = ResponseMock::new(&json!({
+            "rules": [{
+                "path": "/empty",
+                "status_code": status,
+                "body": "must-not-be-sent"
+            }]
+        }))
+        .unwrap_or_else(|e| panic!("status {status} must accept a configured body: {e}"));
+
+        let mut ctx = make_ctx("GET", "/api/empty", "/api");
+        let mut request_headers = HashMap::new();
+        let rejection = plugin.before_proxy(&mut ctx, &mut request_headers).await;
+        let PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } = rejection
+        else {
+            panic!("Expected Reject for status {status}");
+        };
+        assert_eq!(status_code, status);
+        assert_eq!(body, "must-not-be-sent");
+
+        let plugins: Vec<std::sync::Arc<dyn Plugin>> = vec![std::sync::Arc::new(plugin)];
+        let finalized = ferrum_edge::_test_support::finalize_plugin_rejection_for_test(
+            &plugins,
+            &mut ctx,
+            PluginResult::Reject {
+                status_code,
+                body,
+                headers,
+            },
+        )
+        .await;
+
+        match finalized {
+            PluginResult::RejectBinary {
+                status_code,
+                body,
+                headers,
+            } => {
+                assert_eq!(status_code, status);
+                assert!(
+                    body.is_empty(),
+                    "status {status} must omit content bytes, got {} bytes",
+                    body.len()
+                );
+                assert!(
+                    !headers
+                        .keys()
+                        .any(|k| k.eq_ignore_ascii_case("content-length")),
+                    "status {status} must strip Content-Length"
+                );
+            }
+            other => panic!("Expected finalized RejectBinary for {status}, got {other:?}"),
+        }
     }
 }

@@ -7228,6 +7228,33 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(description.contains("WebSocket"));
     assert!(description.contains("frame stream"));
     assert!(
+        description.contains("204")
+            && description.contains("205")
+            && description.contains("304")
+            && description.contains("HEAD"),
+        "ResponseMockConfig must document HEAD/no-body wire constraints: {description}"
+    );
+    let status_desc = rule["properties"]["status_code"]["description"]
+        .as_str()
+        .expect("status_code description");
+    assert!(
+        status_desc.contains("informational") && status_desc.contains("rejected"),
+        "status_code must document informational rejection: {status_desc}"
+    );
+    assert!(
+        status_desc.contains("101") && status_desc.contains("200–599"),
+        "status_code must document 101 + final range: {status_desc}"
+    );
+    let body_desc = rule["properties"]["body"]["description"]
+        .as_str()
+        .expect("body description");
+    assert!(
+        body_desc.contains("HEAD")
+            && body_desc.contains("204")
+            && body_desc.contains("Content-Length"),
+        "body must document HEAD/no-body wire semantics: {body_desc}"
+    );
+    assert!(
         rule["properties"]["path"]["description"]
             .as_str()
             .expect("path description")
@@ -7247,7 +7274,7 @@ fn response_mock_schema_matches_strict_runtime_contract() {
             "rules": [{
                 "method": "GET",
                 "path": "/users",
-                "status_code": 100,
+                "status_code": 101,
                 "headers": {"x-mock": "true", "content-type": "text/plain"},
                 "body": "ok",
                 "delay_ms": 0
@@ -7258,6 +7285,13 @@ fn response_mock_schema_matches_strict_runtime_contract() {
                 "path": "/api/v1",
                 "status_code": 599,
                 "body": "exact-listen-path"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "path": "/empty",
+                "status_code": 204,
+                "body": "must-not-be-sent"
             }]
         }),
     ] {
@@ -7279,6 +7313,8 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         json!({"rules": [{"path": "", "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "method": "", "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 99, "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "status_code": 100, "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "status_code": 103, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 600, "body": "ok"}]}),
         json!({"rules": [{"body": "missing-path"}]}),
         json!({"rules": []}),
@@ -7290,9 +7326,23 @@ fn response_mock_schema_matches_strict_runtime_contract() {
             }]
         }),
     ] {
+        // OpenAPI keeps minimum 100 / maximum 599; runtime rejects unsupported
+        // informational statuses (100, 102–199) as the authoritative boundary.
+        let runtime_err = ResponseMock::new(&invalid).is_err();
+        if invalid
+            .pointer("/rules/0/status_code")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|code| matches!(code, 100 | 103))
+        {
+            assert!(
+                runtime_err,
+                "informational status must fail runtime: {invalid}"
+            );
+            continue;
+        }
         assert_component_validity(&spec, "ResponseMockConfig", &invalid, false);
         assert!(
-            ResponseMock::new(&invalid).is_err(),
+            runtime_err,
             "schema-invalid config unexpectedly passed runtime: {invalid}"
         );
     }
@@ -7303,6 +7353,8 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("WebSocket handshake contract"));
     assert!(guide.contains("never establishes an upgraded frame stream"));
     assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
+    assert!(guide.contains("Status / body wire semantics"));
+    assert!(guide.contains("informational statuses"));
 
     let matrix = include_str!("../../docs/plugin_execution_order.md");
     assert!(

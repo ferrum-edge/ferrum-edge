@@ -2770,7 +2770,17 @@ Returns configurable mock responses without proxying to the backend. Supports ma
 
 **Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP family (HTTP, gRPC, WebSocket handshake)
 
-Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). The free-form `headers` map remains open for arbitrary string-valued response headers. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be in range 100–599. Runtime construction is the authoritative final boundary.
+Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). The free-form `headers` map remains open for arbitrary string-valued response headers. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be a final status `200–599` or `101` (synthetic WebSocket handshake only). Other informational statuses (`100`, `102`–`199`) are rejected — a mock cannot emit a 1xx as a body-bearing final response. Runtime construction is the authoritative final boundary.
+
+**Status / body wire semantics (H1, H2, and H3):** A configured `body` is the representation the mock would return for a GET. Shared synthetic-response finalization then aligns every frontend:
+
+| Request / status | Wire body | `Content-Length` |
+|---|---|---|
+| `HEAD` with a body-capable status (not 204/205/304) | Omitted (no DATA / no payload) | Representation length (same as the GET body would have been) |
+| `204` / `205` / `304` (any method) | Omitted | Stripped, even when `body` is configured non-empty |
+| Other final statuses on GET/POST/… | Configured `body` | Unchanged unless a later hook sets it |
+
+gRPC and WebSocket frame streams are unchanged: gRPC rejects still normalize to trailers-only errors, and a matching WebSocket rule still short-circuits only the HTTP handshake.
 
 **Path matching by listen-path scope:**
 
