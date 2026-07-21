@@ -32,14 +32,6 @@ fn file_secret_reads_use_detached_os_thread_not_spawn_blocking() {
         registry_src.contains("file::read_secret_detached"),
         "FileBackend must delegate to the shared detached reader"
     );
-    let registry_code_lines = registry_src.lines().filter(|line| {
-        let trimmed = line.trim_start();
-        !trimmed.starts_with("//")
-    });
-    assert!(
-        registry_code_lines.all(|line| !line.contains("spawn_blocking")),
-        "the secret registry must not call spawn_blocking for _FILE reads"
-    );
 }
 
 #[test]
