@@ -709,4 +709,3 @@ pub fn builtin_plugin_parity_meta(name: &str) -> Option<&'static BuiltinPluginPa
         .iter()
         .find(|entry| entry.name == name)
 }
-

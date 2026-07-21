@@ -10,7 +10,7 @@
 //! those sources (no missing, extra, duplicate, or stale name/priority/protocol
 //! cells).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use ferrum_edge::plugins::{
     BUILTIN_PLUGIN_PARITY_META, BUILTIN_PLUGIN_REGISTRATIONS, BuiltinPluginClassification,
@@ -32,7 +32,7 @@ struct OrderRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MatrixRow {
     name: String,
-    protocols: BTreeSet<ProxyProtocol>,
+    protocols: HashSet<ProxyProtocol>,
     config_only_dashes: bool,
     rationale: String,
 }
@@ -116,7 +116,7 @@ fn parse_protocol_matrix(doc: &str) -> Vec<MatrixRow> {
         let name = cols[0].trim_matches('`').to_string();
         let cells = &cols[1..6];
         let config_only_dashes = cells.iter().all(|c| *c == "—");
-        let mut protocols = BTreeSet::new();
+        let mut protocols = HashSet::new();
         if !config_only_dashes {
             for (cell, protocol) in cells.iter().zip([
                 ProxyProtocol::Http,
@@ -145,7 +145,7 @@ fn parse_protocol_matrix(doc: &str) -> Vec<MatrixRow> {
     rows
 }
 
-fn protocols_set(protocols: &[ProxyProtocol]) -> BTreeSet<ProxyProtocol> {
+fn protocols_set(protocols: &[ProxyProtocol]) -> HashSet<ProxyProtocol> {
     protocols.iter().copied().collect()
 }
 
@@ -202,8 +202,8 @@ fn builtin_parity_meta_matches_registry_set() {
     }
 }
 
-#[test]
-fn complete_order_table_matches_parity_meta_and_runtime_priority() {
+#[tokio::test]
+async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
     let rows = parse_complete_order_table(EXECUTION_ORDER_DOC);
     assert_unique_names(
         "complete-order table",
@@ -261,8 +261,8 @@ fn complete_order_table_matches_parity_meta_and_runtime_priority() {
     );
 }
 
-#[test]
-fn protocol_matrix_matches_parity_meta_and_runtime_protocols() {
+#[tokio::test]
+async fn protocol_matrix_matches_parity_meta_and_runtime_protocols() {
     let rows = parse_protocol_matrix(EXECUTION_ORDER_DOC);
     assert_unique_names("protocol matrix", rows.iter().map(|r| r.name.clone()));
 
