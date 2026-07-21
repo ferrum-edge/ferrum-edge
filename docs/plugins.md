@@ -3424,6 +3424,7 @@ Configuration must be a top-level object. The only accepted keys are `ttl_second
 | `invalidate_on_unsafe_methods` | bool | `true` | Invalidate cached entries for the same path prefix on non-cacheable methods such as `POST`, `PUT`, `PATCH`, and `DELETE` |
 
 Behavior:
+- Multiple `response_caching` instances on one proxy each receive a process-unique runtime staging id. Request metadata for base key, status, predictor key, request timing, and header snapshot is namespaced as `response_caching.<instance_id>.*`, so sibling instances with different query, consumer, Vary, method, SSE, or status policies cannot overwrite one another's staged inputs. Bypass, HIT, and REVALIDATED paths clear only the current instance's lookup staging. Reload reconstructions mint a new id and never read or clear a retired generation's namespaced keys.
 - The plugin caches the final post-transform response body and headers, so cached hits include `response_transformer` output rather than the raw backend payload.
 - Backend `Vary` is honored automatically. If the origin returns `Vary: Accept-Encoding`, compressed and uncompressed representations are cached separately.
 - Freshness uses the response's corrected initial age plus cache residency time. Backend `Age` and valid `Date` headers are incorporated, `s-maxage` takes precedence over `max-age`, and cache hits replace any stored `Age` value with the current age.

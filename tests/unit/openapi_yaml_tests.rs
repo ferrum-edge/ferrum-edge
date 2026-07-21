@@ -7055,6 +7055,16 @@ fn response_caching_schema_matches_strict_runtime_contract() {
     }
     assert!(docs.contains("KeepLastKnownGood"));
     assert!(docs.contains("Unknown keys are rejected"));
+    assert!(
+        docs.contains("response_caching.<instance_id>"),
+        "docs must describe per-instance request-staging isolation"
+    );
+    assert!(
+        schema["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("response_caching.<instance_id>")),
+        "OpenAPI ResponseCachingConfig must describe per-instance staging isolation"
+    );
 
     for valid in [
         json!({}),

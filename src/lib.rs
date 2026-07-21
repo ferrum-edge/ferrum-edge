@@ -1011,6 +1011,19 @@ pub mod _test_support {
         plugin.advance_clock_for_tests(duration);
     }
 
+    pub fn response_caching_staging_metadata_key_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+        suffix: &str,
+    ) -> String {
+        plugin.staging_metadata_key_for_tests(suffix)
+    }
+
+    pub fn response_caching_instance_id_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+    ) -> u64 {
+        plugin.instance_id_for_tests()
+    }
+
     pub fn response_caching_current_total_size_for_test(
         plugin: &crate::plugins::response_caching::ResponseCaching,
     ) -> usize {

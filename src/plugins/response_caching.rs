@@ -59,19 +59,41 @@ const DEFAULT_MAX_ENTRY_SIZE_BYTES: usize = 1_048_576;
 /// Default maximum total cache size (100 MiB).
 const DEFAULT_MAX_TOTAL_SIZE_BYTES: usize = 104_857_600;
 
-const CACHE_BASE_KEY: &str = "cache_base_key";
-const CACHE_STATUS: &str = "cache_status";
-const CACHE_PREDICT_KEY: &str = "cache_predict_key";
-const CACHE_REQUEST_STARTED_MONOTONIC_NANOS: &str = "cache_request_started_monotonic_nanos";
+/// Request-metadata namespace prefix. Each plugin instance appends its
+/// process-unique [`ResponseCaching::instance_id`] so multiple
+/// `response_caching` configs on one proxy cannot overwrite one another's
+/// staged base key, status, predictor key, timing, or header snapshot.
+const METADATA_NAMESPACE_PREFIX: &str = "response_caching.";
+const CACHE_BASE_KEY_SUFFIX: &str = "cache_base_key";
+const CACHE_STATUS_SUFFIX: &str = "cache_status";
+const CACHE_PREDICT_KEY_SUFFIX: &str = "cache_predict_key";
+const CACHE_REQUEST_STARTED_MONOTONIC_NANOS_SUFFIX: &str =
+    "cache_request_started_monotonic_nanos";
 /// JSON-serialized snapshot of the request header values `before_proxy` saw
 /// while building the cache key. `on_final_response_body` reads it back to
 /// build the storage cache key from the *same* header view, even when an
 /// earlier plugin's `transform_request_headers` mutated the outbound
 /// headers map — see [`ResponseCaching::stash_request_headers_snapshot`]
-/// and the bug it fixes.
-const CACHE_REQUEST_HEADERS_SNAPSHOT: &str = "cache_request_headers_snapshot";
+/// and the bug it fixes. The full metadata key is
+/// `response_caching.<instance_id>.cache_request_headers_snapshot`.
+const CACHE_REQUEST_HEADERS_SNAPSHOT_SUFFIX: &str = "cache_request_headers_snapshot";
 
 static CACHE_CLOCK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+static NEXT_RESPONSE_CACHING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn staging_metadata_key(instance_id: u64, suffix: &str) -> String {
+    let mut key = String::with_capacity(
+        METADATA_NAMESPACE_PREFIX.len() + 20 + 1 + suffix.len(),
+    );
+    key.push_str(METADATA_NAMESPACE_PREFIX);
+    {
+        use std::fmt::Write;
+        let _ = write!(key, "{instance_id}");
+    }
+    key.push('.');
+    key.push_str(suffix);
+    key
+}
 
 fn sha256_hex(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
@@ -581,6 +603,20 @@ impl UncacheablePredictor {
 }
 
 pub struct ResponseCaching {
+    /// Process-unique ownership key for request-private staging metadata.
+    /// Fresh on every constructor call so reload generations and sibling
+    /// instances never share `RequestContext.metadata` slots.
+    instance_id: u64,
+    /// Precomputed `response_caching.<id>.cache_base_key` (hot-path insert/get).
+    meta_base_key: String,
+    /// Precomputed `response_caching.<id>.cache_status`.
+    meta_status: String,
+    /// Precomputed `response_caching.<id>.cache_predict_key`.
+    meta_predict_key: String,
+    /// Precomputed `response_caching.<id>.cache_request_started_monotonic_nanos`.
+    meta_request_started: String,
+    /// Precomputed `response_caching.<id>.cache_request_headers_snapshot`.
+    meta_headers_snapshot: String,
     config: ResponseCachingConfig,
     cache: Arc<DashMap<String, CacheEntry>>,
     vary_index: Arc<DashMap<String, Vec<String>>>,
@@ -601,8 +637,21 @@ impl ResponseCaching {
             );
         }
 
+        let instance_id = NEXT_RESPONSE_CACHING_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         let predictor_size = config.max_entries / 10; // 10% of cache size
         Ok(Self {
+            instance_id,
+            meta_base_key: staging_metadata_key(instance_id, CACHE_BASE_KEY_SUFFIX),
+            meta_status: staging_metadata_key(instance_id, CACHE_STATUS_SUFFIX),
+            meta_predict_key: staging_metadata_key(instance_id, CACHE_PREDICT_KEY_SUFFIX),
+            meta_request_started: staging_metadata_key(
+                instance_id,
+                CACHE_REQUEST_STARTED_MONOTONIC_NANOS_SUFFIX,
+            ),
+            meta_headers_snapshot: staging_metadata_key(
+                instance_id,
+                CACHE_REQUEST_HEADERS_SNAPSHOT_SUFFIX,
+            ),
             config,
             cache: Arc::new(DashMap::new()),
             vary_index: Arc::new(DashMap::new()),
@@ -611,6 +660,39 @@ impl ResponseCaching {
             clock_offset_nanos: Arc::new(AtomicU64::new(0)),
             uncacheable_predictor: UncacheablePredictor::new(predictor_size.max(100)),
         })
+    }
+
+    /// Process-unique staging namespace for this instance (tests / diagnostics).
+    #[allow(dead_code)]
+    pub(crate) fn instance_id_for_tests(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// Namespaced metadata key for `suffix` under this instance's staging
+    /// namespace (tests assert isolation without hard-coding id digits).
+    #[allow(dead_code)]
+    pub(crate) fn staging_metadata_key_for_tests(&self, suffix: &str) -> String {
+        staging_metadata_key(self.instance_id, suffix)
+    }
+
+    fn set_cache_status(&self, ctx: &mut RequestContext, status: &str) {
+        ctx.metadata
+            .insert(self.meta_status.clone(), status.to_string());
+    }
+
+    fn cache_status<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
+        ctx.metadata.get(&self.meta_status).map(String::as_str)
+    }
+
+    /// Drop this instance's lookup/store staging inputs without touching
+    /// sibling instances' namespaced keys. Used on method/SSE bypass and
+    /// HIT/REVALIDATED so leftover base/snapshot/predict/timing from an
+    /// earlier phase of this instance cannot leak into a later final hook.
+    fn clear_lookup_staging(&self, ctx: &mut RequestContext) {
+        ctx.metadata.remove(&self.meta_base_key);
+        ctx.metadata.remove(&self.meta_predict_key);
+        ctx.metadata.remove(&self.meta_request_started);
+        ctx.metadata.remove(&self.meta_headers_snapshot);
     }
 
     fn accounting_guard(&self) -> MutexGuard<'_, ()> {
@@ -1154,14 +1236,14 @@ impl ResponseCaching {
 
     fn stash_request_started_at(&self, ctx: &mut RequestContext, request_time: Duration) {
         ctx.metadata.insert(
-            CACHE_REQUEST_STARTED_MONOTONIC_NANOS.to_string(),
+            self.meta_request_started.clone(),
             request_time.as_nanos().to_string(),
         );
     }
 
     fn response_delay(&self, ctx: &RequestContext, response_time: Duration) -> Duration {
         ctx.metadata
-            .get(CACHE_REQUEST_STARTED_MONOTONIC_NANOS)
+            .get(&self.meta_request_started)
             .and_then(|value| duration_from_monotonic_nanos_str(value))
             .map(|request_time| response_time.saturating_sub(request_time))
             .unwrap_or_default()
@@ -1286,7 +1368,7 @@ impl ResponseCaching {
         }
         if let Ok(serialized) = serde_json::to_string(&snapshot) {
             ctx.metadata
-                .insert(CACHE_REQUEST_HEADERS_SNAPSHOT.to_string(), serialized);
+                .insert(self.meta_headers_snapshot.clone(), serialized);
         }
     }
 
@@ -1298,7 +1380,7 @@ impl ResponseCaching {
     fn restore_request_headers_view(&self, ctx: &RequestContext) -> RestoredRequestHeadersView {
         let mut headers = ctx.headers.clone();
         let mut cache_key_ready_headers = HashSet::new();
-        if let Some(serialized) = ctx.metadata.get(CACHE_REQUEST_HEADERS_SNAPSHOT)
+        if let Some(serialized) = ctx.metadata.get(&self.meta_headers_snapshot)
             && let Ok(snapshot) =
                 serde_json::from_str::<Vec<RequestHeaderSnapshotEntry>>(serialized)
         {
@@ -1437,14 +1519,16 @@ impl Plugin for ResponseCaching {
             if self.config.invalidate_on_unsafe_methods {
                 self.invalidate_path(ctx);
             }
-            ctx.metadata
-                .insert(CACHE_STATUS.to_string(), "BYPASS".to_string());
+            // Clear only this instance's staging so a sibling cache keeps
+            // its independently staged base/snapshot/status.
+            self.clear_lookup_staging(ctx);
+            self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
         }
 
         if super::utils::sse::headers_accept_sse(headers) {
-            ctx.metadata
-                .insert(CACHE_STATUS.to_string(), "BYPASS".to_string());
+            self.clear_lookup_staging(ctx);
+            self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
         }
 
@@ -1455,7 +1539,7 @@ impl Plugin for ResponseCaching {
         // during this phase.
         let base_key = self.build_base_cache_key(ctx, headers);
         ctx.metadata
-            .insert(CACHE_BASE_KEY.to_string(), base_key.clone());
+            .insert(self.meta_base_key.clone(), base_key.clone());
         self.stash_request_started_at(ctx, self.now_monotonic());
         // Snapshot every header value that could end up in the cache key
         // so `on_final_response_body` can rebuild the same key from
@@ -1478,15 +1562,17 @@ impl Plugin for ResponseCaching {
         // Store the full cache key (with Vary dimensions) so on_final_response_body
         // can mark the correct variant-specific key in the uncacheable predictor.
         ctx.metadata
-            .insert(CACHE_PREDICT_KEY.to_string(), cache_key.clone());
+            .insert(self.meta_predict_key.clone(), cache_key.clone());
 
         if self.config.respect_no_cache
             && let Some(cc) = headers.get("cache-control")
         {
             let directives = parse_cache_control(cc);
             if directives.no_cache || directives.no_store {
-                ctx.metadata
-                    .insert(CACHE_STATUS.to_string(), "BYPASS".to_string());
+                // Keep this instance's staged base/snapshot/predict so a
+                // no-cache refresh can still store the replacement response
+                // under the same instance-owned key inputs.
+                self.set_cache_status(ctx, "BYPASS");
                 return PluginResult::Continue;
             }
         }
@@ -1498,8 +1584,7 @@ impl Plugin for ResponseCaching {
             .uncacheable_predictor
             .is_predicted_cacheable(&cache_key)
         {
-            ctx.metadata
-                .insert(CACHE_STATUS.to_string(), "PREDICTED-BYPASS".to_string());
+            self.set_cache_status(ctx, "PREDICTED-BYPASS");
             return PluginResult::Continue;
         }
 
@@ -1513,8 +1598,11 @@ impl Plugin for ResponseCaching {
                 debug!(cache_key = %cache_key, "response_caching: cache HIT");
 
                 if self.is_fresh_conditional_hit(headers, &entry) {
-                    ctx.metadata
-                        .insert(CACHE_STATUS.to_string(), "REVALIDATED".to_string());
+                    self.set_cache_status(ctx, "REVALIDATED");
+                    // HIT/REVALIDATED will not store; drop this instance's
+                    // lookup staging so a later final hook cannot mix it with
+                    // another instance's store path.
+                    self.clear_lookup_staging(ctx);
                     return PluginResult::RejectBinary {
                         status_code: 304,
                         body: Bytes::new(),
@@ -1525,8 +1613,8 @@ impl Plugin for ResponseCaching {
                 let mut headers = entry.headers.clone();
                 self.add_age_header(&mut headers, current_age);
                 self.add_cache_status_header(&mut headers, "HIT");
-                ctx.metadata
-                    .insert(CACHE_STATUS.to_string(), "HIT".to_string());
+                self.set_cache_status(ctx, "HIT");
+                self.clear_lookup_staging(ctx);
 
                 return PluginResult::RejectBinary {
                     status_code: entry.status_code,
@@ -1536,8 +1624,7 @@ impl Plugin for ResponseCaching {
             }
         }
 
-        ctx.metadata
-            .insert(CACHE_STATUS.to_string(), "MISS".to_string());
+        self.set_cache_status(ctx, "MISS");
         PluginResult::Continue
     }
 
@@ -1547,11 +1634,7 @@ impl Plugin for ResponseCaching {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        let status = ctx
-            .metadata
-            .get(CACHE_STATUS)
-            .map(String::as_str)
-            .unwrap_or("MISS");
+        let status = self.cache_status(ctx).unwrap_or("MISS");
         self.add_cache_status_header(response_headers, status);
         PluginResult::Continue
     }
@@ -1596,14 +1679,14 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
-        let base_key = match ctx.metadata.get(CACHE_BASE_KEY) {
+        let base_key = match ctx.metadata.get(&self.meta_base_key) {
             Some(base_key) => base_key.clone(),
             None => return PluginResult::Continue,
         };
         // Use the variant-specific predict key (set during before_proxy) for
         // predictor marking so that uncacheability of one Vary variant does not
         // suppress cache lookups for other variants of the same route.
-        let predict_key = ctx.metadata.get(CACHE_PREDICT_KEY).cloned();
+        let predict_key = ctx.metadata.get(&self.meta_predict_key).cloned();
 
         if !self
             .config
@@ -1821,7 +1904,7 @@ impl Plugin for ResponseCaching {
         }
         // Response was cacheable; remove the exact cache key from the predictor
         // even for client no-cache bypass refreshes, which return before
-        // `CACHE_PREDICT_KEY` is available.
+        // this instance's predict-key metadata is available.
         self.uncacheable_predictor.mark_cacheable(&cache_key);
 
         debug!(
@@ -1872,7 +1955,7 @@ mod tests {
         let miss_result = plugin.before_proxy(&mut miss_ctx, &mut miss_headers).await;
         assert!(matches!(miss_result, PluginResult::Continue));
         assert_eq!(
-            miss_ctx.metadata.get(CACHE_STATUS).map(String::as_str),
+            plugin.cache_status(&miss_ctx),
             Some("MISS")
         );
         let mut response_headers = HashMap::new();
@@ -1911,7 +1994,7 @@ mod tests {
             "second request should be served from cache"
         );
         assert_eq!(
-            hit_ctx.metadata.get(CACHE_STATUS).map(String::as_str),
+            plugin.cache_status(&hit_ctx),
             Some("HIT")
         );
 
@@ -1964,7 +2047,7 @@ mod tests {
         let result = plugin.before_proxy(&mut ctx, &mut request_headers).await;
         assert!(matches!(result, PluginResult::Continue));
 
-        let Some(predict_key) = ctx.metadata.get(CACHE_PREDICT_KEY) else {
+        let Some(predict_key) = ctx.metadata.get(&plugin.meta_predict_key) else {
             panic!("before_proxy should store variant predict key");
         };
         assert!(!predict_key.contains(bearer));
@@ -2300,7 +2383,7 @@ mod tests {
 
         let predict_key = ctx
             .metadata
-            .get(CACHE_PREDICT_KEY)
+            .get(&plugin.meta_predict_key)
             .expect("predict_key stored")
             .clone();
         assert!(
@@ -2352,7 +2435,7 @@ mod tests {
         assert!(matches!(result, PluginResult::Continue));
         let predict_key = ctx
             .metadata
-            .get(CACHE_PREDICT_KEY)
+            .get(&plugin.meta_predict_key)
             .expect("predict_key stored")
             .clone();
 
