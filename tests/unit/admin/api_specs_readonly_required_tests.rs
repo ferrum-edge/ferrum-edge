@@ -131,7 +131,10 @@ fn openapi_30_drops_readonly_required_on_request_and_writeonly_on_response() {
         request["properties"]["nested"]["required"],
         json!(["token", "label"])
     );
-    assert_eq!(response["properties"]["nested"]["required"], json!(["label"]));
+    assert_eq!(
+        response["properties"]["nested"]["required"],
+        json!(["label"])
+    );
     assert_eq!(
         request["properties"]["items"]["items"]["required"],
         json!(["password"])
@@ -145,10 +148,7 @@ fn openapi_30_drops_readonly_required_on_request_and_writeonly_on_response() {
     assert_eq!(request["oneOf"][0]["required"], json!(["kind", "password"]));
     assert_eq!(response["oneOf"][0]["required"], json!(["kind"]));
     assert_eq!(request["anyOf"][0]["required"], json!(["marker"]));
-    assert_eq!(
-        response["anyOf"][0]["required"],
-        json!(["marker", "etag"])
-    );
+    assert_eq!(response["anyOf"][0]["required"], json!(["marker", "etag"]));
     assert_eq!(request["properties"]["id"]["readOnly"], json!(true));
     assert_eq!(response["properties"]["secret"]["writeOnly"], json!(true));
 }

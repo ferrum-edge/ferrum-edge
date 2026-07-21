@@ -1128,11 +1128,7 @@ enum SchemaDirection {
     Response,
 }
 
-fn normalize_schema_for_openapi(
-    schema: Value,
-    version: &str,
-    direction: SchemaDirection,
-) -> Value {
+fn normalize_schema_for_openapi(schema: Value, version: &str, direction: SchemaDirection) -> Value {
     if version != "2.0" && !version.starts_with("3.0.") {
         // OpenAPI 3.1+: keep the schema as authored. `readOnly`/`writeOnly` are
         // JSON Schema annotations; Ferrum does not rewrite `required` here.
