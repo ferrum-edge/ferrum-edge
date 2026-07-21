@@ -509,7 +509,10 @@ async fn test_no_acceptable_representation_returns_406() {
                 assert_eq!(status_code, 406, "Accept-Encoding: {accept_encoding}");
                 assert!(body.contains("not acceptable"));
                 assert!(!headers.contains_key("content-encoding"));
-                assert_eq!(headers.get("vary").map(String::as_str), Some("Accept-Encoding"));
+                assert_eq!(
+                    headers.get("vary").map(String::as_str),
+                    Some("Accept-Encoding")
+                );
             }
             other => panic!("expected 406 for {accept_encoding:?}, got {other:?}"),
         }
