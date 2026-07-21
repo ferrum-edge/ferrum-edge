@@ -431,7 +431,7 @@ async fn base_cache_key_for_raw_query(plugin: &ResponseCaching, raw_query: &str)
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     ctx.metadata
-        .get(&staging_key(&plugin, "cache_base_key"))
+        .get(&staging_key(plugin, "cache_base_key"))
         .expect("cache key should be stored")
         .clone()
 }
