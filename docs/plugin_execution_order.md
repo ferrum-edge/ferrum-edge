@@ -868,7 +868,7 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `response_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy response body size limits |
 | `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |
 | `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli) |
-| `ai_prompt_shield` | ✓ | ✓ | | | | Scans bare JSON request bodies for PII; native protobuf/framed gRPC is outside its JSON inspection scope |
+| `ai_prompt_shield` | ✓ | | | | | HTTP-only bare-JSON PII scan; native gRPC unsupported; framed gRPC-Web bodies are skipped without decoding |
 | `ai_semantic_firewall` | ✓ | | | | | HTTP-only semantic inspection for LLM JSON request and response bodies |
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
 | `ai_response_guard` | ✓ | | | | | HTTP-only JSON/SSE/text response inspection; native gRPC protobuf framing is unsupported |
