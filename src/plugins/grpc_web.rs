@@ -1191,7 +1191,15 @@ pub fn sync_translated_body_trailer_frame_from_trailers(
     } else {
         std::mem::take(body)
     };
-    truncate_trailing_trailer_frames(&mut binary);
+    if !truncate_trailing_trailer_frames(&mut binary) {
+        // The body transform always emits a complete trailing frame. Refuse to
+        // append a second frame when that invariant cannot be proven; doing so
+        // would turn malformed backend bytes into an ambiguous frame stream.
+        if !is_text {
+            *body = binary;
+        }
+        return false;
+    }
     binary.extend(build_trailer_frame(reconciled_trailers, http_status));
     if is_text {
         *body = BASE64.encode(&binary).into_bytes();
@@ -1203,7 +1211,8 @@ pub fn sync_translated_body_trailer_frame_from_trailers(
 
 /// Drop trailing gRPC-Web trailer frames (flag `0x80`) from a binary body so a
 /// reconciled frame can replace the transform-phase draft.
-fn truncate_trailing_trailer_frames(data: &mut Vec<u8>) {
+fn truncate_trailing_trailer_frames(data: &mut Vec<u8>) -> bool {
+    let mut removed = false;
     loop {
         let mut pos = 0;
         let mut last_frame_start = None;
@@ -1216,21 +1225,21 @@ fn truncate_trailing_trailer_frames(data: &mut Vec<u8>) {
             let frame_start = pos;
             pos += 5;
             if pos + len > data.len() {
-                return;
+                return false;
             }
             last_frame_start = Some(frame_start);
             last_frame_is_trailer = flag == GRPC_FRAME_TRAILER;
             pos += len;
         }
-        // Only truncate a trailer that ends the buffer. Trailing incomplete
-        // bytes after a complete frame are left alone (fail closed).
+        // Only truncate a trailer that ends a fully valid frame stream.
         if pos != data.len() || !last_frame_is_trailer {
-            return;
+            return removed;
         }
         let Some(start) = last_frame_start else {
-            return;
+            return removed;
         };
         data.truncate(start);
+        removed = true;
     }
 }
 

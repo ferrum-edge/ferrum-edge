@@ -1556,6 +1556,28 @@ async fn grpc_web_body_frame_after_policy_hooks(
     grpc_web_trailer_payload(&body)
 }
 
+#[test]
+fn test_sync_trailer_frame_refuses_malformed_draft_body() {
+    // An incomplete data frame followed by a syntactically complete trailer
+    // must not gain another trailer. Production always supplies a complete
+    // transform-phase draft, so failure to prove that shape is fail-closed.
+    let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x20, 0x01];
+    body.extend(ferrum_edge::_test_support::build_trailer_frame(
+        &HashMap::from([("grpc-status".to_string(), "0".to_string())]),
+    ));
+    let original = body.clone();
+
+    assert!(
+        !ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut body,
+            Some("application/grpc-web"),
+            &HashMap::from([("grpc-status".to_string(), "13".to_string())]),
+            Some(200),
+        )
+    );
+    assert_eq!(body, original);
+}
+
 #[tokio::test]
 async fn test_transform_policy_set_preserves_backend_trailer_in_body_frame() {
     let policy: Arc<dyn Plugin> = Arc::new(

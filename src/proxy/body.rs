@@ -3154,9 +3154,8 @@ pub(crate) fn direct_streaming_h2_body_strip_hop_by_hop_trailers(
 /// [`Frame::trailers`] frames as they pass through. DATA frames pass
 /// through unchanged. The predicate is
 /// [`crate::proxy::headers::is_backend_response_strip_header`] (RFC 9110
-/// §7.6.1, response-direction set: `connection`, `keep-alive`,
-/// `proxy-authenticate`, `proxy-connection`, `te`, `trailer`,
-/// `transfer-encoding`, `upgrade`).
+/// §7.6.1 response-direction fields plus Ferrum-owned internal response
+/// controls).
 ///
 /// This is intentionally generic over any body whose `Data` is `Bytes` so
 /// the same wrapper can be composed over `hyper::body::Incoming`,

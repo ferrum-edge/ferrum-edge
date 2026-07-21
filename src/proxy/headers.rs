@@ -311,13 +311,19 @@ pub fn merge_proxy_headers_and_strip_for_grpc(
     strip_backend_request_headers_for_grpc(headers);
 }
 
-/// Returns `true` for headers that must NOT be forwarded on a backend
-/// response, per RFC 9110 §7.6.1 (response-direction hop-by-hop set).
+/// Returns `true` for headers that must NOT cross the backend-response trust
+/// boundary: the RFC 9110 §7.6.1 response-direction hop-by-hop set plus
+/// Ferrum-owned internal response control fields.
 ///
 /// Note that this set differs from the request-direction set:
 /// `proxy-authenticate` is response-only, `proxy-authorization` is
 /// request-only. `content-length` is preserved on responses because the
 /// downstream client uses it for framing.
+///
+/// This boundary also strips Ferrum-owned response control fields. Those
+/// fields are injected only after backend response collection and must never
+/// be accepted from an untrusted backend: otherwise a backend could forge
+/// internal provenance consumed by a later trusted plugin phase.
 ///
 /// **Trailers**: this same predicate MUST be applied to backend response
 /// **trailers** (RFC 9110 §6.5 distinct concept). gRPC encodes
@@ -346,7 +352,18 @@ pub fn is_backend_response_strip_header(name: &str) -> bool {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
-    )
+    ) || is_internal_response_control_header(name)
+}
+
+/// Ferrum-owned response fields used only between trusted proxy phases.
+///
+/// Use an ASCII-insensitive comparison because backend decoders normalize
+/// names but plugin-produced maps can still contain mixed-case keys before the
+/// final client-boundary sanitation pass.
+#[inline]
+fn is_internal_response_control_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("x-ferrum-grpc-web-trailer-names")
+        || name.eq_ignore_ascii_case("x-ferrum-grpc-web-shadowed-trailers")
 }
 
 /// Case-insensitive final-wire counterpart for plugin-produced response maps.
@@ -558,6 +575,21 @@ mod tests {
                 is_backend_response_strip_header(name),
                 "RFC 9110 §7.6.1 response hop-by-hop header `{}` must be stripped",
                 name
+            );
+        }
+    }
+
+    #[test]
+    fn response_strip_rejects_backend_forged_grpc_web_bridge_fields() {
+        for name in [
+            "x-ferrum-grpc-web-trailer-names",
+            "x-ferrum-grpc-web-shadowed-trailers",
+            "X-Ferrum-Grpc-Web-Trailer-Names",
+            "X-Ferrum-Grpc-Web-Shadowed-Trailers",
+        ] {
+            assert!(
+                is_backend_response_strip_header(name),
+                "Ferrum-owned response control field `{name}` must be stripped"
             );
         }
     }
