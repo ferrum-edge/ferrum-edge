@@ -1134,10 +1134,14 @@ fn normalize_schema_for_openapi(schema: Value, version: &str, direction: SchemaD
         // JSON Schema annotations; Ferrum does not rewrite `required` here.
         return schema;
     }
-    normalize_legacy_schema(schema, direction)
+    normalize_legacy_schema(schema, direction, version.starts_with("3.0."))
 }
 
-fn normalize_legacy_schema(schema: Value, direction: SchemaDirection) -> Value {
+fn normalize_legacy_schema(
+    schema: Value,
+    direction: SchemaDirection,
+    supports_write_only: bool,
+) -> Value {
     match schema {
         Value::Object(mut object) => {
             let nullable = object
@@ -1173,10 +1177,14 @@ fn normalize_legacy_schema(schema: Value, direction: SchemaDirection) -> Value {
             // Filter `required` against same-object `properties` before
             // recursing so nested objects / composition members keep their
             // own direction semantics.
-            apply_direction_required_semantics(&mut object, direction);
+            apply_direction_required_semantics(&mut object, direction, supports_write_only);
 
             for child in object.values_mut() {
-                *child = normalize_legacy_schema(std::mem::take(child), direction);
+                *child = normalize_legacy_schema(
+                    std::mem::take(child),
+                    direction,
+                    supports_write_only,
+                );
             }
             let value = Value::Object(object);
             if nullable {
@@ -1188,7 +1196,7 @@ fn normalize_legacy_schema(schema: Value, direction: SchemaDirection) -> Value {
         Value::Array(values) => Value::Array(
             values
                 .into_iter()
-                .map(|child| normalize_legacy_schema(child, direction))
+                .map(|child| normalize_legacy_schema(child, direction, supports_write_only))
                 .collect(),
         ),
         other => other,
@@ -1204,7 +1212,11 @@ fn normalize_legacy_schema(schema: Value, direction: SchemaDirection) -> Value {
 /// therefore a no-op for Swagger documents. Property schemas without a local
 /// `properties` entry (for example names satisfied only via sibling `allOf`
 /// members) are left in `required` so composition is not weakened.
-fn apply_direction_required_semantics(object: &mut Map<String, Value>, direction: SchemaDirection) {
+fn apply_direction_required_semantics(
+    object: &mut Map<String, Value>,
+    direction: SchemaDirection,
+    supports_write_only: bool,
+) {
     let Some(required) = object.get("required").and_then(Value::as_array) else {
         return;
     };
@@ -1229,9 +1241,10 @@ fn apply_direction_required_semantics(object: &mut Map<String, Value>, direction
                 SchemaDirection::Request => {
                     prop.get("readOnly").and_then(Value::as_bool) != Some(true)
                 }
-                SchemaDirection::Response => {
+                SchemaDirection::Response if supports_write_only => {
                     prop.get("writeOnly").and_then(Value::as_bool) != Some(true)
                 }
+                SchemaDirection::Response => true,
             }
         })
         .cloned()

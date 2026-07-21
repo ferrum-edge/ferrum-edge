@@ -235,9 +235,10 @@ fn swagger_20_drops_readonly_required_on_request_only() {
             "required": true,
             "schema": {{
               "type": "object",
-              "required": ["id", "name"],
+              "required": ["id", "secret", "name"],
               "properties": {{
                 "id": {{"type": "string", "readOnly": true}},
+                "secret": {{"type": "string", "writeOnly": true}},
                 "name": {{"type": "string"}}
               }}
             }}
@@ -248,9 +249,10 @@ fn swagger_20_drops_readonly_required_on_request_only() {
             "description": "ok",
             "schema": {{
               "type": "object",
-              "required": ["id", "name"],
+              "required": ["id", "secret", "name"],
               "properties": {{
                 "id": {{"type": "string", "readOnly": true}},
+                "secret": {{"type": "string", "writeOnly": true}},
                 "name": {{"type": "string"}}
               }}
             }}
@@ -267,11 +269,12 @@ fn swagger_20_drops_readonly_required_on_request_only() {
     let operation = first_operation(&spec);
     assert_eq!(
         operation["request_body"]["content"]["application/json"]["required"],
-        json!(["name"])
+        json!(["secret", "name"]),
+        "Swagger 2.0 must treat writeOnly as an unknown annotation on requests"
     );
     assert_eq!(
         operation["responses"]["200"]["application/json"]["required"],
-        json!(["id", "name"]),
-        "Swagger 2.0 response side must keep required readOnly properties"
+        json!(["id", "secret", "name"]),
+        "Swagger 2.0 responses must keep required readOnly and writeOnly properties"
     );
 }
