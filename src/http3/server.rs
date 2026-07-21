@@ -2137,7 +2137,7 @@ async fn handle_h3_request(
             global_body_limit,
             authorize_body_requirements.plugin_limit,
         );
-        if prebuffered_body_data.is_none() {
+        if crate::proxy::early_upload_phase_needs_fresh_drain(&prebuffered_body_data) {
             let body_data = match collect_h3_request_body_with_deadline(
                 drain_h3_request_body(&mut stream, body_limit),
                 ctx.grpc_deadline_at(),
@@ -2392,7 +2392,9 @@ async fn handle_h3_request(
 
     // If we already buffered above for the body-before-authenticate path, the
     // body is already drained from the stream — no extra recv_data work here.
-    if before_proxy_body_requirements.required && prebuffered_body_data.is_none() {
+    if before_proxy_body_requirements.required
+        && crate::proxy::early_upload_phase_needs_fresh_drain(&prebuffered_body_data)
+    {
         let body_data = match collect_h3_request_body_with_deadline(
             drain_h3_request_body(&mut stream, before_proxy_body_limit),
             ctx.grpc_deadline_at(),

@@ -175,6 +175,8 @@ async fn zero_operator_timeout_without_deadline_leaves_completed_upload_unbounde
     .expect("disabled timeout must not invent an error");
     assert_eq!(h1h2, Ok(7));
 
+    // H3 flattens collect success into Result<T, EarlyUploadWaitError>; after
+    // expect the value is T (not a nested Ok), unlike the H1/H2 helper above.
     let h3 = collect_h3_request_body_with_deadline_for_test(
         std::future::ready::<Result<u8, ()>>(Ok(11)),
         None,
@@ -182,7 +184,7 @@ async fn zero_operator_timeout_without_deadline_leaves_completed_upload_unbounde
     )
     .await
     .expect("disabled timeout must not invent an error");
-    assert_eq!(h3, Ok(11));
+    assert_eq!(h3, 11);
 }
 
 #[tokio::test(start_paused = true)]
@@ -293,9 +295,12 @@ fn h3_early_phases_gate_fresh_drains_on_missing_prebuffer_and_halt_on_cancel() {
     }
 
     assert!(
-        source.contains("if prebuffered_body_data.is_none()")
-            || source.contains("if !body_was_prebuffered"),
-        "later phases must skip a second drain when a prebuffer exists"
+        source.contains("early_upload_phase_needs_fresh_drain(&prebuffered_body_data)"),
+        "authorize/before_proxy must gate fresh drains via the shared prebuffer helper"
+    );
+    assert!(
+        source.contains("if !body_was_prebuffered"),
+        "later buffered/dispatch phases must skip a second drain when a prebuffer exists"
     );
     assert_eq!(
         source.matches("drain_h3_request_body(&mut stream,").count(),
