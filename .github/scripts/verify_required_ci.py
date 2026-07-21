@@ -8,6 +8,7 @@ import re
 import sys
 from pathlib import Path
 
+from check_markdown_links import check_repository, run_self_test
 from live_suite_path_filter import (
     LIVE_SUITE_DOCUMENTATION_PATHS,
     SUITE_PATTERNS,
@@ -18,7 +19,6 @@ from pr_ci_plan import FULL_CI_DOCUMENTATION_PATHS
 
 REQUIRED_JOBS = {
     "ci-plan",
-    "markdown-links",
     "test-unit",
     "test-secrets",
     "test-service-integration",
@@ -440,11 +440,11 @@ def main() -> int:
         planner_errors.append(
             "jobs.ci-plan must run the integration shard-coverage gate"
         )
-    markdown_links_body = extract_job_body(ci_yml, "markdown-links")
-    if markdown_links_body.count("check_markdown_links.py") < 2:
-        planner_errors.append(
-            "jobs.markdown-links must run the first-party Markdown link-check self-test and gate"
-        )
+    try:
+        run_self_test()
+    except AssertionError as error:
+        planner_errors.append(f"Markdown link-check self-test failed: {error}")
+    planner_errors.extend(error.format() for error in check_repository())
 
     node_waypoint_yml = Path(
         ".github/workflows/node-waypoint-ebpf-live.yml"

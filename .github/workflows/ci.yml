@@ -275,19 +275,6 @@ jobs:
           fi
           echo "All $(echo "$actual" | wc -l | tr -d ' ') integration test files are sharded."
 
-  markdown-links:
-    name: Markdown Links
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
-
-      - name: Check first-party Markdown links
-        run: |
-          set -euo pipefail
-          python3 -I .github/scripts/check_markdown_links.py --self-test
-          python3 -I .github/scripts/check_markdown_links.py
-
   test-unit:
     name: Unit Tests
     needs: ci-plan
@@ -2589,7 +2576,6 @@ jobs:
     if: always() && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
     needs:
       - ci-plan
-      - markdown-links
       - test-unit
       - test-secrets
       - test-service-integration
@@ -2677,7 +2663,6 @@ jobs:
           echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
 
           add_row "CI plan, format, and shard coverage (${CI_MODE})" "${{ needs.ci-plan.result }}"
-          add_row "First-party Markdown links" "${{ needs.markdown-links.result }}"
           add_row "Unit and inline lib" "${{ needs.test-unit.result }}"
           add_row "Secret backends" "${{ needs.test-secrets.result }}"
           add_row "Service integration" "${{ needs.test-service-integration.result }}"
@@ -2703,7 +2688,6 @@ jobs:
           add_row "Protected Linux ARM64 Cross build" "${{ needs.build-arm64-cross.result }}"
 
           require_success "CI plan" "${{ needs.ci-plan.result }}"
-          require_success "First-party Markdown links" "${{ needs.markdown-links.result }}"
           require_success "Unit and inline lib" "${{ needs.test-unit.result }}"
           require_success "Secret backends" "${{ needs.test-secrets.result }}"
           require_success "Service integration" "${{ needs.test-service-integration.result }}"
