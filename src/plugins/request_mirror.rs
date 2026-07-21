@@ -20,10 +20,10 @@
 //! Ferrum request-only markers, and proxy-owned `X-Forwarded-*`). Forwarding
 //! identity is stripped rather than regenerated. Client `Host` is omitted so
 //! authority comes from the mirror URL; native gRPC content-types re-synthesise
-//! `te: trailers` for HTTP/2-capable mirror targets. The request-target prefers the original
-//! raw query (after the same auth credential strips the primary backend uses)
-//! so duplicate keys, order, flags, `+`, percent escapes, and encoded bytes
-//! match the primary contract.
+//! `te: trailers` for HTTP/2-capable mirror targets. The request-target prefers
+//! the original raw query (after the same auth credential strips the primary
+//! backend uses) so duplicate keys, order, flags, `+`, percent escapes, and
+//! encoded bytes match the primary contract.
 //!
 //! The mirror request uses the gateway's shared `PluginHttpClient`, which means
 //! it inherits the gateway's DNS cache, connection pool keepalive, and TLS
