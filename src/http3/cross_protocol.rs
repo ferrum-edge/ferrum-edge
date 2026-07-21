@@ -2788,7 +2788,8 @@ where
                 // protected representation this gateway could not inspect just
                 // because the frontend protocol differs.
                 let owned_grpc_web_response_content_type =
-                    crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
+                    crate::plugins::grpc_web::retained_response_content_type(ctx)
+                        .map(str::to_owned);
                 let grpc_web_response_content_type =
                     owned_grpc_web_response_content_type.as_deref();
                 let admission = crate::proxy::admit_buffered_response_body_transforms(
