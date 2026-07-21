@@ -1936,6 +1936,8 @@ The plugin buffers request bodies with SOAP content types (`text/xml`, `applicat
 
 At least one security feature must be enabled (`timestamp.require`, `username_token`, `x509_signature`, or `saml`).
 
+UsernameToken credential failures (unknown username, wrong PasswordText, or wrong PasswordDigest) return the same HTTP `401` status, headers, and generic body (`{"error":"WS-Security: invalid credentials"}`). Client responses and warning logs do not include the supplied username or password/digest verification detail; operational telemetry uses the stable failure class `username_token_invalid_credentials`. Lookup misses still execute PasswordText or PasswordDigest verification against process-local dummy material so work is equalized with known principals. Structural token or policy failures (missing elements, password-type mismatch, nonce replay) remain distinct. Apply an authentication rate-limit policy as defense in depth against online guessing.
+
 #### UsernameToken — PasswordDigest
 
 The PasswordDigest mode computes `Base64(SHA-1(nonce + created + password))` per the WS-Security UsernameToken Profile 1.0 specification. The SOAP request must include `wsse:Nonce` and `wsu:Created` elements alongside the password. Each nonce is tracked for replay protection.
@@ -2792,7 +2794,17 @@ Returns configurable mock responses without proxying to the backend. Supports ma
 
 **Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP family (HTTP, gRPC, WebSocket handshake)
 
-Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). The free-form `headers` map remains open for arbitrary string-valued response headers. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be in range 100–599. Runtime construction is the authoritative final boundary.
+Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). The free-form `headers` map remains open for arbitrary string-valued response headers. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be a final status `200–599` or `101` (synthetic WebSocket handshake only). Other informational statuses (`100`, `102`–`199`) are rejected — a mock cannot emit a 1xx as a body-bearing final response. A configured `101` that matches an ordinary HTTP request fails closed with `500`; only a request already classified as a WebSocket handshake may receive it. Runtime construction and request-flavor enforcement are the authoritative final boundaries.
+
+**Status / body wire semantics (H1, H2, and H3):** A configured `body` is the representation the mock would return for a GET. Shared synthetic-response finalization then aligns every frontend:
+
+| Request / status | Wire body | `Content-Length` |
+|---|---|---|
+| `HEAD` with a body-capable status (not 204/205/304) | Omitted (no DATA / no payload) | Representation length (same as the GET body would have been) |
+| `204` / `205` / `304` (any method) | Omitted | Stripped, even when `body` is configured non-empty |
+| Other final statuses on GET/POST/… | Configured `body` | Unchanged unless a later hook sets it |
+
+gRPC and WebSocket frame streams are unchanged: gRPC rejects still normalize to trailers-only errors, and a matching WebSocket rule still short-circuits only the HTTP handshake.
 
 **Path matching by listen-path scope:**
 
@@ -3253,7 +3265,7 @@ representations explicitly outside the configured response-body scan scope.
 | `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
 | `fp_filters` | string[] | `[]` | Regex filters that suppress known false-positive captured values for this rule. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
-| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries use the same exact / trailing-`*` prefix / `~` regex grammar as `global_exemptions.paths`; `~regex` entries are wrapped as `^(?:regex)`, so use `~.*pattern` for a floating substring match. |
+| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries share exact-match and trailing-`*` prefix forms with `global_exemptions.paths`, but `~regex` anchoring differs: rule `conditions.paths` compile the text after `~` as an operator-authored, unanchored regex evaluated with Rust regex `is_match`, so they may match anywhere in the path unless the pattern itself is anchored (for example `~^/admin(?:/|$)`). A floating match such as `~api` therefore matches both `/api/users` and `/v1/api-keys`. Exact and prefix forms are unchanged and are not regex-anchored. |
 
 Supported targets: `header_names`, `header_values`, `query_keys`,
 `query_values`, `cookies`, `url_path`, `full_url`, `method`, `body_text`,
@@ -3267,9 +3279,10 @@ rules can match IPv6-shaped hex text from logs or diagnostics. Prefer narrow
 `global_exemptions` supports `paths`, `methods`, `consumers`, `ips`,
 `header_present`, and `fp_capture_filters`. Path entries ending in `*` are
 prefix matches; entries starting with `~` are start-anchored regex patterns
-wrapped as `^(?:regex)`; all other entries are exact-path matches (so `/health`
-exempts only `/health`, not `/healthz` or `/health-admin`). Use `~.*pattern`
-for a floating substring match.
+wrapped as `^(?:regex)` (unlike unanchored per-rule `conditions.paths`); all
+other entries are exact-path matches (so `/health` exempts only `/health`, not
+`/healthz` or `/health-admin`). Use `~.*pattern` for a floating substring match
+under these start-anchored exemption semantics.
 
 ```yaml
 config:
@@ -3339,8 +3352,9 @@ Request-side validation only buffers matching request bodies: methods that can c
 | `protobuf_response_type` | String | — | Default fully-qualified protobuf message type for response validation |
 | `protobuf_method_messages` | Object | `{}` | Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`). Each value has `request` and/or `response` string fields |
 | `protobuf_reject_unknown_fields` | bool | `false` | Reject messages containing field numbers not in the descriptor |
+| `grpc_max_decompressed_size_bytes` | usize | env / 10 MiB | Maximum decompressed gRPC protobuf payload size for both request and response validation. `0` disables the decompressed cap. When omitted, inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses as an unsigned integer; otherwise falls back to 10 MiB (10485760). |
 
-**gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly.
+**gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly. The decompressed size is bounded by `grpc_max_decompressed_size_bytes`.
 
 **Scope**: Protobuf validation supports unary RPCs only (single frame per message). Streaming RPCs with multiple concatenated frames are not validated — the length mismatch check will reject multi-frame bodies.
 
@@ -4543,7 +4557,7 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `token_limit` | Integer | `100000` | Maximum tokens allowed per window |
+| `token_limit` | Integer | *(required)* | Maximum tokens allowed per window. Required at construction; there is no default. |
 | `window_seconds` | Integer | `60` | Sliding window duration in seconds |
 | `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens`. Unknown values are rejected at construction time. |
 | `limit_by` | String | `"consumer"` | Rate limit key: authenticated identity (`consumer`) or `ip`. Unknown values are rejected at construction time. |
@@ -4984,7 +4998,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 | `frames_per_second` | u64 | `100` | Maximum frames per second per connection. Must be greater than zero — `frames_per_second: 0` is rejected at config load time. |
 | `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance). Must be greater than zero and greater than or equal to `frames_per_second`. |
 | `close_reason` | String | `"Frame rate exceeded"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
-| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
+| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (externalized per-connection counters, namespaced per plugin/gateway instance; not portable across reconnects/rebuilds) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ws_rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:ws_rate_limiting` when namespace is `"ferrum"` |

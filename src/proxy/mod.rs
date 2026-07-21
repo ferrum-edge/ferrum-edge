@@ -15448,7 +15448,10 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
     );
 
     let body = if reject.body.is_empty() {
-        ProxyBody::empty()
+        // Status-aware empty body: 205 must not advertise Content-Length on H1
+        // (Hyper would otherwise synthesize `Content-Length: 0` for ordinary
+        // empty Full bodies; 204/304 are already special-cased upstream).
+        ProxyBody::empty_for_response_status(reject.http_status.as_u16())
     } else {
         ProxyBody::full(Bytes::from(reject.body))
     };

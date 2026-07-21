@@ -49,6 +49,16 @@ paths:
 
 The importer generates a proxy-scoped `openapi_validator` plugin, resolves local `$ref`s, converts Swagger 2.0 and OpenAPI 3.0 schemas to Draft 7-compatible JSON Schema, and keeps OpenAPI 3.1+ schemas on Draft 2020-12.
 
+### `readOnly` / `writeOnly` required direction
+
+When the source document is Swagger 2.0 or OpenAPI 3.0.x, the importer normalizes each schema with an explicit request or response direction before compiling it into `operations`:
+
+- **Request schemas:** a property marked `readOnly: true` that also appears in `required` is required only on responses, so its name is removed from request-side `required`. Required `writeOnly` properties stay required on requests.
+- **Response schemas:** a property marked `writeOnly: true` that also appears in `required` is required only on requests, so its name is removed from response-side `required`. Required `readOnly` properties stay required on responses.
+- The same filtering walks nested `properties`, `items`, and `allOf` / `oneOf` / `anyOf` members after local `$ref` resolution. Swagger 2.0 defines `readOnly` but not `writeOnly`, so only the request-side rule applies there.
+
+OpenAPI 3.1+ treats `readOnly` and `writeOnly` as JSON Schema annotations. Ferrum does **not** rewrite `required` for those versions; the authored `required` arrays are compiled as-is. Operators who want OAS 3.0-style direction rules on 3.1 documents should publish separate request and response schemas (or an application-specific convention) rather than relying on implicit rewriting.
+
 ## `x-ferrum-validate`
 
 `x-ferrum-validate` accepts `true`, `false`, or an object. `false` and `null` disable auto-injection.

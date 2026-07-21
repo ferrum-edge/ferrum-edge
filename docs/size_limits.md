@@ -41,26 +41,46 @@ Request body limits are enforced in two stages:
 
 ### Layer 4: Response Body Enforcement
 
-Response body limits protect against backends sending unexpectedly large payloads:
-1. **Content-Length fast path**: If the backend's `Content-Length` header exceeds `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, a 502 is returned immediately.
-2. **Streaming enforcement**: Response bytes are collected in chunks with a running size counter. If the accumulated size exceeds the limit, collection stops and a 502 is returned.
+Response body limits protect against backends sending unexpectedly large payloads. Enforcement splits on whether the overrun is known **before** downstream response headers are committed:
+
+1. **Declared-size or buffered pre-commit rejection**: If the backend's `Content-Length` exceeds `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, or if the response is collected under `response_body_mode: buffer` / plugin-forced buffering and the accumulated body crosses the limit before any response bytes are sent downstream, the gateway rejects with a protocol-normalized error (HTTP JSON `502` on ordinary HTTP paths; trailers-only `RESOURCE_EXHAUSTED` on native gRPC buffered paths). No downstream body streaming has begun.
+2. **Unknown-length streaming post-commit termination**: When streaming and `Content-Length` is absent, the gateway does **not** fall back to full-body buffering solely to enforce the limit. It wraps the body in a size-limited streaming adapter (`SizeLimitedStreamingResponse` on the reqwest HTTP/1.1 + HTTP/2 path; `SizeLimitedFrameSource` / size-limited coalescing builders on direct HTTP/2, gRPC, and HTTP/3). Frames are forwarded until the running count crosses the limit; the body then terminates with a stream/body error classified as `ResponseBodyTooLarge`. Downstream headers — and the original backend status — may already be visible to the client, so the gateway cannot replace the response with a JSON `502`.
 
 ### Interaction with Response Body Streaming
 
-When `response_body_mode: stream` is configured (the default), the gateway can forward response chunks to the client as they arrive without buffering the full body. However, response size limits still apply:
+When `response_body_mode: stream` is configured (the default), the gateway can forward response chunks to the client as they arrive without buffering the full body. Response size limits still apply:
 
-- **With `Content-Length` header**: If the backend sends a `Content-Length` that exceeds `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES`, the request is rejected immediately with 502 before any streaming begins. If the Content-Length is within the limit, the response is streamed directly.
-- **Without `Content-Length` header**: The gateway **falls back to buffering** because it cannot verify the response size upfront. This ensures size limits are always enforced, even when streaming is configured.
-- **When `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES=0`** (unlimited): Responses are streamed without any size checks, regardless of whether `Content-Length` is present.
+| Scenario | Size limit | Content-Length | Behavior |
+|----------|------------|----------------|----------|
+| Stream mode | Enabled | Present, within limit | Stream directly (or eagerly buffer when ≤ the adaptive cutoff) |
+| Stream mode | Enabled | Present, exceeds limit | Pre-commit reject (`502` / protocol-normalized) before body bytes flow |
+| Stream mode | Enabled | Absent | Stream with `SizeLimitedStreamingResponse` (or protocol-equivalent) — frame-by-frame enforcement; overrun terminates the body after commit |
+| Stream mode | Disabled (`0`) | Any | Stream with no size checks |
+| Buffer mode / plugin buffering | Any nonzero | Any | Collect with a running counter; overrun returns the pre-commit rejection above |
 
-See [docs/response_body_streaming.md](response_body_streaming.md) for full details on streaming vs buffering behavior.
+- **Without `Content-Length`**: unknown-length bodies keep streaming. The size-limited adapter yields an error once the running count exceeds the limit; clients that already observed the backend status will see a truncated/reset body rather than a rewritten JSON `502`.
+- **`response_size_limiting` plugin**: a per-route ceiling with optional `require_buffered_check`. When buffering is not forced, unknown-length responses without that flag fall through to the global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` streaming adapter described here — see the [`response_size_limiting`](plugins.md#response_size_limiting) reference.
+
+See [Response Body Streaming — Interaction with Response Size Limits](response_body_streaming.md#interaction-with-response-size-limits) for the streaming decision table and adapter constructors.
 
 ## HTTP/3 (QUIC) Enforcement
 
-The same size limits apply to HTTP/3 connections:
-- Header validation (per-header and total) is performed on the parsed request headers
-- Body collection tracks accumulated size during `recv_data()` calls
-- Response body limits are enforced identically to HTTP/1.1 and HTTP/2
+The same size-limit knobs apply to HTTP/3, but client-visible outcomes are **not** identical on every path:
+
+- Header validation (per-header and total) runs on the parsed request headers.
+- Declared `Content-Length` overruns are rejected with the JSON `502` **before** response body streaming begins (native H3 and cross-protocol bridges).
+- Unknown-length / mid-stream overruns count bytes during `recv_data()` loops or via `size_limited_streaming_h3_body`. After headers are committed, the gateway aborts or terminates the QUIC/H3 response stream (`ResponseBodyTooLarge`) rather than rewriting the already-sent status into a JSON `502`.
+- Cross-protocol H3 bridges (H3 frontend → non-H3 backend, and H1/H2 frontend → H3 backend) preserve the same declared-size pre-commit vs post-commit streaming distinction.
+
+## Protocol consequences for response overruns
+
+| Path | Pre-commit (declared size or buffered) | Post-commit (unknown-length streaming) |
+|------|----------------------------------------|----------------------------------------|
+| HTTP/1.1 | JSON `502` with `{"error":"Backend response body exceeds maximum size"}` | Backend status/headers may already be sent; body read fails / connection closes after the limit |
+| HTTP/2 | Same JSON `502` | Stream reset / body error after the limit; if headers flushed first, status remains the backend status (often `200`) |
+| HTTP/3 | Same JSON `502` before `send_data` | Response stream aborted / terminated after the limit; status already visible when headers were sent |
+| gRPC (buffered) | Trailers-only `RESOURCE_EXHAUSTED` (not a JSON HTTP body) | n/a — body was collected before commit |
+| gRPC (streaming) | Declared-size fast path where applicable | Size-limited H2 body adapter stops DATA frames; trailers may not complete with a clean backend `grpc-status` |
 
 ## Admin API Body Limit
 
@@ -68,18 +88,19 @@ The Admin API enforces a **1 MiB** (1,048,576 bytes) request body size limit on 
 
 ## Error Responses
 
-All error responses are JSON with `Content-Type: application/json`.
+Pre-commit gateway rejections below are JSON with `Content-Type: application/json` on ordinary HTTP paths. Post-commit streaming overruns do **not** synthesize that JSON body — see the protocol table above.
 
-| Condition | Status Code | Response Body |
-|-----------|-------------|---------------|
+| Condition | Status / outcome | Response Body |
+|-----------|------------------|---------------|
 | Single header too large | `431 Request Header Fields Too Large` | `{"error":"Request header '{name}' exceeds maximum size of {n} bytes"}` |
 | Total headers too large | `431 Request Header Fields Too Large` | `{"error":"Total request headers exceed maximum size"}` |
 | Request body too large (Content-Length) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` |
 | Request body too large (streaming) | `413 Content Too Large` | `{"error":"Request body exceeds maximum size"}` |
 | Admin API body too large | `413 Payload Too Large` | Request rejected by body size middleware |
-| Response body too large | `502 Bad Gateway` | `{"error":"Backend response body exceeds maximum size"}` |
+| Response body too large (declared `Content-Length` or buffered collection, pre-commit) | `502 Bad Gateway` (HTTP); trailers-only `RESOURCE_EXHAUSTED` (native gRPC buffered) | HTTP: `{"error":"Backend response body exceeds maximum size"}` |
+| Response body too large (unknown-length streaming, post-commit) | Original backend status may already be visible; body/stream terminates (`ResponseBodyTooLarge`) | No JSON `502` replacement after headers are committed |
 
-**Why 502 for response body?** The backend sent a response that violates the gateway's configured limits. The client is not at fault — the backend is misbehaving. This matches HTTP semantics: 502 indicates the gateway received an invalid response from the upstream server.
+**Why 502 for pre-commit response overruns?** The backend sent a response that violates the gateway's configured limits before the gateway committed a downstream response. The client is not at fault — the backend is misbehaving. This matches HTTP semantics: 502 indicates the gateway received an invalid response from the upstream server. Once streaming has begun, that replacement is no longer possible; clients must treat mid-body termination / stream reset as the overrun signal.
 
 ## Example Configurations
 

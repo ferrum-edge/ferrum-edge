@@ -1083,15 +1083,16 @@ impl SinkRuntime {
             .as_ref()
             .and_then(|spool| spool.scan_stats().ok())
             .unwrap_or_default();
-        output
-            .push_str("# HELP chargeback_sink_spool_bytes Chargeback sink on-disk spool bytes.\n");
+        output.push_str(
+            "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, and quarantined files).\n",
+        );
         output.push_str("# TYPE chargeback_sink_spool_bytes gauge\n");
         output.push_str(&format!(
             "chargeback_sink_spool_bytes {}\n",
             spool_stats.bytes
         ));
         output.push_str(
-            "# HELP chargeback_sink_spool_files Chargeback sink on-disk spool file count.\n",
+            "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, and quarantined files).\n",
         );
         output.push_str("# TYPE chargeback_sink_spool_files gauge\n");
         output.push_str(&format!(
@@ -1531,13 +1532,17 @@ impl SpoolManager {
         ensure_private_dir(&cfg.dir)?;
         ensure_private_dir(&cfg.dir.join(node_id.as_ref()))?;
         warn_on_sibling_spool_dirs(&cfg.dir, node_id.as_ref());
-        Ok(Self {
+        let manager = Self {
             cfg,
             node_id,
             metrics,
             last_drop_warn_at: AtomicI64::new(0),
             write_lock: Mutex::new(()),
-        })
+        };
+        // Crash-left *.tmp files consume disk but are incomplete; delete them
+        // before any quota decision so ownership accounting matches durable state.
+        manager.reconcile_stale_temp_files()?;
+        Ok(manager)
     }
 
     #[allow(dead_code)]
@@ -1557,7 +1562,18 @@ impl SpoolManager {
             .write_lock
             .lock()
             .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
-        self.evict_until_below_limit()?;
+        // Size the pending encoded file before admission so max_bytes is a hard
+        // ceiling over existing owned bytes plus this write.
+        let body = serialize_json_each_row(events)?;
+        let bytes = encode_spool_bytes(body.as_bytes(), self.cfg.compression)?;
+        let incoming_len = bytes.len() as u64;
+        if incoming_len > self.cfg.max_bytes {
+            return Err(format!(
+                "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) exceeds spool.max_bytes ({})",
+                self.cfg.max_bytes
+            ));
+        }
+        self.evict_until_can_admit(incoming_len)?;
         let day = Utc::now().format("%Y%m%d").to_string();
         let dir = self.cfg.dir.join(self.node_id.as_ref()).join(day);
         ensure_private_dir(&dir)?;
@@ -1570,15 +1586,13 @@ impl SpoolManager {
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| format!("{PLUGIN_NAME}: invalid spool file path"))?
         ));
-        let body = serialize_json_each_row(events)?;
-        let bytes = encode_spool_bytes(body.as_bytes(), self.cfg.compression)?;
         write_private_file_atomically(&tmp_path, &final_path, &bytes)?;
         invalidate_status_cache();
         Ok(final_path)
     }
 
     pub fn scan_stats(&self) -> Result<SpoolStats, String> {
-        let files = self.list_spool_files()?;
+        let files = self.list_owned_spool_files()?;
         let mut stats = SpoolStats::default();
         for file in files {
             match fs::metadata(&file) {
@@ -1597,14 +1611,28 @@ impl SpoolManager {
         Ok(stats)
     }
 
-    fn evict_until_below_limit(&self) -> Result<(), String> {
+    /// Drop oldest owned spool files until `owned_bytes + incoming_len <= max_bytes`.
+    ///
+    /// Owned bytes include active data files, crash-left temps, and quarantined
+    /// `*.corrupt` files. When a single encoded batch cannot fit even after
+    /// emptying the spool, the write is rejected (never silently over-admitted).
+    fn evict_until_can_admit(&self, incoming_len: u64) -> Result<(), String> {
+        if incoming_len > self.cfg.max_bytes {
+            return Err(format!(
+                "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) exceeds spool.max_bytes ({})",
+                self.cfg.max_bytes
+            ));
+        }
         loop {
             let stats = self.scan_stats()?;
-            if stats.bytes < self.cfg.max_bytes {
+            if stats.bytes.saturating_add(incoming_len) <= self.cfg.max_bytes {
                 return Ok(());
             }
-            let Some(oldest) = self.list_spool_files()?.into_iter().next() else {
-                return Ok(());
+            let Some(oldest) = self.list_owned_spool_files()?.into_iter().next() else {
+                return Err(format!(
+                    "{PLUGIN_NAME}: encoded spool batch ({incoming_len} bytes) cannot fit within spool.max_bytes ({}) after eviction",
+                    self.cfg.max_bytes
+                ));
             };
             match fs::remove_file(&oldest) {
                 Ok(()) => {}
@@ -1630,16 +1658,50 @@ impl SpoolManager {
                 warn!(
                     plugin = PLUGIN_NAME,
                     max_bytes = self.cfg.max_bytes,
-                    "Chargeback sink spool exceeded max_bytes; oldest spool file was dropped"
+                    incoming_bytes = incoming_len,
+                    "Chargeback sink spool exceeded max_bytes; oldest owned spool file was dropped"
                 );
             }
         }
     }
 
-    fn list_spool_files(&self) -> Result<Vec<PathBuf>, String> {
+    fn reconcile_stale_temp_files(&self) -> Result<(), String> {
+        let root = self.cfg.dir.join(self.node_id.as_ref());
+        let mut temps = Vec::new();
+        collect_spool_files(&root, &mut temps, SpoolFileClass::Temp)?;
+        for path in temps {
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    warn!(
+                        plugin = PLUGIN_NAME,
+                        path = %path.display(),
+                        "Chargeback sink removed a stale spool temp file left by an interrupted write"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "{PLUGIN_NAME}: failed to remove stale spool temp file '{}': {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn list_owned_spool_files(&self) -> Result<Vec<PathBuf>, String> {
         let root = self.cfg.dir.join(self.node_id.as_ref());
         let mut files = Vec::new();
-        collect_spool_files(&root, &mut files)?;
+        collect_spool_files(&root, &mut files, SpoolFileClass::Owned)?;
+        files.sort();
+        Ok(files)
+    }
+
+    fn list_replayable_spool_files(&self) -> Result<Vec<PathBuf>, String> {
+        let root = self.cfg.dir.join(self.node_id.as_ref());
+        let mut files = Vec::new();
+        collect_spool_files(&root, &mut files, SpoolFileClass::Replayable)?;
         files.sort();
         Ok(files)
     }
@@ -1672,7 +1734,21 @@ fn warn_on_sibling_spool_dirs(root: &Path, node_id: &str) {
     }
 }
 
-fn collect_spool_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+#[derive(Clone, Copy)]
+enum SpoolFileClass {
+    /// Active data, crash-left temps, and quarantined files — quota/status.
+    Owned,
+    /// Only durable replay candidates (`*.ndjson` / `*.ndjson.zst`).
+    Replayable,
+    /// Interrupted atomic-write temps (`*.ndjson.tmp` / `*.ndjson.zst.tmp`).
+    Temp,
+}
+
+fn collect_spool_files(
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    class: SpoolFileClass,
+) -> Result<(), String> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1698,8 +1774,8 @@ fn collect_spool_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), Strin
             )
         })?;
         if meta.is_dir() {
-            collect_spool_files(&path, files)?;
-        } else if is_spool_data_file(&path) {
+            collect_spool_files(&path, files, class)?;
+        } else if spool_file_matches(&path, class) {
             files.push(path);
         }
     }
@@ -1722,11 +1798,39 @@ fn quarantine_spool_file(path: &Path) -> Result<PathBuf, String> {
     Ok(quarantine_path)
 }
 
+fn spool_file_matches(path: &Path, class: SpoolFileClass) -> bool {
+    match class {
+        SpoolFileClass::Owned => is_spool_owned_file(path),
+        SpoolFileClass::Replayable => is_spool_data_file(path),
+        SpoolFileClass::Temp => is_spool_temp_file(path),
+    }
+}
+
 fn is_spool_data_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    (name.ends_with(".ndjson.zst") || name.ends_with(".ndjson")) && !name.ends_with(".tmp")
+    (name.ends_with(".ndjson.zst") || name.ends_with(".ndjson"))
+        && !name.ends_with(".tmp")
+        && !name.ends_with(".corrupt")
+}
+
+fn is_spool_temp_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.ends_with(".ndjson.tmp") || name.ends_with(".ndjson.zst.tmp")
+}
+
+fn is_spool_corrupt_file(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name.ends_with(".ndjson.corrupt") || name.ends_with(".ndjson.zst.corrupt")
+}
+
+fn is_spool_owned_file(path: &Path) -> bool {
+    is_spool_data_file(path) || is_spool_temp_file(path) || is_spool_corrupt_file(path)
 }
 
 fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec<u8>, String> {
@@ -1735,6 +1839,15 @@ fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec
             .map_err(|error| format!("{PLUGIN_NAME}: zstd compression failed: {error}")),
         SpoolCompression::None => Ok(bytes.to_vec()),
     }
+}
+
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn encode_spool_bytes_for_tests(
+    bytes: &[u8],
+    compression: SpoolCompression,
+) -> Result<Vec<u8>, String> {
+    encode_spool_bytes(bytes, compression)
 }
 
 fn decode_spool_file(path: &Path) -> Result<String, String> {
@@ -1795,7 +1908,31 @@ pub async fn replay_spool_once_for_tests(
     replay_spool_once(spool, &flush_config).await
 }
 
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn write_private_file_atomically_for_tests(
+    tmp_path: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+) -> Result<(), String> {
+    write_private_file_atomically(tmp_path, final_path, bytes)
+}
+
 fn write_private_file_atomically(
+    tmp_path: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let result = write_private_file_atomically_inner(tmp_path, final_path, bytes);
+    if result.is_err() {
+        // Keep quota accounting honest after a failed write/rename: a leftover
+        // *.tmp would otherwise consume disk while remaining invisible to replay.
+        let _ = fs::remove_file(tmp_path);
+    }
+    result
+}
+
+fn write_private_file_atomically_inner(
     tmp_path: &Path,
     final_path: &Path,
     bytes: &[u8],
@@ -1922,7 +2059,7 @@ async fn replay_spool_once(
     spool: &SpoolManager,
     flush_config: &ClickHouseFlushConfig,
 ) -> Result<(), String> {
-    let files = spool.list_spool_files()?;
+    let files = spool.list_replayable_spool_files()?;
     for file in files {
         let body = match decode_spool_file(&file) {
             Ok(body) => body,
