@@ -43,7 +43,8 @@ use crate::proxy::headers::{
 };
 use crate::proxy::{
     ProxyState, apply_plugin_rejection_response, apply_reject_after_proxy_and_synthetic_body_hooks,
-    log_rejected_request, log_rejected_request_with_path, plugin_result_into_reject_parts,
+    log_pre_backend_rejected_request, log_rejected_request, log_rejected_request_with_path,
+    plugin_result_into_reject_parts,
     run_after_proxy_hooks, run_authentication_phase,
 };
 use crate::tls::{CrlList, TlsPolicy};
@@ -1592,7 +1593,7 @@ async fn handle_h3_request(
             epoch.plugin_cache.request_view(&proxy.id, request_protocol)
         };
         let logging_plugins = logging_view.plugins();
-        log_rejected_request(
+        log_pre_backend_rejected_request(
             &logging_plugins,
             &ctx,
             StatusCode::METHOD_NOT_ALLOWED.as_u16(),

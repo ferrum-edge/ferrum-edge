@@ -8,8 +8,8 @@ fn h1_h2_allowed_methods_rejection_logs_before_request_hooks() {
         .expect("H1/H2 allowed_methods gate");
     let region = &source[method_filter..];
     let log = region
-        .find("log_rejected_request(")
-        .expect("405 path must call log_rejected_request");
+        .find("log_pre_backend_rejected_request(")
+        .expect("405 path must call log_pre_backend_rejected_request");
     let phase = region
         .find("\"allowed_methods\"")
         .expect("405 path must use rejection_phase allowed_methods");
@@ -53,8 +53,8 @@ fn h3_allowed_methods_rejection_logs_before_request_hooks() {
         .expect("H3 allowed_methods gate");
     let region = &source[method_filter..];
     let log = region
-        .find("log_rejected_request(")
-        .expect("H3 405 path must call log_rejected_request");
+        .find("log_pre_backend_rejected_request(")
+        .expect("H3 405 path must call log_pre_backend_rejected_request");
     let phase = region
         .find("\"allowed_methods\"")
         .expect("H3 405 path must use rejection_phase allowed_methods");

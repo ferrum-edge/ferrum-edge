@@ -1047,7 +1047,17 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
 }
 ```
 
-Rejected requests have `backend_target: null` (no backend was contacted), latency fields at -1.0, and `metadata.rejection_phase` indicating which plugin phase or gateway admission gate rejected the request. Possible `rejection_phase` values: `authenticate`, `authorize`, `before_proxy`, `allowed_methods`, `grpc_backend_error`, `websocket_backend_error`. Gateway-generated gRPC errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log sinks can distinguish gRPC failures even though the downstream HTTP status is `200`.
+Gateway admission rejections that occur before backend selection, including
+`allowed_methods`, have `backend_target: null`. Other rejection summaries may
+retain the matched proxy's configured target for attribution, but backend
+latency fields remain `-1.0`; a configured target in such a record is not proof
+that Ferrum contacted it. `metadata.rejection_phase` identifies the plugin
+phase or gateway admission gate that rejected the request. Possible values
+include `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
+`grpc_backend_error`, and `websocket_backend_error`. Gateway-generated gRPC
+errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log
+sinks can distinguish gRPC failures even though the downstream HTTP status is
+`200`.
 
 ##### Pre-plugin routing and method failures in transaction logs
 

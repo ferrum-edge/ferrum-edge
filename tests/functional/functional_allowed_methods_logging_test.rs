@@ -346,14 +346,11 @@ async fn functional_allowed_methods_405_logs_stdout_and_http_sinks_h1_h2_and_grp
         access_logs.len()
     );
     for entry in &access_logs {
-        assert_eq!(
-            entry.get("proxy_id").and_then(Value::as_str),
-            Some("allowed-methods-logging")
-        );
-        assert_eq!(
-            entry.get("response_status_code").and_then(Value::as_u64),
-            Some(405)
-        );
+        let method = entry
+            .get("http_method")
+            .and_then(Value::as_str)
+            .expect("logged method");
+        assert_allowed_methods_summary(entry, method);
     }
 
     let sink_a_entries = wait_for_sink_entries(&sink_a, 3, Duration::from_secs(5)).await;
@@ -375,14 +372,11 @@ async fn functional_allowed_methods_405_logs_stdout_and_http_sinks_h1_h2_and_grp
                 == Some("allowed_methods")
         })
     {
-        assert_eq!(
-            entry.get("response_status_code").and_then(Value::as_u64),
-            Some(405)
-        );
-        assert_eq!(
-            entry.get("proxy_id").and_then(Value::as_str),
-            Some("allowed-methods-logging")
-        );
+        let method = entry
+            .get("http_method")
+            .and_then(Value::as_str)
+            .expect("logged method");
+        assert_allowed_methods_summary(entry, method);
     }
 
     assert_eq!(

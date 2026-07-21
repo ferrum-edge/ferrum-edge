@@ -13990,7 +13990,7 @@ pub async fn log_rejected_request(
     rejection_phase: &str,
     plugin_execution_ns: u64,
 ) {
-    log_rejected_request_with_path(
+    log_rejected_request_with_path_and_backend_state(
         plugins,
         ctx,
         status_code,
@@ -13998,6 +13998,33 @@ pub async fn log_rejected_request(
         rejection_phase,
         plugin_execution_ns,
         None,
+        true,
+    )
+    .await;
+}
+
+/// Run logging plugins for a rejection that occurred before backend contact.
+///
+/// The summary retains matched-proxy attribution but deliberately omits
+/// `backend_target`: configuration identifies where a request might have gone,
+/// not a destination that Ferrum actually contacted.
+pub async fn log_pre_backend_rejected_request(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &str,
+    plugin_execution_ns: u64,
+) {
+    log_rejected_request_with_path_and_backend_state(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        None,
+        false,
     )
     .await;
 }
@@ -14017,6 +14044,30 @@ pub(crate) async fn log_rejected_request_with_path(
     rejection_phase: &str,
     plugin_execution_ns: u64,
     request_path_override: Option<&str>,
+) {
+    log_rejected_request_with_path_and_backend_state(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        request_path_override,
+        true,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn log_rejected_request_with_path_and_backend_state(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &str,
+    plugin_execution_ns: u64,
+    request_path_override: Option<&str>,
+    include_backend_target: bool,
 ) {
     if plugins.is_empty() {
         return;
@@ -14066,15 +14117,19 @@ pub(crate) async fn log_rejected_request_with_path(
             .unwrap_or_else(|| ctx.path.clone()),
         proxy_id: proxy.map(|p| p.id.clone()),
         proxy_name: proxy.and_then(|p| p.name.clone()),
-        backend_target: proxy.map(|p| {
-            // Host-only proxies (listen_path None) have no prefix to strip.
-            // `ctx.path` is intentionally used here (not the override) because
-            // `backend_target` should reflect the rewritten path that would
-            // have been sent to the backend.
-            let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
-            let url = build_backend_url(p, &ctx.path, "", strip_len);
-            strip_query_params(&url).to_string()
-        }),
+        backend_target: if include_backend_target {
+            proxy.map(|p| {
+                // Host-only proxies (listen_path None) have no prefix to strip.
+                // `ctx.path` is intentionally used here (not the override) because
+                // `backend_target` should reflect the rewritten path that would
+                // have been sent to the backend.
+                let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
+                let url = build_backend_url(p, &ctx.path, "", strip_len);
+                strip_query_params(&url).to_string()
+            })
+        } else {
+            None
+        },
         response_status_code: status_code,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: total_ms,
@@ -18359,7 +18414,7 @@ async fn handle_proxy_request_inner(
             .plugin_cache
             .request_view(&proxy.id, request_protocol)
             .plugins();
-        log_rejected_request(
+        log_pre_backend_rejected_request(
             &logging_plugins,
             &ctx,
             StatusCode::METHOD_NOT_ALLOWED.as_u16(),

@@ -10,7 +10,7 @@ use std::time::Instant;
 use ferrum_edge::plugins::{
     Plugin, TransactionSummary, create_plugin, priority as plugin_priority,
 };
-use ferrum_edge::proxy::log_rejected_request;
+use ferrum_edge::proxy::{log_pre_backend_rejected_request, log_rejected_request};
 use serde_json::json;
 
 use super::plugin_utils::{create_test_context, create_test_proxy};
@@ -235,7 +235,7 @@ async fn test_log_rejected_request_allowed_methods_phase_attributes_proxy() {
     ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
 
     let start = Instant::now();
-    log_rejected_request(&plugins, &ctx, 405, start, "allowed_methods", 0).await;
+    log_pre_backend_rejected_request(&plugins, &ctx, 405, start, "allowed_methods", 0).await;
 
     let summaries = logger.captured.lock().unwrap();
     assert_eq!(summaries.len(), 1);
@@ -244,6 +244,7 @@ async fn test_log_rejected_request_allowed_methods_phase_attributes_proxy() {
     assert_eq!(summary.http_method, "POST");
     assert_eq!(summary.request_path, "/allowed");
     assert_eq!(summary.proxy_id, Some("test-proxy".to_string()));
+    assert!(summary.backend_target.is_none());
     assert_eq!(
         summary.metadata.get("rejection_phase"),
         Some(&"allowed_methods".to_string())
