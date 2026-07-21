@@ -953,6 +953,7 @@ jobs:
               functional_early_data_test
               functional_ws_origin_test
               functional_allowed_methods_test
+              functional_allowed_methods_logging_test
               functional_forwarded_via_headers_test
               functional_streaming_latency_tracking_test
               functional_streaming_outcome_accounting_test
