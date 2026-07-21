@@ -558,10 +558,7 @@ fn assert_uninspectable_reject(result: PluginResult) {
             let message = parsed["errors"][0]["message"]
                 .as_str()
                 .expect("GraphQL error message");
-            assert!(
-                !message.is_empty(),
-                "reject message must be non-empty"
-            );
+            assert!(!message.is_empty(), "reject message must be non-empty");
         }
         other => panic!("Expected Reject(400), got {other:?}"),
     }
@@ -592,8 +589,8 @@ async fn test_get_query_rejected_by_default() {
 
     let mut ctx = create_test_context();
     ctx.method = "GET".to_string();
-    ctx.path = "/graphql?query=%7B%20__schema%20%7B%20types%20%7B%20name%20%7D%20%7D%20%7D"
-        .to_string();
+    ctx.path =
+        "/graphql?query=%7B%20__schema%20%7B%20types%20%7B%20name%20%7D%20%7D%20%7D".to_string();
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_uninspectable_reject(result);
@@ -610,10 +607,8 @@ async fn test_application_graphql_rejected_by_default() {
         "content-type".to_string(),
         "application/graphql".to_string(),
     );
-    ctx.metadata.insert(
-        "request_body".to_string(),
-        "{ user { id } }".to_string(),
-    );
+    ctx.metadata
+        .insert("request_body".to_string(), "{ user { id } }".to_string());
     let mut headers = HashMap::new();
     headers.insert(
         "content-type".to_string(),
@@ -652,8 +647,7 @@ async fn test_apq_envelope_without_query_rejected_by_default() {
         .insert("content-type".to_string(), "application/json".to_string());
     ctx.metadata.insert(
         "request_body".to_string(),
-        r#"{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"abcdef"}}}"#
-            .to_string(),
+        r#"{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"abcdef"}}}"#.to_string(),
     );
     let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -669,10 +663,8 @@ async fn test_non_json_body_under_json_content_type_rejected_by_default() {
     ctx.method = "POST".to_string();
     ctx.headers
         .insert("content-type".to_string(), "application/json".to_string());
-    ctx.metadata.insert(
-        "request_body".to_string(),
-        "not-valid-json{{{".to_string(),
-    );
+    ctx.metadata
+        .insert("request_body".to_string(), "not-valid-json{{{".to_string());
     let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_uninspectable_reject(result);
@@ -723,10 +715,8 @@ async fn test_uninspectable_transports_continue_when_opted_out() {
         "content-type".to_string(),
         "application/graphql".to_string(),
     );
-    ctx.metadata.insert(
-        "request_body".to_string(),
-        "{ user { id } }".to_string(),
-    );
+    ctx.metadata
+        .insert("request_body".to_string(), "{ user { id } }".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
 
@@ -746,8 +736,7 @@ async fn test_uninspectable_transports_continue_when_opted_out() {
     ctx.method = "POST".to_string();
     ctx.metadata.insert(
         "request_body".to_string(),
-        r#"{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"abcdef"}}}"#
-            .to_string(),
+        r#"{"extensions":{"persistedQuery":{"version":1,"sha256Hash":"abcdef"}}}"#.to_string(),
     );
     let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
@@ -756,10 +745,8 @@ async fn test_uninspectable_transports_continue_when_opted_out() {
     // (e) non-JSON body under JSON content-type
     let mut ctx = create_test_context();
     ctx.method = "POST".to_string();
-    ctx.metadata.insert(
-        "request_body".to_string(),
-        "not-valid-json{{{".to_string(),
-    );
+    ctx.metadata
+        .insert("request_body".to_string(), "not-valid-json{{{".to_string());
     let mut headers = make_graphql_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert_continue(result);
