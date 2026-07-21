@@ -1319,6 +1319,41 @@ pub mod _test_support {
         crate::plugins::grpc_web::build_trailer_frame(response_headers, http_status)
     }
 
+    pub fn sync_translated_body_trailer_frame_from_trailers(
+        body: &mut Vec<u8>,
+        content_type: Option<&str>,
+        reconciled_trailers: &HashMap<String, String>,
+        http_status: Option<u16>,
+    ) -> bool {
+        crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+            body,
+            content_type,
+            reconciled_trailers,
+            http_status,
+        )
+    }
+
+    pub fn begin_buffered_initial_response_header_policy_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        header_names: std::sync::Arc<Vec<String>>,
+        initial_headers: &HashMap<String, String>,
+        merged_headers: &HashMap<String, String>,
+    ) {
+        ctx.begin_buffered_initial_response_header_policy(
+            header_names,
+            initial_headers,
+            merged_headers,
+        );
+    }
+
+    pub fn record_buffered_initial_response_header_plugin_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        plugin: &dyn crate::plugins::Plugin,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        ctx.record_buffered_initial_response_header_plugin(plugin, response_headers);
+    }
+
     pub fn http_response_status_to_grpc_status(http_status: u16) -> u32 {
         crate::plugins::grpc_web::http_response_status_to_grpc_status(http_status)
     }

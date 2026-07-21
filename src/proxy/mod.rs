@@ -22126,9 +22126,12 @@ async fn handle_proxy_request_inner(
                     &plugin_response_headers,
                 );
 
-                // after_proxy hooks
+                // after_proxy hooks. Policy state stays on `ctx` through body
+                // transforms so gRPC-Web trailer framing can honor the same
+                // BufferedInitialResponseHeaderPolicyState outcomes as native
+                // trailer reconciliation; it is taken after transform below.
                 let mut after_proxy_rejected = false;
-                let mut buffered_initial_response_header_policy_state;
+                let mut buffered_initial_response_header_policy_state = None;
                 {
                     let phase_start = Instant::now();
                     let after_proxy_reject = run_after_proxy_hooks(
@@ -22138,10 +22141,8 @@ async fn handle_proxy_request_inner(
                         &mut plugin_response_headers,
                     )
                     .await;
-                    buffered_initial_response_header_policy_state =
-                        ctx.take_buffered_initial_response_header_policy();
                     if let Some(reject) = after_proxy_reject {
-                        buffered_initial_response_header_policy_state = None;
+                        let _ = ctx.take_buffered_initial_response_header_policy();
                         let normalized = normalize_reject_response(
                             StatusCode::from_u16(reject.status_code)
                                 .unwrap_or(StatusCode::BAD_GATEWAY),
@@ -22213,12 +22214,17 @@ async fn handle_proxy_request_inner(
                                 plugin_response_headers = response_headers.clone();
                                 response_trailers.clear();
                                 response_body = normalized.body;
-                                buffered_initial_response_header_policy_state = None;
+                                let _ = ctx.take_buffered_initial_response_header_policy();
                                 response_body_rejected = true;
                                 break;
                             }
                         }
                     }
+                    // Capture normalize / inspect header mutations before the
+                    // gRPC-Web transform frames trailers from the live view.
+                    ctx.record_buffered_initial_response_header_later_mutations(
+                        &mut plugin_response_headers,
+                    );
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
 
@@ -22259,7 +22265,7 @@ async fn handle_proxy_request_inner(
                             &mut response_trailers,
                             &mut authoritative_trailers_only_terminal_metadata,
                         );
-                        buffered_initial_response_header_policy_state = None;
+                        let _ = ctx.take_buffered_initial_response_header_policy();
                         // A gRPC-Web replacement (representation rejection or
                         // deadline) puts its status in the body trailer frame
                         // and keeps it out of both maps. The native gRPC
@@ -22270,13 +22276,16 @@ async fn handle_proxy_request_inner(
                             grpc_web_response_content_type.is_some();
                     }
                     response_body_rejected |= response_replaced;
-                    // Record genuine transform-phase edits BEFORE retiring stale
+                    // Take policy state for wire reconciliation. Record genuine
+                    // transform-phase edits BEFORE retiring stale
                     // compatibility-view trailers below. The discard removes
                     // trailer-only names from the merged view; if it ran first, a
                     // policy-owned initial header whose name the backend also
                     // sent as a trailer would look like a later intentional
                     // removal, and the policy would drop its desired value
                     // instead of replaying it into initial HEADERS.
+                    buffered_initial_response_header_policy_state =
+                        ctx.take_buffered_initial_response_header_policy();
                     if let Some(policy_state) =
                         buffered_initial_response_header_policy_state.as_mut()
                     {
@@ -22361,6 +22370,7 @@ async fn handle_proxy_request_inner(
                                 plugin_response_headers = response_headers.clone();
                                 response_trailers.clear();
                                 buffered_initial_response_header_policy_state = None;
+                                let _ = ctx.take_buffered_initial_response_header_policy();
                                 break;
                             }
                         }
@@ -22402,6 +22412,30 @@ async fn handle_proxy_request_inner(
                         &header_shadowed_trailer_keys,
                         buffered_initial_response_header_policy_state.as_deref(),
                     );
+                    // Body-framed gRPC-Web trailers must match the reconciled
+                    // wire trailers (policy set/override preserves application
+                    // trailers; removals and later rewrites stay authoritative).
+                    if !terminal_metadata_is_body_framed
+                        && crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx)
+                    {
+                        let http_status = ctx
+                            .metadata
+                            .get("grpc_web_http_status")
+                            .and_then(|value| value.parse::<u16>().ok());
+                        let content_type =
+                            plugin_response_headers.get("content-type").map(String::as_str);
+                        if crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                            &mut response_body,
+                            content_type,
+                            &response_trailers,
+                            http_status,
+                        ) {
+                            plugin_response_headers.insert(
+                                "content-length".to_string(),
+                                response_body.len().to_string(),
+                            );
+                        }
+                    }
                     response_headers = plugin_response_headers;
                 }
                 // Health/circuit-breaker accounting intentionally retains the
@@ -23844,6 +23878,26 @@ async fn handle_proxy_request_inner(
         backend_elapsed
     };
 
+    // Mesh-mTLS translated gRPC-Web folds backend trailers into the header map
+    // before this path runs. Capture the bridged split and begin policy-state
+    // tracking so body-framed trailers honor the same
+    // BufferedInitialResponseHeaderPolicyState outcomes as the direct gRPC pool.
+    let mut mesh_grpc_web_trailer_reconcile = None;
+    if grpc_request_is_web_translated
+        && let Some((initial_headers, trailers, shadowed_keys)) =
+            crate::plugins::grpc_web::capture_bridged_trailer_split_for_policy(&response_headers)
+    {
+        let mut merged_for_policy = response_headers.clone();
+        merged_for_policy.remove("x-ferrum-grpc-web-trailer-names");
+        merged_for_policy.remove("x-ferrum-grpc-web-shadowed-trailers");
+        ctx.begin_buffered_initial_response_header_policy(
+            plugin_cache_view.initial_response_header_policy_names(),
+            &initial_headers,
+            &merged_for_policy,
+        );
+        mesh_grpc_web_trailer_reconcile = Some((initial_headers, trailers, shadowed_keys));
+    }
+
     // after_proxy hooks run before anything is sent downstream, so a plugin may
     // still replace the backend response here (for example, content-length fast-path
     // enforcement in response_size_limiting).
@@ -23853,6 +23907,8 @@ async fn handle_proxy_request_inner(
         if let Some(reject) =
             run_after_proxy_hooks(&plugins, &mut ctx, response_status, &mut response_headers).await
         {
+            let _ = ctx.take_buffered_initial_response_header_policy();
+            mesh_grpc_web_trailer_reconcile = None;
             response_status = reject.status_code;
             response_headers = reject.headers;
             response_headers
@@ -23991,8 +24047,12 @@ async fn handle_proxy_request_inner(
             )
             .await;
             response_body = ResponseBody::Buffered(body);
+            let _ = ctx.take_buffered_initial_response_header_policy();
+            mesh_grpc_web_trailer_reconcile = None;
             response_body_rejected = true;
         }
+        // Capture normalize / inspect mutations before gRPC-Web frames trailers.
+        ctx.record_buffered_initial_response_header_later_mutations(&mut response_headers);
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
     }
 
@@ -24015,8 +24075,45 @@ async fn handle_proxy_request_inner(
             initial_response_header_policy_plugins.as_ref(),
         )
         .await;
+        if response_replaced {
+            let _ = ctx.take_buffered_initial_response_header_policy();
+            mesh_grpc_web_trailer_reconcile = None;
+        }
         response_body_rejected |= response_replaced;
+        // Mesh translated gRPC-Web: reconcile bridged trailers with policy state
+        // and rewrite the body trailer frame so it matches native H2/H3 semantics.
+        if let Some((initial_headers, mut trailers, shadowed_keys)) =
+            mesh_grpc_web_trailer_reconcile.take()
+        {
+            ctx.record_buffered_initial_response_header_later_mutations(&mut response_headers);
+            let policy_state = ctx.take_buffered_initial_response_header_policy();
+            grpc_proxy::reconcile_grpc_trailers_from_view(
+                &mut trailers,
+                &response_headers,
+                &initial_headers,
+                &shadowed_keys,
+                policy_state.as_deref(),
+            );
+            let http_status = ctx
+                .metadata
+                .get("grpc_web_http_status")
+                .and_then(|value| value.parse::<u16>().ok());
+            let content_type = response_headers.get("content-type").map(String::as_str);
+            if crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                data,
+                content_type,
+                &trailers,
+                http_status,
+            ) {
+                response_headers.insert("content-length".to_string(), data.len().to_string());
+            }
+        } else {
+            let _ = ctx.take_buffered_initial_response_header_policy();
+        }
         plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
+    } else {
+        let _ = ctx.take_buffered_initial_response_header_policy();
+        mesh_grpc_web_trailer_reconcile = None;
     }
 
     // on_final_response_body hooks — buffered responses after all body transforms.

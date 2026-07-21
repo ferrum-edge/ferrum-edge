@@ -1,11 +1,14 @@
 use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::plugins::grpc_web::{GRPC_WEB_CONFIG_KEYS, GrpcWebPlugin};
+use ferrum_edge::plugins::security_headers::SecurityHeaders;
 use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, Plugin, PluginFailurePolicy, PluginResult, create_plugin,
-    plugin_failure_policy, priority, validate_plugin_config,
+    BufferedInitialResponseHeaderPolicyState, HTTP_GRPC_PROTOCOLS, Plugin, PluginFailurePolicy,
+    PluginResult, create_plugin, plugin_failure_policy, priority, validate_plugin_config,
 };
+use ferrum_edge::proxy::grpc_proxy;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 use super::plugin_utils::create_test_context;
@@ -1473,6 +1476,203 @@ async fn test_transform_with_provenance_excludes_initial_header_only_fields() {
         !payload.contains("quota-remaining"),
         "non-trailer merged field must not enter the trailer frame: {payload}"
     );
+}
+
+/// Apply after_proxy plugins under buffered initial-header policy state, then
+/// transform + reconcile + sync so the body trailer frame matches native H2/H3.
+async fn grpc_web_body_frame_after_policy_hooks(
+    backend_headers: HashMap<String, String>,
+    backend_trailers: HashMap<String, String>,
+    hooks: &[Arc<dyn Plugin>],
+) -> String {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+    ferrum_edge::plugins::grpc_web::record_backend_trailer_provenance_for_frame(
+        &mut ctx.metadata,
+        &backend_headers,
+        &backend_trailers,
+    );
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    plugin_view.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+
+    let policy_names = hooks
+        .iter()
+        .find(|hook| hook.is_initial_response_header_policy())
+        .map(|hook| Arc::new(hook.initial_response_header_policy_names().to_vec()))
+        .unwrap_or_else(|| Arc::new(Vec::new()));
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::clone(&policy_names),
+        &backend_headers,
+        &plugin_view,
+    );
+    ferrum_edge::_test_support::begin_buffered_initial_response_header_policy_for_test(
+        &mut ctx,
+        Arc::clone(&policy_names),
+        &backend_headers,
+        &plugin_view,
+    );
+    for hook in hooks {
+        let _ = hook.after_proxy(&mut ctx, 200, &mut plugin_view).await;
+        if let Some(state) = policy_state.as_mut() {
+            state.record_after_proxy_plugin(hook.as_ref(), &mut plugin_view);
+        }
+        ferrum_edge::_test_support::record_buffered_initial_response_header_plugin_for_test(
+            &mut ctx,
+            hook.as_ref(),
+            &mut plugin_view,
+        );
+    }
+
+    let mut body = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"",
+            Some("application/grpc-web"),
+            &plugin_view,
+        )
+        .await
+        .expect("transform");
+    let mut wire_trailers = backend_trailers;
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        policy_state.as_ref(),
+    );
+    assert!(
+        ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut body,
+            Some("application/grpc-web"),
+            &wire_trailers,
+            Some(200),
+        )
+    );
+    grpc_web_trailer_payload(&body)
+}
+
+#[tokio::test]
+async fn test_transform_policy_set_preserves_backend_trailer_in_body_frame() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": true,
+            "set": { "X-Policy": "gateway-enforced" }
+        }))
+        .unwrap(),
+    );
+    let payload = grpc_web_body_frame_after_policy_hooks(
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]),
+        HashMap::from([
+            ("grpc-status".to_string(), "0".to_string()),
+            ("x-policy".to_string(), "application-value".to_string()),
+        ]),
+        &[policy],
+    )
+    .await;
+    assert!(
+        payload.contains("x-policy: application-value\r\n"),
+        "policy set/override must preserve the backend trailer in the body frame: {payload}"
+    );
+    assert!(
+        !payload.contains("gateway-enforced"),
+        "policy value must not replace the body-framed trailer: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn test_transform_policy_removal_suppresses_body_framed_trailer() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {},
+            "remove": ["X-Trailer-Only"]
+        }))
+        .unwrap(),
+    );
+    let payload = grpc_web_body_frame_after_policy_hooks(
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]),
+        HashMap::from([
+            ("grpc-status".to_string(), "0".to_string()),
+            ("x-trailer-only".to_string(), "backend-trailer".to_string()),
+        ]),
+        &[policy],
+    )
+    .await;
+    assert!(
+        !payload.contains("x-trailer-only"),
+        "final policy removal must suppress the body-framed trailer: {payload}"
+    );
+    assert!(payload.contains("grpc-status: 0"));
+}
+
+#[tokio::test]
+async fn test_transform_later_rewrite_wins_over_initial_header_policy_in_body_frame() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": false,
+            "set": { "X-Policy": "gateway-policy" }
+        }))
+        .unwrap(),
+    );
+    let later_mutator: Arc<dyn Plugin> = Arc::new(
+        ferrum_edge::plugins::response_transformer::ResponseTransformer::new(&json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "X-Policy",
+                "value": "later-transformer"
+            }]
+        }))
+        .unwrap(),
+    );
+    let payload = grpc_web_body_frame_after_policy_hooks(
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]),
+        HashMap::from([
+            ("grpc-status".to_string(), "0".to_string()),
+            ("x-policy".to_string(), "backend-trailer".to_string()),
+        ]),
+        &[policy, later_mutator],
+    )
+    .await;
+    assert!(
+        payload.contains("x-policy: later-transformer\r\n"),
+        "a later genuine rewrite must win in the body frame: {payload}"
+    );
+    assert!(!payload.contains("backend-trailer"));
+    assert!(!payload.contains("gateway-policy"));
+}
+
+#[tokio::test]
+async fn test_transform_policy_set_preserves_shadowed_collision_trailer_in_body_frame() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": true,
+            "set": { "X-Shared-Meta": "gateway-enforced" }
+        }))
+        .unwrap(),
+    );
+    let payload = grpc_web_body_frame_after_policy_hooks(
+        HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("x-shared-meta".to_string(), "initial-value".to_string()),
+        ]),
+        HashMap::from([
+            ("grpc-status".to_string(), "0".to_string()),
+            ("x-shared-meta".to_string(), "trailer-value".to_string()),
+        ]),
+        &[policy],
+    )
+    .await;
+    assert!(
+        payload.contains("x-shared-meta: trailer-value\r\n"),
+        "same-name initial/trailer collision must keep the backend trailer: {payload}"
+    );
+    assert!(!payload.contains("initial-value"));
+    assert!(!payload.contains("gateway-enforced"));
 }
 
 #[tokio::test]

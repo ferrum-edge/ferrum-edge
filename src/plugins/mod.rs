@@ -2465,10 +2465,31 @@ impl RequestContext {
         }
     }
 
+    /// Advance policy-owned initial-header state after a later response phase
+    /// mutates representation metadata (normalize / body transform).
+    pub(crate) fn record_buffered_initial_response_header_later_mutations(
+        &mut self,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if let Some(state) = self.buffered_initial_response_header_policy_state.as_mut() {
+            Arc::make_mut(state).record_later_response_header_mutations(response_headers);
+        }
+    }
+
     pub(crate) fn take_buffered_initial_response_header_policy(
         &mut self,
     ) -> Option<Arc<BufferedInitialResponseHeaderPolicyState>> {
         self.buffered_initial_response_header_policy_state.take()
+    }
+
+    /// Borrow the buffered initial-response policy state while response body
+    /// transforms still need [`BufferedInitialResponseHeaderPolicyState`]
+    /// semantics (gRPC-Web trailer framing).
+    pub(crate) fn buffered_initial_response_header_policy(
+        &self,
+    ) -> Option<&BufferedInitialResponseHeaderPolicyState> {
+        self.buffered_initial_response_header_policy_state
+            .as_deref()
     }
 
     /// Capture the pristine backend header map before trusted response hooks

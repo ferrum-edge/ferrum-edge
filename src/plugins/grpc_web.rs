@@ -70,7 +70,10 @@ use crate::proxy::headers::{
 };
 use crate::util::unknown_keys::reject_unknown_keys;
 
-use super::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
+use super::{
+    BufferedInitialResponseHeaderPolicyState, HTTP_GRPC_PROTOCOLS, Plugin, PluginResult,
+    ProxyProtocol, RequestContext,
+};
 
 /// Authoritative top-level keys accepted by [`GrpcWebPlugin::new`].
 pub const GRPC_WEB_CONFIG_KEYS: &[&str] = &["expose_headers"];
@@ -379,6 +382,7 @@ impl GrpcWebPlugin {
         http_status: Option<u16>,
         trailer_name_allowlist: Option<&HashSet<String>>,
         shadowed_trailers: Option<&HashMap<String, [String; 2]>>,
+        policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
     ) -> Option<Vec<u8>> {
         // Only transform if response content-type is gRPC-Web (set by after_proxy)
         let ct = response_headers.get("content-type")?;
@@ -405,6 +409,7 @@ impl GrpcWebPlugin {
             http_status,
             trailer_name_allowlist,
             shadowed_trailers,
+            policy_state,
         );
         output.extend(trailer_frame);
 
@@ -947,8 +952,7 @@ fn shadowed_trailers_from_metadata(
     metadata: &HashMap<String, String>,
 ) -> Option<HashMap<String, [String; 2]>> {
     let encoded = metadata.get(META_GRPC_WEB_SHADOWED_TRAILERS)?;
-    let decoded = BASE64.decode(encoded).ok()?;
-    serde_json::from_slice(&decoded).ok()
+    decode_shadowed_trailers_payload(encoded)
 }
 
 /// Record both the backend trailer allowlist and collision provenance needed
@@ -988,6 +992,58 @@ pub fn bridge_backend_trailer_provenance_for_frame(
     let shadowed = encode_shadowed_trailers_for_frame(response_headers, trailers);
     bridge_backend_trailer_names_for_frame(response_headers, trailers);
     response_headers.insert(HEADER_GRPC_WEB_SHADOWED_TRAILERS.to_string(), shadowed);
+}
+
+/// Reconstruct the backend initial-header / trailer split from bridged
+/// provenance still present on the merged response-header map.
+///
+/// Used by the mesh-mTLS translated path before `after_proxy` promotes the
+/// bridge headers into metadata, so [`BufferedInitialResponseHeaderPolicyState`]
+/// can track genuine initial headers separately from application trailers.
+/// Returns `(initial_headers, trailers, shadowed_keys)`.
+pub fn capture_bridged_trailer_split_for_policy(
+    response_headers: &HashMap<String, String>,
+) -> Option<(
+    HashMap<String, String>,
+    HashMap<String, String>,
+    HashSet<String>,
+)> {
+    let encoded_names = response_headers.get(HEADER_GRPC_WEB_TRAILER_NAMES)?;
+    let shadowed = response_headers
+        .get(HEADER_GRPC_WEB_SHADOWED_TRAILERS)
+        .and_then(decode_shadowed_trailers_payload)
+        .unwrap_or_default();
+    let mut trailers = HashMap::new();
+    let mut shadowed_keys = HashSet::new();
+    for name in encoded_names.split('\n').filter(|name| !name.is_empty()) {
+        if let Some([_, trailer_value]) = shadowed.get(name) {
+            trailers.insert(name.to_string(), trailer_value.clone());
+            shadowed_keys.insert(name.to_string());
+        } else if let Some(value) = response_headers.get(name).cloned().or_else(|| {
+            response_headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        }) {
+            trailers.insert(name.to_string(), value);
+        }
+    }
+    let mut initial = response_headers.clone();
+    initial.remove(HEADER_GRPC_WEB_TRAILER_NAMES);
+    initial.remove(HEADER_GRPC_WEB_SHADOWED_TRAILERS);
+    for name in trailers.keys() {
+        if let Some([initial_value, _]) = shadowed.get(name) {
+            initial.insert(name.clone(), initial_value.clone());
+        } else {
+            initial.retain(|key, _| !key.eq_ignore_ascii_case(name));
+        }
+    }
+    Some((initial, trailers, shadowed_keys))
+}
+
+fn decode_shadowed_trailers_payload(encoded: &str) -> Option<HashMap<String, [String; 2]>> {
+    let decoded = BASE64.decode(encoded).ok()?;
+    serde_json::from_slice(&decoded).ok()
 }
 
 fn trailer_name_allowlist_from_metadata(
@@ -1057,7 +1113,125 @@ pub(crate) fn build_trailer_frame_with_provenance(
         http_status,
         trailer_name_allowlist,
         None,
+        None,
     )
+}
+
+/// Resolve the trailer value that should enter the gRPC-Web body frame.
+///
+/// Mirrors [`crate::proxy::grpc_proxy::reconcile_grpc_trailers_from_view`]:
+/// a final initial-header policy set/override restores the pre-policy
+/// application trailer, a final policy removal suppresses ordinary trailers
+/// (reserved terminal metadata stays trailer-authoritative), and a later
+/// genuine rewrite/removal (no remaining policy outcome) follows the live
+/// merged view — including shadowed-name restoration while untouched.
+fn resolve_trailer_frame_value(
+    name: &str,
+    view_value: Option<&str>,
+    shadowed_trailers: Option<&HashMap<String, [String; 2]>>,
+    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
+) -> Option<String> {
+    if let Some((pre_policy_value, final_policy_value_present)) = policy_state
+        .and_then(|state| state.application_trailer_initial_response_policy_outcome(name))
+    {
+        if !final_policy_value_present && !is_reserved_grpc_web_terminal_metadata(name) {
+            return None;
+        }
+        if let Some(pre_policy_value) = pre_policy_value {
+            if let Some([initial_value, trailer_value]) =
+                shadowed_trailers.and_then(|shadowed| shadowed.get(name))
+            {
+                // Same-name collision: when the pre-policy outcome is the
+                // genuine initial header, keep the true backend trailer.
+                if initial_value.as_str() == pre_policy_value {
+                    return Some(trailer_value.clone());
+                }
+            }
+            return Some(pre_policy_value.to_string());
+        }
+        return None;
+    }
+    let view_value = view_value?;
+    // The compatibility view keeps an initial-header value when a backend
+    // supplied the same name in HEADERS and TRAILERS. Use the true trailer
+    // value only while that view is untouched. A hook-rewritten value wins,
+    // and a removed name stays removed.
+    Some(
+        shadowed_trailers
+            .and_then(|shadowed| shadowed.get(name))
+            .filter(|[initial_value, _]| initial_value.as_str() == view_value)
+            .map(|[_, trailer_value]| trailer_value.clone())
+            .unwrap_or_else(|| view_value.to_string()),
+    )
+}
+
+/// Replace any trailing gRPC-Web trailer frame(s) in a buffered body with a
+/// frame built from already-reconciled wire trailers.
+///
+/// Called after [`crate::proxy::grpc_proxy::reconcile_grpc_trailers_from_view`]
+/// so body-framed trailers match native H2/H3 policy semantics even when the
+/// transform-phase draft frame still saw the post-policy merged view.
+pub fn sync_translated_body_trailer_frame_from_trailers(
+    body: &mut Vec<u8>,
+    content_type: Option<&str>,
+    reconciled_trailers: &HashMap<String, String>,
+    http_status: Option<u16>,
+) -> bool {
+    let Some(content_type) = content_type.filter(|ct| is_grpc_web_content_type(ct)) else {
+        return false;
+    };
+    let is_text = is_grpc_web_text(content_type);
+    let mut binary = if is_text {
+        match BASE64.decode(body.as_slice()) {
+            Ok(decoded) => decoded,
+            // Fail closed: leave the transform-phase body untouched rather than
+            // inventing frames from a corrupt text payload.
+            Err(_) => return false,
+        }
+    } else {
+        std::mem::take(body)
+    };
+    truncate_trailing_trailer_frames(&mut binary);
+    binary.extend(build_trailer_frame(reconciled_trailers, http_status));
+    if is_text {
+        *body = BASE64.encode(&binary).into_bytes();
+    } else {
+        *body = binary;
+    }
+    true
+}
+
+/// Drop trailing gRPC-Web trailer frames (flag `0x80`) from a binary body so a
+/// reconciled frame can replace the transform-phase draft.
+fn truncate_trailing_trailer_frames(data: &mut Vec<u8>) {
+    loop {
+        let mut pos = 0;
+        let mut last_frame_start = None;
+        let mut last_frame_is_trailer = false;
+        while pos + 5 <= data.len() {
+            let flag = data[pos];
+            let len =
+                u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+                    as usize;
+            let frame_start = pos;
+            pos += 5;
+            if pos + len > data.len() {
+                return;
+            }
+            last_frame_start = Some(frame_start);
+            last_frame_is_trailer = flag == GRPC_FRAME_TRAILER;
+            pos += len;
+        }
+        // Only truncate a trailer that ends the buffer. Trailing incomplete
+        // bytes after a complete frame are left alone (fail closed).
+        if pos != data.len() || !last_frame_is_trailer {
+            return;
+        }
+        let Some(start) = last_frame_start else {
+            return;
+        };
+        data.truncate(start);
+    }
 }
 
 fn build_trailer_frame_with_full_provenance(
@@ -1065,42 +1239,58 @@ fn build_trailer_frame_with_full_provenance(
     http_status: Option<u16>,
     trailer_name_allowlist: Option<&HashSet<String>>,
     shadowed_trailers: Option<&HashMap<String, [String; 2]>>,
+    policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
 ) -> Vec<u8> {
     let connection_listed = parse_connection_listed_from_str_map(response_headers);
     let mut eligible: Vec<(String, String)> = Vec::new();
-    for (key, value) in response_headers {
-        let Some(header_name) = is_valid_trailer_header(key) else {
-            continue;
-        };
-        let name = header_name.as_str();
+    // Candidate names are the live view plus any allowlisted trailer that a
+    // final initial-header policy removed from the compatibility view.
+    // Reserved terminal metadata must still frame from the pre-policy trailer
+    // outcome (matching `reconcile_grpc_trailers_from_view`).
+    let mut candidate_names: Vec<String> = response_headers
+        .keys()
+        .filter_map(|key| is_valid_trailer_header(key).map(|name| name.as_str().to_string()))
+        .collect();
+    if let Some(allowlist) = trailer_name_allowlist {
+        for name in allowlist {
+            if is_valid_trailer_header(name).is_some()
+                && !candidate_names.iter().any(|existing| existing == name)
+            {
+                candidate_names.push(name.clone());
+            }
+        }
+    }
+    for name in candidate_names {
         if connection_listed
             .iter()
-            .any(|listed| listed.eq_ignore_ascii_case(name))
+            .any(|listed| listed.eq_ignore_ascii_case(&name))
         {
             continue;
         }
         if let Some(allowlist) = trailer_name_allowlist
-            && !allowlist.contains(name)
-            && !is_reserved_grpc_web_terminal_metadata(name)
+            && !allowlist.contains(&name)
+            && !is_reserved_grpc_web_terminal_metadata(&name)
         {
             continue;
         }
-        // The compatibility view keeps an initial-header value when a backend
-        // supplied the same name in HEADERS and TRAILERS. Use the true trailer
-        // value only while that view is untouched. A hook-rewritten value wins,
-        // and iteration over the live view means a removed name stays removed.
-        let value = shadowed_trailers
-            .and_then(|shadowed| shadowed.get(name))
-            .filter(|[initial_value, _]| initial_value == value)
-            .map(|[_, trailer_value]| trailer_value)
-            .unwrap_or(value);
+        let view_value = response_headers.get(&name).map(String::as_str).or_else(|| {
+            response_headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(&name))
+                .map(|(_, value)| value.as_str())
+        });
+        let Some(value) =
+            resolve_trailer_frame_value(&name, view_value, shadowed_trailers, policy_state)
+        else {
+            continue;
+        };
         // Multi-value gRPC metadata is stored newline-joined in the string map
         // (see `collect_buffered_grpc_trailers`). Emit each occurrence as its
         // own trailer line; reject any occurrence that fails value safety so a
         // single hostile duplicate cannot smuggle CR/LF past the filter.
         for occurrence in value.split('\n') {
             if is_valid_trailer_value(occurrence) {
-                eligible.push((name.to_string(), occurrence.to_string()));
+                eligible.push((name.clone(), occurrence.to_owned()));
             }
         }
     }
@@ -1567,6 +1757,7 @@ impl Plugin for GrpcWebPlugin {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1596,6 +1787,7 @@ impl Plugin for GrpcWebPlugin {
             http_status,
             allowlist.as_ref(),
             shadowed_trailers.as_ref(),
+            ctx.buffered_initial_response_header_policy(),
         )
     }
 }
