@@ -219,6 +219,109 @@ async fn test_detects_grpc_web_binary() {
 }
 
 #[tokio::test]
+async fn test_request_decode_mode_is_independent_from_accept_response_mode() {
+    let plugin = create_plugin_default();
+
+    let mut binary_request = create_grpc_web_context("application/grpc-web+proto");
+    binary_request.headers.insert(
+        "accept".to_string(),
+        "application/grpc-web-text; charset=utf-8".to_string(),
+    );
+    assert!(matches!(
+        plugin.on_request_received(&mut binary_request).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(binary_request.metadata.get("grpc_web_mode").map(String::as_str), Some("binary"));
+    assert_eq!(
+        binary_request
+            .metadata
+            .get("grpc_web_original_ct")
+            .map(String::as_str),
+        Some("application/grpc-web-text+proto")
+    );
+
+    let mut text_request = create_grpc_web_context("application/grpc-web-text+json");
+    text_request.headers.insert(
+        "accept".to_string(),
+        "Application/Grpc-Web; Q=1".to_string(),
+    );
+    assert!(matches!(
+        plugin.on_request_received(&mut text_request).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(text_request.metadata.get("grpc_web_mode").map(String::as_str), Some("text"));
+    assert_eq!(
+        text_request
+            .metadata
+            .get("grpc_web_original_ct")
+            .map(String::as_str),
+        Some("application/grpc-web+json")
+    );
+}
+
+#[tokio::test]
+async fn test_accept_rejection_stays_http_406_and_internal_marker_is_consumed() {
+    let plugin = create_plugin_default();
+    for accept in [
+        "text/html",
+        "application/grpc-web;q=bogus",
+        "application/grpc-web;q=0, application/grpc-web-text;q=0",
+        "application/grpc-web-text; note=\"unterminated",
+    ] {
+        let mut ctx = create_grpc_web_context("application/grpc-web+proto");
+        ctx.headers.insert("accept".to_string(), accept.to_string());
+        let PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } = plugin.on_request_received(&mut ctx).await
+        else {
+            panic!("invalid or unacceptable Accept must reject: {accept}");
+        };
+        assert_eq!(status_code, 406);
+        assert!(!plugin.should_buffer_response_body(&ctx));
+        assert!(!plugin.may_modify_response_content_type(&ctx, Some("application/grpc")));
+        let mut response_headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("vary".to_string(), "Accept".to_string()),
+        ]);
+        assert!(matches!(
+            plugin
+                .after_proxy(&mut ctx, status_code, &mut response_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            response_headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert!(!response_headers.contains_key("x-grpc-web"));
+        assert!(
+            ferrum_edge::plugins::grpc_web::translated_error_response(&ctx, 14, "blocked")
+                .is_none()
+        );
+        let normalized = ferrum_edge::_test_support::normalize_reject_response(
+            http::StatusCode::from_u16(status_code).expect("status"),
+            body.as_bytes(),
+            &headers,
+            true,
+        );
+        assert_eq!(normalized.http_status, http::StatusCode::NOT_ACCEPTABLE);
+        assert_eq!(normalized.body, body.as_bytes());
+        assert!(normalized.grpc_status.is_none());
+        assert_eq!(
+            normalized.headers.get("vary").map(String::as_str),
+            Some("Accept")
+        );
+        assert!(
+            !normalized
+                .headers
+                .contains_key("x-ferrum-grpc-web-accept-rejected")
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_may_modify_response_content_type_tracks_grpc_web_request() {
     let plugin = create_plugin_default();
 
@@ -1285,13 +1388,101 @@ fn test_response_content_type() {
     );
     assert_eq!(
         response_content_type("application/grpc-web-text+json; charset=utf-8"),
-        "application/grpc-web-text"
+        "application/grpc-web-text+json"
+    );
+    assert_eq!(
+        response_content_type("application/grpc-web+thrift"),
+        "application/grpc-web+thrift"
+    );
+    assert_eq!(
+        response_content_type("application/grpc-web-text+custom-format"),
+        "application/grpc-web-text+custom-format"
     );
     assert_eq!(
         response_content_type("application/grpc-website"),
         "application/grpc-web",
         "unrecognized values must never be reflected"
     );
+}
+
+#[test]
+fn test_accept_negotiation_lists_weights_wildcards_and_suffixes() {
+    use ferrum_edge::_test_support::negotiate_grpc_web_response_media_type as negotiate;
+
+    for (request_content_type, accept, expected) in [
+        (
+            "application/grpc-web+proto",
+            None,
+            "application/grpc-web+proto",
+        ),
+        (
+            "application/grpc-web-text+json",
+            Some(""),
+            "application/grpc-web-text+json",
+        ),
+        (
+            "application/grpc-web+proto",
+            Some("application/grpc-web-text"),
+            "application/grpc-web-text+proto",
+        ),
+        (
+            "application/grpc-web-text+json",
+            Some("application/grpc-web"),
+            "application/grpc-web+json",
+        ),
+        (
+            "application/grpc-web+json",
+            Some(
+                "text/html, Application/Grpc-Web-Text+Thrift; level=1; Q=0.7, application/grpc-web+json;q=0.2",
+            ),
+            "application/grpc-web-text+thrift",
+        ),
+        (
+            "application/grpc-web+json",
+            Some("application/grpc-website, application/*;q=0.5"),
+            "application/grpc-web+json",
+        ),
+        (
+            "application/grpc-web-text+custom",
+            Some("*/*;q=0.8"),
+            "application/grpc-web-text+custom",
+        ),
+        (
+            "application/grpc-web+json",
+            Some(
+                "application/grpc-web-text+proto;q=0, application/grpc-web-text+json;q=0.9, */*;q=0.4",
+            ),
+            "application/grpc-web-text+json",
+        ),
+        (
+            "application/grpc-web+json",
+            Some(
+                "application/grpc-web-text+proto;q=0.9, application/grpc-web-text+json;q=0.2",
+            ),
+            "application/grpc-web-text+proto",
+        ),
+    ] {
+        assert_eq!(
+            negotiate(request_content_type, accept).expect("negotiation"),
+            expected,
+            "request={request_content_type}, accept={accept:?}"
+        );
+    }
+
+    for accept in [
+        "application/grpc-web;q=1.001",
+        "application/grpc-web;q=-1",
+        "application/grpc-web;q=0.1234",
+        "application/grpc-web;q=0.5;q=0.4",
+        "application/grpc-web; note=\"unterminated",
+        "text/html, application/grpc-website",
+        "application/grpc-web;q=0, application/grpc-web-text;q=0, */*;q=0",
+    ] {
+        assert!(
+            negotiate("application/grpc-web+proto", Some(accept)).is_err(),
+            "must reject malformed or unacceptable Accept: {accept}"
+        );
+    }
 }
 
 #[test]

@@ -856,7 +856,11 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         &format!("https://127.0.0.1:{https_port}/success/echo.Echo/Unary"),
         GetOptions::default()
             .method(Method::POST)
-            .header("content-type", "application/grpc-web+proto")
+            .header("content-type", "application/grpc-web+json")
+            .header(
+                "accept",
+                "text/html, Application/Grpc-Web-Text+Json; charset=utf-8; Q=0.8",
+            )
             .header("x-api-key", "h3-grpc-web-chargeback-key-99887766")
             .body(Bytes::from(grpc_frame(b"ping"))),
     )
@@ -868,13 +872,23 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
             .headers
             .get("content-type")
             .and_then(|value| value.to_str().ok()),
-        Some("application/grpc-web+proto")
+        Some("application/grpc-web-text+json")
+    );
+    assert!(
+        response
+            .headers
+            .get("vary")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|vary| vary.split(',').any(|token| token.trim() == "Accept"))
     );
     assert!(
         response.trailers.is_none(),
         "gRPC-Web must not leak native H3 trailers"
     );
-    let frames = grpc_web_frames(&response.body_bytes);
+    let decoded_response = BASE64
+        .decode(&response.body_bytes)
+        .expect("Accept-negotiated H3 response must be base64 text");
+    let frames = grpc_web_frames(&decoded_response);
     assert_eq!(
         frames.first().map(|(flag, body)| (*flag, *body)),
         Some((0, b"pong".as_slice()))
@@ -893,12 +907,46 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         &format!("https://127.0.0.1:{https_port}/success/echo.Echo/Unary"),
         GetOptions::default()
             .method(Method::POST)
+            .header("content-type", "application/grpc-web-text+custom")
+            .header("accept", "application/grpc-web; q=1")
+            .header("x-api-key", "h3-grpc-web-chargeback-key-99887766")
+            .body(Bytes::from(BASE64.encode(grpc_frame(b"ping")))),
+    )
+    .await;
+    assert_grpc_web_error(&failure, "7", "application/grpc-web+custom");
+
+    let unacceptable = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/success/echo.Echo/Unary"),
+        GetOptions::default()
+            .method(Method::POST)
             .header("content-type", "application/grpc-web+proto")
+            .header("accept", "application/grpc-web;q=broken")
             .header("x-api-key", "h3-grpc-web-chargeback-key-99887766")
             .body(Bytes::from(grpc_frame(b"ping"))),
     )
     .await;
-    assert_grpc_web_error(&failure, "7", "application/grpc-web+proto");
+    assert_eq!(unacceptable.status, StatusCode::NOT_ACCEPTABLE);
+    assert_eq!(
+        unacceptable
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        unacceptable
+            .headers
+            .get("vary")
+            .and_then(|value| value.to_str().ok()),
+        Some("Accept")
+    );
+    assert!(
+        !unacceptable
+            .headers
+            .contains_key("x-ferrum-grpc-web-accept-rejected")
+    );
+    assert!(String::from_utf8_lossy(&unacceptable.body_bytes).contains("Not Acceptable"));
 
     let logs = gateway
         .wait_for_log_contains(

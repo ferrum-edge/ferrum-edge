@@ -1016,15 +1016,16 @@ async fn handle_h3_request(
                 if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
                     return None;
                 }
-                let accept = req
-                    .headers()
-                    .get(hyper::header::ACCEPT)
-                    .and_then(|value| value.to_str().ok());
+                let negotiated =
+                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
+                        content_type,
+                        req.headers(),
+                        state.max_header_size_bytes,
+                    );
                 Some(
-                    crate::plugins::grpc_web::negotiate_response_media_type(content_type, accept)
-                        .unwrap_or_else(|_| {
-                            crate::plugins::grpc_web::response_content_type(content_type)
-                        }),
+                    negotiated.unwrap_or_else(|_| {
+                        crate::plugins::grpc_web::response_content_type(content_type)
+                    }),
                 )
             })
     };

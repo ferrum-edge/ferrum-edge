@@ -600,15 +600,50 @@ async fn send_http_request(
     path: &str,
     content_type: &str,
 ) -> Result<(u16, HashMap<String, String>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    send_http_request_with_accept(gateway_addr, version, method, path, content_type, None).await
+}
+
+async fn send_http_request_with_accept(
+    gateway_addr: SocketAddr,
+    version: TestHttpVersion,
+    method: Method,
+    path: &str,
+    content_type: &str,
+    accept: Option<&str>,
+) -> Result<(u16, HashMap<String, String>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    send_http_request_with_body_and_accept(
+        gateway_addr,
+        version,
+        method,
+        path,
+        content_type,
+        accept,
+        Bytes::from_static(&[0u8, 0, 0, 0, 0]),
+    )
+    .await
+}
+
+async fn send_http_request_with_body_and_accept(
+    gateway_addr: SocketAddr,
+    version: TestHttpVersion,
+    method: Method,
+    path: &str,
+    content_type: &str,
+    accept: Option<&str>,
+    body: Bytes,
+) -> Result<(u16, HashMap<String, String>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
     let stream = tokio::net::TcpStream::connect(gateway_addr).await?;
     let _ = stream.set_nodelay(true);
     let io = TokioIo::new(stream);
-    let request = Request::builder()
+    let mut request = Request::builder()
         .method(method)
         .uri(path)
         .header("host", "localhost")
-        .header("content-type", content_type)
-        .body(Full::new(Bytes::from_static(&[0u8, 0, 0, 0, 0])))?;
+        .header("content-type", content_type);
+    if let Some(accept) = accept {
+        request = request.header("accept", accept);
+    }
+    let request = request.body(Full::new(body))?;
 
     let response = match version {
         TestHttpVersion::H1 => {
@@ -650,6 +685,107 @@ async fn send_http_request(
         .map(|collected| collected.to_bytes().to_vec())
         .unwrap_or_default();
     Ok((status, headers, body))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let (backend_addr, _backend_handle) = start_grpc_backend_with_trailer_fixture().await;
+    let mut proxy = create_grpc_proxy("grpc-web-accept", "/grpc-accept", backend_addr.port());
+    proxy.response_body_mode = ResponseBodyMode::Buffer;
+    attach_test_plugin(&mut proxy, "grpc-web-accept-plugin");
+    let plugin = test_plugin_config(
+        "grpc-web-accept-plugin",
+        "grpc_web",
+        "grpc-web-accept",
+        serde_json::json!({}),
+    );
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
+        let (status, headers, encoded) = send_http_request_with_accept(
+            gateway_addr,
+            version,
+            Method::POST,
+            "/grpc-accept/my.Service/Unary",
+            "application/grpc-web+json",
+            Some(
+                "text/html, Application/Grpc-Web-Text+Json; charset=utf-8; Q=0.8",
+            ),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{version:?} text-negotiated request failed: {error}"));
+        assert_eq!(status, 200, "{version:?} text-negotiated status");
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/grpc-web-text+json"),
+            "{version:?} text-negotiated content type"
+        );
+        assert!(
+            headers
+                .get("vary")
+                .is_some_and(|vary| vary.split(',').any(|token| token.trim() == "Accept")),
+            "{version:?} negotiated response must vary on Accept"
+        );
+        let decoded = BASE64
+            .decode(&encoded)
+            .unwrap_or_else(|error| panic!("{version:?} response was not base64: {error}"));
+        assert!(
+            decoded
+                .windows(b"grpc-status: 0".len())
+                .any(|window| window == b"grpc-status: 0"),
+            "{version:?} text response missing terminal status"
+        );
+
+        let text_request = BASE64.encode([0u8, 0, 0, 0, 0]);
+        let (status, headers, binary) = send_http_request_with_body_and_accept(
+            gateway_addr,
+            version,
+            Method::POST,
+            "/grpc-accept/my.Service/Unary",
+            "application/grpc-web-text+custom",
+            Some("application/grpc-web; q=1"),
+            Bytes::from(text_request),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{version:?} binary-negotiated request failed: {error}"));
+        assert_eq!(status, 200, "{version:?} binary-negotiated status");
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/grpc-web+custom"),
+            "{version:?} binary-negotiated content type"
+        );
+        assert!(
+            binary
+                .windows(b"grpc-status: 0".len())
+                .any(|window| window == b"grpc-status: 0"),
+            "{version:?} binary response missing terminal status"
+        );
+
+        for accept in ["text/html", "application/grpc-web;q=broken"] {
+            let (status, headers, body) = send_http_request_with_accept(
+                gateway_addr,
+                version,
+                Method::POST,
+                "/grpc-accept/my.Service/Unary",
+                "application/grpc-web+proto",
+                Some(accept),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{version:?} rejected request failed: {error}"));
+            assert_eq!(status, 406, "{version:?} rejected Accept {accept}");
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+            assert_eq!(headers.get("vary").map(String::as_str), Some("Accept"));
+            assert!(!headers.contains_key("x-ferrum-grpc-web-accept-rejected"));
+            assert!(String::from_utf8_lossy(&body).contains("Not Acceptable"));
+        }
+    }
 }
 
 fn test_plugin_config(

@@ -17514,7 +17514,8 @@ components:
         Content-Type; response encoding and Content-Type follow Accept
         negotiation (absent Accept defaults to the request Content-Type mode
         and suffix; lists, q-values, and */* / application/* wildcards are
-        honored; malformed or fully refused Accept fails closed with HTTP 406).
+        honored; malformed or fully refused Accept fails closed with HTTP 406;
+        translated responses merge Vary: Accept so caches separate variants).
         Config must be a JSON object (not null); `{}` and objects that only set
         `expose_headers` are accepted. Unknown keys are rejected. When a backend
         or intermediary response omits a valid numeric grpc-status, the response

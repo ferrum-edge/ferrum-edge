@@ -98,6 +98,17 @@ const META_GRPC_WEB_ORIGINAL_CT: &str = "grpc_web_original_ct";
 /// status is stashed here for HTTP→gRPC trailer synthesis when `grpc-status`
 /// is absent.
 const META_GRPC_WEB_HTTP_STATUS: &str = "grpc_web_http_status";
+/// Metadata marker for this plugin's own failed Accept negotiation. Frontend
+/// classification may already have retained the request representation for
+/// unrelated early errors; this marker prevents later response hooks from
+/// turning the intentional HTTP 406 into a gRPC-Web response.
+const META_GRPC_WEB_ACCEPT_REJECTED: &str = "grpc_web_accept_rejected";
+/// Gateway-internal response marker carried only on the plugin's own Accept
+/// negotiation rejection. The shared rejection normalizer consumes it to keep
+/// this protocol-level failure as HTTP 406 instead of translating it into an
+/// HTTP-200 gRPC status response.
+pub(crate) const HEADER_GRPC_WEB_ACCEPT_REJECTED: &str =
+    "x-ferrum-grpc-web-accept-rejected";
 
 /// Internal proxy header injected by `before_proxy` so that `transform_request_body`
 /// (which lacks access to `ctx.metadata`) can deterministically identify the
@@ -600,7 +611,7 @@ fn valid_grpc_web_parameters(mut value: &[u8]) -> bool {
 ///
 /// Returns `None` when the parameter is present but not a valid weight — callers
 /// treat that as a malformed Accept list and fail closed.
-fn parse_q_weight(raw: &[u8]) -> Option<f32> {
+fn parse_q_weight(raw: &[u8]) -> Option<u16> {
     let text = std::str::from_utf8(trim_ows(raw)).ok()?;
     if text.is_empty() {
         return None;
@@ -618,16 +629,24 @@ fn parse_q_weight(raw: &[u8]) -> Option<f32> {
     if whole == "1" && !frac.is_empty() && !frac.bytes().all(|b| b == b'0') {
         return None;
     }
-    let value: f32 = text.parse().ok().filter(|v: &f32| v.is_finite())?;
-    if !(0.0..=1.0).contains(&value) {
-        return None;
+    if whole == "1" {
+        return Some(1000);
     }
-    Some(value)
+    let mut thousandths = 0u16;
+    for (index, digit) in frac.bytes().enumerate() {
+        let place = match index {
+            0 => 100,
+            1 => 10,
+            _ => 1,
+        };
+        thousandths += u16::from(digit - b'0') * place;
+    }
+    Some(thousandths)
 }
 
-fn parameter_q_weight(parameters: &[u8]) -> Result<f32, GrpcWebAcceptError> {
+fn parameter_q_weight(parameters: &[u8]) -> Result<u16, GrpcWebAcceptError> {
     let mut value = parameters;
-    let mut quality: Option<f32> = None;
+    let mut quality: Option<u16> = None;
     while !value.is_empty() {
         while value.first().is_some_and(|byte| is_ows(*byte)) {
             value = &value[1..];
@@ -704,7 +723,7 @@ fn parameter_q_weight(parameters: &[u8]) -> Result<f32, GrpcWebAcceptError> {
             return Err(GrpcWebAcceptError::Malformed);
         }
     }
-    Ok(quality.unwrap_or(1.0))
+    Ok(quality.unwrap_or(1000))
 }
 
 fn grpc_web_media_type(ct: &str) -> Option<GrpcWebMediaType> {
@@ -758,6 +777,31 @@ fn canonical_grpc_web_content_type(media: &GrpcWebMediaType) -> String {
     }
 }
 
+fn ensure_vary_accept(headers: &mut HashMap<String, String>) {
+    match headers.get("vary") {
+        Some(existing)
+            if existing.trim() == "*"
+                || existing
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("accept")) =>
+        {
+            return;
+        }
+        Some(existing) => {
+            let mut merged = String::with_capacity(existing.len() + ", Accept".len());
+            merged.push_str(existing);
+            if !existing.trim().is_empty() {
+                merged.push_str(", ");
+            }
+            merged.push_str("Accept");
+            headers.insert("vary".to_string(), merged);
+        }
+        None => {
+            headers.insert("vary".to_string(), "Accept".to_string());
+        }
+    }
+}
+
 /// Specificity rank for Accept matching: exact > type wildcard > full wildcard.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum AcceptSpecificity {
@@ -777,7 +821,7 @@ struct AcceptRange {
     kind: AcceptRangeKind,
     /// When the Accept entry names a `+suffix`, that suffix is preferred.
     format_suffix: Option<String>,
-    quality: f32,
+    quality: u16,
     specificity: AcceptSpecificity,
 }
 
@@ -895,81 +939,98 @@ pub fn negotiate_response_media_type(
         return Err(GrpcWebAcceptError::NotAcceptable);
     }
 
-    // Last exact entry wins per mode (quality + Accept-supplied suffix).
-    let mut exact_binary: Option<(f32, Option<String>)> = None;
-    let mut exact_text: Option<(f32, Option<String>)> = None;
-    let mut best_wildcard: Option<(f32, AcceptSpecificity)> = None;
+    // Candidate representations are the request format in both wire modes plus
+    // every explicitly requested format. A refusal for one exact suffix must
+    // not poison another acceptable suffix in the same binary/text mode.
+    let mut candidates = vec![
+        GrpcWebMediaType {
+            mode: GrpcWebMode::Binary,
+            format_suffix: request.format_suffix.clone(),
+        },
+        GrpcWebMediaType {
+            mode: GrpcWebMode::Text,
+            format_suffix: request.format_suffix.clone(),
+        },
+    ];
     for range in &ranges {
-        match range.kind {
-            AcceptRangeKind::Exact(GrpcWebMode::Binary) => {
-                exact_binary = Some((range.quality, range.format_suffix.clone()));
-            }
-            AcceptRangeKind::Exact(GrpcWebMode::Text) => {
-                exact_text = Some((range.quality, range.format_suffix.clone()));
-            }
-            AcceptRangeKind::ApplicationWildcard | AcceptRangeKind::FullWildcard => {
-                if range.quality <= 0.0 {
-                    continue;
-                }
-                let replace = match best_wildcard {
-                    None => true,
-                    Some((best_q, best_spec)) => {
-                        range.quality > best_q
-                            || (range.quality == best_q && range.specificity > best_spec)
-                    }
-                };
-                if replace {
-                    best_wildcard = Some((range.quality, range.specificity));
-                }
-            }
-        }
-    }
-
-    let mut best: Option<(f32, AcceptSpecificity, bool, GrpcWebMediaType)> = None;
-    let mut consider =
-        |quality: f32, specificity: AcceptSpecificity, mode: GrpcWebMode, suffix: Option<String>| {
-            if quality <= 0.0 {
-                return;
-            }
-            let format_suffix = suffix.or_else(|| request.format_suffix.clone());
+        if let AcceptRangeKind::Exact(mode) = range.kind {
             let candidate = GrpcWebMediaType {
                 mode,
-                format_suffix,
+                format_suffix: range
+                    .format_suffix
+                    .clone()
+                    .or_else(|| request.format_suffix.clone()),
             };
-            let matches_request_mode = mode == request.mode;
-            let replace = match &best {
-                None => true,
-                Some((best_q, best_spec, best_match, _)) => {
-                    quality > *best_q
-                        || (quality == *best_q && specificity > *best_spec)
-                        || (quality == *best_q
-                            && specificity == *best_spec
-                            && matches_request_mode
-                            && !*best_match)
-                }
-            };
-            if replace {
-                best = Some((quality, specificity, matches_request_mode, candidate));
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
             }
+        }
+    }
+
+    let mut best: Option<(u16, AcceptSpecificity, bool, usize, GrpcWebMediaType)> = None;
+    for candidate in candidates {
+        // RFC 9110 selection is per representation: the most specific matching
+        // range supplies its quality. The later entry wins only when the same
+        // representation has duplicate ranges at equal specificity.
+        let mut controlling: Option<(AcceptSpecificity, usize, u16)> = None;
+        for (index, range) in ranges.iter().enumerate() {
+            let matches = match range.kind {
+                AcceptRangeKind::Exact(mode) => {
+                    mode == candidate.mode
+                        && range
+                            .format_suffix
+                            .as_deref()
+                            .or(request.format_suffix.as_deref())
+                            == candidate.format_suffix.as_deref()
+                }
+                AcceptRangeKind::ApplicationWildcard | AcceptRangeKind::FullWildcard => true,
+            };
+            if !matches {
+                continue;
+            }
+            if controlling
+                .as_ref()
+                .is_none_or(|(specificity, previous_index, _)| {
+                    range.specificity > *specificity
+                        || (range.specificity == *specificity && index > *previous_index)
+                })
+            {
+                controlling = Some((range.specificity, index, range.quality));
+            }
+        }
+        let Some((specificity, index, quality)) = controlling else {
+            continue;
         };
-
-    if let Some((quality, suffix)) = exact_binary {
-        consider(quality, AcceptSpecificity::Exact, GrpcWebMode::Binary, suffix);
-    }
-    if let Some((quality, suffix)) = exact_text {
-        consider(quality, AcceptSpecificity::Exact, GrpcWebMode::Text, suffix);
-    }
-    // Wildcards fill only modes that have no exact Accept entry.
-    if let Some((quality, specificity)) = best_wildcard {
-        if exact_binary.is_none() {
-            consider(quality, specificity, GrpcWebMode::Binary, None);
+        if quality == 0 {
+            continue;
         }
-        if exact_text.is_none() {
-            consider(quality, specificity, GrpcWebMode::Text, None);
+        let matches_request_mode = candidate.mode == request.mode;
+        let replace = best.as_ref().is_none_or(
+            |(best_quality, best_specificity, best_matches_request, best_index, _)| {
+                quality > *best_quality
+                    || (quality == *best_quality && specificity > *best_specificity)
+                    || (quality == *best_quality
+                        && specificity == *best_specificity
+                        && matches_request_mode
+                        && !*best_matches_request)
+                    || (quality == *best_quality
+                        && specificity == *best_specificity
+                        && matches_request_mode == *best_matches_request
+                        && index < *best_index)
+            },
+        );
+        if replace {
+            best = Some((
+                quality,
+                specificity,
+                matches_request_mode,
+                index,
+                candidate,
+            ));
         }
     }
 
-    best.map(|(_, _, _, media)| canonical_grpc_web_content_type(&media))
+    best.map(|(_, _, _, _, media)| canonical_grpc_web_content_type(&media))
         .ok_or(GrpcWebAcceptError::NotAcceptable)
 }
 
@@ -1015,16 +1076,63 @@ pub(crate) fn retain_client_content_type_for_errors(ctx: &mut RequestContext, co
     if !is_grpc_web_content_type(content_type) {
         return;
     }
-    let accept = ctx
-        .headers
-        .get("accept")
-        .map(String::as_str)
-        .or_else(|| ctx.raw_header_get("accept"));
-    let retained = match negotiate_response_media_type(content_type, accept) {
+    let accept = request_accept_header(ctx);
+    let retained = match accept.and_then(|accept| {
+        negotiate_response_media_type(content_type, accept.as_deref())
+    }) {
         Ok(negotiated) => negotiated,
         Err(_) => response_content_type(content_type),
     };
     retain_negotiated_response_content_type(ctx, &retained);
+}
+
+fn combine_accept_header_values<'a>(
+    values: impl IntoIterator<Item = &'a [u8]>,
+    max_bytes: usize,
+) -> Result<Option<String>, GrpcWebAcceptError> {
+    let mut combined = String::new();
+    for value in values {
+        let value = std::str::from_utf8(value).map_err(|_| GrpcWebAcceptError::Malformed)?;
+        let separator_len = if combined.is_empty() { 0 } else { 1 };
+        if combined
+            .len()
+            .checked_add(separator_len)
+            .and_then(|length| length.checked_add(value.len()))
+            .is_none_or(|length| length > max_bytes)
+        {
+            return Err(GrpcWebAcceptError::Malformed);
+        }
+        if !combined.is_empty() {
+            combined.push(',');
+        }
+        combined.push_str(value);
+    }
+    Ok((!combined.is_empty()).then_some(combined))
+}
+
+fn request_accept_header(ctx: &RequestContext) -> Result<Option<String>, GrpcWebAcceptError> {
+    if ctx.has_raw_headers() {
+        return combine_accept_header_values(ctx.raw_header_value_bytes("accept"), usize::MAX);
+    }
+    Ok(ctx.headers.get("accept").cloned())
+}
+
+/// Negotiate from every `Accept` field line in an HTTP header map. Frontend
+/// early-error classification uses this same parser as the plugin request hook
+/// so duplicate field lines, invalid bytes, and list semantics cannot diverge.
+pub(crate) fn negotiate_response_media_type_from_headers(
+    request_content_type: &str,
+    headers: &http::HeaderMap,
+    max_accept_bytes: usize,
+) -> Result<String, GrpcWebAcceptError> {
+    let accept = combine_accept_header_values(
+        headers
+            .get_all(http::header::ACCEPT)
+            .iter()
+            .map(|value| value.as_bytes()),
+        max_accept_bytes,
+    )?;
+    negotiate_response_media_type(request_content_type, accept.as_deref())
 }
 
 /// Store an already-negotiated (or defaulted) gRPC-Web response media type for
@@ -1042,7 +1150,7 @@ pub(crate) fn retain_negotiated_response_content_type(
 }
 
 pub(crate) fn client_uses_grpc_web(ctx: &RequestContext) -> bool {
-    ctx.metadata.contains_key(META_GRPC_WEB_ORIGINAL_CT)
+    retained_response_content_type(ctx).is_some()
 }
 
 /// Which gRPC framing grammar this request's buffered response body may use, or
@@ -1091,6 +1199,9 @@ pub(crate) fn client_grpc_framing_representation(
 /// `on_request_received`, so callers must not re-derive it from request
 /// `Content-Type` alone — that would ignore Accept negotiation.
 pub(crate) fn retained_response_content_type(ctx: &RequestContext) -> Option<&str> {
+    if ctx.metadata.contains_key(META_GRPC_WEB_ACCEPT_REJECTED) {
+        return None;
+    }
     ctx.metadata
         .get(META_GRPC_WEB_ORIGINAL_CT)
         .map(String::as_str)
@@ -1141,13 +1252,14 @@ pub fn error_response_for_content_type(
     message: &str,
 ) -> GrpcWebErrorResponse {
     let response_ct = response_content_type(response_ct);
-    let mut headers = HashMap::with_capacity(3);
+    let mut headers = HashMap::with_capacity(4);
     headers.insert("content-type".to_string(), response_ct.clone());
     headers.insert("x-grpc-web".to_string(), "1".to_string());
     headers.insert(
         "access-control-expose-headers".to_string(),
         BASE_EXPOSE_HEADERS_VALUE.to_string(),
     );
+    ensure_vary_accept(&mut headers);
 
     // gRPC-Web carries terminal metadata in its body trailer frame, never as
     // native response headers. Keep a separate trailer map so an early gateway
@@ -1356,7 +1468,8 @@ impl Plugin for GrpcWebPlugin {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        ctx.metadata.contains_key(META_GRPC_WEB_MODE)
+        !ctx.metadata.contains_key(META_GRPC_WEB_ACCEPT_REJECTED)
+            && ctx.metadata.contains_key(META_GRPC_WEB_MODE)
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1407,24 +1520,31 @@ impl Plugin for GrpcWebPlugin {
         };
 
         // Response encoding follows Accept negotiation (default: request CT).
-        let accept = ctx.headers.get("accept").map(String::as_str);
-        let response_ct = match negotiate_response_media_type(&content_type, accept) {
+        let accept = request_accept_header(ctx);
+        let response_ct = match accept.and_then(|accept| {
+            negotiate_response_media_type(&content_type, accept.as_deref())
+        }) {
             Ok(negotiated) => negotiated,
             Err(err) => {
                 debug!(
                     plugin = "grpc_web",
                     ?err,
-                    accept = ?accept,
                     "Rejecting gRPC-Web request: Accept negotiation failed"
                 );
+                ctx.metadata
+                    .insert(META_GRPC_WEB_ACCEPT_REJECTED.to_string(), "1".to_string());
                 return PluginResult::Reject {
                     status_code: 406,
                     body: r#"{"error":"Not Acceptable: no supported gRPC-Web response media type"}"#
                         .to_string(),
-                    headers: HashMap::from([(
-                        "content-type".to_string(),
-                        "application/json".to_string(),
-                    )]),
+                    headers: HashMap::from([
+                        (
+                            "content-type".to_string(),
+                            "application/json".to_string(),
+                        ),
+                        ("vary".to_string(), "Accept".to_string()),
+                        (HEADER_GRPC_WEB_ACCEPT_REJECTED.to_string(), "1".to_string()),
+                    ]),
                 };
             }
         };
@@ -1569,7 +1689,7 @@ impl Plugin for GrpcWebPlugin {
         // newly pins a streaming body.) Signal that so the proxy keeps the body
         // buffered for final-response inspection instead of trusting the
         // backend's `application/grpc` header for the buffer/stream decision.
-        ctx.metadata.contains_key(META_GRPC_WEB_ORIGINAL_CT)
+        retained_response_content_type(ctx).is_some()
     }
 
     async fn after_proxy(
@@ -1578,6 +1698,10 @@ impl Plugin for GrpcWebPlugin {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        if ctx.metadata.contains_key(META_GRPC_WEB_ACCEPT_REJECTED) {
+            return PluginResult::Continue;
+        }
+
         // The shared lifecycle cannot embed trailers or base64-rewrite a
         // preserved 206/226 representation. Leave its native headers coherent
         // with the untouched bytes instead of falsely labelling it gRPC-Web.
@@ -1606,6 +1730,7 @@ impl Plugin for GrpcWebPlugin {
 
         // Signal to clients that this is a gRPC-Web response
         response_headers.insert("x-grpc-web".to_string(), "1".to_string());
+        ensure_vary_accept(response_headers);
 
         // Add CORS-friendly expose headers so browsers can read gRPC metadata.
         // We MUST set this whether or not the backend already returned an
