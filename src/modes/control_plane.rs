@@ -2456,7 +2456,10 @@ mod tests {
             "CP recovery must share the startup custom-plugin migration policy"
         );
         assert!(
-            source.matches("plugin_migrations_need_reconcile = true;").count() >= 2,
+            source
+                .matches("plugin_migrations_need_reconcile = true;")
+                .count()
+                >= 2,
             "both DNS pool reconnect and failover must reset the migration gate"
         );
         for context in [

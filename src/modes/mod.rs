@@ -586,10 +586,9 @@ mod tests {
         let db: Arc<dyn DatabaseBackend> = store;
         let migrations = synthetic_pending_migration();
 
-        let err =
-            handle_startup_plugin_migrations_with_list(&db, true, "database", &migrations)
-                .await
-                .expect_err("auto-apply must fail startup when pending probe fails");
+        let err = handle_startup_plugin_migrations_with_list(&db, true, "database", &migrations)
+            .await
+            .expect_err("auto-apply must fail startup when pending probe fails");
 
         assert!(
             err.to_string().contains(
@@ -620,8 +619,8 @@ mod tests {
         let migrations = synthetic_pending_migration();
 
         handle_startup_plugin_migrations_with_list(&db, false, "database-recovery", &migrations)
-        .await
-        .expect("warn-only recovery must match warn-only startup probe behavior");
+            .await
+            .expect("warn-only recovery must match warn-only startup probe behavior");
     }
 
     #[tokio::test]

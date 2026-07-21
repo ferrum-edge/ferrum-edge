@@ -2861,9 +2861,8 @@ mod tests {
             "a successful initial DB load after offline connect must run plugin migration policy"
         );
         assert!(
-            startup_recovery.contains(
-                ".store(PLUGIN_MIGRATIONS_RECONCILED, Ordering::Release)"
-            ) && startup_recovery.contains("bootstrap_from_backup = false;"),
+            startup_recovery.contains(".store(PLUGIN_MIGRATIONS_RECONCILED, Ordering::Release)")
+                && startup_recovery.contains("bootstrap_from_backup = false;"),
             "startup recovery must clear both migration and backup availability gates"
         );
     }
