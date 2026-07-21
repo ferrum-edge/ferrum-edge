@@ -4571,7 +4571,11 @@ fn ai_prompt_shield_excluded_from_native_grpc_but_retained_on_grpc_web_view() {
     // transports. The composed gRPC-Web view keeps HTTP guardrails, which then
     // skip framed bodies without decoding.
     let config = make_config(
-        vec![make_proxy("p1", "/ai", vec!["shield", "grpc-web", "limiter"])],
+        vec![make_proxy(
+            "p1",
+            "/ai",
+            vec!["shield", "grpc-web", "limiter"],
+        )],
         vec![
             make_plugin_config(
                 "shield",
@@ -4581,7 +4585,13 @@ fn ai_prompt_shield_excluded_from_native_grpc_but_retained_on_grpc_web_view() {
                 true,
             ),
             make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
-            make_plugin_config("limiter", "rate_limiting", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "limiter",
+                "rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
         ],
     );
     let cache = PluginCache::new(&config).expect("plugin cache");
