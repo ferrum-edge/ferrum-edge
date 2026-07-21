@@ -76,7 +76,7 @@ fn later_early_phases_reuse_one_prebuffer_instead_of_a_second_drain() {
     // Simulate a second consumer that would otherwise start a fresh operator
     // window: with reuse, composition is never consulted again for that body.
     let absolute = tokio::time::Instant::now()
-        .checked_add(Duration::from_millis(40))
+        .checked_add(Duration::from_secs(60))
         .expect("representable");
     let first = compose_early_upload_bound_for_test(Some(absolute), 40).expect("first drain bound");
     assert_eq!(first.1, EarlyUploadBoundKind::OperatorTimeout);
