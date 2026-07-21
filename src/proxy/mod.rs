@@ -9872,6 +9872,7 @@ async fn handle_websocket_request_authenticated(
         auth_method: ctx.auth_method,
         metadata: clone_log_metadata(&ctx),
         session_start: chrono::Utc::now(),
+        session_start_mono: Instant::now(),
     };
     tokio::spawn(async move {
         let _ws_lb_guard = ws_lb_guard;
@@ -11173,7 +11174,11 @@ pub struct WsSessionMeta {
     pub consumer_username: Option<String>,
     pub auth_method: Option<&'static str>,
     pub metadata: HashMap<String, String>,
+    /// Civil/UTC connect time for human-readable `timestamp_connected` only.
     pub session_start: chrono::DateTime<chrono::Utc>,
+    /// Process-monotonic connect instant used for `duration_ms`. Wall-clock
+    /// corrections must not freeze, clamp, or inflate WebSocket session duration.
+    pub session_start_mono: Instant,
 }
 
 /// Fire `on_ws_disconnect` for the tunnel-mode path, where raw
@@ -11205,10 +11210,8 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
     if ws_disconnect_plugins.is_empty() {
         return;
     }
+    let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
     let disconnected_at = chrono::Utc::now();
-    let disconnect_duration_ms = (disconnected_at - session_meta.session_start)
-        .num_milliseconds()
-        .max(0) as f64;
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace.clone(),
         proxy_id: proxy_id.to_string(),
@@ -12429,10 +12432,8 @@ where
     // the whole block — zero overhead for deployments that don't observe
     // WebSocket sessions.
     if !ws_disconnect_plugins.is_empty() {
+        let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
         let disconnected_at = chrono::Utc::now();
-        let disconnect_duration_ms = (disconnected_at - session_meta.session_start)
-            .num_milliseconds()
-            .max(0) as f64;
         let failure = first_failure.get().cloned();
         let disconnect_ctx = crate::plugins::WsDisconnectContext {
             namespace: session_meta.namespace,

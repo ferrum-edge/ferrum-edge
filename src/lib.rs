@@ -2084,6 +2084,35 @@ pub mod _test_support {
             auth_method: None,
             metadata,
             session_start,
+            // Duration is Instant-based; wall `session_start` is rendering-only.
+            session_start_mono: std::time::Instant::now(),
+        }
+    }
+
+    /// Test helper that pins both wall and monotonic WebSocket session starts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn make_ws_session_meta_with_mono(
+        namespace: String,
+        proxy_name: Option<String>,
+        client_ip: String,
+        backend_target: String,
+        listen_port: u16,
+        consumer_username: Option<String>,
+        metadata: HashMap<String, String>,
+        session_start: chrono::DateTime<chrono::Utc>,
+        session_start_mono: std::time::Instant,
+    ) -> crate::proxy::WsSessionMeta {
+        crate::proxy::WsSessionMeta {
+            namespace,
+            proxy_name,
+            client_ip,
+            backend_target,
+            listen_port,
+            consumer_username,
+            auth_method: None,
+            metadata,
+            session_start,
+            session_start_mono,
         }
     }
 

@@ -24,8 +24,11 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use std::time::Instant;
+
 use ferrum_edge::_test_support::{
     StreamIoSide, fire_ws_tunnel_disconnect_hooks, make_ws_session_meta,
+    make_ws_session_meta_with_mono,
 };
 use ferrum_edge::plugins::{Direction, Plugin, WsDisconnectContext};
 use ferrum_edge::retry::ErrorClass;
@@ -43,6 +46,7 @@ struct CapturedDisconnect {
     frames_b2c: u64,
     bytes_c2b: u64,
     bytes_b2c: u64,
+    duration_ms: f64,
     timestamp_connected: String,
     timestamp_disconnected: String,
     direction: Option<Direction>,
@@ -84,6 +88,7 @@ impl Plugin for CapturingDisconnectPlugin {
             frames_b2c: ctx.frames_backend_to_client,
             bytes_c2b: ctx.bytes_client_to_backend,
             bytes_b2c: ctx.bytes_backend_to_client,
+            duration_ms: ctx.duration_ms,
             timestamp_connected: ctx.timestamp_connected.clone(),
             timestamp_disconnected: ctx.timestamp_disconnected.clone(),
             direction: ctx.direction,
@@ -213,4 +218,38 @@ async fn test_tunnel_disconnect_skips_when_no_plugins_opted_in() {
         Some((Direction::Unknown, ErrorClass::RequestError, None)),
     )
     .await;
+}
+
+#[tokio::test]
+async fn test_tunnel_disconnect_duration_ignores_wall_clock_skew() {
+    // Wall connect is an hour in the past; monotonic start is "now". Duration
+    // must follow Instant, not civil-clock subtraction (~3.6e6 ms).
+    let (plugin, captured) = CapturingDisconnectPlugin::new();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin)];
+    let meta = make_ws_session_meta_with_mono(
+        "ferrum".to_string(),
+        Some("ws-echo".to_string()),
+        "10.0.0.7".to_string(),
+        "backend:9000".to_string(),
+        8000,
+        None,
+        HashMap::new(),
+        chrono::Utc::now() - chrono::Duration::hours(1),
+        Instant::now(),
+    );
+
+    fire_ws_tunnel_disconnect_hooks(&plugins, "proxy-abc", &meta, 0, 0, None).await;
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert!(
+        captured[0].duration_ms < 5_000.0,
+        "duration_ms must use Instant, not wall delta; got {}",
+        captured[0].duration_ms
+    );
+    assert_eq!(
+        captured[0].timestamp_connected,
+        meta.session_start.to_rfc3339(),
+        "wall connect timestamp is preserved for rendering"
+    );
 }

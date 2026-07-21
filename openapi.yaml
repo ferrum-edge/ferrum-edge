@@ -12487,7 +12487,7 @@ components:
             metric:
               type: string
               enum: [backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms]
-              description: Latency metric to observe. `stream_duration_ms` applies to TCP/UDP/WebSocket sessions; the others apply to HTTP-family summaries.
+              description: Latency metric to observe. `stream_duration_ms` applies to TCP/UDP/DTLS/WebSocket sessions and is measured on a process-monotonic clock (not UTC wall time); connect/disconnect timestamps remain civil-clock values for rendering. The other metrics apply to HTTP-family summaries.
             percentile:
               type: integer
               minimum: 1
