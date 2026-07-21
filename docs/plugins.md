@@ -3233,7 +3233,7 @@ representations explicitly outside the configured response-body scan scope.
 | `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
 | `fp_filters` | string[] | `[]` | Regex filters that suppress known false-positive captured values for this rule. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
-| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries use the same exact / trailing-`*` prefix / `~` regex grammar as `global_exemptions.paths`; `~regex` entries are wrapped as `^(?:regex)`, so use `~.*pattern` for a floating substring match. |
+| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries share exact-match and trailing-`*` prefix forms with `global_exemptions.paths`, but `~regex` anchoring differs: rule `conditions.paths` compile the text after `~` as an operator-authored, unanchored regex evaluated with Rust regex `is_match`, so they may match anywhere in the path unless the pattern itself is anchored (for example `~^/admin(?:/|$)`). A floating match such as `~api` therefore matches both `/api/users` and `/v1/api-keys`. Exact and prefix forms are unchanged and are not regex-anchored. |
 
 Supported targets: `header_names`, `header_values`, `query_keys`,
 `query_values`, `cookies`, `url_path`, `full_url`, `method`, `body_text`,
@@ -3247,9 +3247,10 @@ rules can match IPv6-shaped hex text from logs or diagnostics. Prefer narrow
 `global_exemptions` supports `paths`, `methods`, `consumers`, `ips`,
 `header_present`, and `fp_capture_filters`. Path entries ending in `*` are
 prefix matches; entries starting with `~` are start-anchored regex patterns
-wrapped as `^(?:regex)`; all other entries are exact-path matches (so `/health`
-exempts only `/health`, not `/healthz` or `/health-admin`). Use `~.*pattern`
-for a floating substring match.
+wrapped as `^(?:regex)` (unlike unanchored per-rule `conditions.paths`); all
+other entries are exact-path matches (so `/health` exempts only `/health`, not
+`/healthz` or `/health-admin`). Use `~.*pattern` for a floating substring match
+under these start-anchored exemption semantics.
 
 ```yaml
 config:
@@ -3319,8 +3320,9 @@ Request-side validation only buffers matching request bodies: methods that can c
 | `protobuf_response_type` | String | — | Default fully-qualified protobuf message type for response validation |
 | `protobuf_method_messages` | Object | `{}` | Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`). Each value has `request` and/or `response` string fields |
 | `protobuf_reject_unknown_fields` | bool | `false` | Reject messages containing field numbers not in the descriptor |
+| `grpc_max_decompressed_size_bytes` | usize | env / 10 MiB | Maximum decompressed gRPC protobuf payload size for both request and response validation. `0` disables the decompressed cap. When omitted, inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses as an unsigned integer; otherwise falls back to 10 MiB (10485760). |
 
-**gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly.
+**gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly. The decompressed size is bounded by `grpc_max_decompressed_size_bytes`.
 
 **Scope**: Protobuf validation supports unary RPCs only (single frame per message). Streaming RPCs with multiple concatenated frames are not validated — the length mismatch check will reject multi-frame bodies.
 
@@ -4523,7 +4525,7 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `token_limit` | Integer | `100000` | Maximum tokens allowed per window |
+| `token_limit` | Integer | *(required)* | Maximum tokens allowed per window. Required at construction; there is no default. |
 | `window_seconds` | Integer | `60` | Sliding window duration in seconds |
 | `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens`. Unknown values are rejected at construction time. |
 | `limit_by` | String | `"consumer"` | Rate limit key: authenticated identity (`consumer`) or `ip`. Unknown values are rejected at construction time. |
