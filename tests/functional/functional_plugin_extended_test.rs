@@ -1207,7 +1207,7 @@ async fn test_plugin_soap_ws_security_utf16be_username_token() {
         .post(format!("{}/soap-utf16be/service", harness.proxy_base_url))
         .header("Content-Type", "text/xml; charset=utf-16be")
         .header("SOAPAction", "GetData")
-        .body(utf16be)
+        .body(utf16be.clone())
         .send()
         .await
         .expect("Request failed");
@@ -1217,6 +1217,24 @@ async fn test_plugin_soap_ws_security_utf16be_username_token() {
     assert_eq!(
         status, 200,
         "UTF-16BE SOAP UsernameToken should be proxied, got {status}: {response_body}"
+    );
+
+    let h2_client = reqwest::Client::builder()
+        .http2_prior_knowledge()
+        .build()
+        .expect("build H2 client");
+    let h2_resp = h2_client
+        .post(format!("{}/soap-utf16be/service", harness.proxy_base_url))
+        .header("Content-Type", "text/xml; charset=utf-16be")
+        .header("SOAPAction", "GetData")
+        .body(utf16be)
+        .send()
+        .await
+        .expect("H2 UTF-16BE request failed");
+    assert_eq!(
+        h2_resp.status().as_u16(),
+        200,
+        "UTF-16BE SOAP UsernameToken must validate on H2"
     );
 }
 

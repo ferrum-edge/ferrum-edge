@@ -1607,9 +1607,9 @@ impl Plugin for SoapWsSecurity {
             }
             Err(err) => {
                 // Fail closed on hostile/unsupported encodings. Never log the
-                // body or credential material — only the stable error class.
+                // body, attacker-controlled Content-Type parameters, or
+                // credential material — only the stable error class.
                 warn!(
-                    content_type = %content_type,
                     error_class = err.class(),
                     "soap_ws_security: SOAP body encoding rejected"
                 );
@@ -3078,13 +3078,13 @@ fn matches_utf8_label(label: &str) -> bool {
 }
 
 fn matches_utf16le_label(label: &str) -> bool {
-    label.eq_ignore_ascii_case("utf-16le")
-        || label.eq_ignore_ascii_case("utf16le")
-        || label.eq_ignore_ascii_case("unicodefffe")
+    label.eq_ignore_ascii_case("utf-16le") || label.eq_ignore_ascii_case("utf16le")
 }
 
 fn matches_utf16be_label(label: &str) -> bool {
-    label.eq_ignore_ascii_case("utf-16be") || label.eq_ignore_ascii_case("utf16be")
+    label.eq_ignore_ascii_case("utf-16be")
+        || label.eq_ignore_ascii_case("utf16be")
+        || label.eq_ignore_ascii_case("unicodefffe")
 }
 
 fn matches_utf16_unspecified_label(label: &str) -> bool {
@@ -3197,7 +3197,12 @@ fn validate_xml_declaration_encoding(
     resolved: SoapXmlEncoding,
 ) -> Result<(), SoapBodyDecodeError> {
     let trimmed = xml.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
-    if !trimmed.as_bytes().starts_with(b"<?xml") {
+    let bytes = trimmed.as_bytes();
+    if !bytes.starts_with(b"<?xml")
+        || !bytes
+            .get(5)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+    {
         return Ok(());
     }
     let Some(end) = trimmed.find("?>") else {

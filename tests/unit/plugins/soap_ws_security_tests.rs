@@ -2434,6 +2434,18 @@ fn decode_accepts_explicit_utf16le_charset_without_bom() {
 }
 
 #[test]
+fn decode_unicodefffe_label_uses_utf16be() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let mut bytes = Vec::new();
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    let decoded = soap_decode_xml_body_for_test(&bytes, "text/xml; charset=unicodeFFFE")
+        .expect("unicodeFFFE is a UTF-16BE label");
+    assert!(decoded.contains("Envelope"));
+}
+
+#[test]
 fn decode_rejects_bom_charset_conflict() {
     let xml = wrap_soap(&fresh_timestamp());
     let bytes = encode_utf16_le(&xml);
@@ -2539,6 +2551,17 @@ fn xml_declaration_finds_encoding_after_misleading_attribute_value() {
     let err = soap_decode_xml_body_for_test(&bytes, "text/xml; charset=utf-16")
         .expect_err("the real XML declaration encoding must still be checked");
     assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+}
+
+#[test]
+fn xml_stylesheet_processing_instruction_is_not_an_xml_declaration() {
+    let xml = r#"<?xml-stylesheet type="text/xsl" href="style.xsl"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body><GetPrice/></soap:Body>
+</soap:Envelope>"#;
+    let decoded = soap_decode_xml_body_for_test(xml.as_bytes(), "text/xml; charset=utf-8")
+        .expect("xml-stylesheet processing instruction is not an XML declaration");
+    assert_eq!(decoded, xml);
 }
 
 #[tokio::test]

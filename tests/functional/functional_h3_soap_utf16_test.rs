@@ -20,6 +20,14 @@ fn encode_utf16_le(text: &str) -> Vec<u8> {
     bytes
 }
 
+fn encode_utf16_be(text: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFE, 0xFF];
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    bytes
+}
+
 fn username_token_envelope() -> String {
     r#"<?xml version="1.0" encoding="UTF-16"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
@@ -119,10 +127,36 @@ async fn request_with_retry(client: &Http3Client, url: &str, options: GetOptions
 
 #[tokio::test]
 #[ignore]
-async fn h3_utf16_username_token_validates_and_charset_conflict_fails_closed() {
+async fn h3_soap_encodings_validate_and_hostile_metadata_fails_closed() {
     let backend_reservation = reserve_port().await.expect("reserve backend port");
     let backend_port = backend_reservation.port;
     let _backend = ScriptedHttp1Backend::builder(backend_reservation.into_listener())
+        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+            "POST", "/service",
+        )))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".to_string(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".to_string(),
+            value: "2".to_string(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"ok".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
+        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+            "POST", "/service",
+        )))
+        .step(HttpStep::RespondStatus {
+            status: 200,
+            reason: "OK".to_string(),
+        })
+        .step(HttpStep::RespondHeader {
+            name: "Content-Length".to_string(),
+            value: "2".to_string(),
+        })
+        .step(HttpStep::RespondBodyChunk(b"ok".to_vec()))
+        .step(HttpStep::RespondBodyEnd)
         .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
             "POST", "/service",
         )))
@@ -156,6 +190,32 @@ async fn h3_utf16_username_token_validates_and_charset_conflict_fails_closed() {
     assert_eq!(accepted.status, StatusCode::OK);
     assert_eq!(accepted.body_bytes.as_ref(), b"ok");
 
+    let accepted_be = request_with_retry(
+        &client,
+        &url,
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "text/xml; charset=utf-16be")
+            .body(Bytes::from(encode_utf16_be(&username_token_envelope()))),
+    )
+    .await;
+    assert_eq!(accepted_be.status, StatusCode::OK);
+    assert_eq!(accepted_be.body_bytes.as_ref(), b"ok");
+
+    let utf8 =
+        username_token_envelope().replace("encoding=\"UTF-16\"", "encoding=\"UTF-8\"");
+    let accepted_utf8 = request_with_retry(
+        &client,
+        &url,
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "application/soap+xml; charset=utf-8")
+            .body(Bytes::from(utf8)),
+    )
+    .await;
+    assert_eq!(accepted_utf8.status, StatusCode::OK);
+    assert_eq!(accepted_utf8.body_bytes.as_ref(), b"ok");
+
     let conflict = request_with_retry(
         &client,
         &url,
@@ -167,4 +227,16 @@ async fn h3_utf16_username_token_validates_and_charset_conflict_fails_closed() {
     .await;
     assert_eq!(conflict.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert!(String::from_utf8_lossy(&conflict.body_bytes).contains("conflicting"));
+
+    let malformed = request_with_retry(
+        &client,
+        &url,
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "text/xml; charset=utf-16")
+            .body(Bytes::from_static(&[0xFF, 0xFE, 0x3C])),
+    )
+    .await;
+    assert_eq!(malformed.status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&malformed.body_bytes).contains("not valid"));
 }
