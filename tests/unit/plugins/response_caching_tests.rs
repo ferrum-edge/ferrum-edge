@@ -162,10 +162,8 @@ async fn replace_cached_response(
     body: &[u8],
 ) {
     let mut ctx = make_ctx(method, path);
-    let mut request_headers = HashMap::from([(
-        "cache-control".to_string(),
-        "no-cache".to_string(),
-    )]);
+    let mut request_headers =
+        HashMap::from([("cache-control".to_string(), "no-cache".to_string())]);
     assert!(matches!(
         plugin.before_proxy(&mut ctx, &mut request_headers).await,
         PluginResult::Continue
