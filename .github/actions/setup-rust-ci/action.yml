@@ -33,14 +33,51 @@ runs:
     - name: Opt pedagogical example plugins into CI/test builds
       shell: bash
       run: |
+        set -euo pipefail
         # Examples under custom_plugins/examples/ are excluded from default /
         # Docker / release builds. Jobs that use this action (unit, lint,
         # coverage, test-artifact archives, etc.) opt them in here so their
         # tests and clippy coverage exercise the templates. The protected
         # ARM64 Cross job does not use this action and keeps examples out.
-        # Append production custom_plugins/*.rs stems here if operator plugins
-        # must also compile in the same CI jobs.
-        echo "FERRUM_CUSTOM_PLUGINS=example_plugin,example_audit_plugin" >> "$GITHUB_ENV"
+        # Discover example stems and every production custom_plugins/*.rs stem
+        # automatically so neither directory can drift out of CI merely because
+        # this opt-in list exists for the pedagogical examples.
+        plugins=""
+        append_plugin_stem() {
+          local stem="$1"
+          # Reject empty / non-identifier stems so a hostile filename cannot
+          # inject extra GITHUB_ENV lines or commas into the CSV list.
+          case "$stem" in
+            ''|*[!A-Za-z0-9_]*)
+              echo "::error::invalid custom plugin stem for FERRUM_CUSTOM_PLUGINS: ${stem}"
+              exit 1
+              ;;
+          esac
+          if [ -z "$plugins" ]; then
+            plugins="$stem"
+          else
+            plugins="${plugins},${stem}"
+          fi
+        }
+        for source in custom_plugins/examples/*.rs; do
+          [ -e "$source" ] || continue
+          stem="${source##*/}"
+          stem="${stem%.rs}"
+          append_plugin_stem "$stem"
+        done
+        for source in custom_plugins/*.rs; do
+          [ -e "$source" ] || continue
+          stem="${source##*/}"
+          stem="${stem%.rs}"
+          [ "$stem" = "mod" ] && continue
+          append_plugin_stem "$stem"
+        done
+        if [ -z "$plugins" ]; then
+          echo "::error::FERRUM_CUSTOM_PLUGINS resolved to an empty list"
+          exit 1
+        fi
+        # printf keeps the value on one KEY=VALUE line (no echo -e surprises).
+        printf 'FERRUM_CUSTOM_PLUGINS=%s\n' "$plugins" >> "$GITHUB_ENV"
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable

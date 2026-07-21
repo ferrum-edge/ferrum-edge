@@ -5,4 +5,5 @@ mod admin_jwt_auth_tests;
 mod admin_read_only_tests;
 mod admin_tests;
 mod admin_validation_tests;
+mod api_specs_readonly_required_tests;
 mod mesh_remote_clusters_tests;

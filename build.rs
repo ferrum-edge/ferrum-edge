@@ -78,7 +78,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let stem = path
                     .file_stem()
                     .and_then(|s| s.to_str())
-                    .unwrap_or("")
+                    .ok_or_else(|| {
+                        format!(
+                            "custom plugin source name must be valid UTF-8: {}",
+                            path.display()
+                        )
+                    })?
                     .to_string();
                 if stem == "mod" {
                     continue;

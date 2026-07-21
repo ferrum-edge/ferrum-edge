@@ -61,10 +61,7 @@ use url::Url;
 use super::utils::auth_flow::constant_time_eq;
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::dns::DnsCacheResolver;
-use crate::proxy::headers::{
-    is_backend_request_strip_header, is_proxy_generated_forwarding_header,
-    parse_connection_listed_from_str_map,
-};
+use crate::proxy::headers::{SecondaryRequestHostPolicy, filter_secondary_request_headers};
 use crate::retry::classify_reqwest_error;
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -104,8 +101,8 @@ const MAX_PROCESS_ACTIVE_CLIENTS: u64 = 10_000;
 pub const MAX_REPLAY_REQUEST_BODY_BYTES: usize = 10_485_760;
 const MAX_PROCESS_RETAINED_BODY_BYTES: u64 = 67_108_864;
 
-const HEADER_TRIGGER_KEY: &str = "x-loadtesting-key";
-const HEADER_FANOUT: &str = "x-loadtesting-fanout";
+pub(crate) const HEADER_TRIGGER_KEY: &str = "x-loadtesting-key";
+pub(crate) const HEADER_FANOUT: &str = "x-loadtesting-fanout";
 const FANOUT_MARKER: &str = "1";
 const INVALID_ADDRESS_LABEL: &str = "invalid-gateway-address";
 
@@ -1379,36 +1376,15 @@ fn fanout_ack_result() -> PluginResult {
 }
 
 fn filter_outbound_headers(headers: &HashMap<String, String>) -> Vec<(String, String)> {
-    // Snapshot Connection-listed names before filtering so RFC 9110 dynamic
-    // hop-by-hop tokens are removed even though `connection` itself is stripped.
-    let connection_listed: HashSet<String> = parse_connection_listed_from_str_map(headers)
-        .into_iter()
-        .collect();
-
-    headers
-        .iter()
-        .filter(|(k, _)| {
-            let name = k.as_str();
-            let name_lower = name.to_ascii_lowercase();
-            if name_lower == HEADER_FANOUT {
-                return false;
-            }
-            if name_lower == HEADER_TRIGGER_KEY {
-                return false;
-            }
-            if connection_listed.contains(&name_lower) {
-                return false;
-            }
-            if is_backend_request_strip_header(&name_lower)
-                || is_proxy_generated_forwarding_header(&name_lower)
-            {
-                return false;
-            }
-            // Keep Host for host-based routing on synthetic/fan-out requests.
-            true
-        })
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect()
+    // Same canonical secondary-request boundary as primary backend dispatch and
+    // request_mirror. Preserve Host for host-based routing on synthetic/fan-out
+    // re-entry; drop the reserved load-testing controls from the shared snapshot
+    // (fan-out re-attaches the canonical key/marker pair explicitly).
+    filter_secondary_request_headers(
+        headers,
+        SecondaryRequestHostPolicy::Preserve,
+        &[HEADER_TRIGGER_KEY, HEADER_FANOUT],
+    )
 }
 
 fn record_status(counters: &mut WorkerCounters, status: u16) {

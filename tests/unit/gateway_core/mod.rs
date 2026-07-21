@@ -35,6 +35,7 @@ mod response_representation_tests;
 mod retry_tests;
 mod router_cache_tests;
 mod runtime_metrics_tests;
+mod secondary_request_headers_tests;
 mod service_discovery_tests;
 mod sni_tests;
 mod socket_opts_tests;

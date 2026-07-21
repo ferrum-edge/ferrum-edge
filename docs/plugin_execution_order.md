@@ -7,7 +7,16 @@ and delta cache builds construct its global instances first to stage named
 schemas, then discard those instances after the registry owns the compiled
 definitions. It is absent from global/per-proxy lifecycle lists and all
 HTTP, gRPC, WebSocket, TCP, and UDP protocol snapshots, so it never runs a
-request, summary, connection, or frame hook.
+request, summary, connection, or frame hook. It still appears in the complete
+inventory at priority `9999` because schema registration has explicit ordering
+semantics relative to every logger that may resolve `schema_ref` — the priority
+documents that contract even though no request hook ever fires.
+
+`__mesh_bpf_metrics` is a reserved, mesh-auto-injected plugin (NodeWaypoint
+topology). Operators should not configure it directly; the mesh runtime injects
+it so the BPF SOCK_OPS event consumer can expose TCP-layer Prometheus counters.
+It declares all protocols so an accidental non-mesh attachment is not silently
+dropped, but it implements no request/response/stream hooks.
 
 ## Lifecycle Phases
 
@@ -467,7 +476,7 @@ Priority bands are spaced with gaps so future plugins can slot in without renumb
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `load_testing` (3070), `request_mirror` (3075), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, security headers, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_prompt_compressor` (4055), `ai_federation` (4060), `ai_response_guard` (4075), `security_headers` (4080), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
-| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `kafka_logging` (9150), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `proxy_alerts` (9250), `prometheus_metrics` (9300), `api_chargeback` (9350), `api_chargeback_sink` (9351), `workload_metrics` (9360), `__mesh_bpf_metrics` (9365) |
+| **Logging** | 9000–9999 | Observability and frame logging | `stdout_logging` (9000), `ws_frame_logging` (9050), `statsd_logging` (9075), `http_logging` (9100), `tcp_logging` (9125), `kafka_logging` (9150), `loki_logging` (9155), `udp_logging` (9160), `ws_logging` (9175), `transaction_debugger` (9200), `proxy_alerts` (9250), `prometheus_metrics` (9300), `api_chargeback` (9350), `api_chargeback_sink` (9351), `workload_metrics` (9360), `__mesh_bpf_metrics` (9365), `transaction_log_schema` (9999, config-only) |
 
 `soap_ws_security` keeps AuthN-band priority 1500 for ordering, but validates SOAP bodies in `before_proxy` after request-body buffering is available.
 
@@ -578,6 +587,19 @@ Given all built-in plugins enabled, the execution order is:
 | 79 | `api_chargeback_sink` | 9351 | log, on_stream_disconnect, on_ws_disconnect |
 | 80 | `workload_metrics` | 9360 | on_request_received, before_proxy, after_proxy, log, on_stream_connect, on_stream_disconnect |
 | 81 | `__mesh_bpf_metrics` | 9365 | (no lifecycle hooks; passive Prometheus surface populated by the BPF SOCK_OPS event consumer) |
+| 82 | `transaction_log_schema` | 9999 | (config-only; no lifecycle hooks — priority retained for schema-registration inventory/order) |
+
+### Config-only and reserved inventory rows
+
+- `transaction_log_schema` (9999) is listed so the published inventory stays set-equal
+  with the built-in registry. Cache rebuild still constructs it first (ahead of every
+  other plugin) so named schemas exist before loggers resolve `schema_ref`; the
+  priority value itself is not used for request-phase ordering because the instance
+  is discarded after registry staging.
+- `__mesh_bpf_metrics` (9365) is reserved for NodeWaypoint mesh auto-injection. It is
+  a passive Prometheus surface fed by the BPF SOCK_OPS consumer and intentionally
+  overrides no lifecycle hooks.
+
 
 ## Why This Order Matters
 
@@ -826,12 +848,26 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 
 ### Per-Plugin Protocol Matrix
 
+Every built-in from `BUILTIN_PLUGIN_REGISTRATIONS` has exactly one row. Config-only
+plugins use `—` in every protocol column. Reserved/auto-injected plugins keep
+ordinary checkmarks for their declared `supported_protocols()` surface and call
+out the reservation in the rationale. CI enforces name/priority/protocol set
+parity against runtime metadata in `src/plugins/builtin_parity.rs`.
+
 | Plugin | Http | Grpc | WebSocket | Tcp | Udp | Rationale |
 |--------|:----:|:----:|:---------:|:---:|:---:|-----------|
+| `otel_tracing` | ✓ | ✓ | ✓ | ✓ | ✓ | Tracing for all protocols |
+| `correlation_id` | ✓ | ✓ | ✓ | ✓ | ✓ | ID assignment is protocol-agnostic |
 | `cors` | ✓ | ✓ | | | | Origin/ACAO enforcement includes browser gRPC-Web requests |
+| `request_termination` | ✓ | ✓ | ✓ | | | Returns HTTP error response |
+| `mesh_outbound_registry` | ✓ | ✓ | ✓ | | | Host-header outbound registry gating is HTTP-family only; raw streams use mesh connect/datagram enforcement |
 | `ip_restriction` | ✓ | ✓ | ✓ | ✓ | ✓ | IP filtering is protocol-agnostic |
+| `geo_restriction` | ✓ | ✓ | ✓ | ✓ | ✓ | GeoIP country allow/deny is protocol-agnostic |
 | `bot_detection` | ✓ | ✓ | ✓ | | | Needs User-Agent header |
+| `spec_expose` | ✓ | | | | | HTTP-only; requires prefix listen_path |
 | `sse` | ✓ | | | | | SSE is HTTP-only (text/event-stream over chunked transfer) |
+| `grpc_web` | ✓ | ✓ | | | | Translates gRPC-Web (browser) ↔ native gRPC (HTTP/2) |
+| `grpc_method_router` | | ✓ | | | | gRPC method-level access control and rate limiting |
 | `spiffe_identity` | ✓ | ✓ | ✓ | ✓ | ✓ | Extracts SPIFFE IDs from TLS/DTLS client certificates |
 | `mtls_auth` | ✓ | ✓ | ✓ | ✓ | ✓ | Requires TLS/DTLS client certificate |
 | `jwks_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers |
@@ -844,51 +880,54 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `hmac_auth` | ✓ | ✓ | ✓ | | | Requires HTTP headers and a buffered request body; HBONE CONNECT fails closed as incompatible |
 | `soap_ws_security` | ✓ | | | | | SOAP XML body parsing (text/xml, application/soap+xml) |
 | `access_control` | ✓ | ✓ | ✓ | ✓ | ✓ | Needs authenticated identity from an auth plugin; supports consumer username and ACL group allow/deny lists |
+| `tcp_connection_throttle` | | | | ✓ | | Tracks process-local active TCP/TCP+TLS connections per Consumer or canonical client IP; each replica enforces independently |
 | `mesh_authz` | ✓ | ✓ | ✓ | ✓ | ✓ | Applies Layer 2 mesh policy using SPIFFE or HBONE identities |
 | `opa` | ✓ | | | | | Delegates HTTP request authorization to an OPA Data API policy |
-| `tcp_connection_throttle` | | | | ✓ | | Tracks process-local active TCP/TCP+TLS connections per Consumer or canonical client IP; each replica enforces independently |
 | `adaptive_concurrency` | ✓ | ✓ | ✓ | | | Target-aware backend admission for HTTP-family upstream survival |
-| `grpc_web` | ✓ | ✓ | | | | Translates gRPC-Web (browser) ↔ native gRPC (HTTP/2) |
-| `grpc_method_router` | | ✓ | | | | gRPC method-level access control and rate limiting |
-| `grpc_deadline` | | ✓ | | | | gRPC timeout enforcement and propagation |
-| `graphql` | ✓ | | | | | GraphQL is HTTP-only (JSON body parsing) |
+| `request_deduplication` | ✓ | | | | | HTTP-only request deduplication and response replay |
 | `request_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy request body size limits |
+| `ws_message_size_limiting` | | | ✓ | | | Enforces actual-frame and bounded-reassembly limits on WebSocket connections |
+| `graphql` | ✓ | | ✓ | | | GraphQL JSON over HTTP and GraphQL subscriptions over WebSocket |
 | `rate_limiting` | ✓ | ✓ | ✓ | ✓ | ✓ | Connection/session rate applies everywhere |
+| `ws_rate_limiting` | | | ✓ | | | Per-connection frame rate limiting for WebSocket |
+| `udp_rate_limiting` | | | | | ✓ | Per-client-IP datagram and byte rate limiting for UDP proxies |
+| `ai_transcript_audit` | ✓ | | | | | HTTP-only AI transcript capture to a configured sink |
+| `ai_prompt_shield` | ✓ | | | | | HTTP-only PII detection/redaction for bare JSON prompts; native gRPC unsupported (gRPC-Web framed bodies are skipped) |
 | `waf` | ✓ | ✓ | ✓ | ✓ | ✓ | HTTP-family always; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured |
 | `fault_injection` | ✓ | ✓ | ✓ | ✓ | | Probabilistic aborts and delays; raw TCP only for stream hooks (no UDP/DTLS) |
-| `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
-| `request_mirror` | ✓ | ✓ | | | | Duplicates traffic to a shadow destination for validation |
-| `load_testing` | ✓ | | | | | On-demand load testing via header trigger with multi-node fan-out |
-| `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions) |
-| `response_mock` | ✓ | ✓ | ✓ | | | Short-circuits HTTP/gRPC and WebSocket upgrade handshakes with a synthetic response; does not mock upgraded frame streams |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |
 | `openapi_validator` | ✓ | | | | | Validates bodies against generated OpenAPI operation schemas |
-| `spec_expose` | ✓ | | | | | HTTP-only; requires prefix listen_path |
-| `request_termination` | ✓ | ✓ | ✓ | | | Returns HTTP error response |
-| `response_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy response body size limits |
-| `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |
-| `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli) |
-| `ai_prompt_shield` | ✓ | | | | | HTTP-only bare-JSON PII scan; native gRPC unsupported; framed gRPC-Web bodies are skipped without decoding |
 | `ai_semantic_firewall` | ✓ | | | | | HTTP-only semantic inspection for LLM JSON request and response bodies |
 | `ai_request_guard` | ✓ | ✓ | | | | Validates JSON request bodies |
-| `ai_response_guard` | ✓ | | | | | HTTP-only JSON/SSE/text response inspection; native gRPC protobuf framing is unsupported |
+| `ai_tool_governor` | ✓ | | | | | HTTP-only deterministic tool/function-call policy on JSON and SSE bodies |
+| `ai_semantic_cache` | ✓ | | | | | HTTP-only exact/semantic cache for LLM JSON request and response bodies |
 | `ai_stream_router` | ✓ | | | | | Claims `stream: true` OpenAI Chat Completions, route-overrides to a provider, normalizes provider SSE to OpenAI SSE |
-| `ai_federation` | ✓ | | | | | HTTP-only; routes final OpenAI JSON bodies to providers and normalizes bounded responses |
-| `mcp_gateway` | ✓ | ✓ | | | | Parses MCP JSON-RPC, emits `mcp.*` metadata, routes namespaced MCP tools/resources/prompts, and reverse-maps routed JSON results |
+| `mcp_gateway` | ✓ | | | | | HTTP-only MCP JSON-RPC parsing, metadata, and namespaced tool/resource/prompt routing |
 | `a2a_gateway` | ✓ | ✓ | | | | Detects A2A HTTP/REST/gRPC methods, rewrites HTTP Agent Cards, applies method policy, and emits `a2a.*` metadata |
 | `mesh_route_dispatch` | ✓ | ✓ | ✓ | | | Rewrites the routing decision per request via `RequestContext.route_override_*`; for WebSocket, selects the upgrade backend only, not per-frame routing |
+| `request_transformer` | ✓ | ✓ | | | | Modifies HTTP headers/query/body |
+| `serverless_function` | ✓ | ✓ | | | | Invokes cloud functions (AWS Lambda, Azure Functions, GCP Cloud Functions) |
+| `response_mock` | ✓ | ✓ | ✓ | | | Short-circuits HTTP/gRPC and WebSocket upgrade handshakes with a synthetic response; does not mock upgraded frame streams |
+| `grpc_deadline` | | ✓ | | | | gRPC timeout enforcement and propagation |
+| `load_testing` | ✓ | | | | | On-demand load testing via header trigger with multi-node fan-out |
+| `request_mirror` | ✓ | ✓ | | | | Duplicates traffic to a shadow destination for validation |
+| `response_size_limiting` | ✓ | ✓ | | | | Enforces per-proxy response body size limits |
+| `response_caching` | ✓ | | | | | HTTP-only response cache lookup and store |
+| `response_transformer` | ✓ | ✓ | | | | Modifies HTTP response headers/body |
+| `compression` | ✓ | | | | | HTTP response compression and request decompression (gzip, brotli) |
+| `ai_prompt_compressor` | ✓ | | | | | HTTP-only JSON prompt compression; native gRPC wire frames are not rewritten |
+| `ai_federation` | ✓ | | | | | HTTP-only; routes final OpenAI JSON bodies to providers and normalizes bounded responses |
+| `ai_response_guard` | ✓ | | | | | HTTP-only JSON/SSE/text response inspection; native gRPC protobuf framing is unsupported |
+| `security_headers` | ✓ | ✓ | ✓ | | | HTTP-family response security headers and fingerprint stripping |
 | `ai_token_metrics` | ✓ | | | | | HTTP JSON/SSE accounting only; native gRPC protobuf has no supported provider schema contract |
 | `ai_rate_limiter` | ✓ | ✓ | | | | Parses JSON response bodies for token counts |
-| `ws_message_size_limiting` | | | ✓ | | | Enforces actual-frame and bounded-reassembly limits on WebSocket connections |
-| `ws_rate_limiting` | | | ✓ | | | Per-connection frame rate limiting for WebSocket |
-| `ws_frame_logging` | | | ✓ | | | Logs WebSocket frame metadata |
-| `udp_rate_limiting` | | | | | ✓ | Per-client-IP datagram and byte rate limiting for UDP proxies |
 | `stdout_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
+| `ws_frame_logging` | | | ✓ | | | Logs WebSocket frame metadata |
 | `statsd_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
-| `correlation_id` | ✓ | ✓ | ✓ | ✓ | ✓ | ID assignment is protocol-agnostic |
 | `http_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `tcp_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `kafka_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
+| `loki_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `udp_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `ws_logging` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
 | `transaction_debugger` | ✓ | ✓ | ✓ | ✓ | ✓ | Observability applies everywhere |
@@ -897,7 +936,8 @@ TLS/DTLS are transport-layer concerns, not separate protocols. A plugin that sup
 | `api_chargeback` | ✓ | ✓ | ✓ | ✓ | ✓ | In-memory charge accumulator for HTTP-family, WebSocket bandwidth, and stream sessions |
 | `api_chargeback_sink` | ✓ | ✓ | ✓ | ✓ | ✓ | Durable ClickHouse charge event/snapshot exporter |
 | `workload_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Adds Istio/GAMMA mesh identity labels to metadata |
-| `otel_tracing` | ✓ | ✓ | ✓ | ✓ | ✓ | Tracing for all protocols |
+| `__mesh_bpf_metrics` | ✓ | ✓ | ✓ | ✓ | ✓ | Reserved/auto-injected NodeWaypoint BPF SOCK_OPS Prometheus surface; no request hooks |
+| `transaction_log_schema` | — | — | — | — | — | Config-only: registers named log schemas during cache rebuild; no protocol hooks (ordering priority 9999) |
 
 Protocol-filtered plugin lists are pre-computed in `PluginCache` at config reload time, so there is zero filtering cost on the hot path.
 

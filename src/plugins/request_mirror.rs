@@ -15,6 +15,16 @@
 //! mirror destination. The main request proceeds immediately — mirror latency
 //! has zero impact on client response time.
 //!
+//! Outbound mirror headers cross the same canonical secondary-request boundary
+//! as primary backend dispatch (Connection-listed hop-by-hop, Trailer, framing,
+//! Ferrum request-only markers, and proxy-owned `X-Forwarded-*`). Forwarding
+//! identity is stripped rather than regenerated. Client `Host` is omitted so
+//! authority comes from the mirror URL; native gRPC content-types re-synthesise
+//! `te: trailers` for HTTP/2-capable mirror targets. The request-target prefers
+//! the original raw query (after the same auth credential strips the primary
+//! backend uses) so duplicate keys, order, flags, `+`, percent escapes, and
+//! encoded bytes match the primary contract.
+//!
 //! The mirror request uses the gateway's shared `PluginHttpClient`, which means
 //! it inherits the gateway's DNS cache, connection pool keepalive, and TLS
 //! settings (CA bundle, skip-verify).
@@ -48,7 +58,7 @@
 //! | `mirror_host` | string | **(required)** | Hostname or IP of the mirror target |
 //! | `mirror_port` | u16 | 80 (http) / 443 (https) | Port of the mirror target |
 //! | `mirror_protocol` | string | `"http"` | `"http"` or `"https"` |
-//! | `mirror_path` | string | (none) | Override the request path for the mirror. When unset, the backend-effective authorized path is used if backend-path policy is active; otherwise the original request path is used |
+//! | `mirror_path` | string | (none) | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, the backend-effective authorized path is used if backend-path policy is active; otherwise the original request path is used |
 //! | `percentage` | f64 | `100.0` | Percentage of requests to mirror (0.0–100.0) |
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
 //! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes read from a mirror response when sizing it (only consulted when the response has no `content-length`). Streaming aborts as soon as the limit is crossed; mirror task discards the bytes after sizing. |
@@ -56,6 +66,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -64,10 +75,15 @@ use std::time::Duration;
 use tracing::warn;
 use url::{Host, form_urlencoded};
 
+use super::load_testing::{HEADER_FANOUT, HEADER_TRIGGER_KEY};
 use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, parse_max_response_body_bytes,
 };
 use super::{MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult, RequestContext};
+use crate::proxy::headers::{
+    SecondaryRequestHostPolicy, filter_secondary_request_headers,
+    synthesize_grpc_te_trailers_if_needed,
+};
 
 /// Default cap on the size of mirror response bodies the gateway is willing
 /// to read. The body is discarded — only its length is reported in mirror
@@ -76,8 +92,6 @@ use super::{MirrorResponseMeta, Plugin, PluginHttpClient, PluginResult, RequestC
 /// response over a fire-and-forget task.
 const DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_IN_FLIGHT_MIRRORS: usize = 256;
-const LOAD_TESTING_TRIGGER_HEADER: &str = "x-loadtesting-key";
-const LOAD_TESTING_FANOUT_HEADER: &str = "x-loadtesting-fanout";
 
 fn strip_query_params(url: &str) -> &str {
     url.split_once('?').map_or(url, |(base, _)| base)
@@ -149,6 +163,13 @@ impl RequestMirror {
         {
             return Err("request_mirror: 'mirror_path' must start with '/'".to_string());
         }
+        if let Some(path) = &mirror_path
+            && (path.contains('?') || path.contains('#'))
+        {
+            return Err(
+                "request_mirror: 'mirror_path' must not contain a query or fragment".to_string(),
+            );
+        }
 
         let percentage = optional_f64(config, "percentage")?.unwrap_or(100.0);
         if !(0.0..=100.0).contains(&percentage) {
@@ -196,9 +217,16 @@ impl RequestMirror {
     }
 
     /// Build the full mirror URL from the configured or gateway-selected path.
+    ///
+    /// Prefer the effective raw query string (original wire query after the same
+    /// auth credential strips primary dispatch applies) so duplicate keys,
+    /// ordering, flags, empty values, `+`, percent escapes, and non-ASCII
+    /// encoded bytes survive. Fall back to the materialised `query_params` map
+    /// only when no raw query is available (tests / already-decoded contexts).
     fn build_mirror_url(
         &self,
         original_path: &str,
+        raw_query: Option<&str>,
         query_params: &HashMap<String, String>,
     ) -> String {
         let path = self.mirror_path.as_deref().unwrap_or(original_path);
@@ -213,7 +241,15 @@ impl RequestMirror {
         let _ = write!(&mut url, "{}", self.mirror_port);
         url.push_str(path);
 
-        if !query_params.is_empty() {
+        if let Some(query) = raw_query {
+            // `Some("")` is authoritative: an auth strip may have removed the
+            // entire raw query, so falling back to the materialised map here
+            // would reintroduce the credential.
+            if !query.is_empty() {
+                url.push('?');
+                url.push_str(query);
+            }
+        } else if !query_params.is_empty() {
             url.push('?');
             let encoded: String = form_urlencoded::Serializer::new(String::new())
                 .extend_pairs(query_params.iter())
@@ -387,18 +423,40 @@ impl Plugin for RequestMirror {
         // final authorization. Falling back to the ordinary client path keeps
         // the established behavior for proxies without that policy boundary.
         let mirror_path = ctx.authorized_backend_path().unwrap_or(&ctx.path);
-        let mirror_url = self.build_mirror_url(mirror_path, &ctx.query_params);
+        // Match primary backend query construction: start from the retained raw
+        // query, then apply auth credential strips marked on the context.
+        // Decoded `request_transformer` query-map mutations are intentionally
+        // not re-serialized here — primary dispatch likewise keeps the raw
+        // (auth-stripped) wire query.
+        let query_map_was_transformed = ctx
+            .metadata
+            .contains_key(crate::proxy::QUERY_PARAMS_TRANSFORMED_METADATA_KEY);
+        let effective_query = match ctx.raw_query_string() {
+            Some(raw) => Some(crate::proxy::query_string_after_plugin_strips(ctx, raw)),
+            // Query-transformer map mutations are intentionally not serialized
+            // by primary dispatch. Preserve that contract even when the client
+            // supplied no original query, while retaining the legacy map
+            // fallback for synthetic/test contexts with no transform marker.
+            None if query_map_was_transformed => Some(Cow::Borrowed("")),
+            None => None,
+        };
+        let mirror_url =
+            self.build_mirror_url(mirror_path, effective_query.as_deref(), &ctx.query_params);
         let method = ctx.method.clone();
 
-        // Collect headers for the mirror request. Use the proxy headers (post-transform)
-        // which reflect any modifications from upstream plugins like request_transformer.
-        let mut mirror_headers: Vec<(String, String)> = headers
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-
         // Mirror destinations are an egress boundary just like the primary
-        // backend. Apply the operator-configured baggage strip
+        // backend. Apply the canonical secondary-request sanitizer (hop-by-hop,
+        // Connection-listed, framing, proxy-owned forwarding identity, Host
+        // strip) before any mirror-specific exclusions.
+        let mut mirror_headers = filter_secondary_request_headers(
+            headers,
+            SecondaryRequestHostPolicy::Strip,
+            &[HEADER_TRIGGER_KEY, HEADER_FANOUT],
+        );
+        // gRPC mirrors need `te: trailers` after the generic strip removes `te`.
+        synthesize_grpc_te_trailers_if_needed(&mut mirror_headers);
+
+        // Apply the operator-configured baggage strip
         // (`FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`) so mesh-internal identity
         // claims like `source.principal` don't leak to mirror analytics /
         // auditing services that the operator considers off-mesh.
@@ -480,41 +538,12 @@ impl Plugin for RequestMirror {
                 req_builder = req_builder.timeout(t);
             }
 
-            // Forward all headers from the original (transformed) request
+            // Forward sanitized headers from the original (transformed) request.
+            // The canonical secondary-request filter already removed hop-by-hop,
+            // Connection-listed, framing, proxy-owned forwarding, Host, and the
+            // reserved load-testing controls.
             for (key, value) in &mirror_headers {
-                // Defense in depth for chains with a priority override: the
-                // reusable load-testing controls are never mirror data, even if
-                // request_mirror executes before load_testing strips them.
-                if key.eq_ignore_ascii_case(LOAD_TESTING_TRIGGER_HEADER)
-                    || key.eq_ignore_ascii_case(LOAD_TESTING_FANOUT_HEADER)
-                {
-                    continue;
-                }
-                // Skip hop-by-hop and connection-specific headers. Also skip
-                // `content-length`: when the body is not mirrored
-                // (`mirror_request_body = false`) or simply unavailable, no
-                // `.body()` is attached, so forwarding the original
-                // `content-length: N` would declare N body bytes with a
-                // zero-length body — a malformed request that makes many mirror
-                // servers block awaiting the bytes until timeout or reject it,
-                // wasting an in-flight permit / pooled connection and corrupting
-                // mirror analytics. Dropping it lets reqwest set the correct
-                // Content-Length from the actual mirror body (0 when no body is
-                // attached, exact length when one is).
-                match key.as_str() {
-                    "host"
-                    | "connection"
-                    | "keep-alive"
-                    | "transfer-encoding"
-                    | "te"
-                    | "upgrade"
-                    | "content-length"
-                    | "proxy-authorization"
-                    | "proxy-connection" => continue,
-                    _ => {
-                        req_builder = req_builder.header(key.as_str(), value.as_str());
-                    }
-                }
+                req_builder = req_builder.header(key.as_str(), value.as_str());
             }
 
             if let Some(body) = body_bytes {
@@ -639,8 +668,43 @@ mod tests {
         query_params.insert("page".to_string(), "1".to_string());
 
         assert_eq!(
-            plugin.build_mirror_url("/shadow", &query_params),
+            plugin.build_mirror_url("/shadow", None, &query_params),
             "https://[2001:db8::10]:8443/shadow?page=1"
         );
+        assert_eq!(
+            plugin.build_mirror_url("/shadow", Some("tag=red&tag=blue&q=a+b"), &query_params),
+            "https://[2001:db8::10]:8443/shadow?tag=red&tag=blue&q=a+b"
+        );
+    }
+
+    #[test]
+    fn build_mirror_url_preserves_raw_query_edge_cases_byte_for_byte() {
+        let plugin = RequestMirror::new(
+            &json!({ "mirror_host": "mirror.example", "mirror_port": 8080 }),
+            PluginHttpClient::default(),
+        )
+        .unwrap();
+        let collapsed = HashMap::from([("tag".to_string(), "only-one".to_string())]);
+        for raw in [
+            "tag=red&tag=blue",
+            "b=1&a=2",
+            "flag",
+            "empty=",
+            "q=a+b",
+            "path=%2Froot&k=a%26b",
+            "key=a%2Fb",
+            "name=%E2%9C%93&q=%C3%A9",
+            "tag=red&tag=blue&q=a+b&flag&empty=&path=%2Froot&key=a%2Fb&name=%E2%9C%93",
+        ] {
+            let url = plugin.build_mirror_url("/api", Some(raw), &collapsed);
+            assert!(
+                url.ends_with(&format!("?{raw}")),
+                "raw query must be preserved exactly: got {url}"
+            );
+            assert!(
+                !url.contains("only-one"),
+                "lossy query map must not replace raw query: {url}"
+            );
+        }
     }
 }

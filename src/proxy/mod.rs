@@ -9872,6 +9872,7 @@ async fn handle_websocket_request_authenticated(
         auth_method: ctx.auth_method,
         metadata: clone_log_metadata(&ctx),
         session_start: chrono::Utc::now(),
+        session_start_mono: Instant::now(),
     };
     tokio::spawn(async move {
         let _ws_lb_guard = ws_lb_guard;
@@ -11173,7 +11174,11 @@ pub struct WsSessionMeta {
     pub consumer_username: Option<String>,
     pub auth_method: Option<&'static str>,
     pub metadata: HashMap<String, String>,
+    /// Civil/UTC connect time for human-readable `timestamp_connected` only.
     pub session_start: chrono::DateTime<chrono::Utc>,
+    /// Process-monotonic connect instant used for `duration_ms`. Wall-clock
+    /// corrections must not freeze, clamp, or inflate WebSocket session duration.
+    pub session_start_mono: Instant,
 }
 
 /// Fire `on_ws_disconnect` for the tunnel-mode path, where raw
@@ -11205,10 +11210,8 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
     if ws_disconnect_plugins.is_empty() {
         return;
     }
+    let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
     let disconnected_at = chrono::Utc::now();
-    let disconnect_duration_ms = (disconnected_at - session_meta.session_start)
-        .num_milliseconds()
-        .max(0) as f64;
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace.clone(),
         proxy_id: proxy_id.to_string(),
@@ -11229,6 +11232,59 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         consumer_username: session_meta.consumer_username.clone(),
         auth_method: session_meta.auth_method,
         metadata: session_meta.metadata.clone(),
+    };
+    for plugin in ws_disconnect_plugins {
+        plugin.on_ws_disconnect(&disconnect_ctx).await;
+    }
+}
+
+/// Fire `on_ws_disconnect` for the framed (parsed) WebSocket path.
+///
+/// Unlike tunnel mode, framed mode reports real frame counters. Duration still
+/// comes from `session_start_mono` (`Instant`); wall `session_start` is only
+/// used for `timestamp_connected` rendering. Takes `session_meta` by value
+/// because the framed relay consumes it at teardown.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn fire_ws_framed_disconnect_hooks(
+    ws_disconnect_plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    session_meta: WsSessionMeta,
+    frames_client_to_backend: u64,
+    frames_backend_to_client: u64,
+    bytes_client_to_backend: u64,
+    bytes_backend_to_client: u64,
+    failure: Option<(
+        crate::plugins::Direction,
+        retry::ErrorClass,
+        Option<tcp_proxy::StreamIoSide>,
+    )>,
+) {
+    if ws_disconnect_plugins.is_empty() {
+        return;
+    }
+    let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
+    let disconnected_at = chrono::Utc::now();
+    let disconnect_ctx = crate::plugins::WsDisconnectContext {
+        namespace: session_meta.namespace,
+        proxy_id: proxy_id.to_string(),
+        proxy_name: session_meta.proxy_name,
+        client_ip: session_meta.client_ip,
+        backend_target: session_meta.backend_target,
+        listen_port: session_meta.listen_port,
+        duration_ms: disconnect_duration_ms,
+        frames_client_to_backend,
+        frames_backend_to_client,
+        bytes_client_to_backend,
+        bytes_backend_to_client,
+        timestamp_connected: session_meta.session_start.to_rfc3339(),
+        timestamp_disconnected: disconnected_at.to_rfc3339(),
+        direction: failure.as_ref().map(|(d, _, _)| *d),
+        io_side: failure.as_ref().and_then(|(_, _, side)| *side),
+        error_class: failure.map(|(_, c, _)| c),
+        consumer_username: session_meta.consumer_username,
+        auth_method: session_meta.auth_method,
+        metadata: session_meta.metadata,
     };
     for plugin in ws_disconnect_plugins {
         plugin.on_ws_disconnect(&disconnect_ctx).await;
@@ -12428,37 +12484,17 @@ where
     // have wound down. When no plugin opted in the list is empty and we skip
     // the whole block — zero overhead for deployments that don't observe
     // WebSocket sessions.
-    if !ws_disconnect_plugins.is_empty() {
-        let disconnected_at = chrono::Utc::now();
-        let disconnect_duration_ms = (disconnected_at - session_meta.session_start)
-            .num_milliseconds()
-            .max(0) as f64;
-        let failure = first_failure.get().cloned();
-        let disconnect_ctx = crate::plugins::WsDisconnectContext {
-            namespace: session_meta.namespace,
-            proxy_id: proxy_id.to_string(),
-            proxy_name: session_meta.proxy_name,
-            client_ip: session_meta.client_ip,
-            backend_target: session_meta.backend_target,
-            listen_port: session_meta.listen_port,
-            duration_ms: disconnect_duration_ms,
-            frames_client_to_backend: frames_c2b.load(Ordering::Relaxed),
-            frames_backend_to_client: frames_b2c.load(Ordering::Relaxed),
-            bytes_client_to_backend: bytes_c2b.load(Ordering::Relaxed),
-            bytes_backend_to_client: bytes_b2c.load(Ordering::Relaxed),
-            timestamp_connected: session_meta.session_start.to_rfc3339(),
-            timestamp_disconnected: disconnected_at.to_rfc3339(),
-            direction: failure.as_ref().map(|(d, _, _)| *d),
-            io_side: failure.as_ref().and_then(|(_, _, side)| *side),
-            error_class: failure.map(|(_, c, _)| c),
-            consumer_username: session_meta.consumer_username,
-            auth_method: session_meta.auth_method,
-            metadata: session_meta.metadata,
-        };
-        for plugin in &ws_disconnect_plugins {
-            plugin.on_ws_disconnect(&disconnect_ctx).await;
-        }
-    }
+    fire_ws_framed_disconnect_hooks(
+        &ws_disconnect_plugins,
+        proxy_id,
+        session_meta,
+        frames_c2b.load(Ordering::Relaxed),
+        frames_b2c.load(Ordering::Relaxed),
+        bytes_c2b.load(Ordering::Relaxed),
+        bytes_b2c.load(Ordering::Relaxed),
+        first_failure.get().cloned(),
+    )
+    .await;
 
     debug!("WebSocket proxy connection closed for {}", proxy_id);
     Ok(())
@@ -15393,7 +15429,10 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
     );
 
     let body = if reject.body.is_empty() {
-        ProxyBody::empty()
+        // Status-aware empty body: 205 must not advertise Content-Length on H1
+        // (Hyper would otherwise synthesize `Content-Length: 0` for ordinary
+        // empty Full bodies; 204/304 are already special-cased upstream).
+        ProxyBody::empty_for_response_status(reject.http_status.as_u16())
     } else {
         ProxyBody::full(Bytes::from(reject.body))
     };

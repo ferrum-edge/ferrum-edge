@@ -286,6 +286,22 @@ fn test_mirror_path_must_start_with_slash() {
 }
 
 #[test]
+fn test_mirror_path_rejects_query_and_fragment_syntax() {
+    for mirror_path in ["/shadow?src=config", "/shadow#fragment"] {
+        let error = RequestMirror::new(
+            &json!({ "mirror_host": "mirror.local", "mirror_path": mirror_path }),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .expect("query and fragment syntax must be rejected");
+        assert!(
+            error.contains("'mirror_path' must not contain a query or fragment"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
 fn test_empty_mirror_host_is_error() {
     let result = RequestMirror::new(&json!({ "mirror_host": "" }), PluginHttpClient::default());
     assert!(result.is_err());
@@ -1325,4 +1341,321 @@ async fn test_stale_content_length_not_forwarded_when_body_not_mirrored() {
             "mirror request forwarded a stale/incorrect content-length: {other} (expected 0 or absent)"
         ),
     }
+}
+
+// === Issue #2606: canonical secondary-request header sanitization on the wire ===
+
+async fn capture_mirror_request_headers(
+    ctx: &mut RequestContext,
+    headers: &mut HashMap<String, String>,
+) -> HashMap<String, String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<HashMap<String, String>>();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let head = String::from_utf8_lossy(&buf);
+            let mut captured = HashMap::new();
+            for line in head.lines().skip(1) {
+                if line.is_empty() {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    captured.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+                }
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+            let _ = tx.send(captured);
+        }
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "percentage": 100.0
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let _ = plugin.before_proxy(ctx, headers).await;
+    let _ = ctx.collect_mirror_result().await;
+    rx.await.expect("mirror sink should capture headers")
+}
+
+#[tokio::test]
+async fn test_mirror_strips_hostile_h1_connection_trailer_and_internal_markers() {
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "Connection".to_string(),
+        "X-Hop , , bad:token, Keep-Alive".to_string(),
+    );
+    headers.insert("X-Hop".to_string(), "per-connection".to_string());
+    headers.insert("Trailer".to_string(), "X-Foo".to_string());
+    headers.insert(
+        "x-ferrum-original-content-encoding".to_string(),
+        "gzip".to_string(),
+    );
+    headers.insert("x-grpc-web-mode".to_string(), "1".to_string());
+    headers.insert("proxy-authorization".to_string(), "Basic leak".to_string());
+    headers.insert("x-forwarded-for".to_string(), "198.51.100.7".to_string());
+    headers.insert("x-forwarded-proto".to_string(), "https".to_string());
+    headers.insert("x-forwarded-host".to_string(), "evil.example".to_string());
+    headers.insert("content-length".to_string(), "99".to_string());
+    headers.insert("host".to_string(), "client.example".to_string());
+    headers.insert(
+        "x-loadtesting-key".to_string(),
+        "should-not-mirror".to_string(),
+    );
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+    headers.insert("authorization".to_string(), "Bearer keep".to_string());
+
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    for stripped in [
+        "connection",
+        "x-hop",
+        "trailer",
+        "x-ferrum-original-content-encoding",
+        "x-grpc-web-mode",
+        "proxy-authorization",
+        "x-forwarded-for",
+        "x-forwarded-proto",
+        "x-forwarded-host",
+        "x-loadtesting-key",
+    ] {
+        assert!(
+            !observed.contains_key(stripped),
+            "mirror leaked `{stripped}`: {observed:?}"
+        );
+    }
+    // Host comes from the mirror URL, not the client header.
+    assert_ne!(
+        observed.get("host").map(String::as_str),
+        Some("client.example")
+    );
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+    assert_eq!(
+        observed.get("authorization").map(String::as_str),
+        Some("Bearer keep")
+    );
+    match observed.get("content-length").map(String::as_str) {
+        None | Some("0") => {}
+        Some(other) => panic!("stale content-length survived mirror sanitization: {other}"),
+    }
+}
+
+#[tokio::test]
+async fn test_mirror_h2_h3_parity_and_grpc_te_resynthesis() {
+    let mut ctx = make_ctx_with_proxy();
+    // No Connection header (H2/H3 inbound shape).
+    let mut headers = HashMap::new();
+    headers.insert("trailer".to_string(), "grpc-status".to_string());
+    headers.insert("te".to_string(), "gzip".to_string());
+    headers.insert("transfer-encoding".to_string(), "chunked".to_string());
+    headers.insert(
+        "x-ferrum-original-content-encoding".to_string(),
+        "br".to_string(),
+    );
+    headers.insert("x-grpc-web-mode".to_string(), "1".to_string());
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpc+proto".to_string(),
+    );
+    headers.insert("x-keep".to_string(), "ok".to_string());
+
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    for stripped in [
+        "trailer",
+        "transfer-encoding",
+        "x-ferrum-original-content-encoding",
+        "x-grpc-web-mode",
+    ] {
+        assert!(
+            !observed.contains_key(stripped),
+            "H2/H3 mirror parity leaked `{stripped}`: {observed:?}"
+        );
+    }
+    assert_eq!(
+        observed.get("te").map(String::as_str),
+        Some("trailers"),
+        "gRPC mirror must re-synthesise te: trailers after generic strip: {observed:?}"
+    );
+    assert_eq!(observed.get("x-keep").map(String::as_str), Some("ok"));
+}
+
+async fn capture_mirror_request_line(ctx: &mut RequestContext) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<String>();
+    tokio::spawn(async move {
+        if let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stream.read(&mut chunk).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let head = String::from_utf8_lossy(&buf);
+            let request_line = head.lines().next().unwrap_or("").to_string();
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+            let _ = tx.send(request_line);
+        }
+    });
+
+    let plugin = RequestMirror::new(
+        &json!({
+            "mirror_host": addr.ip().to_string(),
+            "mirror_port": addr.port(),
+            "mirror_request_body": false,
+            "percentage": 100.0
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(ctx, &mut headers).await;
+    plugin_utils::assert_continue(result);
+    let _ = ctx.collect_mirror_result().await;
+    rx.await.expect("mirror request line")
+}
+
+#[tokio::test]
+async fn test_mirror_preserves_raw_query_edge_cases() {
+    // Issue #2444: repeated pairs, order, flags, empty values, `+`, encoded
+    // delimiters, percent escapes, and non-ASCII encoded bytes must survive.
+    const RAW: &str =
+        "tag=red&tag=blue&b=1&a=2&flag&empty=&q=a+b&path=%2Froot&k=a%26b&key=a%2Fb&name=%E2%9C%93";
+
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string(RAW.to_string());
+    // Materialised map would collapse duplicates and re-encode; raw query must win.
+    ctx.query_params
+        .insert("tag".to_string(), "only-one".to_string());
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains(RAW),
+        "mirror must preserve raw query edge cases: {request_line}"
+    );
+    assert!(
+        !request_line.contains("only-one"),
+        "materialised query map must not replace raw query: {request_line}"
+    );
+}
+
+#[tokio::test]
+async fn test_mirror_applies_auth_query_strips_like_primary() {
+    // Intentional query mutation parity with primary:
+    // `query_string_after_plugin_strips` removes auth-marked credential params.
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("api_key=secret&tag=red&tag=blue&keep=1".to_string());
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        request_line.contains("tag=red&tag=blue&keep=1"),
+        "mirror must keep non-credential raw pairs: {request_line}"
+    );
+    assert!(
+        !request_line.contains("api_key="),
+        "mirror must strip auth-marked query credentials like primary: {request_line}"
+    );
+}
+
+#[tokio::test]
+async fn test_mirror_does_not_reintroduce_fully_stripped_query_credential() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("api_key=secret".to_string());
+    // Model the already-materialised map retained for later plugins. An empty
+    // effective raw query must remain authoritative over this stale value.
+    ctx.query_params
+        .insert("api_key".to_string(), "secret".to_string());
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        !request_line.contains("api_key") && !request_line.contains('?'),
+        "mirror must not restore a fully stripped credential query: {request_line}"
+    );
+}
+
+#[tokio::test]
+async fn test_mirror_ignores_query_map_transform_when_client_had_no_query() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.query_params
+        .insert("injected".to_string(), "value".to_string());
+    ctx.metadata.insert(
+        "ferrum:query_params_transformed".to_string(),
+        "true".to_string(),
+    );
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        !request_line.contains("injected") && !request_line.contains('?'),
+        "mirror must match primary raw-query construction: {request_line}"
+    );
+}
+
+#[tokio::test]
+async fn test_mirror_rejects_grpc_prefix_smuggling_for_te_resynthesis() {
+    let mut ctx = make_ctx_with_proxy();
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "application/grpcfoo".to_string(),
+    );
+    headers.insert("te".to_string(), "gzip".to_string());
+
+    let observed = capture_mirror_request_headers(&mut ctx, &mut headers).await;
+    assert!(
+        !observed.contains_key("te"),
+        "prefix-smuggled content-type must not re-synthesise te: {observed:?}"
+    );
 }
