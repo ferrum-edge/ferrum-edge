@@ -4577,7 +4577,7 @@ config:
 
 Scans AI/LLM request bodies for PII and either rejects, redacts, or warns.
 
-Request buffering is only enabled for matching bare-JSON `POST` requests when the plugin has at least one valid pattern to scan. Native gRPC and gRPC-Web bodies are framed wire formats even when their media type ends in `+json`; they are explicitly outside this JSON policy's inspection scope and are not buffered.
+This plugin is HTTP-only. Native gRPC has no supported prompt-schema or frame-decoding contract, so the plugin is not registered for the gRPC protocol view and must not be treated as a fail-closed PII control for unary or streaming native gRPC traffic. Request buffering is only enabled for matching bare-JSON `POST` requests when the plugin has at least one valid pattern to scan. gRPC-Web framed bodies (including `application/grpc-web*+json`) remain outside this JSON policy: they are not buffered, decoded, or rewritten, so message framing is never corrupted.
 
 **Priority:** 2925
 

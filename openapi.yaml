@@ -18438,7 +18438,7 @@ components:
     AiPromptShieldConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_prompt_shield — PII detection and redaction in bare JSON AI prompts. Native protobuf/framed gRPC and gRPC-Web bodies are outside the JSON inspection scope."
+      description: "Plugin: ai_prompt_shield — HTTP-only PII detection and redaction in bare JSON AI prompts. Native gRPC is unsupported (not registered for the Grpc protocol view). Framed gRPC-Web bodies remain outside the JSON inspection scope and are skipped without decoding."
       anyOf:
         - not:
             required: [patterns]
