@@ -2576,7 +2576,7 @@ async fn utf16le_username_token_validates_over_decoded_text() {
     let bytes = encode_utf16_le(&body);
     let mut ctx = make_ctx_with_soap_bytes(bytes.clone(), "application/soap+xml; charset=utf-16");
     // Simulate H1/H2/H3 handoff: non-UTF-8 bytes must not populate request_body.
-    assert!(ctx.metadata.get("request_body").is_none());
+    assert!(!ctx.metadata.contains_key("request_body"));
     let mut headers = soap_headers_with_content_type("application/soap+xml; charset=utf-16");
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(
