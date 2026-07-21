@@ -1588,6 +1588,43 @@ async fn test_mirror_applies_auth_query_strips_like_primary() {
 }
 
 #[tokio::test]
+async fn test_mirror_does_not_reintroduce_fully_stripped_query_credential() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.set_raw_query_string("api_key=secret".to_string());
+    // Model the already-materialised map retained for later plugins. An empty
+    // effective raw query must remain authoritative over this stale value.
+    ctx.query_params
+        .insert("api_key".to_string(), "secret".to_string());
+    ctx.metadata.insert(
+        "auth.strip_query_param.api_key".to_string(),
+        "true".to_string(),
+    );
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        !request_line.contains("api_key") && !request_line.contains('?'),
+        "mirror must not restore a fully stripped credential query: {request_line}"
+    );
+}
+
+#[tokio::test]
+async fn test_mirror_ignores_query_map_transform_when_client_had_no_query() {
+    let mut ctx = make_ctx_with_proxy();
+    ctx.query_params
+        .insert("injected".to_string(), "value".to_string());
+    ctx.metadata.insert(
+        "ferrum:query_params_transformed".to_string(),
+        "true".to_string(),
+    );
+
+    let request_line = capture_mirror_request_line(&mut ctx).await;
+    assert!(
+        !request_line.contains("injected") && !request_line.contains('?'),
+        "mirror must match primary raw-query construction: {request_line}"
+    );
+}
+
+#[tokio::test]
 async fn test_mirror_rejects_grpc_prefix_smuggling_for_te_resynthesis() {
     let mut ctx = make_ctx_with_proxy();
     let mut headers = HashMap::new();

@@ -65,6 +65,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -233,9 +234,14 @@ impl RequestMirror {
         let _ = write!(&mut url, "{}", self.mirror_port);
         url.push_str(path);
 
-        if let Some(query) = raw_query.filter(|q| !q.is_empty()) {
-            url.push('?');
-            url.push_str(query);
+        if let Some(query) = raw_query {
+            // `Some("")` is authoritative: an auth strip may have removed the
+            // entire raw query, so falling back to the materialised map here
+            // would reintroduce the credential.
+            if !query.is_empty() {
+                url.push('?');
+                url.push_str(query);
+            }
         } else if !query_params.is_empty() {
             url.push('?');
             let encoded: String = form_urlencoded::Serializer::new(String::new())
@@ -415,9 +421,18 @@ impl Plugin for RequestMirror {
         // Decoded `request_transformer` query-map mutations are intentionally
         // not re-serialized here — primary dispatch likewise keeps the raw
         // (auth-stripped) wire query.
-        let effective_query = ctx
-            .raw_query_string()
-            .map(|raw| crate::proxy::query_string_after_plugin_strips(ctx, raw));
+        let query_map_was_transformed = ctx
+            .metadata
+            .contains_key(crate::proxy::QUERY_PARAMS_TRANSFORMED_METADATA_KEY);
+        let effective_query = match ctx.raw_query_string() {
+            Some(raw) => Some(crate::proxy::query_string_after_plugin_strips(ctx, raw)),
+            // Query-transformer map mutations are intentionally not serialized
+            // by primary dispatch. Preserve that contract even when the client
+            // supplied no original query, while retaining the legacy map
+            // fallback for synthetic/test contexts with no transform marker.
+            None if query_map_was_transformed => Some(Cow::Borrowed("")),
+            None => None,
+        };
         let mirror_url =
             self.build_mirror_url(mirror_path, effective_query.as_deref(), &ctx.query_params);
         let method = ctx.method.clone();
