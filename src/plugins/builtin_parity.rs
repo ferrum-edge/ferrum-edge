@@ -338,8 +338,8 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         classification: BuiltinPluginClassification::Public,
         priority: 2925,
         active_phases: "before_proxy, transform_request_body, on_final_request_body",
-        matrix_protocols: HTTP_GRPC_PROTOCOLS,
-        protocol_rationale: "Scans bare JSON request bodies for PII; native protobuf/framed gRPC is outside its JSON inspection scope",
+        matrix_protocols: HTTP_ONLY_PROTOCOLS,
+        protocol_rationale: "HTTP-only PII detection/redaction for bare JSON prompts; native gRPC unsupported (gRPC-Web framed bodies are skipped)",
     },
     BuiltinPluginParityMeta {
         name: "waf",

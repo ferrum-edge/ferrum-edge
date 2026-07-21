@@ -892,7 +892,7 @@ parity against runtime metadata in `src/plugins/builtin_parity.rs`.
 | `ws_rate_limiting` | | | ✓ | | | Per-connection frame rate limiting for WebSocket |
 | `udp_rate_limiting` | | | | | ✓ | Per-client-IP datagram and byte rate limiting for UDP proxies |
 | `ai_transcript_audit` | ✓ | | | | | HTTP-only AI transcript capture to a configured sink |
-| `ai_prompt_shield` | ✓ | ✓ | | | | Scans bare JSON request bodies for PII; native protobuf/framed gRPC is outside its JSON inspection scope |
+| `ai_prompt_shield` | ✓ | | | | | HTTP-only PII detection/redaction for bare JSON prompts; native gRPC unsupported (gRPC-Web framed bodies are skipped) |
 | `waf` | ✓ | ✓ | ✓ | ✓ | ✓ | HTTP-family always; TCP/UDP first-bytes and datagram inspection when a `stream` block is configured |
 | `fault_injection` | ✓ | ✓ | ✓ | ✓ | | Probabilistic aborts and delays; raw TCP only for stream hooks (no UDP/DTLS) |
 | `body_validator` | ✓ | ✓ | | | | Validates request and response bodies |

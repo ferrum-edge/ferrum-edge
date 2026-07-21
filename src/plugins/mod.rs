@@ -7163,6 +7163,15 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("fault_injection", PluginFailurePolicy::KeepLastKnownGood),
 ];
 
+// Keep documentation/parity inventory linked in both the library crate (consumed
+// by integration tests) and the binary crate (same sources, separate compilation).
+// Length equality is a cheap compile-time guard; name set-equality remains in tests.
+const _: () = {
+    assert!(BUILTIN_PLUGIN_PARITY_META.len() == BUILTIN_PLUGIN_REGISTRATIONS.len());
+    let _: fn(&str) -> Option<&'static BuiltinPluginParityMeta> = builtin_plugin_parity_meta;
+    let _: BuiltinPluginClassification = BuiltinPluginClassification::Public;
+};
+
 pub fn builtin_plugin_registration(name: &str) -> Option<&'static PluginRegistration> {
     BUILTIN_PLUGIN_REGISTRATIONS
         .iter()
