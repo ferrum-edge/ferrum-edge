@@ -976,6 +976,7 @@ jobs:
               functional_h3_grpc_web_test
               functional_h3_grpc_streaming_test
               functional_request_termination_h3_test
+              functional_response_mock_semantics_test
               functional_websocket_limits_test
           - shard: data-plane
             # Serialized because DP functional tests bind exclusive ports and
