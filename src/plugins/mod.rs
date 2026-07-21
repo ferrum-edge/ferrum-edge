@@ -3954,8 +3954,10 @@ pub async fn normalize_response_body_for_inspection(
         {
             Ok(body) => body,
             Err(()) => {
+                let owned_grpc_web_response_content_type =
+                    crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
                 let grpc_web_response_content_type =
-                    crate::plugins::grpc_web::retained_response_content_type(ctx);
+                    owned_grpc_web_response_content_type.as_deref();
                 crate::proxy::replace_buffered_grpc_response_with_deadline(
                     ctx,
                     grpc_web_response_content_type,

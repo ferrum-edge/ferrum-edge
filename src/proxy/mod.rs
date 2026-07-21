@@ -14701,8 +14701,9 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
     // serverless terminate, dedup replay), so there is no upstream snapshot and
     // no hidden origin coding — the live headers are the only description of
     // these bytes, and `GatewayGenerated` reads them directly.
-    let grpc_web_response_content_type =
-        crate::plugins::grpc_web::retained_response_content_type(ctx);
+    let owned_grpc_web_response_content_type =
+        crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
+    let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
     // `false`: the reject `after_proxy` hooks are deliberately deferred on this
     // path and applied exactly once by
     // `apply_reject_after_proxy_and_synthetic_body_hooks` over the final

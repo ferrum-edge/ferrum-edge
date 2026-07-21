@@ -2787,8 +2787,10 @@ where
                 // An H3 client bridged to an H1/H2 backend must not receive a
                 // protected representation this gateway could not inspect just
                 // because the frontend protocol differs.
+                let owned_grpc_web_response_content_type =
+                    crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
                 let grpc_web_response_content_type =
-                    crate::plugins::grpc_web::retained_response_content_type(ctx);
+                    owned_grpc_web_response_content_type.as_deref();
                 let admission = crate::proxy::admit_buffered_response_body_transforms(
                     plugins,
                     ctx,
@@ -4653,8 +4655,9 @@ where
             // the transforms see. A rejection here replaces the response, so the
             // backend trailers no longer describe the bytes being sent and are
             // dropped — the same rule the deadline replacement below follows.
-            let grpc_web_response_content_type =
-                crate::plugins::grpc_web::retained_response_content_type(ctx);
+            let owned_grpc_web_response_content_type =
+                crate::plugins::grpc_web::retained_response_content_type(ctx).map(str::to_owned);
+            let grpc_web_response_content_type = owned_grpc_web_response_content_type.as_deref();
             let admission = crate::proxy::admit_buffered_response_body_transforms(
                 plugins,
                 ctx,
