@@ -697,8 +697,6 @@ fn test_kafka_logging_finalize_budget_includes_blocking_pool_queue() {
         .enable_all()
         .build()
         .expect("build constrained Kafka finalize test runtime");
-    start_kafka_logging(&plugin);
-
     runtime.block_on(async {
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -721,6 +719,7 @@ fn test_kafka_logging_finalize_budget_includes_blocking_pool_queue() {
             &default_http_client(),
         )
         .expect("construct Kafka logger for blocking-pool budget test");
+        start_kafka_logging(&plugin);
         plugin.log(&create_test_transaction_summary()).await;
         tokio::time::timeout(Duration::from_secs(2), async {
             while plugin.snapshot().admitted_total == 0 {
@@ -780,7 +779,6 @@ fn docs_do_not_require_undeclared_kafka_cargo_feature() {
     let features_idx = cargo
         .find("[features]")
         .expect("Cargo.toml must declare [features]");
-    start_kafka_logging(&plugin);
     let features = &cargo[features_idx..];
     assert!(
         !features
