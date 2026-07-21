@@ -129,6 +129,120 @@ fn reject_body(result: &PluginResult) -> &str {
     }
 }
 
+fn reject_headers(result: &PluginResult) -> &HashMap<String, String> {
+    match result {
+        PluginResult::Reject { headers, .. } => headers,
+        _ => panic!("Expected Reject, got {:?}", result),
+    }
+}
+
+/// Public UsernameToken invalid-credential body (GHSA-jp56 / issue #2642).
+const USERNAME_TOKEN_INVALID_CREDENTIALS_BODY: &str =
+    r#"{"error":"WS-Security: invalid credentials"}"#;
+
+fn assert_username_token_invalid_credentials(result: &PluginResult, candidate_usernames: &[&str]) {
+    assert!(is_reject(result));
+    assert_eq!(reject_status(result), 401);
+    assert_eq!(reject_body(result), USERNAME_TOKEN_INVALID_CREDENTIALS_BODY);
+    assert!(
+        reject_headers(result).is_empty(),
+        "invalid-credential rejects must not add distinguishing headers: {:?}",
+        reject_headers(result)
+    );
+    let body = reject_body(result);
+    for candidate in candidate_usernames {
+        assert!(
+            !body.contains(candidate),
+            "client body must not leak candidate username {:?}: {}",
+            candidate,
+            body
+        );
+    }
+    assert!(
+        !body.to_ascii_lowercase().contains("unknown"),
+        "client body must not disclose unknown-username: {}",
+        body
+    );
+    assert!(
+        !body.contains("invalid password"),
+        "client body must not disclose password-verification detail: {}",
+        body
+    );
+    assert!(
+        !body.contains("PasswordDigest verification failed"),
+        "client body must not disclose digest-verification detail: {}",
+        body
+    );
+}
+
+fn assert_username_token_structural(
+    result: &PluginResult,
+    expected_fragment: &str,
+    candidate_usernames: &[&str],
+) {
+    assert!(is_reject(result));
+    assert_eq!(reject_status(result), 401);
+    assert!(
+        reject_headers(result).is_empty(),
+        "structural rejects must not add distinguishing headers: {:?}",
+        reject_headers(result)
+    );
+    let body = reject_body(result);
+    assert_ne!(
+        body, USERNAME_TOKEN_INVALID_CREDENTIALS_BODY,
+        "structural failures must remain distinct from invalid-credential rejects"
+    );
+    assert!(
+        body.contains(expected_fragment),
+        "expected structural fragment {:?}, got: {}",
+        expected_fragment,
+        body
+    );
+    for candidate in candidate_usernames {
+        assert!(
+            !body.contains(candidate),
+            "structural body must not leak candidate username {:?}: {}",
+            candidate,
+            body
+        );
+    }
+}
+
+fn password_digest_token(username: &str, password: &str, nonce_bytes: &[u8]) -> String {
+    let created = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+    password_digest_token_with_created(username, password, nonce_bytes, &created)
+}
+
+fn password_digest_token_with_created(
+    username: &str,
+    password: &str,
+    nonce_bytes: &[u8],
+    created: &str,
+) -> String {
+    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
+
+    let mut data = Vec::new();
+    data.extend_from_slice(nonce_bytes);
+    data.extend_from_slice(created.as_bytes());
+    data.extend_from_slice(password.as_bytes());
+
+    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
+    let digest_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
+
+    format!(
+        r#"<wsse:UsernameToken>
+        <wsse:Username>{}</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
+        <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</wsse:Nonce>
+        <wsu:Created>{}</wsu:Created>
+    </wsse:UsernameToken>"#,
+        username, digest_b64, nonce_b64, created
+    )
+}
+
 // ── Constructor validation tests ────────────────────────────────────────────
 
 #[test]
@@ -724,9 +838,7 @@ async fn test_username_token_wrong_password_rejects() {
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(is_reject(&result));
-    assert_eq!(reject_status(&result), 401);
-    assert!(reject_body(&result).contains("invalid password"));
+    assert_username_token_invalid_credentials(&result, &["alice"]);
 }
 
 #[tokio::test]
@@ -788,8 +900,7 @@ async fn test_username_token_unknown_user_rejects() {
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(is_reject(&result));
-    assert!(reject_body(&result).contains("unknown username"));
+    assert_username_token_invalid_credentials(&result, &["eve", "alice"]);
 }
 
 #[tokio::test]
@@ -866,38 +977,59 @@ async fn test_password_digest_valid() {
 #[tokio::test]
 async fn test_password_digest_wrong_password_rejects() {
     let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
-
-    let nonce_bytes = b"wrong-nonce-test";
-    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
-    let created = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
-
-    // Use wrong password for digest
-    let mut data = Vec::new();
-    data.extend_from_slice(nonce_bytes);
-    data.extend_from_slice(created.as_bytes());
-    data.extend_from_slice(b"wrongpassword");
-
-    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
-    let digest_b64 =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
-
-    let ut = format!(
-        r#"<wsse:UsernameToken>
-        <wsse:Username>alice</wsse:Username>
-        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
-        <wsse:Nonce>{}</wsse:Nonce>
-        <wsu:Created>{}</wsu:Created>
-    </wsse:UsernameToken>"#,
-        digest_b64, nonce_b64, created
-    );
+    let ut = password_digest_token("alice", "wrongpassword", b"wrong-nonce-test");
     let body = wrap_soap(&ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(is_reject(&result));
-    assert!(reject_body(&result).contains("PasswordDigest verification failed"));
+    assert_username_token_invalid_credentials(&result, &["alice"]);
+}
+
+#[tokio::test]
+async fn test_username_token_credential_failures_are_indistinguishable() {
+    // GHSA-jp56-p5h6-f45q / issue #2642: unknown user, wrong PasswordText, and
+    // wrong PasswordDigest must expose identical public status/headers/body and
+    // must not echo the attacker-supplied candidate username.
+    let text_plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let digest_plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+
+    let unknown_text = r#"<wsse:UsernameToken>
+        <wsse:Username>eve-candidate</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">anything</wsse:Password>
+    </wsse:UsernameToken>"#;
+    let wrong_text = r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">wrongpass</wsse:Password>
+    </wsse:UsernameToken>"#;
+    let wrong_digest = password_digest_token("alice", "wrongpassword", b"oracle-digest-nonce");
+    let unknown_digest =
+        password_digest_token("eve-candidate", "anything", b"oracle-unknown-digest");
+
+    let mut outcomes = Vec::new();
+    for (plugin, token) in [
+        (&text_plugin, unknown_text.to_string()),
+        (&text_plugin, wrong_text.to_string()),
+        (&digest_plugin, wrong_digest),
+        (&digest_plugin, unknown_digest),
+    ] {
+        let body = wrap_soap(&token);
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_username_token_invalid_credentials(&result, &["eve-candidate", "alice"]);
+        outcomes.push((
+            reject_status(&result),
+            reject_body(&result).to_string(),
+            reject_headers(&result).clone(),
+        ));
+    }
+
+    let (status0, body0, headers0) = &outcomes[0];
+    for (idx, (status, body, headers)) in outcomes.iter().enumerate().skip(1) {
+        assert_eq!(status, status0, "status mismatch at outcome {}", idx);
+        assert_eq!(body, body0, "body mismatch at outcome {}", idx);
+        assert_eq!(headers, headers0, "headers mismatch at outcome {}", idx);
+    }
 }
 
 #[tokio::test]
@@ -914,6 +1046,82 @@ async fn test_password_digest_missing_nonce_rejects() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("requires Nonce"));
+}
+
+#[tokio::test]
+async fn test_username_token_missing_token_is_structural() {
+    // Security header present but no UsernameToken: fail closed as structural,
+    // not as the generic invalid-credential body.
+    let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let body = wrap_soap("");
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_username_token_structural(&result, "missing UsernameToken", &["alice", "eve"]);
+}
+
+#[tokio::test]
+async fn test_username_token_empty_password_element_is_structural() {
+    // Self-closing Password has no text content and must fail closed before any
+    // known/unknown credential comparison.
+    let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let ut = r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"/>
+    </wsse:UsernameToken>"#;
+    let body = wrap_soap(ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_username_token_structural(&result, "Password element has no content", &["alice"]);
+}
+
+#[tokio::test]
+async fn test_password_digest_invalid_nonce_base64_is_structural() {
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let ut = r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">dGVzdA==</wsse:Password>
+        <wsse:Nonce>!!!not-valid-base64!!!</wsse:Nonce>
+        <wsu:Created>2026-01-01T00:00:00Z</wsu:Created>
+    </wsse:UsernameToken>"#;
+    let body = wrap_soap(ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_username_token_structural(&result, "invalid Nonce base64 encoding", &["alice"]);
+}
+
+#[tokio::test]
+async fn test_password_digest_missing_created_is_structural_for_known_and_unknown() {
+    // Nonce/Created structural checks run before the known/unknown credential
+    // branch so a missing Created cannot become a username oracle.
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let mut bodies = Vec::new();
+    for username in ["alice", "eve-candidate"] {
+        let ut = format!(
+            r#"<wsse:UsernameToken>
+        <wsse:Username>{}</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">dGVzdA==</wsse:Password>
+        <wsse:Nonce>dGVzdC1ub25jZQ==</wsse:Nonce>
+    </wsse:UsernameToken>"#,
+            username
+        );
+        let body = wrap_soap(&ut);
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_username_token_structural(
+            &result,
+            "PasswordDigest requires Created",
+            &["alice", "eve-candidate"],
+        );
+        bodies.push(reject_body(&result).to_string());
+    }
+    assert_eq!(
+        bodies[0], bodies[1],
+        "known and unknown principals must share the same missing-Created structural body"
+    );
 }
 
 // ── Nonce replay protection tests ───────────────────────────────────────────
@@ -960,6 +1168,60 @@ async fn test_nonce_replay_detected() {
     let result2 = plugin.before_proxy(&mut ctx2, &mut headers2).await;
     assert!(is_reject(&result2));
     assert!(reject_body(&result2).contains("nonce replay"));
+}
+
+#[tokio::test]
+async fn failed_digest_attempts_do_not_poison_a_valid_principals_nonce() {
+    // Failed pre-auth attempts must do the dummy digest work but must not
+    // reserve the nonce. Otherwise an attacker can race either an unknown
+    // username or a known username with a wrong digest ahead of the victim.
+    for (attempt_username, attempt_password, nonce_bytes) in [
+        ("eve-candidate", "anything", b"unknown-user-race".as_slice()),
+        ("alice", "wrongpassword", b"wrong-password-race".as_slice()),
+    ] {
+        let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+        let created = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+
+        let failed_token = password_digest_token_with_created(
+            attempt_username,
+            attempt_password,
+            nonce_bytes,
+            &created,
+        );
+        let failed_body = wrap_soap(&failed_token);
+        let mut failed_ctx = make_ctx_with_soap_body(&failed_body);
+        let mut failed_headers = soap_headers();
+        let failed = plugin
+            .before_proxy(&mut failed_ctx, &mut failed_headers)
+            .await;
+        assert_username_token_invalid_credentials(
+            &failed,
+            &[attempt_username, "alice", "eve-candidate"],
+        );
+
+        let valid_token =
+            password_digest_token_with_created("alice", "secret123", nonce_bytes, &created);
+        let valid_body = wrap_soap(&valid_token);
+        let mut valid_ctx = make_ctx_with_soap_body(&valid_body);
+        let mut valid_headers = soap_headers();
+        let valid = plugin
+            .before_proxy(&mut valid_ctx, &mut valid_headers)
+            .await;
+        assert!(
+            matches!(valid, PluginResult::Continue),
+            "failed attempt for {attempt_username} poisoned the legitimate nonce: {valid:?}"
+        );
+
+        let mut replay_ctx = make_ctx_with_soap_body(&valid_body);
+        let mut replay_headers = soap_headers();
+        let replay = plugin
+            .before_proxy(&mut replay_ctx, &mut replay_headers)
+            .await;
+        assert!(is_reject(&replay));
+        assert!(reject_body(&replay).contains("nonce replay"));
+    }
 }
 
 // ── SAML config tests ───────────────────────────────────────────────────────
@@ -2095,6 +2357,26 @@ fn test_nonce_replay_detected_via_direct_api() {
 
     assert!(plugin.check_nonce_replay("unique-nonce").is_ok());
     assert!(plugin.check_nonce_replay("unique-nonce").is_err());
+}
+
+#[test]
+fn test_nonce_cache_refreshes_occupied_entry_after_ttl() {
+    // cache_ttl_seconds=0 means every Occupied hit is already expired, so the
+    // atomic entry path must refresh inserted_at instead of treating reuse as
+    // a live replay. This covers the post-TTL Occupied insert branch used by
+    // successful PasswordDigest authentication.
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": { "max_cache_size": 100, "cache_ttl_seconds": 0 },
+        "reject_missing_security_header": false
+    }))
+    .unwrap();
+
+    assert!(plugin.check_nonce_replay("ttl-expired-nonce").is_ok());
+    assert!(
+        plugin.check_nonce_replay("ttl-expired-nonce").is_ok(),
+        "expired Occupied nonce must be refreshed, not rejected as a live replay"
+    );
 }
 
 // ── X.509 signature verification — end-to-end roundtrip ─────────────────────

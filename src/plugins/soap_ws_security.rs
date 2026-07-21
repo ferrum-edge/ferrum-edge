@@ -41,7 +41,7 @@
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
+use dashmap::{DashMap, mapref::entry::Entry};
 use ring::digest;
 use ring::signature as ring_sig;
 use roxmltree::{Document, Node, NodeId, ParsingOptions};
@@ -111,10 +111,43 @@ enum DigestAlgorithm {
     Sha1,
 }
 
+fn sha256_array(value: &[u8]) -> [u8; 32] {
+    let hashed = digest::digest(&digest::SHA256, value);
+    let mut output = [0u8; 32];
+    output.copy_from_slice(hashed.as_ref());
+    output
+}
+
 #[derive(Debug, Clone)]
 struct Credential {
     username: String,
     password: String,
+    /// Fixed-width digest used by PasswordText verification so known and
+    /// unknown principals take the same comparison path even when configured
+    /// secret lengths differ from the process-local dummy material.
+    password_text_hash: [u8; 32],
+}
+
+/// UsernameToken authentication outcomes that must not create a username oracle.
+///
+/// Structural token/policy failures remain distinguishable because they do not
+/// depend on whether the supplied principal exists. Credential failures
+/// (unknown user, wrong PasswordText, wrong PasswordDigest) share one public
+/// body and one stable telemetry class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UsernameTokenError {
+    Structural(String),
+    InvalidCredentials,
+}
+
+impl UsernameTokenError {
+    /// Stable operational failure class for credential rejection (no username).
+    const INVALID_CREDENTIALS_CLASS: &'static str = "username_token_invalid_credentials";
+    /// Stable structural failure class for malformed / policy-mismatch tokens.
+    const STRUCTURAL_CLASS: &'static str = "username_token_structural";
+    /// Client-visible JSON body shared by every invalid-credential outcome.
+    const INVALID_CREDENTIALS_BODY: &'static str =
+        r#"{"error":"WS-Security: invalid credentials"}"#;
 }
 
 struct TrustedCert {
@@ -143,6 +176,11 @@ pub struct SoapWsSecurity {
     username_token_enabled: bool,
     password_type: PasswordType,
     credentials: Vec<Credential>,
+    /// Process-local padding secret used only to equalize verification work on
+    /// username lookup misses. Never authenticates a principal.
+    dummy_password: String,
+    /// Fixed-width PasswordText verifier for `dummy_password`.
+    dummy_password_text_hash: [u8; 32],
 
     // X.509 signature verification
     x509_enabled: bool,
@@ -203,7 +241,12 @@ impl SoapWsSecurity {
                     .filter_map(|v| {
                         let username = v["username"].as_str()?.to_string();
                         let password = v["password"].as_str()?.to_string();
-                        Some(Credential { username, password })
+                        let password_text_hash = sha256_array(password.as_bytes());
+                        Some(Credential {
+                            username,
+                            password,
+                            password_text_hash,
+                        })
                     })
                     .collect()
             })
@@ -215,6 +258,12 @@ impl SoapWsSecurity {
                     .to_string(),
             );
         }
+
+        // Random process-local material so lookup misses still execute the same
+        // PasswordText / PasswordDigest verification work as known principals.
+        // This value is never accepted as a configured credential.
+        let dummy_password = format!("soap-ws-security-dummy:{}", uuid::Uuid::new_v4());
+        let dummy_password_text_hash = sha256_array(dummy_password.as_bytes());
 
         // ── X.509 signature config ──────────────────────────────────────
         let x509_cfg = config_obj.get("x509_signature").unwrap_or(&Value::Null);
@@ -500,6 +549,8 @@ impl SoapWsSecurity {
             username_token_enabled,
             password_type,
             credentials,
+            dummy_password,
+            dummy_password_text_hash,
             x509_enabled,
             trusted_certs,
             allowed_signature_algorithms,
@@ -573,18 +624,29 @@ impl SoapWsSecurity {
 
     // ── UsernameToken validation ────────────────────────────────────────
 
-    fn validate_username_token(&self, security_block: &str) -> Result<String, String> {
-        let ut_block = find_element_block(security_block, "UsernameToken")
-            .ok_or_else(|| "WS-Security: missing UsernameToken element".to_string())?;
+    fn validate_username_token(&self, security_block: &str) -> Result<String, UsernameTokenError> {
+        let ut_block = find_element_block(security_block, "UsernameToken").ok_or_else(|| {
+            UsernameTokenError::Structural("WS-Security: missing UsernameToken element".to_string())
+        })?;
 
-        let username = find_element_text(&ut_block, "Username")
-            .ok_or_else(|| "WS-Security: UsernameToken missing Username element".to_string())?;
+        let username = find_element_text(&ut_block, "Username").ok_or_else(|| {
+            UsernameTokenError::Structural(
+                "WS-Security: UsernameToken missing Username element".to_string(),
+            )
+        })?;
 
-        let password_element = find_element_block(&ut_block, "Password")
-            .ok_or_else(|| "WS-Security: UsernameToken missing Password element".to_string())?;
+        let password_element = find_element_block(&ut_block, "Password").ok_or_else(|| {
+            UsernameTokenError::Structural(
+                "WS-Security: UsernameToken missing Password element".to_string(),
+            )
+        })?;
 
         let password_value = extract_element_text_content(&password_element, "Password")
-            .ok_or_else(|| "WS-Security: Password element has no content".to_string())?;
+            .ok_or_else(|| {
+                UsernameTokenError::Structural(
+                    "WS-Security: Password element has no content".to_string(),
+                )
+            })?;
 
         // The verification mode is dictated solely by the operator-configured
         // `password_type`, NEVER by the client-supplied `Type` attribute.
@@ -607,73 +669,96 @@ impl SoapWsSecurity {
             if let Some(wire_type) = wire_type
                 && wire_type != self.password_type
             {
-                return Err(
+                return Err(UsernameTokenError::Structural(
                     "WS-Security: Password Type does not match the configured password_type"
                         .to_string(),
-                );
+                ));
             }
         }
         let effective_type = self.password_type;
 
-        // Find the matching credential
-        let cred = self
-            .credentials
-            .iter()
-            .find(|c| c.username == username)
-            .ok_or_else(|| {
-                format!(
-                    "WS-Security: unknown username '{}'",
-                    escape_xml_chars(&username)
-                )
-            })?;
+        // Always run verification against either the matched credential or
+        // process-local dummy material so lookup misses do not skip crypto work
+        // and do not produce a distinct public failure.
+        let cred = self.credentials.iter().find(|c| c.username == username);
+        let password_material = cred
+            .map(|c| c.password.as_str())
+            .unwrap_or(self.dummy_password.as_str());
+        let username_known = cred.is_some();
 
         match effective_type {
             PasswordType::PasswordText => {
-                // Constant-time compare: `password_value` is attacker-controlled
-                // and `cred.password` is the stored shared secret, so a
-                // short-circuiting `!=` leaks password bytes via timing. Mirrors
-                // basic_auth / hmac_auth; `constant_time_eq` handles length
-                // mismatches safely.
-                if !constant_time_eq(password_value.as_bytes(), cred.password.as_bytes()) {
-                    return Err("WS-Security: invalid password".to_string());
+                // Hash the attacker input once, then compare fixed-width
+                // digests. `constant_time_eq` intentionally returns early on a
+                // length mismatch, so comparing plaintext directly would make
+                // the dummy path observably different whenever the configured
+                // password and dummy material have different lengths.
+                let supplied_hash = sha256_array(password_value.as_bytes());
+                let expected_hash = cred
+                    .map(|credential| &credential.password_text_hash)
+                    .unwrap_or(&self.dummy_password_text_hash);
+                let matched = constant_time_eq(&supplied_hash, expected_hash);
+                // Dummy material is timing padding only and must never establish
+                // identity for an unregistered username.
+                if username_known && matched {
+                    Ok(username)
+                } else {
+                    Err(UsernameTokenError::InvalidCredentials)
                 }
             }
             PasswordType::PasswordDigest => {
+                // Structural Nonce/Created requirements are enforced before the
+                // known/unknown credential branch so missing digest inputs cannot
+                // themselves become a username oracle.
                 // PasswordDigest = Base64(SHA-1(nonce + created + password))
                 let nonce_b64 = find_element_text(&ut_block, "Nonce").ok_or_else(|| {
-                    "WS-Security: PasswordDigest requires Nonce element".to_string()
+                    UsernameTokenError::Structural(
+                        "WS-Security: PasswordDigest requires Nonce element".to_string(),
+                    )
                 })?;
 
-                let nonce_bytes = BASE64
-                    .decode(nonce_b64.trim())
-                    .map_err(|e| format!("WS-Security: invalid Nonce base64 encoding: {}", e))?;
+                let nonce_bytes = BASE64.decode(nonce_b64.trim()).map_err(|e| {
+                    UsernameTokenError::Structural(format!(
+                        "WS-Security: invalid Nonce base64 encoding: {}",
+                        e
+                    ))
+                })?;
 
                 let created = find_element_text(&ut_block, "Created").ok_or_else(|| {
-                    "WS-Security: PasswordDigest requires Created element".to_string()
+                    UsernameTokenError::Structural(
+                        "WS-Security: PasswordDigest requires Created element".to_string(),
+                    )
                 })?;
-
-                // Check nonce replay
-                self.check_nonce_replay(&nonce_b64)?;
 
                 // Compute expected digest: SHA-1(nonce + created + password)
                 let mut data =
-                    Vec::with_capacity(nonce_bytes.len() + created.len() + cred.password.len());
+                    Vec::with_capacity(nonce_bytes.len() + created.len() + password_material.len());
                 data.extend_from_slice(&nonce_bytes);
                 data.extend_from_slice(created.as_bytes());
-                data.extend_from_slice(cred.password.as_bytes());
+                data.extend_from_slice(password_material.as_bytes());
 
                 let computed = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
                 let expected_b64 = BASE64.encode(computed.as_ref());
 
                 // Constant-time compare for consistency with the PasswordText
-                // path (the digest is derived from the shared secret).
-                if !constant_time_eq(password_value.trim().as_bytes(), expected_b64.as_bytes()) {
-                    return Err("WS-Security: PasswordDigest verification failed".to_string());
+                // path (the digest is derived from the shared secret or dummy).
+                let matched =
+                    constant_time_eq(password_value.trim().as_bytes(), expected_b64.as_bytes());
+                if username_known && matched {
+                    // Only a successfully verified principal may consume a
+                    // nonce. Recording attacker-controlled failed attempts
+                    // would let an unknown-user or wrong-password request
+                    // poison a victim's nonce before the legitimate request
+                    // arrives. The atomic entry check also prevents two
+                    // concurrent valid requests from both accepting it.
+                    self.check_nonce_replay(&nonce_b64)
+                        .map_err(UsernameTokenError::Structural)?;
+                    Ok(username)
+                } else {
+                    Err(UsernameTokenError::InvalidCredentials)
                 }
             }
         }
-
-        Ok(username)
     }
 
     // ── Nonce replay protection ─────────────────────────────────────────
@@ -695,17 +780,18 @@ impl SoapWsSecurity {
 
         let now = Instant::now();
 
-        // Check if nonce was already seen
-        if let Some(entry) = self.nonce_cache.get(nonce) {
-            let age = now.duration_since(entry.inserted_at);
-            if age.as_secs() < self.nonce_cache_ttl_seconds {
-                return Err("WS-Security: nonce replay detected".to_string());
+        match self.nonce_cache.entry(nonce.to_string()) {
+            Entry::Occupied(mut entry) => {
+                let age = now.duration_since(entry.get().inserted_at);
+                if age.as_secs() < self.nonce_cache_ttl_seconds {
+                    return Err("WS-Security: nonce replay detected".to_string());
+                }
+                entry.insert(NonceEntry { inserted_at: now });
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(NonceEntry { inserted_at: now });
             }
         }
-
-        // Record the nonce
-        self.nonce_cache
-            .insert(nonce.to_string(), NonceEntry { inserted_at: now });
 
         Ok(())
     }
@@ -1557,11 +1643,27 @@ impl Plugin for SoapWsSecurity {
                         "soap_ws_security: UsernameToken validated"
                     );
                 }
-                Err(e) => {
-                    warn!("soap_ws_security: UsernameToken validation failed: {}", e);
+                Err(UsernameTokenError::InvalidCredentials) => {
+                    // Generic response + stable failure class: do not log the
+                    // candidate username or password/digest verification detail.
+                    warn!(
+                        failure_class = UsernameTokenError::INVALID_CREDENTIALS_CLASS,
+                        "soap_ws_security: UsernameToken authentication failed"
+                    );
                     return PluginResult::Reject {
                         status_code: 401,
-                        body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(&e)),
+                        body: UsernameTokenError::INVALID_CREDENTIALS_BODY.to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+                Err(UsernameTokenError::Structural(detail)) => {
+                    warn!(
+                        failure_class = UsernameTokenError::STRUCTURAL_CLASS,
+                        "soap_ws_security: UsernameToken validation failed: {}", detail
+                    );
+                    return PluginResult::Reject {
+                        status_code: 401,
+                        body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(&detail)),
                         headers: HashMap::new(),
                     };
                 }
