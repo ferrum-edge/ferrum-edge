@@ -5171,6 +5171,21 @@ fn ai_prompt_shield_schema_matches_runtime_validation() {
 
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiPromptShieldConfig")
+        .expect("missing AiPromptShieldConfig schema");
+    let schema_description = schema["description"]
+        .as_str()
+        .expect("AiPromptShieldConfig description");
+    assert!(
+        schema_description.contains("HTTP-only"),
+        "OpenAPI must advertise HTTP-only attachment for ai_prompt_shield"
+    );
+    assert!(
+        schema_description.contains("Native gRPC is unsupported"),
+        "OpenAPI must reject the inert native-gRPC support claim"
+    );
+
     let pattern_schema = spec
         .pointer("/components/schemas/AiPromptShieldConfig/properties/patterns")
         .expect("missing ai_prompt_shield patterns schema");

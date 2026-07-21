@@ -57,6 +57,22 @@ impl Algorithm {
     }
 }
 
+/// Outcome of `Accept-Encoding` negotiation for one response (RFC 9110
+/// §12.5.3). Compared against every representation Ferrum can produce —
+/// each configured algorithm and the uncoded (identity) representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodingSelection {
+    /// Compress the backend's identity response with the selected algorithm.
+    Compress(Algorithm),
+    /// Send the representation without a content coding: identity is the
+    /// most preferred acceptable representation, or the only acceptable one.
+    Identity,
+    /// Every available representation, including identity, has quality zero —
+    /// the client refused all of them (for example `identity;q=0` combined
+    /// with `gzip;q=0, br;q=0`, or `*;q=0` without an identity override).
+    NotAcceptable,
+}
+
 /// Default MIME types eligible for compression (matches Envoy's defaults + common API types).
 const DEFAULT_CONTENT_TYPES: &[&str] = &[
     "application/json",
@@ -75,6 +91,11 @@ const DEFAULT_CONTENT_TYPES: &[&str] = &[
 const UNCOMPRESSIBLE_STATUS_CODES: &[u16] = &[204, 205, 304];
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+/// Metadata key set by `response_caching` for the current request's lookup
+/// outcome (`HIT`, `MISS`, …). Used to scope reject-path 406 replacement to
+/// cache HITs of identity variants without masking auth/policy rejections.
+const RESPONSE_CACHE_STATUS_METADATA_KEY: &str = "cache_status";
+const RESPONSE_CACHE_HIT_STATUS: &str = "HIT";
 const REQUEST_NO_TRANSFORM_METADATA_KEY: &str = "compression:request_no_transform";
 const RESPONSE_ALGORITHM_METADATA_KEY: &str = "compression:algorithm";
 
@@ -226,26 +247,38 @@ impl CompressionPlugin {
         })
     }
 
-    /// Parse `Accept-Encoding` and select the best algorithm from our configured set.
+    /// Parse `Accept-Encoding` and negotiate the representation coding among
+    /// the configured algorithms and `identity` (RFC 9110 §12.5.3).
     ///
-    /// Selection: highest q-value wins. Ties broken by server preference order
-    /// (the `algorithms` config array). Wildcard `*` matches all configured
-    /// algorithms at whatever q-value `*` carries, but per RFC 9110 §12.5.3 a
-    /// more specific entry takes precedence over `*` — so an explicit
-    /// `gzip;q=0` excludes gzip even when `*` is present with `q>0`.
+    /// Selection: highest q-value wins across every representation Ferrum can
+    /// produce, including the uncoded (identity) representation. Ties are
+    /// broken by server preference order (the `algorithms` config array), so
+    /// an algorithm tied with identity still compresses. Wildcard `*` matches
+    /// every *configured algorithm* not explicitly listed at whatever q-value
+    /// `*` carries, and a more specific algorithm entry takes precedence — so
+    /// an explicit `gzip;q=0` excludes gzip even when `*` is present with
+    /// `q>0`.
+    ///
+    /// Identity is special per RFC 9110 §12.5.3 and is ranked via
+    /// [`identity_coding_quality`]: acceptable by default at q=1; a nonzero
+    /// wildcard does **not** lower that default; only `identity;q=0` or
+    /// `*;q=0` without a more-specific identity entry makes identity
+    /// unacceptable. An unlisted configured algorithm is instead unacceptable
+    /// (q=0) unless the wildcard assigns it a quality.
     ///
     /// This is a two-pass parse rather than a single fused loop: pass 1 records
     /// each codec's explicit q-value (when its exact token appears, capturing
-    /// `q=0` refusals) and the wildcard q-value; pass 2 resolves each configured
-    /// algorithm's effective q (explicit wins over wildcard) and applies the
-    /// `q <= 0` not-acceptable gate and the highest-q / server-preference
-    /// tie-break.
-    fn select_algorithm(&self, accept_encoding: &str) -> Option<Algorithm> {
-        // Pass 1: scan every token once, recording the explicit q-value for each
-        // codec we support and the wildcard q-value. `None` means "no explicit
-        // entry for this codec". Later duplicate tokens overwrite earlier ones
-        // (last value wins), matching the previous single-loop behaviour for
-        // repeated identical tokens.
+    /// `q=0` refusals) and the wildcard q-value; pass 2 resolves each
+    /// candidate's effective q (explicit wins over wildcard), compares it
+    /// against identity's effective q, and applies the `q <= 0`
+    /// not-acceptable gate and the highest-q / server-preference tie-break.
+    fn select_algorithm(&self, accept_encoding: &str) -> CodingSelection {
+        // Pass 1: scan every token once, recording the explicit q-value for
+        // each configured codec and the wildcard q-value. `None` means "no
+        // explicit entry for this codec". Later duplicate algorithm/wildcard
+        // tokens overwrite earlier ones (last value wins), matching the
+        // previous single-loop behaviour. Identity duplicates are handled by
+        // [`identity_coding_quality`] (first identity entry wins).
         let mut explicit_gzip: Option<f32> = None;
         let mut explicit_br: Option<f32> = None;
         let mut wildcard: Option<f32> = None;
@@ -266,8 +299,11 @@ impl CompressionPlugin {
             }
         }
 
+        let identity_q = identity_coding_quality(accept_encoding);
+
         // Pass 2: resolve each configured algorithm's effective q (its explicit
-        // entry wins over the wildcard) and pick the best one.
+        // entry wins over the wildcard; unlisted without wildcard means
+        // unacceptable) and pick the best one.
         let mut best: Option<(Algorithm, f32, usize)> = None; // (algo, q, server_pref_index)
         for (pref_idx, &algo) in self.config.algorithms.iter().enumerate() {
             let explicit = match algo {
@@ -275,10 +311,7 @@ impl CompressionPlugin {
                 Algorithm::Brotli => explicit_br,
             };
             // Explicit entry takes precedence over the wildcard fallback.
-            let effective_q = match explicit.or(wildcard) {
-                Some(q) => q,
-                None => continue,
-            };
+            let effective_q = explicit.or(wildcard).unwrap_or(0.0);
             if effective_q <= 0.0 {
                 continue;
             }
@@ -291,7 +324,106 @@ impl CompressionPlugin {
             }
         }
 
-        best.map(|(algo, _, _)| algo)
+        match best {
+            // A configured algorithm beats or ties identity: server preference
+            // keeps compressing on ties, preserving prior behavior.
+            Some((algo, q, _)) if q >= identity_q => CodingSelection::Compress(algo),
+            // Identity is the most preferred acceptable representation, or the
+            // only acceptable one.
+            _ if identity_q > 0.0 => CodingSelection::Identity,
+            // Every representation Ferrum can produce — every configured
+            // algorithm and identity — has quality zero.
+            _ => CodingSelection::NotAcceptable,
+        }
+    }
+
+    /// Whether this response can be gateway-compressed (content-type whitelist
+    /// and optional Content-Length minimum). Protocol-hard skips (no-body
+    /// statuses, ranges, already-encoded upstream) are checked separately.
+    fn is_compression_eligible(&self, response_headers: &HashMap<String, String>) -> bool {
+        let compressible = response_headers
+            .get("content-type")
+            .is_some_and(|ct| self.is_compressible_content_type(ct));
+        if !compressible {
+            return false;
+        }
+        if let Some(cl) = response_headers.get("content-length")
+            && let Ok(len) = cl.parse::<usize>()
+            && len < self.config.min_content_length
+        {
+            return false;
+        }
+        true
+    }
+
+    fn response_forbids_transform(
+        ctx: &RequestContext,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::NO_TRANSFORM_RESPONSE_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY)
+            || headers_have_cache_control_directive(response_headers, "no-transform")
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::STRONG_ETAG_RESPONSE_METADATA_KEY)
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::LATER_STRONG_ETAG_RESPONSE_METADATA_KEY)
+            || headers_have_strong_etag(response_headers)
+    }
+
+    /// Hard protocol cases where Ferrum must not rewrite the representation
+    /// and must not invent a negotiation failure for an absent payload or an
+    /// already-coded upstream response.
+    ///
+    /// Identity range/delta responses are *not* hard skips: they are
+    /// non-transformable (see [`Self::is_non_transformable_range_or_delta`])
+    /// and still subject to identity-acceptability / 406 negotiation.
+    fn is_protocol_hard_skip(
+        _ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status)
+            || response_headers.contains_key("content-encoding")
+    }
+
+    /// Range/delta representations Ferrum must not re-encode, but which remain
+    /// identity when they lack `Content-Encoding`. Forward unchanged when
+    /// identity is acceptable; fail closed with 406 when it is not.
+    fn is_non_transformable_range_or_delta(
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        !super::response_body_rewrite_allowed(response_status)
+            || response_headers.contains_key("content-range")
+            || ctx
+                .metadata
+                .contains_key(crate::proxy::RANGE_RESPONSE_METADATA_KEY)
+    }
+
+    /// Reject-path 406 replacement is reserved for `response_caching` HITs of
+    /// identity variants. Other synthetic/auth/policy rejections keep their
+    /// original status so negotiation does not mask security denials.
+    fn is_response_cache_hit(ctx: &RequestContext) -> bool {
+        ctx.metadata
+            .get(RESPONSE_CACHE_STATUS_METADATA_KEY)
+            .is_some_and(|status| status == RESPONSE_CACHE_HIT_STATUS)
+    }
+
+    /// Emit 406 on the reject path only for cache-HIT identity variants; on the
+    /// ordinary backend path always fail closed when identity is unacceptable.
+    fn should_fail_closed_not_acceptable(ctx: &RequestContext, on_rejection: bool) -> bool {
+        !on_rejection || Self::is_response_cache_hit(ctx)
     }
 
     /// Check if the content type is eligible for compression.
@@ -568,6 +700,95 @@ fn parse_encoding_quality(token: &str) -> (&str, f32) {
     }
 }
 
+/// Parse one `Accept-Encoding` member's qvalue under the RFC 9110 §12.4.2
+/// grammar (`qvalue = ( "0" [ "." *3DIGIT ] ) / ( "1" [ "." *3"0" ] )`).
+///
+/// Returns the member's effective quality, defaulting to 1.0 when no `q`
+/// parameter is present. Returns `None` when a `q` parameter is present but
+/// malformed, so callers can ignore the entry rather than read it as a
+/// refusal: only a well-formed `q=0` weight may forbid a coding. Reading
+/// unparseable input as `q=0` would turn otherwise-servable traffic into a
+/// negotiation error — the same fail-safe posture as the shared
+/// identity-acceptability predicate in `response_representation`.
+fn rfc9110_entry_quality(token: &str) -> Option<f32> {
+    let Some(semi_idx) = token.find(';') else {
+        return Some(1.0);
+    };
+    for param in token[semi_idx + 1..].split(';') {
+        let Some((name, value)) = param.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("q") {
+            continue;
+        }
+        let value = value.trim();
+        // Grammar check before numeric conversion: `0[.0*3DIGIT]` or
+        // `1[.0*3("0")]` — anything else (extra fraction digits, signs,
+        // exponents, out-of-range weights) is malformed.
+        let (units, fraction) = value.split_once('.').unwrap_or((value, ""));
+        let well_formed = fraction.len() <= 3
+            && match units {
+                "0" => fraction.bytes().all(|b| b.is_ascii_digit()),
+                "1" => fraction.bytes().all(|b| b == b'0'),
+                _ => false,
+            };
+        if !well_formed {
+            return None;
+        }
+        return value.parse::<f32>().ok().filter(|q| q.is_finite());
+    }
+    Some(1.0)
+}
+
+/// Effective quality of the identity (uncoded) representation for
+/// `Accept-Encoding` negotiation (RFC 9110 §12.5.3).
+///
+/// Shared by compression selection and
+/// `response_representation::identity_coding_is_acceptable` so first/last
+/// duplicate handling and invalid-q behavior stay aligned:
+///
+/// - The **first** `identity` entry settles the question (more-specific match).
+///   A well-formed qvalue is that entry's quality; a malformed qvalue is not a
+///   refusal and keeps the default weight of `1.0`.
+/// - A nonzero wildcard does **not** lower identity below its default of `1.0`.
+/// - Only a well-formed `*;q=0` without a more-specific identity entry makes
+///   identity unacceptable (`0.0`). The **last** wildcard wins when several
+///   `*` entries appear.
+/// - Absent identity and non-forbidding wildcard → default `1.0`.
+pub(crate) fn identity_coding_quality(accept_encoding: &str) -> f32 {
+    let mut wildcard_forbids_identity = false;
+    for entry in accept_encoding.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let coding = entry.split(';').next().unwrap_or("").trim();
+        if coding.is_empty() {
+            continue;
+        }
+        if coding.eq_ignore_ascii_case("identity") {
+            // First identity entry wins — including "malformed q ⇒ default 1.0".
+            return rfc9110_entry_quality(entry).unwrap_or(1.0);
+        }
+        if coding == "*" {
+            // Last wildcard wins; only a well-formed zero weight forbids identity.
+            wildcard_forbids_identity = matches!(rfc9110_entry_quality(entry), Some(q) if q == 0.0);
+        }
+    }
+    if wildcard_forbids_identity { 0.0 } else { 1.0 }
+}
+
+fn not_acceptable_reject() -> PluginResult {
+    PluginResult::Reject {
+        status_code: 406,
+        body: "{\"error\":\"not acceptable: no available content coding matches the request Accept-Encoding\"}".to_string(),
+        headers: HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("vary".to_string(), "Accept-Encoding".to_string()),
+        ]),
+    }
+}
+
 fn request_no_transform(ctx: &RequestContext, headers: &HashMap<String, String>) -> bool {
     ctx.metadata
         .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
@@ -752,6 +973,20 @@ impl Plugin for CompressionPlugin {
         true
     }
 
+    fn may_replace_rejection_response(&self) -> bool {
+        // Opt in so a required 406 can replace an uncommitted `response_caching`
+        // HIT of an identity variant. `after_proxy` only returns that Reject when
+        // `cache_status=HIT` and identity is explicitly unacceptable — auth/policy
+        // rejections are left unchanged.
+        true
+    }
+
+    fn warn_on_rejection_response_replacement(&self) -> bool {
+        // Replacing a cache HIT identity variant with a standards-required 406
+        // is expected negotiation behavior, not an anomalous overwrite.
+        false
+    }
+
     async fn before_proxy(
         &self,
         ctx: &mut RequestContext,
@@ -862,148 +1097,98 @@ impl Plugin for CompressionPlugin {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Rejection handling currently re-runs only `after_proxy` header hooks,
-        // not response-body transforms. Do not commit a Content-Encoding there
-        // unless/until the rejection path can also compress the reject body.
-        if ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY) {
+        // Synthetic / rejection responses re-run `after_proxy` without body
+        // transforms. Do not commit Content-Encoding there. Fail-closed 406 on
+        // this path is scoped to `response_caching` HITs of identity variants
+        // (`cache_status=HIT`) — including when identity responses omit
+        // `Vary: Accept-Encoding` (#2355) — so auth/policy rejections keep their
+        // original status.
+        let on_rejection = ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY);
+
+        // No-body statuses and already-coded upstream responses are
+        // protocol-correct as-is; negotiation does not invent a 406 for them.
+        if Self::is_protocol_hard_skip(ctx, response_status, response_headers) {
             return PluginResult::Continue;
         }
 
-        // The shared response lifecycle preserves range and delta bytes for
-        // 206/226 responses. Do not commit Content-Encoding or remove framing
-        // headers when the corresponding body transform cannot run.
-        if !super::response_body_rewrite_allowed(response_status) {
-            return PluginResult::Continue;
-        }
+        let range_or_delta =
+            Self::is_non_transformable_range_or_delta(ctx, response_status, response_headers);
 
-        // Skip uncompressible status codes.
-        if UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status) {
-            return PluginResult::Continue;
-        }
-
-        if ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
-            || ctx
-                .metadata
-                .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
-        {
-            return PluginResult::Continue;
-        }
-
-        // Range responses carry byte offsets for the original representation.
-        // Compressing them changes those byte positions and corrupts range
-        // semantics, even if a backend sends Content-Range with a non-206
-        // status. Range responses are also streamed (see
-        // `should_buffer_response_body_for_content_type`), so committing a
-        // `Content-Encoding` here would mislabel an uncompressed body whose
-        // `transform_response_body` (buffered-only) never runs. The live
-        // headers may already have been rewritten by an earlier-ordered hook
-        // (e.g. `response_transformer` removing `Content-Range`), so also honor
-        // the original backend range decision captured before `after_proxy`.
-        if response_headers.contains_key("content-range")
-            || ctx
-                .metadata
-                .contains_key(crate::proxy::RANGE_RESPONSE_METADATA_KEY)
-        {
-            return PluginResult::Continue;
-        }
-
-        // RFC 9111 no-transform forbids an intermediary from transforming the
-        // payload representation, including content-coding compression. The
-        // marker preserves the original backend directive if an earlier hook
-        // removed or renamed Cache-Control before compression runs.
-        if ctx
-            .metadata
-            .contains_key(crate::proxy::NO_TRANSFORM_RESPONSE_METADATA_KEY)
-            || ctx
-                .metadata
-                .contains_key(crate::proxy::LATER_NO_TRANSFORM_RESPONSE_METADATA_KEY)
-            || headers_have_cache_control_directive(response_headers, "no-transform")
-        {
-            return PluginResult::Continue;
-        }
-
-        // Strong ETags validate the exact selected representation. Compressing
-        // the body changes the representation bytes, so the gateway must not
-        // retain a strong origin validator. Weak validators are explicitly
-        // representation-variant tolerant and remain eligible.
-        if ctx
-            .metadata
-            .contains_key(crate::proxy::STRONG_ETAG_RESPONSE_METADATA_KEY)
-            || ctx
-                .metadata
-                .contains_key(crate::proxy::LATER_STRONG_ETAG_RESPONSE_METADATA_KEY)
-            || headers_have_strong_etag(response_headers)
-        {
-            return PluginResult::Continue;
-        }
-
-        // Skip if response already has Content-Encoding (don't double-compress).
-        if response_headers.contains_key("content-encoding") {
-            return PluginResult::Continue;
-        }
-
-        // Check Content-Type against whitelist.
-        let compressible = response_headers
-            .get("content-type")
-            .is_some_and(|ct| self.is_compressible_content_type(ct));
-        if !compressible {
-            return PluginResult::Continue;
-        }
-
-        // Check Content-Length against minimum (if known).
-        if let Some(cl) = response_headers.get("content-length")
-            && let Ok(len) = cl.parse::<usize>()
-            && len < self.config.min_content_length
-        {
-            return PluginResult::Continue;
-        }
-
-        // Select algorithm based on client's Accept-Encoding.
         let accept_encoding = ctx
             .metadata
             .get(REQUEST_ACCEPT_ENCODING_METADATA_KEY)
             .or_else(|| ctx.headers.get("accept-encoding"));
 
-        let algorithm = match accept_encoding.and_then(|ae| self.select_algorithm(ae)) {
-            Some(algo) => algo,
-            None => return PluginResult::Continue,
-        };
-
-        // Record authoritative ownership outside public plugin metadata so
-        // response security hooks can distinguish gateway-planned compression
-        // from an encoded origin response without trusting a spoofable key.
-        ctx.mark_gateway_response_compression(algorithm.content_encoding());
-
-        // Retain the existing observable decision metadata.
-        ctx.metadata.insert(
-            RESPONSE_ALGORITHM_METADATA_KEY.to_string(),
-            algorithm.content_encoding().to_string(),
-        );
-
-        // Set Content-Encoding. Remove Content-Length (it's stale after compression).
-        response_headers.insert(
-            "content-encoding".to_string(),
-            algorithm.content_encoding().to_string(),
-        );
-        response_headers.remove("content-length");
-
-        // Add Vary: Accept-Encoding so caches distinguish compressed variants.
-        match response_headers.get("vary") {
-            Some(existing) => {
-                // Don't duplicate if already present.
-                if !comma_header_contains_token(existing, "accept-encoding") {
-                    let mut updated = String::with_capacity(existing.len() + 17);
-                    updated.push_str(existing);
-                    updated.push_str(", Accept-Encoding");
-                    response_headers.insert("vary".to_string(), updated);
+        let selection = accept_encoding.map(|ae| self.select_algorithm(ae));
+        match selection {
+            // No Accept-Encoding field, or identity is the most preferred /
+            // only acceptable representation: forward the uncoded response.
+            Some(CodingSelection::Identity) | None => return PluginResult::Continue,
+            // Client refused identity and every configured algorithm.
+            Some(CodingSelection::NotAcceptable) => {
+                if Self::should_fail_closed_not_acceptable(ctx, on_rejection) {
+                    return not_acceptable_reject();
                 }
+                PluginResult::Continue
             }
-            None => {
-                response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+            Some(CodingSelection::Compress(algo)) => {
+                let can_encode = !on_rejection
+                    && !range_or_delta
+                    && !Self::response_forbids_transform(ctx, response_headers)
+                    && self.is_compression_eligible(response_headers);
+                if can_encode {
+                    // Record authoritative ownership outside public plugin metadata so
+                    // response security hooks can distinguish gateway-planned compression
+                    // from an encoded origin response without trusting a spoofable key.
+                    ctx.mark_gateway_response_compression(algo.content_encoding());
+
+                    // Retain the existing observable decision metadata.
+                    ctx.metadata.insert(
+                        RESPONSE_ALGORITHM_METADATA_KEY.to_string(),
+                        algo.content_encoding().to_string(),
+                    );
+
+                    // Set Content-Encoding. Remove Content-Length (it's stale after compression).
+                    response_headers.insert(
+                        "content-encoding".to_string(),
+                        algo.content_encoding().to_string(),
+                    );
+                    response_headers.remove("content-length");
+
+                    // Add Vary: Accept-Encoding so caches distinguish compressed variants.
+                    match response_headers.get("vary") {
+                        Some(existing) => {
+                            // Don't duplicate if already present.
+                            if !comma_header_contains_token(existing, "accept-encoding") {
+                                let mut updated = String::with_capacity(existing.len() + 17);
+                                updated.push_str(existing);
+                                updated.push_str(", Accept-Encoding");
+                                response_headers.insert("vary".to_string(), updated);
+                            }
+                        }
+                        None => {
+                            response_headers
+                                .insert("vary".to_string(), "Accept-Encoding".to_string());
+                        }
+                    }
+
+                    return PluginResult::Continue;
+                }
+
+                // Cannot produce the selected coded representation (range/delta,
+                // size / content-type eligibility, no-transform / strong ETag, or
+                // reject-path without body transforms). If identity is also
+                // unacceptable, fail closed rather than forwarding an excluded
+                // identity body — and never partially mutate compression headers.
+                // On the reject path, only `response_caching` HITs are replaced.
+                if accept_encoding.is_some_and(|ae| identity_coding_quality(ae) == 0.0)
+                    && Self::should_fail_closed_not_acceptable(ctx, on_rejection)
+                {
+                    return not_acceptable_reject();
+                }
+                PluginResult::Continue
             }
         }
-
-        PluginResult::Continue
     }
 
     async fn transform_request_body(
