@@ -67,8 +67,7 @@ const METADATA_NAMESPACE_PREFIX: &str = "response_caching.";
 const CACHE_BASE_KEY_SUFFIX: &str = "cache_base_key";
 const CACHE_STATUS_SUFFIX: &str = "cache_status";
 const CACHE_PREDICT_KEY_SUFFIX: &str = "cache_predict_key";
-const CACHE_REQUEST_STARTED_MONOTONIC_NANOS_SUFFIX: &str =
-    "cache_request_started_monotonic_nanos";
+const CACHE_REQUEST_STARTED_MONOTONIC_NANOS_SUFFIX: &str = "cache_request_started_monotonic_nanos";
 /// JSON-serialized snapshot of the request header values `before_proxy` saw
 /// while building the cache key. `on_final_response_body` reads it back to
 /// build the storage cache key from the *same* header view, even when an
@@ -82,9 +81,7 @@ static CACHE_CLOCK_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
 static NEXT_RESPONSE_CACHING_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 fn staging_metadata_key(instance_id: u64, suffix: &str) -> String {
-    let mut key = String::with_capacity(
-        METADATA_NAMESPACE_PREFIX.len() + 20 + 1 + suffix.len(),
-    );
+    let mut key = String::with_capacity(METADATA_NAMESPACE_PREFIX.len() + 20 + 1 + suffix.len());
     key.push_str(METADATA_NAMESPACE_PREFIX);
     {
         use std::fmt::Write;
@@ -1954,10 +1951,7 @@ mod tests {
         let mut miss_headers = miss_ctx.headers.clone();
         let miss_result = plugin.before_proxy(&mut miss_ctx, &mut miss_headers).await;
         assert!(matches!(miss_result, PluginResult::Continue));
-        assert_eq!(
-            plugin.cache_status(&miss_ctx),
-            Some("MISS")
-        );
+        assert_eq!(plugin.cache_status(&miss_ctx), Some("MISS"));
         let mut response_headers = HashMap::new();
         response_headers.insert(
             "cache-control".to_string(),
@@ -1993,10 +1987,7 @@ mod tests {
             ),
             "second request should be served from cache"
         );
-        assert_eq!(
-            plugin.cache_status(&hit_ctx),
-            Some("HIT")
-        );
+        assert_eq!(plugin.cache_status(&hit_ctx), Some("HIT"));
 
         // 3) The synthetic-response-body path now re-runs on_final_response_body
         // over the HIT body. In production `apply_synthetic_response_body_hooks`

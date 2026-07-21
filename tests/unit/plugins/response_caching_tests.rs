@@ -70,7 +70,9 @@ fn staging_key(plugin: &ResponseCaching, suffix: &str) -> String {
 
 fn assert_status(plugin: &ResponseCaching, ctx: &RequestContext, expected: &str) {
     assert_eq!(
-        ctx.metadata.get(&staging_key(plugin, "cache_status")).map(String::as_str),
+        ctx.metadata
+            .get(&staging_key(plugin, "cache_status"))
+            .map(String::as_str),
         Some(expected)
     );
 }
@@ -380,8 +382,16 @@ async fn test_cache_miss_first_request() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(), "MISS");
-    assert!(ctx.metadata.contains_key(&staging_key(&plugin, "cache_base_key")));
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "MISS"
+    );
+    assert!(
+        ctx.metadata
+            .contains_key(&staging_key(&plugin, "cache_base_key"))
+    );
 }
 
 #[tokio::test]
@@ -557,7 +567,13 @@ async fn test_upstream_age_near_freshness_expires_after_residency() {
         .before_proxy(&mut stale_ctx, &mut stale_headers)
         .await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(stale_ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(), "MISS");
+    assert_eq!(
+        stale_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "MISS"
+    );
     assert_eq!(assert_size_accounting_exact(&plugin), 0);
 }
 
@@ -575,7 +591,11 @@ async fn test_ttl_expiry() {
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    let status = ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap().as_str();
+    let status = ctx
+        .metadata
+        .get(&staging_key(&plugin, "cache_status"))
+        .unwrap()
+        .as_str();
     assert!(
         status == "MISS" || status == "PREDICTED-BYPASS",
         "expected MISS or PREDICTED-BYPASS, got {status}"
@@ -682,7 +702,9 @@ async fn test_old_date_reduces_remaining_freshness() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(
-        ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(),
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
         "PREDICTED-BYPASS"
     );
 }
@@ -765,7 +787,9 @@ async fn test_overflowing_age_does_not_wrap_to_fresh() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(
-        ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(),
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
         "PREDICTED-BYPASS"
     );
 }
@@ -869,7 +893,13 @@ async fn test_fallback_ttl_freshness_accounts_for_age() {
         .before_proxy(&mut stale_ctx, &mut stale_headers)
         .await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(stale_ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(), "MISS");
+    assert_eq!(
+        stale_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "MISS"
+    );
     assert_eq!(assert_size_accounting_exact(&plugin), 0);
 }
 
@@ -897,7 +927,12 @@ async fn test_client_no_cache_bypasses() {
     headers.insert("cache-control".to_string(), "no-cache".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(), "BYPASS");
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
 }
 
 #[tokio::test]
@@ -927,7 +962,13 @@ async fn test_bypassed_stale_response_does_not_poison_fresh_entry() {
             .await,
         PluginResult::Continue
     ));
-    assert_eq!(bypass_ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(), "BYPASS");
+    assert_eq!(
+        bypass_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
 
     let mut stale_headers = HashMap::new();
     stale_headers.insert("cache-control".to_string(), "max-age=60".to_string());
@@ -975,7 +1016,13 @@ async fn test_bypassed_zero_freshness_response_invalidates_existing_entry() {
             .await,
         PluginResult::Continue
     ));
-    assert_eq!(bypass_ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(), "BYPASS");
+    assert_eq!(
+        bypass_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
 
     let mut zero_response_headers = HashMap::new();
     zero_response_headers.insert("cache-control".to_string(), "max-age=0".to_string());
@@ -992,7 +1039,10 @@ async fn test_bypassed_zero_freshness_response_invalidates_existing_entry() {
         plugin.before_proxy(&mut miss_ctx, &mut miss_headers).await,
         PluginResult::Continue
     ));
-    let status = miss_ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap();
+    let status = miss_ctx
+        .metadata
+        .get(&staging_key(&plugin, "cache_status"))
+        .unwrap();
     assert!(
         status == "MISS" || status == "PREDICTED-BYPASS",
         "expected MISS or PREDICTED-BYPASS after zero-freshness invalidation, got {status}"
@@ -1022,7 +1072,13 @@ async fn test_bypassed_zero_freshness_with_new_vary_invalidates_matched_entry() 
             .await,
         PluginResult::Continue
     ));
-    assert_eq!(bypass_ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(), "BYPASS");
+    assert_eq!(
+        bypass_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
 
     let mut zero_response_headers = HashMap::new();
     zero_response_headers.insert("cache-control".to_string(), "max-age=0".to_string());
@@ -1167,9 +1223,17 @@ async fn test_bypassed_fresh_response_clears_stale_predictor() {
             .await,
         PluginResult::Continue
     ));
-    assert_eq!(bypass_ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(), "BYPASS");
+    assert_eq!(
+        bypass_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
     assert!(
-        bypass_ctx.metadata.contains_key(&staging_key(&plugin, "cache_predict_key")),
+        bypass_ctx
+            .metadata
+            .contains_key(&staging_key(&plugin, "cache_predict_key")),
         "client no-cache bypass should preserve the matched cache key for refresh invalidation"
     );
 
@@ -1201,7 +1265,12 @@ async fn test_post_not_cached() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(), "BYPASS");
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
 }
 
 #[tokio::test]
@@ -1212,7 +1281,12 @@ async fn test_delete_not_cached() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(), "BYPASS");
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
 }
 
 // === Non-cacheable status codes ===
@@ -1612,7 +1686,10 @@ async fn test_zero_freshness_invalidates_only_matching_vary_variant() {
             .await,
         PluginResult::Continue
     ));
-    let status = br_miss_ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap();
+    let status = br_miss_ctx
+        .metadata
+        .get(&staging_key(&plugin, "cache_status"))
+        .unwrap();
     assert!(
         status == "MISS" || status == "PREDICTED-BYPASS",
         "expected MISS or PREDICTED-BYPASS after zero-freshness invalidation, got {status}"
@@ -2587,7 +2664,12 @@ async fn test_total_size_limit_uses_saturating_add() {
         matches!(result, PluginResult::Continue),
         "Entry exceeding max_total_size_bytes should not be cached"
     );
-    assert_eq!(ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(), "MISS");
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "MISS"
+    );
 }
 
 // === Set-Cookie safety ===
@@ -2622,7 +2704,11 @@ async fn test_set_cookie_response_not_cached() {
         matches!(result, PluginResult::Continue),
         "Response with Set-Cookie header must not be cached"
     );
-    let status = ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap().as_str();
+    let status = ctx
+        .metadata
+        .get(&staging_key(&plugin, "cache_status"))
+        .unwrap()
+        .as_str();
     assert!(
         status == "MISS" || status == "PREDICTED-BYPASS",
         "expected MISS or PREDICTED-BYPASS, got {status}"
@@ -2900,8 +2986,18 @@ async fn test_sse_request_bypasses_preexisting_cached_response() {
 
     let result = plugin.before_proxy(&mut sse_ctx, &mut sse_headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(sse_ctx.metadata.get(&staging_key(&plugin, "cache_status")).unwrap(), "BYPASS");
-    assert!(!sse_ctx.metadata.contains_key(&staging_key(&plugin, "cache_base_key")));
+    assert_eq!(
+        sse_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
+    assert!(
+        !sse_ctx
+            .metadata
+            .contains_key(&staging_key(&plugin, "cache_base_key"))
+    );
 
     let mut bypass_headers = HashMap::new();
     plugin
@@ -3137,8 +3233,10 @@ async fn run_two_instance_store_isolation(a_first: bool) {
         staging_key(second, "cache_status")
     );
     assert!(
-        ctx.metadata
-            .contains_key(&staging_key(&consumer_vary_instance, "cache_request_headers_snapshot")),
+        ctx.metadata.contains_key(&staging_key(
+            &consumer_vary_instance,
+            "cache_request_headers_snapshot"
+        )),
         "Vary-aware instance must stash its own header snapshot"
     );
 
@@ -3161,9 +3259,7 @@ async fn run_two_instance_store_isolation(a_first: bool) {
     let first_hit = first.before_proxy(&mut replay, &mut replay_headers).await;
     match first_hit {
         PluginResult::RejectBinary {
-            status_code,
-            body,
-            ..
+            status_code, body, ..
         } => {
             assert_eq!(status_code, 200);
             assert_eq!(&body[..], b"first-body");
@@ -3183,9 +3279,7 @@ async fn run_two_instance_store_isolation(a_first: bool) {
         .await;
     match second_hit {
         PluginResult::RejectBinary {
-            status_code,
-            body,
-            ..
+            status_code, body, ..
         } => {
             assert_eq!(status_code, 200);
             assert_eq!(&body[..], b"second-body");
@@ -3222,7 +3316,10 @@ async fn multiple_instances_method_and_sse_bypass_clear_only_own_staging() {
         PluginResult::Continue
     ));
     assert_status(&cacheable, &ctx, "MISS");
-    assert!(ctx.metadata.contains_key(&staging_key(&cacheable, "cache_base_key")));
+    assert!(
+        ctx.metadata
+            .contains_key(&staging_key(&cacheable, "cache_base_key"))
+    );
 
     assert!(matches!(
         method_only_head.before_proxy(&mut ctx, &mut headers).await,
@@ -3234,7 +3331,10 @@ async fn multiple_instances_method_and_sse_bypass_clear_only_own_staging() {
             .contains_key(&staging_key(&method_only_head, "cache_base_key"))
     );
     assert_status(&cacheable, &ctx, "MISS");
-    assert!(ctx.metadata.contains_key(&staging_key(&cacheable, "cache_base_key")));
+    assert!(
+        ctx.metadata
+            .contains_key(&staging_key(&cacheable, "cache_base_key"))
+    );
 
     // Reverse order: method bypass first, then cacheable stages.
     let mut ctx = make_ctx("GET", "/mixed-method-rev");
@@ -3249,7 +3349,10 @@ async fn multiple_instances_method_and_sse_bypass_clear_only_own_staging() {
         PluginResult::Continue
     ));
     assert_status(&cacheable, &ctx, "MISS");
-    assert!(ctx.metadata.contains_key(&staging_key(&cacheable, "cache_base_key")));
+    assert!(
+        ctx.metadata
+            .contains_key(&staging_key(&cacheable, "cache_base_key"))
+    );
     assert_status(&method_only_head, &ctx, "BYPASS");
 
     // SSE bypass after a staged miss must not wipe the sibling's staging.
@@ -3353,9 +3456,7 @@ async fn status_policy_divergence_does_not_cross_contaminate_stores() {
             .await;
         match allows_404_result {
             PluginResult::RejectBinary {
-                status_code,
-                body,
-                ..
+                status_code, body, ..
             } => {
                 assert_eq!(status_code, 404);
                 assert_eq!(&body[..], b"missing");
@@ -3442,9 +3543,7 @@ async fn reload_generations_do_not_share_staging_namespaces() {
         .await
     {
         PluginResult::RejectBinary {
-            status_code,
-            body,
-            ..
+            status_code, body, ..
         } => {
             assert_eq!(status_code, 200);
             assert_eq!(&body[..], b"gen1");
