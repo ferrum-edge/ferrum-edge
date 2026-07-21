@@ -730,6 +730,8 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
     for _ in 0..20 {
         let plugin =
             ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+        plugin.start_background_tasks().expect("chargeback start");
+        plugin.commit_background_tasks();
         let node_dirs: Vec<_> = fs::read_dir(temp.path())
             .unwrap()
             .flatten()

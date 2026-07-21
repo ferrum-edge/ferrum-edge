@@ -845,6 +845,9 @@ impl Plugin for PriorityOverridePlugin {
     fn start_background_tasks(&self) -> Result<(), String> {
         self.inner.start_background_tasks()
     }
+    fn commit_background_tasks(&self) {
+        self.inner.commit_background_tasks();
+    }
     fn warmup_hostnames(&self) -> Vec<String> {
         self.inner.warmup_hostnames()
     }
@@ -2976,6 +2979,19 @@ fn start_background_tasks(
     Ok(())
 }
 
+fn commit_background_tasks(proxy_map: &ProxyPluginMap, globals: &[Arc<dyn Plugin>]) {
+    let mut committed = HashSet::new();
+    for plugin in globals
+        .iter()
+        .chain(proxy_map.values().flat_map(|plugins| plugins.iter()))
+    {
+        let pointer = Arc::as_ptr(plugin) as *const () as usize;
+        if committed.insert(pointer) {
+            plugin.commit_background_tasks();
+        }
+    }
+}
+
 /// All plugin-cache state swapped as a single unit so a single load observes
 /// either the old generation or the new generation, never a partial rebuild.
 pub(crate) struct PluginCacheInner {
@@ -3489,10 +3505,12 @@ impl PluginCache {
         http_client: PluginHttpClient,
     ) -> Result<Self, String> {
         let inner = Self::build_inner(config, &http_client)?;
-        Ok(Self {
-            inner: ArcSwap::new(inner),
+        let cache = Self {
+            inner: ArcSwap::new(Arc::clone(&inner)),
             http_client,
-        })
+        };
+        commit_background_tasks(&inner.proxy_plugins, &inner.global_plugins);
+        Ok(cache)
     }
 
     /// Borrow the shared HTTP client configured at construction. Used by
@@ -3574,6 +3592,7 @@ impl PluginCache {
         let previous = self.inner.load_full();
         inner.prepare_adaptive_concurrency_generations();
         self.inner.store(Arc::clone(&inner));
+        commit_background_tasks(&inner.proxy_plugins, &inner.global_plugins);
         inner.commit_adaptive_concurrency_generations();
         for (identity, instance) in &previous.tcp_connection_throttle_instances {
             if !inner

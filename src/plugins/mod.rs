@@ -6197,6 +6197,12 @@ pub trait Plugin: Send + Sync {
         Ok(())
     }
 
+    /// Publishes process-global runtime state after the complete plugin-cache
+    /// generation has been atomically installed. Implementations must be
+    /// infallible and idempotent: all fallible setup belongs in
+    /// [`Self::start_background_tasks`].
+    fn commit_background_tasks(&self) {}
+
     /// Returns `true` if this plugin participates in the authorization phase.
     ///
     /// The gateway uses this to pre-filter authorize callbacks at config

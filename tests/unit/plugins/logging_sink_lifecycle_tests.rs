@@ -398,12 +398,41 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
     plugin
         .start_background_tasks()
         .expect("activation retries after secret is present");
+    plugin.commit_background_tasks();
     let status: Value =
         serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status json");
     assert_eq!(
         status.get("enabled").and_then(Value::as_bool),
         Some(true),
         "successful activation must publish ACTIVE_SINK"
+    );
+
+    // A later staged generation may start its owned workers before the cache
+    // swap, but it must not displace diagnostics for the committed live sink.
+    let mut staged_cfg = cfg.clone();
+    staged_cfg["pricing_version"] = Value::String("staged-v2".to_string());
+    let staged = ApiChargebackSink::new(&staged_cfg, client(), "default").expect("staged cb");
+    staged
+        .start_background_tasks()
+        .expect("staged activation starts owned workers");
+    let status_while_staged: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status json");
+    assert_eq!(
+        status_while_staged
+            .get("pricing_version")
+            .and_then(Value::as_str),
+        Some("test-v1"),
+        "uncommitted staged activation must not replace the live sink"
+    );
+    drop(staged);
+    let status_after_staged_drop: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status json");
+    assert_eq!(
+        status_after_staged_drop
+            .get("pricing_version")
+            .and_then(Value::as_str),
+        Some("test-v1"),
+        "dropping a rejected staged sink must preserve live diagnostics"
     );
     unsafe {
         std::env::remove_var("FERRUM_CHARGEBACK_LIFECYCLE_MISSING_SECRET");

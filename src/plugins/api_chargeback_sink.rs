@@ -852,8 +852,6 @@ impl ApiChargebackSink {
             ));
         }
 
-        active_sink().store(Arc::new(Some(runtime)));
-        invalidate_status_cache();
         Ok(())
     }
 
@@ -931,6 +929,22 @@ impl Plugin for ApiChargebackSink {
             format!("{PLUGIN_NAME}: start_background_tasks requires a Tokio runtime")
         })?;
         self.activate()
+    }
+
+    fn commit_background_tasks(&self) {
+        let Some(runtime) = self.runtime.get() else {
+            return;
+        };
+        let current = active_sink().load_full();
+        if current
+            .as_ref()
+            .as_ref()
+            .is_some_and(|published| Arc::ptr_eq(published, runtime))
+        {
+            return;
+        }
+        active_sink().store(Arc::new(Some(Arc::clone(runtime))));
+        invalidate_status_cache();
     }
 
     async fn log(&self, summary: &TransactionSummary) {
