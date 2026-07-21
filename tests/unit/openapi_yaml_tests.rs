@@ -3420,7 +3420,9 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
     let property = spec
-        .pointer("/components/schemas/BodyValidatorConfig/properties/grpc_max_decompressed_size_bytes")
+        .pointer(
+            "/components/schemas/BodyValidatorConfig/properties/grpc_max_decompressed_size_bytes",
+        )
         .expect("BodyValidatorConfig must publish grpc_max_decompressed_size_bytes");
     assert_eq!(property["type"], json!("integer"));
     assert_eq!(property["format"], json!("uint64"));
