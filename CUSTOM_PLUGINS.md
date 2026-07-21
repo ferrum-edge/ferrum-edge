@@ -1422,7 +1422,7 @@ rows until an operator drops them deliberately.
 See `custom_plugins/examples/example_audit_plugin.rs` (build with
 `FERRUM_CUSTOM_PLUGINS=example_audit_plugin`) for a full working example that
 demonstrates:
-- Multi-version migrations (V1: create table + indexes, V2: add composite index)
+- Multi-version migrations (V3: create table + indexes, V4: add composite index)
 - PostgreSQL overrides (including `DOUBLE PRECISION`)
 - MySQL overrides (`VARCHAR` sizing) with exact drop/recreate index reconciliation
 - Multi-statement SQL (CREATE TABLE + CREATE INDEX in one migration)

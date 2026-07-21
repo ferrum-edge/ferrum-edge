@@ -372,15 +372,17 @@ fn test_resolve_secret_neither_set() {
 
 #[test]
 fn test_resolve_secret_file_not_found() {
-    with_env_vars_async(
-        &[("FERRUM_TEST_SECRET_E_FILE", "/nonexistent/path/to/secret")],
-        || async {
-            let result = resolve_secret("FERRUM_TEST_SECRET_E").await;
-            assert!(result.is_err());
-            let err = result.unwrap_err();
-            assert!(err.contains("Failed to read"));
-        },
-    );
+    let missing = "/nonexistent/path/to/secret";
+    with_env_vars_async(&[("FERRUM_TEST_SECRET_E_FILE", missing)], || async {
+        let result = resolve_secret("FERRUM_TEST_SECRET_E").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Failed to read"));
+        assert!(
+            !err.contains(missing),
+            "source path must not be disclosed, got: {err}"
+        );
+    });
 }
 
 #[test]
@@ -504,23 +506,29 @@ fn test_resolve_all_env_secrets_reports_first_unsupported_suffix_deterministical
     );
 }
 
+/// Shared FIFO + watchdog harness for `_FILE` timeout/teardown coverage.
+///
 /// A `_FILE` source can point at a FIFO with no writer, where the read blocks
 /// uninterruptibly. `tokio::time::timeout` around a `spawn_blocking` handle
 /// returns on schedule but does not stop the blocking task, and **dropping the
 /// runtime then waits for the blocking pool** — so the timeout was honored and
-/// the process hung anyway at runtime teardown. That made `validate`
-/// non-hermetic for exactly the bad local source it exists to catch.
+/// the process hung anyway at runtime teardown.
 ///
-/// This test must not be able to hang CI itself, so the whole resolve — runtime
-/// build, `block_on`, *and the runtime drop* — happens on a worker thread that
-/// the test body joins with a bounded `recv_timeout`. A regression fails the
-/// test loudly instead of parking the suite.
+/// These tests must not be able to hang CI themselves, so the whole resolve —
+/// runtime build, `block_on`, *and the runtime drop* — happens on a worker
+/// thread that the test body joins with a bounded `recv_timeout`. A regression
+/// fails the test loudly instead of parking the suite.
 ///
 /// The env vars are set and left in place for the worker (which only reads
 /// them) and are cleared after the bounded wait; `ENV_LOCK` is held throughout.
 #[cfg(unix)]
-#[test]
-fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
+fn assert_blocked_file_source_times_out_and_tears_down<F>(
+    file_env_key: &str,
+    expected_base_key: &str,
+    resolve: F,
+) where
+    F: FnOnce() -> Result<(), String> + Send + 'static,
+{
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
@@ -528,6 +536,9 @@ fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
     // Generous multiple of the fetch timeout: enough that a slow runner cannot
     // flake, far below anything that looks like a hang.
     const WATCHDOG: Duration = Duration::from_secs(30);
+    // Soft upper bound: timeout plus generous scheduling slack. Still proves
+    // we are nowhere near a blocking-pool hang.
+    const EXPECTED_CEILING: Duration = Duration::from_secs(15);
 
     let dir = tempfile::tempdir().unwrap();
     let fifo = dir.path().join("blocked-secret");
@@ -546,9 +557,9 @@ fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     // SAFETY: ENV_LOCK is held for the whole test, including the worker thread.
     unsafe {
-        std::env::set_var("FERRUM_TEST_SECRET_BLOCKED_FILE", &fifo);
-        // Read from the environment only — startup resolution deliberately does
-        // not consult `ferrum.conf`, so no settings file is needed here.
+        std::env::set_var(file_env_key, &fifo);
+        // Startup resolution reads this from the environment only; single-key
+        // resolution also honors the env override through the conf-aware helper.
         std::env::set_var(
             "FERRUM_SECRET_FETCH_TIMEOUT_SECONDS",
             FETCH_TIMEOUT_SECS.to_string(),
@@ -558,15 +569,7 @@ fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
     let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let started = Instant::now();
-        let result = {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(resolve_all_env_secrets())
-            // `rt` is dropped here. With a `spawn_blocking` read this is where
-            // the process parks forever; the send below would never happen.
-        };
+        let result = resolve();
         let _ = sender.send((result, started.elapsed()));
     });
 
@@ -574,7 +577,7 @@ fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
 
     // SAFETY: ENV_LOCK is still held.
     unsafe {
-        std::env::remove_var("FERRUM_TEST_SECRET_BLOCKED_FILE");
+        std::env::remove_var(file_env_key);
         std::env::remove_var("FERRUM_SECRET_FETCH_TIMEOUT_SECONDS");
     }
 
@@ -583,11 +586,11 @@ fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
          must not be waited on",
     );
     let err = match result {
-        Ok(_) => panic!("a FIFO with no writer must not resolve"),
+        Ok(()) => panic!("a FIFO with no writer must not resolve"),
         Err(err) => err,
     };
     assert!(
-        err.contains("Timeout resolving FERRUM_TEST_SECRET_BLOCKED"),
+        err.contains(&format!("Timeout resolving {expected_base_key}")),
         "expected a fetch timeout naming the base key, got: {err}"
     );
     assert!(
@@ -595,8 +598,48 @@ fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
         "the source reference must not be disclosed, got: {err}"
     );
     assert!(
-        elapsed < WATCHDOG,
+        elapsed < EXPECTED_CEILING,
         "resolution must be bounded by the fetch timeout, took {elapsed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_resolve_all_env_secrets_times_out_on_blocked_file_source() {
+    assert_blocked_file_source_times_out_and_tears_down(
+        "FERRUM_TEST_SECRET_BLOCKED_FILE",
+        "FERRUM_TEST_SECRET_BLOCKED",
+        || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            // `rt` is dropped when this closure returns. With a `spawn_blocking`
+            // read this is where the process parks forever.
+            rt.block_on(resolve_all_env_secrets()).map(|_| ())
+        },
+    );
+}
+
+/// Single-key / runtime `_FILE` callers share the same detached reader. Cover
+/// that path independently so a regression that only breaks `resolve_secret`
+/// cannot hide behind the startup-batch test.
+#[cfg(unix)]
+#[test]
+fn test_resolve_secret_times_out_on_blocked_file_source() {
+    assert_blocked_file_source_times_out_and_tears_down(
+        "FERRUM_TEST_SECRET_BLOCKED_ONE_FILE",
+        "FERRUM_TEST_SECRET_BLOCKED_ONE",
+        || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            match rt.block_on(resolve_secret("FERRUM_TEST_SECRET_BLOCKED_ONE")) {
+                Ok(_) => Ok(()),
+                Err(err) => Err(err),
+            }
+        },
     );
 }
 

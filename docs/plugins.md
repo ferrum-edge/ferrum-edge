@@ -2772,7 +2772,17 @@ Returns configurable mock responses without proxying to the backend. Supports ma
 
 **Priority:** 3030 | **Phase:** `before_proxy` | **Protocols:** HTTP family (HTTP, gRPC, WebSocket handshake)
 
-Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). The free-form `headers` map remains open for arbitrary string-valued response headers. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be in range 100–599. Runtime construction is the authoritative final boundary.
+Configuration must be a top-level object. Unknown top-level and per-rule keys are rejected instead of falling back to defaults (typos such as `passthrough_on_no_mach` or `status_cod` fail construction). The free-form `headers` map remains open for arbitrary string-valued response headers. When supplied, `method` must be a non-empty HTTP method token, `path` must be non-empty, and `status_code` must be a final status `200–599` or `101` (synthetic WebSocket handshake only). Other informational statuses (`100`, `102`–`199`) are rejected — a mock cannot emit a 1xx as a body-bearing final response. A configured `101` that matches an ordinary HTTP request fails closed with `500`; only a request already classified as a WebSocket handshake may receive it. Runtime construction and request-flavor enforcement are the authoritative final boundaries.
+
+**Status / body wire semantics (H1, H2, and H3):** A configured `body` is the representation the mock would return for a GET. Shared synthetic-response finalization then aligns every frontend:
+
+| Request / status | Wire body | `Content-Length` |
+|---|---|---|
+| `HEAD` with a body-capable status (not 204/205/304) | Omitted (no DATA / no payload) | Representation length (same as the GET body would have been) |
+| `204` / `205` / `304` (any method) | Omitted | Stripped, even when `body` is configured non-empty |
+| Other final statuses on GET/POST/… | Configured `body` | Unchanged unless a later hook sets it |
+
+gRPC and WebSocket frame streams are unchanged: gRPC rejects still normalize to trailers-only errors, and a matching WebSocket rule still short-circuits only the HTTP handshake.
 
 **Path matching by listen-path scope:**
 
@@ -3320,8 +3330,9 @@ Request-side validation only buffers matching request bodies: methods that can c
 | `protobuf_response_type` | String | — | Default fully-qualified protobuf message type for response validation |
 | `protobuf_method_messages` | Object | `{}` | Per-method message type overrides keyed by gRPC path (e.g., `/pkg.Svc/Method`). Each value has `request` and/or `response` string fields |
 | `protobuf_reject_unknown_fields` | bool | `false` | Reject messages containing field numbers not in the descriptor |
+| `grpc_max_decompressed_size_bytes` | usize | env / 10 MiB | Maximum decompressed gRPC protobuf payload size for both request and response validation. `0` disables the decompressed cap. When omitted, inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses as an unsigned integer; otherwise falls back to 10 MiB (10485760). |
 
-**gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly.
+**gRPC compression**: Compressed gRPC frames (compression flag = 1) are automatically decompressed using gzip before validation. Non-gzip compression algorithms will produce a validation error. Uncompressed frames are validated directly. The decompressed size is bounded by `grpc_max_decompressed_size_bytes`.
 
 **Scope**: Protobuf validation supports unary RPCs only (single frame per message). Streaming RPCs with multiple concatenated frames are not validated — the length mismatch check will reject multi-frame bodies.
 
@@ -4965,7 +4976,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 | `frames_per_second` | u64 | `100` | Maximum frames per second per connection. Must be greater than zero — `frames_per_second: 0` is rejected at config load time. |
 | `burst_size` | u64 | (= `frames_per_second`) | Token bucket capacity (burst allowance). Must be greater than zero and greater than or equal to `frames_per_second`. |
 | `close_reason` | String | `"Frame rate exceeded"` | Close-frame reason text (truncated to 123 UTF-8 bytes — the RFC 6455 §5.5 control-frame payload limit) |
-| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (centralized) |
+| `sync_mode` | String | `local` | `local` (in-memory per instance) or `redis` (externalized per-connection counters, namespaced per plugin/gateway instance; not portable across reconnects/rebuilds) |
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ws_rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:ws_rate_limiting` when namespace is `"ferrum"` |

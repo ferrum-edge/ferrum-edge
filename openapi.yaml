@@ -8490,9 +8490,12 @@ components:
         exhausted, the plugin sends a WebSocket close frame (RFC 6455 close code
         1008 — Policy Violation) to both client and backend. Both directions
         (client→backend and backend→client) consume from the same per-connection
-        bucket. Supports centralized Redis-backed mode for cross-instance
-        coordination of frame counters. Counter storage supports only local
-        memory and Redis; database-backed counters are intentionally unsupported.
+        bucket. Redis mode (`sync_mode: "redis"`) externalizes those
+        per-connection counters under a per-plugin/gateway-instance key
+        namespace; it does not coordinate a portable frame budget across
+        gateway instances, reconnects, or plugin rebuilds. Counter storage
+        supports only local memory and Redis; database-backed counters are
+        intentionally unsupported.
       properties:
         frames_per_second:
           type: integer
@@ -8521,7 +8524,11 @@ components:
           type: string
           enum: [local, redis]
           default: local
-          description: "Frame counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported. Any RESP-compatible server works."
+          description: >-
+            Frame counter storage: 'local' (in-memory) or 'redis' (externalized
+            per-connection counters namespaced per plugin/gateway instance; not
+            a portable cross-instance budget). Database-backed counters are
+            unsupported. Any RESP-compatible server works.
         redis_url:
           type: string
           description: "Redis connection URL. Required when sync_mode is 'redis'."
@@ -16465,11 +16472,14 @@ components:
           type: integer
           format: uint64
           minimum: 0
-          default: 10485760
           description: >-
-            Maximum decompressed protobuf payload size accepted from a gRPC
-            frame. Defaults to `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`, or 10 MiB
-            when that setting is absent.
+            Maximum decompressed gRPC protobuf payload size in bytes for both
+            request and response validation. Nonnegative integer matching runtime
+            `usize` parsing. `0` disables the decompressed cap. When omitted,
+            inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses
+            as an unsigned integer; otherwise falls back to 10 MiB (10485760).
+            No static OpenAPI default is advertised because the effective value
+            can be environment-derived.
 
     OpenapiValidatorConfig:
       type: object
@@ -16752,8 +16762,14 @@ components:
         handshakes: a match short-circuits only the HTTP handshake response and
         does not establish or mock an upgraded WebSocket frame stream. Unknown
         top-level and per-rule keys are rejected; the free-form headers map
-        remains open for string-valued response headers. Runtime construction
-        is the authoritative final boundary.
+        remains open for string-valued response headers. Status codes must be
+        final (200–599) or 101 for a synthetic WebSocket handshake; other
+        informational statuses are rejected. A configured 101 fails closed
+        with 500 when the matching request is not an actual WebSocket
+        handshake. HEAD omits content bytes while keeping representation
+        Content-Length; 204/205/304 omit body and Content-Length on every
+        frontend (H1/H2/H3). Runtime construction and request-flavor
+        enforcement are the authoritative final boundaries.
       required:
         - rules
       properties:
@@ -16790,11 +16806,15 @@ components:
                 minimum: 100
                 maximum: 599
                 description: >-
-                  HTTP status code to return (default 200). Values outside
-                  100–599 are rejected. Status 101 on an HTTP/1.1 WebSocket
-                  upgrade, or a success-like 200 on HTTP/2 / HTTP/3 Extended
-                  CONNECT, is still only a synthetic HTTP handshake response;
-                  it does not create an upgraded frame stream.
+                  HTTP status code to return (default 200). Must be a final
+                  status 200–599, or 101 for a synthetic WebSocket handshake
+                  response. Other informational statuses (100, 102–199) and
+                  values outside 100–599 are rejected at construction rather
+                  than coerced. Status 101 on an HTTP/1.1 WebSocket upgrade, or
+                  a success-like 200 on HTTP/2 / HTTP/3 Extended CONNECT, is
+                  still only a synthetic HTTP handshake response; it does not
+                  create an upgraded frame stream. A 101 rule that matches an
+                  ordinary HTTP request fails closed with status 500.
               headers:
                 type: object
                 additionalProperties:
@@ -16802,7 +16822,12 @@ components:
                 description: Response headers (default content-type application/json)
               body:
                 type: string
-                description: Response body string
+                description: >-
+                  Response body string (default empty). On the wire, HEAD
+                  responses omit content bytes while keeping representation
+                  Content-Length. Statuses 204, 205, and 304 omit both the body
+                  and Content-Length even when this field is non-empty. Shared
+                  synthetic-response finalization keeps H1, H2, and H3 aligned.
               delay_ms:
                 type: integer
                 format: uint64
@@ -18205,8 +18230,11 @@ components:
           description: Enable TLS for Redis connection
         redis_key_prefix:
           type: string
-          default: "ferrum:ai_semantic_cache"
-          description: Redis key namespace prefix
+          description: >-
+            Redis key namespace prefix. When omitted, the runtime derives
+            `{FERRUM_NAMESPACE}:ai_cache` (for example `ferrum:ai_cache` when
+            the namespace is `ferrum`). No static OpenAPI default is advertised
+            because the value depends on the gateway namespace.
         redis_pool_size:
           type: integer
           format: uint64
