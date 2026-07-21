@@ -16,9 +16,11 @@
 //!
 //! Construction (`new`) is runtime-free: it parses and admits configuration
 //! without creating a `ThreadedProducer`, spawning a Ferrum flush worker, or
-//! registering a generation. Live activation happens only from
-//! [`Plugin::start_background_tasks`] after the plugin-cache generation that
-//! owns this instance is accepted.
+//! registering a generation. Fallible producer/logger construction and local
+//! lifecycle ownership happen in [`Plugin::start_background_tasks`]. Process-
+//! global active-generation publication is deferred to
+//! [`Plugin::commit_background_tasks`] after PluginCache atomically installs
+//! the generation that owns this instance.
 //!
 //! Graceful shutdown and reload atomically stop admission, await every
 //! already-reserved/transient admit, await the batching worker, then await one
@@ -1007,7 +1009,8 @@ fn register_generation(generation: Arc<KafkaGeneration>) {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.insert(id, generation);
+    // Idempotent: commit may be invoked more than once for the same owner.
+    guard.entry(id).or_insert(generation);
 }
 
 fn unregister_generation(id: u64) {
@@ -1131,9 +1134,10 @@ struct KafkaPendingActivation {
 }
 
 pub struct KafkaLogging {
-    /// Live generation after [`Plugin::start_background_tasks`]. Hot-path
-    /// admission remains behind `ArcSwapOption` and tolerates `None` when this
-    /// slot is still empty (validate / unstarted).
+    /// Live generation after [`Plugin::start_background_tasks`]. Local hot-path
+    /// admission uses this slot; process-global diagnostics registration waits
+    /// for [`Plugin::commit_background_tasks`]. Tolerates `None` when still
+    /// empty (validate / unstarted).
     generation: OnceLock<Arc<KafkaGeneration>>,
     pending: Mutex<Option<KafkaPendingActivation>>,
     start_lock: Mutex<()>,
@@ -2004,8 +2008,10 @@ impl Plugin for KafkaLogging {
                 return Err(error);
             }
         };
-        // Publish locally first so Drop can own cleanup if global registration
-        // never happens. Only registered generations appear in diagnostics.
+        // Own the generation locally only. Process-global ACTIVE_GENERATIONS
+        // publication waits for commit_background_tasks after PluginCache
+        // installs this instance. Drop/finalize still clean up local ownership
+        // whether or not commit ever ran.
         if self.generation.set(Arc::clone(&generation)).is_err() {
             // A racing activation under the start lock should be impossible; if
             // the slot is occupied, tear down this orphan without registering so
@@ -2015,8 +2021,14 @@ impl Plugin for KafkaLogging {
                 "kafka_logging: generation already activated; refusing duplicate start".to_string(),
             );
         }
-        register_generation(generation);
         Ok(())
+    }
+
+    fn commit_background_tasks(&self) {
+        let Some(generation) = self.generation.get() else {
+            return;
+        };
+        register_generation(Arc::clone(generation));
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {

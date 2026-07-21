@@ -346,6 +346,81 @@ async fn kafka_generation_id_allocated_only_on_activation() {
     second.finalize().await;
 }
 
+/// Process-global registration must wait for cache commit (issue #2616).
+///
+/// Assertions match the exact owned generation id so parallel suites that
+/// register unrelated generations cannot false-pass or false-fail this proof.
+#[tokio::test]
+async fn kafka_generation_registers_only_after_commit() {
+    let plugin = KafkaLogging::new(&kafka_sink_config(), &client()).expect("kafka");
+    plugin
+        .start_background_tasks()
+        .expect("kafka start under tokio");
+    let generation_id = plugin.snapshot().generation_id;
+    assert!(
+        generation_id >= 1,
+        "start must allocate/own a live generation id"
+    );
+    assert!(
+        plugin.snapshot().accepting,
+        "start must open local admission before commit"
+    );
+    assert!(
+        !ferrum_edge::plugins::kafka_logging::snapshots()
+            .iter()
+            .any(|snap| snap.generation_id == generation_id),
+        "started but uncommitted generation {generation_id} must be absent from snapshots()"
+    );
+
+    plugin.commit_background_tasks();
+    assert!(
+        ferrum_edge::plugins::kafka_logging::snapshots()
+            .iter()
+            .any(|snap| snap.generation_id == generation_id),
+        "commit must publish generation {generation_id} into snapshots()"
+    );
+
+    plugin.commit_background_tasks();
+    let published = ferrum_edge::plugins::kafka_logging::snapshots()
+        .iter()
+        .filter(|snap| snap.generation_id == generation_id)
+        .count();
+    assert_eq!(
+        published, 1,
+        "repeated commit must remain idempotent for generation {generation_id}"
+    );
+
+    plugin.finalize().await;
+    assert!(
+        !ferrum_edge::plugins::kafka_logging::snapshots()
+            .iter()
+            .any(|snap| snap.generation_id == generation_id),
+        "finalize must remove generation {generation_id} from snapshots()"
+    );
+
+    // Never-committed staged instance: start owns a generation locally, but
+    // Drop must leave no process-global registration behind.
+    let staged = KafkaLogging::new(&kafka_sink_config(), &client()).expect("staged kafka");
+    staged
+        .start_background_tasks()
+        .expect("staged kafka start");
+    let staged_id = staged.snapshot().generation_id;
+    assert!(staged_id >= 1 && staged_id != generation_id);
+    assert!(
+        !ferrum_edge::plugins::kafka_logging::snapshots()
+            .iter()
+            .any(|snap| snap.generation_id == staged_id),
+        "uncommitted staged generation {staged_id} must stay out of snapshots()"
+    );
+    drop(staged);
+    assert!(
+        !ferrum_edge::plugins::kafka_logging::snapshots()
+            .iter()
+            .any(|snap| snap.generation_id == staged_id),
+        "dropping an uncommitted generation must leave no snapshots() entry for {staged_id}"
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial(api_chargeback_sink_lifecycle_secret)]
 async fn chargeback_activation_failure_publishes_no_active_sink() {
