@@ -6,7 +6,8 @@ use std::time::Duration;
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
     SpoolManager, SpoolSettings, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
-    new_ulid, replay_spool_once_for_tests, serialize_json_each_row,
+    new_ulid, render_prometheus, replay_spool_once_for_tests, serialize_json_each_row,
+    write_private_file_atomically_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::ChargeComputation;
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
@@ -704,6 +705,146 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
         stats.bytes,
         disk_owned_bytes(&temp.path().join("node-a")),
         "status bytes must match on-disk owned usage after concurrent writes"
+    );
+}
+
+#[tokio::test]
+async fn prometheus_counts_quarantined_owned_spool_bytes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(server.uri());
+    let corrupt_bytes = 256u64;
+    let byte_line = format!("chargeback_sink_spool_bytes {corrupt_bytes}\n");
+
+    // ACTIVE_SINK is process-global; retry briefly if a parallel sink test races
+    // the published runtime between construction and scrape.
+    let mut matched_prom = None;
+    let mut held_plugin = None;
+    for _ in 0..20 {
+        let plugin =
+            ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+        let node_dirs: Vec<_> = fs::read_dir(temp.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+            .collect();
+        assert_eq!(
+            node_dirs.len(),
+            1,
+            "enabled spool should create exactly one node directory"
+        );
+        let day = node_dirs[0].join("20260524");
+        fs::create_dir_all(&day).unwrap();
+        let corrupt = day.join("00000000000000000000000000.ndjson.corrupt");
+        fs::write(&corrupt, vec![0u8; corrupt_bytes as usize]).unwrap();
+
+        let prom = render_prometheus();
+        if prom.contains(&byte_line) {
+            matched_prom = Some(prom);
+            held_plugin = Some(plugin);
+            break;
+        }
+        drop(plugin);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let prom = matched_prom.expect(
+        "ACTIVE_SINK never observed this sink's quarantined owned bytes in prometheus output",
+    );
+    assert!(
+        prom.contains(
+            "# HELP chargeback_sink_spool_bytes Chargeback sink on-disk owned spool bytes (active, temp, and quarantined files)."
+        ),
+        "prometheus HELP must describe the owned-byte ceiling contract"
+    );
+    assert!(
+        prom.contains(
+            "# HELP chargeback_sink_spool_files Chargeback sink on-disk owned spool file count (active, temp, and quarantined files)."
+        ),
+        "prometheus HELP must describe owned file accounting"
+    );
+    assert!(
+        prom.contains("chargeback_sink_spool_files 1\n"),
+        "prometheus must count quarantined files toward spool.files; got:\n{prom}"
+    );
+    assert_eq!(
+        disk_owned_bytes(temp.path()),
+        corrupt_bytes,
+        "on-disk owned usage must include the planted .corrupt file"
+    );
+    drop(held_plugin);
+}
+
+#[cfg(unix)]
+#[test]
+fn spool_reconcile_fails_closed_when_stale_tmp_cannot_be_removed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let day = temp.path().join("node-a").join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    fs::write(&stale_tmp, vec![0u8; 128]).unwrap();
+
+    // Remove directory write bits so unlink of the planted temp fails. Startup
+    // must fail closed rather than ignore an undeletable owned temp.
+    let mut perms = fs::metadata(&day).unwrap().permissions();
+    perms.set_mode(0o555);
+    fs::set_permissions(&day, perms).unwrap();
+
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 1024 * 1024,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let err = SpoolManager::for_tests(settings, "node-a")
+        .expect_err("undeletable stale tmp must fail spool startup");
+    assert!(
+        err.contains("failed to remove stale spool temp file"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        stale_tmp.exists(),
+        "fail-closed reconcile must leave the undeletable temp in place"
+    );
+
+    // Restore writability so TempDir cleanup can succeed.
+    let mut perms = fs::metadata(&day).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&day, perms).unwrap();
+}
+
+#[test]
+fn failed_atomic_spool_write_removes_tmp_and_does_not_publish() {
+    let temp = tempfile::tempdir().unwrap();
+    let final_path = temp.path().join("batch.ndjson");
+    let tmp_path = temp.path().join("batch.ndjson.tmp");
+    // Block rename so the write path reaches the error-cleanup branch after the
+    // temp body has already been created.
+    fs::create_dir(&final_path).unwrap();
+
+    let err = write_private_file_atomically_for_tests(&tmp_path, &final_path, b"{\"ok\":true}\n")
+        .expect_err("rename onto a directory must fail the atomic publish");
+    assert!(
+        err.contains("failed to rename spool temp file"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !tmp_path.exists(),
+        "failed atomic write must delete the leftover *.tmp so it cannot evade quota"
+    );
+    assert!(
+        final_path.is_dir(),
+        "failed publish must not replace the blocking path with a data file"
     );
 }
 

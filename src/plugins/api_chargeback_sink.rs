@@ -1908,6 +1908,16 @@ pub async fn replay_spool_once_for_tests(
     replay_spool_once(spool, &flush_config).await
 }
 
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn write_private_file_atomically_for_tests(
+    tmp_path: &Path,
+    final_path: &Path,
+    bytes: &[u8],
+) -> Result<(), String> {
+    write_private_file_atomically(tmp_path, final_path, bytes)
+}
+
 fn write_private_file_atomically(
     tmp_path: &Path,
     final_path: &Path,
