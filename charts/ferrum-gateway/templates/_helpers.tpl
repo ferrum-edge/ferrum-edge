@@ -696,8 +696,10 @@ Validation: fail render on missing/unsafe configuration.
 
 {{- define "ferrum-gateway.validate" -}}
 {{- $mode := .Values.mode | default "" -}}
-{{- if not (has $mode (list "database" "file" "cp" "dp")) -}}
-{{- fail (printf "mode must be one of: database, file, cp, dp (got %q). The mesh, injector, and node_agent modes live in the ferrum-mesh chart, not this one." $mode) -}}
+{{- if eq $mode "migrate" -}}
+{{- fail "mode=migrate is not deployed by the ferrum-gateway or ferrum-mesh charts. Run explicit migrate as an external pre-deploy Kubernetes Job (see charts/ferrum-gateway/examples/migrate-job-*.yaml and docs/kubernetes_deployment.md#explicit-migrate-mode-external-job). database/cp installs still auto-apply pending core schema migrations on startup." -}}
+{{- else if not (has $mode (list "database" "file" "cp" "dp")) -}}
+{{- fail (printf "mode must be one of: database, file, cp, dp (got %q). The mesh, injector, and node_agent modes live in the ferrum-mesh chart, not this one. Explicit migrate mode is an external Job workflow, not a chart mode." $mode) -}}
 {{- end -}}
 {{/* A generic secretFileMount emits <name>_FILE. Most chart-managed variables
      are also rendered directly, which gives the external-secret resolver two
