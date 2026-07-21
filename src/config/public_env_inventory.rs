@@ -11,8 +11,9 @@
 //!
 //! [`PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS`] is a small allowlist for accepted
 //! compatibility aliases that intentionally share the canonical setting's
-//! docs/template row. Build-out policy does not add new legacy shims; only
-//! existing permitted aliases belong here.
+//! docs/template row. [`is_public_ferrum_env_coverage_exempt`] is the membership
+//! check used by the external parity tests. Build-out policy does not add new
+//! legacy shims; only existing permitted aliases belong here.
 //!
 //! External unit tests under `tests/unit/config/env_docs_parity_tests.rs`
 //! fail closed when a public inventory setting lacks a
@@ -452,3 +453,13 @@ pub const PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS: &[&str] = &[
     // Compatibility alias of `FERRUM_TLS_KEY_EXCHANGE_GROUPS` (canonical).
     "FERRUM_TLS_CURVES",
 ];
+
+/// True when `key` is an explicit DOC-03 docs/`ferrum.conf` coverage exemption.
+///
+/// Exemptions remain inventory members; they only skip owning a separate docs
+/// table row and/or template assignment because a canonical twin is covered.
+pub fn is_public_ferrum_env_coverage_exempt(key: &str) -> bool {
+    PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS
+        .binary_search(&key)
+        .is_ok()
+}
