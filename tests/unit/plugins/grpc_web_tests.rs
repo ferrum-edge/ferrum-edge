@@ -1768,10 +1768,8 @@ async fn test_transform_missing_collision_provenance_fails_closed() {
     let mut ctx = create_grpc_web_context("application/grpc-web");
     plugin.on_request_received(&mut ctx).await;
 
-    let initial_headers = HashMap::from([(
-        "x-shared-meta".to_string(),
-        "initial-secret".to_string(),
-    )]);
+    let initial_headers =
+        HashMap::from([("x-shared-meta".to_string(), "initial-secret".to_string())]);
     let trailers = HashMap::from([
         ("grpc-status".to_string(), "0".to_string()),
         ("x-shared-meta".to_string(), "trailer-value".to_string()),
@@ -1810,14 +1808,9 @@ async fn test_transform_missing_collision_provenance_fails_closed() {
 
 #[test]
 fn test_mesh_bridge_promotion_strips_value_bearing_internal_headers() {
-    let trailers = HashMap::from([(
-        "x-shared-meta".to_string(),
-        "trailer-secret".to_string(),
-    )]);
-    let mut response_headers = HashMap::from([(
-        "x-shared-meta".to_string(),
-        "initial-secret".to_string(),
-    )]);
+    let trailers = HashMap::from([("x-shared-meta".to_string(), "trailer-secret".to_string())]);
+    let mut response_headers =
+        HashMap::from([("x-shared-meta".to_string(), "initial-secret".to_string())]);
     ferrum_edge::plugins::grpc_web::bridge_backend_trailer_provenance_for_frame(
         &mut response_headers,
         &trailers,
