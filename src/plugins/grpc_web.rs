@@ -25,6 +25,15 @@
 //! 3. Text mode: base64-encode the entire response body
 //! 4. Rewrite response content-type to the original gRPC-Web variant
 //!
+//! When the backend (or an intermediary) returns a response without a present,
+//! numeric `grpc-status`, the trailer frame synthesizes status from the official
+//! HTTP-to-gRPC client mapping
+//! (<https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md>).
+//! A valid supplied `grpc-status` remains authoritative. The client-visible HTTP
+//! status is left unchanged — Ferrum does not rewrite it to 200 on this path —
+//! so intermediaries that inspect the wire status still see the backend/HTTP
+//! failure while gRPC-Web clients read the mapped code from the body trailer.
+//!
 //! ## Configuration
 //!
 //! Config must be a JSON object. Explicit `null`, arrays, scalars, and booleans
@@ -64,6 +73,12 @@ pub const GRPC_WEB_CONFIG_KEYS: &[&str] = &["expose_headers"];
 const META_GRPC_WEB_MODE: &str = "grpc_web_mode";
 /// Metadata key storing the original content-type for response rewriting.
 const META_GRPC_WEB_ORIGINAL_CT: &str = "grpc_web_original_ct";
+/// Metadata key storing the backend HTTP status observed in `after_proxy`.
+///
+/// `transform_response_body` cannot see response status directly, so the
+/// status is stashed here for HTTP→gRPC trailer synthesis when `grpc-status`
+/// is absent.
+const META_GRPC_WEB_HTTP_STATUS: &str = "grpc_web_http_status";
 
 /// Internal proxy header injected by `before_proxy` so that `transform_request_body`
 /// (which lacks access to `ctx.metadata`) can deterministically identify the
@@ -324,6 +339,55 @@ impl GrpcWebPlugin {
             expose_headers,
             expose_headers_value,
         })
+    }
+
+    fn transform_grpc_web_response_body(
+        &self,
+        body: &[u8],
+        _content_type: Option<&str>,
+        response_headers: &HashMap<String, String>,
+        http_status: Option<u16>,
+    ) -> Option<Vec<u8>> {
+        // Only transform if response content-type is gRPC-Web (set by after_proxy)
+        let ct = response_headers.get("content-type")?;
+        if !is_grpc_web_content_type(ct) {
+            return None;
+        }
+
+        let is_text = is_grpc_web_text(ct);
+
+        // Build the gRPC-Web response:
+        // 1. Keep existing data frames from the body
+        // 2. Append a trailer frame with gRPC status metadata
+        let mut output = Vec::with_capacity(body.len() + 64);
+
+        // Copy the original response body (data frames)
+        output.extend_from_slice(body);
+
+        // Build and append trailer frame from response headers. When the
+        // backend omitted a valid grpc-status, synthesize from the stashed
+        // HTTP status (official client mapping).
+        let trailer_frame = build_trailer_frame(response_headers, http_status);
+        output.extend(trailer_frame);
+
+        // For text mode, base64-encode the entire output
+        if is_text {
+            let encoded = BASE64.encode(&output);
+            debug!(
+                plugin = "grpc_web",
+                binary_len = output.len(),
+                encoded_len = encoded.len(),
+                "Base64-encoded gRPC-Web text response body"
+            );
+            Some(encoded.into_bytes())
+        } else {
+            debug!(
+                plugin = "grpc_web",
+                body_len = output.len(),
+                "Built gRPC-Web binary response with trailer frame"
+            );
+            Some(output)
+        }
     }
 }
 
@@ -660,7 +724,7 @@ pub(crate) fn rebuild_error_body_from_headers(response: &mut GrpcWebErrorRespons
         }
         trailer_headers.insert(name.clone(), value.clone());
     }
-    let mut body = build_trailer_frame(&trailer_headers);
+    let mut body = build_trailer_frame(&trailer_headers, None);
     if is_grpc_web_text(response_ct) {
         body = BASE64.encode(&body).into_bytes();
     }
@@ -691,7 +755,7 @@ pub fn error_response_for_content_type(
         ("grpc-status".to_string(), status.to_string()),
         ("grpc-message".to_string(), message.to_string()),
     ]);
-    let mut body = build_trailer_frame(&trailer_headers);
+    let mut body = build_trailer_frame(&trailer_headers, None);
     if is_grpc_web_text(response_ct) {
         body = BASE64.encode(&body).into_bytes();
     }
@@ -733,13 +797,39 @@ fn is_valid_trailer_value(value: &str) -> bool {
     !value.bytes().any(|b| b == b'\r' || b == b'\n')
 }
 
+/// Official HTTP→gRPC client mapping for responses that omit `grpc-status`.
+///
+/// Spec: <https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md>.
+/// Used only when a numeric `grpc-status` is absent; a valid supplied status
+/// remains authoritative. This is intentionally distinct from the gateway's
+/// reject-path mapper (`http_reject_status_to_grpc_status`), which chooses
+/// richer codes for Ferrum-authored refusals.
+pub(crate) fn http_response_status_to_grpc_status(http_status: u16) -> u32 {
+    match http_status {
+        400 => 13,                   // INTERNAL
+        401 => 16,                   // UNAUTHENTICATED
+        403 => 7,                    // PERMISSION_DENIED
+        404 => 12,                   // UNIMPLEMENTED
+        429 | 502 | 503 | 504 => 14, // UNAVAILABLE
+        _ => 2,                      // UNKNOWN (includes HTTP 200)
+    }
+}
+
 /// Build a gRPC-Web trailer frame from response headers.
 ///
 /// The trailer frame format is:
 /// - 1 byte: 0x80 (trailer flag)
 /// - 4 bytes: big-endian u32 length of trailer payload
 /// - N bytes: trailer payload (HTTP header encoding: `key: value\r\n`)
-pub(crate) fn build_trailer_frame(response_headers: &HashMap<String, String>) -> Vec<u8> {
+///
+/// When no present, numeric `grpc-status` exists, synthesize one from
+/// `http_status` via [`http_response_status_to_grpc_status`]. Passing `None`
+/// is equivalent to HTTP 200 (UNKNOWN), matching the mapping doc's default
+/// for a completed response that still lacks status.
+pub(crate) fn build_trailer_frame(
+    response_headers: &HashMap<String, String>,
+    http_status: Option<u16>,
+) -> Vec<u8> {
     let mut trailer_payload = Vec::new();
     let mut has_grpc_status = false;
     for (key, value) in response_headers {
@@ -751,8 +841,8 @@ pub(crate) fn build_trailer_frame(response_headers: &HashMap<String, String>) ->
                 // Only a present, numeric grpc-status is a valid terminal
                 // status. An empty (`grpc-status:`) or non-numeric
                 // (`grpc-status: abc`) value is malformed — skip forwarding it
-                // so the synthesized UNKNOWN (grpc-status: 2) below is emitted
-                // instead of passing a bogus status (or duplicating it).
+                // so the synthesized mapped status below is emitted instead of
+                // passing a bogus status (or duplicating it).
                 let Ok(code) = value.trim().parse::<u32>() else {
                     continue;
                 };
@@ -772,11 +862,15 @@ pub(crate) fn build_trailer_frame(response_headers: &HashMap<String, String>) ->
         }
     }
 
-    // A backend response without a present, numeric grpc-status is malformed.
-    // Native gRPC clients treat HTTP 200 without grpc-status as UNKNOWN;
-    // gRPC-Web must not silently report OK.
+    // A backend response without a present, numeric grpc-status is malformed /
+    // non-gRPC. Apply the official client HTTP→gRPC mapping so intermediaries
+    // that return 401/403/404/429/502/503/504 without grpc-status do not
+    // collapse to UNKNOWN and break retry classification.
     if !has_grpc_status {
-        trailer_payload.extend_from_slice(b"grpc-status: 2\r\n");
+        let mapped = http_response_status_to_grpc_status(http_status.unwrap_or(200));
+        trailer_payload.extend_from_slice(b"grpc-status: ");
+        trailer_payload.extend_from_slice(mapped.to_string().as_bytes());
+        trailer_payload.extend_from_slice(b"\r\n");
     }
 
     let len = trailer_payload.len() as u32;
@@ -1087,6 +1181,15 @@ impl Plugin for GrpcWebPlugin {
             None => return PluginResult::Continue,
         };
 
+        // Stash the backend HTTP status for trailer-frame synthesis. A valid
+        // backend `grpc-status` stays authoritative; the mapper only runs when
+        // that status is absent/malformed. The client-visible HTTP status is
+        // intentionally not rewritten here (see module docs).
+        ctx.metadata.insert(
+            META_GRPC_WEB_HTTP_STATUS.to_string(),
+            response_status.to_string(),
+        );
+
         // Rewrite response content-type to the gRPC-Web variant
         let resp_ct = response_content_type(&original_ct);
         response_headers.insert("content-type".to_string(), resp_ct.to_string());
@@ -1164,46 +1267,23 @@ impl Plugin for GrpcWebPlugin {
     async fn transform_response_body(
         &self,
         body: &[u8],
-        _content_type: Option<&str>,
+        content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        // Only transform if response content-type is gRPC-Web (set by after_proxy)
-        let ct = response_headers.get("content-type")?;
-        if !is_grpc_web_content_type(ct) {
-            return None;
-        }
+        self.transform_grpc_web_response_body(body, content_type, response_headers, None)
+    }
 
-        let is_text = is_grpc_web_text(ct);
-
-        // Build the gRPC-Web response:
-        // 1. Keep existing data frames from the body
-        // 2. Append a trailer frame with gRPC status metadata
-        let mut output = Vec::with_capacity(body.len() + 64);
-
-        // Copy the original response body (data frames)
-        output.extend_from_slice(body);
-
-        // Build and append trailer frame from response headers
-        let trailer_frame = build_trailer_frame(response_headers);
-        output.extend(trailer_frame);
-
-        // For text mode, base64-encode the entire output
-        if is_text {
-            let encoded = BASE64.encode(&output);
-            debug!(
-                plugin = "grpc_web",
-                binary_len = output.len(),
-                encoded_len = encoded.len(),
-                "Base64-encoded gRPC-Web text response body"
-            );
-            Some(encoded.into_bytes())
-        } else {
-            debug!(
-                plugin = "grpc_web",
-                body_len = output.len(),
-                "Built gRPC-Web binary response with trailer frame"
-            );
-            Some(output)
-        }
+    async fn transform_response_body_with_context(
+        &self,
+        ctx: &mut RequestContext,
+        body: &[u8],
+        content_type: Option<&str>,
+        response_headers: &HashMap<String, String>,
+    ) -> Option<Vec<u8>> {
+        let http_status = ctx
+            .metadata
+            .get(META_GRPC_WEB_HTTP_STATUS)
+            .and_then(|value| value.parse::<u16>().ok());
+        self.transform_grpc_web_response_body(body, content_type, response_headers, http_status)
     }
 }

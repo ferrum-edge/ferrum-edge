@@ -4488,6 +4488,18 @@ fn grpc_web_schema_matches_the_strict_runtime_shape() {
         .expect("grpc_web docs section");
     assert!(grpc_web_docs.contains("`null` is not an alias for `{}`"));
     assert!(grpc_web_docs.contains("KeepLastKnownGood"));
+    assert!(
+        grpc_web_docs.contains("HTTP-to-gRPC client mapping"),
+        "grpc_web docs must describe non-gRPC HTTP status synthesis"
+    );
+    assert!(
+        description.contains("HTTP-to-gRPC client mapping"),
+        "GrpcWebConfig OpenAPI description must document status synthesis"
+    );
+    assert!(
+        description.contains("not rewritten to 200"),
+        "GrpcWebConfig OpenAPI description must document client-visible HTTP status contract"
+    );
 }
 
 #[test]
@@ -5074,6 +5086,21 @@ fn ai_prompt_shield_schema_matches_runtime_validation() {
 
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiPromptShieldConfig")
+        .expect("missing AiPromptShieldConfig schema");
+    let schema_description = schema["description"]
+        .as_str()
+        .expect("AiPromptShieldConfig description");
+    assert!(
+        schema_description.contains("HTTP-only"),
+        "OpenAPI must advertise HTTP-only attachment for ai_prompt_shield"
+    );
+    assert!(
+        schema_description.contains("Native gRPC is unsupported"),
+        "OpenAPI must reject the inert native-gRPC support claim"
+    );
+
     let pattern_schema = spec
         .pointer("/components/schemas/AiPromptShieldConfig/properties/patterns")
         .expect("missing ai_prompt_shield patterns schema");
