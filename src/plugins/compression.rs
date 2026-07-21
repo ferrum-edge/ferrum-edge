@@ -340,10 +340,7 @@ impl CompressionPlugin {
     /// Whether this response can be gateway-compressed (content-type whitelist
     /// and optional Content-Length minimum). Protocol-hard skips (no-body
     /// statuses, ranges, already-encoded upstream) are checked separately.
-    fn is_compression_eligible(
-        &self,
-        response_headers: &HashMap<String, String>,
-    ) -> bool {
+    fn is_compression_eligible(&self, response_headers: &HashMap<String, String>) -> bool {
         let compressible = response_headers
             .get("content-type")
             .is_some_and(|ct| self.is_compressible_content_type(ct));
@@ -775,15 +772,10 @@ pub(crate) fn identity_coding_quality(accept_encoding: &str) -> f32 {
         }
         if coding == "*" {
             // Last wildcard wins; only a well-formed zero weight forbids identity.
-            wildcard_forbids_identity =
-                matches!(rfc9110_entry_quality(entry), Some(q) if q == 0.0);
+            wildcard_forbids_identity = matches!(rfc9110_entry_quality(entry), Some(q) if q == 0.0);
         }
     }
-    if wildcard_forbids_identity {
-        0.0
-    } else {
-        1.0
-    }
+    if wildcard_forbids_identity { 0.0 } else { 1.0 }
 }
 
 fn not_acceptable_reject() -> PluginResult {

@@ -727,7 +727,9 @@ async fn test_406_not_applied_to_nobody_or_already_encoded_responses() {
         let mut headers = HashMap::new();
         plugin.before_proxy(&mut ctx, &mut headers).await;
 
-        let result = plugin.after_proxy(&mut ctx, status, &mut resp_headers).await;
+        let result = plugin
+            .after_proxy(&mut ctx, status, &mut resp_headers)
+            .await;
         assert!(
             matches!(result, PluginResult::Continue),
             "status={status} ae={accept_encoding}: expected Continue, got {result:?}"
@@ -767,14 +769,10 @@ async fn test_406_via_shared_after_proxy_chokepoint() {
     resp_headers.insert("content-type".to_string(), "application/json".to_string());
     resp_headers.insert("content-length".to_string(), "1000".to_string());
 
-    let (status, _body, headers) = run_after_proxy_hooks_reject_for_test(
-        &plugins,
-        &mut ctx,
-        200,
-        &mut resp_headers,
-    )
-    .await
-    .expect("shared after_proxy chokepoint must produce 406");
+    let (status, _body, headers) =
+        run_after_proxy_hooks_reject_for_test(&plugins, &mut ctx, 200, &mut resp_headers)
+            .await
+            .expect("shared after_proxy chokepoint must produce 406");
     assert_eq!(status, 406);
     assert_eq!(
         headers.get("vary").map(String::as_str),
@@ -835,8 +833,8 @@ async fn test_response_cache_hit_cannot_bypass_required_406() {
     // without Vary: Accept-Encoding (#2355) must still be replaced by 406 when
     // a later request refuses identity — the shared reject-path after_proxy
     // negotiation must not be skipped on cache HIT.
-    let cache = Arc::new(ResponseCaching::new(&json!({"ttl_seconds": 60})).unwrap())
-        as Arc<dyn Plugin>;
+    let cache =
+        Arc::new(ResponseCaching::new(&json!({"ttl_seconds": 60})).unwrap()) as Arc<dyn Plugin>;
     let compression = Arc::new(make_plugin(json!({}))) as Arc<dyn Plugin>;
     let plugins = vec![cache, compression];
 
@@ -933,8 +931,8 @@ async fn test_response_cache_hit_preserves_identity_when_acceptable() {
     // Cache HIT + absent / identity-acceptable Accept-Encoding must keep the
     // cached identity representation — replacement is only when identity is
     // explicitly unacceptable.
-    let cache = Arc::new(ResponseCaching::new(&json!({"ttl_seconds": 60})).unwrap())
-        as Arc<dyn Plugin>;
+    let cache =
+        Arc::new(ResponseCaching::new(&json!({"ttl_seconds": 60})).unwrap()) as Arc<dyn Plugin>;
     let compression = Arc::new(make_plugin(json!({}))) as Arc<dyn Plugin>;
     let plugins = vec![cache, compression];
 
@@ -1049,10 +1047,8 @@ async fn test_security_rejection_not_replaced_by_406() {
         }
     }
 
-    let plugins: Vec<Arc<dyn Plugin>> = vec![
-        Arc::new(AuthRejectPlugin),
-        Arc::new(make_plugin(json!({}))),
-    ];
+    let plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(AuthRejectPlugin), Arc::new(make_plugin(json!({})))];
     let mut ctx = make_ctx(Some("*;q=0"));
     let mut headers = ctx.headers.clone();
     let (status, body, resp_headers) = match plugins[0].before_proxy(&mut ctx, &mut headers).await {
@@ -1067,14 +1063,9 @@ async fn test_security_rejection_not_replaced_by_406() {
     // No cache_status marker — this is not a response_caching HIT.
     assert!(!ctx.metadata.contains_key("cache_status"));
 
-    let (final_status, final_body, final_headers) = finalize_plugin_rejection_parts_for_test(
-        &plugins,
-        &mut ctx,
-        status,
-        body,
-        resp_headers,
-    )
-    .await;
+    let (final_status, final_body, final_headers) =
+        finalize_plugin_rejection_parts_for_test(&plugins, &mut ctx, status, body, resp_headers)
+            .await;
 
     assert_eq!(
         final_status, 401,
@@ -1120,7 +1111,9 @@ async fn test_identity_range_delta_continues_when_identity_acceptable() {
         let mut ctx = make_ctx(accept_encoding);
         let mut headers = HashMap::new();
         plugin.before_proxy(&mut ctx, &mut headers).await;
-        let result = plugin.after_proxy(&mut ctx, status, &mut resp_headers).await;
+        let result = plugin
+            .after_proxy(&mut ctx, status, &mut resp_headers)
+            .await;
         assert!(
             matches!(result, PluginResult::Continue),
             "status={status} ae={accept_encoding:?}: expected Continue, got {result:?}"
@@ -1138,27 +1131,39 @@ async fn test_identity_range_delta_406_when_identity_unacceptable() {
     // representation (issue #2602).
     let plugin = make_plugin(json!({}));
     for (status, mut resp_headers, stamp_range_marker) in [
-        (206, {
-            let mut h = HashMap::new();
-            h.insert("content-type".to_string(), "application/json".to_string());
-            h.insert("content-length".to_string(), "1000".to_string());
-            h.insert("content-range".to_string(), "bytes 0-999/5000".to_string());
-            h
-        }, false),
-        (226, {
-            let mut h = HashMap::new();
-            h.insert("content-type".to_string(), "application/json".to_string());
-            h.insert("content-length".to_string(), "1000".to_string());
-            h.insert("im".to_string(), "vcdiff".to_string());
-            h.insert("delta-base".to_string(), "\"version-1\"".to_string());
-            h
-        }, false),
-        (200, {
-            let mut h = HashMap::new();
-            h.insert("content-type".to_string(), "application/json".to_string());
-            h.insert("content-length".to_string(), "1000".to_string());
-            h
-        }, true),
+        (
+            206,
+            {
+                let mut h = HashMap::new();
+                h.insert("content-type".to_string(), "application/json".to_string());
+                h.insert("content-length".to_string(), "1000".to_string());
+                h.insert("content-range".to_string(), "bytes 0-999/5000".to_string());
+                h
+            },
+            false,
+        ),
+        (
+            226,
+            {
+                let mut h = HashMap::new();
+                h.insert("content-type".to_string(), "application/json".to_string());
+                h.insert("content-length".to_string(), "1000".to_string());
+                h.insert("im".to_string(), "vcdiff".to_string());
+                h.insert("delta-base".to_string(), "\"version-1\"".to_string());
+                h
+            },
+            false,
+        ),
+        (
+            200,
+            {
+                let mut h = HashMap::new();
+                h.insert("content-type".to_string(), "application/json".to_string());
+                h.insert("content-length".to_string(), "1000".to_string());
+                h
+            },
+            true,
+        ),
     ] {
         for accept_encoding in ["*;q=0", "identity;q=0", "identity;q=0, gzip;q=0, br;q=0"] {
             let mut ctx = make_ctx(Some(accept_encoding));
@@ -1169,7 +1174,10 @@ async fn test_identity_range_delta_406_when_identity_unacceptable() {
             let mut headers = HashMap::new();
             plugin.before_proxy(&mut ctx, &mut headers).await;
 
-            match plugin.after_proxy(&mut ctx, status, &mut resp_headers).await {
+            match plugin
+                .after_proxy(&mut ctx, status, &mut resp_headers)
+                .await
+            {
                 PluginResult::Reject {
                     status_code,
                     headers: reject_headers,
@@ -1185,9 +1193,9 @@ async fn test_identity_range_delta_406_when_identity_unacceptable() {
                         Some("Accept-Encoding")
                     );
                 }
-                other => panic!(
-                    "status={status} ae={accept_encoding}: expected 406, got {other:?}"
-                ),
+                other => {
+                    panic!("status={status} ae={accept_encoding}: expected 406, got {other:?}")
+                }
             }
             assert!(
                 !ctx.metadata.contains_key("compression:algorithm"),
