@@ -978,52 +978,12 @@ impl SecretBackend for FileBackend {
         format!("file:{}", reference)
     }
 
-    /// Read the file on a **detached OS thread**, not `spawn_blocking`.
-    ///
-    /// A `_FILE` source can be a FIFO with no writer or a stalled network
-    /// mount, where `open`/`read` blocks indefinitely and is not interruptible.
-    /// `tokio::time::timeout` around a `spawn_blocking` join handle returns on
-    /// schedule but does not stop the blocking task, and dropping the runtime
-    /// waits for its blocking pool to quiesce — so the caller's timeout was
-    /// honored and the process then hung anyway, at runtime shutdown. That is
-    /// exactly the bad local source `validate` exists to catch, and it made the
-    /// new `validate` path unbounded.
-    ///
-    /// A detached thread is owned by no runtime: the timeout drops the receiver
-    /// and returns, the temporary startup runtime drops immediately, and the
-    /// process is free to exit — Rust does not join detached threads at exit.
-    ///
-    /// **Residual, deliberate and bounded:** the abandoned thread stays parked
-    /// in the kernel until the read completes or the process exits. Startup
-    /// treats a fetch timeout as fatal, so `run`/`validate` leak at most one
-    /// thread per configured `_FILE` source in the one run that is about to
-    /// exit non-zero. There is no path that leaks per request or in a loop.
+    /// Delegate to [`file::read_secret_detached`]: every `_FILE` path (startup
+    /// batch and single-key/runtime) shares the detached-OS-thread read so a
+    /// FIFO/stalled mount cannot pin Tokio runtime teardown after the fetch
+    /// timeout. Do not reintroduce `tokio::task::spawn_blocking` here.
     async fn resolve_one(&self, reference: &str, key: &str) -> Result<String, String> {
-        let reference = reference.to_string();
-        let key = key.to_string();
-        let key_for_error = key.clone();
-
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
-            .name("ferrum-secret-file".to_string())
-            .spawn(move || {
-                // The receiver is gone when the caller timed out; the result is
-                // then simply dropped.
-                let _ = sender.send(file::read_secret(&reference, &key));
-            })
-            .map_err(|err| {
-                format!(
-                    "Failed to start file secret read thread for {}: {}",
-                    key_for_error, err
-                )
-            })?;
-
-        receiver.await.map_err(|_| {
-            format!(
-                "File secret read for {} ended without producing a result",
-                key_for_error
-            )
-        })?
+        file::read_secret_detached(reference, key).await
     }
 }
 
