@@ -80,28 +80,25 @@ pub(crate) async fn collect_h3_request_body_with_deadline<F, T, E>(
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    if let Some(deadline) = deadline {
-        // Preserve both timeout regimes: the absolute RPC deadline bounds the
-        // whole call, and the operator read timeout still caps a stalled
-        // client upload even when grpc-timeout is very large.
-        let (effective_deadline, timeout_error) = if request_body_read_timeout_ms > 0 {
-            match tokio::time::Instant::now()
-                .checked_add(Duration::from_millis(request_body_read_timeout_ms))
-            {
-                Some(read_deadline) if read_deadline < deadline => {
-                    (read_deadline, H3RequestBodyReadError::TimedOut)
-                }
-                _ => (deadline, H3RequestBodyReadError::DeadlineExceeded),
-            }
-        } else {
-            (deadline, H3RequestBodyReadError::DeadlineExceeded)
-        };
-        return tokio::time::timeout_at(effective_deadline, collect)
-            .await
-            .map_err(|_| timeout_error)?
-            .map_err(H3RequestBodyReadError::Read);
+    // Preserve both timeout regimes via the shared earliest-of composer: the
+    // absolute RPC deadline bounds the whole call, and the operator read
+    // timeout still caps a stalled client upload even when grpc-timeout is
+    // very large. Operator timeout `0` disables only that fresh bound.
+    match crate::proxy::compose_early_upload_bound(deadline, request_body_read_timeout_ms) {
+        Some((effective_deadline, crate::proxy::EarlyUploadBoundKind::OperatorTimeout)) => {
+            tokio::time::timeout_at(effective_deadline, collect)
+                .await
+                .map_err(|_| H3RequestBodyReadError::TimedOut)?
+                .map_err(H3RequestBodyReadError::Read)
+        }
+        Some((effective_deadline, crate::proxy::EarlyUploadBoundKind::RpcDeadline)) => {
+            tokio::time::timeout_at(effective_deadline, collect)
+                .await
+                .map_err(|_| H3RequestBodyReadError::DeadlineExceeded)?
+                .map_err(H3RequestBodyReadError::Read)
+        }
+        None => collect_h3_request_body_with_timeout(collect, request_body_read_timeout_ms).await,
     }
-    collect_h3_request_body_with_timeout(collect, request_body_read_timeout_ms).await
 }
 
 /// Drain an H3 request-body recv half into an owned buffer.
@@ -3268,8 +3265,7 @@ async fn handle_h3_request(
                     .await?;
                     return Ok(());
                 }
-            }
-                    };
+            };
         }
 
         let raw_request_body_bytes = body_data.len() as u64;
@@ -3647,8 +3643,7 @@ async fn handle_h3_request(
                     .await?;
                     return Ok(());
                 }
-            }
-                    };
+            };
         }
         let raw_request_body_bytes = body_data.len() as u64;
         prepared_raw_request_body_bytes = Some(raw_request_body_bytes);
@@ -4316,8 +4311,7 @@ async fn handle_h3_request(
                             .await?;
                             return Ok(());
                         }
-                    }
-                                    };
+                    };
                 }
                 Some(body_data)
             } else {
@@ -5495,8 +5489,7 @@ async fn handle_h3_request(
                 .await?;
                 return Ok(());
             }
-        }
-            };
+        };
     }
 
     // Capture the on-wire request body length BEFORE plugin transforms run.

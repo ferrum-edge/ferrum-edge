@@ -965,6 +965,7 @@ jobs:
               functional_protocol_h3_body_limit_config_test
               functional_protocol_h2_body_limit_config_test
               functional_protocol_body_limit_config_test
+              functional_early_upload_deadline_test
               functional_h3_authority_validation_test
               functional_h3_local_policy_test
               functional_h3_grpc_web_test

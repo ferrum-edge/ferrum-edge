@@ -2477,6 +2477,54 @@ pub(crate) enum RequestBodyWaitError {
     DeadlineExceeded,
 }
 
+/// Which ceiling won when composing an absolute RPC deadline with the
+/// operator whole-upload `backend_read_timeout_ms` bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EarlyUploadBoundKind {
+    /// Fresh operator whole-upload stall guard (`backend_read_timeout_ms > 0`).
+    OperatorTimeout,
+    /// Absolute client/RPC deadline (`grpc-timeout` / prepared budget).
+    RpcDeadline,
+}
+
+/// Compose the earliest applicable early-upload ceiling.
+///
+/// - `operator_timeout_ms == 0` disables the fresh operator bound.
+/// - A present absolute deadline still caps the drain when the operator bound
+///   is disabled.
+/// - When both are present, the earlier instant wins; the operator bound is
+///   measured from `now` once per drain (later phases must reuse a prebuffer
+///   instead of starting a second fresh operator window).
+pub(crate) fn compose_early_upload_bound(
+    absolute_deadline: Option<tokio::time::Instant>,
+    operator_timeout_ms: u64,
+) -> Option<(tokio::time::Instant, EarlyUploadBoundKind)> {
+    match absolute_deadline {
+        Some(deadline) if operator_timeout_ms > 0 => {
+            match tokio::time::Instant::now()
+                .checked_add(Duration::from_millis(operator_timeout_ms))
+            {
+                Some(read_deadline) if read_deadline < deadline => {
+                    Some((read_deadline, EarlyUploadBoundKind::OperatorTimeout))
+                }
+                _ => Some((deadline, EarlyUploadBoundKind::RpcDeadline)),
+            }
+        }
+        Some(deadline) => Some((deadline, EarlyUploadBoundKind::RpcDeadline)),
+        None if operator_timeout_ms > 0 => tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(operator_timeout_ms))
+            .map(|read_deadline| (read_deadline, EarlyUploadBoundKind::OperatorTimeout)),
+        None => None,
+    }
+}
+
+/// Later early-phase consumers must reuse one already-drained prebuffer rather
+/// than starting (and deducting) a second fresh whole-upload timeout.
+#[inline]
+pub(crate) fn early_upload_phase_needs_fresh_drain(prebuffered_body: &Option<Vec<u8>>) -> bool {
+    prebuffered_body.is_none()
+}
+
 impl From<RequestBodyWaitError> for RequestBodyBufferError {
     fn from(error: RequestBodyWaitError) -> Self {
         match error {
@@ -2510,28 +2558,23 @@ pub(crate) async fn collect_request_body_with_deadline<F, T, E>(
 where
     F: std::future::Future<Output = Result<T, E>>,
 {
-    if let Some(deadline) = deadline {
-        // The RPC deadline is an end-to-end ceiling, while the configured
-        // read timeout remains the operator's client-upload stall guard. Keep
-        // both by waiting only until the earlier instant; a very large
-        // grpc-timeout must not disable the operator bound.
-        let (effective_deadline, timeout_error) = if request_body_read_timeout_ms > 0 {
-            match tokio::time::Instant::now()
-                .checked_add(Duration::from_millis(request_body_read_timeout_ms))
-            {
-                Some(read_deadline) if read_deadline < deadline => {
-                    (read_deadline, RequestBodyWaitError::TimedOut)
-                }
-                _ => (deadline, RequestBodyWaitError::DeadlineExceeded),
-            }
-        } else {
-            (deadline, RequestBodyWaitError::DeadlineExceeded)
-        };
-        return tokio::time::timeout_at(effective_deadline, collect)
-            .await
-            .map_err(|_| timeout_error);
+    // The RPC deadline is an end-to-end ceiling, while the configured read
+    // timeout remains the operator's client-upload stall guard. Keep both by
+    // waiting only until the earlier instant; a very large grpc-timeout must
+    // not disable the operator bound.
+    match compose_early_upload_bound(deadline, request_body_read_timeout_ms) {
+        Some((effective_deadline, EarlyUploadBoundKind::OperatorTimeout)) => {
+            tokio::time::timeout_at(effective_deadline, collect)
+                .await
+                .map_err(|_| RequestBodyWaitError::TimedOut)
+        }
+        Some((effective_deadline, EarlyUploadBoundKind::RpcDeadline)) => {
+            tokio::time::timeout_at(effective_deadline, collect)
+                .await
+                .map_err(|_| RequestBodyWaitError::DeadlineExceeded)
+        }
+        None => collect_request_body_with_timeout(collect, request_body_read_timeout_ms).await,
     }
-    collect_request_body_with_timeout(collect, request_body_read_timeout_ms).await
 }
 
 pub(crate) fn request_may_have_body(method: &str, headers: &HashMap<String, String>) -> bool {

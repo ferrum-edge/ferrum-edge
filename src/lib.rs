@@ -2274,6 +2274,37 @@ pub mod _test_support {
         Read,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EarlyUploadBoundKind {
+        OperatorTimeout,
+        RpcDeadline,
+    }
+
+    pub fn compose_early_upload_bound_for_test(
+        absolute_deadline: Option<tokio::time::Instant>,
+        operator_timeout_ms: u64,
+    ) -> Option<(tokio::time::Instant, EarlyUploadBoundKind)> {
+        crate::proxy::compose_early_upload_bound(absolute_deadline, operator_timeout_ms).map(
+            |(deadline, kind)| {
+                let kind = match kind {
+                    crate::proxy::EarlyUploadBoundKind::OperatorTimeout => {
+                        EarlyUploadBoundKind::OperatorTimeout
+                    }
+                    crate::proxy::EarlyUploadBoundKind::RpcDeadline => {
+                        EarlyUploadBoundKind::RpcDeadline
+                    }
+                };
+                (deadline, kind)
+            },
+        )
+    }
+
+    pub fn early_upload_phase_needs_fresh_drain_for_test(
+        prebuffered_body: &Option<Vec<u8>>,
+    ) -> bool {
+        crate::proxy::early_upload_phase_needs_fresh_drain(prebuffered_body)
+    }
+
     pub async fn collect_h1h2_request_body_with_deadline_for_test<F, T, E>(
         collect: F,
         deadline: Option<tokio::time::Instant>,

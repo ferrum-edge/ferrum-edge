@@ -1,118 +1,277 @@
 //! Early buffered-upload deadline composition and cancellation contracts.
 //!
-//! Covers H1/H2 and H3 helpers for the shared early body phases (authenticate,
-//! authorize, before_proxy) required by GHSA-rrx3-m3wf-wg3w / issue #2669:
-//! absolute RPC deadline vs operator whole-upload timeout, timeout-disabled
-//! (`0`) semantics, and source-level halt/drain wiring across every H3 phase.
+//! Executable coverage for GHSA-rrx3-m3wf-wg3w / issue #2669: earliest-of
+//! operator whole-upload timeout vs absolute `grpc-timeout`, timeout-`0`
+//! semantics, prompt cancellation that drops caller-owned buffers, independent
+//! concurrent waiters, and multi-consumer prebuffer reuse (no second fresh
+//! operator window). Live H1/H2/H3 protocol shaping lives in
+//! `tests/functional/functional_early_upload_deadline_test.rs`.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ferrum_edge::_test_support::{
-    EarlyUploadWaitError, collect_h1h2_request_body_with_deadline_for_test,
-    collect_h3_request_body_with_deadline_for_test,
+    EarlyUploadBoundKind, EarlyUploadWaitError, collect_h1h2_request_body_with_deadline_for_test,
+    collect_h3_request_body_with_deadline_for_test, compose_early_upload_bound_for_test,
+    early_upload_phase_needs_fresh_drain_for_test,
 };
 
-#[tokio::test]
-async fn h1h2_and_h3_operator_timeout_caps_a_long_rpc_deadline() {
-    let deadline = tokio::time::Instant::now()
+#[test]
+fn compose_earliest_of_picks_operator_when_it_is_sooner() {
+    let absolute = tokio::time::Instant::now()
         .checked_add(Duration::from_secs(60))
-        .expect("one minute after now is representable");
-    let pending = std::future::pending::<Result<(), ()>>();
-
-    let h1h2 = collect_h1h2_request_body_with_deadline_for_test(pending, Some(deadline), 10).await;
-    assert!(matches!(h1h2, Err(EarlyUploadWaitError::TimedOut)));
-
-    let pending = std::future::pending::<Result<(), ()>>();
-    let h3 = collect_h3_request_body_with_deadline_for_test(pending, Some(deadline), 10).await;
-    assert!(matches!(h3, Err(EarlyUploadWaitError::TimedOut)));
-}
-
-#[tokio::test]
-async fn h1h2_and_h3_rpc_deadline_wins_over_a_larger_operator_timeout() {
-    let deadline = tokio::time::Instant::now()
-        .checked_sub(Duration::from_secs(1))
-        .expect("one second before now is representable");
-
-    let pending = std::future::pending::<Result<(), ()>>();
-    let h1h2 =
-        collect_h1h2_request_body_with_deadline_for_test(pending, Some(deadline), 60_000).await;
-    assert!(matches!(h1h2, Err(EarlyUploadWaitError::DeadlineExceeded)));
-
-    let pending = std::future::pending::<Result<(), ()>>();
-    let h3 = collect_h3_request_body_with_deadline_for_test(pending, Some(deadline), 60_000).await;
-    assert!(matches!(h3, Err(EarlyUploadWaitError::DeadlineExceeded)));
-}
-
-#[tokio::test]
-async fn zero_operator_timeout_still_honors_rpc_deadline_on_h1h2_and_h3() {
-    let deadline = tokio::time::Instant::now()
-        .checked_sub(Duration::from_millis(1))
-        .expect("one millisecond before now is representable");
-
-    let pending = std::future::pending::<Result<(), ()>>();
-    let h1h2 = collect_h1h2_request_body_with_deadline_for_test(pending, Some(deadline), 0).await;
-    assert!(matches!(h1h2, Err(EarlyUploadWaitError::DeadlineExceeded)));
-
-    let pending = std::future::pending::<Result<(), ()>>();
-    let h3 = collect_h3_request_body_with_deadline_for_test(pending, Some(deadline), 0).await;
-    assert!(matches!(h3, Err(EarlyUploadWaitError::DeadlineExceeded)));
-}
-
-#[tokio::test]
-async fn zero_operator_timeout_without_deadline_leaves_upload_unbounded_helpers() {
-    let upload = std::future::ready::<Result<u8, ()>>(Ok(7));
-    let h1h2 = collect_h1h2_request_body_with_deadline_for_test(upload, None, 0)
-        .await
-        .expect("disabled timeout must not invent an error");
-    assert_eq!(h1h2, Ok(7));
-
-    let upload = std::future::ready::<Result<u8, ()>>(Ok(11));
-    let h3 = collect_h3_request_body_with_deadline_for_test(upload, None, 0)
-        .await
-        .expect("disabled timeout must not invent an error");
-    assert_eq!(h3, Ok(11));
-}
-
-#[tokio::test]
-async fn completed_uploads_are_not_failed_by_future_deadlines() {
-    let deadline = tokio::time::Instant::now()
-        .checked_add(Duration::from_secs(30))
-        .expect("thirty seconds after now is representable");
-
-    let upload = std::future::ready::<Result<&'static str, ()>>(Ok("done"));
-    let h1h2 = collect_h1h2_request_body_with_deadline_for_test(upload, Some(deadline), 1_000)
-        .await
-        .expect("completed upload");
-    assert_eq!(h1h2, Ok("done"));
-
-    let upload = std::future::ready::<Result<&'static str, ()>>(Ok("done"));
-    let h3 = collect_h3_request_body_with_deadline_for_test(upload, Some(deadline), 1_000)
-        .await
-        .expect("completed upload");
-    assert_eq!(h3, Ok("done"));
-}
-
-#[tokio::test]
-async fn cancelled_pending_upload_does_not_retain_caller_owned_buffer() {
-    // Mimic the pre-fix outer-buffer anti-pattern: if the collect future owned
-    // the Vec, cancellation would drop it. The H3 drain helper owns the buffer
-    // inside the future; this parity check ensures the deadline helper cancels
-    // promptly rather than waiting for the pending future forever.
-    let deadline = tokio::time::Instant::now()
-        .checked_add(Duration::from_millis(20))
-        .expect("deadline representable");
-    let started = tokio::time::Instant::now();
-    let pending = std::future::pending::<Result<Vec<u8>, ()>>();
-    let result = collect_h3_request_body_with_deadline_for_test(pending, Some(deadline), 0).await;
-    assert!(matches!(result, Err(EarlyUploadWaitError::DeadlineExceeded)));
+        .expect("representable");
+    let (effective, kind) = compose_early_upload_bound_for_test(Some(absolute), 25)
+        .expect("bound must exist");
+    assert_eq!(kind, EarlyUploadBoundKind::OperatorTimeout);
+    assert!(effective <= absolute);
     assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "deadline cancellation must unbound a stalled upload promptly"
+        effective
+            <= tokio::time::Instant::now()
+                .checked_add(Duration::from_millis(25))
+                .expect("representable")
     );
 }
 
 #[test]
-fn h3_early_phases_use_owned_drain_and_immediate_halt_on_cancel() {
+fn compose_earliest_of_picks_absolute_rpc_deadline_when_sooner() {
+    let absolute = tokio::time::Instant::now()
+        .checked_add(Duration::from_millis(5))
+        .expect("representable");
+    let (effective, kind) = compose_early_upload_bound_for_test(Some(absolute), 60_000)
+        .expect("bound must exist");
+    assert_eq!(kind, EarlyUploadBoundKind::RpcDeadline);
+    assert_eq!(effective, absolute);
+}
+
+#[test]
+fn compose_timeout_zero_still_honors_absolute_deadline() {
+    let absolute = tokio::time::Instant::now()
+        .checked_add(Duration::from_millis(10))
+        .expect("representable");
+    let (effective, kind) =
+        compose_early_upload_bound_for_test(Some(absolute), 0).expect("RPC bound remains");
+    assert_eq!(kind, EarlyUploadBoundKind::RpcDeadline);
+    assert_eq!(effective, absolute);
+}
+
+#[test]
+fn compose_timeout_zero_without_deadline_disables_all_bounds() {
+    assert!(compose_early_upload_bound_for_test(None, 0).is_none());
+}
+
+#[test]
+fn later_early_phases_reuse_one_prebuffer_instead_of_a_second_drain() {
+    let mut prebuffered: Option<Vec<u8>> = None;
+    assert!(early_upload_phase_needs_fresh_drain_for_test(&prebuffered));
+
+    // First consumer (authenticate / authorize / before_proxy) owns the drain.
+    prebuffered = Some(vec![1, 2, 3]);
+    assert!(
+        !early_upload_phase_needs_fresh_drain_for_test(&prebuffered),
+        "a second early-phase consumer must reuse the bounded prebuffer"
+    );
+
+    // Simulate a second consumer that would otherwise start a fresh operator
+    // window: with reuse, composition is never consulted again for that body.
+    let absolute = tokio::time::Instant::now()
+        .checked_add(Duration::from_millis(40))
+        .expect("representable");
+    let first = compose_early_upload_bound_for_test(Some(absolute), 40).expect("first drain bound");
+    assert_eq!(first.1, EarlyUploadBoundKind::OperatorTimeout);
+    assert!(
+        !early_upload_phase_needs_fresh_drain_for_test(&prebuffered),
+        "must not deduct a second fresh operator timeout after prebuffering"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn h1h2_and_h3_operator_timeout_caps_a_long_rpc_deadline_without_wall_sleep() {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .expect("representable");
+
+    let h1h2_pending = std::future::pending::<Result<(), ()>>();
+    let h1h2_task = tokio::spawn(async move {
+        collect_h1h2_request_body_with_deadline_for_test(h1h2_pending, Some(deadline), 10).await
+    });
+    let h3_pending = std::future::pending::<Result<(), ()>>();
+    let h3_task = tokio::spawn(async move {
+        collect_h3_request_body_with_deadline_for_test(h3_pending, Some(deadline), 10).await
+    });
+
+    // Register timeout_at waiters before advancing paused time.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(10)).await;
+    tokio::task::yield_now().await;
+
+    let h1h2 = h1h2_task.await.expect("join");
+    let h3 = h3_task.await.expect("join");
+    assert!(matches!(h1h2, Err(EarlyUploadWaitError::TimedOut)));
+    assert!(matches!(h3, Err(EarlyUploadWaitError::TimedOut)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn h1h2_and_h3_rpc_deadline_wins_over_larger_operator_timeout_without_wall_sleep() {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_millis(15))
+        .expect("representable");
+
+    let h1h2_pending = std::future::pending::<Result<(), ()>>();
+    let h1h2_task = tokio::spawn(async move {
+        collect_h1h2_request_body_with_deadline_for_test(h1h2_pending, Some(deadline), 60_000)
+            .await
+    });
+    let h3_pending = std::future::pending::<Result<(), ()>>();
+    let h3_task = tokio::spawn(async move {
+        collect_h3_request_body_with_deadline_for_test(h3_pending, Some(deadline), 60_000).await
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(15)).await;
+    tokio::task::yield_now().await;
+
+    assert!(matches!(
+        h1h2_task.await.expect("join"),
+        Err(EarlyUploadWaitError::DeadlineExceeded)
+    ));
+    assert!(matches!(
+        h3_task.await.expect("join"),
+        Err(EarlyUploadWaitError::DeadlineExceeded)
+    ));
+}
+
+#[tokio::test]
+async fn zero_operator_timeout_still_honors_already_expired_rpc_deadline() {
+    let deadline = tokio::time::Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .expect("representable");
+
+    let h1h2 = collect_h1h2_request_body_with_deadline_for_test(
+        std::future::pending::<Result<(), ()>>(),
+        Some(deadline),
+        0,
+    )
+    .await;
+    assert!(matches!(h1h2, Err(EarlyUploadWaitError::DeadlineExceeded)));
+
+    let h3 = collect_h3_request_body_with_deadline_for_test(
+        std::future::pending::<Result<(), ()>>(),
+        Some(deadline),
+        0,
+    )
+    .await;
+    assert!(matches!(h3, Err(EarlyUploadWaitError::DeadlineExceeded)));
+}
+
+#[tokio::test]
+async fn zero_operator_timeout_without_deadline_leaves_completed_upload_unbounded() {
+    let h1h2 = collect_h1h2_request_body_with_deadline_for_test(
+        std::future::ready::<Result<u8, ()>>(Ok(7)),
+        None,
+        0,
+    )
+    .await
+    .expect("disabled timeout must not invent an error");
+    assert_eq!(h1h2, Ok(7));
+
+    let h3 = collect_h3_request_body_with_deadline_for_test(
+        std::future::ready::<Result<u8, ()>>(Ok(11)),
+        None,
+        0,
+    )
+    .await
+    .expect("disabled timeout must not invent an error");
+    assert_eq!(h3, Ok(11));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_pending_upload_drops_future_owned_buffer() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    let flag = Arc::clone(&dropped);
+    let upload = async move {
+        let _guard = DropFlag(flag);
+        let mut body = vec![0_u8; 64 * 1024];
+        std::future::pending::<()>().await;
+        // Keep the buffer live across the pending await so cancellation must
+        // drop it with the future (owned-drain contract).
+        body.fill(1);
+        Ok::<Vec<u8>, ()>(body)
+    };
+
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_millis(20))
+        .expect("representable");
+    let task = tokio::spawn(async move {
+        collect_h3_request_body_with_deadline_for_test(upload, Some(deadline), 0).await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(20)).await;
+    tokio::task::yield_now().await;
+
+    assert!(matches!(
+        task.await.expect("join"),
+        Err(EarlyUploadWaitError::DeadlineExceeded)
+    ));
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "deadline cancellation must drop the drain-owned buffer promptly"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn one_cancelled_waiter_does_not_block_an_independent_concurrent_waiter() {
+    let completed = Arc::new(AtomicUsize::new(0));
+
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_millis(10))
+        .expect("representable");
+    let slow = tokio::spawn(async move {
+        collect_h3_request_body_with_deadline_for_test(
+            std::future::pending::<Result<(), ()>>(),
+            Some(deadline),
+            0,
+        )
+        .await
+    });
+
+    let counter = Arc::clone(&completed);
+    let fast = tokio::spawn(async move {
+        let result = collect_h3_request_body_with_deadline_for_test(
+            std::future::ready::<Result<&'static str, ()>>(Ok("ok")),
+            None,
+            0,
+        )
+        .await;
+        counter.fetch_add(1, Ordering::SeqCst);
+        result
+    });
+
+    // Fast stream must complete while the slow waiter is still outstanding.
+    tokio::task::yield_now().await;
+    let fast_result = fast.await.expect("join");
+    assert_eq!(fast_result, Ok("ok"));
+    assert_eq!(completed.load(Ordering::SeqCst), 1);
+    assert!(!slow.is_finished());
+
+    tokio::time::advance(Duration::from_millis(10)).await;
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        slow.await.expect("join"),
+        Err(EarlyUploadWaitError::DeadlineExceeded)
+    ));
+}
+
+#[test]
+fn h3_early_phases_gate_fresh_drains_on_missing_prebuffer_and_halt_on_cancel() {
     let source = include_str!("../../../src/http3/server.rs");
 
     for phase in [
@@ -134,48 +293,21 @@ fn h3_early_phases_use_owned_drain_and_immediate_halt_on_cancel() {
         );
     }
 
-    assert!(source.contains("async fn drain_h3_request_body<"));
+    assert!(
+        source.contains("if prebuffered_body_data.is_none()")
+            || source.contains("if !body_was_prebuffered"),
+        "later phases must skip a second drain when a prebuffer exists"
+    );
     assert_eq!(
         source.matches("drain_h3_request_body(&mut stream,").count(),
         7,
         "every native H3 buffered upload site must use the owned-buffer drain"
     );
-    assert!(source.contains("pub(crate) async fn drain_h3_request_body<"));
     assert!(
         !source.contains(
             "let collect = async {\n            while let Some(chunk) = stream.recv_data()"
         ),
         "early/buffered H3 uploads must not accumulate into an outer buffer across cancellation"
-    );
-}
-
-#[test]
-fn h1h2_early_phases_compose_absolute_deadline_with_operator_timeout() {
-    let source = include_str!("../../../src/proxy/mod.rs");
-    for phase in [
-        "grpc_deadline_upload_before_authenticate",
-        "grpc_deadline_upload_before_authorize",
-        "grpc_deadline_upload_before_before_proxy",
-    ] {
-        assert!(
-            source.contains(phase),
-            "missing H1/H2 early upload deadline phase {phase}"
-        );
-    }
-
-    let helper = source
-        .split("pub(crate) async fn collect_request_body_with_deadline<")
-        .nth(1)
-        .expect("H1/H2 deadline helper")
-        .split("pub(crate) fn request_may_have_body(")
-        .next()
-        .expect("bounded H1/H2 deadline helper");
-    assert!(helper.contains("timeout_at(effective_deadline, collect)"));
-    assert!(helper.contains("RequestBodyWaitError::TimedOut"));
-    assert!(helper.contains("RequestBodyWaitError::DeadlineExceeded"));
-    assert!(
-        helper.contains("request_body_read_timeout_ms > 0"),
-        "operator timeout 0 must disable the fresh read bound"
     );
 }
 
