@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use ferrum_edge::plugins::{
     BUILTIN_PLUGIN_PARITY_META, BUILTIN_PLUGIN_REGISTRATIONS, BuiltinPluginClassification,
-    ProxyProtocol, create_plugin,
+    ProxyProtocol, builtin_plugin_parity_meta, create_plugin,
 };
 
 use super::minimal_plugin_config;
@@ -189,6 +189,19 @@ fn builtin_parity_meta_matches_registry_set() {
         "parity meta must be set-equal with BUILTIN_PLUGIN_REGISTRATIONS; missing={:?} extra={:?}",
         registry.difference(&meta).copied().collect::<Vec<_>>(),
         meta.difference(&registry).copied().collect::<Vec<_>>()
+    );
+
+    for entry in BUILTIN_PLUGIN_PARITY_META {
+        assert_eq!(
+            builtin_plugin_parity_meta(entry.name),
+            Some(entry),
+            "lookup must return canonical parity metadata for {}",
+            entry.name
+        );
+    }
+    assert!(
+        builtin_plugin_parity_meta("__missing_builtin_plugin__").is_none(),
+        "lookup must reject names outside the built-in parity inventory"
     );
 
     let mut priorities = BTreeMap::new();
