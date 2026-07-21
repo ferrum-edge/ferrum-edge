@@ -10820,6 +10820,8 @@ async fn finalize_h3_upload_deadline_rejection(
     // The upload drain already expired. Do not race this already-selected
     // rejection against the same absolute deadline: a Pending QUIC write would
     // lose immediately and abort before response HEADERS become observable.
+    // Bound the terminal write with the shared post-deadline grace instead so a
+    // flow-control-blocked client cannot retain the task indefinitely.
     send_h3_plugin_reject_flavor_aware(
         stream,
         plugins,
@@ -10881,29 +10883,43 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
             &mut deadline_body,
             &[],
         );
-        // Gateway already selected the deadline rejection; write it without
-        // re-racing the expired absolute deadline (a Pending QUIC write would
-        // otherwise abort before HEADERS are visible). Skip STOP_SENDING after
-        // mid-recv_data cancel — h3-quinn would unwrap-abort under panic=abort.
-        if grpc_web_response_content_type.is_some() {
-            return send_h3_finalized_reject_response_with_recv_halt(
-                stream,
-                StatusCode::OK,
-                &deadline_body,
-                &deadline_headers,
-                false,
-            )
-            .await;
-        }
-        return send_h3_reject_flavor_aware_with_recv_halt(
-            stream,
-            flavor,
-            deadline_status,
-            &deadline_body,
-            &deadline_headers,
-            false,
-        )
-        .await;
+        // Gateway already selected the deadline rejection; give HEADERS a real
+        // opportunity under the shared post-deadline grace (not the expired
+        // absolute deadline). Skip STOP_SENDING after mid-recv_data cancel —
+        // h3-quinn would unwrap-abort under panic=abort. Grace expiry aborts
+        // only the send half.
+        let write = async {
+            if grpc_web_response_content_type.is_some() {
+                send_h3_finalized_reject_response_with_recv_halt(
+                    stream,
+                    StatusCode::OK,
+                    &deadline_body,
+                    &deadline_headers,
+                    false,
+                )
+                .await
+            } else {
+                send_h3_reject_flavor_aware_with_recv_halt(
+                    stream,
+                    flavor,
+                    deadline_status,
+                    &deadline_body,
+                    &deadline_headers,
+                    false,
+                )
+                .await
+            }
+        };
+        return match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(())
+            }
+        };
     }
 
     let write = async {
@@ -10923,6 +10939,20 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
 
         send_h3_reject_flavor_aware_with_recv_halt(stream, flavor, http_status, body, headers, halt_recv).await
     };
+    // Operator timeout / mid-recv cancel paths pass halt_recv=false; bound the
+    // same way so flow-control cannot retain the task after the upload bound.
+    if !halt_recv {
+        return match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(())
+            }
+        };
+    }
     write.await
 }
 
@@ -11155,7 +11185,9 @@ async fn send_h3_error_flavor_aware_with_policy(
 }
 
 /// `halt_recv = false` after a mid-`recv_data` timeout/deadline cancel so
-/// h3-quinn's `stop_sending` cannot abort under `panic = "abort"`.
+/// h3-quinn's `stop_sending` cannot abort under `panic = "abort"`. When
+/// `halt_recv` is false the write is also bounded by the shared post-deadline
+/// grace so a flow-control-blocked client cannot retain the task indefinitely.
 #[allow(clippy::too_many_arguments)]
 async fn send_h3_error_flavor_aware_with_policy_and_recv_halt(
     stream: &mut RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
@@ -11168,54 +11200,69 @@ async fn send_h3_error_flavor_aware_with_policy_and_recv_halt(
     initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
     halt_recv: bool,
 ) -> Result<(), anyhow::Error> {
-    if let Some(content_type) = grpc_web_response_content_type {
-        let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
-            content_type,
-            grpc_status,
-            grpc_message,
-        );
-        crate::proxy::finalize_grpc_web_error_response_headers(
-            &mut translated,
-            initial_response_header_policy_plugins,
-            None,
-        );
-        send_h3_finalized_reject_response_with_recv_halt(
-            stream,
-            StatusCode::OK,
-            &translated.body,
-            &translated.headers,
-            halt_recv,
-        )
-        .await
-    } else if matches!(flavor, HttpFlavor::Grpc) {
-        send_h3_grpc_error_with_recv_halt(
-            stream,
-            grpc_status,
-            grpc_message,
-            initial_response_header_policy_plugins,
-            halt_recv,
-        )
-        .await
-    } else if initial_response_header_policy_plugins.is_empty() {
-        send_h3_response_with_recv_halt(stream, http_status, http_body, halt_recv).await
-    } else {
-        let mut headers = HashMap::new();
-        finalize_h3_gateway_error_headers(
-            flavor,
-            http_status,
-            http_body.as_bytes(),
-            &mut headers,
-            initial_response_header_policy_plugins,
-        );
-        send_h3_finalized_reject_response_with_recv_halt(
-            stream,
-            http_status,
-            http_body.as_bytes(),
-            &headers,
-            halt_recv,
-        )
-        .await
+    let write = async {
+        if let Some(content_type) = grpc_web_response_content_type {
+            let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
+                content_type,
+                grpc_status,
+                grpc_message,
+            );
+            crate::proxy::finalize_grpc_web_error_response_headers(
+                &mut translated,
+                initial_response_header_policy_plugins,
+                None,
+            );
+            send_h3_finalized_reject_response_with_recv_halt(
+                stream,
+                StatusCode::OK,
+                &translated.body,
+                &translated.headers,
+                halt_recv,
+            )
+            .await
+        } else if matches!(flavor, HttpFlavor::Grpc) {
+            send_h3_grpc_error_with_recv_halt(
+                stream,
+                grpc_status,
+                grpc_message,
+                initial_response_header_policy_plugins,
+                halt_recv,
+            )
+            .await
+        } else if initial_response_header_policy_plugins.is_empty() {
+            send_h3_response_with_recv_halt(stream, http_status, http_body, halt_recv).await
+        } else {
+            let mut headers = HashMap::new();
+            finalize_h3_gateway_error_headers(
+                flavor,
+                http_status,
+                http_body.as_bytes(),
+                &mut headers,
+                initial_response_header_policy_plugins,
+            );
+            send_h3_finalized_reject_response_with_recv_halt(
+                stream,
+                http_status,
+                http_body.as_bytes(),
+                &headers,
+                halt_recv,
+            )
+            .await
+        }
+    };
+    if !halt_recv {
+        return match crate::http3::stream_util::await_post_deadline_terminal_response_write(write)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(())
+            }
+        };
     }
+    write.await
 }
 
 /// Flavor-aware rejection for H3 with custom response headers (used on the

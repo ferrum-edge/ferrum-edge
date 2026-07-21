@@ -1911,6 +1911,39 @@ pub mod _test_support {
         )
     }
 
+    /// Return true when an immediately-ready post-deadline terminal rejection
+    /// write completes under the shared gateway grace.
+    pub async fn ready_h3_post_deadline_terminal_write_completes_for_test() -> bool {
+        matches!(
+            crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                std::future::ready(Ok::<(), ()>(())),
+            )
+            .await,
+            Ok(())
+        )
+    }
+
+    /// Return true when a stalled post-deadline terminal rejection write is
+    /// cancelled by [`crate::http3::stream_util::H3_POST_DEADLINE_TERMINAL_WRITE_GRACE`].
+    pub async fn stalled_h3_post_deadline_terminal_write_expires_for_test() -> bool {
+        let write = std::future::pending::<Result<(), ()>>();
+        let task = tokio::spawn(async move {
+            crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(crate::http3::stream_util::H3_POST_DEADLINE_TERMINAL_WRITE_GRACE)
+            .await;
+        tokio::task::yield_now().await;
+        matches!(
+            task.await.expect("join"),
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
+        )
+    }
+
+    pub fn h3_post_deadline_terminal_write_grace_for_test() -> std::time::Duration {
+        crate::http3::stream_util::H3_POST_DEADLINE_TERMINAL_WRITE_GRACE
+    }
+
     pub fn grpc_deadline_can_send_terminal_status_for_test(bytes_streamed: u64) -> bool {
         crate::http3::stream_util::grpc_deadline_can_send_terminal_status(bytes_streamed)
     }

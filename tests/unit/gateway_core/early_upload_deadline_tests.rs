@@ -364,6 +364,10 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
         !timed_out.contains("halt_request_body(stream)"),
         "timed-out bridge arm must skip STOP_SENDING after mid-recv cancel"
     );
+    assert!(
+        timed_out.contains("await_post_deadline_terminal_response_write("),
+        "timed-out bridge arm must bound the terminal write with the shared grace"
+    );
     let deadline = bridge
         .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {")
         .nth(1)
@@ -371,5 +375,9 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
     assert!(
         !deadline.contains("halt_request_body(stream)"),
         "deadline bridge arm must skip STOP_SENDING after mid-recv cancel"
+    );
+    assert!(
+        deadline.contains("write_final_body_reject("),
+        "deadline bridge arm must reuse the grace-bounded final reject writer"
     );
 }

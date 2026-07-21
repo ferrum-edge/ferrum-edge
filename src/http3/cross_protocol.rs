@@ -4035,15 +4035,35 @@ where
                 // Send-only writer: mid-recv_data cancel leaves h3-quinn's recv
                 // slot None, so STOP_SENDING would unwrap-abort under panic=abort.
                 // Quinn Drop still stops the peer when the stream is released.
-                return write_grpc_error_send_with_policy(
+                // Bound the terminal write with the shared post-deadline grace.
+                let write = write_grpc_error_send_with_policy(
                     stream,
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     "Request body read timed out",
                     backend_start,
                     0,
                     initial_response_header_policy_plugins,
+                );
+                return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                    write,
                 )
-                .await;
+                .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => {
+                        Err(error)
+                    }
+                    Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            StatusCode::OK.as_u16(),
+                            0,
+                            backend_start,
+                            0,
+                            false,
+                        ))
+                    }
+                };
             }
             Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {
                 ctx.mark_gateway_deadline_response_selected();
@@ -6903,15 +6923,15 @@ where
     .await;
     // Pending committed observers continue on owned state under a post-response
     // bound, while the downstream terminal write remains best-effort: it must
-    // not park forever on exhausted QUIC flow-control credit. Give the complete
-    // HEADERS/DATA/FIN writer one immediate poll after expiry and reset the
-    // stream if any constituent write would block.
+    // not park forever on exhausted QUIC flow-control credit. Already-selected
+    // deadline rejections use the shared post-deadline grace (not the expired
+    // absolute deadline) so HEADERS can become visible without unbounded
+    // retention; grace expiry aborts the send half without STOP_SENDING after
+    // a mid-recv_data cancel.
     let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
     if let Some(translated) = grpc_web_reject {
-        // Already-selected deadline rejections must not re-race the expired
-        // absolute deadline, and must not STOP_SENDING after a mid-recv cancel.
         if terminal_gateway_deadline {
-            return write_reject_with_headers_and_recv_halt(
+            let write = write_reject_with_headers_and_recv_halt(
                 stream,
                 StatusCode::OK,
                 &translated.body,
@@ -6919,8 +6939,25 @@ where
                 backend_start,
                 bytes_sent,
                 false,
+            );
+            return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                write,
             )
-            .await;
+            .await
+            {
+                Ok(outcome) => Ok(outcome),
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    Ok(terminal_deadline_write_aborted_outcome(
+                        StatusCode::OK.as_u16(),
+                        0,
+                        backend_start,
+                        bytes_sent,
+                        false,
+                    ))
+                }
+            };
         }
         write_reject_with_headers(
             stream,
@@ -6934,17 +6971,34 @@ where
     } else if matches!(flavor, HttpFlavor::Grpc) {
         if terminal_gateway_deadline {
             // Send-only: skip STOP_SENDING after mid-recv_data cancel.
-            return write_normalized_grpc_reject_send(
+            let write = write_normalized_grpc_reject_send(
                 stream,
                 &normalized,
                 backend_start,
                 bytes_sent,
+            );
+            return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                write,
             )
-            .await;
+            .await
+            {
+                Ok(outcome) => Ok(outcome),
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    Ok(terminal_deadline_write_aborted_outcome(
+                        normalized.http_status.as_u16(),
+                        0,
+                        backend_start,
+                        bytes_sent,
+                        false,
+                    ))
+                }
+            };
         }
         write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
     } else if terminal_gateway_deadline {
-        write_reject_with_headers_and_recv_halt(
+        let write = write_reject_with_headers_and_recv_halt(
             stream,
             normalized.http_status,
             &normalized.body,
@@ -6952,8 +7006,21 @@ where
             backend_start,
             bytes_sent,
             false,
-        )
-        .await
+        );
+        match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
+            Ok(outcome) => Ok(outcome),
+            Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(terminal_deadline_write_aborted_outcome(
+                    normalized.http_status.as_u16(),
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    false,
+                ))
+            }
+        }
     } else {
         write_reject_with_headers(
             stream,
@@ -7140,12 +7207,10 @@ where
     if !ctx.gateway_deadline_response_selected() {
         return write.await;
     }
-    match crate::http3::stream_util::await_terminal_response_write_before_deadline(
-        ctx.grpc_deadline_at(),
-        write,
-    )
-    .await
-    {
+    // Post-deadline send-only reject: use the shared gateway grace so an
+    // immediately-ready status-4 HEADERS can complete, while a Pending
+    // flow-control wait cannot retain the task past the grace.
+    match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
         Ok(outcome) => Ok(outcome),
         Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
         Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {

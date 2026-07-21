@@ -10,10 +10,25 @@
 //!
 //! See RFC 9114 §8.1 (H3 error codes) and RFC 9000 §4.5 (STOP_SENDING).
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use h3::error::Code;
 use h3::quic::{RecvStream, SendStream};
 use h3::server::RequestStream;
+
+/// Fixed gateway grace for writing an already-selected post-deadline /
+/// post-timeout terminal H3 rejection (tiny HEADERS / trailers / FIN).
+///
+/// Independent of the expired client RPC deadline: racing that `Instant`
+/// cancels on the first `Pending` poll and prevents response HEADERS from
+/// becoming observable, while an unbounded await lets a flow-control-blocked
+/// client retain the request task indefinitely (CWE-400 / CWE-770). One
+/// second is long enough for a ready QUIC peer to accept a tiny rejection
+/// under mild congestion, and short enough to bound retention when the peer
+/// withholds credit. Not the detached plugin-cleanup bound — that governs
+/// owned hook work, not the QUIC write.
+pub(crate) const H3_POST_DEADLINE_TERMINAL_WRITE_GRACE: Duration = Duration::from_secs(1);
 
 /// Result of a downstream HTTP/3 write that is bounded by the client's
 /// absolute RPC deadline.
@@ -70,6 +85,11 @@ where
 /// trailer write. Biasing the write here preserves the clean gRPC status when
 /// QUIC has credit, while a pending flow-control wait still loses immediately
 /// to the expired deadline and is cancelled by the caller's stream reset.
+///
+/// For already-selected post-upload-cancel rejections that must remain visible
+/// without unbounded retention, prefer
+/// [`await_post_deadline_terminal_response_write`] — it uses a fresh gateway
+/// grace instead of the expired client deadline.
 pub(crate) async fn await_terminal_response_write_before_deadline<F, T, E>(
     deadline: Option<tokio::time::Instant>,
     write: F,
@@ -89,6 +109,24 @@ where
         result = &mut write => result.map_err(H3ResponseWriteError::Write),
         () = &mut deadline_sleep => Err(H3ResponseWriteError::DeadlineExceeded),
     }
+}
+
+/// Await a post-deadline / post-timeout terminal rejection write under
+/// [`H3_POST_DEADLINE_TERMINAL_WRITE_GRACE`].
+///
+/// Biases the write so an immediately-ready HEADERS/FIN completes; a Pending
+/// flow-control wait is cancelled when the grace expires. Callers that see
+/// [`H3ResponseWriteError::DeadlineExceeded`] must
+/// [`abort_response_stream`] and must **not** call [`halt_request_body`] after
+/// a mid-`recv_data` cancel (h3-quinn's recv slot is `None`).
+pub(crate) async fn await_post_deadline_terminal_response_write<F, T, E>(
+    write: F,
+) -> Result<T, H3ResponseWriteError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let grace_at = tokio::time::Instant::now() + H3_POST_DEADLINE_TERMINAL_WRITE_GRACE;
+    await_terminal_response_write_before_deadline(Some(grace_at), write).await
 }
 
 /// Signal the peer that we are done with the receive side of the
@@ -138,7 +176,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::Code;
+    use super::{Code, H3_POST_DEADLINE_TERMINAL_WRITE_GRACE, H3ResponseWriteError};
+    use std::time::Duration;
 
     /// RFC 9114 §8.1 defines H3_NO_ERROR == 0x100. The halt helper
     /// must use exactly this code so peers treat the recv-half close
@@ -152,5 +191,34 @@ mod tests {
     #[test]
     fn response_abort_code_matches_rfc9114_h3_internal_error() {
         assert_eq!(Code::H3_INTERNAL_ERROR.value(), 0x102);
+    }
+
+    #[test]
+    fn post_deadline_terminal_write_grace_is_short_and_fixed() {
+        assert_eq!(H3_POST_DEADLINE_TERMINAL_WRITE_GRACE, Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ready_post_deadline_terminal_write_completes_within_grace() {
+        let result = super::await_post_deadline_terminal_response_write(async {
+            Ok::<(), ()>(())
+        })
+        .await;
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_post_deadline_terminal_write_expires_grace() {
+        let write = std::future::pending::<Result<(), ()>>();
+        let task = tokio::spawn(async move {
+            super::await_post_deadline_terminal_response_write(write).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(H3_POST_DEADLINE_TERMINAL_WRITE_GRACE).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            task.await.expect("join"),
+            Err(H3ResponseWriteError::DeadlineExceeded)
+        ));
     }
 }
