@@ -333,3 +333,43 @@ async fn test_genuine_sse_fails_closed_at_strict_route_limit() {
         _ => panic!("Expected fail-closed event-stream rejection"),
     }
 }
+
+/// Keep `docs/size_limits.md` aligned with the streaming runtime contract that
+/// `response_size_limiting` points operators at (issue #2346). Unknown-length
+/// responses must not be documented as a full-buffer fallback that promises a
+/// post-commit JSON 502.
+#[test]
+fn test_size_limits_guide_matches_streaming_runtime_contract() {
+    let size_limits = include_str!("../../../docs/size_limits.md");
+    let streaming = include_str!("../../../docs/response_body_streaming.md");
+    let plugin_docs = include_str!("../../../docs/plugins.md");
+
+    assert!(
+        !size_limits.contains("falls back to buffering"),
+        "size_limits.md must not claim unknown-length responses fall back to buffering"
+    );
+    assert!(
+        size_limits.contains("SizeLimitedStreamingResponse"),
+        "size_limits.md must name SizeLimitedStreamingResponse for unknown-length streaming"
+    );
+    assert!(
+        size_limits.contains("post-commit"),
+        "size_limits.md must distinguish post-commit stream termination from pre-commit rejection"
+    );
+    assert!(
+        size_limits.contains("response_body_streaming.md#interaction-with-response-size-limits"),
+        "size_limits.md must link the streaming size-limit section"
+    );
+    assert!(
+        size_limits.contains("plugins.md#response_size_limiting"),
+        "size_limits.md must link the response_size_limiting plugin reference"
+    );
+
+    // Counterpart docs already describe the streaming adapter; keep the shared
+    // terminology from drifting back to a buffering-only story.
+    assert!(streaming.contains("SizeLimitedStreamingResponse"));
+    assert!(
+        plugin_docs.contains("SizeLimitedStreamingResponse"),
+        "response_size_limiting reference must mention the global streaming adapter"
+    );
+}

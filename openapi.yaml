@@ -14493,7 +14493,14 @@ components:
               description: Clock skew tolerance (seconds) for timestamp validation
         username_token:
           type: object
-          description: WS-Security UsernameToken authentication
+          description: |
+            WS-Security UsernameToken authentication. Unknown usernames, wrong
+            PasswordText values, and wrong PasswordDigest values share one
+            generic HTTP 401 body (`{"error":"WS-Security: invalid credentials"}`)
+            and must not disclose whether the principal exists. Lookup misses
+            still perform PasswordText/PasswordDigest verification against
+            process-local dummy material. Structural token or policy failures
+            remain distinct.
           properties:
             enabled:
               type: boolean
