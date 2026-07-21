@@ -2924,7 +2924,7 @@ fn parse_content_type_charset(
         if !name.trim().eq_ignore_ascii_case("charset") {
             continue;
         }
-        let raw = value.trim().trim_matches('"').trim_matches('\'');
+        let raw = parse_charset_parameter_value(value.trim())?;
         if raw.is_empty() {
             return Err(SoapBodyDecodeError::UnsupportedCharset);
         }
@@ -2935,6 +2935,30 @@ fn parse_content_type_charset(
         charset = Some(normalize_declared_charset(raw)?);
     }
     Ok(charset)
+}
+
+fn parse_charset_parameter_value(raw: &str) -> Result<&str, SoapBodyDecodeError> {
+    if raw.is_empty() {
+        return Err(SoapBodyDecodeError::UnsupportedCharset);
+    }
+    let first = raw.as_bytes()[0];
+    if first == b'"' || first == b'\'' {
+        if raw.len() < 2 || raw.as_bytes().last().copied() != Some(first) {
+            return Err(SoapBodyDecodeError::ConflictingCharset);
+        }
+        let inner = &raw[1..raw.len() - 1];
+        if inner.is_empty() || inner.bytes().any(|byte| byte == first || byte == b'\\') {
+            return Err(SoapBodyDecodeError::UnsupportedCharset);
+        }
+        return Ok(inner);
+    }
+    if raw
+        .bytes()
+        .any(|byte| matches!(byte, b'"' | b'\'' | b'\\'))
+    {
+        return Err(SoapBodyDecodeError::ConflictingCharset);
+    }
+    Ok(raw)
 }
 
 fn normalize_declared_charset(raw: &str) -> Result<DeclaredCharset, SoapBodyDecodeError> {
@@ -3084,7 +3108,7 @@ fn validate_xml_declaration_encoding(
         return Err(SoapBodyDecodeError::MalformedEncoding);
     };
     let decl = &trimmed[..end + 2];
-    let Some(label) = extract_xml_decl_encoding(decl) else {
+    let Some(label) = extract_xml_decl_encoding(decl)? else {
         return Ok(());
     };
     if resolved.accepts_xml_decl_label(&label) {
@@ -3101,24 +3125,52 @@ fn validate_xml_declaration_encoding(
     }
 }
 
-fn extract_xml_decl_encoding(decl: &str) -> Option<String> {
-    let lower = decl.to_ascii_lowercase();
-    let key = "encoding";
-    let idx = lower.find(key)?;
-    let after = decl[idx + key.len()..].trim_start();
-    let after = after.strip_prefix('=')?.trim_start();
-    let quote = after.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
+fn extract_xml_decl_encoding(decl: &str) -> Result<Option<String>, SoapBodyDecodeError> {
+    let Some(mut rest) = decl.strip_prefix("<?xml") else {
+        return Err(SoapBodyDecodeError::MalformedEncoding);
+    };
+    rest = rest
+        .strip_suffix("?>")
+        .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+
+    let mut encoding = None;
+    while !rest.trim_start().is_empty() {
+        rest = rest.trim_start();
+        let name_len = rest
+            .bytes()
+            .take_while(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-' | b'.')
+            })
+            .count();
+        if name_len == 0 {
+            return Err(SoapBodyDecodeError::MalformedEncoding);
+        }
+        let (name, after_name) = rest.split_at(name_len);
+        rest = after_name.trim_start();
+        rest = rest
+            .strip_prefix('=')
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?
+            .trim_start();
+        let quote = rest
+            .chars()
+            .next()
+            .filter(|quote| matches!(quote, '"' | '\''))
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        rest = &rest[quote.len_utf8()..];
+        let end = rest
+            .find(quote)
+            .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+        let value = &rest[..end];
+        rest = &rest[end + quote.len_utf8()..];
+
+        if name.eq_ignore_ascii_case("encoding") {
+            if encoding.is_some() || value.trim().is_empty() {
+                return Err(SoapBodyDecodeError::ConflictingCharset);
+            }
+            encoding = Some(value.trim().to_string());
+        }
     }
-    let rest = &after[quote.len_utf8()..];
-    let end = rest.find(quote)?;
-    let value = rest[..end].trim();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value.to_string())
-    }
+    Ok(encoding)
 }
 
 // Reached only via the lib target's `_test_support` shim (external unit tests).

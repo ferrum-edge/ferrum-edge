@@ -2212,6 +2212,32 @@ fn decode_rejects_duplicate_charset_parameters() {
     assert!(err.contains("conflicting or ambiguous"), "got: {err}");
 }
 
+#[test]
+fn decode_rejects_unbalanced_charset_quotes() {
+    let xml = wrap_soap(&fresh_timestamp());
+    for content_type in [
+        "text/xml; charset=\"utf-8",
+        "text/xml; charset=utf-8\"",
+        "text/xml; charset='utf-8",
+    ] {
+        let err = soap_decode_xml_body_for_test(xml.as_bytes(), content_type)
+            .expect_err("unbalanced charset quotes must fail closed");
+        assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+    }
+}
+
+#[test]
+fn xml_declaration_finds_encoding_after_misleading_attribute_value() {
+    let xml = r#"<?xml version="encoding" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body><GetPrice/></soap:Body>
+</soap:Envelope>"#;
+    let bytes = encode_utf16_le(xml);
+    let err = soap_decode_xml_body_for_test(&bytes, "text/xml; charset=utf-16")
+        .expect_err("the real XML declaration encoding must still be checked");
+    assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+}
+
 #[tokio::test]
 async fn utf16le_username_token_validates_over_decoded_text() {
     let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
