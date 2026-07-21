@@ -17,9 +17,10 @@
 //!
 //! Outbound mirror headers cross the same canonical secondary-request boundary
 //! as primary backend dispatch (Connection-listed hop-by-hop, Trailer, framing,
-//! Ferrum request-only markers, and proxy-owned `X-Forwarded-*`). Client `Host`
-//! is omitted so authority comes from the mirror URL; native gRPC content-types
-//! re-synthesise `te: trailers`. The mirror request-target prefers the original
+//! Ferrum request-only markers, and proxy-owned `X-Forwarded-*`). Forwarding
+//! identity is stripped rather than regenerated. Client `Host` is omitted so
+//! authority comes from the mirror URL; native gRPC content-types re-synthesise
+//! `te: trailers` for HTTP/2-capable mirror targets. The request-target prefers the original
 //! raw query (after the same auth credential strips the primary backend uses)
 //! so duplicate keys, order, flags, `+`, percent escapes, and encoded bytes
 //! match the primary contract.
@@ -57,7 +58,7 @@
 //! | `mirror_host` | string | **(required)** | Hostname or IP of the mirror target |
 //! | `mirror_port` | u16 | 80 (http) / 443 (https) | Port of the mirror target |
 //! | `mirror_protocol` | string | `"http"` | `"http"` or `"https"` |
-//! | `mirror_path` | string | (none) | Override the request path for the mirror. When unset, the backend-effective authorized path is used if backend-path policy is active; otherwise the original request path is used |
+//! | `mirror_path` | string | (none) | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, the backend-effective authorized path is used if backend-path policy is active; otherwise the original request path is used |
 //! | `percentage` | f64 | `100.0` | Percentage of requests to mirror (0.0–100.0) |
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
 //! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes read from a mirror response when sizing it (only consulted when the response has no `content-length`). Streaming aborts as soon as the limit is crossed; mirror task discards the bytes after sizing. |
