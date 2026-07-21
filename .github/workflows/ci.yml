@@ -108,6 +108,12 @@ jobs:
         if: github.event_name == 'pull_request'
         run: git diff --check "origin/${{ github.base_ref }}...HEAD"
 
+      - name: Check first-party Markdown links
+        run: |
+          set -euo pipefail
+          python3 -I .github/scripts/check_markdown_links.py --self-test
+          python3 -I .github/scripts/check_markdown_links.py
+
       - id: plan
         name: Select CI mode
         run: |

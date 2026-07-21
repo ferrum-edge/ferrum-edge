@@ -439,6 +439,10 @@ def main() -> int:
         planner_errors.append(
             "jobs.ci-plan must run the integration shard-coverage gate"
         )
+    if "check_markdown_links.py" not in ci_plan_body:
+        planner_errors.append(
+            "jobs.ci-plan must run the first-party Markdown link-check gate"
+        )
 
     node_waypoint_yml = Path(
         ".github/workflows/node-waypoint-ebpf-live.yml"
