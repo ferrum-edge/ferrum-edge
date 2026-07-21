@@ -159,10 +159,12 @@ impl rustls::client::danger::ServerCertVerifier for DangerAcceptAny {
     }
 }
 
-async fn h3_post_stalled_json(
+async fn h3_post_stalled_body(
     url: &str,
     host: &str,
     addr: SocketAddr,
+    content_type: &'static str,
+    grpc_timeout: Option<&'static str>,
 ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
     let provider = rustls::crypto::ring::default_provider();
     let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
@@ -185,11 +187,14 @@ async fn h3_post_stalled_json(
         let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
     });
 
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method(Method::POST)
         .uri(url)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(())?;
+        .header(http::header::CONTENT_TYPE, content_type);
+    if let Some(timeout) = grpc_timeout {
+        req = req.header("grpc-timeout", timeout);
+    }
+    let req = req.body(())?;
     let mut stream = send_request.send_request(req).await?;
     stream
         .send_data(Bytes::from_static(
@@ -342,49 +347,42 @@ async fn h2_stalled_early_body_hits_operator_whole_upload_timeout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
-async fn h1_zero_operator_timeout_still_honors_grpc_timeout_absolute_deadline() {
+async fn h3_zero_operator_timeout_still_honors_native_grpc_absolute_deadline() {
     // `backend_read_timeout_ms = 0` disables the operator whole-upload bound,
-    // but a present `grpc-timeout` absolute deadline must still cap the early
-    // drain. Plain JSON + ai_request_guard keeps status shaping on the HTTP
-    // 408 path (deadline rejection body).
+    // but a native gRPC request's `grpc-timeout` absolute deadline must still
+    // cap the request_mirror pre-before_proxy body drain.
     let (backend_port, _backend) = spawn_ok_backend().await;
-    let harness = GatewayHarness::builder()
-        .mode_in_process()
-        .file_config(early_body_proxy_yaml(backend_port, 0))
-        .pool_warmup_enabled(false)
-        .spawn()
+    let (mut gateway, https_port) =
+        spawn_h3_gateway(early_body_proxy_yaml(backend_port, 0)).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
         .await
-        .expect("spawn gateway");
+        .expect("proxy ready");
 
-    let (body, keeper, _tx) = stalled_json_body();
+    let url = format!("https://127.0.0.1:{https_port}/upload");
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, https_port));
     let started = Instant::now();
-    let resp = harness
-        .http_client()
-        .expect("client")
-        .as_reqwest()
-        .post(harness.proxy_url("/upload"))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .header("grpc-timeout", "100m")
-        .body(body)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-        .expect("deadline-capped stalled upload");
+    let response = h3_post_stalled_body(
+        &url,
+        "localhost",
+        addr,
+        "application/grpc",
+        Some("100m"),
+    )
+    .await
+    .expect("deadline-capped native gRPC H3 upload");
     let elapsed = started.elapsed();
-    let status = resp.status();
-    let body_text = resp.text().await.unwrap_or_default();
-    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
-    assert!(
-        body_text.contains("deadline")
-            || body_text.contains("timed out")
-            || body_text.contains("timeout"),
-        "deadline/timeout rejection body expected, got {body_text}"
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(
+        response.headers.get("grpc-status").and_then(|value| value.to_str().ok()),
+        Some("4"),
+        "native gRPC deadline rejection must be trailers-only DEADLINE_EXCEEDED"
     );
     assert!(
         elapsed < Duration::from_secs(2),
         "absolute RPC deadline must fire promptly, elapsed={elapsed:?}"
     );
-    keeper.abort();
+    gateway.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -446,7 +444,7 @@ async fn h3_stalled_early_body_hits_operator_whole_upload_timeout() {
     let response = {
         let deadline = Instant::now() + Duration::from_secs(15);
         loop {
-            match h3_post_stalled_json(&url, "localhost", addr).await {
+            match h3_post_stalled_body(&url, "localhost", addr, "application/json", None).await {
                 Ok(response) => break response,
                 Err(error) if Instant::now() < deadline => {
                     last_err = Some(error.to_string());
@@ -481,7 +479,9 @@ async fn h3_slow_cancelled_stream_does_not_block_independent_sibling_stream() {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, https_port));
 
     let stalled =
-        tokio::spawn(async move { h3_post_stalled_json(&upload_url, "localhost", addr).await });
+        tokio::spawn(async move {
+            h3_post_stalled_body(&upload_url, "localhost", addr, "application/json", None).await
+        });
 
     // Independent GET has no early body phase and should reach the OK backend
     // promptly while the sibling POST is still parked in the early drain.
