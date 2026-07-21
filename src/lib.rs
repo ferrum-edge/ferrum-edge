@@ -1309,7 +1309,18 @@ pub mod _test_support {
     }
 
     pub fn build_trailer_frame(response_headers: &HashMap<String, String>) -> Vec<u8> {
-        crate::plugins::grpc_web::build_trailer_frame(response_headers)
+        crate::plugins::grpc_web::build_trailer_frame(response_headers, None)
+    }
+
+    pub fn build_trailer_frame_with_http_status(
+        response_headers: &HashMap<String, String>,
+        http_status: Option<u16>,
+    ) -> Vec<u8> {
+        crate::plugins::grpc_web::build_trailer_frame(response_headers, http_status)
+    }
+
+    pub fn http_response_status_to_grpc_status(http_status: u16) -> u32 {
+        crate::plugins::grpc_web::http_response_status_to_grpc_status(http_status)
     }
 
     pub fn parse_grpc_frames(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
