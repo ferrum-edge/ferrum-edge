@@ -185,8 +185,9 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .next()
         .expect("H3 terminal provider dispatch must remain bounded");
     assert!(terminal_dispatch.contains("collect_h3_request_body_with_deadline("));
+    assert!(terminal_dispatch.contains("drain_h3_request_body("));
     for (failure, next_failure, sends_response) in [
-        ("Ok(false)", "H3RequestBodyReadError::Read(error)", true),
+        ("Ok(None)", "H3RequestBodyReadError::Read(error)", true),
         (
             "H3RequestBodyReadError::Read(error)",
             "H3RequestBodyReadError::TimedOut",
@@ -205,6 +206,10 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
             .split(next_failure)
             .next()
             .expect("bounded terminal upload branch");
+        assert!(
+            branch.contains("halt_cancelled_h3_upload("),
+            "cancelled terminal H3 uploads must STOP_SENDING before rejection work"
+        );
         assert_eq!(
             branch
                 .matches("finalize_h3_terminal_body_read_rejection(")

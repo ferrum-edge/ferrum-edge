@@ -9,6 +9,7 @@ mod cp_server_tests;
 mod date_cache_tests;
 mod dns_tests;
 mod dp_client_tests;
+mod early_upload_deadline_tests;
 mod error_classifier_tests;
 mod grpc_proxy_tests;
 mod gso_batch_buf_tests;

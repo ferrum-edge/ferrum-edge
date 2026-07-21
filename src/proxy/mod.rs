@@ -2472,7 +2472,7 @@ enum RequestBodyBufferError {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum RequestBodyWaitError {
+pub(crate) enum RequestBodyWaitError {
     TimedOut,
     DeadlineExceeded,
 }
@@ -2486,7 +2486,7 @@ impl From<RequestBodyWaitError> for RequestBodyBufferError {
     }
 }
 
-async fn collect_request_body_with_timeout<F, T, E>(
+pub(crate) async fn collect_request_body_with_timeout<F, T, E>(
     collect: F,
     request_body_read_timeout_ms: u64,
 ) -> Result<Result<T, E>, RequestBodyWaitError>
@@ -2502,7 +2502,7 @@ where
         .map_err(|_| RequestBodyWaitError::TimedOut)
 }
 
-async fn collect_request_body_with_deadline<F, T, E>(
+pub(crate) async fn collect_request_body_with_deadline<F, T, E>(
     collect: F,
     deadline: Option<tokio::time::Instant>,
     request_body_read_timeout_ms: u64,

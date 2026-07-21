@@ -2266,4 +2266,62 @@ pub mod _test_support {
     pub fn udp_logging_dtls_send_timeout_secs_for_test() -> u64 {
         crate::plugins::udp_logging::UDP_LOGGING_DTLS_SEND_TIMEOUT.as_secs()
     }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum EarlyUploadWaitError {
+        TimedOut,
+        DeadlineExceeded,
+        Read,
+    }
+
+    pub async fn collect_h1h2_request_body_with_deadline_for_test<F, T, E>(
+        collect: F,
+        deadline: Option<tokio::time::Instant>,
+        request_body_read_timeout_ms: u64,
+    ) -> Result<Result<T, E>, EarlyUploadWaitError>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        match crate::proxy::collect_request_body_with_deadline(
+            collect,
+            deadline,
+            request_body_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(result) => Ok(result),
+            Err(crate::proxy::RequestBodyWaitError::TimedOut) => Err(EarlyUploadWaitError::TimedOut),
+            Err(crate::proxy::RequestBodyWaitError::DeadlineExceeded) => {
+                Err(EarlyUploadWaitError::DeadlineExceeded)
+            }
+        }
+    }
+
+    pub async fn collect_h3_request_body_with_deadline_for_test<F, T, E>(
+        collect: F,
+        deadline: Option<tokio::time::Instant>,
+        request_body_read_timeout_ms: u64,
+    ) -> Result<T, EarlyUploadWaitError>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        match crate::http3::server::collect_h3_request_body_with_deadline(
+            collect,
+            deadline,
+            request_body_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(value) => Ok(value),
+            Err(crate::http3::server::H3RequestBodyReadError::TimedOut) => {
+                Err(EarlyUploadWaitError::TimedOut)
+            }
+            Err(crate::http3::server::H3RequestBodyReadError::DeadlineExceeded) => {
+                Err(EarlyUploadWaitError::DeadlineExceeded)
+            }
+            Err(crate::http3::server::H3RequestBodyReadError::Read(_)) => {
+                Err(EarlyUploadWaitError::Read)
+            }
+        }
+    }
 }

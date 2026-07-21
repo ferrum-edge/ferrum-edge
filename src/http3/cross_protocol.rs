@@ -3983,6 +3983,7 @@ where
         {
             Ok(Some(b)) => b,
             Ok(None) => {
+                crate::http3::stream_util::halt_request_body(stream);
                 release_cross_protocol_circuit_breaker_probe_on_admission_reject(
                     state,
                     proxy,
@@ -4001,6 +4002,7 @@ where
                 .await;
             }
             Err(super::server::H3RequestBodyReadError::Read(e)) => {
+                crate::http3::stream_util::halt_request_body(stream);
                 warn!(
                     proxy_id = %proxy.id,
                     error = %e,
@@ -4024,6 +4026,7 @@ where
                 .await;
             }
             Err(super::server::H3RequestBodyReadError::TimedOut) => {
+                crate::http3::stream_util::halt_request_body(stream);
                 release_cross_protocol_circuit_breaker_probe_on_admission_reject(
                     state,
                     proxy,
@@ -4042,6 +4045,7 @@ where
                 .await;
             }
             Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {
+                crate::http3::stream_util::halt_request_body(stream);
                 ctx.mark_gateway_deadline_response_selected();
                 release_cross_protocol_circuit_breaker_probe_on_admission_reject(
                     state,
@@ -6450,17 +6454,9 @@ async fn drain_h3_body<S>(
     max_bytes: usize,
 ) -> Result<Option<Vec<u8>>, h3::error::StreamError>
 where
-    S: RecvStream + SendStream<Bytes>,
+    S: RecvStream,
 {
-    let mut body = Vec::new();
-    while let Some(chunk) = stream.recv_data().await? {
-        let bytes = chunk.chunk();
-        if max_bytes > 0 && body.len() + bytes.len() > max_bytes {
-            return Ok(None);
-        }
-        body.extend_from_slice(bytes);
-    }
-    Ok(Some(body))
+    super::server::drain_h3_request_body(stream, max_bytes).await
 }
 
 async fn send_response_headers<S>(
