@@ -6,7 +6,7 @@
   "properties": {
     "mode": {
       "type": "string",
-      "description": "Core gateway operating mode. mesh/injector/node_agent live in the ferrum-mesh chart.",
+      "description": "Core gateway operating mode. mesh/injector/node_agent live in the ferrum-mesh chart. migrate is an external pre-deploy Job, not a chart mode.",
       "enum": ["database", "file", "cp", "dp"]
     },
     "replicaCount": {

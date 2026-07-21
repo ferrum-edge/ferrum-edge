@@ -2390,6 +2390,82 @@ jobs:
             echo "::error title=QUIC port without HTTPS listener::https-quic must require an active HTTPS listener"
             exit 1
           fi
+          # DOC-02: migrate is an external Job workflow, not a chart mode and not
+          # redirected to ferrum-mesh. mesh-family modes still point at ferrum-mesh.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=migrate \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/migrate-mode.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/migrate-mode.err"; then
+            echo "::error title=migrate mode rendered::mode=migrate must fail as an external Job contract"
+            exit 1
+          fi
+          grep -F 'external pre-deploy Kubernetes Job' "$RUNNER_TEMP/ferrum-gateway-helm-results/migrate-mode.err"
+          if grep -Fi 'live in the ferrum-mesh' "$RUNNER_TEMP/ferrum-gateway-helm-results/migrate-mode.err"; then
+            echo "::error title=migrate pointed at ferrum-mesh::migrate must not redirect to the mesh chart"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=mesh \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/mesh-mode.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/mesh-mode.err"; then
+            echo "::error title=mesh mode rendered on gateway chart::mesh must fail with a ferrum-mesh pointer"
+            exit 1
+          fi
+          grep -F 'ferrum-mesh chart' "$RUNNER_TEMP/ferrum-gateway-helm-results/mesh-mode.err"
+          # External migrate Job examples keep the migrate env contract and Job shape.
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          examples = {
+              "migrate-job-up.yaml": {"action": "up", "dry_run": False},
+              "migrate-job-status.yaml": {"action": "status", "dry_run": False},
+              "migrate-job-up-dry-run.yaml": {"action": "up", "dry_run": True},
+              "migrate-job-config.yaml": {"action": "config", "dry_run": False},
+          }
+          root = Path("charts/ferrum-gateway/examples")
+          for name, expect in examples.items():
+              text = (root / name).read_text()
+              if not re.search(r"(?m)^kind:\s*Job\s*$", text):
+                  print(f"::error title=Migrate example not a Job::{name} must be kind: Job")
+                  sys.exit(1)
+              if not re.search(r"(?m)^\s*- name: FERRUM_MODE\s*$", text) or not re.search(
+                  r"(?m)^\s+value:\s*migrate\s*$", text
+              ):
+                  print(f"::error title=Migrate example missing FERRUM_MODE::{name}")
+                  sys.exit(1)
+              if not re.search(
+                  rf"(?m)^\s*- name: FERRUM_MIGRATE_ACTION\s*$\n\s+value:\s*{re.escape(expect['action'])}\s*$",
+                  text,
+              ):
+                  print(f"::error title=Migrate example wrong action::{name}")
+                  sys.exit(1)
+              has_dry = bool(re.search(r"(?m)^\s*- name: FERRUM_MIGRATE_DRY_RUN\s*$", text))
+              if has_dry != expect["dry_run"]:
+                  print(f"::error title=Migrate example dry-run mismatch::{name}")
+                  sys.exit(1)
+              if "runAsNonRoot: true" not in text or "runAsUser: 65532" not in text:
+                  print(f"::error title=Migrate example security drift::{name}")
+                  sys.exit(1)
+          print("migrate job examples ok")
+          PY
+          # Every binary operating mode is mapped to a chart, external workflow, or
+          # explicit unsupported contract in the Kubernetes deployment guide.
+          mode_contract=docs/kubernetes_deployment.md
+          for mode in database file cp dp mesh injector node_agent migrate; do
+            if ! grep -Eq "^\\| \`${mode}\` \\|" "$mode_contract"; then
+              echo "::error title=Missing mode Kubernetes contract::${mode} must appear in the operating-mode table"
+              exit 1
+            fi
+          done
+          grep -F 'External pre-deploy Job' "$mode_contract"
+          grep -F 'charts/ferrum-gateway/examples/migrate-job-' "$mode_contract"
+          if grep -Eni 'migrate.*pointer to the right chart|migrate.*ferrum-mesh chart' \
+            charts/ferrum-gateway/README.md charts/ferrum-gateway/values.yaml; then
+            echo "::error title=Stale migrate chart redirect::migrate must not claim another chart owns it"
+            exit 1
+          fi
 
       - name: Upload core gateway chart diagnostics
         if: always()

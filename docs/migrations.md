@@ -311,6 +311,16 @@ Before modifying any config file, the migrator creates a backup at `{filename}.b
 
 Use `FERRUM_MODE=migrate` to run migrations without starting the gateway.
 
+On Kubernetes, neither the `ferrum-gateway` nor `ferrum-mesh` Helm chart accepts
+`mode=migrate`. Run the same env contract as an **external pre-deploy Job**
+using the manifests under
+[`charts/ferrum-gateway/examples/migrate-job-*.yaml`](../charts/ferrum-gateway/examples/)
+(see
+[docs/kubernetes_deployment.md § Explicit migrate mode](kubernetes_deployment.md#explicit-migrate-mode-external-job)).
+`database` / `cp` chart installs still auto-apply pending core schema migrations
+on startup; the Job path is for `status`, dry-run, and operator-controlled
+`up` / `config`.
+
 ### Run Pending Database Migrations
 
 ```bash

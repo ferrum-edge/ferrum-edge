@@ -64,12 +64,13 @@ for operators who cannot use Helm.
 
 `mode` is a first-class value; supported values are `database`, `file`, `cp`,
 and `dp`. The mesh, injector, and node_agent modes live in the separate
-`charts/ferrum-mesh` chart. The chart validates configuration at
-`helm template`/`helm install` time and fails early with a helpful message when,
-for example, a database/cp/dp install is missing its `>=32`-char admin JWT
-secret, a dp install is missing `dp.cpGrpcUrls`, or an admin Service is requested
-without a non-loopback admin bind (which the binary hard-fails on in
-database/cp modes).
+`charts/ferrum-mesh` chart. Explicit `migrate` mode is **not** deployed by
+either chart — see [Explicit migrate mode (external Job)](#explicit-migrate-mode-external-job).
+The chart validates configuration at `helm template`/`helm install` time and
+fails early with a helpful message when, for example, a database/cp/dp install
+is missing its `>=32`-char admin JWT secret, a dp install is missing
+`dp.cpGrpcUrls`, or an admin Service is requested without a non-loopback admin
+bind (which the binary hard-fails on in database/cp modes).
 
 Per-mode quickstarts:
 
@@ -111,6 +112,65 @@ in-pod `ferrum-edge health` exec check that works with that default. See
 external-secret `_FILE` mount pattern). TLS and `_FILE` Secret projections
 default to group-readable `0440` with the distroless nonroot group supplied by
 the pod security context; both settings remain overridable.
+
+### Binary operating-mode Kubernetes contract
+
+Every `FERRUM_MODE` value maps to exactly one supported Kubernetes contract:
+
+| Mode | Kubernetes contract |
+|------|---------------------|
+| `database` | `charts/ferrum-gateway` (`mode=database`) |
+| `file` | `charts/ferrum-gateway` (`mode=file`) |
+| `cp` | `charts/ferrum-gateway` (`mode=cp`) |
+| `dp` | `charts/ferrum-gateway` (`mode=dp`) |
+| `mesh` | `charts/ferrum-mesh` (mesh data-plane components) |
+| `injector` | `charts/ferrum-mesh` (injector webhook) |
+| `node_agent` | `charts/ferrum-mesh` (node-agent DaemonSet) |
+| `migrate` | **External pre-deploy Job** — neither chart accepts `mode=migrate`; use [`charts/ferrum-gateway/examples/migrate-job-*.yaml`](../charts/ferrum-gateway/examples/) |
+
+### Explicit migrate mode (external Job)
+
+`FERRUM_MODE=migrate` is a one-shot CLI mode (apply / status / config, plus
+optional dry-run). It is intentionally **not** a Helm chart `mode` value:
+
+- Setting `mode=migrate` on `ferrum-gateway` fails at template time with a
+  pointer to the Job examples below (not to another chart).
+- `ferrum-mesh` also does not deploy migrate mode.
+
+Keep automatic startup migration separate from this workflow:
+
+- **Automatic:** `database` and `cp` chart installs still run pending **core**
+  schema migrations on process startup (normal day-2 operation).
+- **Explicit:** use a Job when you need `status`, dry-run preflight, or
+  operator-controlled `up` / `config` before cutover. See
+  [docs/migrations.md](migrations.md#running-migrations-explicitly).
+
+Supported Job examples (pin `image` to the same tag as the gateway Deployment
+and reuse the same DB Secret / ServiceAccount / security context):
+
+```bash
+# Read-only status
+kubectl -n ferrum apply -f charts/ferrum-gateway/examples/migrate-job-status.yaml
+kubectl -n ferrum logs job/ferrum-migrate-status
+
+# Dry-run pending DB migrations (no schema changes)
+kubectl -n ferrum apply -f charts/ferrum-gateway/examples/migrate-job-up-dry-run.yaml
+kubectl -n ferrum logs job/ferrum-migrate-up-dry-run
+
+# Apply pending DB migrations
+kubectl -n ferrum apply -f charts/ferrum-gateway/examples/migrate-job-up.yaml
+kubectl -n ferrum logs job/ferrum-migrate-up
+
+# Persist a file-config version migration (stages ConfigMap → emptyDir)
+kubectl -n ferrum create configmap ferrum-file-config --from-file=config.yaml=./config.yaml
+kubectl -n ferrum apply -f charts/ferrum-gateway/examples/migrate-job-config.yaml
+kubectl -n ferrum logs job/ferrum-migrate-config
+```
+
+Do not run overlapping `up` Jobs against the same database. The binary takes a
+cross-process migration lock, but one operator-owned Job at a time is the
+supported concurrency contract. Delete or rename finished Jobs before
+re-applying the same manifest name.
 
 ## Ferrum Mesh Helm Chart Contract
 

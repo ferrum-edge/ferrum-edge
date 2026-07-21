@@ -42,9 +42,11 @@ For the full feature list, see [FEATURES.md](FEATURES.md).
 | **Mesh** | `FERRUM_MODE=mesh` | Service-mesh data plane consuming native MeshSubscribe, xDS ADS, or a localized config file with six topologies | Read-only | Yes |
 | **Injector** | `FERRUM_MODE=injector` | Kubernetes admission webhook that injects Ferrum mesh sidecars/init capture | No | No |
 | **Node Agent** | `FERRUM_MODE=node_agent` | Per-node eBPF capture manager for ambient mesh; no proxy listeners. See [docs/node_agent.md](docs/node_agent.md) | Optional (read-only) | No |
-| **Migrate** | `FERRUM_MODE=migrate` | Runs DB schema migrations then exits | No | No |
+| **Migrate** | `FERRUM_MODE=migrate` | Runs DB schema migrations then exits (explicit CLI / external K8s Job; not a Helm chart mode) | No | No |
 
 See [docs/cp_dp_mode.md](docs/cp_dp_mode.md) for distributed deployment details.
+On Kubernetes, map each mode to its chart or external contract in
+[docs/kubernetes_deployment.md](docs/kubernetes_deployment.md#binary-operating-mode-kubernetes-contract).
 
 ## Prerequisites
 

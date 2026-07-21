@@ -13,8 +13,15 @@ conventions so they feel like one product.
 | Control plane | `cp` | no | read/write | `database.*`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) |
 | Data plane | `dp` | yes | read-only | `dp.cpGrpcUrls`, `admin.jwtSecret`, `grpc.jwtSecret` (>=32) |
 
-The `mode` value is first-class and required; any other value (mesh, injector,
-node_agent, migrate) fails at template time with a pointer to the right chart.
+The `mode` value is first-class and required. `mesh` / `injector` / `node_agent`
+fail at template time with a pointer to [`ferrum-mesh`](../ferrum-mesh).
+`migrate` is **not** deployed by either chart — it fails with a pointer to the
+external pre-deploy Job examples under
+[`examples/migrate-job-*.yaml`](examples/) (see
+[docs/kubernetes_deployment.md](../../docs/kubernetes_deployment.md#explicit-migrate-mode-external-job)).
+Normal `database` / `cp` startup still auto-applies pending core schema
+migrations; use the explicit Job for `status`, dry-run, and operator-controlled
+`up` / `config` workflows.
 
 ## Security defaults you should know
 
@@ -197,6 +204,24 @@ label. The quickstart pair explicitly opts into plaintext ClusterIP gRPC for
 development. Production control planes should remove that opt-in, serve gRPC
 over TLS (`tls.cpGrpc` or a complete CP cert/key SOURCE pair), and have DPs pin
 CP trust (`tls.dpGrpc`).
+
+## Explicit migrate mode (external Job)
+
+Neither this chart nor `ferrum-mesh` accepts `mode=migrate`. For status,
+dry-run, preflight, and operator-controlled schema/config migration, apply one
+of the Job manifests under [`examples/`](examples/):
+
+| Action | Example |
+|--------|---------|
+| Apply pending DB migrations | [`migrate-job-up.yaml`](examples/migrate-job-up.yaml) |
+| Migration status (read-only) | [`migrate-job-status.yaml`](examples/migrate-job-status.yaml) |
+| Dry-run pending DB migrations | [`migrate-job-up-dry-run.yaml`](examples/migrate-job-up-dry-run.yaml) |
+| Persist file-config version migration | [`migrate-job-config.yaml`](examples/migrate-job-config.yaml) |
+
+Reuse the same image tag, DB Secret, ServiceAccount, and security context as the
+gateway Deployment so the Job cannot drift from the running release. Do not run
+overlapping `up` Jobs against the same database; the binary takes a migration
+lock, but one operator-owned Job at a time is the supported workflow.
 
 ## Ports and stream listeners
 
