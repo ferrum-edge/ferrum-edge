@@ -782,8 +782,7 @@ fn ensure_vary_accept(headers: &mut HashMap<String, String>) {
             if existing.trim() == "*"
                 || existing
                     .split(',')
-                    .any(|token| token.trim().eq_ignore_ascii_case("accept")) =>
-        {}
+                    .any(|token| token.trim().eq_ignore_ascii_case("accept")) => {}
         Some(existing) => {
             let mut merged = String::with_capacity(existing.len() + ", Accept".len());
             merged.push_str(existing);
