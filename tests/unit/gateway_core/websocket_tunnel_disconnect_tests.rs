@@ -277,21 +277,24 @@ async fn test_framed_disconnect_duration_ignores_wall_clock_skew() {
 
     fire_ws_framed_disconnect_hooks(&plugins, "proxy-framed", meta, 3, 5, 30, 50, None).await;
 
-    let captured = captured.lock().unwrap();
-    assert_eq!(captured.len(), 1);
-    assert_eq!(captured[0].frames_c2b, 3);
-    assert_eq!(captured[0].frames_b2c, 5);
-    assert_eq!(captured[0].bytes_c2b, 30);
-    assert_eq!(captured[0].bytes_b2c, 50);
-    assert!(
-        captured[0].duration_ms < 5_000.0,
-        "framed duration_ms must use Instant under wall rollback; got {}",
-        captured[0].duration_ms
-    );
-    assert_eq!(
-        captured[0].timestamp_connected, expected_connected,
-        "wall connect timestamp is preserved for rendering"
-    );
+    // Drop the MutexGuard before the forward-skew await below (clippy::await_holding_lock).
+    {
+        let captured = captured.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].frames_c2b, 3);
+        assert_eq!(captured[0].frames_b2c, 5);
+        assert_eq!(captured[0].bytes_c2b, 30);
+        assert_eq!(captured[0].bytes_b2c, 50);
+        assert!(
+            captured[0].duration_ms < 5_000.0,
+            "framed duration_ms must use Instant under wall rollback; got {}",
+            captured[0].duration_ms
+        );
+        assert_eq!(
+            captured[0].timestamp_connected, expected_connected,
+            "wall connect timestamp is preserved for rendering"
+        );
+    }
 
     // Forward civil-clock skew: wall connect an hour in the future would make
     // a wall-delta path report zero/negative; Instant still reports near-zero
