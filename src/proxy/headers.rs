@@ -43,6 +43,8 @@ macro_rules! define_header_name_set {
 }
 
 define_header_name_set! {
+    // Public inventory is consumed by library tests, not the binary target.
+    #[allow(dead_code)]
     /// Closed set of lowercase names stripped by
     /// [`is_backend_request_strip_header`]. Secondary-request builders call that
     /// predicate directly; this const is the shared inventory for docs/tests.
@@ -87,6 +89,8 @@ define_header_name_set! {
 }
 
 define_header_name_set! {
+    // Public inventory is consumed by library tests, not the binary target.
+    #[allow(dead_code)]
     /// Closed set of lowercase proxy-owned forwarding identity headers stripped
     /// before Ferrum regenerates them on primary dispatch (and before secondary
     /// request builders copy the materialised map).
