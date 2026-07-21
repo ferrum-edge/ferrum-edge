@@ -4475,6 +4475,12 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
         ("content-type".to_string(), "application/grpc".to_string()),
         ("x-cache-status".to_string(), "MISS".to_string()),
     ]);
+    assert!(matches!(
+        after_proxy_plugins[0]
+            .before_proxy(&mut ctx, &mut headers)
+            .await,
+        PluginResult::Continue
+    ));
     assert!(
         !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
         "response_caching must not reject the buffered response"
@@ -4508,9 +4514,9 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
 /// actually written. Direct trait-level coverage keeps the two in step for the
 /// plugins whose end-to-end deadline path is exercised above only for
 /// `response_caching`.
-#[test]
-fn exact_value_telemetry_decorators_declare_only_what_they_write() {
-    let ctx = create_test_context();
+#[tokio::test]
+async fn exact_value_telemetry_decorators_declare_only_what_they_write() {
+    let mut ctx = create_test_context();
 
     let caching = create_plugin(
         "response_caching",
@@ -4518,6 +4524,12 @@ fn exact_value_telemetry_decorators_declare_only_what_they_write() {
     )
     .unwrap()
     .unwrap();
+    assert!(!caching.owns_deadline_response_header(&ctx, "x-cache-status"));
+    let mut request_headers = HashMap::new();
+    assert!(matches!(
+        caching.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
     assert!(caching.owns_deadline_response_header(&ctx, "x-cache-status"));
     assert!(caching.owns_deadline_response_header(&ctx, "X-Cache-Status"));
     assert!(!caching.owns_deadline_response_header(&ctx, "x-other"));

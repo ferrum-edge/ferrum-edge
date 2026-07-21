@@ -150,6 +150,36 @@ async fn cache_response(
         .await;
 }
 
+// Simulate a backend refresh of an existing entry. A normal lookup would HIT
+// and short-circuit before any backend response exists; request no-cache keeps
+// the instance's store staging while bypassing that fresh entry.
+async fn replace_cached_response(
+    plugin: &ResponseCaching,
+    method: &str,
+    path: &str,
+    status: u16,
+    response_headers: &HashMap<String, String>,
+    body: &[u8],
+) {
+    let mut ctx = make_ctx(method, path);
+    let mut request_headers = HashMap::from([(
+        "cache-control".to_string(),
+        "no-cache".to_string(),
+    )]);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut response_headers = response_headers.clone();
+    plugin
+        .after_proxy(&mut ctx, status, &mut response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, status, &response_headers, body)
+        .await;
+}
+
 // === Plugin creation ===
 
 #[tokio::test]
@@ -2531,7 +2561,7 @@ async fn test_replacement_admission_uses_size_delta() {
     .await;
     assert!(assert_size_accounting_exact(&plugin) <= 450);
 
-    cache_response(
+    replace_cached_response(
         &plugin,
         "GET",
         "/api/replacement-delta",
@@ -2570,7 +2600,7 @@ async fn test_large_to_small_replacement_releases_capacity() {
     .await;
     assert!(assert_size_accounting_exact(&plugin) <= 430);
 
-    cache_response(
+    replace_cached_response(
         &plugin,
         "GET",
         "/api/replacement-shrink",
@@ -2609,7 +2639,7 @@ async fn test_rejected_replacement_preserves_old_entry_and_accounting() {
     .await;
     let before = assert_size_accounting_exact(&plugin);
 
-    cache_response(
+    replace_cached_response(
         &plugin,
         "GET",
         "/api/replacement-reject",
@@ -3547,7 +3577,7 @@ async fn status_policy_divergence_does_not_cross_contaminate_stores() {
             matches!(only_200_result, PluginResult::Continue),
             "200-only instance must not store 404"
         );
-        assert_status(&only_200, &replay, "MISS");
+        assert_status(&only_200, &replay, "PREDICTED-BYPASS");
 
         let mut replay = make_ctx("GET", "/status-policy");
         let mut replay_headers = HashMap::new();
