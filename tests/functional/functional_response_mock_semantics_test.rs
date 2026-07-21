@@ -150,9 +150,14 @@ async fn assert_h1_h2_no_body_path(
         expected_status,
         "{protocol} {url} status"
     );
+    // Contract: 204/205/304 must not advertise Content-Length on any frontend.
+    // H1 is the sharp edge for 205 — Hyper would otherwise synthesize
+    // `Content-Length: 0` for ordinary empty bodies (it special-cases only
+    // 204/304), so this assertion guards the status-aware empty body path.
     assert!(
-        content_length(response.headers()).is_none(),
-        "{protocol} {url} must not advertise Content-Length"
+        response.headers().get(header::CONTENT_LENGTH).is_none(),
+        "{protocol} {url} must not advertise Content-Length (got {:?})",
+        response.headers().get(header::CONTENT_LENGTH)
     );
     let body = response
         .bytes()
@@ -298,8 +303,9 @@ async fn functional_response_mock_head_and_no_body_statuses_across_h1_h2_h3() {
             "H3 {url} must omit configured body"
         );
         assert!(
-            h3_content_length(&response.headers).is_none(),
-            "H3 {url} must strip Content-Length"
+            response.headers.get(header::CONTENT_LENGTH).is_none(),
+            "H3 {url} must strip Content-Length (got {:?})",
+            response.headers.get(header::CONTENT_LENGTH)
         );
     }
 
