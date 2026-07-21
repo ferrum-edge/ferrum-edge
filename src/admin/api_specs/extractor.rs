@@ -1180,11 +1180,8 @@ fn normalize_legacy_schema(
             apply_direction_required_semantics(&mut object, direction, supports_write_only);
 
             for child in object.values_mut() {
-                *child = normalize_legacy_schema(
-                    std::mem::take(child),
-                    direction,
-                    supports_write_only,
-                );
+                *child =
+                    normalize_legacy_schema(std::mem::take(child), direction, supports_write_only);
             }
             let value = Value::Object(object);
             if nullable {
