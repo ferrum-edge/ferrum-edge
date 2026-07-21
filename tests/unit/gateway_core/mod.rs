@@ -1,4 +1,5 @@
 mod adaptive_buffer_tests;
+mod allowed_methods_logging_tests;
 mod backend_dispatch_tests;
 mod cidr_tests;
 mod circuit_breaker_tests;
@@ -36,6 +37,7 @@ mod response_representation_tests;
 mod retry_tests;
 mod router_cache_tests;
 mod runtime_metrics_tests;
+mod secondary_request_headers_tests;
 mod service_discovery_tests;
 mod sni_tests;
 mod socket_opts_tests;

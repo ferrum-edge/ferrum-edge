@@ -22,8 +22,8 @@ use ferrum_edge::plugins::proxy_alerts::windows::{
 };
 use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
 use ferrum_edge::plugins::{
-    ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, TransactionSummary, WsDisconnectContext,
-    plugin_failure_policy,
+    ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, StreamTransactionSummary,
+    TransactionSummary, WsDisconnectContext, plugin_failure_policy,
 };
 use ferrum_edge::proxy::tcp_proxy::StreamIoSide;
 use ferrum_edge::retry::ErrorClass;
@@ -1505,4 +1505,91 @@ fn recovery_disabled_when_recovery_ms_is_zero() {
     assert_eq!(gate.current_state(1, "p"), Some(RuleState::Healthy));
     let next_breach = gate.observe(1, "p", true, 0, 1_000_000);
     assert_eq!(next_breach, LifecycleOutcome::Trigger);
+}
+
+#[test]
+fn stream_duration_percentile_observes_monotonic_producer_duration() {
+    // End-to-end: upstream summaries carry Instant/mono-derived duration_ms
+    // even when civil-clock disconnect precedes connect (wall rollback).
+    // proxy_alerts must sample that duration unchanged for stream_duration_ms.
+    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [
+            { "name": "slow_stream", "type": "latency_percentile",
+              "metric": "stream_duration_ms", "percentile": 95,
+              "threshold_ms": 1000, "min_request_count": 1, "channels": ["c"] }
+        ]
+    }))
+    .unwrap();
+    let specs = parsed
+        .rules
+        .iter()
+        .map(|r| (r.id(), r.window_spec()))
+        .collect();
+    let store = WindowStore::new(specs);
+
+    let connected = Utc.with_ymd_and_hms(2026, 7, 21, 12, 0, 0).unwrap();
+    let disconnected = connected - chrono::Duration::hours(1);
+    let summary = StreamTransactionSummary {
+        namespace: "ferrum".to_string(),
+        proxy_id: "udp-1".to_string(),
+        proxy_name: Some("udp".to_string()),
+        client_ip: "10.0.0.9".to_string(),
+        consumer_username: None,
+        auth_method: None,
+        backend_target: "10.0.0.50:5353".to_string(),
+        backend_resolved_ip: Some("10.0.0.50".to_string()),
+        protocol: "udp".to_string(),
+        listen_port: 5353,
+        duration_ms: 1_500.0,
+        bytes_sent: 32,
+        bytes_received: 64,
+        connection_error: None,
+        error_class: None,
+        disconnect_direction: None,
+        disconnect_cause: None,
+        timestamp_connected: connected.to_rfc3339(),
+        timestamp_disconnected: disconnected.to_rfc3339(),
+        sni_hostname: None,
+        metadata: Default::default(),
+    };
+
+    let observation = parsed.rules[0]
+        .observe(SampleInput::Stream(&summary), &store, 1_000)
+        .expect("stream sample should apply");
+    assert!(
+        observation.breach,
+        "1500ms mono duration must breach 1000ms"
+    );
+    assert_eq!(observation.sample_count, 1);
+
+    // TCP-parity WebSocket sample with the same mono duration / wall skew.
+    let ws = WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: "ws-1".to_string(),
+        proxy_name: Some("ws".to_string()),
+        client_ip: "10.0.0.8".to_string(),
+        backend_target: "ws://backend".to_string(),
+        listen_port: 443,
+        duration_ms: 1_500.0,
+        frames_client_to_backend: 1,
+        frames_backend_to_client: 1,
+        bytes_client_to_backend: 0,
+        bytes_backend_to_client: 0,
+        timestamp_connected: connected.to_rfc3339(),
+        timestamp_disconnected: disconnected.to_rfc3339(),
+        direction: None,
+        io_side: None,
+        error_class: None,
+        consumer_username: None,
+        auth_method: None,
+        metadata: Default::default(),
+    };
+    let ws_observation = parsed.rules[0]
+        .observe(SampleInput::WebSocket(&ws), &store, 2_000)
+        .expect("websocket sample should apply");
+    assert!(ws_observation.breach);
+    assert_eq!(ws_observation.sample_count, 1);
 }

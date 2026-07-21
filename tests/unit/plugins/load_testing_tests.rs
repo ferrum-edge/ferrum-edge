@@ -1682,3 +1682,165 @@ fn test_gateway_address_query_fragment_still_rejected() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_synthetic_request_strips_trailer_internal_markers_and_hostile_connection() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let capture = tokio::spawn(capture_one_http_request(listener));
+
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 2,
+            "gateway_port": port,
+            "request_timeout_ms": 1000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/sanitize".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    headers.insert(
+        "Connection".to_string(),
+        "X-Hop , , bad:token, Keep-Alive".to_string(),
+    );
+    headers.insert("X-Hop".to_string(), "per-connection".to_string());
+    headers.insert("Trailer".to_string(), "X-Foo".to_string());
+    headers.insert(
+        "x-ferrum-original-content-encoding".to_string(),
+        "gzip".to_string(),
+    );
+    headers.insert("x-grpc-web-mode".to_string(), "1".to_string());
+    headers.insert("proxy-authorization".to_string(), "Basic leak".to_string());
+    headers.insert("te".to_string(), "trailers".to_string());
+    headers.insert("x-custom".to_string(), "keep-me".to_string());
+    headers.insert("host".to_string(), "gateway.example".to_string());
+
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let raw = capture.await.expect("capture task");
+    let (_, req_headers, _) = parse_captured_request(&raw);
+    for stripped in [
+        "connection",
+        "x-hop",
+        "trailer",
+        "x-ferrum-original-content-encoding",
+        "x-grpc-web-mode",
+        "proxy-authorization",
+        "te",
+        "x-loadtesting-key",
+    ] {
+        assert!(
+            !req_headers.contains_key(stripped),
+            "synthetic request leaked `{stripped}`: {req_headers:?}"
+        );
+    }
+    assert_eq!(
+        req_headers.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
+    assert_eq!(
+        req_headers.get("host").map(String::as_str),
+        Some("gateway.example")
+    );
+    wait_until_idle(&plugin).await;
+}
+
+#[tokio::test]
+async fn test_synthetic_and_fanout_h2_h3_parity_strips_protocol_invalid_fields() {
+    let local_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_port = local_listener.local_addr().unwrap().port();
+    let remote_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_port = remote_listener.local_addr().unwrap().port();
+    let local_capture = tokio::spawn(capture_one_http_request(local_listener));
+    let remote_capture = tokio::spawn(capture_one_http_request(remote_listener));
+
+    let plugin = LoadTesting::new(
+        &json!({
+            "key": VALID_KEY,
+            "concurrent_clients": 1,
+            "duration_seconds": 2,
+            "gateway_port": local_port,
+            "gateway_addresses": [format!("http://127.0.0.1:{remote_port}")],
+            "request_timeout_ms": 1000
+        }),
+        PluginHttpClient::default(),
+    )
+    .unwrap();
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/h2h3".to_string(),
+    );
+    ctx.matched_proxy = Some(matched_proxy());
+    // H2/H3 inbound: no Connection, but Trailer + internal markers present.
+    let mut headers = HashMap::new();
+    headers.insert("x-loadtesting-key".to_string(), VALID_KEY.to_string());
+    headers.insert("trailer".to_string(), "grpc-status".to_string());
+    headers.insert("transfer-encoding".to_string(), "chunked".to_string());
+    headers.insert("content-length".to_string(), "999".to_string());
+    headers.insert(
+        "x-ferrum-original-content-encoding".to_string(),
+        "br".to_string(),
+    );
+    headers.insert("x-grpc-web-mode".to_string(), "1".to_string());
+    headers.insert("x-forwarded-host".to_string(), "evil.example".to_string());
+    headers.insert("x-keep".to_string(), "present".to_string());
+    headers.insert("host".to_string(), "gateway.example".to_string());
+
+    let result = run_before_proxy(&plugin, &mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+
+    let remote_raw = tokio::time::timeout(Duration::from_secs(3), remote_capture)
+        .await
+        .expect("fan-out request timeout")
+        .expect("fan-out capture task");
+    let (_, fanout_headers, _) = parse_captured_request(&remote_raw);
+    for stripped in [
+        "trailer",
+        "transfer-encoding",
+        "x-ferrum-original-content-encoding",
+        "x-grpc-web-mode",
+        "x-forwarded-host",
+    ] {
+        assert!(
+            !fanout_headers.contains_key(stripped),
+            "fan-out H2/H3 parity leaked `{stripped}`: {fanout_headers:?}"
+        );
+    }
+    assert_eq!(
+        fanout_headers.get("x-keep").map(String::as_str),
+        Some("present")
+    );
+
+    let local_raw = tokio::time::timeout(Duration::from_secs(3), local_capture)
+        .await
+        .expect("local synthetic request timeout")
+        .expect("local capture task");
+    let (_, local_headers, _) = parse_captured_request(&local_raw);
+    for stripped in [
+        "trailer",
+        "transfer-encoding",
+        "x-ferrum-original-content-encoding",
+        "x-grpc-web-mode",
+        "x-forwarded-host",
+        "x-loadtesting-key",
+    ] {
+        assert!(
+            !local_headers.contains_key(stripped),
+            "synthetic H2/H3 parity leaked `{stripped}`: {local_headers:?}"
+        );
+    }
+    wait_until_idle(&plugin).await;
+}

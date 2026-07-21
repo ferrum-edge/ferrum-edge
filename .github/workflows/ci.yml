@@ -925,6 +925,7 @@ jobs:
               functional_cors_protocol_test
               functional_grpc_test
               functional_key_auth_query_test
+              functional_request_mirror_query_parity_test
               functional_load_testing_replay_test
               functional_passthrough_test
               functional_sse_test
@@ -953,6 +954,7 @@ jobs:
               functional_early_data_test
               functional_ws_origin_test
               functional_allowed_methods_test
+              functional_allowed_methods_logging_test
               functional_forwarded_via_headers_test
               functional_streaming_latency_tracking_test
               functional_streaming_outcome_accounting_test
