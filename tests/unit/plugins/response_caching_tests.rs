@@ -3327,8 +3327,13 @@ async fn later_sibling_without_lookup_state_cannot_overwrite_hit_header() {
     else {
         panic!("first instance must serve the cached response");
     };
-    assert_eq!(headers.get("x-cache-status").map(String::as_str), Some("HIT"));
-    assert!(ferrum_edge::_test_support::response_cache_hit_for_test(&hit_ctx));
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("HIT")
+    );
+    assert!(ferrum_edge::_test_support::response_cache_hit_for_test(
+        &hit_ctx
+    ));
 
     assert!(matches!(
         unvisited_sibling
@@ -3357,16 +3362,13 @@ async fn global_hit_signal_is_monotonic_across_sibling_statuses() {
     let mut store_ctx = make_ctx("GET", "/global-hit");
     let mut headers = HashMap::new();
     assert!(matches!(
-        hit_instance.before_proxy(&mut store_ctx, &mut headers).await,
+        hit_instance
+            .before_proxy(&mut store_ctx, &mut headers)
+            .await,
         PluginResult::Continue
     ));
     hit_instance
-        .on_final_response_body(
-            &mut store_ctx,
-            200,
-            &public_response_headers(),
-            b"cached",
-        )
+        .on_final_response_body(&mut store_ctx, 200, &public_response_headers(), b"cached")
         .await;
 
     let mut ctx = make_ctx("GET", "/global-hit");
@@ -3375,7 +3377,9 @@ async fn global_hit_signal_is_monotonic_across_sibling_statuses() {
         hit_instance.before_proxy(&mut ctx, &mut headers).await,
         PluginResult::RejectBinary { .. }
     ));
-    assert!(ferrum_edge::_test_support::response_cache_hit_for_test(&ctx));
+    assert!(ferrum_edge::_test_support::response_cache_hit_for_test(
+        &ctx
+    ));
 
     let mut sibling_headers = HashMap::new();
     assert!(matches!(
