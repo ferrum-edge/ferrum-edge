@@ -480,7 +480,8 @@ fn spool_rejects_empty_spool_oversized_batch() {
         .write_events(std::slice::from_ref(&event))
         .expect_err("one-byte-over batch must be rejected on an empty spool");
     assert!(
-        err.contains("exceeds spool.max_bytes") || err.contains("cannot fit within spool.max_bytes"),
+        err.contains("exceeds spool.max_bytes")
+            || err.contains("cannot fit within spool.max_bytes"),
         "unexpected error: {err}"
     );
     let stats = spool.scan_stats().unwrap();
@@ -650,7 +651,10 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
-    assert!(!stale_tmp.exists(), "startup reconcile should clear planted tmp");
+    assert!(
+        !stale_tmp.exists(),
+        "startup reconcile should clear planted tmp"
+    );
 
     fs::write(&stale_tmp, vec![0u8; encoded_len as usize]).unwrap();
     let stats = spool.scan_stats().unwrap();
