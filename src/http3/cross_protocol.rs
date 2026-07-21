@@ -4416,11 +4416,13 @@ where
                     &resp.trailers,
                 );
             // Same gRPC-Web trailer-frame provenance as the H1/H2 buffered path:
-            // record backend trailer names so the body frame does not copy
-            // initial-header-only fields from the merged plugin view.
+            // record backend trailer names and collision values so the body
+            // frame neither copies initial-header-only fields nor substitutes
+            // an initial value for a same-name backend trailer.
             if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) {
-                crate::plugins::grpc_web::record_backend_trailer_names_for_frame(
+                crate::plugins::grpc_web::record_backend_trailer_provenance_for_frame(
                     &mut ctx.metadata,
+                    &resp.headers,
                     &resp.trailers,
                 );
             }

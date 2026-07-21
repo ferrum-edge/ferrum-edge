@@ -2228,6 +2228,10 @@ async fn start_grpc_backend_with_custom_trailer_fixture() -> (SocketAddr, tokio:
                         hyper::header::HeaderValue::from_static("AQID"),
                     );
                     trailers.insert(
+                        hyper::header::HeaderName::from_static("x-shared-meta"),
+                        hyper::header::HeaderValue::from_static("trailer-value"),
+                    );
+                    trailers.insert(
                         hyper::header::HeaderName::from_static("proxy-authenticate"),
                         hyper::header::HeaderValue::from_static("Basic realm=backend"),
                     );
@@ -2242,6 +2246,7 @@ async fn start_grpc_backend_with_custom_trailer_fixture() -> (SocketAddr, tokio:
                         .status(200)
                         .header("content-type", "application/grpc")
                         .header("x-powered-by", "initial-header-only")
+                        .header("x-shared-meta", "initial-value")
                         .body(body)
                         .unwrap();
 
@@ -2275,6 +2280,14 @@ fn assert_grpc_web_custom_trailer_payload(payload: &str) {
     assert!(
         payload.contains("trace-proto-bin: AQID"),
         "missing binary custom trailer in {payload}"
+    );
+    assert!(
+        payload.contains("x-shared-meta: trailer-value"),
+        "header-shadowed metadata must use the backend trailer value in {payload}"
+    );
+    assert!(
+        !payload.contains("x-shared-meta: initial-value"),
+        "initial-header value replaced the true trailer value in {payload}"
     );
     assert!(
         !payload.contains("proxy-authenticate"),

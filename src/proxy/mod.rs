@@ -22082,12 +22082,15 @@ async fn handle_proxy_request_inner(
                     );
                 // Provenance for the gRPC-Web body trailer frame: only names
                 // that arrived as backend trailers (plus reserved terminal
-                // metadata) may be embedded. Record even when the trailer map
-                // is empty so initial-header-only fields in the merged view
-                // cannot leak into the frame.
+                // metadata) may be embedded. Collision provenance also keeps a
+                // true trailing value distinct from a same-name initial header
+                // without bypassing hook rewrites/removals. Record even when
+                // the trailer map is empty so initial-header-only fields in the
+                // merged view cannot leak into the frame.
                 if crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx) {
-                    crate::plugins::grpc_web::record_backend_trailer_names_for_frame(
+                    crate::plugins::grpc_web::record_backend_trailer_provenance_for_frame(
                         &mut ctx.metadata,
+                        &response_headers,
                         &response_trailers,
                     );
                 }
@@ -30534,7 +30537,7 @@ async fn proxy_to_backend_mesh_mtls(
                     &mut backend_trailer_headers,
                 );
             }
-            crate::plugins::grpc_web::bridge_backend_trailer_names_for_frame(
+            crate::plugins::grpc_web::bridge_backend_trailer_provenance_for_frame(
                 &mut resp_headers,
                 &backend_trailer_headers,
             );

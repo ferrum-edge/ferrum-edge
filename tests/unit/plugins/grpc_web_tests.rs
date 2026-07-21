@@ -1485,6 +1485,71 @@ async fn test_transform_with_provenance_excludes_initial_header_only_fields() {
     );
 }
 
+#[tokio::test]
+async fn test_transform_with_provenance_uses_true_shadowed_trailer_value() {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut initial_headers = HashMap::new();
+    initial_headers.insert("x-shared-meta".to_string(), "initial-value".to_string());
+    let mut trailers = HashMap::new();
+    trailers.insert("grpc-status".to_string(), "0".to_string());
+    trailers.insert("x-shared-meta".to_string(), "trailer-value".to_string());
+    ferrum_edge::plugins::grpc_web::record_backend_trailer_provenance_for_frame(
+        &mut ctx.metadata,
+        &initial_headers,
+        &trailers,
+    );
+
+    let mut merged_view = initial_headers;
+    merged_view.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+    merged_view.insert("grpc-status".to_string(), "0".to_string());
+
+    let output = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"",
+            Some("application/grpc-web"),
+            &merged_view,
+        )
+        .await
+        .expect("transform");
+    let payload = grpc_web_trailer_payload(&output);
+    assert!(payload.contains("x-shared-meta: trailer-value\r\n"));
+    assert!(!payload.contains("x-shared-meta: initial-value\r\n"));
+
+    merged_view.insert("x-shared-meta".to_string(), "sanitized".to_string());
+    let output = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"",
+            Some("application/grpc-web"),
+            &merged_view,
+        )
+        .await
+        .expect("sanitized transform");
+    let payload = grpc_web_trailer_payload(&output);
+    assert!(payload.contains("x-shared-meta: sanitized\r\n"));
+    assert!(!payload.contains("trailer-value"));
+
+    merged_view.remove("x-shared-meta");
+    let output = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"",
+            Some("application/grpc-web"),
+            &merged_view,
+        )
+        .await
+        .expect("removed transform");
+    let payload = grpc_web_trailer_payload(&output);
+    assert!(!payload.contains("x-shared-meta"));
+}
+
 #[test]
 fn test_build_trailer_frame_missing_status_defaults_to_unknown() {
     use ferrum_edge::_test_support::{GRPC_FRAME_TRAILER, build_trailer_frame};

@@ -62,7 +62,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use http::header::HeaderName;
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::debug;
 
 use crate::proxy::headers::{
@@ -95,11 +95,20 @@ const META_GRPC_WEB_HTTP_STATUS: &str = "grpc_web_http_status";
 /// — never indiscriminately copying initial response headers from the merged
 /// plugin view.
 const META_GRPC_WEB_TRAILER_NAMES: &str = "grpc_web_trailer_names";
+/// Base64-encoded JSON map of trailer names that were also present in the
+/// backend's initial headers. Each entry stores `[initial_value, trailer_value]`
+/// so the body-frame encoder can retain the true trailer value without
+/// bypassing a response hook that rewrote or removed the merged view.
+const META_GRPC_WEB_SHADOWED_TRAILERS: &str = "grpc_web_shadowed_trailers";
 /// Internal response-header bridge for trailer-name provenance on dispatch
 /// paths that only hold `&RequestContext` (sidecar mesh-mTLS). `after_proxy`
 /// promotes this into [`META_GRPC_WEB_TRAILER_NAMES`] and strips it before the
 /// client-visible header map is finalized.
 const HEADER_GRPC_WEB_TRAILER_NAMES: &str = "x-ferrum-grpc-web-trailer-names";
+/// Internal response-header bridge for [`META_GRPC_WEB_SHADOWED_TRAILERS`].
+/// The payload is base64 so arbitrary printable trailer metadata never becomes
+/// header syntax while it crosses the sidecar mesh-mTLS dispatch boundary.
+const HEADER_GRPC_WEB_SHADOWED_TRAILERS: &str = "x-ferrum-grpc-web-shadowed-trailers";
 
 /// Internal proxy header injected by `before_proxy` so that `transform_request_body`
 /// (which lacks access to `ctx.metadata`) can deterministically identify the
@@ -369,6 +378,7 @@ impl GrpcWebPlugin {
         response_headers: &HashMap<String, String>,
         http_status: Option<u16>,
         trailer_name_allowlist: Option<&HashSet<String>>,
+        shadowed_trailers: Option<&HashMap<String, [String; 2]>>,
     ) -> Option<Vec<u8>> {
         // Only transform if response content-type is gRPC-Web (set by after_proxy)
         let ct = response_headers.get("content-type")?;
@@ -390,8 +400,12 @@ impl GrpcWebPlugin {
         // backend omitted a valid grpc-status, synthesize from the stashed
         // HTTP status (official client mapping). Provenance (when recorded)
         // keeps initial-header-only fields out of the body trailer block.
-        let trailer_frame =
-            build_trailer_frame_with_provenance(response_headers, http_status, trailer_name_allowlist);
+        let trailer_frame = build_trailer_frame_with_full_provenance(
+            response_headers,
+            http_status,
+            trailer_name_allowlist,
+            shadowed_trailers,
+        );
         output.extend(trailer_frame);
 
         // For text mode, base64-encode the entire output
@@ -850,6 +864,7 @@ fn is_forbidden_grpc_web_trailer_name(name: &str) -> bool {
                 | "access-control-request-headers"
                 | "access-control-request-method"
                 | "x-ferrum-grpc-web-trailer-names"
+                | "x-ferrum-grpc-web-shadowed-trailers"
         )
 }
 
@@ -906,6 +921,55 @@ pub fn record_backend_trailer_names_for_frame(
     );
 }
 
+fn encode_shadowed_trailers_for_frame(
+    response_headers: &HashMap<String, String>,
+    trailers: &HashMap<String, String>,
+) -> String {
+    let shadowed = trailers
+        .iter()
+        .filter_map(|(name, trailer_value)| {
+            response_headers.get(name).and_then(|initial_value| {
+                (!is_reserved_grpc_web_terminal_metadata(name)).then(|| {
+                    (
+                        name.clone(),
+                        [initial_value.clone(), trailer_value.clone()],
+                    )
+                })
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    match serde_json::to_vec(&shadowed) {
+        Ok(encoded) => BASE64.encode(encoded),
+        // String-keyed/string-valued JSON serialization has no data-dependent
+        // failure mode. Keep the boundary fail-closed if that invariant ever
+        // changes: an empty map cannot introduce a backend value into a frame.
+        Err(_) => BASE64.encode(b"{}"),
+    }
+}
+
+fn shadowed_trailers_from_metadata(
+    metadata: &HashMap<String, String>,
+) -> Option<HashMap<String, [String; 2]>> {
+    let encoded = metadata.get(META_GRPC_WEB_SHADOWED_TRAILERS)?;
+    let decoded = BASE64.decode(encoded).ok()?;
+    serde_json::from_slice(&decoded).ok()
+}
+
+/// Record both the backend trailer allowlist and collision provenance needed
+/// to preserve a true trailer value when the same name also appeared in the
+/// backend's initial headers.
+pub fn record_backend_trailer_provenance_for_frame(
+    metadata: &mut HashMap<String, String>,
+    response_headers: &HashMap<String, String>,
+    trailers: &HashMap<String, String>,
+) {
+    record_backend_trailer_names_for_frame(metadata, trailers);
+    metadata.insert(
+        META_GRPC_WEB_SHADOWED_TRAILERS.to_string(),
+        encode_shadowed_trailers_for_frame(response_headers, trailers),
+    );
+}
+
 /// Embed trailer-name provenance in a response-header bridge for dispatch paths
 /// that cannot mutate `RequestContext` (sidecar mesh-mTLS). [`GrpcWebPlugin::after_proxy`]
 /// promotes the value into metadata and strips the bridge header.
@@ -916,6 +980,20 @@ pub fn bridge_backend_trailer_names_for_frame(
     response_headers.insert(
         HEADER_GRPC_WEB_TRAILER_NAMES.to_string(),
         encode_trailer_names_for_frame(trailers),
+    );
+}
+
+/// Bridge full trailer provenance through a response-header-only dispatch
+/// boundary. Both internal headers are removed by `after_proxy`.
+pub fn bridge_backend_trailer_provenance_for_frame(
+    response_headers: &mut HashMap<String, String>,
+    trailers: &HashMap<String, String>,
+) {
+    let shadowed = encode_shadowed_trailers_for_frame(response_headers, trailers);
+    bridge_backend_trailer_names_for_frame(response_headers, trailers);
+    response_headers.insert(
+        HEADER_GRPC_WEB_SHADOWED_TRAILERS.to_string(),
+        shadowed,
     );
 }
 
@@ -981,6 +1059,20 @@ pub(crate) fn build_trailer_frame_with_provenance(
     http_status: Option<u16>,
     trailer_name_allowlist: Option<&HashSet<String>>,
 ) -> Vec<u8> {
+    build_trailer_frame_with_full_provenance(
+        response_headers,
+        http_status,
+        trailer_name_allowlist,
+        None,
+    )
+}
+
+fn build_trailer_frame_with_full_provenance(
+    response_headers: &HashMap<String, String>,
+    http_status: Option<u16>,
+    trailer_name_allowlist: Option<&HashSet<String>>,
+    shadowed_trailers: Option<&HashMap<String, [String; 2]>>,
+) -> Vec<u8> {
     let connection_listed = parse_connection_listed_from_str_map(response_headers);
     let mut eligible: Vec<(String, String)> = Vec::new();
     for (key, value) in response_headers {
@@ -1000,6 +1092,15 @@ pub(crate) fn build_trailer_frame_with_provenance(
         {
             continue;
         }
+        // The compatibility view keeps an initial-header value when a backend
+        // supplied the same name in HEADERS and TRAILERS. Use the true trailer
+        // value only while that view is untouched. A hook-rewritten value wins,
+        // and iteration over the live view means a removed name stays removed.
+        let value = shadowed_trailers
+            .and_then(|shadowed| shadowed.get(name))
+            .filter(|[initial_value, _]| initial_value == value)
+            .map(|[_, trailer_value]| trailer_value)
+            .unwrap_or(value);
         // Multi-value gRPC metadata is stored newline-joined in the string map
         // (see `collect_buffered_grpc_trailers`). Emit each occurrence as its
         // own trailer line; reject any occurrence that fails value safety so a
@@ -1012,7 +1113,7 @@ pub(crate) fn build_trailer_frame_with_provenance(
     }
     // Deterministic ordering: sort by name, then keep relative occurrence
     // order for duplicates of the same name (stable sort).
-    eligible.sort_by(|a, b| a.0.cmp(b.0));
+    eligible.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut trailer_payload = Vec::new();
     let mut has_grpc_status = false;
@@ -1360,6 +1461,10 @@ impl Plugin for GrpcWebPlugin {
             ctx.metadata
                 .insert(META_GRPC_WEB_TRAILER_NAMES.to_string(), encoded);
         }
+        if let Some(encoded) = response_headers.remove(HEADER_GRPC_WEB_SHADOWED_TRAILERS) {
+            ctx.metadata
+                .insert(META_GRPC_WEB_SHADOWED_TRAILERS.to_string(), encoded);
+        }
 
         // The shared lifecycle cannot embed trailers or base64-rewrite a
         // preserved 206/226 representation. Leave its native headers coherent
@@ -1462,7 +1567,14 @@ impl Plugin for GrpcWebPlugin {
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        self.transform_grpc_web_response_body(body, content_type, response_headers, None, None)
+        self.transform_grpc_web_response_body(
+            body,
+            content_type,
+            response_headers,
+            None,
+            None,
+            None,
+        )
     }
 
     async fn transform_response_body_with_context(
@@ -1476,13 +1588,24 @@ impl Plugin for GrpcWebPlugin {
             .metadata
             .get(META_GRPC_WEB_HTTP_STATUS)
             .and_then(|value| value.parse::<u16>().ok());
-        let allowlist = trailer_name_allowlist_from_metadata(&ctx.metadata);
+        let mut allowlist = trailer_name_allowlist_from_metadata(&ctx.metadata);
+        let shadowed_trailers = shadowed_trailers_from_metadata(&ctx.metadata);
+        if ctx
+            .metadata
+            .contains_key(META_GRPC_WEB_SHADOWED_TRAILERS)
+            && shadowed_trailers.is_none()
+        {
+            // Corrupt internal provenance must not fall back to framing a
+            // same-name initial header. Retain only reserved terminal metadata.
+            allowlist = Some(HashSet::new());
+        }
         self.transform_grpc_web_response_body(
             body,
             content_type,
             response_headers,
             http_status,
             allowlist.as_ref(),
+            shadowed_trailers.as_ref(),
         )
     }
 }
