@@ -26,7 +26,7 @@ use futures_util::SinkExt;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Duration;
@@ -424,7 +424,10 @@ impl Write for BoundedJsonWriter {
 }
 
 pub struct WsLogging {
-    sender: mpsc::Sender<QueuedEntry>,
+    buffer_capacity: usize,
+    pending_config: Mutex<Option<WsConfig>>,
+    sender: OnceLock<mpsc::Sender<QueuedEntry>>,
+    start_lock: Mutex<()>,
     schema: Option<Arc<SummarySchema>>,
     byte_budget: Arc<WsByteBudget>,
     max_entry_bytes: usize,
@@ -473,6 +476,8 @@ impl WsLogging {
         let endpoint_url_for_logs = redacted_endpoint_url(&parsed_url);
 
         // Build TLS connector for wss:// using gateway CA/verify settings.
+        // This is sync admission work (no Tokio spawn) and remains in `new`
+        // so a bad CA/SNI config still fails before a generation is published.
         let connector = if parsed_url.scheme() == "wss" {
             Some(build_tls_connector(&http_client)?)
         } else {
@@ -598,11 +603,11 @@ impl WsLogging {
             write_timeout: Duration::from_millis(write_timeout_ms),
         };
 
-        let (sender, receiver) = mpsc::channel(buffer_capacity);
-        tokio::spawn(flush_loop(receiver, ws_config));
-
         Ok(Self {
-            sender,
+            buffer_capacity,
+            pending_config: Mutex::new(Some(ws_config)),
+            sender: OnceLock::new(),
+            start_lock: Mutex::new(()),
             schema,
             byte_budget: Arc::new(WsByteBudget::new(buffer_max_bytes)),
             max_entry_bytes,
@@ -614,7 +619,12 @@ impl WsLogging {
     where
         T: serde::Serialize,
     {
-        let Ok(permit) = self.sender.try_reserve() else {
+        let Some(sender) = self.sender.get() else {
+            self.byte_budget
+                .record_drop("worker unavailable before start_background_tasks");
+            return;
+        };
+        let Ok(permit) = sender.try_reserve() else {
             self.byte_budget.record_drop("queue slot exhausted");
             return;
         };
@@ -855,6 +865,34 @@ impl Plugin for WsLogging {
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         ALL_PROTOCOLS
+    }
+
+    fn start_background_tasks(&self) -> Result<(), String> {
+        if self.sender.get().is_some() {
+            return Ok(());
+        }
+        let _guard = self.start_lock.lock().map_err(|_| {
+            "ws_logging: start lock poisoned; refusing to start flush worker".to_string()
+        })?;
+        if self.sender.get().is_some() {
+            return Ok(());
+        }
+        let _runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            "ws_logging: start_background_tasks requires a Tokio runtime".to_string()
+        })?;
+        let ws_config = self
+            .pending_config
+            .lock()
+            .map_err(|_| "ws_logging: pending config lock poisoned".to_string())?
+            .take()
+            .ok_or_else(|| {
+                "ws_logging: flush worker config already consumed without an active sender"
+                    .to_string()
+            })?;
+        let (sender, receiver) = mpsc::channel(self.buffer_capacity);
+        tokio::spawn(flush_loop(receiver, ws_config));
+        let _ = self.sender.set(sender);
+        Ok(())
     }
 
     fn requires_ws_disconnect_hooks(&self) -> bool {

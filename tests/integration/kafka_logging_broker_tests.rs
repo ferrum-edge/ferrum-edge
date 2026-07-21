@@ -85,6 +85,7 @@ async fn kafka_logging_broker_delivers_and_finalizes() {
         &PluginHttpClient::default(),
     )
     .expect("construct kafka_logging against real broker");
+    plugin.start_background_tasks().expect("kafka start");
 
     plugin.log(&summary()).await;
     let deadline = Instant::now() + Duration::from_secs(20);

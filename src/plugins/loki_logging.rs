@@ -35,7 +35,7 @@ use crate::config::types::MAX_ID_LENGTH;
 
 use super::utils::log_schema::{SchemaCapabilities, SchemaView, SummarySchema, resolve_schema};
 use super::utils::{
-    BatchConfig, BatchConfigDefaults, BatchingLogger, HttpBatchDrainOutcome, MAX_BATCH_SIZE,
+    BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, HttpBatchDrainOutcome, MAX_BATCH_SIZE,
     MAX_BUFFER_CAPACITY, PluginHttpClient, RetryPolicy, build_batch_config,
     drain_http_batch_response_body, parse_custom_headers, parse_http_endpoint,
     validate_batch_config,
@@ -262,7 +262,9 @@ impl LabelConfig {
 }
 
 pub struct LokiLogging {
-    logger: BatchingLogger<LokiEntry>,
+    batch_config: BatchConfig,
+    flush_config: LokiFlushConfig,
+    logger: DeferredBatchingLogger<LokiEntry>,
     endpoint_hostname: String,
     label_config: LabelConfig,
     schema: Option<Arc<SummarySchema>>,
@@ -370,21 +372,18 @@ impl LokiLogging {
             retry: batch_config.retry,
             last_timestamp_ns: Arc::new(AtomicU64::new(0)),
         };
-        let logger = BatchingLogger::spawn(
-            // Loki retries inside `send_batch` so we can reuse the same
-            // serialized + gzipped body bytes across attempts.
-            BatchConfig {
-                retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
-                ..batch_config
-            },
-            move |batch| {
-                let flush_config = flush_config.clone();
-                async move { send_batch(&flush_config, batch).await }
-            },
-        );
+        // Loki retries inside `send_batch` so we reuse the same serialized +
+        // gzipped body bytes across attempts. The deferred worker therefore
+        // uses a single-attempt shared retry policy.
+        let batch_config = BatchConfig {
+            retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
+            ..batch_config
+        };
 
         Ok(Self {
-            logger,
+            batch_config,
+            flush_config,
+            logger: DeferredBatchingLogger::new(),
             endpoint_hostname,
             label_config,
             schema,
@@ -799,6 +798,15 @@ impl Plugin for LokiLogging {
         super::ALL_PROTOCOLS
     }
 
+    fn start_background_tasks(&self) -> Result<(), String> {
+        let flush_config = self.flush_config.clone();
+        self.logger
+            .start("loki_logging", self.batch_config, move |batch| {
+                let flush_config = flush_config.clone();
+                async move { send_batch(&flush_config, batch).await }
+            })
+    }
+
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
         match self.schema.as_ref().filter(|s| s.applies_to_stream()) {
             Some(schema) => {
@@ -1098,13 +1106,10 @@ mod tests {
         }
     }
 
-    // `LokiLogging::new` spawns a `BatchingLogger` flush task via
-    // `tokio::spawn`, which panics under plain `#[test]` because no Tokio
-    // reactor is running. The test bodies themselves are synchronous (no
-    // awaits) but need to execute inside a tokio runtime so `tokio::spawn`
-    // can register the flush task — `#[tokio::test]` provides that runtime.
-    #[tokio::test]
-    async fn label_include_proxy_id_key_controls_proxy_id_label() {
+    // Pure construction no longer spawns a flush worker. Label helpers below
+    // only need the compiled config, so they remain usable without activation.
+    #[test]
+    fn label_include_proxy_id_key_controls_proxy_id_label() {
         let plugin = LokiLogging::new(
             &json!({
                 "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push",
@@ -1120,8 +1125,8 @@ mod tests {
         assert!(!labels.contains_key("status_class"));
     }
 
-    #[tokio::test]
-    async fn removed_listen_path_key_is_rejected() {
+    #[test]
+    fn removed_listen_path_key_is_rejected() {
         let result = LokiLogging::new(
             &json!({
                 "endpoint_url": "http://127.0.0.1:1/loki/api/v1/push",

@@ -37,7 +37,7 @@ use super::utils::log_schema::{
     SchemaCapabilities, SummaryLogEntryBatchView, SummarySchema, resolve_schema,
 };
 use super::utils::{
-    BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry,
+    BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, PluginHttpClient, SummaryLogEntry,
     UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, parse_socket_host,
     resolve_udp_endpoint, validate_batch_config,
 };
@@ -124,7 +124,9 @@ struct UdpFlushState {
 }
 
 pub struct UdpLogging {
-    logger: BatchingLogger<SummaryLogEntry>,
+    batch_config: BatchConfig,
+    flush_config: UdpFlushConfig,
+    logger: DeferredBatchingLogger<SummaryLogEntry>,
     endpoint_hostname: Option<String>,
     /// Shared with the flush worker; retained here so external unit tests can
     /// inspect/age DNS state. Binary target sees no readers.
@@ -166,26 +168,17 @@ impl UdpLogging {
             next_resolve_addr: Arc::clone(&next_resolve_addr),
             dtls_connect_timeout_ms: Arc::clone(&dtls_connect_timeout_ms),
         };
-        let state = Arc::new(Mutex::new(UdpFlushState {
+        let flush_state = Arc::new(Mutex::new(UdpFlushState {
             sender: None,
             current_addr: None,
             last_resolve: Instant::now(),
             sender_generation: 0,
         }));
-        let flush_state = Arc::clone(&state);
-        let logger = BatchingLogger::spawn(
-            // Config remains `max_retries`; the shared retry policy counts the
-            // initial attempt plus those retries.
-            build_batch_config(config, "udp_logging", batch_defaults),
-            move |batch| {
-                let flush_config = flush_config.clone();
-                let state = Arc::clone(&state);
-                async move { send_batch(&flush_config, &state, batch).await }
-            },
-        );
 
         Ok(Self {
-            logger,
+            batch_config: build_batch_config(config, "udp_logging", batch_defaults),
+            flush_config,
+            logger: DeferredBatchingLogger::new(),
             endpoint_hostname: socket_host_warmup,
             flush_state,
             next_resolve_addr,
@@ -198,9 +191,9 @@ impl UdpLogging {
     ///
     /// Used by shared plugin validation / Admin surfaces. Runtime construction
     /// still goes through [`Self::new`], which reuses the same parser and then
-    /// starts the flush worker. Registration remains `OptionalFailOpen`: a
-    /// failed enabled instance is omitted from the published cache rather than
-    /// retaining last-known-good.
+    /// defers the flush worker to [`Plugin::start_background_tasks`].
+    /// Registration remains `OptionalFailOpen`: a failed enabled instance is
+    /// omitted from the published cache rather than retaining last-known-good.
     pub(crate) fn validate_config(
         config: &Value,
         http_client: PluginHttpClient,
@@ -609,6 +602,19 @@ impl Plugin for UdpLogging {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
+    }
+
+    fn start_background_tasks(&self) -> Result<(), String> {
+        let flush_config = self.flush_config.clone();
+        let state = Arc::clone(&self.flush_state);
+        // Config remains `max_retries`; the shared retry policy counts the
+        // initial attempt plus those retries.
+        self.logger
+            .start("udp_logging", self.batch_config, move |batch| {
+                let flush_config = flush_config.clone();
+                let state = Arc::clone(&state);
+                async move { send_batch(&flush_config, &state, batch).await }
+            })
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {

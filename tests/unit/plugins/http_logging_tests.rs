@@ -18,6 +18,12 @@ fn default_client() -> PluginHttpClient {
     PluginHttpClient::default()
 }
 
+fn start_http_logging(plugin: &HttpLogging) {
+    plugin
+        .start_background_tasks()
+        .expect("http_logging live tests require start_background_tasks");
+}
+
 async fn spawn_http_logging_keepalive_server(
     responses: Vec<(u16, &'static [u8])>,
 ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
@@ -437,6 +443,7 @@ async fn test_http_logging_stream_disconnect_does_not_panic() {
         default_client(),
     )
     .unwrap();
+    start_http_logging(&plugin);
     let summary = create_test_stream_transaction_summary();
 
     plugin.on_stream_disconnect(&summary).await;
@@ -458,6 +465,7 @@ async fn test_http_logging_reuses_http11_connection_across_successful_batches() 
         default_client(),
     )
     .unwrap();
+    start_http_logging(&plugin);
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
     plugin.log(&summary).await;
@@ -484,6 +492,7 @@ async fn test_http_logging_reuses_http11_connection_across_retry() {
         default_client(),
     )
     .unwrap();
+    start_http_logging(&plugin);
     plugin.log(&create_test_transaction_summary()).await;
     wait_for_count(&requests, 2).await;
     assert_eq!(
@@ -530,6 +539,7 @@ async fn test_http_logging_oversized_ack_does_not_block_flush_worker() {
         default_client(),
     )
     .unwrap();
+    start_http_logging(&plugin);
     // Two batches: the second request only arrives if the oversized ACK cap
     // frees the flush worker instead of pinning it on the peer's delayed body.
     plugin.log(&create_test_transaction_summary()).await;

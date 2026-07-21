@@ -3,6 +3,11 @@
 //! This plugin is intentionally independent from `api_chargeback`: it uses the
 //! same pricing parser/math but owns its queue, spool, replay, metrics, and
 //! optional snapshot accumulator.
+//!
+//! Construction (`new`) is runtime-free shape validation: it does not create
+//! spool directories, materialize secrets, build a dedicated TLS client, spawn
+//! the batching worker / background tasks, or publish `ACTIVE_SINK`. Live
+//! activation happens only from [`Plugin::start_background_tasks`].
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -407,16 +412,21 @@ struct SinkSummary {
 }
 
 pub struct ApiChargebackSink {
-    runtime: Arc<SinkRuntime>,
     pricing: PricingConfig,
     config: Arc<ApiChargebackSinkConfig>,
     node_id: Arc<str>,
-    snapshot_accumulator: Option<Arc<SnapshotAccumulator>>,
+    namespace: String,
+    /// Shared gateway client retained for dedicated ClickHouse client build at start.
+    http_client: PluginHttpClient,
+    /// Live sink runtime after [`Plugin::start_background_tasks`].
+    runtime: OnceLock<Arc<SinkRuntime>>,
+    snapshot_accumulator: OnceLock<Arc<SnapshotAccumulator>>,
     /// Handles for the per-instance background loops (spool replayer and, in
     /// snapshot mode, the snapshot emitter). Aborted on `Drop` so a config
     /// reload or admin-validation throwaway does not leak immortal tasks that
     /// would otherwise keep racing on the shared spool directory.
-    background_tasks: Vec<tokio::task::JoinHandle<()>>,
+    background_tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    start_lock: Mutex<()>,
 }
 
 struct SinkRuntime {
@@ -630,24 +640,39 @@ impl ApiChargebackSink {
             &parsed_url,
             http_client.backend_allow_ips(),
         )?;
+
+        Ok(Self {
+            pricing,
+            config: Arc::new(config),
+            node_id: Arc::<str>::from(resolve_node_id()),
+            namespace: namespace.to_string(),
+            http_client,
+            runtime: OnceLock::new(),
+            snapshot_accumulator: OnceLock::new(),
+            background_tasks: Mutex::new(Vec::new()),
+            start_lock: Mutex::new(()),
+        })
+    }
+
+    fn activate(&self) -> Result<(), String> {
+        let parsed_url = parse_clickhouse_url(&self.config.clickhouse.url)?;
         let endpoint = sanitized_endpoint(&parsed_url);
-        let insert_url = build_insert_url(&parsed_url, &config.clickhouse);
-        let password = resolve_password_ref(config.clickhouse.password_ref.as_deref())?;
-        let http = build_clickhouse_http_client(&config.clickhouse, &http_client)?;
+        let insert_url = build_insert_url(&parsed_url, &self.config.clickhouse);
+        let password = resolve_password_ref(self.config.clickhouse.password_ref.as_deref())?;
+        let http = build_clickhouse_http_client(&self.config.clickhouse, &self.http_client)?;
         let flush_config = ClickHouseFlushConfig {
             http,
             insert_url: insert_url.clone(),
-            username: config.clickhouse.username.clone(),
+            username: self.config.clickhouse.username.clone(),
             password,
-            timeout: Duration::from_millis(config.clickhouse.timeout_ms),
+            timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
             metrics: Arc::new(SinkMetrics::default()),
         };
         let metrics = Arc::clone(&flush_config.metrics);
-        let node_id = Arc::<str>::from(resolve_node_id());
-        let spool = if config.spool.enabled {
+        let spool = if self.config.spool.enabled {
             Some(Arc::new(SpoolManager::new(
-                config.spool.clone(),
-                Arc::clone(&node_id),
+                self.config.spool.clone(),
+                Arc::clone(&self.node_id),
                 Arc::clone(&metrics),
             )?))
         } else {
@@ -706,17 +731,17 @@ impl ApiChargebackSink {
 
         let logger = BatchingLogger::spawn_with_hooks(
             BatchConfig {
-                batch_size: config.batch.size,
-                flush_interval: Duration::from_millis(config.batch.flush_interval_ms),
-                buffer_capacity: config.batch.buffer_capacity,
+                batch_size: self.config.batch.size,
+                flush_interval: Duration::from_millis(self.config.batch.flush_interval_ms),
+                buffer_capacity: self.config.batch.buffer_capacity,
                 // Honor the advertised retry schema: bounded exponential
                 // backoff from initial_delay_ms up to max_delay_ms, with
                 // optional full jitter (finding #77).
                 retry: RetryPolicy {
-                    max_attempts: config.retry.max_attempts.max(1),
-                    delay: Duration::from_millis(config.retry.initial_delay_ms),
-                    max_delay: Duration::from_millis(config.retry.max_delay_ms),
-                    jitter: config.retry.jitter,
+                    max_attempts: self.config.retry.max_attempts.max(1),
+                    delay: Duration::from_millis(self.config.retry.initial_delay_ms),
+                    max_delay: Duration::from_millis(self.config.retry.max_delay_ms),
+                    jitter: self.config.retry.jitter,
                 },
                 plugin_name: PLUGIN_NAME,
             },
@@ -729,11 +754,11 @@ impl ApiChargebackSink {
 
         let runtime = Arc::new(SinkRuntime {
             summary: SinkSummary {
-                mode: config.mode,
-                pricing_version: config.pricing_version.clone(),
+                mode: self.config.mode,
+                pricing_version: self.config.pricing_version.clone(),
                 endpoint,
-                database: config.clickhouse.database.clone(),
-                table: config.clickhouse.table.clone(),
+                database: self.config.clickhouse.database.clone(),
+                table: self.config.clickhouse.table.clone(),
             },
             logger,
             metrics,
@@ -746,52 +771,62 @@ impl ApiChargebackSink {
                 Arc::clone(&spool),
                 runtime.summary.clone(),
                 ClickHouseFlushConfig {
-                    http: build_clickhouse_http_client(&config.clickhouse, &http_client)?,
+                    http: build_clickhouse_http_client(
+                        &self.config.clickhouse,
+                        &self.http_client,
+                    )?,
                     insert_url,
-                    username: config.clickhouse.username.clone(),
-                    password: resolve_password_ref(config.clickhouse.password_ref.as_deref())?,
-                    timeout: Duration::from_millis(config.clickhouse.timeout_ms),
+                    username: self.config.clickhouse.username.clone(),
+                    password: resolve_password_ref(
+                        self.config.clickhouse.password_ref.as_deref(),
+                    )?,
+                    timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
                     metrics: Arc::clone(&runtime.metrics),
                 },
-                config.batch.size,
-                config.spool.replay_interval_secs,
+                self.config.batch.size,
+                self.config.spool.replay_interval_secs,
             ));
         }
 
-        let config = Arc::new(config);
-        let snapshot_accumulator = if config.mode == SinkMode::Snapshot {
+        let snapshot_accumulator = if self.config.mode == SinkMode::Snapshot {
             let accumulator = Arc::new(SnapshotAccumulator::new());
             background_tasks.push(start_snapshot_task(
                 Arc::clone(&accumulator),
                 Arc::clone(&runtime),
-                Arc::clone(&config),
-                Arc::clone(&node_id),
-                namespace.to_string(),
+                Arc::clone(&self.config),
+                Arc::clone(&self.node_id),
+                self.namespace.clone(),
             ));
             Some(accumulator)
         } else {
             None
         };
 
-        active_sink().store(Arc::new(Some(Arc::clone(&runtime))));
-        invalidate_status_cache();
+        {
+            let mut tasks = self.background_tasks.lock().map_err(|_| {
+                format!("{PLUGIN_NAME}: background task lock poisoned; refusing to start")
+            })?;
+            *tasks = background_tasks;
+        }
 
-        Ok(Self {
-            runtime,
-            pricing,
-            config,
-            node_id,
-            snapshot_accumulator,
-            background_tasks,
-        })
+        if let Some(accumulator) = snapshot_accumulator {
+            let _ = self.snapshot_accumulator.set(accumulator);
+        }
+        let _ = self.runtime.set(Arc::clone(&runtime));
+        active_sink().store(Arc::new(Some(runtime)));
+        invalidate_status_cache();
+        Ok(())
     }
 
     fn enqueue(&self, event: ChargeEvent) {
-        self.runtime
+        let Some(runtime) = self.runtime.get() else {
+            return;
+        };
+        runtime
             .metrics
             .events_enqueued_total
             .fetch_add(1, Ordering::Relaxed);
-        self.runtime.logger.try_send(event);
+        runtime.logger.try_send(event);
         invalidate_status_cache();
     }
 }
@@ -804,9 +839,15 @@ impl Drop for ApiChargebackSink {
         // BatchingLogger flush loop is intentionally left running: it owns the
         // mpsc receiver and terminates on its own once the sender is dropped,
         // after draining any buffered events.
-        for task in &self.background_tasks {
-            task.abort();
+        if let Ok(mut tasks) = self.background_tasks.lock() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
         }
+        let Some(runtime) = self.runtime.get() else {
+            // Never started: ACTIVE_SINK was never published for this instance.
+            return;
+        };
         // If this instance is still the one published for status/metrics
         // rendering, clear the slot. Without this, a dropped validation
         // throwaway would leave stale (zeroed) metrics — and its idle flush
@@ -815,7 +856,7 @@ impl Drop for ApiChargebackSink {
         if current
             .as_ref()
             .as_ref()
-            .is_some_and(|runtime| Arc::ptr_eq(runtime, &self.runtime))
+            .is_some_and(|published| Arc::ptr_eq(published, runtime))
         {
             active_sink().store(Arc::new(None));
             invalidate_status_cache();
@@ -837,6 +878,22 @@ impl Plugin for ApiChargebackSink {
         super::ALL_PROTOCOLS
     }
 
+    fn start_background_tasks(&self) -> Result<(), String> {
+        if self.runtime.get().is_some() {
+            return Ok(());
+        }
+        let _guard = self.start_lock.lock().map_err(|_| {
+            format!("{PLUGIN_NAME}: start lock poisoned; refusing to start chargeback sink")
+        })?;
+        if self.runtime.get().is_some() {
+            return Ok(());
+        }
+        let _runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            format!("{PLUGIN_NAME}: start_background_tasks requires a Tokio runtime")
+        })?;
+        self.activate()
+    }
+
     async fn log(&self, summary: &TransactionSummary) {
         let consumer = match summary.consumer_username.as_deref() {
             Some(c) if !c.is_empty() => c,
@@ -851,7 +908,7 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(accumulator) = self.snapshot_accumulator.as_ref() {
+            if let Some(accumulator) = self.snapshot_accumulator.get() {
                 accumulator.record_http(summary, consumer, outcome, charge);
             }
             return;
@@ -879,7 +936,7 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(accumulator) = self.snapshot_accumulator.as_ref() {
+            if let Some(accumulator) = self.snapshot_accumulator.get() {
                 accumulator.record_stream(summary, consumer, charge);
             }
             return;
@@ -910,7 +967,7 @@ impl Plugin for ApiChargebackSink {
             return;
         };
         if self.config.mode == SinkMode::Snapshot {
-            if let Some(accumulator) = self.snapshot_accumulator.as_ref() {
+            if let Some(accumulator) = self.snapshot_accumulator.get() {
                 accumulator.record_websocket(summary, consumer, charge);
             }
             return;
@@ -1264,7 +1321,9 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
                 "{PLUGIN_NAME}: spool.replay_interval_secs must be at least 1"
             ));
         }
-        ensure_private_dir(&config.spool.dir)?;
+        // Shape-only: do not mkdir/chmod/probe here — that is deferred to
+        // SpoolManager::new inside start_background_tasks.
+        validate_spool_dir_shape(&config.spool.dir)?;
     } else if config.mode == SinkMode::Snapshot {
         return Err(format!(
             "{PLUGIN_NAME}: snapshot mode requires spool.enabled=true so emitted deltas remain durable during ClickHouse outages"
@@ -1309,11 +1368,36 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
             "{PLUGIN_NAME}: clickhouse.password_ref cannot be used when ClickHouse TLS certificate or hostname verification is disabled"
         ));
     }
+    // Shape-only secret-ref check (do not materialize the env value here).
+    if let Some(reference) = config
+        .clickhouse
+        .password_ref
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && !reference.starts_with("FERRUM_")
+    {
+        return Err(format!(
+            "{PLUGIN_NAME}: clickhouse.password_ref must reference a FERRUM_* environment variable"
+        ));
+    }
     if config.pricing_version.trim().is_empty() {
         return Err(format!("{PLUGIN_NAME}: pricing_version must not be empty"));
     }
     if config.currency.trim().is_empty() {
         return Err(format!("{PLUGIN_NAME}: currency must not be empty"));
+    }
+    Ok(())
+}
+
+fn validate_spool_dir_shape(path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err(format!("{PLUGIN_NAME}: spool.dir must not be empty"));
+    }
+    // Reject obviously unusable relative placeholders without touching the FS.
+    let display = path.to_string_lossy();
+    if display.contains('\0') {
+        return Err(format!("{PLUGIN_NAME}: spool.dir must not contain NUL bytes"));
     }
     Ok(())
 }

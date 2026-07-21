@@ -22,8 +22,9 @@ use tracing::warn;
 
 use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema};
 use super::utils::{
-    BatchConfigDefaults, BatchingLogger, PluginHttpClient, UDP_RE_RESOLVE_INTERVAL,
-    bind_connected_udp_socket, build_batch_config, parse_socket_host, resolve_udp_endpoint,
+    BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, PluginHttpClient,
+    UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, parse_socket_host,
+    resolve_udp_endpoint,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::config::types::MAX_NAMESPACE_LENGTH;
@@ -479,7 +480,10 @@ struct StatsdFlushState {
 }
 
 pub struct StatsdLogging {
-    logger: BatchingLogger<MetricEntry>,
+    batch_config: BatchConfig,
+    flush_config: StatsdFlushConfig,
+    flush_state: Arc<Mutex<StatsdFlushState>>,
+    logger: DeferredBatchingLogger<MetricEntry>,
     hostname: Option<String>,
 }
 
@@ -556,36 +560,29 @@ impl StatsdLogging {
             dns_cache: http_client.dns_cache().cloned(),
             schema,
         };
-        let state = Arc::new(Mutex::new(StatsdFlushState {
-            socket: None,
-            current_addr: None,
-            last_resolve: Instant::now(),
-        }));
-        let logger = BatchingLogger::spawn(
-            // Config remains `max_retries`; the shared retry policy counts the
-            // initial attempt plus those retries.
-            build_batch_config(
-                config,
-                "statsd_logging",
-                BatchConfigDefaults {
-                    batch_size_key: "max_batch_lines",
-                    batch_size: 50,
-                    flush_interval_ms: 500,
-                    min_flush_interval_ms: 50,
-                    buffer_capacity: 10000,
-                    max_retries: 0,
-                    retry_delay_ms: 0,
-                },
-            ),
-            move |batch| {
-                let flush_config = flush_config.clone();
-                let state = Arc::clone(&state);
-                async move { send_batch(&flush_config, &state, batch).await }
+        let batch_config = build_batch_config(
+            config,
+            "statsd_logging",
+            BatchConfigDefaults {
+                batch_size_key: "max_batch_lines",
+                batch_size: 50,
+                flush_interval_ms: 500,
+                min_flush_interval_ms: 50,
+                buffer_capacity: 10000,
+                max_retries: 0,
+                retry_delay_ms: 0,
             },
         );
 
         Ok(Self {
-            logger,
+            batch_config,
+            flush_config,
+            flush_state: Arc::new(Mutex::new(StatsdFlushState {
+                socket: None,
+                current_addr: None,
+                last_resolve: Instant::now(),
+            })),
+            logger: DeferredBatchingLogger::new(),
             hostname: socket_host.warmup_hostname,
         })
     }
@@ -603,6 +600,19 @@ impl Plugin for StatsdLogging {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
+    }
+
+    fn start_background_tasks(&self) -> Result<(), String> {
+        let flush_config = self.flush_config.clone();
+        let state = Arc::clone(&self.flush_state);
+        // Config remains `max_retries`; the shared retry policy counts the
+        // initial attempt plus those retries.
+        self.logger
+            .start("statsd_logging", self.batch_config, move |batch| {
+                let flush_config = flush_config.clone();
+                let state = Arc::clone(&state);
+                async move { send_batch(&flush_config, &state, batch).await }
+            })
     }
 
     async fn log(&self, summary: &TransactionSummary) {

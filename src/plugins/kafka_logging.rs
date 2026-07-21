@@ -14,6 +14,12 @@
 //! through a custom [`ProducerContext`] delivery callback and exposed as
 //! authenticated diagnostics/metrics.
 //!
+//! Construction (`new`) is runtime-free: it parses and admits configuration
+//! without creating a `ThreadedProducer`, spawning a Ferrum flush worker, or
+//! registering a generation. Live activation happens only from
+//! [`Plugin::start_background_tasks`] after the plugin-cache generation that
+//! owns this instance is accepted.
+//!
 //! Graceful shutdown and reload atomically stop admission, await every
 //! already-reserved/transient admit, await the batching worker, then await one
 //! bounded producer flush. See #2548, #2551, #2552 and draft advisories
@@ -1107,9 +1113,33 @@ pub fn render_prometheus() -> String {
     output
 }
 
+/// Config + ClientConfig captured by [`KafkaLogging::new`] and consumed by
+/// [`Plugin::start_background_tasks`] to finish producer/logger construction.
+struct KafkaPendingActivation {
+    kafka_config: ClientConfig,
+    topic: String,
+    key_field: KeyField,
+    schema: Option<Arc<SummarySchema>>,
+    max_entry_bytes: usize,
+    buffer_max_bytes: usize,
+    buffer_capacity: usize,
+    flush_timeout: Duration,
+    generation_id: u64,
+}
+
 pub struct KafkaLogging {
-    generation: Arc<KafkaGeneration>,
+    /// Live generation after [`Plugin::start_background_tasks`]. Hot-path
+    /// admission remains behind `ArcSwapOption` and tolerates `None` when this
+    /// slot is still empty (validate / unstarted).
+    generation: OnceLock<Arc<KafkaGeneration>>,
+    pending: Mutex<Option<KafkaPendingActivation>>,
+    start_lock: Mutex<()>,
     broker_hostnames: Vec<String>,
+    /// Pre-start snapshot fields (config-derived; counters stay zero).
+    generation_id: u64,
+    flush_timeout_seconds: u64,
+    max_entry_bytes: usize,
+    buffer_max_bytes: usize,
 }
 
 impl KafkaLogging {
@@ -1288,7 +1318,8 @@ impl KafkaLogging {
         // Resolve the gateway CRL filesystem identity only when verification
         // is enabled on a TLS transport, so plaintext/SASL-plaintext and
         // ssl_no_verify=true do not fail merely because loaded CRLs lack a path
-        // suitable for librdkafka.
+        // suitable for librdkafka. Path resolution is pure config admission —
+        // the producer itself is not created until start_background_tasks.
         let gateway_crl_path = if !security.protocol.uses_tls() || security.ssl_no_verify {
             None
         } else {
@@ -1322,27 +1353,6 @@ impl KafkaLogging {
             }
         }
 
-        let generation_id = NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed);
-        let metrics = Arc::new(KafkaDeliveryMetrics::new(generation_id));
-        let context = KafkaDeliveryContext {
-            metrics: Arc::clone(&metrics),
-        };
-        let producer: ThreadedProducer<KafkaDeliveryContext> = kafka_config
-            .create_with_context(context)
-            // `KafkaError::ClientConfig` retains and prints the rejected
-            // property value. That value can be credential material supplied
-            // through `producer_config` (for example an OAuth setting), so do
-            // not pass librdkafka's display text across the config-admission
-            // boundary. The fixed classification is enough for operators to
-            // distinguish invalid configuration from client construction
-            // failure without echoing secrets or TLS source identities.
-            .map_err(|error| {
-                format!(
-                    "kafka_logging: failed to create Kafka producer ({})",
-                    safe_kafka_error_kind(&error)
-                )
-            })?;
-
         let broker_hostnames: Vec<String> = broker_list
             .split(',')
             .filter_map(|broker| {
@@ -1360,17 +1370,70 @@ impl KafkaLogging {
             })
             .collect();
 
-        let byte_budget = Arc::new(KafkaByteBudget::new(buffer_max_bytes));
+        let schema = resolve_schema(config, "kafka_logging", SchemaCapabilities::BASE)?;
+        let generation_id = NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed);
+
+        Ok(Self {
+            generation: OnceLock::new(),
+            pending: Mutex::new(Some(KafkaPendingActivation {
+                kafka_config,
+                topic,
+                key_field,
+                schema,
+                max_entry_bytes,
+                buffer_max_bytes,
+                buffer_capacity,
+                flush_timeout: Duration::from_secs(flush_timeout_seconds),
+                generation_id,
+            })),
+            start_lock: Mutex::new(()),
+            broker_hostnames,
+            generation_id,
+            flush_timeout_seconds,
+            max_entry_bytes,
+            buffer_max_bytes,
+        })
+    }
+
+    fn activate(
+        &self,
+        pending: KafkaPendingActivation,
+    ) -> Result<Arc<KafkaGeneration>, (KafkaPendingActivation, String)> {
+        let metrics = Arc::new(KafkaDeliveryMetrics::new(pending.generation_id));
+        let context = KafkaDeliveryContext {
+            metrics: Arc::clone(&metrics),
+        };
+        let producer: ThreadedProducer<KafkaDeliveryContext> =
+            match pending.kafka_config.create_with_context(context) {
+                Ok(producer) => producer,
+                Err(error) => {
+                    // `KafkaError::ClientConfig` retains and prints the rejected
+                    // property value. That value can be credential material supplied
+                    // through `producer_config` (for example an OAuth setting), so do
+                    // not pass librdkafka's display text across the config-admission
+                    // boundary. The fixed classification is enough for operators to
+                    // distinguish invalid configuration from client construction
+                    // failure without echoing secrets or TLS source identities.
+                    return Err((
+                        pending,
+                        format!(
+                            "kafka_logging: failed to create Kafka producer ({})",
+                            safe_kafka_error_kind(&error)
+                        ),
+                    ));
+                }
+            };
+
+        let byte_budget = Arc::new(KafkaByteBudget::new(pending.buffer_max_bytes));
         let state = Arc::new(KafkaProducerState {
             producer,
             metrics: Arc::clone(&metrics),
-            flush_timeout: Duration::from_secs(flush_timeout_seconds),
-            max_entry_bytes,
-            buffer_max_bytes,
+            flush_timeout: pending.flush_timeout,
+            max_entry_bytes: pending.max_entry_bytes,
+            buffer_max_bytes: pending.buffer_max_bytes,
             byte_budget: Arc::clone(&byte_budget),
             finalized: AtomicBool::new(false),
         });
-        let schema = resolve_schema(config, "kafka_logging", SchemaCapabilities::BASE)?;
         let metrics_for_hooks = Arc::clone(&metrics);
         let hooks = LoggerHooks {
             on_failed_batch: None,
@@ -1386,7 +1449,7 @@ impl KafkaLogging {
                 // librdkafka owns the real batching underneath.
                 batch_size: 1,
                 flush_interval: Duration::from_millis(1000),
-                buffer_capacity,
+                buffer_capacity: pending.buffer_capacity,
                 // librdkafka handles its own delivery retries; keep the
                 // shared logger at a single attempt for each message.
                 retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
@@ -1395,6 +1458,7 @@ impl KafkaLogging {
             hooks,
             {
                 let state = Arc::clone(&state);
+                let topic = pending.topic.clone();
                 move |batch| {
                     let state = Arc::clone(&state);
                     let topic = topic.clone();
@@ -1402,53 +1466,80 @@ impl KafkaLogging {
                 }
             },
         );
-        let handle = logger.handle().ok_or_else(|| {
-            "kafka_logging: failed to publish Ferrum admission handle".to_string()
-        })?;
+        let handle = logger
+            .handle()
+            .expect("kafka_logging: BatchingLogger::spawn_with_hooks must expose an admission handle");
         let in_flight = Arc::new(AtomicUsize::new(0));
         let admission = Arc::new(KafkaAdmission {
             handle,
-            key_field,
-            schema,
-            max_entry_bytes,
+            key_field: pending.key_field,
+            schema: pending.schema,
+            max_entry_bytes: pending.max_entry_bytes,
             byte_budget,
             metrics: Arc::clone(&metrics),
             in_flight: Arc::clone(&in_flight),
         });
 
-        let generation = Arc::new(KafkaGeneration {
+        Ok(Arc::new(KafkaGeneration {
             state,
             admission: Arc::new(ArcSwapOption::from(Some(admission))),
             logger: Mutex::new(Some(logger)),
             in_flight,
             finalize_lock: AsyncMutex::new(()),
-        });
-        register_generation(Arc::clone(&generation));
-
-        Ok(Self {
-            generation,
-            broker_hostnames,
-        })
+        }))
     }
 
     /// Snapshot lifecycle counters for external integration and unit tests.
     #[allow(dead_code)] // public test support is unused by the binary target
     pub fn snapshot(&self) -> KafkaSinkSnapshot {
-        self.generation.state.snapshot()
+        if let Some(generation) = self.generation.get() {
+            return generation.state.snapshot();
+        }
+        // Never-started: config-derived ceilings only, no liveliness noise.
+        KafkaSinkSnapshot {
+            generation_id: self.generation_id,
+            healthy: true,
+            accepting: false,
+            finalized: false,
+            flush_timeout_seconds: self.flush_timeout_seconds,
+            max_entry_bytes: self.max_entry_bytes as u64,
+            buffer_max_bytes: self.buffer_max_bytes as u64,
+            retained_bytes: 0,
+            admitted_total: 0,
+            delivered_total: 0,
+            delivery_failed_total: 0,
+            queue_rejected_total: 0,
+            ferrum_dropped_total: 0,
+            entry_oversize_total: 0,
+            byte_budget_exhausted_total: 0,
+            flush_failures_total: 0,
+            flush_timeouts_total: 0,
+            shutdown_incomplete_total: 0,
+            in_flight: 0,
+            last_failure: None,
+        }
     }
 
     /// Finalize this generation deterministically from external tests.
     #[allow(dead_code)] // public test support is unused by the binary target
     pub async fn finalize(&self) {
-        self.generation.finalize().await;
-        unregister_generation(self.generation.state.metrics.generation_id);
+        let Some(generation) = self.generation.get() else {
+            return;
+        };
+        generation.finalize().await;
+        unregister_generation(generation.state.metrics.generation_id);
     }
 }
 
 impl Drop for KafkaLogging {
     fn drop(&mut self) {
-        if self.generation.state.finalized.load(Ordering::Acquire) {
-            unregister_generation(self.generation.state.metrics.generation_id);
+        let Some(generation) = self.generation.get() else {
+            // Never started: no generation was registered and no producer /
+            // Ferrum worker exists. Drop pending config quietly.
+            return;
+        };
+        if generation.state.finalized.load(Ordering::Acquire) {
+            unregister_generation(generation.state.metrics.generation_id);
             return;
         }
         // Reload disposal / abandoned instance. Prefer an ordered finalize
@@ -1456,7 +1547,7 @@ impl Drop for KafkaLogging {
         // Never flush librdkafka while Ferrum entries may still enqueue.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                let generation = Arc::clone(&self.generation);
+                let generation = Arc::clone(generation);
                 tokio::task::block_in_place(|| {
                     handle.block_on(async move {
                         generation.finalize().await;
@@ -1470,14 +1561,14 @@ impl Drop for KafkaLogging {
             // Drop, so close/abort admission and report any abandoned work
             // instead of spawning an unowned task that runtime teardown may
             // cancel before it unregisters the generation.
-            self.generation.close_admission_report_incomplete();
-            unregister_generation(self.generation.state.metrics.generation_id);
+            generation.close_admission_report_incomplete();
+            unregister_generation(generation.state.metrics.generation_id);
             return;
         }
         // No runtime: close admission and account incomplete local work. Do
         // not flush librdkafka — the Ferrum worker cannot be awaited here.
-        self.generation.close_admission_report_incomplete();
-        unregister_generation(self.generation.state.metrics.generation_id);
+        generation.close_admission_report_incomplete();
+        unregister_generation(generation.state.metrics.generation_id);
     }
 }
 
@@ -1869,14 +1960,56 @@ impl Plugin for KafkaLogging {
         super::ALL_PROTOCOLS
     }
 
+    fn start_background_tasks(&self) -> Result<(), String> {
+        if self.generation.get().is_some() {
+            return Ok(());
+        }
+        let _guard = self.start_lock.lock().map_err(|_| {
+            "kafka_logging: start lock poisoned; refusing to start Kafka generation".to_string()
+        })?;
+        if self.generation.get().is_some() {
+            return Ok(());
+        }
+        let _runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            "kafka_logging: start_background_tasks requires a Tokio runtime".to_string()
+        })?;
+        let pending = {
+            let mut guard = self.pending.lock().map_err(|_| {
+                "kafka_logging: pending activation lock poisoned".to_string()
+            })?;
+            guard.take().ok_or_else(|| {
+                "kafka_logging: pending activation already consumed without a live generation"
+                    .to_string()
+            })?
+        };
+        let generation = match self.activate(pending) {
+            Ok(generation) => generation,
+            Err((pending, error)) => {
+                if let Ok(mut guard) = self.pending.lock() {
+                    *guard = Some(pending);
+                }
+                return Err(error);
+            }
+        };
+        register_generation(Arc::clone(&generation));
+        let _ = self.generation.set(generation);
+        Ok(())
+    }
+
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        if let Some(admission) = self.generation.admission.load_full() {
+        let Some(generation) = self.generation.get() else {
+            return;
+        };
+        if let Some(admission) = generation.admission.load_full() {
             admission.admit_stream(summary);
         }
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        if let Some(admission) = self.generation.admission.load_full() {
+        let Some(generation) = self.generation.get() else {
+            return;
+        };
+        if let Some(admission) = generation.admission.load_full() {
             admission.admit_http(summary);
         }
     }

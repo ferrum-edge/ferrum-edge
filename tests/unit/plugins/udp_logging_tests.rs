@@ -281,6 +281,7 @@ async fn test_udp_logging_stream_disconnect_does_not_panic() {
         test_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let summary = create_test_stream_transaction_summary();
 
     plugin.on_stream_disconnect(&summary).await;
@@ -301,6 +302,7 @@ async fn test_udp_logging_buffer_accepts_multiple_entries() {
         test_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
 
     let summary = create_test_transaction_summary();
     for _ in 0..100 {
@@ -323,6 +325,7 @@ async fn test_udp_logging_buffer_full_drops_gracefully() {
         test_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
 
     let summary = create_test_transaction_summary();
     // Send more entries than buffer_capacity — excess should be dropped
@@ -410,6 +413,7 @@ async fn test_udp_logging_custom_batch_config() {
         test_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     assert_eq!(plugin.name(), "udp_logging");
 }
 
@@ -1056,6 +1060,7 @@ async fn test_udp_logging_plain_udp_dns_address_change_rebuilds_sender() {
         test_client(),
     )
     .expect("construct");
+    plugin.start_background_tasks().expect("live start");
 
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
@@ -1101,6 +1106,7 @@ async fn test_udp_logging_dtls_dns_address_change_rebuilds_association() {
         test_client(),
     )
     .expect("construct dtls logger");
+    plugin.start_background_tasks().expect("live start");
 
     // Force the first resolve through the one-shot hook so the bind port in
     // config cannot race with the DTLS server's ephemeral port.
@@ -1154,6 +1160,7 @@ async fn test_udp_logging_dtls_retains_association_when_replacement_handshake_fa
         test_client(),
     )
     .expect("construct dtls logger");
+    plugin.start_background_tasks().expect("live start");
 
     plugin.set_next_resolve_addr_for_test(addr_a);
     let summary = create_test_transaction_summary();

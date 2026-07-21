@@ -6,6 +6,10 @@
 //! non-blockingly, and a shared background task drains the queue in
 //! configurable batch sizes with a flush interval timer.
 //!
+//! Construction is runtime-free. The flush worker starts only from
+//! [`Plugin::start_background_tasks`] after the plugin-cache generation that
+//! owns this instance is accepted.
+//!
 //! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
 //! `LogEntry` union type, and uses the shared `PluginHttpClient` for
 //! connection pooling and DNS cache integration.
@@ -20,8 +24,9 @@ use super::utils::log_schema::{
     SchemaCapabilities, SummaryLogEntryBatchView, SummarySchema, resolve_schema,
 };
 use super::utils::{
-    BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
-    handle_http_batch_response, parse_custom_headers, parse_http_endpoint, validate_batch_config,
+    BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, PluginHttpClient, SummaryLogEntry,
+    build_batch_config, handle_http_batch_response, parse_custom_headers, parse_http_endpoint,
+    validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
@@ -34,7 +39,9 @@ struct HttpFlushConfig {
 }
 
 pub struct HttpLogging {
-    logger: BatchingLogger<SummaryLogEntry>,
+    batch_config: BatchConfig,
+    flush_config: HttpFlushConfig,
+    logger: DeferredBatchingLogger<SummaryLogEntry>,
     endpoint_hostname: String,
 }
 
@@ -67,18 +74,11 @@ impl HttpLogging {
             http_client,
             schema,
         };
-        let logger = BatchingLogger::spawn(
-            // Config remains `max_retries`; the shared retry policy counts the
-            // initial attempt plus those retries.
-            build_batch_config(config, "http_logging", batch_defaults),
-            move |batch| {
-                let flush_config = flush_config.clone();
-                async move { send_batch(&flush_config, batch).await }
-            },
-        );
 
         Ok(Self {
-            logger,
+            batch_config: build_batch_config(config, "http_logging", batch_defaults),
+            flush_config,
+            logger: DeferredBatchingLogger::new(),
             endpoint_hostname,
         })
     }
@@ -96,6 +96,16 @@ impl Plugin for HttpLogging {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
+    }
+
+    fn start_background_tasks(&self) -> Result<(), String> {
+        let flush_config = self.flush_config.clone();
+        // Config remains `max_retries`; the shared retry policy counts the
+        // initial attempt plus those retries.
+        self.logger.start("http_logging", self.batch_config, move |batch| {
+            let flush_config = flush_config.clone();
+            async move { send_batch(&flush_config, batch).await }
+        })
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {

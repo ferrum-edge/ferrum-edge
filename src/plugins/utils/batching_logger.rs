@@ -1,7 +1,9 @@
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
@@ -385,6 +387,102 @@ impl<T: Send + 'static> BatchingLogger<T> {
 
     pub fn buffer_capacity(&self) -> usize {
         self.buffer_capacity
+    }
+}
+
+/// Lifecycle owner that constructs a [`BatchingLogger`] only when a committed
+/// plugin-cache generation activates background work via
+/// [`crate::plugins::Plugin::start_background_tasks`].
+///
+/// Offline `ferrum-edge validate` and Admin admission construct plugins without
+/// a Tokio runtime and without calling `start_background_tasks`, so validation
+/// stays runtime-free and leaves no flush worker behind. Live generations must
+/// call [`Self::start`] / [`Self::start_with_hooks`] exactly through that hook.
+pub struct DeferredBatchingLogger<T: Send + 'static> {
+    logger: OnceLock<BatchingLogger<T>>,
+    start_lock: Mutex<()>,
+}
+
+impl<T: Send + 'static> Default for DeferredBatchingLogger<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Send + 'static> DeferredBatchingLogger<T> {
+    pub fn new() -> Self {
+        Self {
+            logger: OnceLock::new(),
+            start_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn is_started(&self) -> bool {
+        self.logger.get().is_some()
+    }
+
+    pub fn get(&self) -> Option<&BatchingLogger<T>> {
+        self.logger.get()
+    }
+
+    /// Idempotent activation. Requires a Tokio runtime (plugin-cache publish).
+    pub fn start_with_hooks<F, Fut>(
+        &self,
+        plugin_name: &'static str,
+        cfg: BatchConfig,
+        hooks: LoggerHooks<T>,
+        flush: F,
+    ) -> Result<(), String>
+    where
+        T: Clone,
+        F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        if self.logger.get().is_some() {
+            return Ok(());
+        }
+        let _guard = self.start_lock.lock().map_err(|_| {
+            format!("{plugin_name}: start lock poisoned; refusing to start batching worker")
+        })?;
+        if self.logger.get().is_some() {
+            return Ok(());
+        }
+        let _runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            format!("{plugin_name}: start_background_tasks requires a Tokio runtime")
+        })?;
+        let logger = BatchingLogger::spawn_with_hooks(cfg, hooks, flush);
+        let _ = self.logger.set(logger);
+        Ok(())
+    }
+
+    /// Variant of [`Self::start_with_hooks`] with default logger hooks.
+    pub fn start<F, Fut>(
+        &self,
+        plugin_name: &'static str,
+        cfg: BatchConfig,
+        flush: F,
+    ) -> Result<(), String>
+    where
+        T: Clone,
+        F: Fn(Vec<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), String>> + Send + 'static,
+    {
+        self.start_with_hooks(plugin_name, cfg, LoggerHooks::default(), flush)
+    }
+
+    /// Non-blocking send. Returns `false` when the worker has not started yet
+    /// or the underlying logger drops the entry.
+    pub fn try_send(&self, item: T) -> bool {
+        match self.logger.get() {
+            Some(logger) => logger.try_send(item),
+            None => false,
+        }
+    }
+
+    /// Reserve a queue slot when the worker is live. Returns `None` when
+    /// background activation has not run or the buffer is full/closed.
+    pub fn try_reserve(&self) -> Option<BatchingLoggerPermit<T>> {
+        self.logger.get().and_then(BatchingLogger::try_reserve)
     }
 }
 

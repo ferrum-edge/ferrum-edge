@@ -262,6 +262,7 @@ async fn test_statsd_logging_buffer_full_drops_gracefully() {
         default_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
 
     let summary = create_test_transaction_summary();
     // Send more entries than buffer_capacity — excess should be dropped
@@ -292,6 +293,7 @@ async fn test_statsd_logging_accepts_all_config_options() {
         default_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     assert_eq!(plugin.name(), "statsd_logging");
 }
 
@@ -853,6 +855,7 @@ async fn test_statsd_udp_payload_ceiling_and_collector_capture() {
         default_client(),
     )
     .expect("construct statsd");
+    plugin.start_background_tasks().expect("live start");
 
     let mut summary = create_test_transaction_summary();
     summary.body_completed = true;
@@ -917,6 +920,7 @@ async fn test_statsd_ws_disconnect_collector_emits_session_once() {
         default_client(),
     )
     .expect("construct statsd");
+    plugin.start_background_tasks().expect("live start");
     assert!(
         plugin.requires_ws_disconnect_hooks(),
         "statsd_logging must opt into terminal WS disconnect dispatch"

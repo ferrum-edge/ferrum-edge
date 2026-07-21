@@ -117,6 +117,7 @@ async fn grpc_per_event_exports_billable_and_raw_terminal_statuses() {
         {"status_codes": [503], "price_per_call": 0.09}
     ]);
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().expect("chargeback start");
 
     plugin.log(&grpc_summary("grpc-ok", "0")).await;
     plugin.log(&grpc_summary("grpc-unavailable", "14")).await;
@@ -493,6 +494,7 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
     config["clickhouse"]["url"] = json!(server.uri());
     config["batch"]["size"] = json!(1);
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().expect("chargeback start");
     assert!(plugin.requires_ws_disconnect_hooks());
 
     plugin
@@ -539,6 +541,7 @@ async fn connect_method_is_not_classified_as_websocket() {
     config["clickhouse"]["url"] = json!(server.uri());
     config["batch"]["size"] = json!(1);
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
+    plugin.start_background_tasks().expect("chargeback start");
 
     plugin
         .log(&TransactionSummary {

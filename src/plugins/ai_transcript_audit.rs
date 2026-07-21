@@ -44,8 +44,9 @@ use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
 use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use super::utils::{
-    BatchConfigDefaults, BatchingLogger, BatchingLoggerPermit, LoggerHooks, PluginHttpClient,
-    build_batch_config, handle_http_batch_response, parse_http_endpoint, validate_batch_config,
+    BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, DeferredBatchingLogger, LoggerHooks,
+    PluginHttpClient, build_batch_config, handle_http_batch_response, parse_http_endpoint,
+    validate_batch_config,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
@@ -415,7 +416,9 @@ pub struct AiTranscriptAudit {
     on_buffer_full: BufferFullPolicy,
     on_sink_error: SinkErrorPolicy,
     redactor: Arc<PiiRedactor>,
-    logger: BatchingLogger<AuditRecord>,
+    batch_config: BatchConfig,
+    flush_config: HttpFlushConfig,
+    logger: DeferredBatchingLogger<AuditRecord>,
     endpoint_hostname: String,
     namespace: String,
     staging: Arc<DashMap<String, AuditStaging>>,
@@ -661,7 +664,7 @@ impl AiTranscriptAudit {
             }
         };
 
-        // ---- background worker ----
+        // ---- deferred background worker ----
         let shard_amount = http_client.pool_shard_amount();
         let sink_healthy = Arc::new(AtomicBool::new(true));
         let flush_config = HttpFlushConfig {
@@ -670,23 +673,7 @@ impl AiTranscriptAudit {
             http_client,
             sink_healthy: Arc::clone(&sink_healthy),
         };
-        let hooks = LoggerHooks {
-            on_failed_batch: {
-                let healthy = Arc::clone(&sink_healthy);
-                Some(Arc::new(move |_batch: Vec<AuditRecord>, _error: String| {
-                    healthy.store(false, Ordering::Relaxed);
-                }))
-            },
-            ..LoggerHooks::default()
-        };
-        let logger = BatchingLogger::spawn_with_hooks(
-            build_batch_config(sink_obj, "ai_transcript_audit", batch_defaults),
-            hooks,
-            move |batch| {
-                let flush_config = flush_config.clone();
-                async move { send_batch(&flush_config, batch).await }
-            },
-        );
+        let batch_config = build_batch_config(sink_obj, "ai_transcript_audit", batch_defaults);
 
         let active = capture.request || capture.response || streaming != StreamingCapture::Off;
         let namespace = std::env::var("FERRUM_NAMESPACE")
@@ -703,7 +690,9 @@ impl AiTranscriptAudit {
             on_buffer_full,
             on_sink_error,
             redactor: Arc::new(redactor),
-            logger,
+            batch_config,
+            flush_config,
+            logger: DeferredBatchingLogger::new(),
             endpoint_hostname,
             namespace,
             staging: Arc::new(DashMap::with_shard_amount(shard_amount)),
@@ -1341,6 +1330,26 @@ impl Plugin for AiTranscriptAudit {
 
     fn supported_protocols(&self) -> &'static [ProxyProtocol] {
         HTTP_ONLY_PROTOCOLS
+    }
+
+    fn start_background_tasks(&self) -> Result<(), String> {
+        let flush_config = self.flush_config.clone();
+        let healthy = Arc::clone(&self.sink_healthy);
+        let hooks = LoggerHooks {
+            on_failed_batch: Some(Arc::new(move |_batch: Vec<AuditRecord>, _error: String| {
+                healthy.store(false, Ordering::Relaxed);
+            })),
+            ..LoggerHooks::default()
+        };
+        self.logger.start_with_hooks(
+            "ai_transcript_audit",
+            self.batch_config,
+            hooks,
+            move |batch| {
+                let flush_config = flush_config.clone();
+                async move { send_batch(&flush_config, batch).await }
+            },
+        )
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {

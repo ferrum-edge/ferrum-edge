@@ -33,8 +33,8 @@ use super::utils::log_schema::{
     SchemaCapabilities, SummaryLogEntryView, SummarySchema, resolve_schema,
 };
 use super::utils::{
-    BatchConfigDefaults, BatchingLogger, PluginHttpClient, SummaryLogEntry, build_batch_config,
-    parse_socket_host, resolve_tcp_endpoint, validate_batch_config,
+    BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, PluginHttpClient, SummaryLogEntry,
+    build_batch_config, parse_socket_host, resolve_tcp_endpoint, validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
@@ -94,7 +94,10 @@ struct TcpFlushConfig {
 }
 
 pub struct TcpLogging {
-    logger: BatchingLogger<SummaryLogEntry>,
+    batch_config: BatchConfig,
+    flush_config: TcpFlushConfig,
+    writer: Arc<Mutex<Option<TcpWriter>>>,
+    logger: DeferredBatchingLogger<SummaryLogEntry>,
     endpoint_hostname: Option<String>,
 }
 
@@ -188,20 +191,12 @@ impl TcpLogging {
             dns_cache: http_client.dns_cache().cloned(),
             schema,
         };
-        let writer = Arc::new(Mutex::new(None));
-        let logger = BatchingLogger::spawn(
-            // Config remains `max_retries`; the shared retry policy counts the
-            // initial attempt plus those retries.
-            build_batch_config(config, "tcp_logging", batch_defaults),
-            move |batch| {
-                let flush_config = flush_config.clone();
-                let writer = Arc::clone(&writer);
-                async move { send_batch(&flush_config, &writer, batch).await }
-            },
-        );
 
         Ok(Self {
-            logger,
+            batch_config: build_batch_config(config, "tcp_logging", batch_defaults),
+            flush_config,
+            writer: Arc::new(Mutex::new(None)),
+            logger: DeferredBatchingLogger::new(),
             endpoint_hostname: socket_host.warmup_hostname,
         })
     }
@@ -273,6 +268,19 @@ impl Plugin for TcpLogging {
 
     fn supported_protocols(&self) -> &'static [super::ProxyProtocol] {
         super::ALL_PROTOCOLS
+    }
+
+    fn start_background_tasks(&self) -> Result<(), String> {
+        let flush_config = self.flush_config.clone();
+        let writer = Arc::clone(&self.writer);
+        // Config remains `max_retries`; the shared retry policy counts the
+        // initial attempt plus those retries.
+        self.logger
+            .start("tcp_logging", self.batch_config, move |batch| {
+                let flush_config = flush_config.clone();
+                let writer = Arc::clone(&writer);
+                async move { send_batch(&flush_config, &writer, batch).await }
+            })
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {

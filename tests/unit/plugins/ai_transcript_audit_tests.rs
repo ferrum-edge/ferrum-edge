@@ -789,6 +789,7 @@ async fn request_capture_redacts_decoded_json_string_escapes() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -832,6 +833,7 @@ async fn request_capture_redacts_json_keys_and_numeric_scalars() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -873,6 +875,7 @@ async fn request_capture_applies_custom_redactor_to_serialized_json_payload() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -926,6 +929,7 @@ async fn non_json_buffered_response_does_not_export_body_or_hash() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let request_headers = json_headers();
     plugin
@@ -966,6 +970,7 @@ async fn buffered_sse_response_capture_uses_streaming_policy() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
@@ -1080,6 +1085,7 @@ async fn sampling_rate_zero_still_captures_on_guardrail() {
         json!({ "sampling": { "rate": 0.0, "always_capture_on_guardrail": true } }),
     );
     let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -1109,6 +1115,7 @@ async fn sampling_rate_zero_captures_non_empty_guardrail_metadata() {
         json!({ "sampling": { "rate": 0.0, "always_capture_on_guardrail": true } }),
     );
     let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -1139,6 +1146,7 @@ async fn sampling_rate_zero_captures_reject_guardrail_markers() {
             json!({ "sampling": { "rate": 0.0, "always_capture_on_guardrail": true } }),
         );
         let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
         let mut ctx = make_ctx();
         let headers = json_headers();
         plugin
@@ -1163,6 +1171,7 @@ async fn sampling_rate_zero_captures_scoped_semantic_firewall_metadata() {
         json!({ "sampling": { "rate": 0.0, "always_capture_on_guardrail": true } }),
     );
     let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -1189,6 +1198,7 @@ async fn error_status_capture_reason_is_error() {
         json!({ "sampling": { "rate": 0.0, "always_capture_on_error": true } }),
     );
     let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -1331,6 +1341,7 @@ async fn final_body_hook_refreshes_staged_capture_after_transforms() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     ctx.metadata.insert(
         "request_body".to_string(),
@@ -1381,6 +1392,7 @@ async fn backend_path_after_proxy_does_not_revert_final_request_capture_from_sta
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     ctx.metadata.insert(
         "request_body".to_string(),
@@ -1425,6 +1437,7 @@ async fn synthetic_response_refreshes_live_request_metadata_before_emitting() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     ctx.metadata.insert(
         "request_body".to_string(),
@@ -1588,6 +1601,7 @@ async fn streaming_selection_releases_precommit_buffer_reservation() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     assert!(
         plugin.requires_response_stream_hooks(),
         "fail-closed buffered capture must observe a content-type downgrade to release its slot"
@@ -1635,6 +1649,7 @@ async fn selected_stream_reserves_queue_capacity_before_commit() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let request_headers = json_headers();
     let stream_body =
         br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
@@ -1697,6 +1712,7 @@ async fn streaming_capture_preserves_buffered_response_admission() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let request_headers = json_headers();
     let request_body = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}"#;
     let mut response_headers = json_headers();
@@ -1749,6 +1765,7 @@ async fn response_guardrail_candidate_reserves_stream_capacity_before_commit() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let request_headers = json_headers();
     let stream_body =
         br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
@@ -1804,6 +1821,7 @@ async fn possible_final_sse_relabel_is_admitted_before_header_rewrite() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let request_headers = json_headers();
     // No `stream:true`: a later response hook can still relabel this candidate
     // to SSE, so admission cannot depend on the request or current response
@@ -1864,6 +1882,7 @@ async fn unsampled_stream_with_error_override_reserves_fail_closed_capacity() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let request_headers = json_headers();
     let stream_body =
         br#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"stream":true}"#;
@@ -2007,6 +2026,7 @@ async fn downstream_stream_cut_omits_pre_cut_capture_and_forces_guardrail_sample
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
@@ -2073,6 +2093,7 @@ async fn redaction_runs_before_truncation_at_capture_boundary() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -2106,6 +2127,7 @@ async fn stream_capture_tail_guard_prevents_boundary_leak() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
@@ -2158,6 +2180,7 @@ async fn stream_capture_redacts_decoded_sse_json_frames() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
@@ -2284,6 +2307,7 @@ async fn sink_recovers_after_transient_outage_with_reject_policy() {
         }
     });
     let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
 
     async fn roundtrip(plugin: &AiTranscriptAudit) -> PluginResult {
         let headers = json_headers();
@@ -2342,6 +2366,7 @@ async fn harvests_guardrail_and_token_metadata() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -2429,6 +2454,7 @@ async fn sampled_error_sse_is_teed_and_captures_body() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
@@ -2476,6 +2502,7 @@ async fn buffered_sse_captured_when_buffered_json_capture_disabled() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
@@ -2544,6 +2571,7 @@ async fn custom_sink_headers_are_sent_with_env_expansion() {
         }
     });
     let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -2616,6 +2644,7 @@ async fn privacy_client_ip_and_redacted_response_headers_captured() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let mut response_headers = json_headers();
     response_headers.insert("x-model-name".to_string(), "gpt-4o".to_string());
@@ -2646,6 +2675,7 @@ async fn tool_names_extracted_from_tools_and_functions() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -2680,6 +2710,7 @@ async fn stream_end_without_on_end_omits_body() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
@@ -2710,6 +2741,7 @@ async fn framed_grpc_response_does_not_export_body() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
@@ -2738,6 +2770,7 @@ async fn log_fallback_emits_from_summary_envelope() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
@@ -2771,6 +2804,7 @@ async fn sampled_validator_rejected_response_emits_committed_status_and_body() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -2807,6 +2841,7 @@ async fn provider_prefers_ai_provider_over_federation_name() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -2840,6 +2875,7 @@ async fn sampled_field_reflects_roll_not_emit_on_guardrail_capture() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -2942,6 +2978,7 @@ async fn fail_closed_record_carries_503_status() {
         }
     });
     let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
     let headers = json_headers();
     let mut saw_503 = false;
     for _ in 0..100 {
@@ -3019,6 +3056,7 @@ async fn non_2xx_short_circuit_refreshes_staged_request_via_after_proxy() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     ctx.metadata.insert(
         "request_body".to_string(),
@@ -3182,6 +3220,7 @@ async fn stream_hash_is_incremental_keyed_hmac_over_teed_bytes() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
@@ -3227,6 +3266,7 @@ async fn request_derived_model_and_tool_names_are_redacted() {
             loopback_http_client(),
         )
         .expect("valid config");
+    plugin.start_background_tasks().expect("live start");
         let mut ctx = make_ctx();
         let headers = json_headers();
         plugin
@@ -3291,6 +3331,7 @@ async fn transaction_log_sampled_flag_carries_roll_not_emit() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -3340,6 +3381,7 @@ async fn request_guardrail_after_staging_tees_unsampled_stream() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -3525,6 +3567,7 @@ async fn non_retryable_sink_4xx_marks_sink_unhealthy_under_reject() {
         }
     });
     let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
     let headers = json_headers();
     let mut saw_reject = false;
     for _ in 0..100 {
@@ -3585,6 +3628,7 @@ async fn unhealthy_sink_rejects_unsampled_candidate_that_may_emit_at_commit() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let headers = json_headers();
 
     // Emit one error record so the collector 401 marks the sink unhealthy.
@@ -3649,6 +3693,7 @@ async fn sink_2xx_after_4xx_restores_health() {
         }
     });
     let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
     let headers = json_headers();
     let mut saw_reject = false;
     let mut recovered = false;
@@ -3695,6 +3740,7 @@ async fn sse_pii_split_across_deltas_is_redacted_in_reassembled_excerpt() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
@@ -3754,6 +3800,7 @@ async fn non_openai_sse_capture_keeps_per_frame_redacted_fallback() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
@@ -3909,6 +3956,7 @@ async fn fail_closed_rejected_then_unsampled_keeps_rejected_sink_status() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     let headers = json_headers();
 
     // Emit one guardrail record (guardrail forces emit even with
@@ -4073,6 +4121,7 @@ async fn ai_transcript_audit_reuses_http11_connection_across_successful_batches(
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
     // Ensure sink batching settings from config_with_sink (batch_size 1).
     audit_roundtrip(&plugin).await;
     audit_roundtrip(&plugin).await;
@@ -4100,6 +4149,7 @@ async fn ai_transcript_audit_reuses_http11_connection_across_retry() {
         }
     });
     let plugin = AiTranscriptAudit::new(&config, loopback_http_client()).unwrap();
+    plugin.start_background_tasks().expect("live start");
     audit_roundtrip(&plugin).await;
     wait_for_audit_count(&requests, 2).await;
     assert_eq!(
