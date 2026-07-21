@@ -915,6 +915,7 @@ async fn test_websocket_upgrade_status_101_is_still_synthetic_reject() {
     .unwrap();
 
     let mut ctx = make_ctx("GET", "/api/socket", "/api");
+    ferrum_edge::_test_support::set_websocket_response_boundary_for_test(&mut ctx, true);
     let mut headers = HashMap::new();
 
     match plugin.before_proxy(&mut ctx, &mut headers).await {
@@ -922,6 +923,37 @@ async fn test_websocket_upgrade_status_101_is_still_synthetic_reject() {
             assert_eq!(status_code, 101);
         }
         _ => panic!("Expected Reject with status 101"),
+    }
+}
+
+#[tokio::test]
+async fn test_status_101_fails_closed_outside_websocket_handshake() {
+    let plugin = ResponseMock::new(&json!({
+        "rules": [{
+            "path": "/ordinary",
+            "status_code": 101,
+            "body": ""
+        }]
+    }))
+    .unwrap();
+
+    let mut ctx = make_ctx("GET", "/api/ordinary", "/api");
+    let mut headers = HashMap::new();
+
+    match plugin.before_proxy(&mut ctx, &mut headers).await {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => {
+            assert_eq!(status_code, 500);
+            assert!(body.contains("requires a WebSocket handshake"));
+            assert_eq!(
+                headers.get("content-type").map(String::as_str),
+                Some("application/json")
+            );
+        }
+        other => panic!("Expected fail-closed Reject, got {other:?}"),
     }
 }
 

@@ -7245,6 +7245,10 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         status_desc.contains("101") && status_desc.contains("200–599"),
         "status_code must document 101 + final range: {status_desc}"
     );
+    assert!(
+        status_desc.contains("ordinary HTTP request") && status_desc.contains("500"),
+        "status_code must document the non-WebSocket 101 failure: {status_desc}"
+    );
     let body_desc = rule["properties"]["body"]["description"]
         .as_str()
         .expect("body description");

@@ -407,6 +407,23 @@ impl Plugin for ResponseMock {
         };
 
         if let Some(rule) = self.find_match(&ctx.method, match_path) {
+            // 101 is a valid terminal response only at a WebSocket handshake
+            // boundary. The request flavor is stamped before plugin hooks and
+            // cannot be forged by mutable request headers. Fail closed instead
+            // of emitting an informational-only response on ordinary HTTP.
+            if rule.status_code == 101 && !ctx.has_websocket_response_boundary() {
+                let mut headers = HashMap::new();
+                headers.insert(
+                    "content-type".to_string(),
+                    "application/json".to_string(),
+                );
+                return PluginResult::Reject {
+                    status_code: 500,
+                    body: r#"{"error":"response_mock status 101 requires a WebSocket handshake"}"#
+                        .to_string(),
+                    headers,
+                };
+            }
             if rule.delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(rule.delay_ms)).await;
             }

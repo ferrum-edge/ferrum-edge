@@ -16745,10 +16745,12 @@ components:
         top-level and per-rule keys are rejected; the free-form headers map
         remains open for string-valued response headers. Status codes must be
         final (200–599) or 101 for a synthetic WebSocket handshake; other
-        informational statuses are rejected. HEAD omits content bytes while
-        keeping representation Content-Length; 204/205/304 omit body and
-        Content-Length on every frontend (H1/H2/H3). Runtime construction is
-        the authoritative final boundary.
+        informational statuses are rejected. A configured 101 fails closed
+        with 500 when the matching request is not an actual WebSocket
+        handshake. HEAD omits content bytes while keeping representation
+        Content-Length; 204/205/304 omit body and Content-Length on every
+        frontend (H1/H2/H3). Runtime construction and request-flavor
+        enforcement are the authoritative final boundaries.
       required:
         - rules
       properties:
@@ -16792,7 +16794,8 @@ components:
                   than coerced. Status 101 on an HTTP/1.1 WebSocket upgrade, or
                   a success-like 200 on HTTP/2 / HTTP/3 Extended CONNECT, is
                   still only a synthetic HTTP handshake response; it does not
-                  create an upgraded frame stream.
+                  create an upgraded frame stream. A 101 rule that matches an
+                  ordinary HTTP request fails closed with status 500.
               headers:
                 type: object
                 additionalProperties:
