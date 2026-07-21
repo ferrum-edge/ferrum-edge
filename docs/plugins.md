@@ -4519,7 +4519,7 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `token_limit` | Integer | `100000` | Maximum tokens allowed per window |
+| `token_limit` | Integer | *(required)* | Maximum tokens allowed per window. Required at construction; there is no default. |
 | `window_seconds` | Integer | `60` | Sliding window duration in seconds |
 | `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens`. Unknown values are rejected at construction time. |
 | `limit_by` | String | `"consumer"` | Rate limit key: authenticated identity (`consumer`) or `ip`. Unknown values are rejected at construction time. |

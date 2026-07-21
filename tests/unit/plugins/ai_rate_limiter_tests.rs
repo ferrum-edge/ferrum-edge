@@ -722,6 +722,33 @@ fn test_valid_on_unmetered_response_accepted() {
 }
 
 #[test]
+fn test_token_limit_is_required_with_no_default() {
+    // Contract (#2263): runtime requires `token_limit`; omitting it must fail
+    // rather than silently applying a documented 100000 default.
+    let err = AiRateLimiter::new(&json!({}), PluginHttpClient::default())
+        .err()
+        .expect("empty ai_rate_limiter config must fail without token_limit");
+    assert!(
+        err.contains("token_limit"),
+        "missing token_limit must surface in the error: {err}"
+    );
+
+    let err = AiRateLimiter::new(
+        &json!({"window_seconds": 60}),
+        PluginHttpClient::default(),
+    )
+    .err()
+    .expect("window_seconds alone must not satisfy construction");
+    assert!(
+        err.contains("token_limit"),
+        "optional fields must not mask missing token_limit: {err}"
+    );
+
+    AiRateLimiter::new(&json!({"token_limit": 100000}), PluginHttpClient::default())
+        .expect("explicit token_limit must construct");
+}
+
+#[test]
 fn test_invalid_config_shapes_rejected() {
     for (config, needle) in [
         (json!(null), "config must be an object"),
