@@ -347,6 +347,18 @@ fn grpc_content_type_header() -> HashMap<String, String> {
     h
 }
 
+/// Provenance context for building a gRPC-Web trailer frame from a response.
+///
+/// Groups the backend trailer provenance that `transform_grpc_web_response_body`
+/// forwards to `build_trailer_frame_with_full_provenance`, keeping the
+/// provenance boundary explicit at the transform entry point.
+struct TrailerFrameProvenance<'a> {
+    http_status: Option<u16>,
+    trailer_name_allowlist: Option<&'a HashSet<String>>,
+    shadowed_trailers: Option<&'a HashMap<String, [String; 2]>>,
+    policy_state: Option<&'a BufferedInitialResponseHeaderPolicyState>,
+}
+
 pub struct GrpcWebPlugin {
     expose_headers: Vec<String>,
     expose_headers_value: String,
@@ -379,10 +391,7 @@ impl GrpcWebPlugin {
         body: &[u8],
         _content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
-        http_status: Option<u16>,
-        trailer_name_allowlist: Option<&HashSet<String>>,
-        shadowed_trailers: Option<&HashMap<String, [String; 2]>>,
-        policy_state: Option<&BufferedInitialResponseHeaderPolicyState>,
+        provenance: TrailerFrameProvenance,
     ) -> Option<Vec<u8>> {
         // Only transform if response content-type is gRPC-Web (set by after_proxy)
         let ct = response_headers.get("content-type")?;
@@ -406,10 +415,10 @@ impl GrpcWebPlugin {
         // keeps initial-header-only fields out of the body trailer block.
         let trailer_frame = build_trailer_frame_with_full_provenance(
             response_headers,
-            http_status,
-            trailer_name_allowlist,
-            shadowed_trailers,
-            policy_state,
+            provenance.http_status,
+            provenance.trailer_name_allowlist,
+            provenance.shadowed_trailers,
+            provenance.policy_state,
         );
         output.extend(trailer_frame);
 
@@ -1005,20 +1014,26 @@ pub fn bridge_backend_trailer_provenance_for_frame(
     response_headers.insert(HEADER_GRPC_WEB_SHADOWED_TRAILERS.to_string(), shadowed);
 }
 
+/// Reconstructed backend initial-header / trailer split from bridged
+/// provenance on the merged response-header map.
+///
+/// Returned by [`capture_bridged_trailer_split_for_policy`] so callers can
+/// track genuine initial headers separately from application trailers.
+pub struct BridgedTrailerSplit {
+    pub initial_headers: HashMap<String, String>,
+    pub trailers: HashMap<String, String>,
+    pub shadowed_keys: HashSet<String>,
+}
+
 /// Reconstruct the backend initial-header / trailer split from bridged
 /// provenance still present on the merged response-header map.
 ///
 /// Used by the mesh-mTLS translated path before `after_proxy` promotes the
 /// bridge headers into metadata, so [`BufferedInitialResponseHeaderPolicyState`]
 /// can track genuine initial headers separately from application trailers.
-/// Returns `(initial_headers, trailers, shadowed_keys)`.
 pub fn capture_bridged_trailer_split_for_policy(
     response_headers: &HashMap<String, String>,
-) -> Option<(
-    HashMap<String, String>,
-    HashMap<String, String>,
-    HashSet<String>,
-)> {
+) -> Option<BridgedTrailerSplit> {
     let encoded_names = response_headers.get(HEADER_GRPC_WEB_TRAILER_NAMES)?;
     let shadowed = response_headers
         .get(HEADER_GRPC_WEB_SHADOWED_TRAILERS)
@@ -1049,7 +1064,11 @@ pub fn capture_bridged_trailer_split_for_policy(
             initial.retain(|key, _| !key.eq_ignore_ascii_case(name));
         }
     }
-    Some((initial, trailers, shadowed_keys))
+    Some(BridgedTrailerSplit {
+        initial_headers: initial,
+        trailers,
+        shadowed_keys,
+    })
 }
 
 /// Move mesh-mTLS trailer provenance out of the response-header map before
@@ -1796,10 +1815,12 @@ impl Plugin for GrpcWebPlugin {
             body,
             content_type,
             response_headers,
-            None,
-            None,
-            None,
-            None,
+            TrailerFrameProvenance {
+                http_status: None,
+                trailer_name_allowlist: None,
+                shadowed_trailers: None,
+                policy_state: None,
+            },
         )
     }
 
@@ -1827,10 +1848,12 @@ impl Plugin for GrpcWebPlugin {
             body,
             content_type,
             response_headers,
-            http_status,
-            allowlist.as_ref(),
-            shadowed_trailers.as_ref(),
-            ctx.buffered_initial_response_header_policy(),
+            TrailerFrameProvenance {
+                http_status,
+                trailer_name_allowlist: allowlist.as_ref(),
+                shadowed_trailers: shadowed_trailers.as_ref(),
+                policy_state: ctx.buffered_initial_response_header_policy(),
+            },
         )
     }
 }

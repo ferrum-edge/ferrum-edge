@@ -23884,7 +23884,7 @@ async fn handle_proxy_request_inner(
     // BufferedInitialResponseHeaderPolicyState outcomes as the direct gRPC pool.
     let mut mesh_grpc_web_trailer_reconcile = None;
     if grpc_request_is_web_translated
-        && let Some((initial_headers, trailers, shadowed_keys)) =
+        && let Some(split) =
             crate::plugins::grpc_web::capture_bridged_trailer_split_for_policy(&response_headers)
     {
         let mut merged_for_policy = response_headers.clone();
@@ -23892,10 +23892,10 @@ async fn handle_proxy_request_inner(
         merged_for_policy.remove("x-ferrum-grpc-web-shadowed-trailers");
         ctx.begin_buffered_initial_response_header_policy(
             plugin_cache_view.initial_response_header_policy_names(),
-            &initial_headers,
+            &split.initial_headers,
             &merged_for_policy,
         );
-        mesh_grpc_web_trailer_reconcile = Some((initial_headers, trailers, shadowed_keys));
+        mesh_grpc_web_trailer_reconcile = Some(split);
     }
     // The shadowed-trailer bridge can contain application metadata values.
     // Promote and strip it before any response hook (including transaction
@@ -24089,8 +24089,11 @@ async fn handle_proxy_request_inner(
         response_body_rejected |= response_replaced;
         // Mesh translated gRPC-Web: reconcile bridged trailers with policy state
         // and rewrite the body trailer frame so it matches native H2/H3 semantics.
-        if let Some((initial_headers, mut trailers, shadowed_keys)) =
-            mesh_grpc_web_trailer_reconcile.take()
+        if let Some(crate::plugins::grpc_web::BridgedTrailerSplit {
+            mut trailers,
+            initial_headers,
+            shadowed_keys,
+        }) = mesh_grpc_web_trailer_reconcile.take()
         {
             ctx.record_buffered_initial_response_header_later_mutations(&mut response_headers);
             let policy_state = ctx.take_buffered_initial_response_header_policy();
