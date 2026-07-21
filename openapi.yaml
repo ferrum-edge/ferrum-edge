@@ -17501,7 +17501,12 @@ components:
         and native gRPC (HTTP/2) wire formats. Supports binary
         (application/grpc-web) and text (application/grpc-web-text) encoding.
         Config must be a JSON object (not null); `{}` and objects that only set
-        `expose_headers` are accepted. Unknown keys are rejected.
+        `expose_headers` are accepted. Unknown keys are rejected. When a backend
+        or intermediary response omits a valid numeric grpc-status, the response
+        trailer frame synthesizes status from the official HTTP-to-gRPC client
+        mapping (400→13, 401→16, 403→7, 404→12, 429/502/503/504→14, others→2);
+        a valid supplied grpc-status remains authoritative. The client-visible
+        HTTP status is not rewritten to 200 on this path.
       properties:
         expose_headers:
           type: array

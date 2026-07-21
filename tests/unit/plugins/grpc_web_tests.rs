@@ -1355,6 +1355,19 @@ fn test_build_trailer_frame_empty_status_reports_unknown() {
 }
 
 #[test]
+fn test_build_trailer_frame_malformed_status_uses_http_mapping() {
+    use ferrum_edge::_test_support::build_trailer_frame_with_http_status;
+    let mut headers = HashMap::new();
+    headers.insert("grpc-status".to_string(), "abc".to_string());
+
+    let frame = build_trailer_frame_with_http_status(&headers, Some(503));
+    let trailer_str = String::from_utf8_lossy(&frame[5..]);
+    assert!(trailer_str.contains("grpc-status: 14"));
+    assert!(!trailer_str.contains("abc"));
+    assert_eq!(trailer_str.matches("grpc-status:").count(), 1);
+}
+
+#[test]
 fn test_build_trailer_frame_non_numeric_status_reports_unknown() {
     use ferrum_edge::_test_support::build_trailer_frame;
     let mut headers = HashMap::new();
@@ -1401,6 +1414,236 @@ async fn test_transform_response_body_missing_grpc_status_reports_unknown() {
     let trailer_str = String::from_utf8_lossy(&output[5..5 + trailer_len]);
     assert!(trailer_str.contains("grpc-status: 2"));
     assert!(!trailer_str.contains("grpc-status: 0"));
+}
+
+#[test]
+fn test_http_response_status_to_grpc_status_official_mapping_table() {
+    use ferrum_edge::_test_support::http_response_status_to_grpc_status;
+
+    // Every row of
+    // https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md
+    let cases = [
+        (400, 13), // INTERNAL
+        (401, 16), // UNAUTHENTICATED
+        (403, 7),  // PERMISSION_DENIED
+        (404, 12), // UNIMPLEMENTED
+        (429, 14), // UNAVAILABLE
+        (502, 14), // UNAVAILABLE
+        (503, 14), // UNAVAILABLE
+        (504, 14), // UNAVAILABLE
+        (200, 2),  // UNKNOWN (completed response still lacking grpc-status)
+        (418, 2),  // UNKNOWN (unmapped)
+        (500, 2),  // UNKNOWN (unmapped 5xx)
+        (301, 2),  // UNKNOWN (unmapped 3xx)
+    ];
+    for (http_status, expected_grpc) in cases {
+        assert_eq!(
+            http_response_status_to_grpc_status(http_status),
+            expected_grpc,
+            "HTTP {http_status} must map to gRPC {expected_grpc}"
+        );
+    }
+}
+
+#[test]
+fn test_build_trailer_frame_maps_http_status_when_grpc_status_missing() {
+    use ferrum_edge::_test_support::build_trailer_frame_with_http_status;
+
+    let cases = [
+        (401, "grpc-status: 16"),
+        (403, "grpc-status: 7"),
+        (404, "grpc-status: 12"),
+        (429, "grpc-status: 14"),
+        (502, "grpc-status: 14"),
+        (503, "grpc-status: 14"),
+        (504, "grpc-status: 14"),
+        (400, "grpc-status: 13"),
+        (418, "grpc-status: 2"),
+        (200, "grpc-status: 2"),
+    ];
+    for (http_status, expected) in cases {
+        let frame = build_trailer_frame_with_http_status(&HashMap::new(), Some(http_status));
+        let trailer_str = String::from_utf8_lossy(&frame[5..]);
+        assert!(
+            trailer_str.contains(expected),
+            "HTTP {http_status}: expected {expected} in {trailer_str}"
+        );
+        assert_eq!(trailer_str.matches("grpc-status:").count(), 1);
+    }
+}
+
+#[test]
+fn test_build_trailer_frame_keeps_valid_grpc_status_over_http_mapping() {
+    use ferrum_edge::_test_support::build_trailer_frame_with_http_status;
+
+    let mut headers = HashMap::new();
+    headers.insert("grpc-status".to_string(), "5".to_string());
+    headers.insert("grpc-message".to_string(), "not found".to_string());
+
+    // Non-200 HTTP must not override a valid backend grpc-status.
+    let frame = build_trailer_frame_with_http_status(&headers, Some(503));
+    let trailer_str = String::from_utf8_lossy(&frame[5..]);
+    assert!(trailer_str.contains("grpc-status: 5"));
+    assert!(trailer_str.contains("grpc-message: not found"));
+    assert!(!trailer_str.contains("grpc-status: 14"));
+    assert!(!trailer_str.contains("grpc-status: 2"));
+}
+
+async fn grpc_web_response_after_proxy_and_transform(
+    request_content_type: &str,
+    http_status: u16,
+    backend_headers: HashMap<String, String>,
+    body: &[u8],
+) -> (u16, HashMap<String, String>, Vec<u8>) {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context(request_content_type);
+    let received = plugin.on_request_received(&mut ctx).await;
+    assert!(matches!(received, PluginResult::Continue));
+
+    let mut response_headers = backend_headers;
+    let after = plugin
+        .after_proxy(&mut ctx, http_status, &mut response_headers)
+        .await;
+    assert!(
+        matches!(after, PluginResult::Continue),
+        "after_proxy must not replace the response; client-visible HTTP status stays {http_status}"
+    );
+
+    let output = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            body,
+            response_headers.get("content-type").map(String::as_str),
+            &response_headers,
+        )
+        .await
+        .expect("gRPC-Web response body should be transformed");
+
+    (http_status, response_headers, output)
+}
+
+#[tokio::test]
+async fn test_binary_maps_http_401_404_503_and_unmapped_without_grpc_status() {
+    let cases = [
+        (401, "16"),
+        (404, "12"),
+        (503, "14"),
+        (418, "2"),
+    ];
+    for (http_status, expected_grpc) in cases {
+        let (_status, headers, output) = grpc_web_response_after_proxy_and_transform(
+            "application/grpc-web+proto",
+            http_status,
+            HashMap::from([("content-type".to_string(), "application/grpc".to_string())]),
+            b"",
+        )
+        .await;
+
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/grpc-web+proto")
+        );
+        assert_eq!(output[0], 0x80);
+        let payload = grpc_web_trailer_payload(&output);
+        assert!(
+            payload.contains(&format!("grpc-status: {expected_grpc}")),
+            "HTTP {http_status}: got {payload}"
+        );
+        assert_eq!(payload.matches("grpc-status:").count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn test_text_maps_http_401_404_503_and_unmapped_without_grpc_status() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let cases = [
+        (401, "16"),
+        (404, "12"),
+        (503, "14"),
+        (418, "2"),
+    ];
+    for (http_status, expected_grpc) in cases {
+        let (_status, headers, output) = grpc_web_response_after_proxy_and_transform(
+            "application/grpc-web-text",
+            http_status,
+            HashMap::from([("content-type".to_string(), "application/grpc".to_string())]),
+            b"",
+        )
+        .await;
+
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/grpc-web-text")
+        );
+        let decoded = BASE64.decode(&output).expect("text mode body is base64");
+        assert_eq!(decoded[0], 0x80);
+        let payload = grpc_web_trailer_payload(&decoded);
+        assert!(
+            payload.contains(&format!("grpc-status: {expected_grpc}")),
+            "HTTP {http_status}: got {payload}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_non_200_with_supplied_grpc_status_stays_authoritative_binary_and_text() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    // Backend HTTP 503 with an explicit grpc-status must win over the mapping.
+    let backend = HashMap::from([
+        ("content-type".to_string(), "application/grpc".to_string()),
+        ("grpc-status".to_string(), "8".to_string()),
+        ("grpc-message".to_string(), "resource exhausted".to_string()),
+    ]);
+
+    let (_status, _headers, binary) = grpc_web_response_after_proxy_and_transform(
+        "application/grpc-web",
+        503,
+        backend.clone(),
+        b"",
+    )
+    .await;
+    let binary_payload = grpc_web_trailer_payload(&binary);
+    assert!(binary_payload.contains("grpc-status: 8"));
+    assert!(binary_payload.contains("grpc-message: resource exhausted"));
+    assert!(!binary_payload.contains("grpc-status: 14"));
+
+    let (_status, _headers, text) = grpc_web_response_after_proxy_and_transform(
+        "application/grpc-web-text+proto",
+        503,
+        backend,
+        b"",
+    )
+    .await;
+    let decoded = BASE64.decode(&text).expect("text mode body is base64");
+    let text_payload = grpc_web_trailer_payload(&decoded);
+    assert!(text_payload.contains("grpc-status: 8"));
+    assert!(text_payload.contains("grpc-message: resource exhausted"));
+    assert!(!text_payload.contains("grpc-status: 14"));
+}
+
+#[tokio::test]
+async fn test_after_proxy_preserves_client_visible_http_status_contract() {
+    // Decision for #2504: keep the backend HTTP status on the wire; only the
+    // body trailer synthesizes the mapped grpc-status. after_proxy must not
+    // Reject/replace the response to force HTTP 200.
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let result = plugin
+        .after_proxy(&mut ctx, 503, &mut response_headers)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata.get("grpc_web_http_status").map(String::as_str),
+        Some("503")
+    );
 }
 
 #[test]

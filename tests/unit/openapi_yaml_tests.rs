@@ -4488,6 +4488,18 @@ fn grpc_web_schema_matches_the_strict_runtime_shape() {
         .expect("grpc_web docs section");
     assert!(grpc_web_docs.contains("`null` is not an alias for `{}`"));
     assert!(grpc_web_docs.contains("KeepLastKnownGood"));
+    assert!(
+        grpc_web_docs.contains("HTTP-to-gRPC client mapping"),
+        "grpc_web docs must describe non-gRPC HTTP status synthesis"
+    );
+    assert!(
+        description.contains("HTTP-to-gRPC client mapping"),
+        "GrpcWebConfig OpenAPI description must document status synthesis"
+    );
+    assert!(
+        description.contains("not rewritten to 200"),
+        "GrpcWebConfig OpenAPI description must document client-visible HTTP status contract"
+    );
 }
 
 #[test]
