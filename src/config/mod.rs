@@ -21,6 +21,7 @@ pub(crate) mod incremental_apply;
 pub mod migrations;
 pub mod mongo_store;
 pub mod pool_config;
+pub mod public_env_inventory;
 pub mod types;
 pub(crate) mod validation_pipeline;
 
