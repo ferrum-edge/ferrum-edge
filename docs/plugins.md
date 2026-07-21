@@ -1047,7 +1047,19 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
 }
 ```
 
-Rejected requests have `backend_target: null` (no backend was contacted), latency fields at -1.0, and `metadata.rejection_phase` indicating which plugin phase rejected the request. Possible `rejection_phase` values: `authenticate`, `authorize`, `before_proxy`, `grpc_backend_error`, `websocket_backend_error`. Gateway-generated gRPC errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log sinks can distinguish gRPC failures even though the downstream HTTP status is `200`.
+Rejected requests have `backend_target: null` (no backend was contacted), latency fields at -1.0, and `metadata.rejection_phase` indicating which plugin phase or gateway admission gate rejected the request. Possible `rejection_phase` values: `authenticate`, `authorize`, `before_proxy`, `allowed_methods`, `grpc_backend_error`, `websocket_backend_error`. Gateway-generated gRPC errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log sinks can distinguish gRPC failures even though the downstream HTTP status is `200`.
+
+##### Pre-plugin routing and method failures in transaction logs
+
+Terminal transaction logging is independent of ordinary request hooks:
+
+| Outcome | Status | Transaction log | Ordinary request hooks (`on_request_received`, auth, transform, mirror, …) |
+| --- | --- | --- | --- |
+| Unmatched route | 404 | Not emitted (no matched proxy / plugin-cache view) | Not run |
+| Matched proxy, method absent from `allowed_methods` | 405 (+ authoritative `Allow`) | Emitted once with `rejection_phase: "allowed_methods"`, matched proxy/namespace, method/path, and client identity available at that phase | Not run |
+| Matched native gRPC with non-`POST` method | protocol reject (typically 400 / gRPC `INVALID_ARGUMENT`) | Not emitted by the method-admission gate today | Not run |
+
+H1, H2, and H3 share this contract. The matched-proxy 405 path selects protocol-appropriate terminal logging/mirror hooks from one immutable plugin-cache generation and does not double-count with a later success path.
 
 #### Example: TCP Stream
 

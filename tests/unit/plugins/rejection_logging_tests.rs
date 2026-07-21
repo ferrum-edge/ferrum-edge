@@ -123,6 +123,7 @@ async fn test_log_rejected_request_all_phases() {
         ("authenticate", 401),
         ("authorize", 403),
         ("before_proxy", 429),
+        ("allowed_methods", 405),
         ("grpc_backend_error", 200),
     ];
 
@@ -197,4 +198,54 @@ async fn test_rejected_request_summary_no_backend_fields() {
         Some(&"authenticate".to_string())
     );
     assert!(summary.consumer_username.is_none());
+}
+
+#[tokio::test]
+async fn test_log_rejected_request_allowed_methods_phase_attributes_proxy() {
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+
+    struct CapturingLogger {
+        captured: Mutex<Vec<TransactionSummary>>,
+    }
+
+    #[async_trait]
+    impl Plugin for CapturingLogger {
+        fn name(&self) -> &str {
+            "capturing_logger"
+        }
+
+        fn priority(&self) -> u16 {
+            plugin_priority::STDOUT_LOGGING
+        }
+
+        async fn log(&self, summary: &TransactionSummary) {
+            self.captured.lock().unwrap().push(summary.clone());
+        }
+    }
+
+    let logger = Arc::new(CapturingLogger {
+        captured: Mutex::new(Vec::new()),
+    });
+    let plugins: Vec<Arc<dyn Plugin>> = vec![logger.clone()];
+
+    let mut ctx = create_test_context();
+    ctx.method = "POST".to_string();
+    ctx.path = "/allowed".to_string();
+    ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+
+    let start = Instant::now();
+    log_rejected_request(&plugins, &ctx, 405, start, "allowed_methods", 0).await;
+
+    let summaries = logger.captured.lock().unwrap();
+    assert_eq!(summaries.len(), 1);
+    let summary = &summaries[0];
+    assert_eq!(summary.response_status_code, 405);
+    assert_eq!(summary.http_method, "POST");
+    assert_eq!(summary.request_path, "/allowed");
+    assert_eq!(summary.proxy_id, Some("test-proxy".to_string()));
+    assert_eq!(
+        summary.metadata.get("rejection_phase"),
+        Some(&"allowed_methods".to_string())
+    );
 }

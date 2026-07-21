@@ -32,7 +32,7 @@ A comprehensive feature list for Ferrum Edge.
 - **Host-only routing** — HTTP proxies can match purely on `hosts` with no `listen_path`. A host-only proxy serves any path under the configured host. Per-host matching order: exact path → prefix path → regex path → host-only fallback.
 - Pre-sorted route table with bounded O(1) path cache, rebuilt atomically on config changes
 - Configurable path stripping and backend path prefixing
-- Per-proxy HTTP method filtering (`allowed_methods`) with 405 Method Not Allowed responses
+- Per-proxy HTTP method filtering (`allowed_methods`) with 405 Method Not Allowed responses and terminal transaction logging (`rejection_phase: allowed_methods`)
 - Per-proxy WebSocket Origin validation (`allowed_ws_origins`) for CSWSH protection (RFC 6455 §10.2)
 
 ## Load Balancing

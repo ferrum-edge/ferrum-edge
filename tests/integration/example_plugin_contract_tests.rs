@@ -31,8 +31,10 @@ fn h1_h2_route_miss_and_method_rejection_precede_request_hooks() {
         &[
             "No route matched for request path",
             "StatusCode::NOT_FOUND",
-            "// Per-proxy HTTP method filtering (checked before plugins to save work)",
+            "// Per-proxy HTTP method filtering (checked before plugins to save work).",
             "StatusCode::METHOD_NOT_ALLOWED",
+            "log_rejected_request(",
+            "\"allowed_methods\"",
             "// gRPC spec mandates POST method.",
             "StatusCode::BAD_REQUEST",
             "let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);",
@@ -50,8 +52,10 @@ fn h3_route_miss_and_method_rejection_precede_request_hooks() {
         "H3 proxy",
         &[
             "StatusCode::NOT_FOUND",
-            "// Per-proxy HTTP method filtering (checked before plugins to save work)",
+            "// Per-proxy HTTP method filtering (checked before plugins to save work).",
             "StatusCode::METHOD_NOT_ALLOWED",
+            "log_rejected_request(",
+            "\"allowed_methods\"",
             "// gRPC spec mandates POST.",
             "StatusCode::BAD_REQUEST",
             "// Execute on_request_received hooks",
@@ -117,10 +121,12 @@ fn trait_example_and_guides_describe_the_same_request_boundary() {
             "matched request with a disallowed method returns 405 without running either"
         )
     );
+    assert!(CUSTOM_PLUGIN_GUIDE.contains("rejection_phase = \"allowed_methods\""));
     assert!(
         EXECUTION_ORDER_GUIDE
             .contains("`on_request_received` is therefore a post-route, post-allowed-method hook")
     );
+    assert!(EXECUTION_ORDER_GUIDE.contains("rejection_phase = \"allowed_methods\""));
     for source in [
         TRAIT_SOURCE,
         EXAMPLE_SOURCE,

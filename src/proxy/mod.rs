@@ -18323,7 +18323,10 @@ async fn handle_proxy_request_inner(
         .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
 
-    // Per-proxy HTTP method filtering (checked before plugins to save work)
+    // Per-proxy HTTP method filtering (checked before plugins to save work).
+    // Ordinary request hooks stay skipped, but terminal transaction logging
+    // still runs from the protocol-filtered plugin-cache view so sinks can
+    // attribute the matched-proxy 405.
     if let Some(ref allowed) = proxy.allowed_methods
         && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
     {
@@ -18343,10 +18346,28 @@ async fn handle_proxy_request_inner(
             initial_response_header_policy_plugins.as_ref(),
         );
         restore_authoritative_allow_header(&mut reject.headers, &allow_header);
+        // Empty plugin list: do not run after_proxy / request hooks merely to
+        // shape the response. Logging uses a separate immutable cache view.
         let grpc_web_response =
             build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
                 .await;
-        record_status(&state, reject.http_status.as_u16());
+        // Metrics and transaction logs keep the admission status (405) even when
+        // native gRPC reshapes the client-visible HTTP status to trailers-only
+        // 200 + grpc-status.
+        record_status(&state, StatusCode::METHOD_NOT_ALLOWED.as_u16());
+        let logging_plugins = epoch
+            .plugin_cache
+            .request_view(&proxy.id, request_protocol)
+            .plugins();
+        log_rejected_request(
+            &logging_plugins,
+            &ctx,
+            StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+            start_time,
+            "allowed_methods",
+            0,
+        )
+        .await;
         if let Some(response) = grpc_web_response {
             return Ok(response);
         }

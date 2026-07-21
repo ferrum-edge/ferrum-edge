@@ -5239,8 +5239,11 @@ pub trait Plugin: Send + Sync {
     /// and a matched route with a disallowed method returns 405, before any
     /// `on_request_received` hook runs. Consequently neither global nor scoped
     /// implementations observe those two early terminal paths on H1, H2, or H3.
-    /// Terminal transaction logging is a separate lifecycle concern and must
-    /// not be inferred from whether this ordinary request hook ran.
+    /// Matched-proxy `allowed_methods` 405 responses still emit one terminal
+    /// transaction summary (`rejection_phase = "allowed_methods"`) without
+    /// running this or other ordinary request-policy hooks. Terminal
+    /// transaction logging is a separate lifecycle concern and must not be
+    /// inferred from whether this ordinary request hook ran.
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {
         PluginResult::Continue
     }
