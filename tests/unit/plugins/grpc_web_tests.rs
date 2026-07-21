@@ -1762,6 +1762,79 @@ async fn test_transform_with_provenance_uses_true_shadowed_trailer_value() {
     assert!(!payload.contains("x-shared-meta"));
 }
 
+#[tokio::test]
+async fn test_transform_missing_collision_provenance_fails_closed() {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+
+    let initial_headers = HashMap::from([(
+        "x-shared-meta".to_string(),
+        "initial-secret".to_string(),
+    )]);
+    let trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("x-shared-meta".to_string(), "trailer-value".to_string()),
+    ]);
+    ferrum_edge::plugins::grpc_web::record_backend_trailer_provenance_for_frame(
+        &mut ctx.metadata,
+        &initial_headers,
+        &trailers,
+    );
+    ctx.metadata.remove("grpc_web_shadowed_trailers");
+
+    let response_headers = HashMap::from([
+        (
+            "content-type".to_string(),
+            "application/grpc-web".to_string(),
+        ),
+        ("grpc-status".to_string(), "0".to_string()),
+        ("x-shared-meta".to_string(), "initial-secret".to_string()),
+    ]);
+    let output = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"",
+            Some("application/grpc-web"),
+            &response_headers,
+        )
+        .await
+        .expect("transform");
+    let payload = grpc_web_trailer_payload(&output);
+    assert!(payload.contains("grpc-status: 0"));
+    assert!(
+        !payload.contains("x-shared-meta"),
+        "missing collision provenance must not frame an initial header: {payload}"
+    );
+}
+
+#[test]
+fn test_mesh_bridge_promotion_strips_value_bearing_internal_headers() {
+    let trailers = HashMap::from([(
+        "x-shared-meta".to_string(),
+        "trailer-secret".to_string(),
+    )]);
+    let mut response_headers = HashMap::from([(
+        "x-shared-meta".to_string(),
+        "initial-secret".to_string(),
+    )]);
+    ferrum_edge::plugins::grpc_web::bridge_backend_trailer_provenance_for_frame(
+        &mut response_headers,
+        &trailers,
+    );
+
+    let mut metadata = HashMap::new();
+    ferrum_edge::plugins::grpc_web::promote_bridged_trailer_provenance(
+        &mut metadata,
+        &mut response_headers,
+    );
+
+    assert!(!response_headers.contains_key("x-ferrum-grpc-web-trailer-names"));
+    assert!(!response_headers.contains_key("x-ferrum-grpc-web-shadowed-trailers"));
+    assert!(metadata.contains_key("grpc_web_trailer_names"));
+    assert!(metadata.contains_key("grpc_web_shadowed_trailers"));
+}
+
 #[test]
 fn test_build_trailer_frame_missing_status_defaults_to_unknown() {
     use ferrum_edge::_test_support::{GRPC_FRAME_TRAILER, build_trailer_frame};

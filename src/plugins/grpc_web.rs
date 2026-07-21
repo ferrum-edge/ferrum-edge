@@ -924,6 +924,13 @@ pub fn record_backend_trailer_names_for_frame(
         META_GRPC_WEB_TRAILER_NAMES.to_string(),
         encode_trailer_names_for_frame(trailers),
     );
+    // A names-only caller has no same-name initial/trailer collisions to
+    // preserve. Still install a valid empty collision map so a missing payload
+    // can unambiguously mean corrupt/incomplete internal provenance later.
+    metadata.insert(
+        META_GRPC_WEB_SHADOWED_TRAILERS.to_string(),
+        BASE64.encode(b"{}"),
+    );
 }
 
 fn encode_shadowed_trailers_for_frame(
@@ -980,6 +987,10 @@ pub fn bridge_backend_trailer_names_for_frame(
     response_headers.insert(
         HEADER_GRPC_WEB_TRAILER_NAMES.to_string(),
         encode_trailer_names_for_frame(trailers),
+    );
+    response_headers.insert(
+        HEADER_GRPC_WEB_SHADOWED_TRAILERS.to_string(),
+        BASE64.encode(b"{}"),
     );
 }
 
@@ -1039,6 +1050,22 @@ pub fn capture_bridged_trailer_split_for_policy(
         }
     }
     Some((initial, trailers, shadowed_keys))
+}
+
+/// Move mesh-mTLS trailer provenance out of the response-header map before
+/// response hooks run. The collision payload can contain application metadata
+/// values and therefore must become redacted request-local metadata before a
+/// debugger or custom hook can observe the backend response headers.
+pub fn promote_bridged_trailer_provenance(
+    metadata: &mut HashMap<String, String>,
+    response_headers: &mut HashMap<String, String>,
+) {
+    if let Some(encoded) = response_headers.remove(HEADER_GRPC_WEB_TRAILER_NAMES) {
+        metadata.insert(META_GRPC_WEB_TRAILER_NAMES.to_string(), encoded);
+    }
+    if let Some(encoded) = response_headers.remove(HEADER_GRPC_WEB_SHADOWED_TRAILERS) {
+        metadata.insert(META_GRPC_WEB_SHADOWED_TRAILERS.to_string(), encoded);
+    }
 }
 
 fn decode_shadowed_trailers_payload(encoded: &str) -> Option<HashMap<String, [String; 2]>> {
@@ -1789,10 +1816,11 @@ impl Plugin for GrpcWebPlugin {
             .and_then(|value| value.parse::<u16>().ok());
         let mut allowlist = trailer_name_allowlist_from_metadata(&ctx.metadata);
         let shadowed_trailers = shadowed_trailers_from_metadata(&ctx.metadata);
-        if ctx.metadata.contains_key(META_GRPC_WEB_SHADOWED_TRAILERS) && shadowed_trailers.is_none()
-        {
+        if allowlist.is_some() && shadowed_trailers.is_none() {
             // Corrupt internal provenance must not fall back to framing a
-            // same-name initial header. Retain only reserved terminal metadata.
+            // same-name initial header. Every core and names-only recorder
+            // installs a collision payload, so absence is incomplete internal
+            // state. Retain only reserved terminal metadata.
             allowlist = Some(HashSet::new());
         }
         self.transform_grpc_web_response_body(

@@ -23897,6 +23897,13 @@ async fn handle_proxy_request_inner(
         );
         mesh_grpc_web_trailer_reconcile = Some((initial_headers, trailers, shadowed_keys));
     }
+    // The shadowed-trailer bridge can contain application metadata values.
+    // Promote and strip it before any response hook (including transaction
+    // debugging) can inspect or log the backend response-header map.
+    crate::plugins::grpc_web::promote_bridged_trailer_provenance(
+        &mut ctx.metadata,
+        &mut response_headers,
+    );
 
     // after_proxy hooks run before anything is sent downstream, so a plugin may
     // still replace the backend response here (for example, content-length fast-path
