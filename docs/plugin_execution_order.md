@@ -143,13 +143,18 @@ a pre-routing receipt hook. Once it runs, `ctx.matched_proxy` is populated and
 the plugin list is the resolved view for that proxy: applicable global plugins
 plus proxy/proxy-group-scoped plugins. Unmatched 404 responses run neither
 global nor scoped hooks because there is no proxy view to select. Matched 405
-responses also return before either kind of hook runs.
-Native gRPC requests must also use `POST` before this hook runs.
+responses also return before either kind of ordinary request hook runs, but
+they still emit one terminal transaction summary from the protocol-filtered
+plugin-cache view (`metadata.rejection_phase = "allowed_methods"`) without
+running authentication, transformation, mirroring, or other request-policy
+hooks. Native gRPC requests must also use `POST` before this hook runs.
 A matched request using a different method is rejected at its protocol
 admission gate before either kind of hook, even if `allowed_methods` permits
-that method. H1, H2, and H3 share these blind spots. Terminal transaction
-logging is separate from ordinary request hooks; whether a terminal summary
-exists must not be inferred from whether `on_request_received` ran.
+that method. H1, H2, and H3 share the ordinary-hook blind spots for unmatched
+404 and gRPC non-POST admission; matched-proxy `allowed_methods` 405 responses
+are included in transaction logs. Terminal transaction logging is separate from
+ordinary request hooks; whether a terminal summary exists must not be inferred
+from whether `on_request_received` ran.
 
 Any plugin can short-circuit the pipeline by returning a `Reject` result. For example, a native direct CORS policy returns a `204` preflight response in phase 1 without ever reaching authentication (an Istio projection returns its source-compatible 200). Rate limiting returns `429` in the authorize phase (phase 3) after the consumer is identified.
 
