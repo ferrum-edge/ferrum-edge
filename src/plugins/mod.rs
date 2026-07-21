@@ -27,6 +27,7 @@
 
 pub mod a2a_gateway;
 pub mod access_control;
+pub mod builtin_parity;
 pub mod adaptive_concurrency;
 pub mod ai_federation;
 pub mod ai_prompt_compressor;
@@ -107,6 +108,10 @@ pub mod ws_logging;
 pub mod ws_message_size_limiting;
 pub mod ws_rate_limiting;
 
+pub use builtin_parity::{
+    BUILTIN_PLUGIN_PARITY_META, BuiltinPluginClassification, BuiltinPluginParityMeta,
+    builtin_plugin_parity_meta,
+};
 pub use utils::PluginHttpClient;
 
 use async_trait::async_trait;
@@ -4950,7 +4955,7 @@ pub struct StreamTransactionSummary {
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_transcript_audit (2924), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
