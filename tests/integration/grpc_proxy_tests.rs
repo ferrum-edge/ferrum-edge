@@ -712,9 +712,7 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
             Method::POST,
             "/grpc-accept/my.Service/Unary",
             "application/grpc-web+json",
-            Some(
-                "text/html, Application/Grpc-Web-Text+Json; charset=utf-8; Q=0.8",
-            ),
+            Some("text/html, Application/Grpc-Web-Text+Json; charset=utf-8; Q=0.8"),
         )
         .await
         .unwrap_or_else(|error| panic!("{version:?} text-negotiated request failed: {error}"));

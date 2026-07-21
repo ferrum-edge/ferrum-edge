@@ -15271,20 +15271,15 @@ pub(crate) fn normalize_reject_response(
     headers: &HashMap<String, String>,
     is_grpc_request: bool,
 ) -> NormalizedRejectResponse {
-    let grpc_web_accept_rejected = headers
-        .keys()
-        .any(|name| {
-            name.eq_ignore_ascii_case(
-                crate::plugins::grpc_web::HEADER_GRPC_WEB_ACCEPT_REJECTED,
-            )
-        });
+    let grpc_web_accept_rejected = headers.keys().any(|name| {
+        name.eq_ignore_ascii_case(crate::plugins::grpc_web::HEADER_GRPC_WEB_ACCEPT_REJECTED)
+    });
     if !is_grpc_request || grpc_web_accept_rejected {
         let mut normalized_headers = headers
             .iter()
             .filter(|(name, _)| {
-                !name.eq_ignore_ascii_case(
-                    crate::plugins::grpc_web::HEADER_GRPC_WEB_ACCEPT_REJECTED,
-                )
+                !name
+                    .eq_ignore_ascii_case(crate::plugins::grpc_web::HEADER_GRPC_WEB_ACCEPT_REJECTED)
             })
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<HashMap<_, _>>();
@@ -17939,11 +17934,9 @@ async fn handle_proxy_request_inner(
                         req.headers(),
                         state.max_header_size_bytes,
                     );
-                Some(
-                    negotiated.unwrap_or_else(|_| {
-                        crate::plugins::grpc_web::response_content_type(content_type)
-                    }),
-                )
+                Some(negotiated.unwrap_or_else(|_| {
+                    crate::plugins::grpc_web::response_content_type(content_type)
+                }))
             })
     };
     let grpc_web_request = grpc_web_response_content_type_owned.is_some();
@@ -28658,9 +28651,10 @@ pub(crate) fn client_grpc_deadline_exceeded_response_for_request(
     else {
         return client_grpc_deadline_exceeded_response(resolved_ip);
     };
-    let response_content_type = crate::plugins::grpc_web::retained_response_content_type(request_ctx)
-        .map(str::to_owned)
-        .unwrap_or_else(|| crate::plugins::grpc_web::response_content_type(content_type));
+    let response_content_type =
+        crate::plugins::grpc_web::retained_response_content_type(request_ctx)
+            .map(str::to_owned)
+            .unwrap_or_else(|| crate::plugins::grpc_web::response_content_type(content_type));
     let translated = crate::plugins::grpc_web::error_response_for_content_type(
         &response_content_type,
         grpc_proxy::grpc_status::DEADLINE_EXCEEDED,

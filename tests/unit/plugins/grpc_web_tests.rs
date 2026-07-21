@@ -231,7 +231,13 @@ async fn test_request_decode_mode_is_independent_from_accept_response_mode() {
         plugin.on_request_received(&mut binary_request).await,
         PluginResult::Continue
     ));
-    assert_eq!(binary_request.metadata.get("grpc_web_mode").map(String::as_str), Some("binary"));
+    assert_eq!(
+        binary_request
+            .metadata
+            .get("grpc_web_mode")
+            .map(String::as_str),
+        Some("binary")
+    );
     assert_eq!(
         binary_request
             .metadata
@@ -249,7 +255,13 @@ async fn test_request_decode_mode_is_independent_from_accept_response_mode() {
         plugin.on_request_received(&mut text_request).await,
         PluginResult::Continue
     ));
-    assert_eq!(text_request.metadata.get("grpc_web_mode").map(String::as_str), Some("text"));
+    assert_eq!(
+        text_request
+            .metadata
+            .get("grpc_web_mode")
+            .map(String::as_str),
+        Some("text")
+    );
     assert_eq!(
         text_request
             .metadata
@@ -1456,9 +1468,7 @@ fn test_accept_negotiation_lists_weights_wildcards_and_suffixes() {
         ),
         (
             "application/grpc-web+json",
-            Some(
-                "application/grpc-web-text+proto;q=0.9, application/grpc-web-text+json;q=0.2",
-            ),
+            Some("application/grpc-web-text+proto;q=0.9, application/grpc-web-text+json;q=0.2"),
             "application/grpc-web-text+proto",
         ),
     ] {

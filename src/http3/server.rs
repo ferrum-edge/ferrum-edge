@@ -1022,11 +1022,9 @@ async fn handle_h3_request(
                         req.headers(),
                         state.max_header_size_bytes,
                     );
-                Some(
-                    negotiated.unwrap_or_else(|_| {
-                        crate::plugins::grpc_web::response_content_type(content_type)
-                    }),
-                )
+                Some(negotiated.unwrap_or_else(|_| {
+                    crate::plugins::grpc_web::response_content_type(content_type)
+                }))
             })
     };
     let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();

@@ -107,8 +107,7 @@ const META_GRPC_WEB_ACCEPT_REJECTED: &str = "grpc_web_accept_rejected";
 /// negotiation rejection. The shared rejection normalizer consumes it to keep
 /// this protocol-level failure as HTTP 406 instead of translating it into an
 /// HTTP-200 gRPC status response.
-pub(crate) const HEADER_GRPC_WEB_ACCEPT_REJECTED: &str =
-    "x-ferrum-grpc-web-accept-rejected";
+pub(crate) const HEADER_GRPC_WEB_ACCEPT_REJECTED: &str = "x-ferrum-grpc-web-accept-rejected";
 
 /// Internal proxy header injected by `before_proxy` so that `transform_request_body`
 /// (which lacks access to `ctx.metadata`) can deterministically identify the
@@ -1020,13 +1019,7 @@ pub fn negotiate_response_media_type(
             },
         );
         if replace {
-            best = Some((
-                quality,
-                specificity,
-                matches_request_mode,
-                index,
-                candidate,
-            ));
+            best = Some((quality, specificity, matches_request_mode, index, candidate));
         }
     }
 
@@ -1077,9 +1070,9 @@ pub(crate) fn retain_client_content_type_for_errors(ctx: &mut RequestContext, co
         return;
     }
     let accept = request_accept_header(ctx);
-    let retained = match accept.and_then(|accept| {
-        negotiate_response_media_type(content_type, accept.as_deref())
-    }) {
+    let retained = match accept
+        .and_then(|accept| negotiate_response_media_type(content_type, accept.as_deref()))
+    {
         Ok(negotiated) => negotiated,
         Err(_) => response_content_type(content_type),
     };
@@ -1521,9 +1514,9 @@ impl Plugin for GrpcWebPlugin {
 
         // Response encoding follows Accept negotiation (default: request CT).
         let accept = request_accept_header(ctx);
-        let response_ct = match accept.and_then(|accept| {
-            negotiate_response_media_type(&content_type, accept.as_deref())
-        }) {
+        let response_ct = match accept
+            .and_then(|accept| negotiate_response_media_type(&content_type, accept.as_deref()))
+        {
             Ok(negotiated) => negotiated,
             Err(err) => {
                 debug!(
@@ -1535,13 +1528,11 @@ impl Plugin for GrpcWebPlugin {
                     .insert(META_GRPC_WEB_ACCEPT_REJECTED.to_string(), "1".to_string());
                 return PluginResult::Reject {
                     status_code: 406,
-                    body: r#"{"error":"Not Acceptable: no supported gRPC-Web response media type"}"#
-                        .to_string(),
+                    body:
+                        r#"{"error":"Not Acceptable: no supported gRPC-Web response media type"}"#
+                            .to_string(),
                     headers: HashMap::from([
-                        (
-                            "content-type".to_string(),
-                            "application/json".to_string(),
-                        ),
+                        ("content-type".to_string(), "application/json".to_string()),
                         ("vary".to_string(), "Accept".to_string()),
                         (HEADER_GRPC_WEB_ACCEPT_REJECTED.to_string(), "1".to_string()),
                     ]),
