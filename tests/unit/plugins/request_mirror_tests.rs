@@ -1440,7 +1440,10 @@ async fn test_mirror_strips_hostile_h1_connection_trailer_and_internal_markers()
         observed.get("host").map(String::as_str),
         Some("client.example")
     );
-    assert_eq!(observed.get("x-custom").map(String::as_str), Some("keep-me"));
+    assert_eq!(
+        observed.get("x-custom").map(String::as_str),
+        Some("keep-me")
+    );
     assert_eq!(
         observed.get("authorization").map(String::as_str),
         Some("Bearer keep")

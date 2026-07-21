@@ -151,9 +151,11 @@ fn secondary_filter_host_policy_and_extra_excludes() {
             .iter()
             .any(|(k, v)| k.eq_ignore_ascii_case("host") && v == "gateway.example")
     );
-    assert!(!preserved
-        .iter()
-        .any(|(k, _)| k.eq_ignore_ascii_case("x-loadtesting-key")));
+    assert!(
+        !preserved
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("x-loadtesting-key"))
+    );
     assert!(preserved.iter().any(|(k, _)| k == "x-custom"));
 }
 
@@ -202,9 +204,7 @@ fn synthesize_grpc_te_accepts_native_family_and_rejects_prefix_smuggling() {
         ];
         synthesize_grpc_te_trailers_if_needed(&mut headers);
         assert!(
-            !headers
-                .iter()
-                .any(|(k, _)| k.eq_ignore_ascii_case("te")),
+            !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("te")),
             "non-native content-type `{content_type}` must not inject te: trailers: {headers:?}"
         );
     }

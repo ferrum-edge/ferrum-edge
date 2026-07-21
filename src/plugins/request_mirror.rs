@@ -665,11 +665,7 @@ mod tests {
             "https://[2001:db8::10]:8443/shadow?page=1"
         );
         assert_eq!(
-            plugin.build_mirror_url(
-                "/shadow",
-                Some("tag=red&tag=blue&q=a+b"),
-                &query_params
-            ),
+            plugin.build_mirror_url("/shadow", Some("tag=red&tag=blue&q=a+b"), &query_params),
             "https://[2001:db8::10]:8443/shadow?tag=red&tag=blue&q=a+b"
         );
     }

@@ -125,11 +125,7 @@ impl CapturingBackend {
     }
 
     fn first_target(&self) -> Option<String> {
-        self.targets
-            .lock()
-            .expect("targets lock")
-            .first()
-            .cloned()
+        self.targets.lock().expect("targets lock").first().cloned()
     }
 
     fn clear(&self) {
