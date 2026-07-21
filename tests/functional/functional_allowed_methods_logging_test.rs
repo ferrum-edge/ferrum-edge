@@ -111,7 +111,8 @@ async fn start_http_logging_sink() -> (u16, Arc<Mutex<Vec<Value>>>) {
                         guard.push(entry);
                     }
                 }
-                let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let response =
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
                 let _ = stream.write_all(response.as_bytes()).await;
                 let _ = stream.shutdown().await;
             });
@@ -320,7 +321,8 @@ async fn functional_allowed_methods_405_logs_stdout_and_http_sinks_h1_h2_and_grp
                 extract_access_logs(raw)
                     .iter()
                     .filter(|e| {
-                        e.pointer("/metadata/rejection_phase").and_then(Value::as_str)
+                        e.pointer("/metadata/rejection_phase")
+                            .and_then(Value::as_str)
                             == Some("allowed_methods")
                     })
                     .count()
@@ -333,7 +335,9 @@ async fn functional_allowed_methods_405_logs_stdout_and_http_sinks_h1_h2_and_grp
     let access_logs = extract_access_logs(&stdout)
         .into_iter()
         .filter(|e| {
-            e.pointer("/metadata/rejection_phase").and_then(Value::as_str) == Some("allowed_methods")
+            e.pointer("/metadata/rejection_phase")
+                .and_then(Value::as_str)
+                == Some("allowed_methods")
         })
         .collect::<Vec<_>>();
     assert!(
@@ -366,7 +370,9 @@ async fn functional_allowed_methods_405_logs_stdout_and_http_sinks_h1_h2_and_grp
         .iter()
         .chain(sink_b_entries.iter())
         .filter(|e| {
-            e.pointer("/metadata/rejection_phase").and_then(Value::as_str) == Some("allowed_methods")
+            e.pointer("/metadata/rejection_phase")
+                .and_then(Value::as_str)
+                == Some("allowed_methods")
         })
     {
         assert_eq!(
@@ -450,7 +456,8 @@ async fn functional_allowed_methods_405_logs_stdout_on_http3() {
         .wait_for_captured_output(
             |raw| {
                 extract_access_logs(raw).iter().any(|e| {
-                    e.pointer("/metadata/rejection_phase").and_then(Value::as_str)
+                    e.pointer("/metadata/rejection_phase")
+                        .and_then(Value::as_str)
                         == Some("allowed_methods")
                 })
             },
@@ -461,7 +468,9 @@ async fn functional_allowed_methods_405_logs_stdout_on_http3() {
     let entry = extract_access_logs(&stdout)
         .into_iter()
         .find(|e| {
-            e.pointer("/metadata/rejection_phase").and_then(Value::as_str) == Some("allowed_methods")
+            e.pointer("/metadata/rejection_phase")
+                .and_then(Value::as_str)
+                == Some("allowed_methods")
         })
         .expect("missing H3 allowed_methods access log");
     assert_allowed_methods_summary(&entry, "POST");
@@ -470,7 +479,9 @@ async fn functional_allowed_methods_405_logs_stdout_on_http3() {
     let remote = sink_entries
         .iter()
         .find(|e| {
-            e.pointer("/metadata/rejection_phase").and_then(Value::as_str) == Some("allowed_methods")
+            e.pointer("/metadata/rejection_phase")
+                .and_then(Value::as_str)
+                == Some("allowed_methods")
         })
         .expect("missing H3 http_logging record");
     assert_allowed_methods_summary(remote, "POST");

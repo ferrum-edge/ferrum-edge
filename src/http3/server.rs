@@ -1589,9 +1589,7 @@ async fn handle_h3_request(
         let logging_view = if grpc_web_response_content_type.is_some() {
             epoch.plugin_cache.grpc_web_request_view(&proxy.id)
         } else {
-            epoch
-                .plugin_cache
-                .request_view(&proxy.id, request_protocol)
+            epoch.plugin_cache.request_view(&proxy.id, request_protocol)
         };
         let logging_plugins = logging_view.plugins();
         log_rejected_request(
