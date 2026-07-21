@@ -16456,13 +16456,14 @@ components:
           type: integer
           format: uint64
           minimum: 0
-          default: 10485760
           description: >-
             Maximum decompressed gRPC protobuf payload size in bytes for both
             request and response validation. Nonnegative integer matching runtime
             `usize` parsing. `0` disables the decompressed cap. When omitted,
             inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses
             as an unsigned integer; otherwise falls back to 10 MiB (10485760).
+            No static OpenAPI default is advertised because the effective value
+            can be environment-derived.
 
     OpenapiValidatorConfig:
       type: object

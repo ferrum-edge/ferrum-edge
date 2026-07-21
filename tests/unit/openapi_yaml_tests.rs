@@ -3425,7 +3425,10 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
     assert_eq!(property["type"], json!("integer"));
     assert_eq!(property["format"], json!("uint64"));
     assert_eq!(property["minimum"], json!(0));
-    assert_eq!(property["default"], json!(10485760));
+    assert!(
+        property.get("default").is_none(),
+        "environment-derived omission semantics cannot be represented by a static OpenAPI default"
+    );
 
     let description = property["description"]
         .as_str()
@@ -3436,6 +3439,7 @@ fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_run
         "parses as an unsigned integer",
         "10 MiB",
         "request and response",
+        "No static OpenAPI default",
     ] {
         assert!(
             description.contains(contract),
