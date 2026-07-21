@@ -1524,12 +1524,7 @@ async fn grpc_web_response_after_proxy_and_transform(
 
 #[tokio::test]
 async fn test_binary_maps_http_401_404_503_and_unmapped_without_grpc_status() {
-    let cases = [
-        (401, "16"),
-        (404, "12"),
-        (503, "14"),
-        (418, "2"),
-    ];
+    let cases = [(401, "16"), (404, "12"), (503, "14"), (418, "2")];
     for (http_status, expected_grpc) in cases {
         let (_status, headers, output) = grpc_web_response_after_proxy_and_transform(
             "application/grpc-web+proto",
@@ -1558,12 +1553,7 @@ async fn test_text_maps_http_401_404_503_and_unmapped_without_grpc_status() {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
-    let cases = [
-        (401, "16"),
-        (404, "12"),
-        (503, "14"),
-        (418, "2"),
-    ];
+    let cases = [(401, "16"), (404, "12"), (503, "14"), (418, "2")];
     for (http_status, expected_grpc) in cases {
         let (_status, headers, output) = grpc_web_response_after_proxy_and_transform(
             "application/grpc-web-text",

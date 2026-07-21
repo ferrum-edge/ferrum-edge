@@ -806,12 +806,12 @@ fn is_valid_trailer_value(value: &str) -> bool {
 /// richer codes for Ferrum-authored refusals.
 pub(crate) fn http_response_status_to_grpc_status(http_status: u16) -> u32 {
     match http_status {
-        400 => 13,                // INTERNAL
-        401 => 16,                // UNAUTHENTICATED
-        403 => 7,                 // PERMISSION_DENIED
-        404 => 12,                // UNIMPLEMENTED
+        400 => 13,                   // INTERNAL
+        401 => 16,                   // UNAUTHENTICATED
+        403 => 7,                    // PERMISSION_DENIED
+        404 => 12,                   // UNIMPLEMENTED
         429 | 502 | 503 | 504 => 14, // UNAVAILABLE
-        _ => 2,                   // UNKNOWN (includes HTTP 200)
+        _ => 2,                      // UNKNOWN (includes HTTP 200)
     }
 }
 
