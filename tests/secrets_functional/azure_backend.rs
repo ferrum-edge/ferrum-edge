@@ -339,9 +339,12 @@ async fn azure_tls_inventory_reports_fetched_version() {
     fake.mock_secret_version("edge-cert", "v1", "not-a-pem-body")
         .await;
 
-    // Prefer the static bearer token so inventory's resolve path does not
-    // attempt a real Entra ID round trip against the fake.
-    guard.set("AZURE_KEY_VAULT_BEARER_TOKEN", "dummy-token");
+    // The Key Vault client can be constructed from placeholders. The fake
+    // returns the secret on the initial data-plane request, so these values are
+    // never exchanged with Entra ID.
+    guard.set("AZURE_TENANT_ID", "00000000-0000-0000-0000-000000000000");
+    guard.set("AZURE_CLIENT_ID", "00000000-0000-0000-0000-000000000001");
+    guard.set("AZURE_CLIENT_SECRET", "placeholder-not-used");
 
     let reference = fake.secret_version_url("edge-cert", "v1");
     let azure_uri = format!("azure://{reference}");

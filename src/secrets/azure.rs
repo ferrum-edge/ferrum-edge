@@ -5,11 +5,6 @@
 //! - `AZURE_CLIENT_ID` — Application (service principal) client ID
 //! - `AZURE_CLIENT_SECRET` — Application client secret
 //!
-//! A pre-acquired bearer token may be supplied instead via
-//! `AZURE_KEY_VAULT_BEARER_TOKEN` (sidecar / federated injection / local fakes).
-//! When that variable is set and non-empty it takes precedence over the
-//! client-secret credential chain and performs no Entra ID round trip.
-//!
 //! # Reference grammar
 //!
 //! Key Vault secret URLs follow:
@@ -57,16 +52,7 @@ pub struct AzureCredentials {
 impl AzureCredentials {
     /// Create Azure credentials from standard env vars.
     ///
-    /// When `AZURE_KEY_VAULT_BEARER_TOKEN` is set and non-empty, a static
-    /// bearer-token credential is used instead of the client-secret chain.
     pub fn new() -> Result<Self, String> {
-        if let Ok(token) = env::var("AZURE_KEY_VAULT_BEARER_TOKEN") {
-            let token = token.trim();
-            if !token.is_empty() {
-                return Ok(Self::from_static_token(token.to_string()));
-            }
-        }
-
         let tenant_id = env::var("AZURE_TENANT_ID").map_err(|_| {
             "AZURE_TENANT_ID must be set to resolve secrets from Azure Key Vault".to_string()
         })?;
