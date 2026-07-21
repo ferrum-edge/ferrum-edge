@@ -48,10 +48,8 @@ use crate::util::unknown_keys::reject_unknown_keys;
 /// Maximum rate-limit state entries before triggering stale eviction.
 const MAX_STATE_ENTRIES: usize = 100_000;
 const EVICTION_CHECK_INTERVAL_REQUESTS: u64 = 1024;
-const GRAPHQL_PROTOCOLS: &[super::ProxyProtocol] = &[
-    super::ProxyProtocol::Http,
-    super::ProxyProtocol::WebSocket,
-];
+const GRAPHQL_PROTOCOLS: &[super::ProxyProtocol] =
+    &[super::ProxyProtocol::Http, super::ProxyProtocol::WebSocket];
 
 /// GraphQL-specific top-level config keys (excludes shared Redis sync fields).
 const GRAPHQL_POLICY_CONFIG_KEYS: &[&str] = &[
