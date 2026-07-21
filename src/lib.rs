@@ -2177,6 +2177,7 @@ pub mod _test_support {
     /// Framed (parsed) WebSocket disconnect entry point — mirrors production
     /// teardown in `run_websocket_proxy` so unit tests can assert Instant-based
     /// `duration_ms` with non-zero frame counters.
+    #[allow(clippy::too_many_arguments)]
     pub async fn fire_ws_framed_disconnect_hooks(
         ws_disconnect_plugins: &[Arc<dyn Plugin>],
         proxy_id: &str,

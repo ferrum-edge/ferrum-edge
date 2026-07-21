@@ -11245,6 +11245,7 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
 /// used for `timestamp_connected` rendering. Takes `session_meta` by value
 /// because the framed relay consumes it at teardown.
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub async fn fire_ws_framed_disconnect_hooks(
     ws_disconnect_plugins: &[Arc<dyn Plugin>],
     proxy_id: &str,
