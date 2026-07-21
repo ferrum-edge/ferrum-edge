@@ -1,14 +1,16 @@
-//! DOC-03: EnvConfig ↔ docs/configuration.md ↔ ferrum.conf coverage contract.
+//! DOC-03: public FERRUM_* inventory ↔ docs/configuration.md ↔ ferrum.conf.
 //!
-//! Assembles one public inventory from production `EnvConfig` parse sites plus
-//! [`ferrum_edge::config::public_env_inventory::EXTRA_PUBLIC_FERRUM_ENV_SETTINGS`],
+//! Uses the complete sorted inventory in
+//! [`ferrum_edge::config::public_env_inventory::PUBLIC_FERRUM_ENV_SETTINGS`],
 //! then fails closed when any non-exempt setting lacks a canonical docs table
-//! row or a `ferrum.conf` template assignment. Membership is order-independent.
+//! row or a `ferrum.conf` template assignment. A separate guard requires every
+//! production `EnvConfig` acceptance key to appear in that inventory.
+//! Membership checks are order-independent.
 
 use std::collections::BTreeSet;
 
 use ferrum_edge::config::public_env_inventory::{
-    EXTRA_PUBLIC_FERRUM_ENV_SETTINGS, PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS,
+    PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS, PUBLIC_FERRUM_ENV_SETTINGS,
     is_public_ferrum_env_coverage_exempt,
 };
 
@@ -16,16 +18,14 @@ const ENV_CONFIG_SOURCE: &str = include_str!("../../../src/config/env_config.rs"
 const CONFIGURATION_MD: &str = include_str!("../../../docs/configuration.md");
 const FERRUM_CONF: &str = include_str!("../../../ferrum.conf");
 
-/// Production `impl EnvConfig` body only — excludes `#[cfg(test)]` helpers and
-/// macro unit-test sample keys such as `FERRUM_SAMPLE_*`.
+/// Production `env_config.rs` only — truncate at the first `#[cfg(test)]` so
+/// macro sample keys such as `FERRUM_SAMPLE_*` and other test helpers are
+/// excluded. Includes free functions and `impl` bodies above that boundary.
 fn production_env_config_source() -> &'static str {
-    let impl_start = ENV_CONFIG_SOURCE
-        .find("impl EnvConfig {")
-        .expect("EnvConfig impl block");
-    let test_mod = ENV_CONFIG_SOURCE[impl_start..]
-        .find("#[cfg(test)]\nmod tests {")
-        .expect("EnvConfig inline test module boundary");
-    &ENV_CONFIG_SOURCE[impl_start..impl_start + test_mod]
+    match ENV_CONFIG_SOURCE.find("#[cfg(test)]") {
+        Some(idx) => &ENV_CONFIG_SOURCE[..idx],
+        None => ENV_CONFIG_SOURCE,
+    }
 }
 
 fn is_ferrum_env_key(key: &str) -> bool {
@@ -35,17 +35,16 @@ fn is_ferrum_env_key(key: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
 }
 
-/// Extract quoted `FERRUM_*` string literals from production `EnvConfig` parse
-/// sites. Requires a preceding `=` / `(` so comment prose is ignored.
+/// Extract quoted `FERRUM_*` string literals from production `EnvConfig`
+/// acceptance sites. Requires a preceding `=` / `(` / `,` so comment prose is
+/// ignored. This is a focused EnvConfig-source guard, not a brittle
+/// repository-wide regex sweep.
 fn extract_env_config_keys(source: &str) -> BTreeSet<String> {
     let mut keys = BTreeSet::new();
     let bytes = source.as_bytes();
     let mut i = 0;
     while i + 8 < bytes.len() {
-        // Find `"FERRUM_`
-        if bytes[i] == b'"'
-            && source[i + 1..].starts_with("FERRUM_")
-        {
+        if bytes[i] == b'"' && source[i + 1..].starts_with("FERRUM_") {
             let key_start = i + 1;
             let mut key_end = key_start;
             while key_end < bytes.len()
@@ -58,9 +57,6 @@ fn extract_env_config_keys(source: &str) -> BTreeSet<String> {
             if key_end < bytes.len() && bytes[key_end] == b'"' {
                 let key = &source[key_start..key_end];
                 if is_ferrum_env_key(key) {
-                    // Confirm this looks like a parse-site literal rather than
-                    // a random quoted mention in a comment: look back for `=`
-                    // or `(` on the same line.
                     let line_start = source[..i].rfind('\n').map(|n| n + 1).unwrap_or(0);
                     let prefix = source[line_start..i].trim_end();
                     if prefix.ends_with('=') || prefix.ends_with('(') || prefix.ends_with(',') {
@@ -76,7 +72,7 @@ fn extract_env_config_keys(source: &str) -> BTreeSet<String> {
     keys
 }
 
-fn env_config_public_keys() -> BTreeSet<String> {
+fn env_config_accepted_keys() -> BTreeSet<String> {
     let mut keys = extract_env_config_keys(production_env_config_source());
     // OperatingMode is resolved before the env_config! blocks but is a public
     // accepted setting with its own docs/template surfaces.
@@ -85,11 +81,10 @@ fn env_config_public_keys() -> BTreeSet<String> {
 }
 
 fn public_inventory() -> BTreeSet<String> {
-    let mut keys = env_config_public_keys();
-    for key in EXTRA_PUBLIC_FERRUM_ENV_SETTINGS {
-        keys.insert((*key).to_string());
-    }
-    keys
+    PUBLIC_FERRUM_ENV_SETTINGS
+        .iter()
+        .map(|key| (*key).to_string())
+        .collect()
 }
 
 fn docs_table_keys(docs: &str) -> BTreeSet<&str> {
@@ -136,12 +131,12 @@ fn ferrum_conf_assignment_keys(conf: &str) -> BTreeSet<&str> {
 }
 
 #[test]
-fn extra_public_inventory_is_sorted_and_unique() {
+fn public_inventory_and_exemptions_are_sorted_and_unique() {
     assert!(
-        EXTRA_PUBLIC_FERRUM_ENV_SETTINGS
+        PUBLIC_FERRUM_ENV_SETTINGS
             .windows(2)
             .all(|pair| pair[0] < pair[1]),
-        "EXTRA_PUBLIC_FERRUM_ENV_SETTINGS must be strictly sorted unique keys"
+        "PUBLIC_FERRUM_ENV_SETTINGS must be strictly sorted unique keys"
     );
     assert!(
         PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS
@@ -152,11 +147,33 @@ fn extra_public_inventory_is_sorted_and_unique() {
 }
 
 #[test]
+fn inventory_includes_all_env_config_accepted_keys() {
+    let inventory = public_inventory();
+    let accepted = env_config_accepted_keys();
+    assert!(
+        accepted.len() > 100,
+        "EnvConfig acceptance extraction unexpectedly small ({}); parser likely broke",
+        accepted.len()
+    );
+
+    let missing: Vec<&String> = accepted.difference(&inventory).collect();
+    assert!(
+        missing.is_empty(),
+        "production EnvConfig-accepted FERRUM_* keys missing from PUBLIC_FERRUM_ENV_SETTINGS:\n  {}",
+        missing
+            .iter()
+            .map(|key| key.as_str())
+            .collect::<Vec<_>>()
+            .join("\n  ")
+    );
+}
+
+#[test]
 fn public_ferrum_env_settings_have_docs_table_and_ferrum_conf_coverage() {
     let inventory = public_inventory();
     assert!(
         inventory.len() > 100,
-        "inventory unexpectedly small ({}); extraction likely broke",
+        "inventory unexpectedly small ({}); PUBLIC_FERRUM_ENV_SETTINGS likely empty",
         inventory.len()
     );
 
