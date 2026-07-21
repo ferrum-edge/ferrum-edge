@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
-    SpoolManager, SpoolSettings, decode_spool_file_for_tests, new_ulid,
-    replay_spool_once_for_tests, serialize_json_each_row,
+    SpoolManager, SpoolSettings, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
+    new_ulid, replay_spool_once_for_tests, serialize_json_each_row,
 };
 use ferrum_edge::plugins::chargeback::pricing::ChargeComputation;
 use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
@@ -381,18 +381,64 @@ fn snapshot_delta_computation_tracks_last_emitted_totals() {
     assert_eq!(zero[0].snapshot_id.as_deref(), Some("snap-4"));
 }
 
+fn encoded_event_len(event: &ChargeEvent, compression: SpoolCompression) -> u64 {
+    let body = serialize_json_each_row(std::slice::from_ref(event)).unwrap();
+    encode_spool_bytes_for_tests(body.as_bytes(), compression)
+        .unwrap()
+        .len() as u64
+}
+
+fn disk_owned_bytes(root: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let owned = name.ends_with(".ndjson")
+                || name.ends_with(".ndjson.zst")
+                || name.ends_with(".ndjson.tmp")
+                || name.ends_with(".ndjson.zst.tmp")
+                || name.ends_with(".ndjson.corrupt")
+                || name.ends_with(".ndjson.zst.corrupt");
+            if owned {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
 #[test]
 fn spool_write_round_trip_and_oldest_eviction() {
     let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("evt-001");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    assert_eq!(
+        encoded_len,
+        encoded_event_len(&sample_event("evt-002"), SpoolCompression::None),
+        "fixture event ids must encode to equal sizes"
+    );
     let settings = SpoolSettings {
         enabled: true,
         dir: temp.path().to_path_buf(),
-        max_bytes: 1,
+        max_bytes: encoded_len,
         replay_interval_secs: 60,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
-    let event = sample_event("evt-1");
 
     let first = spool.write_events(std::slice::from_ref(&event)).unwrap();
     let decoded = decode_spool_file_for_tests(&first).unwrap();
@@ -401,7 +447,7 @@ fn spool_write_round_trip_and_oldest_eviction() {
         serialize_json_each_row(std::slice::from_ref(&event)).unwrap()
     );
 
-    let second = spool.write_events(&[sample_event("evt-2")]).unwrap();
+    let second = spool.write_events(&[sample_event("evt-002")]).unwrap();
     assert!(second.exists());
     assert!(
         !first.exists(),
@@ -409,15 +455,229 @@ fn spool_write_round_trip_and_oldest_eviction() {
     );
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+    assert_eq!(
+        stats.bytes,
+        disk_owned_bytes(&temp.path().join("node-a")),
+        "status bytes must match on-disk owned usage"
+    );
+}
+
+#[test]
+fn spool_rejects_empty_spool_oversized_batch() {
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("evt-oversized");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: encoded_len.saturating_sub(1).max(1),
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let err = spool
+        .write_events(std::slice::from_ref(&event))
+        .expect_err("one-byte-over batch must be rejected on an empty spool");
+    assert!(
+        err.contains("exceeds spool.max_bytes") || err.contains("cannot fit within spool.max_bytes"),
+        "unexpected error: {err}"
+    );
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 0);
+    assert_eq!(stats.bytes, 0);
+    assert_eq!(disk_owned_bytes(&temp.path().join("node-a")), 0);
+}
+
+#[test]
+fn spool_admits_exact_fit_and_rejects_one_byte_over_with_resident_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("evt-ex-1");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    assert_eq!(
+        encoded_len,
+        encoded_event_len(&sample_event("evt-ex-2"), SpoolCompression::None)
+    );
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: encoded_len,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let path = spool.write_events(std::slice::from_ref(&event)).unwrap();
+    assert!(path.exists());
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+    assert_eq!(stats.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+
+    // With the resident file still present, a second write of the same size must
+    // evict first (exact fit after eviction), not exceed the ceiling.
+    let second = spool.write_events(&[sample_event("evt-ex-2")]).unwrap();
+    assert!(second.exists());
+    assert!(!path.exists());
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+}
+
+#[test]
+fn spool_quota_uses_compressed_encoded_size() {
+    let temp = tempfile::tempdir().unwrap();
+    // Pad the event id so the uncompressed body is large enough that zstd
+    // typically changes the on-disk size versus the raw JSONEachRow bytes.
+    let event = sample_event(&format!("evt-zstd-{}", "x".repeat(2048)));
+    let encoded_len = encoded_event_len(&event, SpoolCompression::Zstd);
+    let uncompressed_len = encoded_event_len(&event, SpoolCompression::None);
+    assert_ne!(
+        encoded_len, uncompressed_len,
+        "fixture should produce a distinct compressed size so quota uses encoded bytes"
+    );
+
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: encoded_len,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::Zstd,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let path = spool.write_events(std::slice::from_ref(&event)).unwrap();
+    assert!(path.exists());
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+    assert_eq!(stats.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+
+    // Using the uncompressed length as the ceiling must not be how admission
+    // decides: when compressed size exceeds an artificially smaller budget,
+    // the write is rejected.
+    let over = SpoolSettings {
+        enabled: true,
+        dir: temp.path().join("over"),
+        max_bytes: encoded_len.saturating_sub(1).max(1),
+        replay_interval_secs: 60,
+        compression: SpoolCompression::Zstd,
+    };
+    let over_spool = SpoolManager::for_tests(over, "node-a").unwrap();
+    let err = over_spool
+        .write_events(std::slice::from_ref(&event))
+        .expect_err("compressed one-byte-over must reject");
+    assert!(err.contains("exceeds spool.max_bytes") || err.contains("cannot fit"));
+}
+
+#[test]
+fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("evt-after-corrupt");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    let corrupt_dir = temp.path().join("node-a").join("20260524");
+    fs::create_dir_all(&corrupt_dir).unwrap();
+    let corrupt = corrupt_dir.join("00000000000000000000000000.ndjson.corrupt");
+    fs::write(&corrupt, vec![0u8; encoded_len as usize]).unwrap();
+
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: encoded_len,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let before = spool.scan_stats().unwrap();
+    assert_eq!(before.files, 1);
+    assert_eq!(before.bytes, encoded_len);
+    assert_eq!(before.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+
+    let written = spool.write_events(std::slice::from_ref(&event)).unwrap();
+    assert!(written.exists());
+    assert!(
+        !corrupt.exists(),
+        "oldest owned corrupt file must be evictable to admit a new write"
+    );
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+}
+
+#[test]
+fn spool_reconciles_stale_tmp_files_at_startup() {
+    let temp = tempfile::tempdir().unwrap();
+    let day = temp.path().join("node-a").join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    fs::write(&stale_tmp, vec![0u8; 4096]).unwrap();
+
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 1024 * 1024,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    assert!(
+        !stale_tmp.exists(),
+        "startup must delete crash-left spool temp files"
+    );
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 0);
+    assert_eq!(stats.bytes, 0);
+    assert_eq!(disk_owned_bytes(&temp.path().join("node-a")), 0);
+}
+
+#[test]
+fn spool_counts_tmp_files_toward_quota_before_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let event = sample_event("evt-tmp-budget");
+    let encoded_len = encoded_event_len(&event, SpoolCompression::None);
+    let day = temp.path().join("node-a").join("20260524");
+    fs::create_dir_all(&day).unwrap();
+    let stale_tmp = day.join("00000000000000000000000001.ndjson.tmp");
+    fs::write(&stale_tmp, vec![0u8; encoded_len as usize]).unwrap();
+
+    // Construct without going through for_tests' reconcile by using a second
+    // manager after manually recreating a temp that appears between scans:
+    // first manager cleans startup temps; then plant a temp and assert accounting
+    // via scan_stats before the next write admission path removes oldest owned.
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: encoded_len,
+        replay_interval_secs: 60,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    assert!(!stale_tmp.exists(), "startup reconcile should clear planted tmp");
+
+    fs::write(&stale_tmp, vec![0u8; encoded_len as usize]).unwrap();
+    let stats = spool.scan_stats().unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+    assert_eq!(stats.bytes, disk_owned_bytes(&temp.path().join("node-a")));
+
+    let written = spool.write_events(std::slice::from_ref(&event)).unwrap();
+    assert!(written.exists());
+    assert!(
+        !stale_tmp.exists(),
+        "admission eviction must drop owned temp files when they block the ceiling"
+    );
+    let after = spool.scan_stats().unwrap();
+    assert_eq!(after.files, 1);
+    assert_eq!(after.bytes, encoded_len);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_spool_writes_do_not_fail_during_eviction() {
     let temp = tempfile::tempdir().unwrap();
+    let probe = sample_event("evt-00");
+    let encoded_len = encoded_event_len(&probe, SpoolCompression::None);
     let settings = SpoolSettings {
         enabled: true,
         dir: temp.path().to_path_buf(),
-        max_bytes: 1,
+        max_bytes: encoded_len,
         replay_interval_secs: 60,
         compression: SpoolCompression::None,
     };
@@ -426,7 +686,7 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
     for idx in 0..24 {
         let spool = Arc::clone(&spool);
         handles.push(tokio::task::spawn_blocking(move || {
-            spool.write_events(&[sample_event(&format!("evt-{idx}"))])
+            spool.write_events(&[sample_event(&format!("evt-{idx:02}"))])
         }));
     }
 
@@ -435,6 +695,12 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
     }
     let stats = spool.scan_stats().unwrap();
     assert_eq!(stats.files, 1);
+    assert_eq!(stats.bytes, encoded_len);
+    assert_eq!(
+        stats.bytes,
+        disk_owned_bytes(&temp.path().join("node-a")),
+        "status bytes must match on-disk owned usage after concurrent writes"
+    );
 }
 
 #[tokio::test]

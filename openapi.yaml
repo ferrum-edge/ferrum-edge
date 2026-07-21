@@ -19911,6 +19911,15 @@ components:
               type: integer
               minimum: 1
               default: 10737418240
+              description: |
+                Hard ceiling on total encoded on-disk bytes owned by this sink under
+                spool.dir for the local node_id (after compression). Counts active
+                spool files (*.ndjson / *.ndjson.zst), in-progress atomic-write temps
+                (*.tmp), and quarantined (*.corrupt) files. A pending write is sized
+                before admission under the spool write lock; oldest owned files are
+                dropped until the incoming encoded file fits. If one encoded batch
+                still cannot fit, the write is rejected rather than exceeding the
+                ceiling.
             replay_interval_secs:
               type: integer
               minimum: 1
@@ -20088,8 +20097,10 @@ components:
               type: boolean
             files:
               type: integer
+              description: Count of owned spool files (active data, temps, and quarantined).
             bytes:
               type: integer
+              description: Total encoded on-disk bytes for owned spool files (active data, temps, and quarantined).
             drops_total:
               type: integer
             last_replay_at:
