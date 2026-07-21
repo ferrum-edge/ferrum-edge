@@ -3515,7 +3515,18 @@ Supports both encoding modes:
 - **Binary** (`application/grpc-web`, `application/grpc-web+proto`): same length-prefixed framing as native gRPC — request body passes through unchanged.
 - **Text** (`application/grpc-web-text`, `application/grpc-web-text+proto`): base64-encoded binary frames — decoded on request and re-encoded on response.
 
-On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. On the response path, `grpc_web` embeds HTTP/2 trailers (`grpc-status`, `grpc-message`, and custom trailing metadata) as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` back to the original gRPC-Web variant.
+Message-format suffixes (`+proto`, `+json`, `+thrift`, or another valid custom `+subtype`) are preserved on the negotiated response `Content-Type`.
+
+On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. Request-body decoding mode follows request `Content-Type` only.
+
+On the response path, `grpc_web` embeds HTTP/2 trailers (`grpc-status`, `grpc-message`, and custom trailing metadata) as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` to the **negotiated** gRPC-Web variant.
+
+**Response media-type negotiation:** Response encoding and the client-visible response `Content-Type` follow the request `Accept` header ([PROTOCOL-WEB.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md); RFC 9110 content negotiation):
+
+- Absent or empty `Accept` defaults to the request `Content-Type`'s mode and message-format suffix.
+- Lists, parameters, quality values (`q=`), and wildcards (`*/*`, `application/*`) are honored; more specific entries override wildcards, and an explicit `q=0` refusal is not revived by `*`.
+- A present `Accept` that is structurally malformed, or that refuses every gRPC-Web representation the gateway can produce, fails closed with HTTP `406 Not Acceptable`.
+- When `Accept` selects text while `Content-Type` is binary (or the reverse), request decoding and response encoding stay independent.
 
 **Malformed / non-gRPC backend responses:** When the backend or an intermediary returns a response without a present, numeric `grpc-status` (empty or non-numeric values count as absent), `grpc_web` synthesizes the trailer `grpc-status` from the official HTTP-to-gRPC client mapping ([http-grpc-status-mapping.md](https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md)): `400→INTERNAL(13)`, `401→UNAUTHENTICATED(16)`, `403→PERMISSION_DENIED(7)`, `404→UNIMPLEMENTED(12)`, `429/502/503/504→UNAVAILABLE(14)`, and every other HTTP status (including `200`) → `UNKNOWN(2)`. A valid supplied `grpc-status` remains authoritative and is never overridden by the HTTP status. Existing `grpc-message` / `grpc-status-details-bin` metadata is preserved when present; synthesis does not invent a message. The client-visible HTTP status is left unchanged on this path (Ferrum does not force HTTP `200` for translated gRPC-Web backend responses), so wire observers still see the backend/intermediary HTTP failure while gRPC-Web clients read the mapped code from the body trailer frame.
 

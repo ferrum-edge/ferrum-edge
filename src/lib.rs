@@ -1327,8 +1327,15 @@ pub mod _test_support {
         crate::plugins::grpc_web::parse_grpc_frames(data)
     }
 
-    pub fn response_content_type(original_ct: &str) -> &'static str {
+    pub fn response_content_type(original_ct: &str) -> String {
         crate::plugins::grpc_web::response_content_type(original_ct)
+    }
+
+    pub fn negotiate_grpc_web_response_media_type(
+        request_content_type: &str,
+        accept: Option<&str>,
+    ) -> Result<String, crate::plugins::grpc_web::GrpcWebAcceptError> {
+        crate::plugins::grpc_web::negotiate_response_media_type(request_content_type, accept)
     }
 
     pub fn finalize_grpc_web_error_response_headers(

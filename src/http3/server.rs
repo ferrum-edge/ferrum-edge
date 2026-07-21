@@ -1006,18 +1006,29 @@ async fn handle_h3_request(
     // Besides selecting the WebSocket plugin chain below, suppress gRPC-Web
     // rejection shaping so a spoofed header cannot turn a WS policy reject
     // into a gRPC-Web response.
-    let grpc_web_response_content_type = if detected_http_flavor == HttpFlavor::WebSocket {
+    let grpc_web_response_content_type_owned = if detected_http_flavor == HttpFlavor::WebSocket {
         None
     } else {
         req.headers()
             .get(hyper::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .and_then(|content_type| {
-                crate::plugins::grpc_web::is_grpc_web_content_type(content_type).then(|| {
-                    crate::plugins::grpc_web::response_content_type(content_type).to_string()
-                })
+                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
+                    return None;
+                }
+                let accept = req
+                    .headers()
+                    .get(hyper::header::ACCEPT)
+                    .and_then(|value| value.to_str().ok());
+                Some(
+                    crate::plugins::grpc_web::negotiate_response_media_type(content_type, accept)
+                        .unwrap_or_else(|_| {
+                            crate::plugins::grpc_web::response_content_type(content_type)
+                        }),
+                )
             })
     };
+    let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
     // gRPC-Web remains Plain in the shared wire classifier so the grpc_web
     // plugin retains ownership of body translation. Once its content type is
     // recognized here, however, every request-side decision must treat it as
@@ -1025,8 +1036,8 @@ async fn handle_h3_request(
     // fail-closed method policy all need the same answer. Backend transport is
     // selected separately after request hooks, once the translator's trusted
     // marker is known. The separate response content type above preserves
-    // binary/text + proto encoding for client-facing rejection and response
-    // shaping.
+    // binary/text + format-suffix encoding for client-facing rejection and
+    // response shaping after Accept negotiation.
     let http_flavor = if grpc_web_response_content_type.is_some() {
         HttpFlavor::Grpc
     } else {
@@ -1069,8 +1080,8 @@ async fn handle_h3_request(
     ctx.request_is_secure = true;
     ctx.metadata
         .insert("ferrum.frontend_scheme".to_string(), "https".to_string());
-    if let Some(content_type) = grpc_web_response_content_type.as_deref() {
-        crate::plugins::grpc_web::retain_client_content_type_for_errors(&mut ctx, content_type);
+    if let Some(content_type) = grpc_web_response_content_type {
+        crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);
     }
     // Use the actual UDP listener port so port-scoped plugins such as mesh
     // outbound registry and mesh authz see the same frontend port that accepted

@@ -17508,7 +17508,13 @@ components:
       description: >-
         Plugin: grpc_web — Translates between gRPC-Web (browser-compatible)
         and native gRPC (HTTP/2) wire formats. Supports binary
-        (application/grpc-web) and text (application/grpc-web-text) encoding.
+        (application/grpc-web) and text (application/grpc-web-text) encoding,
+        including message-format suffixes such as +proto, +json, +thrift, and
+        other valid +subtype values. Request-body decoding follows request
+        Content-Type; response encoding and Content-Type follow Accept
+        negotiation (absent Accept defaults to the request Content-Type mode
+        and suffix; lists, q-values, and */* / application/* wildcards are
+        honored; malformed or fully refused Accept fails closed with HTTP 406).
         Config must be a JSON object (not null); `{}` and objects that only set
         `expose_headers` are accepted. Unknown keys are rejected. When a backend
         or intermediary response omits a valid numeric grpc-status, the response

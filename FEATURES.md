@@ -127,7 +127,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **Request Deduplication** — idempotency key-based deduplication for POST/PUT/PATCH requests with local in-memory and centralized Redis storage backends
 - **Fault Injection** — probabilistic HTTP/gRPC aborts and latency injection plus stream connect rejection/delay for chaos testing, with per-instance counters so proxy/group scopes stay independent
 - **GraphQL** — query depth/complexity limiting, alias limiting, introspection control, per-operation rate limiting
-- **gRPC-Web** — bidirectional protocol translation between gRPC-Web (browser) and native gRPC (HTTP/2), supporting binary and base64 text encoding modes with trailer frame embedding
+- **gRPC-Web** — bidirectional protocol translation between gRPC-Web (browser) and native gRPC (HTTP/2), supporting binary and base64 text encoding modes with trailer frame embedding; response media type is negotiated from `Accept` (with q-values/wildcards, message-format suffix preservation, and fail-closed refusal when Accept is malformed or fully unacceptable)
 - **gRPC Method Router** — per-method access control (allow/deny lists) and per-method rate limiting with metadata enrichment
 - **gRPC Deadline** — `grpc-timeout` enforcement, default injection, max capping, and gateway processing time subtraction
 
