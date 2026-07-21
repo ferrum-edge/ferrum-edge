@@ -111,10 +111,21 @@ enum DigestAlgorithm {
     Sha1,
 }
 
+fn sha256_array(value: &[u8]) -> [u8; 32] {
+    let hashed = digest::digest(&digest::SHA256, value);
+    let mut output = [0u8; 32];
+    output.copy_from_slice(hashed.as_ref());
+    output
+}
+
 #[derive(Debug, Clone)]
 struct Credential {
     username: String,
     password: String,
+    /// Fixed-width digest used by PasswordText verification so known and
+    /// unknown principals take the same comparison path even when configured
+    /// secret lengths differ from the process-local dummy material.
+    password_text_hash: [u8; 32],
 }
 
 /// UsernameToken authentication outcomes that must not create a username oracle.
@@ -168,6 +179,8 @@ pub struct SoapWsSecurity {
     /// Process-local padding secret used only to equalize verification work on
     /// username lookup misses. Never authenticates a principal.
     dummy_password: String,
+    /// Fixed-width PasswordText verifier for `dummy_password`.
+    dummy_password_text_hash: [u8; 32],
 
     // X.509 signature verification
     x509_enabled: bool,
@@ -228,7 +241,12 @@ impl SoapWsSecurity {
                     .filter_map(|v| {
                         let username = v["username"].as_str()?.to_string();
                         let password = v["password"].as_str()?.to_string();
-                        Some(Credential { username, password })
+                        let password_text_hash = sha256_array(password.as_bytes());
+                        Some(Credential {
+                            username,
+                            password,
+                            password_text_hash,
+                        })
                     })
                     .collect()
             })
@@ -245,6 +263,7 @@ impl SoapWsSecurity {
         // PasswordText / PasswordDigest verification work as known principals.
         // This value is never accepted as a configured credential.
         let dummy_password = format!("soap-ws-security-dummy:{}", uuid::Uuid::new_v4());
+        let dummy_password_text_hash = sha256_array(dummy_password.as_bytes());
 
         // ── X.509 signature config ──────────────────────────────────────
         let x509_cfg = config_obj.get("x509_signature").unwrap_or(&Value::Null);
@@ -531,6 +550,7 @@ impl SoapWsSecurity {
             password_type,
             credentials,
             dummy_password,
+            dummy_password_text_hash,
             x509_enabled,
             trusted_certs,
             allowed_signature_algorithms,
@@ -668,13 +688,16 @@ impl SoapWsSecurity {
 
         match effective_type {
             PasswordType::PasswordText => {
-                // Constant-time compare: `password_value` is attacker-controlled
-                // and `password_material` is either the stored shared secret or
-                // dummy padding, so a short-circuiting `!=` would leak bytes via
-                // timing. Mirrors basic_auth / hmac_auth; `constant_time_eq`
-                // handles length mismatches safely.
-                let matched =
-                    constant_time_eq(password_value.as_bytes(), password_material.as_bytes());
+                // Hash the attacker input once, then compare fixed-width
+                // digests. `constant_time_eq` intentionally returns early on a
+                // length mismatch, so comparing plaintext directly would make
+                // the dummy path observably different whenever the configured
+                // password and dummy material have different lengths.
+                let supplied_hash = sha256_array(password_value.as_bytes());
+                let expected_hash = cred
+                    .map(|credential| &credential.password_text_hash)
+                    .unwrap_or(&self.dummy_password_text_hash);
+                let matched = constant_time_eq(&supplied_hash, expected_hash);
                 // Dummy material is timing padding only and must never establish
                 // identity for an unregistered username.
                 if username_known && matched {
