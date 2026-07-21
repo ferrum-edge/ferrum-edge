@@ -1024,6 +1024,10 @@ pub mod _test_support {
         plugin.instance_id_for_tests()
     }
 
+    pub fn response_cache_hit_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.response_cache_hit()
+    }
+
     pub fn response_caching_current_total_size_for_test(
         plugin: &crate::plugins::response_caching::ResponseCaching,
     ) -> usize {

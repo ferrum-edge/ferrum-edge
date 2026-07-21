@@ -3296,6 +3296,102 @@ async fn multiple_instances_isolate_staging_in_both_priority_orders() {
 }
 
 #[tokio::test]
+async fn later_sibling_without_lookup_state_cannot_overwrite_hit_header() {
+    let hit_instance = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "add_cache_status_header": true
+    }));
+    let unvisited_sibling = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "add_cache_status_header": true
+    }));
+
+    let mut store_ctx = make_ctx("GET", "/header-owner");
+    let mut store_headers = HashMap::new();
+    assert!(matches!(
+        hit_instance
+            .before_proxy(&mut store_ctx, &mut store_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let response_headers = public_response_headers();
+    hit_instance
+        .on_final_response_body(&mut store_ctx, 200, &response_headers, b"cached")
+        .await;
+
+    let mut hit_ctx = make_ctx("GET", "/header-owner");
+    let mut hit_headers = HashMap::new();
+    let PluginResult::RejectBinary { mut headers, .. } = hit_instance
+        .before_proxy(&mut hit_ctx, &mut hit_headers)
+        .await
+    else {
+        panic!("first instance must serve the cached response");
+    };
+    assert_eq!(headers.get("x-cache-status").map(String::as_str), Some("HIT"));
+    assert!(ferrum_edge::_test_support::response_cache_hit_for_test(&hit_ctx));
+
+    assert!(matches!(
+        unvisited_sibling
+            .after_proxy(&mut hit_ctx, 200, &mut headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("HIT"),
+        "an unvisited sibling must not synthesize MISS over the cache owner"
+    );
+    assert!(
+        !hit_ctx
+            .metadata
+            .contains_key(&staging_key(&unvisited_sibling, "cache_status")),
+        "the later sibling must remain without instance-private lookup state"
+    );
+}
+
+#[tokio::test]
+async fn global_hit_signal_is_monotonic_across_sibling_statuses() {
+    let hit_instance = plugin_with_config(json!({"ttl_seconds": 60}));
+    let miss_instance = plugin_with_config(json!({"ttl_seconds": 60}));
+
+    let mut store_ctx = make_ctx("GET", "/global-hit");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        hit_instance.before_proxy(&mut store_ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    hit_instance
+        .on_final_response_body(
+            &mut store_ctx,
+            200,
+            &public_response_headers(),
+            b"cached",
+        )
+        .await;
+
+    let mut ctx = make_ctx("GET", "/global-hit");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        hit_instance.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::RejectBinary { .. }
+    ));
+    assert!(ferrum_edge::_test_support::response_cache_hit_for_test(&ctx));
+
+    let mut sibling_headers = HashMap::new();
+    assert!(matches!(
+        miss_instance
+            .before_proxy(&mut ctx, &mut sibling_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_status(&miss_instance, &ctx, "MISS");
+    assert!(
+        ferrum_edge::_test_support::response_cache_hit_for_test(&ctx),
+        "a sibling MISS must not clear the request-global HIT signal"
+    );
+}
+
+#[tokio::test]
 async fn multiple_instances_method_and_sse_bypass_clear_only_own_staging() {
     let cacheable = plugin_with_config(json!({
         "ttl_seconds": 60,

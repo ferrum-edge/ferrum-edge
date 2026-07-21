@@ -675,6 +675,9 @@ impl ResponseCaching {
     fn set_cache_status(&self, ctx: &mut RequestContext, status: &str) {
         ctx.metadata
             .insert(self.meta_status.clone(), status.to_string());
+        if matches!(status, "HIT" | "REVALIDATED") {
+            ctx.mark_response_cache_hit();
+        }
     }
 
     fn cache_status<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
@@ -1631,7 +1634,12 @@ impl Plugin for ResponseCaching {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        let status = self.cache_status(ctx).unwrap_or("MISS");
+        let Some(status) = self.cache_status(ctx) else {
+            // A preceding sibling may already have short-circuited with a HIT
+            // before this instance reached `before_proxy`. Do not invent MISS
+            // state and overwrite that instance's client-visible header.
+            return PluginResult::Continue;
+        };
         self.add_cache_status_header(response_headers, status);
         PluginResult::Continue
     }
@@ -1642,8 +1650,10 @@ impl Plugin for ResponseCaching {
     /// exhausts the gRPC deadline would then rebuild the DEADLINE_EXCEEDED
     /// response without it. Declared owned only when the header is actually
     /// configured to be written.
-    fn owns_deadline_response_header(&self, _ctx: &RequestContext, name: &str) -> bool {
-        self.config.add_cache_status_header && name.eq_ignore_ascii_case("x-cache-status")
+    fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
+        self.config.add_cache_status_header
+            && self.cache_status(ctx).is_some()
+            && name.eq_ignore_ascii_case("x-cache-status")
     }
 
     async fn on_final_response_body(

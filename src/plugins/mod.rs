@@ -1660,6 +1660,11 @@ pub struct RequestContext {
     /// backend or plugin-controlled `grpc-status`/`grpc-message` text must not
     /// unlock the write-biased terminal H3 completion path.
     gateway_deadline_response_selected: bool,
+    /// Monotonic request-global proof that at least one response-caching
+    /// instance served a HIT or REVALIDATED response. Kept outside public
+    /// metadata so sibling/custom plugins cannot clear or forge the signal
+    /// consumed by fail-closed response negotiation.
+    response_cache_hit: bool,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
     /// Most complete built-in AI usage snapshot for Prometheus export.
@@ -2165,6 +2170,7 @@ impl RequestContext {
             grpc_deadline_at: None,
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
+            response_cache_hit: false,
             metadata: HashMap::new(),
             ai_usage_export: None,
             ai_usage_export_token_prefix: None,
@@ -2428,6 +2434,14 @@ impl RequestContext {
 
     pub(crate) fn gateway_response_compression_algorithm(&self) -> Option<&'static str> {
         self.gateway_response_compression_algorithm
+    }
+
+    pub(crate) fn mark_response_cache_hit(&mut self) {
+        self.response_cache_hit = true;
+    }
+
+    pub(crate) fn response_cache_hit(&self) -> bool {
+        self.response_cache_hit
     }
 
     pub(crate) fn bind_authorized_backend_path(&mut self, path: String) {
@@ -2759,6 +2773,7 @@ impl RequestContext {
             grpc_deadline_at: self.grpc_deadline_at,
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
+            response_cache_hit: self.response_cache_hit,
             // Omit `request_body` (the full buffered prompt): no
             // `on_final_request_body` hook reads it from the context — they all
             // take the body as a `&[u8]` parameter — so copying it here would burn
