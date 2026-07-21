@@ -880,18 +880,33 @@ impl Plugin for WsLogging {
         let _runtime = tokio::runtime::Handle::try_current().map_err(|_| {
             "ws_logging: start_background_tasks requires a Tokio runtime".to_string()
         })?;
-        let ws_config = self
-            .pending_config
-            .lock()
-            .map_err(|_| "ws_logging: pending config lock poisoned".to_string())?
-            .take()
-            .ok_or_else(|| {
+
+        // Take pending config under the start lock. On any failure before the
+        // sender is published, restore it so activation remains retryable.
+        let ws_config = {
+            let mut pending = self
+                .pending_config
+                .lock()
+                .map_err(|_| "ws_logging: pending config lock poisoned".to_string())?;
+            pending.take().ok_or_else(|| {
                 "ws_logging: flush worker config already consumed without an active sender"
                     .to_string()
-            })?;
+            })?
+        };
+
         let (sender, receiver) = mpsc::channel(self.buffer_capacity);
+        if self.sender.set(sender).is_err() {
+            if let Ok(mut pending) = self.pending_config.lock() {
+                *pending = Some(ws_config);
+            }
+            return Err(
+                "ws_logging: flush worker already started; refusing duplicate activation"
+                    .to_string(),
+            );
+        }
+        // Sender is published: Drop of WsLogging closes the channel and the
+        // flush loop exits. Config is intentionally consumed on success.
         tokio::spawn(flush_loop(receiver, ws_config));
-        let _ = self.sender.set(sender);
         Ok(())
     }
 

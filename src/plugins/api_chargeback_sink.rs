@@ -655,20 +655,24 @@ impl ApiChargebackSink {
     }
 
     fn activate(&self) -> Result<(), String> {
+        // Fallible setup first: no flush worker, no background tasks, and no
+        // ACTIVE_SINK publication until ownership can be committed atomically.
         let parsed_url = parse_clickhouse_url(&self.config.clickhouse.url)?;
         let endpoint = sanitized_endpoint(&parsed_url);
         let insert_url = build_insert_url(&parsed_url, &self.config.clickhouse);
         let password = resolve_password_ref(self.config.clickhouse.password_ref.as_deref())?;
         let http = build_clickhouse_http_client(&self.config.clickhouse, &self.http_client)?;
-        let flush_config = ClickHouseFlushConfig {
-            http,
-            insert_url: insert_url.clone(),
-            username: self.config.clickhouse.username.clone(),
-            password,
-            timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
-            metrics: Arc::new(SinkMetrics::default()),
+        // Build the spool-replay client before spawning so a TLS/file failure
+        // cannot orphan an already-running BatchingLogger or replayer task.
+        let replay_http = if self.config.spool.enabled {
+            Some(build_clickhouse_http_client(
+                &self.config.clickhouse,
+                &self.http_client,
+            )?)
+        } else {
+            None
         };
-        let metrics = Arc::clone(&flush_config.metrics);
+        let metrics = Arc::new(SinkMetrics::default());
         let spool = if self.config.spool.enabled {
             Some(Arc::new(SpoolManager::new(
                 self.config.spool.clone(),
@@ -677,6 +681,15 @@ impl ApiChargebackSink {
             )?))
         } else {
             None
+        };
+
+        let flush_config = ClickHouseFlushConfig {
+            http,
+            insert_url: insert_url.clone(),
+            username: self.config.clickhouse.username.clone(),
+            password,
+            timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
+            metrics: Arc::clone(&metrics),
         };
 
         let failed_spool = spool.clone();
@@ -746,9 +759,12 @@ impl ApiChargebackSink {
                 plugin_name: PLUGIN_NAME,
             },
             hooks,
-            move |batch| {
+            {
                 let flush_config = flush_config.clone();
-                async move { send_batch(&flush_config, batch).await }
+                move |batch| {
+                    let flush_config = flush_config.clone();
+                    async move { send_batch(&flush_config, batch).await }
+                }
             },
         );
 
@@ -766,20 +782,15 @@ impl ApiChargebackSink {
         });
 
         let mut background_tasks = Vec::new();
-        if let Some(spool) = runtime.spool.clone() {
+        if let (Some(spool), Some(replay_http)) = (runtime.spool.clone(), replay_http) {
             background_tasks.push(start_spool_replayer(
                 Arc::clone(&spool),
                 runtime.summary.clone(),
                 ClickHouseFlushConfig {
-                    http: build_clickhouse_http_client(
-                        &self.config.clickhouse,
-                        &self.http_client,
-                    )?,
+                    http: replay_http,
                     insert_url,
                     username: self.config.clickhouse.username.clone(),
-                    password: resolve_password_ref(
-                        self.config.clickhouse.password_ref.as_deref(),
-                    )?,
+                    password: flush_config.password.clone(),
                     timeout: Duration::from_millis(self.config.clickhouse.timeout_ms),
                     metrics: Arc::clone(&runtime.metrics),
                 },
@@ -802,17 +813,45 @@ impl ApiChargebackSink {
             None
         };
 
+        // Commit ownership. Abort every spawned task on any failure so infinite
+        // replayer/snapshot loops cannot outlive a rejected activation. The
+        // BatchingLogger is owned by `runtime` and is not published to
+        // ACTIVE_SINK until commit succeeds; dropping `runtime` closes its
+        // channel. ACTIVE_SINK is published only after `self.runtime` is set.
+        let abort_tasks = |tasks: &mut Vec<tokio::task::JoinHandle<()>>| {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        };
+
+        let mut owned_tasks = match self.background_tasks.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                abort_tasks(&mut background_tasks);
+                return Err(format!(
+                    "{PLUGIN_NAME}: background task lock poisoned; refusing to start"
+                ));
+            }
+        };
+
+        *owned_tasks = std::mem::take(&mut background_tasks);
+
+        if let Some(accumulator) = snapshot_accumulator
+            && self.snapshot_accumulator.set(accumulator).is_err()
         {
-            let mut tasks = self.background_tasks.lock().map_err(|_| {
-                format!("{PLUGIN_NAME}: background task lock poisoned; refusing to start")
-            })?;
-            *tasks = background_tasks;
+            abort_tasks(&mut owned_tasks);
+            return Err(format!(
+                "{PLUGIN_NAME}: snapshot accumulator already activated; refusing duplicate start"
+            ));
         }
 
-        if let Some(accumulator) = snapshot_accumulator {
-            let _ = self.snapshot_accumulator.set(accumulator);
+        if self.runtime.set(Arc::clone(&runtime)).is_err() {
+            abort_tasks(&mut owned_tasks);
+            return Err(format!(
+                "{PLUGIN_NAME}: runtime already activated; refusing duplicate start"
+            ));
         }
-        let _ = self.runtime.set(Arc::clone(&runtime));
+
         active_sink().store(Arc::new(Some(runtime)));
         invalidate_status_cache();
         Ok(())

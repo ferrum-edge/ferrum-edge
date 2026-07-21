@@ -451,8 +451,17 @@ impl<T: Send + 'static> DeferredBatchingLogger<T> {
             format!("{plugin_name}: start_background_tasks requires a Tokio runtime")
         })?;
         let logger = BatchingLogger::spawn_with_hooks(cfg, hooks, flush);
-        let _ = self.logger.set(logger);
-        Ok(())
+        match self.logger.set(logger) {
+            Ok(()) => Ok(()),
+            Err(mut logger) => {
+                // Slot already occupied (should be unreachable under start_lock).
+                // Abort the just-spawned worker so it cannot outlive this failure.
+                logger.close_and_abort();
+                Err(format!(
+                    "{plugin_name}: batching worker already started; refusing duplicate activation"
+                ))
+            }
+        }
     }
 
     /// Variant of [`Self::start_with_hooks`] with default logger hooks.

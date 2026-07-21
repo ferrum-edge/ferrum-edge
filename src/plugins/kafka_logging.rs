@@ -1115,6 +1115,10 @@ pub fn render_prometheus() -> String {
 
 /// Config + ClientConfig captured by [`KafkaLogging::new`] and consumed by
 /// [`Plugin::start_background_tasks`] to finish producer/logger construction.
+///
+/// Generation IDs are intentionally absent here: allocating
+/// [`NEXT_GENERATION_ID`] during validation-only construction would burn live
+/// IDs and register nothing. IDs are assigned only in [`KafkaLogging::activate`].
 struct KafkaPendingActivation {
     kafka_config: ClientConfig,
     topic: String,
@@ -1124,7 +1128,6 @@ struct KafkaPendingActivation {
     buffer_max_bytes: usize,
     buffer_capacity: usize,
     flush_timeout: Duration,
-    generation_id: u64,
 }
 
 pub struct KafkaLogging {
@@ -1135,8 +1138,8 @@ pub struct KafkaLogging {
     pending: Mutex<Option<KafkaPendingActivation>>,
     start_lock: Mutex<()>,
     broker_hostnames: Vec<String>,
-    /// Pre-start snapshot fields (config-derived; counters stay zero).
-    generation_id: u64,
+    /// Pre-start snapshot ceilings (config-derived; counters stay zero).
+    /// Unstarted instances are not live generations — see [`Self::snapshot`].
     flush_timeout_seconds: u64,
     max_entry_bytes: usize,
     buffer_max_bytes: usize,
@@ -1371,7 +1374,6 @@ impl KafkaLogging {
             .collect();
 
         let schema = resolve_schema(config, "kafka_logging", SchemaCapabilities::BASE)?;
-        let generation_id = NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed);
 
         Ok(Self {
             generation: OnceLock::new(),
@@ -1384,11 +1386,9 @@ impl KafkaLogging {
                 buffer_max_bytes,
                 buffer_capacity,
                 flush_timeout: Duration::from_secs(flush_timeout_seconds),
-                generation_id,
             })),
             start_lock: Mutex::new(()),
             broker_hostnames,
-            generation_id,
             flush_timeout_seconds,
             max_entry_bytes,
             buffer_max_bytes,
@@ -1399,7 +1399,10 @@ impl KafkaLogging {
         &self,
         pending: KafkaPendingActivation,
     ) -> Result<Arc<KafkaGeneration>, (KafkaPendingActivation, String)> {
-        let metrics = Arc::new(KafkaDeliveryMetrics::new(pending.generation_id));
+        // Allocate only when activation is attempted so validation-only
+        // construction never consumes live generation IDs.
+        let generation_id = NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed);
+        let metrics = Arc::new(KafkaDeliveryMetrics::new(generation_id));
         let context = KafkaDeliveryContext {
             metrics: Arc::clone(&metrics),
         };
@@ -1443,7 +1446,7 @@ impl KafkaLogging {
             on_high_water: None,
             high_watermark_percent: 80,
         };
-        let logger = BatchingLogger::spawn_with_hooks(
+        let mut logger = BatchingLogger::spawn_with_hooks(
             BatchConfig {
                 // Kafka admits one userspace message at a time here while
                 // librdkafka owns the real batching underneath.
@@ -1467,6 +1470,10 @@ impl KafkaLogging {
             },
         );
         let Some(handle) = logger.handle() else {
+            // Producer + flush worker were created but admission cannot be
+            // published. Abort the Ferrum worker before returning pending so a
+            // retry does not leave an unowned flush loop behind.
+            logger.close_and_abort();
             return Err((
                 pending,
                 "kafka_logging: failed to publish Ferrum admission handle".to_string(),
@@ -1498,9 +1505,10 @@ impl KafkaLogging {
         if let Some(generation) = self.generation.get() {
             return generation.state.snapshot();
         }
-        // Never-started: config-derived ceilings only, no liveliness noise.
+        // Never-started: config-derived ceilings only. `generation_id: 0` marks
+        // an unactivated validation/construction object — not a live generation.
         KafkaSinkSnapshot {
-            generation_id: self.generation_id,
+            generation_id: 0,
             healthy: true,
             accepting: false,
             finalized: false,
@@ -1994,8 +2002,18 @@ impl Plugin for KafkaLogging {
                 return Err(error);
             }
         };
-        register_generation(Arc::clone(&generation));
-        let _ = self.generation.set(generation);
+        // Publish locally first so Drop can own cleanup if global registration
+        // never happens. Only registered generations appear in diagnostics.
+        if self.generation.set(Arc::clone(&generation)).is_err() {
+            // A racing activation under the start lock should be impossible; if
+            // the slot is occupied, tear down this orphan without registering so
+            // ACTIVE_GENERATIONS / status stay consistent with the live owner.
+            generation.close_admission_report_incomplete();
+            return Err(
+                "kafka_logging: generation already activated; refusing duplicate start".to_string(),
+            );
+        }
+        register_generation(generation);
         Ok(())
     }
 
