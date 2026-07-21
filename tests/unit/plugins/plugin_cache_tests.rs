@@ -1702,7 +1702,7 @@ fn test_compression_rebuild_rejects_unknown_keys_and_keeps_last_known_good() {
 }
 
 #[test]
-fn test_proxy_alerts_rebuild_omits_malformed_optional_values() {
+fn test_proxy_alerts_rebuild_rejects_malformed_values_and_keeps_prior_cache() {
     let valid_cfg = json!({
         "channels": {
             "ops": {
@@ -1763,12 +1763,13 @@ fn test_proxy_alerts_rebuild_omits_malformed_optional_values() {
     );
     cache
         .rebuild(&malformed)
-        .expect("malformed optional proxy_alerts config must not abort cache publication");
+        .expect_err("malformed proxy_alerts config must reject cache publication");
 
     let after = cache.get_plugins("p1");
+    assert_eq!(after.len(), 1);
     assert!(
-        after.is_empty(),
-        "OptionalFailOpen must omit malformed proxy_alerts instead of retaining it"
+        Arc::ptr_eq(&before[0], &after[0]),
+        "KeepLastKnownGood must retain the accepted proxy_alerts instance"
     );
 }
 
