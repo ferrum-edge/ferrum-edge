@@ -724,6 +724,41 @@ pub mod _test_support {
         crate::proxy::tcp_proxy::classify_stream_error(error)
     }
 
+    /// Mirror the TCP accept-loop disconnect summary contract: `duration_ms`
+    /// from process-monotonic `Instant`, RFC3339 connect/disconnect stamps
+    /// from civil/UTC wall clocks only. Used by parity regression tests for
+    /// issue #2624 (WebSocket/UDP/DTLS must match this split).
+    pub fn tcp_stream_summary_from_clocks_for_test(
+        connected_mono: std::time::Instant,
+        connected_wall_at: chrono::DateTime<chrono::Utc>,
+        disconnected_wall_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::plugins::StreamTransactionSummary {
+        crate::plugins::StreamTransactionSummary {
+            namespace: "ferrum".to_string(),
+            proxy_id: "tcp-proxy".to_string(),
+            proxy_name: Some("TCP Proxy".to_string()),
+            client_ip: "10.0.0.1".to_string(),
+            consumer_username: None,
+            auth_method: None,
+            backend_target: "10.0.0.2:9000".to_string(),
+            backend_resolved_ip: Some("10.0.0.2".to_string()),
+            protocol: "tcp".to_string(),
+            listen_port: 9000,
+            // Production: `connected_at.elapsed().as_millis() as f64`
+            duration_ms: connected_mono.elapsed().as_millis() as f64,
+            bytes_sent: 0,
+            bytes_received: 0,
+            connection_error: None,
+            error_class: None,
+            disconnect_direction: None,
+            disconnect_cause: Some(crate::plugins::DisconnectCause::GracefulShutdown),
+            timestamp_connected: connected_wall_at.to_rfc3339(),
+            timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
+            sni_hostname: None,
+            metadata: Default::default(),
+        }
+    }
+
     /// Resolve the DestinationRule `connectionPool.tcp.maxConnections` cap a
     /// backend dial to `dispatch_port` would enforce. Exposes the
     /// `pub(crate)` hot-path helper the WebSocket dispatch path reads so
@@ -2132,6 +2167,36 @@ pub mod _test_support {
             ws_disconnect_plugins,
             proxy_id,
             session_meta,
+            bytes_client_to_backend,
+            bytes_backend_to_client,
+            failure,
+        )
+        .await
+    }
+
+    /// Framed (parsed) WebSocket disconnect entry point — mirrors production
+    /// teardown in `run_websocket_proxy` so unit tests can assert Instant-based
+    /// `duration_ms` with non-zero frame counters.
+    pub async fn fire_ws_framed_disconnect_hooks(
+        ws_disconnect_plugins: &[Arc<dyn Plugin>],
+        proxy_id: &str,
+        session_meta: crate::proxy::WsSessionMeta,
+        frames_client_to_backend: u64,
+        frames_backend_to_client: u64,
+        bytes_client_to_backend: u64,
+        bytes_backend_to_client: u64,
+        failure: Option<(
+            crate::plugins::Direction,
+            crate::retry::ErrorClass,
+            Option<StreamIoSide>,
+        )>,
+    ) {
+        crate::proxy::fire_ws_framed_disconnect_hooks(
+            ws_disconnect_plugins,
+            proxy_id,
+            session_meta,
+            frames_client_to_backend,
+            frames_backend_to_client,
             bytes_client_to_backend,
             bytes_backend_to_client,
             failure,

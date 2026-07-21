@@ -4812,6 +4812,122 @@ backend_tls_verify_server_cert: false
         );
     }
 
+    #[test]
+    fn dtls_frontend_duration_and_idle_use_monotonic_clock() {
+        // Mirrors the frontend DTLS handler: Instant for duration_ms, wall
+        // clocks only for rendering, idle via the same udp_idle_expired
+        // predicate as `dtls_shared_idle_watchdog`.
+        use std::time::Instant;
+
+        let connected_mono = Instant::now();
+        let connected_wall = chrono::Utc::now();
+        let disconnected_wall_rollback = connected_wall - chrono::TimeDelta::hours(1);
+        let correlation_ids = Default::default();
+        let metadata = HashMap::new();
+
+        // Production pattern: duration_ms = connected_mono.elapsed(), never
+        // (disconnected_wall - connected_wall).
+        let duration_ms = connected_mono.elapsed().as_millis() as f64;
+        let summary = build_dtls_stream_summary(DtlsDisconnectContext {
+            namespace: "ferrum",
+            proxy_id: "dtls-proxy",
+            proxy_name: Some("DTLS Frontend"),
+            client_addr: "127.0.0.1:54000".parse().unwrap(),
+            consumer_username: None,
+            auth_method: None,
+            backend_target: "10.0.0.60:7443",
+            backend_resolved_ip: Some("10.0.0.60"),
+            backend_scheme: BackendScheme::Dtls,
+            listen_port: 7443,
+            connected_at: connected_wall,
+            disconnected_at: disconnected_wall_rollback,
+            duration_ms,
+            bytes_sent: 16,
+            bytes_received: 32,
+            connection_error: None,
+            error_class: None,
+            disconnect_direction: None,
+            disconnect_cause: Some(crate::plugins::DisconnectCause::IdleTimeout),
+            metadata: &metadata,
+            correlation_ids: &correlation_ids,
+        });
+        assert!(
+            summary.duration_ms < 5_000.0,
+            "Instant elapsed must ignore hour wall rollback; got {}",
+            summary.duration_ms
+        );
+        assert!(
+            (disconnected_wall_rollback - connected_wall).num_milliseconds() < 0,
+            "fixture must keep a negative wall delta"
+        );
+        assert_eq!(
+            summary.timestamp_connected,
+            connected_wall.to_rfc3339(),
+            "wall connect preserved for rendering"
+        );
+        assert_eq!(
+            summary.timestamp_disconnected,
+            disconnected_wall_rollback.to_rfc3339(),
+            "wall disconnect preserved for rendering"
+        );
+
+        // Forward civil-clock step: duration still Instant-based (not inflated).
+        let disconnected_wall_forward = connected_wall + chrono::TimeDelta::hours(5);
+        let duration_forward = connected_mono.elapsed().as_millis() as f64;
+        let forward_summary = build_dtls_stream_summary(DtlsDisconnectContext {
+            namespace: "ferrum",
+            proxy_id: "dtls-proxy",
+            proxy_name: None,
+            client_addr: "127.0.0.1:54000".parse().unwrap(),
+            consumer_username: None,
+            auth_method: None,
+            backend_target: "10.0.0.60:7443",
+            backend_resolved_ip: None,
+            backend_scheme: BackendScheme::Dtls,
+            listen_port: 7443,
+            connected_at: connected_wall,
+            disconnected_at: disconnected_wall_forward,
+            duration_ms: duration_forward,
+            bytes_sent: 0,
+            bytes_received: 0,
+            connection_error: None,
+            error_class: None,
+            disconnect_direction: None,
+            disconnect_cause: None,
+            metadata: &metadata,
+            correlation_ids: &correlation_ids,
+        });
+        assert!(
+            forward_summary.duration_ms < 5_000.0,
+            "Instant elapsed must ignore forward wall jump; got {}",
+            forward_summary.duration_ms
+        );
+        assert_eq!(
+            forward_summary.timestamp_disconnected,
+            disconnected_wall_forward.to_rfc3339()
+        );
+
+        // DTLS idle watchdog: injected mono endpoints, independent of wall.
+        // Forward wall would have expired an epoch-based watchdog immediately;
+        // mono without advance must keep the session alive.
+        assert!(
+            !udp_idle_expired(1_000, 1_000, 60_000),
+            "DTLS idle: no mono advance → not expired"
+        );
+        assert!(
+            !udp_idle_expired(61_000, 1_000, 60_000),
+            "DTLS idle: exactly at timeout still alive (strict >)"
+        );
+        assert!(
+            udp_idle_expired(61_001, 1_000, 60_000),
+            "DTLS idle: mono past timeout must expire"
+        );
+        assert!(
+            !udp_idle_expired(500, 1_000, 60_000),
+            "DTLS idle: mono \"rollback\" saturates — must not freeze forever"
+        );
+    }
+
     #[tokio::test]
     async fn test_emit_udp_stream_disconnect_notifies_plugins() {
         let client_addr: SocketAddr = "127.0.0.1:53001".parse().unwrap();

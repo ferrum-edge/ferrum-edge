@@ -27,8 +27,8 @@ use async_trait::async_trait;
 use std::time::Instant;
 
 use ferrum_edge::_test_support::{
-    StreamIoSide, fire_ws_tunnel_disconnect_hooks, make_ws_session_meta,
-    make_ws_session_meta_with_mono,
+    StreamIoSide, fire_ws_framed_disconnect_hooks, fire_ws_tunnel_disconnect_hooks,
+    make_ws_session_meta, make_ws_session_meta_with_mono,
 };
 use ferrum_edge::plugins::{Direction, Plugin, WsDisconnectContext};
 use ferrum_edge::retry::ErrorClass;
@@ -251,5 +251,79 @@ async fn test_tunnel_disconnect_duration_ignores_wall_clock_skew() {
         captured[0].timestamp_connected,
         meta.session_start.to_rfc3339(),
         "wall connect timestamp is preserved for rendering"
+    );
+}
+
+#[tokio::test]
+async fn test_framed_disconnect_duration_ignores_wall_clock_skew() {
+    // Framed path (H1/H2/H3 parsed relay) must match tunnel: Instant duration
+    // with wall stamps used only for rendering. Backward and forward civil
+    // skew must not clamp/inflate duration_ms; frame counters stay non-zero.
+    let (plugin, captured) = CapturingDisconnectPlugin::new();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin)];
+    let wall_connect = chrono::Utc::now() - chrono::Duration::hours(1);
+    let meta = make_ws_session_meta_with_mono(
+        "ferrum".to_string(),
+        Some("ws-framed".to_string()),
+        "10.0.0.8".to_string(),
+        "backend:9001".to_string(),
+        8443,
+        None,
+        HashMap::new(),
+        wall_connect,
+        Instant::now(),
+    );
+    let expected_connected = meta.session_start.to_rfc3339();
+
+    fire_ws_framed_disconnect_hooks(&plugins, "proxy-framed", meta, 3, 5, 30, 50, None).await;
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].frames_c2b, 3);
+    assert_eq!(captured[0].frames_b2c, 5);
+    assert_eq!(captured[0].bytes_c2b, 30);
+    assert_eq!(captured[0].bytes_b2c, 50);
+    assert!(
+        captured[0].duration_ms < 5_000.0,
+        "framed duration_ms must use Instant under wall rollback; got {}",
+        captured[0].duration_ms
+    );
+    assert_eq!(
+        captured[0].timestamp_connected, expected_connected,
+        "wall connect timestamp is preserved for rendering"
+    );
+
+    // Forward civil-clock skew: wall connect an hour in the future would make
+    // a wall-delta path report zero/negative; Instant still reports near-zero
+    // elapsed from session_start_mono = now.
+    let (plugin_fwd, captured_fwd) = CapturingDisconnectPlugin::new();
+    let plugins_fwd: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin_fwd)];
+    let wall_forward = chrono::Utc::now() + chrono::Duration::hours(1);
+    let meta_fwd = make_ws_session_meta_with_mono(
+        "ferrum".to_string(),
+        Some("ws-framed".to_string()),
+        "10.0.0.8".to_string(),
+        "backend:9001".to_string(),
+        8443,
+        None,
+        HashMap::new(),
+        wall_forward,
+        Instant::now(),
+    );
+    let expected_fwd_connected = meta_fwd.session_start.to_rfc3339();
+
+    fire_ws_framed_disconnect_hooks(&plugins_fwd, "proxy-framed", meta_fwd, 1, 1, 8, 8, None)
+        .await;
+
+    let captured_fwd = captured_fwd.lock().unwrap();
+    assert_eq!(captured_fwd.len(), 1);
+    assert!(
+        captured_fwd[0].duration_ms < 5_000.0,
+        "framed duration_ms must not inflate under forward wall skew; got {}",
+        captured_fwd[0].duration_ms
+    );
+    assert_eq!(
+        captured_fwd[0].timestamp_connected, expected_fwd_connected,
+        "forward-skewed wall connect timestamp is still rendered"
     );
 }
