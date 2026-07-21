@@ -22164,7 +22164,7 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
 
-                let mut buffered_initial_response_header_policy_state = if !after_proxy_rejected {
+                if !after_proxy_rejected {
                     let phase_start = Instant::now();
                     crate::plugins::normalize_response_body_for_inspection(
                         &plugins,
@@ -22227,7 +22227,7 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
 
-                if !after_proxy_rejected {
+                let mut buffered_initial_response_header_policy_state = if !after_proxy_rejected {
                     let phase_start = Instant::now();
                     // Keep buffered gRPC-Web conversion keyed to the original
                     // request when the hook-visible response headers are still
