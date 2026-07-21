@@ -452,9 +452,7 @@ async fn h3_stalled_early_body_hits_operator_whole_upload_timeout() {
                     last_err = Some(error.to_string());
                     sleep(Duration::from_millis(100)).await;
                 }
-                Err(error) => panic!(
-                    "H3 stalled early upload failed: {error}; prior={last_err:?}"
-                ),
+                Err(error) => panic!("H3 stalled early upload failed: {error}; prior={last_err:?}"),
             }
         }
     };
@@ -482,9 +480,8 @@ async fn h3_slow_cancelled_stream_does_not_block_independent_sibling_stream() {
     let get_url = upload_url.clone();
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, https_port));
 
-    let stalled = tokio::spawn(async move {
-        h3_post_stalled_json(&upload_url, "localhost", addr).await
-    });
+    let stalled =
+        tokio::spawn(async move { h3_post_stalled_json(&upload_url, "localhost", addr).await });
 
     // Independent GET has no early body phase and should reach the OK backend
     // promptly while the sibling POST is still parked in the early drain.

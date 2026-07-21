@@ -22,8 +22,8 @@ fn compose_earliest_of_picks_operator_when_it_is_sooner() {
     let absolute = tokio::time::Instant::now()
         .checked_add(Duration::from_secs(60))
         .expect("representable");
-    let (effective, kind) = compose_early_upload_bound_for_test(Some(absolute), 25)
-        .expect("bound must exist");
+    let (effective, kind) =
+        compose_early_upload_bound_for_test(Some(absolute), 25).expect("bound must exist");
     assert_eq!(kind, EarlyUploadBoundKind::OperatorTimeout);
     assert!(effective <= absolute);
     assert!(
@@ -39,8 +39,8 @@ fn compose_earliest_of_picks_absolute_rpc_deadline_when_sooner() {
     let absolute = tokio::time::Instant::now()
         .checked_add(Duration::from_millis(5))
         .expect("representable");
-    let (effective, kind) = compose_early_upload_bound_for_test(Some(absolute), 60_000)
-        .expect("bound must exist");
+    let (effective, kind) =
+        compose_early_upload_bound_for_test(Some(absolute), 60_000).expect("bound must exist");
     assert_eq!(kind, EarlyUploadBoundKind::RpcDeadline);
     assert_eq!(effective, absolute);
 }
@@ -120,8 +120,7 @@ async fn h1h2_and_h3_rpc_deadline_wins_over_larger_operator_timeout_without_wall
 
     let h1h2_pending = std::future::pending::<Result<(), ()>>();
     let h1h2_task = tokio::spawn(async move {
-        collect_h1h2_request_body_with_deadline_for_test(h1h2_pending, Some(deadline), 60_000)
-            .await
+        collect_h1h2_request_body_with_deadline_for_test(h1h2_pending, Some(deadline), 60_000).await
     });
     let h3_pending = std::future::pending::<Result<(), ()>>();
     let h3_task = tokio::spawn(async move {

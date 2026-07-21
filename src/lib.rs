@@ -2321,7 +2321,9 @@ pub mod _test_support {
         .await
         {
             Ok(result) => Ok(result),
-            Err(crate::proxy::RequestBodyWaitError::TimedOut) => Err(EarlyUploadWaitError::TimedOut),
+            Err(crate::proxy::RequestBodyWaitError::TimedOut) => {
+                Err(EarlyUploadWaitError::TimedOut)
+            }
             Err(crate::proxy::RequestBodyWaitError::DeadlineExceeded) => {
                 Err(EarlyUploadWaitError::DeadlineExceeded)
             }
