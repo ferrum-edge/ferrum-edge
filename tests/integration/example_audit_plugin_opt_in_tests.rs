@@ -50,52 +50,98 @@ fn build_script_requires_explicit_opt_in_for_examples() {
     );
 }
 
-#[test]
-fn setup_rust_ci_custom_plugins_list_matches_examples_directory() {
-    // Guard against drifting the shared composite action's hardcoded stem list
-    // away from custom_plugins/examples/*.rs (F16).
-    let action = include_str!("../../.github/actions/setup-rust-ci/action.yml");
-    let export_line = action
-        .lines()
-        .find(|line| line.contains("FERRUM_CUSTOM_PLUGINS="))
-        .expect("setup-rust-ci must export FERRUM_CUSTOM_PLUGINS");
-    let assigned = export_line
-        .split("FERRUM_CUSTOM_PLUGINS=")
-        .nth(1)
-        .expect("assignment")
-        .trim()
-        .trim_matches('"')
-        .split(">>")
-        .next()
-        .expect("env assignment")
-        .trim()
-        .trim_matches('"');
-    let mut listed: Vec<&str> = assigned
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .collect();
-    listed.sort_unstable();
-
-    let mut on_disk: Vec<String> = fs::read_dir("custom_plugins/examples")
-        .expect("examples dir")
+fn rust_plugin_stems(dir: &Path) -> Vec<String> {
+    let mut stems: Vec<String> = fs::read_dir(dir)
+        .unwrap_or_else(|err| panic!("read {}: {err}", dir.display()))
         .filter_map(|entry| {
             let entry = entry.ok()?;
             let path = entry.path();
             if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
                 path.file_stem()
                     .and_then(|stem| stem.to_str())
+                    .filter(|stem| {
+                        !stem.is_empty()
+                            && stem
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    })
                     .map(str::to_string)
             } else {
                 None
             }
         })
         .collect();
-    on_disk.sort();
+    stems.sort_unstable();
+    stems
+}
+
+/// Resolve the directory the composite action discovers for pedagogical stems.
+///
+/// setup-rust-ci builds `FERRUM_CUSTOM_PLUGINS` via shell (`$plugins`), so the
+/// effective examples list is the `*.rs` stems under the glob the action loops.
+fn setup_rust_ci_examples_discovery_dir(action: &str) -> &Path {
+    action
+        .lines()
+        .find_map(|line| {
+            let trimmed = line.trim_start();
+            let rest = trimmed.strip_prefix("for source in ")?;
+            let glob = rest.split_whitespace().next()?.trim_end_matches(';');
+            let dir = glob.strip_suffix("/*.rs")?;
+            // Pedagogical opt-in must come from an examples/ tree, not production.
+            if dir.contains("examples") {
+                Some(Path::new(dir))
+            } else {
+                None
+            }
+        })
+        .expect(
+            "setup-rust-ci must discover FERRUM_CUSTOM_PLUGINS example stems via \
+             a `for source in <examples-dir>/*.rs` loop",
+        )
+}
+
+#[test]
+fn setup_rust_ci_custom_plugins_list_matches_examples_directory() {
+    // Guard against drifting the shared composite action's effective
+    // FERRUM_CUSTOM_PLUGINS examples list away from custom_plugins/examples/*.rs
+    // (F16). The action exports via `$plugins`, so parse its discovery glob and
+    // compare that directory's stems to the canonical examples tree.
+    let action = include_str!("../../.github/actions/setup-rust-ci/action.yml");
+    assert!(
+        action.contains("custom_plugins/*.rs"),
+        "setup-rust-ci must auto-include production custom_plugins/*.rs stems"
+    );
+    assert!(
+        action
+            .lines()
+            .any(|line| line.contains("FERRUM_CUSTOM_PLUGINS=") && line.contains("GITHUB_ENV")),
+        "setup-rust-ci must export FERRUM_CUSTOM_PLUGINS to GITHUB_ENV"
+    );
+    // Empty-list and identifier checks keep `$plugins` interpolation from
+    // writing a blank or injectable GITHUB_ENV value.
+    assert!(
+        action.contains("resolved to an empty list"),
+        "setup-rust-ci must fail closed when FERRUM_CUSTOM_PLUGINS would be empty"
+    );
+    assert!(
+        action.contains("invalid custom plugin stem") || action.contains("*[!A-Za-z0-9_]*"),
+        "setup-rust-ci must reject non-identifier plugin stems before GITHUB_ENV write"
+    );
+
+    let configured_examples_dir = setup_rust_ci_examples_discovery_dir(action);
+    let mut listed = rust_plugin_stems(configured_examples_dir);
+    listed.sort_unstable();
+
+    let mut on_disk = rust_plugin_stems(Path::new("custom_plugins/examples"));
+    on_disk.sort_unstable();
+    assert!(
+        !on_disk.is_empty(),
+        "custom_plugins/examples must contain at least one pedagogical plugin stem"
+    );
 
     assert_eq!(
         listed,
-        on_disk.iter().map(String::as_str).collect::<Vec<_>>(),
+        on_disk,
         "setup-rust-ci FERRUM_CUSTOM_PLUGINS must list every custom_plugins/examples/*.rs stem"
     );
 }
