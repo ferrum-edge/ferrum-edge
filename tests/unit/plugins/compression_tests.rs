@@ -1031,7 +1031,7 @@ async fn test_security_rejection_not_replaced_by_406() {
         fn name(&self) -> &str {
             "test_auth_reject"
         }
-        fn priority(&self) -> i32 {
+        fn priority(&self) -> u16 {
             1000
         }
         async fn before_proxy(
