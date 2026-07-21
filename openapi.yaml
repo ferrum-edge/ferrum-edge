@@ -8490,9 +8490,12 @@ components:
         exhausted, the plugin sends a WebSocket close frame (RFC 6455 close code
         1008 — Policy Violation) to both client and backend. Both directions
         (client→backend and backend→client) consume from the same per-connection
-        bucket. Supports centralized Redis-backed mode for cross-instance
-        coordination of frame counters. Counter storage supports only local
-        memory and Redis; database-backed counters are intentionally unsupported.
+        bucket. Redis mode (`sync_mode: "redis"`) externalizes those
+        per-connection counters under a per-plugin/gateway-instance key
+        namespace; it does not coordinate a portable frame budget across
+        gateway instances, reconnects, or plugin rebuilds. Counter storage
+        supports only local memory and Redis; database-backed counters are
+        intentionally unsupported.
       properties:
         frames_per_second:
           type: integer
@@ -8521,7 +8524,11 @@ components:
           type: string
           enum: [local, redis]
           default: local
-          description: "Frame counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported. Any RESP-compatible server works."
+          description: >-
+            Frame counter storage: 'local' (in-memory) or 'redis' (externalized
+            per-connection counters namespaced per plugin/gateway instance; not
+            a portable cross-instance budget). Database-backed counters are
+            unsupported. Any RESP-compatible server works.
         redis_url:
           type: string
           description: "Redis connection URL. Required when sync_mode is 'redis'."

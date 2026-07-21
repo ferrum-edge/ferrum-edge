@@ -658,6 +658,63 @@ fn test_redis_connection_scope_key_is_namespaced_per_instance() {
     assert!(key_b.ends_with(":proxy-a:7"));
 }
 
+/// Public surfaces must retain the instance-scoped Redis limitation from the
+/// detailed plugin reference (`docs/plugins.md` / `docs/plugin_execution_order.md`)
+/// and must not claim portable cross-instance frame-budget coordination.
+#[test]
+fn test_public_docs_retain_instance_scoped_redis_semantics() {
+    let readme = include_str!("../../../README.md");
+    let features = include_str!("../../../FEATURES.md");
+    let openapi = include_str!("../../../openapi.yaml");
+    let plugins = include_str!("../../../docs/plugins.md");
+    let order = include_str!("../../../docs/plugin_execution_order.md");
+
+    assert!(
+        !readme.contains(
+            "All three rate limiting plugins (`rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`) support centralized mode via `sync_mode: \"redis\"` for coordinated limits across multiple gateway instances"
+        ),
+        "README must not unqualifiedly group ws_rate_limiting with portable-identity distributed limiters"
+    );
+    assert!(
+        readme.contains("externalize per-connection frame counters")
+            && readme.contains("per-plugin/gateway-instance Redis namespace"),
+        "README must describe instance-scoped Redis externalization for ws_rate_limiting"
+    );
+
+    assert!(
+        !features.contains("cross-instance frame rate coordination"),
+        "FEATURES must not promise cross-instance frame rate coordination for ws_rate_limiting"
+    );
+    assert!(
+        features.contains("externalizes per-connection counters")
+            && features.contains("per-plugin/gateway-instance key namespacing")
+            && features.contains("not portable across reconnects or rebuilds"),
+        "FEATURES must retain the instance-scoped Redis limitation"
+    );
+
+    let ws_schema = openapi
+        .split("WsRateLimitingConfig:")
+        .nth(1)
+        .and_then(|rest| rest.split("\n    UdpRateLimitingConfig:").next())
+        .expect("WsRateLimitingConfig schema block");
+    assert!(
+        !ws_schema.contains("cross-instance coordination of frame counters"),
+        "OpenAPI must not claim cross-instance coordination for ws_rate_limiting"
+    );
+    assert!(
+        ws_schema.contains("externalizes those")
+            && ws_schema.contains("per-plugin/gateway-instance key")
+            && ws_schema.contains("not a portable cross-instance budget"),
+        "OpenAPI WsRateLimitingConfig/sync_mode must describe instance-scoped Redis semantics"
+    );
+
+    assert!(
+        plugins.contains("does not make per-connection limits portable across reconnects")
+            && order.contains("rather than sharing a portable connection budget across reconnects"),
+        "detailed plugin docs must keep the non-portable Redis semantics that public surfaces mirror"
+    );
+}
+
 #[test]
 fn test_warmup_hostnames_for_redis() {
     let plugin = WsRateLimiting::new(
