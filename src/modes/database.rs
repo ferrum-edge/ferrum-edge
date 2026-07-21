@@ -1058,6 +1058,26 @@ pub async fn run(
     let initial_load = load_full_config_with_sequence(&db, &env_config.namespace).await;
     let (config, initial_change_sequence) = match initial_load {
         Ok((cfg, sequence)) => {
+            // The lazy offline store can recover after the deferred-migration
+            // probe above fails but before this first authoritative load. A
+            // successful load proves that the database is reachable now; run
+            // the ordinary startup plugin-migration policy immediately instead
+            // of leaving admin writes blocked until the first poll tick.
+            if bootstrap_from_backup {
+                crate::modes::handle_startup_plugin_migrations(
+                    &db,
+                    env_config.auto_apply_plugin_migrations,
+                    "database-recovered-during-startup",
+                )
+                .await?;
+                plugin_migration_reconcile_state
+                    .store(PLUGIN_MIGRATIONS_RECONCILED, Ordering::Release);
+                bootstrap_from_backup = false;
+                info!(
+                    "Backup-bootstrapped store recovered during the initial database load; \
+                     custom-plugin migration policy reconciled and admin writes enabled"
+                );
+            }
             info!(
                 "Database mode: loaded {} proxies, {} consumers",
                 cfg.proxies.len(),
@@ -2695,6 +2715,11 @@ async fn mark_db_available_after_successful_poll_load(
             true
         }
         Err(PLUGIN_MIGRATIONS_RECONCILING) => {
+            // The database poll task is the only caller today and invokes this
+            // helper sequentially, so no owner can be abandoned while another
+            // caller observes RECONCILING. If concurrent callers are added,
+            // the reconcile owner must gain a drop/reset guard before relying
+            // on this branch.
             db_available.store(false, Ordering::Relaxed);
             false
         }
@@ -2815,6 +2840,30 @@ mod tests {
         assert!(
             poll_section.contains("PLUGIN_MIGRATIONS_NEED_RECONCILE, Ordering::Release)"),
             "topology reconnect must reset the plugin-migration reconcile gate"
+        );
+    }
+
+    #[test]
+    fn startup_load_recovery_clears_backup_state_before_admin_initialization() {
+        // Issue #2802: the database can recover after the eager deferred-
+        // migration probe but before the initial authoritative load.
+        let source = include_str!("database.rs");
+        let success_arm = source
+            .find("Ok((cfg, sequence)) => {")
+            .expect("initial load success arm must exist");
+        let initial_availability = source
+            .find("let db_available = Arc::new(AtomicBool::new(initial_db_available(")
+            .expect("initial availability initialization must exist");
+        let startup_recovery = &source[success_arm..initial_availability];
+        assert!(
+            startup_recovery.contains("database-recovered-during-startup")
+                && startup_recovery.contains("handle_startup_plugin_migrations("),
+            "a successful initial DB load after offline connect must run plugin migration policy"
+        );
+        assert!(
+            startup_recovery.contains(".store(PLUGIN_MIGRATIONS_RECONCILED, Ordering::Release)")
+                && startup_recovery.contains("bootstrap_from_backup = false;"),
+            "startup recovery must clear both migration and backup availability gates"
         );
     }
 

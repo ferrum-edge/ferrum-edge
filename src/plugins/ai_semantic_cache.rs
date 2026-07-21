@@ -86,6 +86,12 @@ pub const AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS: &[&str] = &[
     "semantic_embedding_timeout_ms",
 ];
 
+/// Suffix appended to `FERRUM_NAMESPACE` when `redis_key_prefix` is omitted.
+///
+/// The full runtime default is `{FERRUM_NAMESPACE}:ai_cache` (for example
+/// `ferrum:ai_cache` when the namespace is `ferrum`).
+pub const AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX: &str = "ai_cache";
+
 /// Every accepted top-level `ai_semantic_cache` configuration property.
 ///
 /// Union of root retention/isolation/size keys, semantic-policy keys, and the
@@ -2245,9 +2251,12 @@ fn validate_semantic_embedding_endpoint(
 }
 
 fn default_redis_key_prefix(namespace: &str) -> String {
-    let mut prefix = String::with_capacity(namespace.len() + 9);
+    let mut prefix = String::with_capacity(
+        namespace.len() + 1 + AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX.len(),
+    );
     prefix.push_str(namespace);
-    prefix.push_str(":ai_cache");
+    prefix.push(':');
+    prefix.push_str(AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX);
     prefix
 }
 

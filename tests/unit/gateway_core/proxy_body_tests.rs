@@ -32,6 +32,44 @@ fn test_proxy_body_empty() {
     assert!(body.is_end_stream());
 }
 
+/// Issue #2445: Hyper H1 synthesizes `Content-Length: 0` for ordinary empty
+/// bodies on 205. The status-aware constructor must not advertise an exact
+/// length until EOF so reject finalization can omit Content-Length on the wire.
+#[test]
+fn test_proxy_body_empty_for_205_omits_exact_length_until_polled() {
+    let body = ProxyBody::empty_for_response_status(205);
+    assert!(
+        body.size_hint().exact().is_none(),
+        "205 empty body must not advertise an exact length before poll"
+    );
+    assert!(
+        !body.is_end_stream(),
+        "205 empty body must stay open until Hyper polls EOF"
+    );
+
+    for status in [204u16, 304] {
+        let body = ProxyBody::empty_for_response_status(status);
+        assert_eq!(
+            body.size_hint().exact(),
+            Some(0),
+            "status {status} keeps the ordinary empty Full body"
+        );
+        assert!(
+            body.is_end_stream(),
+            "status {status} ordinary empty body is already ended"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_proxy_body_empty_for_205_yields_immediate_eof() {
+    use http_body_util::BodyExt;
+
+    let body = ProxyBody::empty_for_response_status(205);
+    let collected = body.collect().await.expect("205 empty body collects");
+    assert!(collected.to_bytes().is_empty());
+}
+
 #[test]
 fn test_proxy_body_full_not_end_stream_when_has_data() {
     let body = ProxyBody::full(Bytes::from("data"));
