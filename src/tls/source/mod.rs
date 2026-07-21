@@ -652,14 +652,50 @@ fn load_secret_material(
     // is deliberately not used here.
     let source_id = uri.redacted_source_id();
     let scheme = uri.scheme;
-    let identifier = uri.identifier.clone();
+    let configured_version = uri.options.get("version").cloned();
     let key = format!("TLS {} material", uri.kind.as_str());
-    let version = uri.options.get("version").cloned();
-    let resolved = resolve_secret_reference_blocking(scheme.as_str().to_string(), identifier, key)
-        .map_err(|details| MaterialError::Secret {
-            source_id: source_id.clone(),
-            details,
-        })?;
+
+    // Azure: merge path `/<version>` with typed `?version=` (reject conflicts)
+    // into the *fetch* reference only. Configured source identity stays on
+    // `uri.identifier` + `uri.options` so distinct spellings do not collapse.
+    let fetch_identifier = {
+        #[cfg(feature = "secrets-azure")]
+        {
+            if scheme == SourceScheme::Azure {
+                crate::secrets::azure_apply_tls_version_option(
+                    &uri.identifier,
+                    configured_version.as_deref(),
+                    &key,
+                )
+                .map_err(|details| MaterialError::InvalidSource {
+                    source_id: source_id.clone(),
+                    details,
+                })?
+            } else {
+                uri.identifier.clone()
+            }
+        }
+        #[cfg(not(feature = "secrets-azure"))]
+        {
+            uri.identifier.clone()
+        }
+    };
+
+    let resolved =
+        resolve_secret_reference_blocking(scheme.as_str().to_string(), fetch_identifier, key)
+            .map_err(|details| MaterialError::Secret {
+                source_id: source_id.clone(),
+                details,
+            })?;
+
+    // Azure material reports the version Key Vault actually returned. Other
+    // providers keep the historical configured `?version=` metadata label.
+    let version = match scheme {
+        #[cfg(feature = "secrets-azure")]
+        SourceScheme::Azure => resolved.version,
+        _ => configured_version,
+    };
+
     Ok(MaterializedMaterial::from_bytes(
         resolved.value.into_bytes(),
         scheme,

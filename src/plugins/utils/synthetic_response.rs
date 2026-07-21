@@ -27,6 +27,11 @@ pub fn synthetic_response_omits_body(method: &str, status: u16) -> bool {
 /// responses leave headers unchanged and return `false`. The caller clears or
 /// substitutes its body only when this returns `true`, avoiding a body clone on
 /// the ordinary response path.
+///
+/// H1 note: Hyper still synthesizes `Content-Length: 0` for ordinary empty
+/// bodies on status 205 (it special-cases only 204/304). Reject finalizers
+/// must select a status-aware empty body so 205 does not re-advertise length
+/// on the wire.
 pub fn prepare_synthetic_response_wire(
     method: &str,
     status: u16,

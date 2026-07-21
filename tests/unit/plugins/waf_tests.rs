@@ -3266,3 +3266,96 @@ fn waf_stream_metadata_ownership_documentation_matches_stream_support() {
         "note must state that stream logs have no equivalent ownership filter"
     );
 }
+
+#[test]
+fn waf_custom_rule_path_regex_docs_match_unanchored_runtime() {
+    // Regression for #2331: docs/plugins.md previously claimed custom-rule
+    // `conditions.paths` used the same start-anchored `^(?:...)` wrapper as
+    // `global_exemptions.paths`. Runtime, docs/waf.md, and OpenAPI keep rule
+    // conditions operator-authored and unanchored. Pin the three surfaces so
+    // the plugin guide cannot drift back to the exemption grammar.
+    let plugin_docs = include_str!("../../../docs/plugins.md");
+    let waf_guide = include_str!("../../../docs/waf.md");
+    let openapi = include_str!("../../../openapi.yaml");
+
+    let custom_rule_table = plugin_docs
+        .split("**Custom rule fields:**")
+        .nth(1)
+        .and_then(|rest| rest.split("`global_exemptions` supports").next())
+        .expect("waf custom rule fields table");
+    let conditions_row = custom_rule_table
+        .lines()
+        .find(|line| line.starts_with("| `conditions` |"))
+        .expect("conditions row in custom rule fields table");
+    let global_exemptions = plugin_docs
+        .split("`global_exemptions` supports")
+        .nth(1)
+        .and_then(|rest| rest.split("```yaml").next())
+        .expect("waf global_exemptions paragraph");
+
+    assert!(
+        !conditions_row.contains("wrapped as `^(?:regex)`"),
+        "conditions.paths must not reuse the global-exemption anchor wrapper"
+    );
+    assert!(
+        !conditions_row.contains("same exact / trailing-`*` prefix / `~` regex grammar"),
+        "conditions.paths must not claim identical regex grammar to global_exemptions.paths"
+    );
+    assert!(
+        conditions_row.contains("unanchored"),
+        "conditions.paths must document unanchored regex matching"
+    );
+    assert!(
+        conditions_row.contains("`is_match`"),
+        "conditions.paths must mention Rust regex is_match semantics"
+    );
+    assert!(
+        conditions_row.contains("~^/admin(?:/|$)"),
+        "conditions.paths must include an explicit start-anchored example"
+    );
+    assert!(
+        conditions_row.contains("`~api`")
+            && conditions_row.contains("/api/users")
+            && conditions_row.contains("/v1/api-keys"),
+        "conditions.paths must include a floating-match example"
+    );
+    assert!(
+        conditions_row.contains("Exact and prefix forms are unchanged"),
+        "conditions.paths must keep exact/prefix behavior distinct from regex anchoring"
+    );
+
+    assert!(
+        global_exemptions.contains("start-anchored"),
+        "global_exemptions.paths must remain start-anchored"
+    );
+    assert!(
+        global_exemptions.contains("wrapped as `^(?:regex)`"),
+        "global_exemptions.paths must keep the implicit ^(?:...) wrapper"
+    );
+    assert!(
+        global_exemptions.contains("unlike unanchored per-rule `conditions.paths`"),
+        "global_exemptions.paths must distinguish unanchored rule conditions"
+    );
+    assert!(
+        global_exemptions.contains("`~.*pattern`"),
+        "global_exemptions.paths must keep the floating-match escape hatch"
+    );
+
+    assert!(
+        waf_guide.contains("operator-authored regex")
+            && waf_guide.contains("may match anywhere in the path")
+            && waf_guide.contains("~^/api/"),
+        "docs/waf.md must keep unanchored conditions.paths semantics"
+    );
+    assert!(
+        waf_guide.contains("`~regex` is start-anchored (an implicit leading `^`)"),
+        "docs/waf.md must keep start-anchored global_exemptions.paths semantics"
+    );
+
+    assert!(
+        openapi.contains("operator-authored regex matched")
+            && openapi.contains("regex conditions may match anywhere")
+            && openapi.contains("`~regex` is a start-anchored regex"),
+        "openapi.yaml must keep unanchored rule conditions and start-anchored exemptions"
+    );
+}
