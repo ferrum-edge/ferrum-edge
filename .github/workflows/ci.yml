@@ -924,6 +924,7 @@ jobs:
             filters: |
               functional_cors_protocol_test
               functional_grpc_test
+              functional_h3_soap_utf16_test
               functional_key_auth_query_test
               functional_load_testing_replay_test
               functional_passthrough_test

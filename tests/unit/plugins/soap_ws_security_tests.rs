@@ -519,6 +519,56 @@ fn test_plugin_contract() {
     assert!(!plugin.applies_after_proxy_on_reject());
 }
 
+/// OpenAPI must advertise the same exclusive-c14n contract as the runtime and
+/// `docs/plugins.md` (issue #2328). Guards against reintroducing the pre-#2033
+/// wire-byte / no-`xml-exc-c14n#` schema wording.
+#[test]
+fn openapi_soap_ws_security_describes_exclusive_c14n_contract() {
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let root = spec["components"]["schemas"]["SoapWsSecurityConfig"]["description"]
+        .as_str()
+        .expect("SoapWsSecurityConfig description");
+    let saml =
+        spec["components"]["schemas"]["SoapWsSecurityConfig"]["properties"]["saml"]["description"]
+            .as_str()
+            .expect("SoapWsSecurityConfig.saml description");
+    let plugins_doc = include_str!("../../../docs/plugins.md");
+
+    for (label, text) in [("root", root), ("saml", saml)] {
+        assert!(
+            text.contains("xml-exc-c14n#"),
+            "{label} OpenAPI description must name exclusive c14n: {text}"
+        );
+        assert!(
+            text.contains("InclusiveNamespaces PrefixList"),
+            "{label} OpenAPI description must name InclusiveNamespaces PrefixList: {text}"
+        );
+        assert!(
+            !text.contains("wire bytes")
+                && !text.contains("do not yet apply")
+                && !text.contains("do not currently apply"),
+            "{label} OpenAPI description must not claim wire-byte / missing-c14n verification: {text}"
+        );
+    }
+
+    assert!(
+        root.contains("enveloped-signature") && root.contains("exclusive c14n"),
+        "root OpenAPI description must name the supported reference-transform chain: {root}"
+    );
+    assert!(
+        saml.contains("enveloped-signature") && saml.contains("xml-exc-c14n#"),
+        "saml OpenAPI description must name the supported reference-transform chain: {saml}"
+    );
+
+    assert!(
+        plugins_doc.contains("Exclusive XML Canonicalization (`xml-exc-c14n#`)")
+            && plugins_doc.contains("InclusiveNamespaces PrefixList")
+            && plugins_doc.contains("enveloped-signature transform followed by exclusive c14n"),
+        "docs/plugins.md must retain the exclusive-c14n contract that OpenAPI mirrors"
+    );
+}
+
 #[test]
 fn count_wsu_id_occurrences_counts_mixed_id_spellings_once_each() {
     let xml = r#"

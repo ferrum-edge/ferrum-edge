@@ -3233,7 +3233,7 @@ representations explicitly outside the configured response-body scan scope.
 | `score` | integer | severity weight | Anomaly-score contribution when `scoring` is enabled. |
 | `fp_filters` | string[] | `[]` | Regex filters that suppress known false-positive captured values for this rule. |
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
-| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries use the same exact / trailing-`*` prefix / `~` regex grammar as `global_exemptions.paths`; `~regex` entries are wrapped as `^(?:regex)`, so use `~.*pattern` for a floating substring match. |
+| `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries share exact-match and trailing-`*` prefix forms with `global_exemptions.paths`, but `~regex` anchoring differs: rule `conditions.paths` compile the text after `~` as an operator-authored, unanchored regex evaluated with Rust regex `is_match`, so they may match anywhere in the path unless the pattern itself is anchored (for example `~^/admin(?:/|$)`). A floating match such as `~api` therefore matches both `/api/users` and `/v1/api-keys`. Exact and prefix forms are unchanged and are not regex-anchored. |
 
 Supported targets: `header_names`, `header_values`, `query_keys`,
 `query_values`, `cookies`, `url_path`, `full_url`, `method`, `body_text`,
@@ -3247,9 +3247,10 @@ rules can match IPv6-shaped hex text from logs or diagnostics. Prefer narrow
 `global_exemptions` supports `paths`, `methods`, `consumers`, `ips`,
 `header_present`, and `fp_capture_filters`. Path entries ending in `*` are
 prefix matches; entries starting with `~` are start-anchored regex patterns
-wrapped as `^(?:regex)`; all other entries are exact-path matches (so `/health`
-exempts only `/health`, not `/healthz` or `/health-admin`). Use `~.*pattern`
-for a floating substring match.
+wrapped as `^(?:regex)` (unlike unanchored per-rule `conditions.paths`); all
+other entries are exact-path matches (so `/health` exempts only `/health`, not
+`/healthz` or `/health-admin`). Use `~.*pattern` for a floating substring match
+under these start-anchored exemption semantics.
 
 ```yaml
 config:
@@ -4523,7 +4524,7 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `token_limit` | Integer | `100000` | Maximum tokens allowed per window |
+| `token_limit` | Integer | *(required)* | Maximum tokens allowed per window. Required at construction; there is no default. |
 | `window_seconds` | Integer | `60` | Sliding window duration in seconds |
 | `count_mode` | String | `"total_tokens"` | What to count: `total_tokens`, `prompt_tokens`, or `completion_tokens`. Unknown values are rejected at construction time. |
 | `limit_by` | String | `"consumer"` | Rate limit key: authenticated identity (`consumer`) or `ip`. Unknown values are rejected at construction time. |

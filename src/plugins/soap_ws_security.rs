@@ -3176,7 +3176,7 @@ fn decode_payload(
 }
 
 fn decode_utf16(payload: &[u8], big_endian: bool) -> Result<String, SoapBodyDecodeError> {
-    if payload.len() % 2 != 0 {
+    if !payload.len().is_multiple_of(2) {
         return Err(SoapBodyDecodeError::MalformedEncoding);
     }
     let units = payload

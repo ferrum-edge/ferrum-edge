@@ -7480,3 +7480,54 @@ fn api_chargeback_schema_closes_unknown_keys() {
         "docs/plugins.md api_chargeback section must warn about misspelled pricing dimensions"
     );
 }
+
+#[test]
+fn ai_rate_limiter_token_limit_required_without_default_contract() {
+    use ferrum_edge::plugins::{PluginHttpClient, ai_rate_limiter::AiRateLimiter};
+
+    // Contract (#2263): `token_limit` is required at runtime and must not publish
+    // a misleading OpenAPI/docs default of 100000.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiRateLimiterConfig")
+        .expect("AiRateLimiterConfig schema");
+
+    assert_eq!(schema["required"], json!(["token_limit"]));
+    assert!(
+        schema["properties"]["token_limit"].get("default").is_none(),
+        "token_limit must not publish a default — runtime requires the field"
+    );
+    let description = schema["properties"]["token_limit"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        description.to_ascii_lowercase().contains("required"),
+        "OpenAPI description must label token_limit as required: {description}"
+    );
+
+    let err = AiRateLimiter::new(&json!({}), PluginHttpClient::default())
+        .err()
+        .expect("empty ai_rate_limiter config must fail");
+    assert!(
+        err.contains("token_limit"),
+        "runtime must reject missing token_limit: {err}"
+    );
+    AiRateLimiter::new(&json!({"token_limit": 100000}), PluginHttpClient::default())
+        .expect("explicit token_limit must construct");
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `ai_rate_limiter`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("ai_rate_limiter docs section");
+    assert!(
+        section.contains("| `token_limit` | Integer | *(required)* |"),
+        "docs must label token_limit as required"
+    );
+    assert!(
+        !section.contains("| `token_limit` | Integer | `100000` |"),
+        "docs must not claim a 100000 default for token_limit"
+    );
+}
