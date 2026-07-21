@@ -665,7 +665,6 @@ fn test_redis_connection_scope_key_is_namespaced_per_instance() {
 fn test_public_docs_retain_instance_scoped_redis_semantics() {
     let readme = include_str!("../../../README.md");
     let features = include_str!("../../../FEATURES.md");
-    let openapi = include_str!("../../../openapi.yaml");
     let plugins = include_str!("../../../docs/plugins.md");
     let order = include_str!("../../../docs/plugin_execution_order.md");
 
@@ -692,19 +691,31 @@ fn test_public_docs_retain_instance_scoped_redis_semantics() {
         "FEATURES must retain the instance-scoped Redis limitation"
     );
 
-    let ws_schema = openapi
-        .split("WsRateLimitingConfig:")
-        .nth(1)
-        .and_then(|rest| rest.split("\n    UdpRateLimitingConfig:").next())
-        .expect("WsRateLimitingConfig schema block");
+    // Parse OpenAPI so folded YAML descriptions are checked as rendered text,
+    // not raw source lines that may wrap mid-phrase.
+    let spec: serde_json::Value = serde_yaml::from_str(include_str!("../../../openapi.yaml"))
+        .expect("openapi.yaml parses");
+    let ws_schema = &spec["components"]["schemas"]["WsRateLimitingConfig"];
+    let schema_description = ws_schema["description"]
+        .as_str()
+        .expect("WsRateLimitingConfig description");
+    let sync_mode_description = ws_schema["properties"]["sync_mode"]["description"]
+        .as_str()
+        .expect("WsRateLimitingConfig.sync_mode description");
+    let openapi_descriptions = format!("{schema_description}\n{sync_mode_description}");
+    let normalized_openapi = openapi_descriptions
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
     assert!(
-        !ws_schema.contains("cross-instance coordination of frame counters"),
+        !normalized_openapi.contains("cross-instance coordination of frame counters"),
         "OpenAPI must not claim cross-instance coordination for ws_rate_limiting"
     );
     assert!(
-        ws_schema.contains("externalizes those")
-            && ws_schema.contains("per-plugin/gateway-instance key")
-            && ws_schema.contains("not a portable cross-instance budget"),
+        normalized_openapi.contains("externalizes those")
+            && normalized_openapi.contains("per-plugin/gateway-instance key")
+            && normalized_openapi.contains("not a portable cross-instance budget"),
         "OpenAPI WsRateLimitingConfig/sync_mode must describe instance-scoped Redis semantics"
     );
 
