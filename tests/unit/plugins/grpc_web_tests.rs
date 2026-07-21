@@ -1840,6 +1840,8 @@ async fn test_two_instances_text_decode_and_encode_exactly_once() {
     let second = create_plugin("grpc_web", &json!({"expose_headers": ["x-b"]}))
         .unwrap()
         .unwrap();
+    assert!(first.needs_final_request_body_context());
+    assert!(second.needs_final_request_body_context());
 
     let mut ctx = create_grpc_web_context("application/grpc-web-text");
     first.on_request_received(&mut ctx).await;
@@ -1991,5 +1993,37 @@ async fn test_follower_fails_closed_without_owner_staging_on_response_transform(
             .await
             .is_none(),
         "non-owner must never translate the response body"
+    );
+}
+
+#[tokio::test]
+async fn test_owner_requires_namespaced_mode_even_when_shared_mode_is_valid() {
+    let owner = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web-text");
+    owner.on_request_received(&mut ctx).await;
+
+    let owner_id = ctx.metadata.get("grpc_web.owner").cloned().unwrap();
+    ctx.metadata
+        .remove(&format!("grpc_web.instance.{owner_id}.mode"));
+    assert_eq!(
+        ctx.metadata.get("grpc_web_mode").map(String::as_str),
+        Some("text")
+    );
+
+    let response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web-text".to_string(),
+    )]);
+    assert!(
+        owner
+            .transform_response_body_with_context(
+                &mut ctx,
+                b"",
+                Some("application/grpc-web-text"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "owner must not fall back to shared mode after losing its namespaced staging"
     );
 }

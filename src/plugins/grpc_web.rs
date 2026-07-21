@@ -392,17 +392,17 @@ impl GrpcWebPlugin {
             .is_some_and(|owner| owner == &self.instance_id_str)
     }
 
-    /// Mode for the owned translation, preferring the namespaced per-instance
-    /// staging key and falling back to the shared canonical marker. Returns
-    /// `None` when staging is missing or not a recognized mode (fail closed).
+    /// Mode for the owned translation. Both the namespaced owner value and the
+    /// shared proxy/H3 marker must be present and equal; missing or divergent
+    /// staging fails closed instead of borrowing another instance's state.
     fn owned_translation_mode<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
-        let raw = ctx
-            .metadata
-            .get(&self.instance_mode_key)
-            .or_else(|| ctx.metadata.get(META_GRPC_WEB_MODE))
-            .map(String::as_str)?;
-        match raw {
-            "text" | "binary" => Some(raw),
+        let owned = ctx.metadata.get(&self.instance_mode_key)?.as_str();
+        let shared = ctx.metadata.get(META_GRPC_WEB_MODE)?.as_str();
+        if owned != shared {
+            return None;
+        }
+        match owned {
+            "text" | "binary" => Some(owned),
             _ => None,
         }
     }
@@ -1039,6 +1039,13 @@ impl Plugin for GrpcWebPlugin {
     }
 
     fn modifies_request_body(&self) -> bool {
+        true
+    }
+
+    fn needs_final_request_body_context(&self) -> bool {
+        // H1/H2 creates the mutable body-hook context only for plugins that opt
+        // in here. Multi-instance text decode and final framing validation must
+        // see the owner/once metadata just like the H3 path does.
         true
     }
 
