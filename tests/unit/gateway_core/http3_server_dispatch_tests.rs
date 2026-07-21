@@ -318,7 +318,7 @@ fn buffered_h3_deadline_replacements_keep_grpc_web_wire_flavor() {
         .expect("buffered H3 direct response write must remain present");
     assert!(transform < replacement && replacement < response_write);
     assert!(
-        committed[..response_write].contains("grpc_web_response_content_type.as_deref()"),
+        committed[..response_write].contains("grpc_web_response_content_type,"),
         "the direct H3 buffered pipeline must retain the original gRPC-Web flavor before writing"
     );
 

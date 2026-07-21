@@ -282,7 +282,7 @@ fn h3_backend_path_policy_runs_after_target_selection_and_before_dispatch() {
         "H3 gRPC-Web must retain its HTTP protocol key and use the composed cache view"
     );
     assert!(
-        policy_block.contains("grpc_web_response_content_type.as_deref()"),
+        policy_block.contains("grpc_web_response_content_type,"),
         "H3 backend-path rejects must retain the client's gRPC-Web response encoding"
     );
     assert!(
@@ -828,7 +828,7 @@ fn h3_grpc_web_early_plugin_rejects_use_client_wire_shape() {
         );
         assert!(
             phase_source.contains("send_h3_plugin_reject_flavor_aware(")
-                && phase_source.contains("grpc_web_response_content_type.as_deref()"),
+                && phase_source.contains("grpc_web_response_content_type,"),
             "H3 {phase} rejects must retain the original gRPC-Web response encoding"
         );
     }
