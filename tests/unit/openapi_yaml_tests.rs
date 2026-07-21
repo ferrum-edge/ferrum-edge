@@ -7457,7 +7457,8 @@ fn ai_semantic_cache_openapi_redis_key_prefix_matches_runtime_namespace_default(
         "stale OpenAPI prefix ferrum:ai_semantic_cache must not remain in the description"
     );
 
-    let namespace = PluginHttpClient::default().namespace();
+    let http_client = PluginHttpClient::default();
+    let namespace = http_client.namespace();
     assert_eq!(namespace, DEFAULT_NAMESPACE);
     assert_eq!(AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX, "ai_cache");
     let expected_default = format!("{namespace}:{AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX}");
