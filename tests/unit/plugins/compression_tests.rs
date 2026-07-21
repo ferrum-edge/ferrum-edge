@@ -808,11 +808,18 @@ fn test_h1_h2_h3_paths_reach_shared_after_proxy_chokepoint() {
         ),
         "H1/H2 streaming path must call run_after_proxy_hooks"
     );
+    // Main may wrap the reject in `let mut` for synthetic-body prep; pin the
+    // helper body itself (not a distant call site) still delegates to the
+    // shared chokepoint with the streaming-wrapper argument shape.
+    const H3_STREAMING_HELPER: &str = "async fn run_h3_streaming_after_proxy_hooks(";
+    const H3_STREAMING_DELEGATION: &str =
+        "run_after_proxy_hooks(plugins, ctx, response_status, response_headers).await";
+    let h3_helper = h3
+        .find(H3_STREAMING_HELPER)
+        .map(|start| &h3[start..h3.len().min(start.saturating_add(1200))])
+        .unwrap_or("");
     assert!(
-        h3.contains("async fn run_h3_streaming_after_proxy_hooks(")
-            && h3.contains(
-                "let reject = run_after_proxy_hooks(plugins, ctx, response_status, response_headers).await;"
-            ),
+        !h3_helper.is_empty() && h3_helper.contains(H3_STREAMING_DELEGATION),
         "native H3 streaming path must delegate to run_after_proxy_hooks"
     );
     assert!(
