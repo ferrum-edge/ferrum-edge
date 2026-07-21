@@ -4596,19 +4596,13 @@ fn ai_prompt_shield_excluded_from_native_grpc_but_retained_on_grpc_web_view() {
     );
     let cache = PluginCache::new(&config).expect("plugin cache");
 
-    let http_names: Vec<&str> = cache
-        .get_plugins_for_protocol("p1", ProxyProtocol::Http)
-        .iter()
-        .map(|p| p.name())
-        .collect();
+    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_names: Vec<&str> = http_plugins.iter().map(|p| p.name()).collect();
     assert!(http_names.contains(&"ai_prompt_shield"));
     assert!(http_names.contains(&"rate_limiting"));
 
-    let grpc_names: Vec<&str> = cache
-        .get_plugins_for_protocol("p1", ProxyProtocol::Grpc)
-        .iter()
-        .map(|p| p.name())
-        .collect();
+    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    let grpc_names: Vec<&str> = grpc_plugins.iter().map(|p| p.name()).collect();
     assert!(
         !grpc_names.contains(&"ai_prompt_shield"),
         "native gRPC protocol view must exclude HTTP-only ai_prompt_shield"
