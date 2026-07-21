@@ -175,6 +175,39 @@ fn assert_username_token_invalid_credentials(result: &PluginResult, candidate_us
     );
 }
 
+fn assert_username_token_structural(
+    result: &PluginResult,
+    expected_fragment: &str,
+    candidate_usernames: &[&str],
+) {
+    assert!(is_reject(result));
+    assert_eq!(reject_status(result), 401);
+    assert!(
+        reject_headers(result).is_empty(),
+        "structural rejects must not add distinguishing headers: {:?}",
+        reject_headers(result)
+    );
+    let body = reject_body(result);
+    assert_ne!(
+        body, USERNAME_TOKEN_INVALID_CREDENTIALS_BODY,
+        "structural failures must remain distinct from invalid-credential rejects"
+    );
+    assert!(
+        body.contains(expected_fragment),
+        "expected structural fragment {:?}, got: {}",
+        expected_fragment,
+        body
+    );
+    for candidate in candidate_usernames {
+        assert!(
+            !body.contains(candidate),
+            "structural body must not leak candidate username {:?}: {}",
+            candidate,
+            body
+        );
+    }
+}
+
 fn password_digest_token(username: &str, password: &str, nonce_bytes: &[u8]) -> String {
     let created = chrono::Utc::now()
         .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -1013,6 +1046,82 @@ async fn test_password_digest_missing_nonce_rejects() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert!(reject_body(&result).contains("requires Nonce"));
+}
+
+#[tokio::test]
+async fn test_username_token_missing_token_is_structural() {
+    // Security header present but no UsernameToken: fail closed as structural,
+    // not as the generic invalid-credential body.
+    let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let body = wrap_soap("");
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_username_token_structural(&result, "missing UsernameToken", &["alice", "eve"]);
+}
+
+#[tokio::test]
+async fn test_username_token_empty_password_element_is_structural() {
+    // Self-closing Password has no text content and must fail closed before any
+    // known/unknown credential comparison.
+    let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let ut = r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText"/>
+    </wsse:UsernameToken>"#;
+    let body = wrap_soap(ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_username_token_structural(&result, "Password element has no content", &["alice"]);
+}
+
+#[tokio::test]
+async fn test_password_digest_invalid_nonce_base64_is_structural() {
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let ut = r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">dGVzdA==</wsse:Password>
+        <wsse:Nonce>!!!not-valid-base64!!!</wsse:Nonce>
+        <wsu:Created>2026-01-01T00:00:00Z</wsu:Created>
+    </wsse:UsernameToken>"#;
+    let body = wrap_soap(ut);
+    let mut ctx = make_ctx_with_soap_body(&body);
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert_username_token_structural(&result, "invalid Nonce base64 encoding", &["alice"]);
+}
+
+#[tokio::test]
+async fn test_password_digest_missing_created_is_structural_for_known_and_unknown() {
+    // Nonce/Created structural checks run before the known/unknown credential
+    // branch so a missing Created cannot become a username oracle.
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+    let mut bodies = Vec::new();
+    for username in ["alice", "eve-candidate"] {
+        let ut = format!(
+            r#"<wsse:UsernameToken>
+        <wsse:Username>{}</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">dGVzdA==</wsse:Password>
+        <wsse:Nonce>dGVzdC1ub25jZQ==</wsse:Nonce>
+    </wsse:UsernameToken>"#,
+            username
+        );
+        let body = wrap_soap(&ut);
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_username_token_structural(
+            &result,
+            "PasswordDigest requires Created",
+            &["alice", "eve-candidate"],
+        );
+        bodies.push(reject_body(&result).to_string());
+    }
+    assert_eq!(
+        bodies[0], bodies[1],
+        "known and unknown principals must share the same missing-Created structural body"
+    );
 }
 
 // ── Nonce replay protection tests ───────────────────────────────────────────
@@ -2248,6 +2357,26 @@ fn test_nonce_replay_detected_via_direct_api() {
 
     assert!(plugin.check_nonce_replay("unique-nonce").is_ok());
     assert!(plugin.check_nonce_replay("unique-nonce").is_err());
+}
+
+#[test]
+fn test_nonce_cache_refreshes_occupied_entry_after_ttl() {
+    // cache_ttl_seconds=0 means every Occupied hit is already expired, so the
+    // atomic entry path must refresh inserted_at instead of treating reuse as
+    // a live replay. This covers the post-TTL Occupied insert branch used by
+    // successful PasswordDigest authentication.
+    let plugin = SoapWsSecurity::new(&json!({
+        "timestamp": { "require": true },
+        "nonce": { "max_cache_size": 100, "cache_ttl_seconds": 0 },
+        "reject_missing_security_header": false
+    }))
+    .unwrap();
+
+    assert!(plugin.check_nonce_replay("ttl-expired-nonce").is_ok());
+    assert!(
+        plugin.check_nonce_replay("ttl-expired-nonce").is_ok(),
+        "expired Occupied nonce must be refreshed, not rejected as a live replay"
+    );
 }
 
 // ── X.509 signature verification — end-to-end roundtrip ─────────────────────
