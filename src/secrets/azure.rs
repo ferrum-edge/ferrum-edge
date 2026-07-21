@@ -296,15 +296,15 @@ async fn fetch_with_credential(
         .into_model()
         .map_err(|e| format!("Failed to parse Azure secret for {}: {}", key, e))?;
 
-    let value = secret
-        .value
-        .ok_or_else(|| format!("Azure secret for {} has no value", key))?;
-
     let fetched_version = secret
         .resource_id()
         .ok()
         .and_then(|id| id.version)
         .or_else(|| parsed.version.clone());
+
+    let value = secret
+        .value
+        .ok_or_else(|| format!("Azure secret for {} has no value", key))?;
 
     if let (Some(requested), Some(returned)) =
         (parsed.version.as_deref(), fetched_version.as_deref())
