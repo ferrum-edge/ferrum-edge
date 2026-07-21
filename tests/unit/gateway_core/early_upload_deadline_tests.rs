@@ -290,10 +290,22 @@ fn h3_early_phases_gate_fresh_drains_on_missing_prebuffer_and_halt_on_cancel() {
         let deadline_branch_idx = source[..phase_idx]
             .rfind("Err(H3RequestBodyReadError::DeadlineExceeded) => {")
             .unwrap_or_else(|| panic!("missing deadline branch for H3 upload phase {phase}"));
-        let window = &source[deadline_branch_idx..phase_idx];
+        let branch_end = source[phase_idx..]
+            .find("\n            }")
+            .or_else(|| source[phase_idx..].find("\n                }"))
+            .map(|rel| phase_idx + rel)
+            .unwrap_or_else(|| panic!("missing end of deadline branch for {phase}"));
+        let window = &source[deadline_branch_idx..branch_end];
         assert!(
-            window.contains("halt_cancelled_h3_upload("),
-            "phase {phase} must STOP_SENDING before rejection work"
+            window.contains("finalize_h3_upload_deadline_rejection("),
+            "phase {phase} must finalize the deadline rejection before returning"
+        );
+        // After a mid-recv_data cancel, STOP_SENDING must not run in this arm:
+        // h3-quinn would unwrap-abort under panic=abort. Quinn Drop still stops
+        // the peer when the RequestStream is released after HEADERS are written.
+        assert!(
+            !window.contains("halt_cancelled_h3_upload("),
+            "phase {phase} must not STOP_SENDING after a cancelled mid-recv drain"
         );
     }
 
@@ -330,9 +342,34 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
     let bridge = &source[start..start + end];
     assert!(bridge.contains("collect_h3_request_body_with_deadline("));
     assert!(bridge.contains("drain_h3_body("));
+    // too-large and read still STOP_SENDING (recv half is idle). Timed-out /
+    // deadline drains cancel mid-recv_data and must skip STOP_SENDING so
+    // h3-quinn cannot unwrap-abort under panic=abort.
     assert_eq!(
         bridge.matches("halt_request_body(stream)").count(),
-        4,
-        "too-large, read, timed-out, and deadline bridge exits must STOP_SENDING promptly"
+        2,
+        "too-large and read bridge exits must STOP_SENDING; cancel exits must not"
+    );
+    assert!(bridge.contains("write_grpc_error_send_with_policy("));
+    assert!(bridge.contains("write_final_body_reject("));
+
+    let timed_out = bridge
+        .split("Err(super::server::H3RequestBodyReadError::TimedOut) => {")
+        .nth(1)
+        .expect("timed-out bridge arm")
+        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {")
+        .next()
+        .expect("bounded timed-out bridge arm");
+    assert!(
+        !timed_out.contains("halt_request_body(stream)"),
+        "timed-out bridge arm must skip STOP_SENDING after mid-recv cancel"
+    );
+    let deadline = bridge
+        .split("Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {")
+        .nth(1)
+        .expect("deadline bridge arm");
+    assert!(
+        !deadline.contains("halt_request_body(stream)"),
+        "deadline bridge arm must skip STOP_SENDING after mid-recv cancel"
     );
 }

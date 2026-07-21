@@ -628,9 +628,12 @@ fn h3_request_plugin_deadlines_mark_and_bound_terminal_rejections() {
         .next()
         .expect("native H3 plugin rejection deadline wrapper must remain bounded");
     assert!(writer.contains("ctx.gateway_deadline_response_selected()"));
-    assert!(writer.contains("await_terminal_response_write_before_deadline("));
-    assert!(writer.contains("abort_response_stream(stream)"));
-    assert!(writer.contains("halt_request_body(stream)"));
+    assert!(writer.contains("replace_buffered_h3_response_with_grpc_deadline("));
+    // Already-selected gateway deadline rejections write HEADERS/trailers
+    // directly; re-racing the expired deadline would abort before the client
+    // observes grpc-status.
+    assert!(!writer.contains("await_terminal_response_write_before_deadline("));
+    assert!(!writer.contains("abort_response_stream(stream)"));
 }
 
 #[test]
@@ -927,7 +930,11 @@ fn h3_buffered_upload_deadlines_run_rejection_cleanup_and_logging() {
     assert!(helper.contains("run_h3_reject_response_committed_hooks("));
     assert!(helper.contains("log_rejected_request("));
     assert!(helper.contains("send_h3_plugin_reject_flavor_aware("));
-    assert!(helper.contains("await_terminal_response_write_before_deadline("));
+    // Upload-deadline rejection is already selected; the terminal write must not
+    // re-race the expired absolute deadline or a Pending QUIC write aborts before
+    // response HEADERS become observable.
+    assert!(!helper.contains("await_terminal_response_write_before_deadline("));
+    assert!(!helper.contains("abort_response_stream(stream)"));
     assert_eq!(
         helper
             .matches("apply_reject_after_proxy_and_synthetic_body_hooks(")

@@ -99,16 +99,24 @@ where
 /// error" code. Using it tells the client its request was accepted and
 /// no further body bytes are needed.
 ///
-/// Safe to call after `finish()` / `send_response()` — the h3 crate
-/// records the code into the underlying QUIC stream which then sends
-/// the STOP_SENDING frame on the next write. This helper performs no
-/// heap work.
+/// Prefer calling this **after** response HEADERS/DATA/trailers/FIN are
+/// written. Do **not** call it after a drain cancelled mid-`recv_data` by
+/// timeout/deadline: h3-quinn keeps the `quinn::RecvStream` inside a
+/// `ReusableBoxFuture` while `poll_data` is `Pending`, leaving the outer
+/// `Option` as `None`, and `stop_sending` would `unwrap`-abort under
+/// `panic = "abort"`. Skip this helper in that case and let
+/// `quinn::RecvStream::drop` issue `STOP_SENDING(0)` when the
+/// `RequestStream` is released.
+///
+/// Safe to call after `finish()` / `send_response()` when the recv half is
+/// idle. Subsequent calls after a successful halt are ignored by quinn
+/// (`ClosedStream`).
 #[inline]
 pub(crate) fn halt_request_body<S>(stream: &mut RequestStream<S, Bytes>)
 where
     S: RecvStream,
 {
-    // stop_sending is required here: otherwise dropping the recv half
+    // stop_sending is required here: otherwise dropping an idle recv half
     // surfaces as RESET_STREAM(0x0) on the wire and clients log
     // "Remote reset: 0x0" + a truncated response.
     stream.stop_sending(Code::H3_NO_ERROR);
