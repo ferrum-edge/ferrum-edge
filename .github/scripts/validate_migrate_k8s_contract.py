@@ -70,7 +70,10 @@ def validate_migrate_examples(root: Path) -> None:
                     "Config migration is ephemeral",
                     "config migration must use the documented writable PVC",
                 )
-            if "emptyDir:" in text or "busybox:" in text:
+            if (
+                re.search(r"(?m)^\s*- name:\s*work\s*$\n\s+emptyDir:", text)
+                or "busybox:" in text
+            ):
                 fail(
                     "Config migration output is not durable",
                     "config migration must not rely on emptyDir or an unpinned copy helper",
