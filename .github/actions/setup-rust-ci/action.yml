@@ -38,9 +38,17 @@ runs:
         # coverage, test-artifact archives, etc.) opt them in here so their
         # tests and clippy coverage exercise the templates. The protected
         # ARM64 Cross job does not use this action and keeps examples out.
-        # Append production custom_plugins/*.rs stems here if operator plugins
-        # must also compile in the same CI jobs.
-        echo "FERRUM_CUSTOM_PLUGINS=example_plugin,example_audit_plugin" >> "$GITHUB_ENV"
+        # Include every production custom_plugins/*.rs stem automatically so
+        # adding a production plugin cannot silently remove it from CI merely
+        # because this opt-in list exists for the pedagogical examples.
+        plugins="example_plugin,example_audit_plugin"
+        for source in custom_plugins/*.rs; do
+          [ -e "$source" ] || continue
+          stem="${source##*/}"
+          stem="${stem%.rs}"
+          [ "$stem" = "mod" ] || plugins="$plugins,$stem"
+        done
+        echo "FERRUM_CUSTOM_PLUGINS=$plugins" >> "$GITHUB_ENV"
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable

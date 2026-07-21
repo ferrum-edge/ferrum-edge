@@ -53,6 +53,33 @@ use crate::config::incremental_apply::upsert_by_id;
 type CpGrpcIncomingStream =
     Pin<Box<dyn Stream<Item = Result<CpGrpcIo, std::io::Error>> + Send + 'static>>;
 
+async fn reconcile_plugin_migrations_after_cp_reconnect(
+    db: &Arc<dyn DatabaseBackend>,
+    db_available: &AtomicBool,
+    auto_apply: bool,
+    needs_reconcile: &mut bool,
+    context: &str,
+) -> bool {
+    if !*needs_reconcile {
+        return true;
+    }
+    match crate::modes::handle_recovery_plugin_migrations(db, auto_apply, "cp-recovery").await {
+        Ok(()) => {
+            *needs_reconcile = false;
+            true
+        }
+        Err(error) => {
+            db_available.store(false, Ordering::Relaxed);
+            warn!(
+                "Control-plane custom-plugin migration reconciliation failed after {}: {}. \
+                 Admin writes and recovered configuration publication remain blocked.",
+                context, error
+            );
+            false
+        }
+    }
+}
+
 enum CpGrpcIo {
     Plain(TcpStream),
     Tls(Box<CpGrpcTlsIo>),
@@ -1459,6 +1486,7 @@ pub async fn run(
     let poll_scope = cp_scope.clone();
     let poll_broadcasts = broadcasts.clone();
     let initial_polled_namespaces = polled_namespaces;
+    let poll_auto_apply_plugin_migrations = env_config.auto_apply_plugin_migrations;
 
     let db_poll_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(poll_interval);
@@ -1473,6 +1501,10 @@ pub async fn run(
         let replica_reconnect_in_flight = Arc::new(AtomicBool::new(false));
         let mut rejected_delta_tracker =
             CpRejectedDeltaTracker::new(rejected_delta_full_reload_threshold);
+        // The poll task is the sole owner. Any pool topology swap resets this
+        // gate; the first load from that pool must run the same custom-plugin
+        // migration policy as startup before CP publishes or enables writes.
+        let mut plugin_migrations_need_reconcile = false;
 
         let mut last_change_sequences = initial_change_sequences;
 
@@ -1502,6 +1534,8 @@ pub async fn run(
                                 Ok(_) => {
                                     last_db_ips = Some(ips);
                                     force_full_reload = true;
+                                    plugin_migrations_need_reconcile = true;
+                                    db_available_poll.store(false, Ordering::Relaxed);
                                 }
                                 Err(e) => {
                                     error!(
@@ -1544,6 +1578,17 @@ pub async fn run(
                         .await;
                         match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
                             Ok((new_config, sequences)) => {
+                                if !reconcile_plugin_migrations_after_cp_reconnect(
+                                    &db_poll,
+                                    &db_available_poll,
+                                    poll_auto_apply_plugin_migrations,
+                                    &mut plugin_migrations_need_reconcile,
+                                    "DB DNS reconnect",
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
                                 // Treat pool swap as a new source snapshot.
                                 last_change_sequences = sequences;
                                 let new_config_arc = Arc::new(new_config.clone());
@@ -1579,6 +1624,17 @@ pub async fn run(
                             }
                             Err(e) => {
                                 if crate::modes::is_poll_validation_rejection(&e) {
+                                    if !reconcile_plugin_migrations_after_cp_reconnect(
+                                        &db_poll,
+                                        &db_available_poll,
+                                        poll_auto_apply_plugin_migrations,
+                                        &mut plugin_migrations_need_reconcile,
+                                        "validation-rejected full load after DB DNS reconnect",
+                                    )
+                                    .await
+                                    {
+                                        continue;
+                                    }
                                     // Reachable backend, invalid snapshot: keep the
                                     // admin API writable (subject to the migration
                                     // gate) for in-band repair and do NOT flip
@@ -1633,6 +1689,17 @@ pub async fn run(
                         .await
                         {
                             Ok((result, next_change_sequences)) => {
+                                if !reconcile_plugin_migrations_after_cp_reconnect(
+                                    &db_poll,
+                                    &db_available_poll,
+                                    poll_auto_apply_plugin_migrations,
+                                    &mut plugin_migrations_need_reconcile,
+                                    "incremental load after pool reconnect",
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
                                 db_available_poll.store(true, Ordering::Relaxed);
                                 last_polled_namespaces = nslist.clone();
                                 if result.is_empty() {
@@ -1863,8 +1930,21 @@ pub async fn run(
                                         // try failover URLs before giving up.
                                         match db_poll.try_failover_reconnect(&db_url_for_reconnect).await {
                                             Ok(_url) => {
+                                                plugin_migrations_need_reconcile = true;
+                                                db_available_poll.store(false, Ordering::Relaxed);
                                                 match load_full_config_multi_with_sequence(db_poll.as_ref(), &nslist).await {
                                                     Ok((new_config, sequences)) => {
+                                                        if !reconcile_plugin_migrations_after_cp_reconnect(
+                                                            &db_poll,
+                                                            &db_available_poll,
+                                                            poll_auto_apply_plugin_migrations,
+                                                            &mut plugin_migrations_need_reconcile,
+                                                            "database failover",
+                                                        )
+                                                        .await
+                                                        {
+                                                            continue;
+                                                        }
                                                         db_available_poll.store(true, Ordering::Relaxed);
                                                         crate::modes::clear_config_rejected_after_accepted_full_reload(
                                                             &config_rejected_poll,
@@ -1889,6 +1969,17 @@ pub async fn run(
                                                     }
                                                     Err(e3) => {
                                                         if crate::modes::is_poll_validation_rejection(&e3) {
+                                                            if !reconcile_plugin_migrations_after_cp_reconnect(
+                                                                &db_poll,
+                                                                &db_available_poll,
+                                                                poll_auto_apply_plugin_migrations,
+                                                                &mut plugin_migrations_need_reconcile,
+                                                                "validation-rejected database failover load",
+                                                            )
+                                                            .await
+                                                            {
+                                                                continue;
+                                                            }
                                                             crate::modes::record_config_validation_rejection(
                                                                 &db_poll,
                                                                 &db_available_poll,
@@ -2352,6 +2443,34 @@ mod tests {
         let after_recovery = tracker.record_rejection(&sequences);
         assert!(!after_recovery.should_escalate);
         assert_eq!(after_recovery.consecutive, 1);
+    }
+
+    #[test]
+    fn cp_pool_swaps_reconcile_plugin_migrations_before_publication() {
+        // Issue #2802: a CP DNS reconnect or failover can land on a database
+        // whose custom-plugin schema lags the process binary.
+        let source = include_str!("control_plane.rs");
+        assert!(
+            source.contains("async fn reconcile_plugin_migrations_after_cp_reconnect(")
+                && source.contains("handle_recovery_plugin_migrations("),
+            "CP recovery must share the startup custom-plugin migration policy"
+        );
+        assert!(
+            source.matches("plugin_migrations_need_reconcile = true;").count() >= 2,
+            "both DNS pool reconnect and failover must reset the migration gate"
+        );
+        for context in [
+            "DB DNS reconnect",
+            "validation-rejected full load after DB DNS reconnect",
+            "incremental load after pool reconnect",
+            "database failover",
+            "validation-rejected database failover load",
+        ] {
+            assert!(
+                source.contains(context),
+                "missing CP migration gate for {context}"
+            );
+        }
     }
 
     #[test]
