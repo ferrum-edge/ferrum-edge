@@ -127,9 +127,11 @@ fn parse_rejects_empty_interior_version_segment() {
 
 #[test]
 fn parse_preserves_explicit_port() {
-    let (vault, name, version) =
-        azure_parse_keyvault_reference("http://127.0.0.1:12345/secrets/admin-jwt/v9", "FERRUM_TEST")
-            .expect("ported URL should parse");
+    let (vault, name, version) = azure_parse_keyvault_reference(
+        "http://127.0.0.1:12345/secrets/admin-jwt/v9",
+        "FERRUM_TEST",
+    )
+    .expect("ported URL should parse");
     assert_eq!(vault, "http://127.0.0.1:12345");
     assert_eq!(name, "admin-jwt");
     assert_eq!(version.as_deref(), Some("v9"));

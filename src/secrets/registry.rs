@@ -906,10 +906,11 @@ pub async fn resolve_external_reference(
     // version rather than a configured query label that was never sent.
     #[cfg(feature = "secrets-azure")]
     if provider == "azure" {
-        let secret = tokio::time::timeout(secret_fetch_timeout(), azure::fetch_secret(reference, key))
-            .await
-            .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))?
-            .map_err(|error| redact_source_reference(error, reference, key))?;
+        let secret =
+            tokio::time::timeout(secret_fetch_timeout(), azure::fetch_secret(reference, key))
+                .await
+                .map_err(|_| timeout_error(key, backend.display_name(), secret_fetch_timeout()))?
+                .map_err(|error| redact_source_reference(error, reference, key))?;
 
         if backend.log_loaded() {
             info!("Loaded {} from {}", key, backend.display_name());
@@ -1261,9 +1262,7 @@ impl SecretBackend for AzureBackend {
             self.display_name(),
             &creds,
             |creds, reference, key| {
-                Box::pin(async move {
-                    Ok(creds.fetch_secret(reference, key).await?.value)
-                })
+                Box::pin(async move { Ok(creds.fetch_secret(reference, key).await?.value) })
             },
         )
         .await

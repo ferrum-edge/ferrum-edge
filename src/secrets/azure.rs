@@ -129,7 +129,10 @@ impl KeyVaultReference {
     pub fn to_reference_url(&self) -> String {
         match &self.version {
             Some(version) => {
-                format!("{}/secrets/{}/{}", self.vault_url, self.secret_name, version)
+                format!(
+                    "{}/secrets/{}/{}",
+                    self.vault_url, self.secret_name, version
+                )
             }
             None => format!("{}/secrets/{}", self.vault_url, self.secret_name),
         }
@@ -280,18 +283,24 @@ async fn fetch_with_credential(
 ) -> Result<AzureSecret, String> {
     let parsed = parse_keyvault_reference_parts(reference, key)?;
 
-    let client =
-        azure_security_keyvault_secrets::SecretClient::new(&parsed.vault_url, credential.clone(), None)
-            .map_err(|e| format!("Failed to create Azure Key Vault client for {}: {}", key, e))?;
+    let client = azure_security_keyvault_secrets::SecretClient::new(
+        &parsed.vault_url,
+        credential.clone(),
+        None,
+    )
+    .map_err(|e| format!("Failed to create Azure Key Vault client for {}: {}", key, e))?;
 
     // Errors name the base key and the failure class only — the vault URL and
     // secret name are the source reference and are treated as sensitive. The
     // registry additionally redacts any residual occurrence echoed back by the
     // SDK error itself.
-    let options = parsed.version.as_ref().map(|version| SecretClientGetSecretOptions {
-        secret_version: Some(version.clone()),
-        ..Default::default()
-    });
+    let options = parsed
+        .version
+        .as_ref()
+        .map(|version| SecretClientGetSecretOptions {
+            secret_version: Some(version.clone()),
+            ..Default::default()
+        });
     let response = client
         .get_secret(&parsed.secret_name, options)
         .await
@@ -311,7 +320,8 @@ async fn fetch_with_credential(
         .and_then(|id| id.version)
         .or_else(|| parsed.version.clone());
 
-    if let (Some(requested), Some(returned)) = (parsed.version.as_deref(), fetched_version.as_deref())
+    if let (Some(requested), Some(returned)) =
+        (parsed.version.as_deref(), fetched_version.as_deref())
     {
         if requested != returned {
             return Err(format!(

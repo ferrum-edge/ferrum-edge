@@ -47,7 +47,9 @@ async fn azure_secret_url_success() {
             path == "/secrets/admin-jwt" || path == "/secrets/admin-jwt/"
         }),
         "unversioned fetch must request latest (no version segment), got: {:?}",
-        hits.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+        hits.iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -265,7 +267,9 @@ async fn azure_versioned_url_fetches_exact_version() {
                 || path == "/secrets/admin-jwt/abc123version/"
         }),
         "versioned fetch must include the version in the request path, got: {:?}",
-        hits.iter().map(|r| r.url.path().to_string()).collect::<Vec<_>>()
+        hits.iter()
+            .map(|r| r.url.path().to_string())
+            .collect::<Vec<_>>()
     );
     assert!(
         !hits.iter().any(|req| {
@@ -285,7 +289,10 @@ async fn azure_versioned_url_does_not_use_latest_mock() {
 
     let creds = AzureCredentials::from_static_token("dummy-token");
     let err = creds
-        .fetch_secret(&fake.secret_version_url("admin-jwt", "missing-version"), KEY)
+        .fetch_secret(
+            &fake.secret_version_url("admin-jwt", "missing-version"),
+            KEY,
+        )
         .await
         .err()
         .expect("pinned version with only a latest mock must fail closed");
@@ -298,11 +305,9 @@ async fn azure_versioned_url_does_not_use_latest_mock() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn azure_extra_path_segments_are_rejected() {
-    let err = azure_parse_keyvault_reference(
-        "https://vault.example.net/secrets/admin-jwt/v1/extra",
-        KEY,
-    )
-    .expect_err("extra segments must fail");
+    let err =
+        azure_parse_keyvault_reference("https://vault.example.net/secrets/admin-jwt/v1/extra", KEY)
+            .expect_err("extra segments must fail");
     assert!(
         err.contains("unexpected path segments"),
         "expected extra-segment error, got: {err}"
@@ -364,7 +369,10 @@ async fn azure_tls_inventory_reports_fetched_version() {
         (CertSource::Uri(path_uri), CertSource::Uri(query_uri)) => {
             assert_eq!(path_uri.scheme, SourceScheme::Azure);
             assert_eq!(query_uri.scheme, SourceScheme::Azure);
-            assert_eq!(query_uri.options.get("version").map(String::as_str), Some("v1"));
+            assert_eq!(
+                query_uri.options.get("version").map(String::as_str),
+                Some("v1")
+            );
             assert!(path_uri.options.get("version").is_none());
         }
         _ => panic!("expected azure:// URIs"),
