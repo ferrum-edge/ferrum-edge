@@ -4,13 +4,15 @@
 Kept out of `.github/workflows/ci.yml` shell so the trusted ARM64 build-policy
 gate can compare unprotected workflow surfaces without freezing routine Helm
 validation edits.
+
+Process launches (helm template / kubectl dry-run) stay in the trusted workflow
+shell. This script only statically parses captured results and repository files.
 """
 
 from __future__ import annotations
 
 import argparse
 import re
-import subprocess
 import sys
 from pathlib import Path
 
@@ -113,38 +115,12 @@ def validate_mode_contract_docs(root: Path) -> None:
     print("mode contract docs ok")
 
 
-def run_helm_template(root: Path, mode: str, stdout_path: Path, stderr_path: Path) -> int:
-    with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
-        "w", encoding="utf-8"
-    ) as stderr:
-        completed = subprocess.run(
-            [
-                "helm",
-                "template",
-                "ferrum",
-                str(root / "charts" / "ferrum-gateway"),
-                "--namespace",
-                "ferrum",
-                "--set",
-                f"mode={mode}",
-            ],
-            cwd=root,
-            stdout=stdout,
-            stderr=stderr,
-            check=False,
-        )
-    return completed.returncode
-
-
-def validate_chart_mode_messages(root: Path, results_dir: Path) -> None:
-    results_dir.mkdir(parents=True, exist_ok=True)
-
-    migrate_out = results_dir / "migrate-mode.yaml"
+def validate_chart_mode_messages(results_dir: Path) -> None:
     migrate_err = results_dir / "migrate-mode.err"
-    if run_helm_template(root, "migrate", migrate_out, migrate_err) == 0:
+    if not migrate_err.is_file():
         fail(
-            "migrate mode rendered",
-            "mode=migrate must fail as an external Job contract",
+            "Missing migrate mode capture",
+            "workflow must capture helm stderr to migrate-mode.err before this script",
         )
     migrate_text = migrate_err.read_text(encoding="utf-8")
     if "external pre-deploy Kubernetes Job" not in migrate_text:
@@ -158,12 +134,11 @@ def validate_chart_mode_messages(root: Path, results_dir: Path) -> None:
             "migrate must not redirect to the mesh chart",
         )
 
-    mesh_out = results_dir / "mesh-mode.yaml"
     mesh_err = results_dir / "mesh-mode.err"
-    if run_helm_template(root, "mesh", mesh_out, mesh_err) == 0:
+    if not mesh_err.is_file():
         fail(
-            "mesh mode rendered on gateway chart",
-            "mesh must fail with a ferrum-mesh pointer",
+            "Missing mesh mode capture",
+            "workflow must capture helm stderr to mesh-mode.err before this script",
         )
     mesh_text = mesh_err.read_text(encoding="utf-8")
     if "ferrum-mesh chart" not in mesh_text:
@@ -172,32 +147,6 @@ def validate_chart_mode_messages(root: Path, results_dir: Path) -> None:
             "mode=mesh must point operators at the ferrum-mesh chart",
         )
     print("chart mode messages ok")
-
-
-def validate_server_dry_run(root: Path) -> None:
-    examples_dir = root / "charts" / "ferrum-gateway" / "examples"
-    for name in MIGRATE_EXAMPLES:
-        manifest = examples_dir / name
-        completed = subprocess.run(
-            [
-                "kubectl",
-                "apply",
-                "--dry-run=server",
-                "-f",
-                str(manifest),
-            ],
-            cwd=root,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "").strip()
-            fail(
-                "Migrate Job server dry-run failed",
-                f"{name}: {detail}",
-            )
-    print("migrate job server dry-run ok")
 
 
 def main(argv: list[str]) -> int:
@@ -211,25 +160,14 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--results-dir",
         type=Path,
-        default=None,
-        help="Directory for helm template stdout/stderr captures",
-    )
-    parser.add_argument(
-        "--server-dry-run",
-        action="store_true",
-        help="Only run kubectl server-side dry-run against migrate Job examples",
+        required=True,
+        help="Directory with helm template stdout/stderr captures from the workflow",
     )
     args = parser.parse_args(argv)
     root = args.root.resolve()
+    results_dir = args.results_dir.resolve()
 
-    if args.server_dry_run:
-        validate_server_dry_run(root)
-        return 0
-
-    results_dir = args.results_dir
-    if results_dir is None:
-        fail("Missing results directory", "--results-dir is required for static checks")
-    validate_chart_mode_messages(root, results_dir.resolve())
+    validate_chart_mode_messages(results_dir)
     validate_migrate_examples(root)
     validate_mode_contract_docs(root)
     return 0

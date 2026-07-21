@@ -2390,8 +2390,24 @@ jobs:
             echo "::error title=QUIC port without HTTPS listener::https-quic must require an active HTTPS listener"
             exit 1
           fi
-          # DOC-02 migrate contract lives in a scanned automation script so this
-          # unprotected job does not grow protected-toolchain workflow shell surfaces.
+          # DOC-02: migrate is an external Job workflow, not a chart mode and not
+          # redirected to ferrum-mesh. mesh-family modes still point at ferrum-mesh.
+          # helm stays in this trusted workflow shell; the automation script only
+          # statically parses the captured stderr and repository contract files.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=migrate \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/migrate-mode.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/migrate-mode.err"; then
+            echo "::error title=migrate mode rendered::mode=migrate must fail as an external Job contract"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=mesh \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/mesh-mode.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/mesh-mode.err"; then
+            echo "::error title=mesh mode rendered on gateway chart::mesh must fail with a ferrum-mesh pointer"
+            exit 1
+          fi
           python3 -I .github/scripts/validate_migrate_k8s_contract.py \
             --results-dir "$RUNNER_TEMP/ferrum-gateway-helm-results"
 
@@ -2426,7 +2442,9 @@ jobs:
         run: |
           set -euo pipefail
           kubectl create namespace ferrum
-          python3 -I .github/scripts/validate_migrate_k8s_contract.py --server-dry-run
+          for manifest in charts/ferrum-gateway/examples/migrate-job-*.yaml; do
+            kubectl apply --dry-run=server -f "$manifest" >/dev/null
+          done
 
       - name: Default install renders no unusable control plane
         run: |
