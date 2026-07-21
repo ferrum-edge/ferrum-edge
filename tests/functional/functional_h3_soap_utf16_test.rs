@@ -104,11 +104,7 @@ async fn spawn_gateway(backend_port: u16) -> (GatewayHarness, u16, tempfile::Tem
     panic!("failed to spawn H3 SOAP gateway: {last_error}");
 }
 
-async fn request_with_retry(
-    client: &Http3Client,
-    url: &str,
-    options: GetOptions,
-) -> Http3Response {
+async fn request_with_retry(client: &Http3Client, url: &str, options: GetOptions) -> Http3Response {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         match client.get_with_options(url, options.clone()).await {
@@ -127,7 +123,9 @@ async fn h3_utf16_username_token_validates_and_charset_conflict_fails_closed() {
     let backend_reservation = reserve_port().await.expect("reserve backend port");
     let backend_port = backend_reservation.port;
     let _backend = ScriptedHttp1Backend::builder(backend_reservation.into_listener())
-        .step(HttpStep::ExpectRequest(RequestMatcher::method_path("POST", "/service")))
+        .step(HttpStep::ExpectRequest(RequestMatcher::method_path(
+            "POST", "/service",
+        )))
         .step(HttpStep::RespondStatus {
             status: 200,
             reason: "OK".to_string(),

@@ -1051,10 +1051,8 @@ async fn test_password_digest_valid_over_utf16le_wire_bytes() {
     );
     let body = wrap_soap(&ut);
     let bytes = encode_utf16_le(&body);
-    let mut ctx =
-        make_ctx_with_soap_bytes(bytes, "application/soap+xml; charset=utf-16");
-    let mut headers =
-        soap_headers_with_content_type("application/soap+xml; charset=utf-16");
+    let mut ctx = make_ctx_with_soap_bytes(bytes, "application/soap+xml; charset=utf-16");
+    let mut headers = soap_headers_with_content_type("application/soap+xml; charset=utf-16");
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(
         matches!(result, PluginResult::Continue),
@@ -1809,10 +1807,8 @@ async fn test_saml_valid_signed_assertion_accepted_over_utf16le() {
 
     let body = wrap_saml_assertion(&assertion);
     let bytes = encode_utf16_le(&body);
-    let mut ctx =
-        make_ctx_with_soap_bytes(bytes, "application/soap+xml; charset=utf-16");
-    let mut headers =
-        soap_headers_with_content_type("application/soap+xml; charset=utf-16");
+    let mut ctx = make_ctx_with_soap_bytes(bytes, "application/soap+xml; charset=utf-16");
+    let mut headers = soap_headers_with_content_type("application/soap+xml; charset=utf-16");
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(
         matches!(result, PluginResult::Continue),
@@ -2340,11 +2336,8 @@ fn test_should_not_buffer_non_soap() {
 fn decode_utf16le_with_bom_and_matching_charset() {
     let xml = wrap_soap(&fresh_timestamp());
     let bytes = encode_utf16_le(&xml);
-    let decoded = soap_decode_xml_body_for_test(
-        &bytes,
-        "application/soap+xml; charset=utf-16",
-    )
-    .expect("UTF-16LE with BOM should decode");
+    let decoded = soap_decode_xml_body_for_test(&bytes, "application/soap+xml; charset=utf-16")
+        .expect("UTF-16LE with BOM should decode");
     assert!(decoded.contains("Envelope"));
     assert!(decoded.contains("Timestamp"));
 }
@@ -2466,11 +2459,9 @@ fn decode_rejects_malformed_utf16_surrogate() {
 #[test]
 fn decode_rejects_duplicate_charset_parameters() {
     let xml = wrap_soap(&fresh_timestamp());
-    let err = soap_decode_xml_body_for_test(
-        xml.as_bytes(),
-        "text/xml; charset=utf-8; charset=utf-16",
-    )
-    .expect_err("duplicate charset is ambiguous");
+    let err =
+        soap_decode_xml_body_for_test(xml.as_bytes(), "text/xml; charset=utf-8; charset=utf-16")
+            .expect_err("duplicate charset is ambiguous");
     assert!(err.contains("conflicting or ambiguous"), "got: {err}");
 }
 
@@ -2510,10 +2501,7 @@ async fn utf16le_username_token_validates_over_decoded_text() {
     </wsse:UsernameToken>"#,
     );
     let bytes = encode_utf16_le(&body);
-    let mut ctx = make_ctx_with_soap_bytes(
-        bytes.clone(),
-        "application/soap+xml; charset=utf-16",
-    );
+    let mut ctx = make_ctx_with_soap_bytes(bytes.clone(), "application/soap+xml; charset=utf-16");
     // Simulate H1/H2/H3 handoff: non-UTF-8 bytes must not populate request_body.
     assert!(ctx.metadata.get("request_body").is_none());
     let mut headers = soap_headers_with_content_type("application/soap+xml; charset=utf-16");
@@ -2556,8 +2544,7 @@ async fn utf16_missing_security_still_rejects_after_decode() {
       <soap:Header></soap:Header>
       <soap:Body><Test/></soap:Body>
     </soap:Envelope>"#;
-    let mut ctx =
-        make_ctx_with_soap_bytes(encode_utf16_le(body), "text/xml; charset=utf-16");
+    let mut ctx = make_ctx_with_soap_bytes(encode_utf16_le(body), "text/xml; charset=utf-16");
     let mut headers = soap_headers_with_content_type("text/xml; charset=utf-16");
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
@@ -2569,8 +2556,7 @@ async fn utf16_missing_security_still_rejects_after_decode() {
 async fn conflicting_charset_rejects_with_415_without_treating_as_empty() {
     let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
     let body = wrap_soap(&fresh_timestamp());
-    let mut ctx =
-        make_ctx_with_soap_bytes(encode_utf16_le(&body), "text/xml; charset=utf-8");
+    let mut ctx = make_ctx_with_soap_bytes(encode_utf16_le(&body), "text/xml; charset=utf-8");
     let mut headers = soap_headers_with_content_type("text/xml; charset=utf-8");
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));

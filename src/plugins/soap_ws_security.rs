@@ -3003,10 +3003,7 @@ fn resolve_soap_request_body(
 ///
 /// The original wire bytes in `ctx.request_body_bytes` are left untouched so
 /// the backend still receives the client representation (including UTF-16).
-fn decode_soap_xml_body(
-    bytes: &[u8],
-    content_type: &str,
-) -> Result<String, SoapBodyDecodeError> {
+fn decode_soap_xml_body(bytes: &[u8], content_type: &str) -> Result<String, SoapBodyDecodeError> {
     let declared = parse_content_type_charset(content_type)?;
     let (encoding, payload) = resolve_soap_xml_encoding(bytes, declared)?;
     let decoded = decode_payload(encoding, payload)?;
@@ -3054,10 +3051,7 @@ fn parse_charset_parameter_value(raw: &str) -> Result<&str, SoapBodyDecodeError>
         }
         return Ok(inner);
     }
-    if raw
-        .bytes()
-        .any(|byte| matches!(byte, b'"' | b'\'' | b'\\'))
-    {
+    if raw.bytes().any(|byte| matches!(byte, b'"' | b'\'' | b'\\')) {
         return Err(SoapBodyDecodeError::ConflictingCharset);
     }
     Ok(raw)
