@@ -1323,14 +1323,14 @@ fn test_build_trailer_frame_preserves_ascii_custom_and_bin_metadata() {
     headers.insert("trace-proto-bin".to_string(), "AQID".to_string());
     headers.insert("content-type".to_string(), "application/grpc".to_string());
     headers.insert("x-grpc-web".to_string(), "1".to_string());
-    headers.insert("proxy-authenticate".to_string(), "Basic realm=x".to_string());
+    headers.insert(
+        "proxy-authenticate".to_string(),
+        "Basic realm=x".to_string(),
+    );
     headers.insert("connection".to_string(), "close".to_string());
     headers.insert("keep-alive".to_string(), "timeout=5".to_string());
     // Connection-listed smuggling attempt: nominate a custom name via Connection.
-    headers.insert(
-        "Connection".to_string(),
-        "x-connection-listed".to_string(),
-    );
+    headers.insert("Connection".to_string(), "x-connection-listed".to_string());
     headers.insert("x-connection-listed".to_string(), "leak".to_string());
     headers.insert(":status".to_string(), "200".to_string());
     headers.insert("bad header".to_string(), "nope".to_string());
@@ -1357,10 +1357,7 @@ fn test_build_trailer_frame_preserves_duplicate_metadata_and_deterministic_order
     use ferrum_edge::_test_support::build_trailer_frame;
     let mut headers = HashMap::new();
     // Newline-joined duplicates mirror collect_buffered_grpc_trailers.
-    headers.insert(
-        "request-id".to_string(),
-        "first\nsecond".to_string(),
-    );
+    headers.insert("request-id".to_string(), "first\nsecond".to_string());
     headers.insert("grpc-status".to_string(), "0".to_string());
     headers.insert("zebra-meta".to_string(), "z".to_string());
     headers.insert("alpha-meta".to_string(), "a".to_string());
@@ -1397,10 +1394,7 @@ async fn test_transform_response_body_binary_and_text_embed_custom_trailers() {
     response_headers.insert("grpc-status".to_string(), "0".to_string());
     response_headers.insert("request-id".to_string(), "abc-123".to_string());
     response_headers.insert("trace-proto-bin".to_string(), "AQID".to_string());
-    response_headers.insert(
-        "request-id-dup".to_string(),
-        "one\ntwo".to_string(),
-    );
+    response_headers.insert("request-id-dup".to_string(), "one\ntwo".to_string());
     response_headers.insert("proxy-authenticate".to_string(), "Basic x".to_string());
 
     let binary = plugin
@@ -1420,11 +1414,7 @@ async fn test_transform_response_body_binary_and_text_embed_custom_trailers() {
         "application/grpc-web-text".to_string(),
     );
     let text = plugin
-        .transform_response_body(
-            &body,
-            Some("application/grpc-web-text"),
-            &response_headers,
-        )
+        .transform_response_body(&body, Some("application/grpc-web-text"), &response_headers)
         .await
         .expect("text transform");
     let decoded = BASE64.decode(&text).expect("text body is base64");

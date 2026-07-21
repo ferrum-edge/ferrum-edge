@@ -929,12 +929,8 @@ fn encode_shadowed_trailers_for_frame(
         .iter()
         .filter_map(|(name, trailer_value)| {
             response_headers.get(name).and_then(|initial_value| {
-                (!is_reserved_grpc_web_terminal_metadata(name)).then(|| {
-                    (
-                        name.clone(),
-                        [initial_value.clone(), trailer_value.clone()],
-                    )
-                })
+                (!is_reserved_grpc_web_terminal_metadata(name))
+                    .then(|| (name.clone(), [initial_value.clone(), trailer_value.clone()]))
             })
         })
         .collect::<BTreeMap<_, _>>();
@@ -991,10 +987,7 @@ pub fn bridge_backend_trailer_provenance_for_frame(
 ) {
     let shadowed = encode_shadowed_trailers_for_frame(response_headers, trailers);
     bridge_backend_trailer_names_for_frame(response_headers, trailers);
-    response_headers.insert(
-        HEADER_GRPC_WEB_SHADOWED_TRAILERS.to_string(),
-        shadowed,
-    );
+    response_headers.insert(HEADER_GRPC_WEB_SHADOWED_TRAILERS.to_string(), shadowed);
 }
 
 fn trailer_name_allowlist_from_metadata(
@@ -1590,10 +1583,7 @@ impl Plugin for GrpcWebPlugin {
             .and_then(|value| value.parse::<u16>().ok());
         let mut allowlist = trailer_name_allowlist_from_metadata(&ctx.metadata);
         let shadowed_trailers = shadowed_trailers_from_metadata(&ctx.metadata);
-        if ctx
-            .metadata
-            .contains_key(META_GRPC_WEB_SHADOWED_TRAILERS)
-            && shadowed_trailers.is_none()
+        if ctx.metadata.contains_key(META_GRPC_WEB_SHADOWED_TRAILERS) && shadowed_trailers.is_none()
         {
             // Corrupt internal provenance must not fall back to framing a
             // same-name initial header. Retain only reserved terminal metadata.

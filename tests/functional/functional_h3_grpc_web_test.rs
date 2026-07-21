@@ -1067,7 +1067,10 @@ async fn h3_grpc_web_preserves_ascii_custom_trailers_binary_and_text() {
     )
     .await;
     assert_eq!(binary.status, StatusCode::OK);
-    assert!(binary.trailers.is_none(), "must not emit native H3 trailers");
+    assert!(
+        binary.trailers.is_none(),
+        "must not emit native H3 trailers"
+    );
     let binary_frames = grpc_web_frames(&binary.body_bytes);
     let binary_trailer = binary_frames
         .iter()

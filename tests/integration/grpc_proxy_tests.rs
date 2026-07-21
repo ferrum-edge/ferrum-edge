@@ -2189,8 +2189,8 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
 /// `grpc-status`, one ASCII custom trailer, one `-bin` trailer, duplicate
 /// metadata, a hop-by-hop trailer that must be filtered, and an initial-header
 /// field that must not be copied into the gRPC-Web trailer frame.
-async fn start_grpc_backend_with_custom_trailer_fixture() -> (SocketAddr, tokio::task::JoinHandle<()>)
-{
+async fn start_grpc_backend_with_custom_trailer_fixture()
+-> (SocketAddr, tokio::task::JoinHandle<()>) {
     use http_body::Frame;
     use http_body_util::StreamBody;
 
@@ -2354,8 +2354,7 @@ async fn grpc_web_custom_trailer_exchange(
         if last_body
             .windows(b"grpc-status: 0".len())
             .any(|window| window == b"grpc-status: 0")
-            || (content_type.contains("grpc-web-text")
-                && !last_body.is_empty())
+            || (content_type.contains("grpc-web-text") && !last_body.is_empty())
         {
             return last_body;
         }
