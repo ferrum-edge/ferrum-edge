@@ -91,6 +91,11 @@ const DEFAULT_CONTENT_TYPES: &[&str] = &[
 const UNCOMPRESSIBLE_STATUS_CODES: &[u16] = &[204, 205, 304];
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
+/// Metadata key set by `response_caching` for the current request's lookup
+/// outcome (`HIT`, `MISS`, …). Used to scope reject-path 406 replacement to
+/// cache HITs of identity variants without masking auth/policy rejections.
+const RESPONSE_CACHE_STATUS_METADATA_KEY: &str = "cache_status";
+const RESPONSE_CACHE_HIT_STATUS: &str = "HIT";
 const REQUEST_NO_TRANSFORM_METADATA_KEY: &str = "compression:request_no_transform";
 const RESPONSE_ALGORITHM_METADATA_KEY: &str = "compression:algorithm";
 
@@ -381,18 +386,47 @@ impl CompressionPlugin {
     /// Hard protocol cases where Ferrum must not rewrite the representation
     /// and must not invent a negotiation failure for an absent payload or an
     /// already-coded upstream response.
+    ///
+    /// Identity range/delta responses are *not* hard skips: they are
+    /// non-transformable (see [`Self::is_non_transformable_range_or_delta`])
+    /// and still subject to identity-acceptability / 406 negotiation.
     fn is_protocol_hard_skip(
+        _ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+    ) -> bool {
+        UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status)
+            || response_headers.contains_key("content-encoding")
+    }
+
+    /// Range/delta representations Ferrum must not re-encode, but which remain
+    /// identity when they lack `Content-Encoding`. Forward unchanged when
+    /// identity is acceptable; fail closed with 406 when it is not.
+    fn is_non_transformable_range_or_delta(
         ctx: &RequestContext,
         response_status: u16,
         response_headers: &HashMap<String, String>,
     ) -> bool {
         !super::response_body_rewrite_allowed(response_status)
-            || UNCOMPRESSIBLE_STATUS_CODES.contains(&response_status)
             || response_headers.contains_key("content-range")
             || ctx
                 .metadata
                 .contains_key(crate::proxy::RANGE_RESPONSE_METADATA_KEY)
-            || response_headers.contains_key("content-encoding")
+    }
+
+    /// Reject-path 406 replacement is reserved for `response_caching` HITs of
+    /// identity variants. Other synthetic/auth/policy rejections keep their
+    /// original status so negotiation does not mask security denials.
+    fn is_response_cache_hit(ctx: &RequestContext) -> bool {
+        ctx.metadata
+            .get(RESPONSE_CACHE_STATUS_METADATA_KEY)
+            .is_some_and(|status| status == RESPONSE_CACHE_HIT_STATUS)
+    }
+
+    /// Emit 406 on the reject path only for cache-HIT identity variants; on the
+    /// ordinary backend path always fail closed when identity is unacceptable.
+    fn should_fail_closed_not_acceptable(ctx: &RequestContext, on_rejection: bool) -> bool {
+        !on_rejection || Self::is_response_cache_hit(ctx)
     }
 
     /// Check if the content type is eligible for compression.
@@ -948,16 +982,16 @@ impl Plugin for CompressionPlugin {
     }
 
     fn may_replace_rejection_response(&self) -> bool {
-        // Allow a required 406 to replace an uncommitted synthetic response
-        // (for example a `response_caching` HIT of an identity variant) when
-        // identity is unacceptable and no coded representation can be produced
-        // on the reject path.
+        // Opt in so a required 406 can replace an uncommitted `response_caching`
+        // HIT of an identity variant. `after_proxy` only returns that Reject when
+        // `cache_status=HIT` and identity is explicitly unacceptable — auth/policy
+        // rejections are left unchanged.
         true
     }
 
     fn warn_on_rejection_response_replacement(&self) -> bool {
-        // Replacing a cache HIT / other synthetic 2xx with a standards-required
-        // 406 is expected negotiation behavior, not an anomalous overwrite.
+        // Replacing a cache HIT identity variant with a standards-required 406
+        // is expected negotiation behavior, not an anomalous overwrite.
         false
     }
 
@@ -1071,18 +1105,22 @@ impl Plugin for CompressionPlugin {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Synthetic / rejection responses (cache HITs, plugin short-circuits)
-        // re-run `after_proxy` without body transforms. Do not commit
-        // Content-Encoding there, but still enforce Accept-Encoding fail-closed
-        // so a cached identity variant cannot bypass a required 406 — including
-        // when identity responses omit `Vary: Accept-Encoding` (#2355).
+        // Synthetic / rejection responses re-run `after_proxy` without body
+        // transforms. Do not commit Content-Encoding there. Fail-closed 406 on
+        // this path is scoped to `response_caching` HITs of identity variants
+        // (`cache_status=HIT`) — including when identity responses omit
+        // `Vary: Accept-Encoding` (#2355) — so auth/policy rejections keep their
+        // original status.
         let on_rejection = ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY);
 
-        // No-body statuses, ranges/deltas, and already-coded upstream responses
-        // are protocol-correct as-is; negotiation does not invent a 406 for them.
+        // No-body statuses and already-coded upstream responses are
+        // protocol-correct as-is; negotiation does not invent a 406 for them.
         if Self::is_protocol_hard_skip(ctx, response_status, response_headers) {
             return PluginResult::Continue;
         }
+
+        let range_or_delta =
+            Self::is_non_transformable_range_or_delta(ctx, response_status, response_headers);
 
         let accept_encoding = ctx
             .metadata
@@ -1095,9 +1133,15 @@ impl Plugin for CompressionPlugin {
             // only acceptable representation: forward the uncoded response.
             Some(CodingSelection::Identity) | None => return PluginResult::Continue,
             // Client refused identity and every configured algorithm.
-            Some(CodingSelection::NotAcceptable) => return not_acceptable_reject(),
+            Some(CodingSelection::NotAcceptable) => {
+                if Self::should_fail_closed_not_acceptable(ctx, on_rejection) {
+                    return not_acceptable_reject();
+                }
+                PluginResult::Continue
+            }
             Some(CodingSelection::Compress(algo)) => {
                 let can_encode = !on_rejection
+                    && !range_or_delta
                     && !Self::response_forbids_transform(ctx, response_headers)
                     && self.is_compression_eligible(response_headers);
                 if can_encode {
@@ -1139,13 +1183,14 @@ impl Plugin for CompressionPlugin {
                     return PluginResult::Continue;
                 }
 
-                // Cannot produce the selected coded representation (size /
-                // content-type eligibility, no-transform / strong ETag, or
+                // Cannot produce the selected coded representation (range/delta,
+                // size / content-type eligibility, no-transform / strong ETag, or
                 // reject-path without body transforms). If identity is also
                 // unacceptable, fail closed rather than forwarding an excluded
                 // identity body — and never partially mutate compression headers.
-                if accept_encoding
-                    .is_some_and(|ae| identity_coding_quality(ae) == 0.0)
+                // On the reject path, only `response_caching` HITs are replaced.
+                if accept_encoding.is_some_and(|ae| identity_coding_quality(ae) == 0.0)
+                    && Self::should_fail_closed_not_acceptable(ctx, on_rejection)
                 {
                     return not_acceptable_reject();
                 }
