@@ -312,7 +312,7 @@ async fn test_framed_disconnect_duration_ignores_wall_clock_skew() {
     );
     let expected_fwd_connected = meta_fwd.session_start.to_rfc3339();
 
-        fire_ws_framed_disconnect_hooks(&plugins_fwd, "proxy-framed", meta_fwd, 1, 1, 8, 8, None).await;
+    fire_ws_framed_disconnect_hooks(&plugins_fwd, "proxy-framed", meta_fwd, 1, 1, 8, 8, None).await;
 
     let captured_fwd = captured_fwd.lock().unwrap();
     assert_eq!(captured_fwd.len(), 1);
