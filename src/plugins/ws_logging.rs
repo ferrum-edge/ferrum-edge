@@ -660,7 +660,12 @@ impl WsLogging {
     fn queue_websocket(&self, ctx: &WsDisconnectContext) {
         // Slot first, then provisional aggregate bytes, then a borrowed
         // disconnect view (no deep clone of attacker-shaped strings/metadata).
-        let Ok(permit) = self.sender.try_reserve() else {
+        let Some(sender) = self.sender.get() else {
+            self.byte_budget
+                .record_drop("worker unavailable before start_background_tasks");
+            return;
+        };
+        let Ok(permit) = sender.try_reserve() else {
             self.byte_budget.record_drop("queue slot exhausted");
             return;
         };
