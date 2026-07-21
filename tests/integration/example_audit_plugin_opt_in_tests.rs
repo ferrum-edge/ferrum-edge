@@ -61,9 +61,7 @@ fn rust_plugin_stems(dir: &Path) -> Vec<String> {
                     .and_then(|stem| stem.to_str())
                     .filter(|stem| {
                         !stem.is_empty()
-                            && stem
-                                .chars()
-                                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                            && stem.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                     })
                     .map(str::to_string)
             } else {
@@ -140,8 +138,7 @@ fn setup_rust_ci_custom_plugins_list_matches_examples_directory() {
     );
 
     assert_eq!(
-        listed,
-        on_disk,
+        listed, on_disk,
         "setup-rust-ci FERRUM_CUSTOM_PLUGINS must list every custom_plugins/examples/*.rs stem"
     );
 }
