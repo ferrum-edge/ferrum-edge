@@ -106,6 +106,11 @@ def first_party_markdown_files(root: Path = REPO_ROOT) -> list[Path]:
             rel = entry.relative_to(root).as_posix()
             if is_excluded(rel):
                 continue
+            # Never follow checkout symlinks. A directory link can escape the
+            # repository or create a cycle, and a file link would make an
+            # external Markdown document look first-party.
+            if entry.is_symlink():
+                continue
             if entry.is_dir():
                 stack.append(entry)
                 continue
@@ -333,6 +338,21 @@ def run_self_test(root: Path = REPO_ROOT) -> None:
         err.line == 4 and "missing heading slug" in err.reason for err in synth_errors
     ), synth_errors
     assert all(":" in err.format() and err.target in err.format() for err in synth_errors)
+
+    # Discovery stays inside the checkout even when it contains a symlink to
+    # an external Markdown tree. Directory symlinks must not be traversed.
+    with tempfile.TemporaryDirectory(prefix="md-link-discovery-") as tmp:
+        temp_root = Path(tmp)
+        repo = temp_root / "repo"
+        external = temp_root / "external"
+        repo.mkdir()
+        external.mkdir()
+        first_party = repo / "README.md"
+        first_party.write_text("# First party\n", encoding="utf-8")
+        (external / "outside.md").write_text("# Outside\n", encoding="utf-8")
+        (repo / "external-link").symlink_to(external, target_is_directory=True)
+        discovered = first_party_markdown_files(repo)
+    assert discovered == [first_party], discovered
     print("markdown link-check self-test passed")
 
 
