@@ -3198,10 +3198,7 @@ fn validate_xml_declaration_encoding(
 ) -> Result<(), SoapBodyDecodeError> {
     let trimmed = xml.trim_start_matches(['\u{feff}', ' ', '\t', '\r', '\n']);
     let bytes = trimmed.as_bytes();
-    if !bytes.starts_with(b"<?xml")
-        || !bytes
-            .get(5)
-            .is_some_and(|byte| byte.is_ascii_whitespace())
+    if !bytes.starts_with(b"<?xml") || !bytes.get(5).is_some_and(|byte| byte.is_ascii_whitespace())
     {
         return Ok(());
     }

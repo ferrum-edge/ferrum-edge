@@ -202,8 +202,7 @@ async fn h3_soap_encodings_validate_and_hostile_metadata_fails_closed() {
     assert_eq!(accepted_be.status, StatusCode::OK);
     assert_eq!(accepted_be.body_bytes.as_ref(), b"ok");
 
-    let utf8 =
-        username_token_envelope().replace("encoding=\"UTF-16\"", "encoding=\"UTF-8\"");
+    let utf8 = username_token_envelope().replace("encoding=\"UTF-16\"", "encoding=\"UTF-8\"");
     let accepted_utf8 = request_with_retry(
         &client,
         &url,
