@@ -129,6 +129,78 @@ fn reject_body(result: &PluginResult) -> &str {
     }
 }
 
+fn reject_headers(result: &PluginResult) -> &HashMap<String, String> {
+    match result {
+        PluginResult::Reject { headers, .. } => headers,
+        _ => panic!("Expected Reject, got {:?}", result),
+    }
+}
+
+/// Public UsernameToken invalid-credential body (GHSA-jp56 / issue #2642).
+const USERNAME_TOKEN_INVALID_CREDENTIALS_BODY: &str =
+    r#"{"error":"WS-Security: invalid credentials"}"#;
+
+fn assert_username_token_invalid_credentials(result: &PluginResult, candidate_usernames: &[&str]) {
+    assert!(is_reject(result));
+    assert_eq!(reject_status(result), 401);
+    assert_eq!(reject_body(result), USERNAME_TOKEN_INVALID_CREDENTIALS_BODY);
+    assert!(
+        reject_headers(result).is_empty(),
+        "invalid-credential rejects must not add distinguishing headers: {:?}",
+        reject_headers(result)
+    );
+    let body = reject_body(result);
+    for candidate in candidate_usernames {
+        assert!(
+            !body.contains(candidate),
+            "client body must not leak candidate username {:?}: {}",
+            candidate,
+            body
+        );
+    }
+    assert!(
+        !body.to_ascii_lowercase().contains("unknown"),
+        "client body must not disclose unknown-username: {}",
+        body
+    );
+    assert!(
+        !body.contains("invalid password"),
+        "client body must not disclose password-verification detail: {}",
+        body
+    );
+    assert!(
+        !body.contains("PasswordDigest verification failed"),
+        "client body must not disclose digest-verification detail: {}",
+        body
+    );
+}
+
+fn password_digest_token(username: &str, password: &str, nonce_bytes: &[u8]) -> String {
+    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
+    let created = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+
+    let mut data = Vec::new();
+    data.extend_from_slice(nonce_bytes);
+    data.extend_from_slice(created.as_bytes());
+    data.extend_from_slice(password.as_bytes());
+
+    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
+    let digest_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
+
+    format!(
+        r#"<wsse:UsernameToken>
+        <wsse:Username>{}</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
+        <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</wsse:Nonce>
+        <wsu:Created>{}</wsu:Created>
+    </wsse:UsernameToken>"#,
+        username, digest_b64, nonce_b64, created
+    )
+}
+
 // ── Constructor validation tests ────────────────────────────────────────────
 
 #[test]
@@ -724,9 +796,7 @@ async fn test_username_token_wrong_password_rejects() {
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(is_reject(&result));
-    assert_eq!(reject_status(&result), 401);
-    assert!(reject_body(&result).contains("invalid password"));
+    assert_username_token_invalid_credentials(&result, &["alice"]);
 }
 
 #[tokio::test]
@@ -788,8 +858,7 @@ async fn test_username_token_unknown_user_rejects() {
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(is_reject(&result));
-    assert!(reject_body(&result).contains("unknown username"));
+    assert_username_token_invalid_credentials(&result, &["eve", "alice"]);
 }
 
 #[tokio::test]
@@ -866,38 +935,59 @@ async fn test_password_digest_valid() {
 #[tokio::test]
 async fn test_password_digest_wrong_password_rejects() {
     let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
-
-    let nonce_bytes = b"wrong-nonce-test";
-    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
-    let created = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-        .to_string();
-
-    // Use wrong password for digest
-    let mut data = Vec::new();
-    data.extend_from_slice(nonce_bytes);
-    data.extend_from_slice(created.as_bytes());
-    data.extend_from_slice(b"wrongpassword");
-
-    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
-    let digest_b64 =
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
-
-    let ut = format!(
-        r#"<wsse:UsernameToken>
-        <wsse:Username>alice</wsse:Username>
-        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
-        <wsse:Nonce>{}</wsse:Nonce>
-        <wsu:Created>{}</wsu:Created>
-    </wsse:UsernameToken>"#,
-        digest_b64, nonce_b64, created
-    );
+    let ut = password_digest_token("alice", "wrongpassword", b"wrong-nonce-test");
     let body = wrap_soap(&ut);
     let mut ctx = make_ctx_with_soap_body(&body);
     let mut headers = soap_headers();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
-    assert!(is_reject(&result));
-    assert!(reject_body(&result).contains("PasswordDigest verification failed"));
+    assert_username_token_invalid_credentials(&result, &["alice"]);
+}
+
+#[tokio::test]
+async fn test_username_token_credential_failures_are_indistinguishable() {
+    // GHSA-jp56-p5h6-f45q / issue #2642: unknown user, wrong PasswordText, and
+    // wrong PasswordDigest must expose identical public status/headers/body and
+    // must not echo the attacker-supplied candidate username.
+    let text_plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let digest_plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+
+    let unknown_text = r#"<wsse:UsernameToken>
+        <wsse:Username>eve-candidate</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">anything</wsse:Password>
+    </wsse:UsernameToken>"#;
+    let wrong_text = r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">wrongpass</wsse:Password>
+    </wsse:UsernameToken>"#;
+    let wrong_digest = password_digest_token("alice", "wrongpassword", b"oracle-digest-nonce");
+    let unknown_digest =
+        password_digest_token("eve-candidate", "anything", b"oracle-unknown-digest");
+
+    let mut outcomes = Vec::new();
+    for (plugin, token) in [
+        (&text_plugin, unknown_text.to_string()),
+        (&text_plugin, wrong_text.to_string()),
+        (&digest_plugin, wrong_digest),
+        (&digest_plugin, unknown_digest),
+    ] {
+        let body = wrap_soap(&token);
+        let mut ctx = make_ctx_with_soap_body(&body);
+        let mut headers = soap_headers();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_username_token_invalid_credentials(&result, &["eve-candidate", "alice"]);
+        outcomes.push((
+            reject_status(&result),
+            reject_body(&result).to_string(),
+            reject_headers(&result).clone(),
+        ));
+    }
+
+    let (status0, body0, headers0) = &outcomes[0];
+    for (idx, (status, body, headers)) in outcomes.iter().enumerate().skip(1) {
+        assert_eq!(status, status0, "status mismatch at outcome {}", idx);
+        assert_eq!(body, body0, "body mismatch at outcome {}", idx);
+        assert_eq!(headers, headers0, "headers mismatch at outcome {}", idx);
+    }
 }
 
 #[tokio::test]

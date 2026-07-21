@@ -117,6 +117,28 @@ struct Credential {
     password: String,
 }
 
+/// UsernameToken authentication outcomes that must not create a username oracle.
+///
+/// Structural token/policy failures remain distinguishable because they do not
+/// depend on whether the supplied principal exists. Credential failures
+/// (unknown user, wrong PasswordText, wrong PasswordDigest) share one public
+/// body and one stable telemetry class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UsernameTokenError {
+    Structural(String),
+    InvalidCredentials,
+}
+
+impl UsernameTokenError {
+    /// Stable operational failure class for credential rejection (no username).
+    const INVALID_CREDENTIALS_CLASS: &'static str = "username_token_invalid_credentials";
+    /// Stable structural failure class for malformed / policy-mismatch tokens.
+    const STRUCTURAL_CLASS: &'static str = "username_token_structural";
+    /// Client-visible JSON body shared by every invalid-credential outcome.
+    const INVALID_CREDENTIALS_BODY: &'static str =
+        r#"{"error":"WS-Security: invalid credentials"}"#;
+}
+
 struct TrustedCert {
     /// DER-encoded public key bytes for signature verification.
     public_key_der: Vec<u8>,
@@ -143,6 +165,9 @@ pub struct SoapWsSecurity {
     username_token_enabled: bool,
     password_type: PasswordType,
     credentials: Vec<Credential>,
+    /// Process-local padding secret used only to equalize verification work on
+    /// username lookup misses. Never authenticates a principal.
+    dummy_password: String,
 
     // X.509 signature verification
     x509_enabled: bool,
@@ -215,6 +240,11 @@ impl SoapWsSecurity {
                     .to_string(),
             );
         }
+
+        // Random process-local material so lookup misses still execute the same
+        // PasswordText / PasswordDigest verification work as known principals.
+        // This value is never accepted as a configured credential.
+        let dummy_password = format!("soap-ws-security-dummy:{}", uuid::Uuid::new_v4());
 
         // ── X.509 signature config ──────────────────────────────────────
         let x509_cfg = config_obj.get("x509_signature").unwrap_or(&Value::Null);
@@ -500,6 +530,7 @@ impl SoapWsSecurity {
             username_token_enabled,
             password_type,
             credentials,
+            dummy_password,
             x509_enabled,
             trusted_certs,
             allowed_signature_algorithms,
@@ -573,18 +604,32 @@ impl SoapWsSecurity {
 
     // ── UsernameToken validation ────────────────────────────────────────
 
-    fn validate_username_token(&self, security_block: &str) -> Result<String, String> {
-        let ut_block = find_element_block(security_block, "UsernameToken")
-            .ok_or_else(|| "WS-Security: missing UsernameToken element".to_string())?;
+    fn validate_username_token(
+        &self,
+        security_block: &str,
+    ) -> Result<String, UsernameTokenError> {
+        let ut_block = find_element_block(security_block, "UsernameToken").ok_or_else(|| {
+            UsernameTokenError::Structural("WS-Security: missing UsernameToken element".to_string())
+        })?;
 
-        let username = find_element_text(&ut_block, "Username")
-            .ok_or_else(|| "WS-Security: UsernameToken missing Username element".to_string())?;
+        let username = find_element_text(&ut_block, "Username").ok_or_else(|| {
+            UsernameTokenError::Structural(
+                "WS-Security: UsernameToken missing Username element".to_string(),
+            )
+        })?;
 
-        let password_element = find_element_block(&ut_block, "Password")
-            .ok_or_else(|| "WS-Security: UsernameToken missing Password element".to_string())?;
+        let password_element = find_element_block(&ut_block, "Password").ok_or_else(|| {
+            UsernameTokenError::Structural(
+                "WS-Security: UsernameToken missing Password element".to_string(),
+            )
+        })?;
 
         let password_value = extract_element_text_content(&password_element, "Password")
-            .ok_or_else(|| "WS-Security: Password element has no content".to_string())?;
+            .ok_or_else(|| {
+                UsernameTokenError::Structural(
+                    "WS-Security: Password element has no content".to_string(),
+                )
+            })?;
 
         // The verification mode is dictated solely by the operator-configured
         // `password_type`, NEVER by the client-supplied `Type` attribute.
@@ -607,73 +652,90 @@ impl SoapWsSecurity {
             if let Some(wire_type) = wire_type
                 && wire_type != self.password_type
             {
-                return Err(
+                return Err(UsernameTokenError::Structural(
                     "WS-Security: Password Type does not match the configured password_type"
                         .to_string(),
-                );
+                ));
             }
         }
         let effective_type = self.password_type;
 
-        // Find the matching credential
-        let cred = self
-            .credentials
-            .iter()
-            .find(|c| c.username == username)
-            .ok_or_else(|| {
-                format!(
-                    "WS-Security: unknown username '{}'",
-                    escape_xml_chars(&username)
-                )
-            })?;
+        // Always run verification against either the matched credential or
+        // process-local dummy material so lookup misses do not skip crypto work
+        // and do not produce a distinct public failure.
+        let cred = self.credentials.iter().find(|c| c.username == username);
+        let password_material = cred
+            .map(|c| c.password.as_str())
+            .unwrap_or(self.dummy_password.as_str());
+        let username_known = cred.is_some();
 
         match effective_type {
             PasswordType::PasswordText => {
                 // Constant-time compare: `password_value` is attacker-controlled
-                // and `cred.password` is the stored shared secret, so a
-                // short-circuiting `!=` leaks password bytes via timing. Mirrors
-                // basic_auth / hmac_auth; `constant_time_eq` handles length
-                // mismatches safely.
-                if !constant_time_eq(password_value.as_bytes(), cred.password.as_bytes()) {
-                    return Err("WS-Security: invalid password".to_string());
+                // and `password_material` is either the stored shared secret or
+                // dummy padding, so a short-circuiting `!=` would leak bytes via
+                // timing. Mirrors basic_auth / hmac_auth; `constant_time_eq`
+                // handles length mismatches safely.
+                let matched =
+                    constant_time_eq(password_value.as_bytes(), password_material.as_bytes());
+                // Dummy material is timing padding only and must never establish
+                // identity for an unregistered username.
+                if username_known && matched {
+                    Ok(username)
+                } else {
+                    Err(UsernameTokenError::InvalidCredentials)
                 }
             }
             PasswordType::PasswordDigest => {
+                // Structural Nonce/Created requirements are enforced before the
+                // known/unknown credential branch so missing digest inputs cannot
+                // themselves become a username oracle.
                 // PasswordDigest = Base64(SHA-1(nonce + created + password))
                 let nonce_b64 = find_element_text(&ut_block, "Nonce").ok_or_else(|| {
-                    "WS-Security: PasswordDigest requires Nonce element".to_string()
+                    UsernameTokenError::Structural(
+                        "WS-Security: PasswordDigest requires Nonce element".to_string(),
+                    )
                 })?;
 
-                let nonce_bytes = BASE64
-                    .decode(nonce_b64.trim())
-                    .map_err(|e| format!("WS-Security: invalid Nonce base64 encoding: {}", e))?;
+                let nonce_bytes = BASE64.decode(nonce_b64.trim()).map_err(|e| {
+                    UsernameTokenError::Structural(format!(
+                        "WS-Security: invalid Nonce base64 encoding: {}",
+                        e
+                    ))
+                })?;
 
                 let created = find_element_text(&ut_block, "Created").ok_or_else(|| {
-                    "WS-Security: PasswordDigest requires Created element".to_string()
+                    UsernameTokenError::Structural(
+                        "WS-Security: PasswordDigest requires Created element".to_string(),
+                    )
                 })?;
 
-                // Check nonce replay
-                self.check_nonce_replay(&nonce_b64)?;
+                // Check nonce replay for every digest attempt (known or unknown).
+                self.check_nonce_replay(&nonce_b64)
+                    .map_err(UsernameTokenError::Structural)?;
 
                 // Compute expected digest: SHA-1(nonce + created + password)
-                let mut data =
-                    Vec::with_capacity(nonce_bytes.len() + created.len() + cred.password.len());
+                let mut data = Vec::with_capacity(
+                    nonce_bytes.len() + created.len() + password_material.len(),
+                );
                 data.extend_from_slice(&nonce_bytes);
                 data.extend_from_slice(created.as_bytes());
-                data.extend_from_slice(cred.password.as_bytes());
+                data.extend_from_slice(password_material.as_bytes());
 
                 let computed = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
                 let expected_b64 = BASE64.encode(computed.as_ref());
 
                 // Constant-time compare for consistency with the PasswordText
-                // path (the digest is derived from the shared secret).
-                if !constant_time_eq(password_value.trim().as_bytes(), expected_b64.as_bytes()) {
-                    return Err("WS-Security: PasswordDigest verification failed".to_string());
+                // path (the digest is derived from the shared secret or dummy).
+                let matched =
+                    constant_time_eq(password_value.trim().as_bytes(), expected_b64.as_bytes());
+                if username_known && matched {
+                    Ok(username)
+                } else {
+                    Err(UsernameTokenError::InvalidCredentials)
                 }
             }
         }
-
-        Ok(username)
     }
 
     // ── Nonce replay protection ─────────────────────────────────────────
@@ -1557,11 +1619,28 @@ impl Plugin for SoapWsSecurity {
                         "soap_ws_security: UsernameToken validated"
                     );
                 }
-                Err(e) => {
-                    warn!("soap_ws_security: UsernameToken validation failed: {}", e);
+                Err(UsernameTokenError::InvalidCredentials) => {
+                    // Generic response + stable failure class: do not log the
+                    // candidate username or password/digest verification detail.
+                    warn!(
+                        failure_class = UsernameTokenError::INVALID_CREDENTIALS_CLASS,
+                        "soap_ws_security: UsernameToken authentication failed"
+                    );
                     return PluginResult::Reject {
                         status_code: 401,
-                        body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(&e)),
+                        body: UsernameTokenError::INVALID_CREDENTIALS_BODY.to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+                Err(UsernameTokenError::Structural(detail)) => {
+                    warn!(
+                        failure_class = UsernameTokenError::STRUCTURAL_CLASS,
+                        "soap_ws_security: UsernameToken validation failed: {}",
+                        detail
+                    );
+                    return PluginResult::Reject {
+                        status_code: 401,
+                        body: format!(r#"{{"error":"{}"}}"#, escape_json_chars(&detail)),
                         headers: HashMap::new(),
                     };
                 }
