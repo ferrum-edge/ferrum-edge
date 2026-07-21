@@ -733,12 +733,9 @@ fn test_token_limit_is_required_with_no_default() {
         "missing token_limit must surface in the error: {err}"
     );
 
-    let err = AiRateLimiter::new(
-        &json!({"window_seconds": 60}),
-        PluginHttpClient::default(),
-    )
-    .err()
-    .expect("window_seconds alone must not satisfy construction");
+    let err = AiRateLimiter::new(&json!({"window_seconds": 60}), PluginHttpClient::default())
+        .err()
+        .expect("window_seconds alone must not satisfy construction");
     assert!(
         err.contains("token_limit"),
         "optional fields must not mask missing token_limit: {err}"
