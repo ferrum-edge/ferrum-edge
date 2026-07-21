@@ -1398,7 +1398,7 @@ impl KafkaLogging {
     fn activate(
         &self,
         pending: KafkaPendingActivation,
-    ) -> Result<Arc<KafkaGeneration>, (KafkaPendingActivation, String)> {
+    ) -> Result<Arc<KafkaGeneration>, Box<(KafkaPendingActivation, String)>> {
         // Allocate only when activation is attempted so validation-only
         // construction never consumes live generation IDs.
         let generation_id = NEXT_GENERATION_ID.fetch_add(1, Ordering::Relaxed);
@@ -1417,13 +1417,13 @@ impl KafkaLogging {
                     // boundary. The fixed classification is enough for operators to
                     // distinguish invalid configuration from client construction
                     // failure without echoing secrets or TLS source identities.
-                    return Err((
+                    return Err(Box::new((
                         pending,
                         format!(
                             "kafka_logging: failed to create Kafka producer ({})",
                             safe_kafka_error_kind(&error)
                         ),
-                    ));
+                    )));
                 }
             };
 
@@ -1474,10 +1474,10 @@ impl KafkaLogging {
             // published. Abort the Ferrum worker before returning pending so a
             // retry does not leave an unowned flush loop behind.
             logger.close_and_abort();
-            return Err((
+            return Err(Box::new((
                 pending,
                 "kafka_logging: failed to publish Ferrum admission handle".to_string(),
-            ));
+            )));
         };
         let in_flight = Arc::new(AtomicUsize::new(0));
         let admission = Arc::new(KafkaAdmission {
@@ -1996,7 +1996,8 @@ impl Plugin for KafkaLogging {
         };
         let generation = match self.activate(pending) {
             Ok(generation) => generation,
-            Err((pending, error)) => {
+            Err(error) => {
+                let (pending, error) = *error;
                 if let Ok(mut guard) = self.pending.lock() {
                     *guard = Some(pending);
                 }
