@@ -1466,9 +1466,12 @@ impl KafkaLogging {
                 }
             },
         );
-        let handle = logger
-            .handle()
-            .expect("kafka_logging: BatchingLogger::spawn_with_hooks must expose an admission handle");
+        let Some(handle) = logger.handle() else {
+            return Err((
+                pending,
+                "kafka_logging: failed to publish Ferrum admission handle".to_string(),
+            ));
+        };
         let in_flight = Arc::new(AtomicUsize::new(0));
         let admission = Arc::new(KafkaAdmission {
             handle,
