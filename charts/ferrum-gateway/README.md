@@ -216,7 +216,7 @@ of the Job manifests under [`examples/`](examples/):
 | Apply pending DB migrations | [`migrate-job-up.yaml`](examples/migrate-job-up.yaml) |
 | Migration status (read-only) | [`migrate-job-status.yaml`](examples/migrate-job-status.yaml) |
 | Dry-run pending DB migrations | [`migrate-job-up-dry-run.yaml`](examples/migrate-job-up-dry-run.yaml) |
-| Persist file-config version migration | [`migrate-job-config.yaml`](examples/migrate-job-config.yaml) |
+| Persist file-config version migration on a pre-staged writable PVC | [`migrate-job-config.yaml`](examples/migrate-job-config.yaml) |
 
 Reuse the same image tag, DB Secret, ServiceAccount, and security context as the
 gateway Deployment so the Job cannot drift from the running release. Do not run

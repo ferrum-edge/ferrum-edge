@@ -1,13 +1,16 @@
 # Explicit migrate mode: persist an on-disk config file version migration.
 #
 # For FERRUM_MIGRATE_ACTION=config the Job needs a writable config path. This
-# example copies an input ConfigMap into an emptyDir, migrates that copy, and
-# leaves the result under /work/config.yaml for `kubectl cp` or a follow-up
-# step that publishes a new ConfigMap. The gateway file-mode Deployment keeps
-# using its read-only ConfigMap mount until you roll it to the migrated content.
+# example mounts a pre-staged writable PVC and migrates `/work/config.yaml` in
+# place. The result remains on the PVC after the Job exits; publish it through
+# your platform's normal volume workflow, then roll file-mode gateways to the
+# migrated content. A ConfigMap mount cannot be the output because it is
+# read-only, and an `emptyDir` would discard the only migrated copy with the
+# Pod.
 #
-#   kubectl -n ferrum create configmap ferrum-file-config \
-#     --from-file=config.yaml=./config.yaml
+# Prerequisite: create/populate a ReadWriteOnce PVC named
+# `ferrum-file-config-migration` with `config.yaml` at its root.
+#
 #   kubectl -n ferrum apply -f charts/ferrum-gateway/examples/migrate-job-config.yaml
 #   kubectl -n ferrum logs job/ferrum-migrate-config
 apiVersion: batch/v1
@@ -39,25 +42,6 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
-      initContainers:
-        - name: stage-config
-          image: busybox:1.36
-          command:
-            - /bin/sh
-            - -c
-            - cp /config-in/config.yaml /work/config.yaml
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop:
-                - ALL
-          volumeMounts:
-            - name: config-in
-              mountPath: /config-in
-              readOnly: true
-            - name: work
-              mountPath: /work
       containers:
         - name: ferrum-edge
           image: ferrumedge/ferrum-edge:0.9.0
@@ -91,7 +75,5 @@ spec:
         - name: tmp
           emptyDir: {}
         - name: work
-          emptyDir: {}
-        - name: config-in
-          configMap:
-            name: ferrum-file-config
+          persistentVolumeClaim:
+            claimName: ferrum-file-config-migration

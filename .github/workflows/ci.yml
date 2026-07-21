@@ -2448,6 +2448,15 @@ jobs:
               if "runAsNonRoot: true" not in text or "runAsUser: 65532" not in text:
                   print(f"::error title=Migrate example security drift::{name}")
                   sys.exit(1)
+              if name == "migrate-job-config.yaml":
+                  if "persistentVolumeClaim:" not in text or (
+                      "claimName: ferrum-file-config-migration" not in text
+                  ):
+                      print("::error title=Config migration is ephemeral::config migration must use the documented writable PVC")
+                      sys.exit(1)
+                  if "emptyDir:" in text or "busybox:" in text:
+                      print("::error title=Config migration output is not durable::config migration must not rely on emptyDir or an unpinned copy helper")
+                      sys.exit(1)
           print("migrate job examples ok")
           PY
           # Every binary operating mode is mapped to a chart, external workflow, or

@@ -161,8 +161,8 @@ kubectl -n ferrum logs job/ferrum-migrate-up-dry-run
 kubectl -n ferrum apply -f charts/ferrum-gateway/examples/migrate-job-up.yaml
 kubectl -n ferrum logs job/ferrum-migrate-up
 
-# Persist a file-config version migration (stages ConfigMap → emptyDir)
-kubectl -n ferrum create configmap ferrum-file-config --from-file=config.yaml=./config.yaml
+# Persist a file-config version migration. First populate a ReadWriteOnce PVC
+# named ferrum-file-config-migration with config.yaml at its root.
 kubectl -n ferrum apply -f charts/ferrum-gateway/examples/migrate-job-config.yaml
 kubectl -n ferrum logs job/ferrum-migrate-config
 ```
@@ -170,7 +170,10 @@ kubectl -n ferrum logs job/ferrum-migrate-config
 Do not run overlapping `up` Jobs against the same database. The binary takes a
 cross-process migration lock, but one operator-owned Job at a time is the
 supported concurrency contract. Delete or rename finished Jobs before
-re-applying the same manifest name.
+re-applying the same manifest name. The config-migration example intentionally
+uses a writable PVC rather than a ConfigMap or `emptyDir`: ConfigMaps are
+read-only, while an ephemeral volume would lose the only migrated copy when the
+Pod is removed.
 
 ## Ferrum Mesh Helm Chart Contract
 
