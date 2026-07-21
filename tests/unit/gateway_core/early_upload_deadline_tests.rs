@@ -287,7 +287,10 @@ fn h3_early_phases_gate_fresh_drains_on_missing_prebuffer_and_halt_on_cancel() {
         let phase_idx = source
             .find(phase)
             .unwrap_or_else(|| panic!("missing H3 upload phase {phase}"));
-        let window = &source[phase_idx.saturating_sub(500)..phase_idx];
+        let deadline_branch_idx = source[..phase_idx]
+            .rfind("Err(H3RequestBodyReadError::DeadlineExceeded) => {")
+            .unwrap_or_else(|| panic!("missing deadline branch for H3 upload phase {phase}"));
+        let window = &source[deadline_branch_idx..phase_idx];
         assert!(
             window.contains("halt_cancelled_h3_upload("),
             "phase {phase} must STOP_SENDING before rejection work"
