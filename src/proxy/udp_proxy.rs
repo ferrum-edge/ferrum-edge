@@ -4734,10 +4734,7 @@ backend_tls_verify_server_cert: false
             disconnect_cause: Some(crate::plugins::DisconnectCause::GracefulShutdown),
         });
         assert_eq!(summary.duration_ms, 1_500.0);
-        assert_eq!(
-            summary.timestamp_disconnected,
-            wall_disconnect.to_rfc3339()
-        );
+        assert_eq!(summary.timestamp_disconnected, wall_disconnect.to_rfc3339());
 
         // Idle expiry follows injected mono, independent of wall.
         assert!(

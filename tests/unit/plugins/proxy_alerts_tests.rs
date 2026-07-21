@@ -1559,7 +1559,10 @@ fn stream_duration_percentile_observes_monotonic_producer_duration() {
     let observation = parsed.rules[0]
         .observe(SampleInput::Stream(&summary), &store, 1_000)
         .expect("stream sample should apply");
-    assert!(observation.breach, "1500ms mono duration must breach 1000ms");
+    assert!(
+        observation.breach,
+        "1500ms mono duration must breach 1000ms"
+    );
     assert_eq!(observation.sample_count, 1);
 
     // TCP-parity WebSocket sample with the same mono duration / wall skew.
