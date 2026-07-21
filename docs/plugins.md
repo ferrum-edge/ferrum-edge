@@ -1914,6 +1914,8 @@ The plugin buffers request bodies with SOAP content types (`text/xml`, `applicat
 
 At least one security feature must be enabled (`timestamp.require`, `username_token`, `x509_signature`, or `saml`).
 
+UsernameToken credential failures (unknown username, wrong PasswordText, or wrong PasswordDigest) return the same HTTP `401` status, headers, and generic body (`{"error":"WS-Security: invalid credentials"}`). Client responses and warning logs do not include the supplied username or password/digest verification detail; operational telemetry uses the stable failure class `username_token_invalid_credentials`. Lookup misses still execute PasswordText or PasswordDigest verification against process-local dummy material so work is equalized with known principals. Structural token or policy failures (missing elements, password-type mismatch, nonce replay) remain distinct. Apply an authentication rate-limit policy as defense in depth against online guessing.
+
 #### UsernameToken — PasswordDigest
 
 The PasswordDigest mode computes `Base64(SHA-1(nonce + created + password))` per the WS-Security UsernameToken Profile 1.0 specification. The SOAP request must include `wsse:Nonce` and `wsu:Created` elements alongside the password. Each nonce is tracked for replay protection.
@@ -3018,7 +3020,7 @@ config:
 
 ### `compression`
 
-On-the-fly response compression and request decompression. Negotiates the best algorithm via the client's `Accept-Encoding` header (RFC 9110 §12.5.3). Supports gzip and brotli.
+On-the-fly response compression and request decompression. Negotiates the best algorithm via the client's `Accept-Encoding` header (RFC 9110 §12.5.3), including the `identity` (uncoded) representation. Supports gzip and brotli.
 
 **Priority:** 4050
 
@@ -3047,13 +3049,15 @@ On-the-fly response compression and request decompression. Negotiates the best a
 **Response compression skip conditions** (checked in order):
 1. Response status is 204 or 304
 2. Request has `Cache-Control: no-transform` (skips gateway response compression only)
-3. Response is a range response (`206`, `Content-Range`, or an internal range marker)
+3. Response is a range response (`206`, `Content-Range`, or an internal range marker) — compression is skipped; identity acceptability still applies (406 when identity is unacceptable)
 4. Response has `Cache-Control: no-transform`
 5. Response already has `Content-Encoding` (no double-compression)
 6. Response has a strong `ETag` validator. Weak validators (`W/"..."`) remain eligible for compression
 7. Response `Content-Type` is not in the whitelist
 8. Response `Content-Length` is below `min_content_length`
-9. Client did not send `Accept-Encoding` with a supported algorithm
+9. Client did not send `Accept-Encoding` with a supported algorithm, or the `identity` (uncoded) representation is the most preferred acceptable one
+
+**Content negotiation (RFC 9110 §12.5.3):** The gateway compares every representation it can produce — each configured algorithm and the uncoded (`identity`) representation — and serves the most preferred acceptable one. Identity is acceptable by default (q=1) unless the client refuses it with `identity;q=0` or with `*;q=0` without a more-specific `identity` entry; a nonzero wildcard (`*;q=0.3`) does **not** lower that default identity quality — the wildcard assigns quality only to unlisted configured algorithms. Explicit algorithm and `identity` entries take precedence over the wildcard, and the `algorithms` server preference order breaks ties (so an algorithm tied with identity still compresses). Only a well-formed `q=0` weight can forbid identity: a malformed qvalue on an `identity` or `*` entry is ignored rather than read as a refusal. When the client refuses identity and no acceptable coded representation is available — including when a configured algorithm would otherwise win but the response cannot be encoded because of content-type / `min_content_length` eligibility, `no-transform`, a strong `ETag`, or because the response is an identity range/delta (`206`/`226`, `Content-Range`, or the internal range marker) — the plugin rejects with `406 Not Acceptable` (`Vary: Accept-Encoding`) and does not commit compression headers or body transforms. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable) rather than protocol hard skips. No-body statuses (`204`/`205`/`304`) and responses that already carry `Content-Encoding` remain protocol hard skips and are left unchanged. On the synthetic reject path, fail-closed 406 replacement is scoped to `response_caching` HITs of identity variants (including when identity responses omit `Vary: Accept-Encoding` per #2355) so a cache hit cannot bypass negotiation; unrelated auth/policy rejection statuses are not replaced.
 
 **Behavior:**
 - Strips `Accept-Encoding` from backend requests (configurable) so the backend sends uncompressed responses for the gateway to compress
@@ -4581,7 +4585,7 @@ config:
 
 Scans AI/LLM request bodies for PII and either rejects, redacts, or warns.
 
-Request buffering is only enabled for matching bare-JSON `POST` requests when the plugin has at least one valid pattern to scan. Native gRPC and gRPC-Web bodies are framed wire formats even when their media type ends in `+json`; they are explicitly outside this JSON policy's inspection scope and are not buffered.
+This plugin is HTTP-only. Native gRPC has no supported prompt-schema or frame-decoding contract, so the plugin is not registered for the gRPC protocol view and must not be treated as a fail-closed PII control for unary or streaming native gRPC traffic. Request buffering is only enabled for matching bare-JSON `POST` requests when the plugin has at least one valid pattern to scan. gRPC-Web framed bodies (including `application/grpc-web*+json`) remain outside this JSON policy: they are not buffered, decoded, or rewritten, so message framing is never corrupted.
 
 **Priority:** 2925
 

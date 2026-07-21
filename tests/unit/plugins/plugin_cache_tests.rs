@@ -4697,6 +4697,62 @@ fn test_get_plugins_for_protocol_grpc_excludes_http_only() {
     assert_eq!(names.len(), 1);
 }
 
+#[test]
+fn ai_prompt_shield_excluded_from_native_grpc_but_retained_on_grpc_web_view() {
+    // GHSA-j7hv-p57w-p3vr / #2668: H2 and H3 native gRPC both use
+    // ProxyProtocol::Grpc, so excluding the shield from that view covers both
+    // transports. The composed gRPC-Web view keeps HTTP guardrails, which then
+    // skip framed bodies without decoding.
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/ai",
+            vec!["shield", "grpc-web", "limiter"],
+        )],
+        vec![
+            make_plugin_config(
+                "shield",
+                "ai_prompt_shield",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config("grpc-web", "grpc_web", PluginScope::Proxy, Some("p1"), true),
+            make_plugin_config(
+                "limiter",
+                "rate_limiting",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let cache = PluginCache::new(&config).expect("plugin cache");
+
+    let http_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let http_names: Vec<&str> = http_plugins.iter().map(|p| p.name()).collect();
+    assert!(http_names.contains(&"ai_prompt_shield"));
+    assert!(http_names.contains(&"rate_limiting"));
+
+    let grpc_plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Grpc);
+    let grpc_names: Vec<&str> = grpc_plugins.iter().map(|p| p.name()).collect();
+    assert!(
+        !grpc_names.contains(&"ai_prompt_shield"),
+        "native gRPC protocol view must exclude HTTP-only ai_prompt_shield"
+    );
+    assert!(grpc_names.contains(&"rate_limiting"));
+
+    let grpc_web_view = ferrum_edge::_test_support::grpc_web_request_view_for_test(&cache, "p1");
+    assert!(
+        grpc_web_view
+            .plugins
+            .iter()
+            .any(|name| name == "ai_prompt_shield"),
+        "gRPC-Web composed view must retain the HTTP shield for explicit framed-body skip"
+    );
+    assert!(grpc_web_view.plugins.iter().any(|name| name == "grpc_web"));
+}
+
 // ---- WebSocket per-frame plugin hook infrastructure ----
 
 #[tokio::test]

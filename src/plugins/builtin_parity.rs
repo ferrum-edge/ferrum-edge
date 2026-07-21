@@ -8,8 +8,7 @@
 
 use super::{
     ALL_PROTOCOLS, GRPC_ONLY_PROTOCOLS, HTTP_FAMILY_PROTOCOLS, HTTP_GRPC_PROTOCOLS,
-    HTTP_ONLY_PROTOCOLS, ProxyProtocol, TCP_ONLY_PROTOCOLS, UDP_ONLY_PROTOCOLS,
-    WS_ONLY_PROTOCOLS,
+    HTTP_ONLY_PROTOCOLS, ProxyProtocol, TCP_ONLY_PROTOCOLS, UDP_ONLY_PROTOCOLS, WS_ONLY_PROTOCOLS,
 };
 
 /// How a built-in plugin appears in public inventories.
@@ -355,7 +354,12 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
         classification: BuiltinPluginClassification::Public,
         priority: 2940,
         active_phases: "before_proxy, on_stream_connect",
-        matrix_protocols: &[ProxyProtocol::Http, ProxyProtocol::Grpc, ProxyProtocol::WebSocket, ProxyProtocol::Tcp],
+        matrix_protocols: &[
+            ProxyProtocol::Http,
+            ProxyProtocol::Grpc,
+            ProxyProtocol::WebSocket,
+            ProxyProtocol::Tcp,
+        ],
         protocol_rationale: "Probabilistic aborts and delays; raw TCP only for stream hooks (no UDP/DTLS)",
     },
     BuiltinPluginParityMeta {

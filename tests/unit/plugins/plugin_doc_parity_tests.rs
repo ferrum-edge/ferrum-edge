@@ -179,15 +179,15 @@ fn builtin_parity_meta_matches_registry_set() {
     );
     assert_unique_names(
         "BUILTIN_PLUGIN_PARITY_META",
-        BUILTIN_PLUGIN_PARITY_META.iter().map(|m| m.name.to_string()),
+        BUILTIN_PLUGIN_PARITY_META
+            .iter()
+            .map(|m| m.name.to_string()),
     );
     assert_eq!(
-        registry, meta,
+        registry,
+        meta,
         "parity meta must be set-equal with BUILTIN_PLUGIN_REGISTRATIONS; missing={:?} extra={:?}",
-        registry
-            .difference(&meta)
-            .copied()
-            .collect::<Vec<_>>(),
+        registry.difference(&meta).copied().collect::<Vec<_>>(),
         meta.difference(&registry).copied().collect::<Vec<_>>()
     );
 
@@ -205,10 +205,7 @@ fn builtin_parity_meta_matches_registry_set() {
 #[tokio::test]
 async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
     let rows = parse_complete_order_table(EXECUTION_ORDER_DOC);
-    assert_unique_names(
-        "complete-order table",
-        rows.iter().map(|r| r.name.clone()),
-    );
+    assert_unique_names("complete-order table", rows.iter().map(|r| r.name.clone()));
 
     let meta_by_name: BTreeMap<_, _> = BUILTIN_PLUGIN_PARITY_META
         .iter()
@@ -217,17 +214,25 @@ async fn complete_order_table_matches_parity_meta_and_runtime_priority() {
     let doc_names: BTreeSet<_> = rows.iter().map(|r| r.name.as_str()).collect();
     let meta_names: BTreeSet<_> = meta_by_name.keys().copied().collect();
     assert_eq!(
-        doc_names, meta_names,
+        doc_names,
+        meta_names,
         "complete-order names drifted; missing={:?} extra={:?}",
         meta_names
             .difference(&doc_names)
             .copied()
             .collect::<Vec<_>>(),
-        doc_names.difference(&meta_names).copied().collect::<Vec<_>>()
+        doc_names
+            .difference(&meta_names)
+            .copied()
+            .collect::<Vec<_>>()
     );
 
     for (idx, row) in rows.iter().enumerate() {
-        assert_eq!(row.index, idx + 1, "complete-order row numbers must be dense");
+        assert_eq!(
+            row.index,
+            idx + 1,
+            "complete-order row numbers must be dense"
+        );
         let meta = meta_by_name[row.name.as_str()];
         assert_eq!(
             row.priority, meta.priority,
@@ -273,13 +278,17 @@ async fn protocol_matrix_matches_parity_meta_and_runtime_protocols() {
     let doc_names: BTreeSet<_> = rows.iter().map(|r| r.name.as_str()).collect();
     let meta_names: BTreeSet<_> = meta_by_name.keys().copied().collect();
     assert_eq!(
-        doc_names, meta_names,
+        doc_names,
+        meta_names,
         "protocol-matrix names drifted; missing={:?} extra={:?}",
         meta_names
             .difference(&doc_names)
             .copied()
             .collect::<Vec<_>>(),
-        doc_names.difference(&meta_names).copied().collect::<Vec<_>>()
+        doc_names
+            .difference(&meta_names)
+            .copied()
+            .collect::<Vec<_>>()
     );
 
     for row in &rows {
@@ -384,7 +393,10 @@ fn special_inventory_classifications_are_documented() {
         .iter()
         .find(|m| m.name == "transaction_log_schema")
         .expect("transaction_log_schema meta");
-    assert_eq!(schema.classification, BuiltinPluginClassification::ConfigOnly);
+    assert_eq!(
+        schema.classification,
+        BuiltinPluginClassification::ConfigOnly
+    );
     assert_eq!(schema.priority, 9999);
 
     let bpf = BUILTIN_PLUGIN_PARITY_META
@@ -395,8 +407,7 @@ fn special_inventory_classifications_are_documented() {
     assert_eq!(bpf.priority, 9365);
 
     assert!(
-        EXECUTION_ORDER_DOC
-            .contains("schema registration has explicit ordering\nsemantics")
+        EXECUTION_ORDER_DOC.contains("schema registration has explicit ordering\nsemantics")
             || EXECUTION_ORDER_DOC.contains("schema registration has explicit ordering semantics"),
         "docs must explain why transaction_log_schema retains ordering semantics"
     );

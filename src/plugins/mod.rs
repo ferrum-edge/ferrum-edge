@@ -27,7 +27,6 @@
 
 pub mod a2a_gateway;
 pub mod access_control;
-pub mod builtin_parity;
 pub mod adaptive_concurrency;
 pub mod ai_federation;
 pub mod ai_prompt_compressor;
@@ -46,6 +45,7 @@ pub mod api_chargeback_sink;
 pub mod basic_auth;
 pub mod body_validator;
 pub mod bot_detection;
+pub mod builtin_parity;
 pub mod chargeback;
 pub mod compression;
 pub mod correlation_id;
