@@ -1314,6 +1314,178 @@ fn test_build_trailer_frame() {
 }
 
 #[test]
+fn test_build_trailer_frame_preserves_ascii_custom_and_bin_metadata() {
+    use ferrum_edge::_test_support::build_trailer_frame;
+    let mut headers = HashMap::new();
+    headers.insert("grpc-status".to_string(), "0".to_string());
+    headers.insert("request-id".to_string(), "abc-123".to_string());
+    headers.insert("quota-remaining".to_string(), "7".to_string());
+    headers.insert("trace-proto-bin".to_string(), "AQID".to_string());
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert("x-grpc-web".to_string(), "1".to_string());
+    headers.insert("proxy-authenticate".to_string(), "Basic realm=x".to_string());
+    headers.insert("connection".to_string(), "close".to_string());
+    headers.insert("keep-alive".to_string(), "timeout=5".to_string());
+    // Connection-listed smuggling attempt: nominate a custom name via Connection.
+    headers.insert(
+        "Connection".to_string(),
+        "x-connection-listed".to_string(),
+    );
+    headers.insert("x-connection-listed".to_string(), "leak".to_string());
+    headers.insert(":status".to_string(), "200".to_string());
+    headers.insert("bad header".to_string(), "nope".to_string());
+    headers.insert("x-bad".to_string(), "line\r\ninject".to_string());
+
+    let frame = build_trailer_frame(&headers);
+    let trailer_str = String::from_utf8_lossy(&frame[5..]);
+    assert!(trailer_str.contains("grpc-status: 0"));
+    assert!(trailer_str.contains("request-id: abc-123"));
+    assert!(trailer_str.contains("quota-remaining: 7"));
+    assert!(trailer_str.contains("trace-proto-bin: AQID"));
+    assert!(!trailer_str.contains("content-type"));
+    assert!(!trailer_str.contains("x-grpc-web"));
+    assert!(!trailer_str.contains("proxy-authenticate"));
+    assert!(!trailer_str.contains("keep-alive"));
+    assert!(!trailer_str.contains("x-connection-listed"));
+    assert!(!trailer_str.contains(":status"));
+    assert!(!trailer_str.contains("bad header"));
+    assert!(!trailer_str.contains("inject"));
+}
+
+#[test]
+fn test_build_trailer_frame_preserves_duplicate_metadata_and_deterministic_order() {
+    use ferrum_edge::_test_support::build_trailer_frame;
+    let mut headers = HashMap::new();
+    // Newline-joined duplicates mirror collect_buffered_grpc_trailers.
+    headers.insert(
+        "request-id".to_string(),
+        "first\nsecond".to_string(),
+    );
+    headers.insert("grpc-status".to_string(), "0".to_string());
+    headers.insert("zebra-meta".to_string(), "z".to_string());
+    headers.insert("alpha-meta".to_string(), "a".to_string());
+
+    let frame = build_trailer_frame(&headers);
+    let trailer_str = String::from_utf8(frame[5..].to_vec()).unwrap();
+    assert!(trailer_str.contains("request-id: first\r\n"));
+    assert!(trailer_str.contains("request-id: second\r\n"));
+    assert_eq!(trailer_str.matches("request-id:").count(), 2);
+
+    // Sorted by lowercase name: alpha-meta, grpc-status, request-id..., zebra-meta
+    let alpha = trailer_str.find("alpha-meta:").expect("alpha-meta");
+    let grpc_status = trailer_str.find("grpc-status:").expect("grpc-status");
+    let request_id = trailer_str.find("request-id:").expect("request-id");
+    let zebra = trailer_str.find("zebra-meta:").expect("zebra-meta");
+    assert!(alpha < grpc_status && grpc_status < request_id && request_id < zebra);
+}
+
+#[tokio::test]
+async fn test_transform_response_body_binary_and_text_embed_custom_trailers() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let plugin = create_plugin_default();
+    let mut body = vec![0x00u8];
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+    response_headers.insert("request-id".to_string(), "abc-123".to_string());
+    response_headers.insert("trace-proto-bin".to_string(), "AQID".to_string());
+    response_headers.insert(
+        "request-id-dup".to_string(),
+        "one\ntwo".to_string(),
+    );
+    response_headers.insert("proxy-authenticate".to_string(), "Basic x".to_string());
+
+    let binary = plugin
+        .transform_response_body(&body, Some("application/grpc-web"), &response_headers)
+        .await
+        .expect("binary transform");
+    let binary_payload = grpc_web_trailer_payload(&binary[body.len()..]);
+    assert!(binary_payload.contains("grpc-status: 0"));
+    assert!(binary_payload.contains("request-id: abc-123"));
+    assert!(binary_payload.contains("trace-proto-bin: AQID"));
+    assert!(binary_payload.contains("request-id-dup: one\r\n"));
+    assert!(binary_payload.contains("request-id-dup: two\r\n"));
+    assert!(!binary_payload.contains("proxy-authenticate"));
+
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web-text".to_string(),
+    );
+    let text = plugin
+        .transform_response_body(
+            &body,
+            Some("application/grpc-web-text"),
+            &response_headers,
+        )
+        .await
+        .expect("text transform");
+    let decoded = BASE64.decode(&text).expect("text body is base64");
+    assert_eq!(&decoded[..body.len()], &body[..]);
+    let text_payload = grpc_web_trailer_payload(&decoded[body.len()..]);
+    assert!(text_payload.contains("request-id: abc-123"));
+    assert!(text_payload.contains("trace-proto-bin: AQID"));
+    assert!(!text_payload.contains("proxy-authenticate"));
+}
+
+#[tokio::test]
+async fn test_transform_with_provenance_excludes_initial_header_only_fields() {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+
+    // Only backend trailers are allowlisted; header-only fields must not leak.
+    let mut trailers = HashMap::new();
+    trailers.insert("grpc-status".to_string(), "0".to_string());
+    trailers.insert("request-id".to_string(), "abc-123".to_string());
+    trailers.insert("trace-proto-bin".to_string(), "AQID".to_string());
+    ferrum_edge::plugins::grpc_web::record_backend_trailer_names_for_frame(
+        &mut ctx.metadata,
+        &trailers,
+    );
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+    response_headers.insert("request-id".to_string(), "abc-123".to_string());
+    response_headers.insert("trace-proto-bin".to_string(), "AQID".to_string());
+    response_headers.insert("x-powered-by".to_string(), "backend-header".to_string());
+    response_headers.insert("quota-remaining".to_string(), "7".to_string());
+
+    let output = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"",
+            Some("application/grpc-web"),
+            &response_headers,
+        )
+        .await
+        .expect("transform");
+    let payload = grpc_web_trailer_payload(&output);
+    assert!(payload.contains("grpc-status: 0"));
+    assert!(payload.contains("request-id: abc-123"));
+    assert!(payload.contains("trace-proto-bin: AQID"));
+    assert!(
+        !payload.contains("x-powered-by"),
+        "initial-header-only field must not enter the trailer frame: {payload}"
+    );
+    assert!(
+        !payload.contains("quota-remaining"),
+        "non-trailer merged field must not enter the trailer frame: {payload}"
+    );
+}
+
+#[test]
 fn test_build_trailer_frame_missing_status_defaults_to_unknown() {
     use ferrum_edge::_test_support::{GRPC_FRAME_TRAILER, build_trailer_frame};
     let headers = HashMap::new();

@@ -971,3 +971,131 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
     assert_eq!(requests[0].body, grpc_frame(b"ping"));
     assert_eq!(requests[1].body, grpc_frame(b"ping"));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_grpc_web_preserves_ascii_custom_trailers_binary_and_text() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gRPC backend");
+    let backend_port = backend_listener.local_addr().expect("backend addr").port();
+    let backend_ca = TestCa::new("h3-grpc-web-custom-trailers").expect("backend CA");
+    let (backend_cert, backend_key) = backend_ca.valid().expect("backend leaf");
+    let custom_trailers = vec![
+        ("request-id", "abc-123".into()),
+        ("request-id", "abc-456".into()),
+        ("trace-proto-bin", "AQID".into()),
+        ("proxy-authenticate", "Basic realm=backend".into()),
+    ];
+    let backend = ScriptedGrpcBackend::builder_tls(backend_listener, &backend_cert, &backend_key)
+        .expect("backend TLS")
+        .step(GrpcStep::AcceptRpc(MatchRpc::custom(|request| {
+            request.method == "POST"
+                && request.path == "/echo.Echo/Unary"
+                && request.header("content-type") == Some("application/grpc")
+        })))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"pong")))
+        .step(GrpcStep::RespondStatusWithTrailers {
+            code: 0,
+            message: "",
+            trailers: custom_trailers.clone(),
+        })
+        .step(GrpcStep::AcceptRpc(MatchRpc::custom(|request| {
+            request.method == "POST"
+                && request.path == "/echo.Echo/Unary"
+                && request.header("content-type") == Some("application/grpc")
+        })))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"pong")))
+        .step(GrpcStep::RespondStatusWithTrailers {
+            code: 0,
+            message: "",
+            trailers: custom_trailers,
+        })
+        .spawn()
+        .expect("spawn gRPC backend");
+
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "h3-grpc-web-custom-trailers",
+            "listen_path": "/custom",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "auth_mode": "single",
+            "plugins": [{"plugin_config_id": "grpc-web-custom-trailers"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "grpc-web-custom-trailers",
+            "plugin_name": "grpc_web",
+            "scope": "proxy",
+            "proxy_id": "h3-grpc-web-custom-trailers",
+            "enabled": true,
+            "config": {},
+        }],
+    });
+    let (_gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
+    let client = Http3Client::insecure().expect("H3 client");
+
+    let assert_payload = |payload: &str| {
+        assert!(payload.contains("grpc-status: 0\r\n"), "{payload}");
+        assert!(payload.contains("request-id: abc-123\r\n"), "{payload}");
+        assert!(payload.contains("request-id: abc-456\r\n"), "{payload}");
+        assert!(payload.contains("trace-proto-bin: AQID\r\n"), "{payload}");
+        assert!(
+            !payload.contains("proxy-authenticate"),
+            "hop-by-hop trailer leaked: {payload}"
+        );
+    };
+
+    let binary = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/custom/echo.Echo/Unary"),
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "application/grpc-web+proto")
+            .body(Bytes::from(grpc_frame(b"ping"))),
+    )
+    .await;
+    assert_eq!(binary.status, StatusCode::OK);
+    assert!(binary.trailers.is_none(), "must not emit native H3 trailers");
+    let binary_frames = grpc_web_frames(&binary.body_bytes);
+    let binary_trailer = binary_frames
+        .iter()
+        .find_map(|(flag, payload)| (*flag == 0x80).then_some(*payload))
+        .expect("binary gRPC-Web trailer frame");
+    assert_payload(&String::from_utf8_lossy(binary_trailer));
+
+    let text = request_with_retry(
+        &client,
+        &format!("https://127.0.0.1:{https_port}/custom/echo.Echo/Unary"),
+        GetOptions::default()
+            .method(Method::POST)
+            .header("content-type", "application/grpc-web-text+proto")
+            .body(Bytes::from(BASE64.encode(grpc_frame(b"ping")))),
+    )
+    .await;
+    assert_eq!(text.status, StatusCode::OK);
+    assert!(text.trailers.is_none(), "must not emit native H3 trailers");
+    let decoded = BASE64
+        .decode(&text.body_bytes)
+        .expect("text mode body is base64");
+    let text_frames = grpc_web_frames(&decoded);
+    let text_trailer = text_frames
+        .iter()
+        .find_map(|(flag, payload)| (*flag == 0x80).then_some(*payload))
+        .expect("text gRPC-Web trailer frame");
+    assert_payload(&String::from_utf8_lossy(text_trailer));
+
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
+}

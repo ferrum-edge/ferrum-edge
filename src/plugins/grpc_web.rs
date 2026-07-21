@@ -20,8 +20,11 @@
 //! ## Response path (native gRPC → gRPC-Web)
 //!
 //! 1. Collect response data frames from the backend
-//! 2. Embed gRPC trailers (grpc-status, grpc-message, plus any custom metadata)
-//!    as a length-prefixed trailer frame (flag byte 0x80) appended to the body
+//! 2. Embed gRPC trailers (`grpc-status`, `grpc-message`, binary `*-bin`
+//!    metadata, and valid ASCII custom trailing metadata) as a length-prefixed
+//!    trailer frame (flag byte 0x80) appended to the body. Hop-by-hop,
+//!    forbidden, pseudo, connection-listed, and invalid names/values are
+//!    excluded; only backend-trailer provenance (when recorded) is embedded
 //! 3. Text mode: base64-encode the entire response body
 //! 4. Rewrite response content-type to the original gRPC-Web variant
 //!
@@ -62,6 +65,9 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use tracing::debug;
 
+use crate::proxy::headers::{
+    is_backend_response_strip_header, parse_connection_listed_from_str_map,
+};
 use crate::util::unknown_keys::reject_unknown_keys;
 
 use super::{HTTP_GRPC_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext};
@@ -79,6 +85,21 @@ const META_GRPC_WEB_ORIGINAL_CT: &str = "grpc_web_original_ct";
 /// status is stashed here for HTTP→gRPC trailer synthesis when `grpc-status`
 /// is absent.
 const META_GRPC_WEB_HTTP_STATUS: &str = "grpc_web_http_status";
+/// Metadata key listing backend trailer names (newline-separated, sorted) that
+/// may be embedded in the gRPC-Web body trailer frame.
+///
+/// Present (including empty) only when proxy core recorded trailer provenance
+/// for a translated request. Absent in unit-level helpers and gateway-authored
+/// error builders that construct the trailer map explicitly. When present, the
+/// frame encoder embeds only those names plus reserved gRPC terminal metadata
+/// — never indiscriminately copying initial response headers from the merged
+/// plugin view.
+const META_GRPC_WEB_TRAILER_NAMES: &str = "grpc_web_trailer_names";
+/// Internal response-header bridge for trailer-name provenance on dispatch
+/// paths that only hold `&RequestContext` (sidecar mesh-mTLS). `after_proxy`
+/// promotes this into [`META_GRPC_WEB_TRAILER_NAMES`] and strips it before the
+/// client-visible header map is finalized.
+const HEADER_GRPC_WEB_TRAILER_NAMES: &str = "x-ferrum-grpc-web-trailer-names";
 
 /// Internal proxy header injected by `before_proxy` so that `transform_request_body`
 /// (which lacks access to `ctx.metadata`) can deterministically identify the
@@ -347,6 +368,7 @@ impl GrpcWebPlugin {
         _content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
         http_status: Option<u16>,
+        trailer_name_allowlist: Option<&HashSet<String>>,
     ) -> Option<Vec<u8>> {
         // Only transform if response content-type is gRPC-Web (set by after_proxy)
         let ct = response_headers.get("content-type")?;
@@ -366,8 +388,10 @@ impl GrpcWebPlugin {
 
         // Build and append trailer frame from response headers. When the
         // backend omitted a valid grpc-status, synthesize from the stashed
-        // HTTP status (official client mapping).
-        let trailer_frame = build_trailer_frame(response_headers, http_status);
+        // HTTP status (official client mapping). Provenance (when recorded)
+        // keeps initial-header-only fields out of the body trailer block.
+        let trailer_frame =
+            build_trailer_frame_with_provenance(response_headers, http_status, trailer_name_allowlist);
         output.extend(trailer_frame);
 
         // For text mode, base64-encode the entire output
@@ -783,18 +807,128 @@ pub fn translated_error_response(
     ))
 }
 
+/// Whether `name` is a reserved gRPC terminal-status metadata key.
+#[inline]
+fn is_reserved_grpc_web_terminal_metadata(name: &str) -> bool {
+    matches!(
+        name,
+        "grpc-status" | "grpc-message" | "grpc-status-details-bin"
+    )
+}
+
+/// HTTP / gateway fields that may appear in the merged response-header view
+/// but must never be copied into the gRPC-Web body trailer frame.
+#[inline]
+fn is_forbidden_grpc_web_trailer_name(name: &str) -> bool {
+    // Pseudo-headers are rejected by `HeaderName::from_bytes` already; keep an
+    // explicit `:` guard for defense in depth if a non-normalized key arrives.
+    name.starts_with(':')
+        || is_backend_response_strip_header(name)
+        || matches!(
+            name,
+            "content-type"
+                | "content-length"
+                | "content-encoding"
+                | "content-disposition"
+                | "content-range"
+                | "host"
+                | "accept"
+                | "accept-encoding"
+                | "user-agent"
+                | "date"
+                | "server"
+                | "vary"
+                | "via"
+                | "location"
+                | "x-grpc-web"
+                | "access-control-allow-origin"
+                | "access-control-allow-credentials"
+                | "access-control-allow-headers"
+                | "access-control-allow-methods"
+                | "access-control-expose-headers"
+                | "access-control-max-age"
+                | "access-control-request-headers"
+                | "access-control-request-method"
+                | "x-ferrum-grpc-web-trailer-names"
+        )
+}
+
+/// gRPC Custom-Metadata header-name charset (PROTOCOL-HTTP2): `0-9` / `a-z` /
+/// `_` / `-` / `.`. Stricter than the HTTP token set so hostile names that
+/// survive `HeaderName` parsing still cannot enter the trailer frame.
+#[inline]
+fn is_grpc_metadata_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'z' | b'_' | b'-' | b'.'))
+}
+
 fn is_valid_trailer_header(key: &str) -> Option<HeaderName> {
     let header = HeaderName::from_bytes(key.trim().as_bytes()).ok()?;
     let normalized = header.as_str();
-    if normalized.starts_with("grpc-") || normalized.ends_with("-bin") {
-        Some(header)
-    } else {
+    if is_forbidden_grpc_web_trailer_name(normalized) || !is_grpc_metadata_name(normalized) {
         None
+    } else {
+        Some(header)
     }
 }
 
+/// gRPC ASCII-Value (PROTOCOL-HTTP2): space and printable ASCII only. Also
+/// rejects embedded CR/LF so a hostile trailer cannot smuggle header lines
+/// into the gRPC-Web trailer block.
 fn is_valid_trailer_value(value: &str) -> bool {
-    !value.bytes().any(|b| b == b'\r' || b == b'\n')
+    value.bytes().all(|b| (0x20..=0x7E).contains(&b))
+}
+
+/// Encode backend trailer names for gRPC-Web body-frame provenance.
+fn encode_trailer_names_for_frame(trailers: &HashMap<String, String>) -> String {
+    let mut names: Vec<&str> = trailers.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    names.join("\n")
+}
+
+/// Record the backend trailer names that may be embedded in the gRPC-Web body
+/// trailer frame for a translated request.
+///
+/// Callers pass the backend trailer map *after* hop-by-hop collection. An empty
+/// map still records provenance (empty allowlist) so initial-header-only fields
+/// in the merged plugin view cannot leak into the frame. Unit helpers that never
+/// call this keep the metadata key absent and therefore unrestricted beyond the
+/// ordinary name/value safety filters.
+pub fn record_backend_trailer_names_for_frame(
+    metadata: &mut HashMap<String, String>,
+    trailers: &HashMap<String, String>,
+) {
+    metadata.insert(
+        META_GRPC_WEB_TRAILER_NAMES.to_string(),
+        encode_trailer_names_for_frame(trailers),
+    );
+}
+
+/// Embed trailer-name provenance in a response-header bridge for dispatch paths
+/// that cannot mutate `RequestContext` (sidecar mesh-mTLS). [`GrpcWebPlugin::after_proxy`]
+/// promotes the value into metadata and strips the bridge header.
+pub fn bridge_backend_trailer_names_for_frame(
+    response_headers: &mut HashMap<String, String>,
+    trailers: &HashMap<String, String>,
+) {
+    response_headers.insert(
+        HEADER_GRPC_WEB_TRAILER_NAMES.to_string(),
+        encode_trailer_names_for_frame(trailers),
+    );
+}
+
+fn trailer_name_allowlist_from_metadata(
+    metadata: &HashMap<String, String>,
+) -> Option<HashSet<String>> {
+    metadata.get(META_GRPC_WEB_TRAILER_NAMES).map(|encoded| {
+        encoded
+            .split('\n')
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
 }
 
 /// Official HTTP→gRPC client mapping for responses that omit `grpc-status`.
@@ -826,40 +960,89 @@ pub(crate) fn http_response_status_to_grpc_status(http_status: u16) -> u32 {
 /// `http_status` via [`http_response_status_to_grpc_status`]. Passing `None`
 /// is equivalent to HTTP 200 (UNKNOWN), matching the mapping doc's default
 /// for a completed response that still lacks status.
+///
+/// Valid ASCII custom trailing metadata is preserved alongside `grpc-*` and
+/// `*-bin` fields, subject to hop-by-hop / forbidden / pseudo / connection-
+/// listed exclusions and printable-ASCII value checks. Duplicate values stored
+/// as newline-separated entries (gRPC multi-value metadata) emit as separate
+/// `key: value\r\n` lines. Encoding order is sorted by lowercase header name
+/// for deterministic frames.
 pub(crate) fn build_trailer_frame(
     response_headers: &HashMap<String, String>,
     http_status: Option<u16>,
 ) -> Vec<u8> {
+    build_trailer_frame_with_provenance(response_headers, http_status, None)
+}
+
+/// Like [`build_trailer_frame`], optionally restricting embedded names to a
+/// backend-trailer provenance allowlist (plus reserved gRPC terminal keys).
+pub(crate) fn build_trailer_frame_with_provenance(
+    response_headers: &HashMap<String, String>,
+    http_status: Option<u16>,
+    trailer_name_allowlist: Option<&HashSet<String>>,
+) -> Vec<u8> {
+    let connection_listed = parse_connection_listed_from_str_map(response_headers);
+    let mut eligible: Vec<(String, String)> = Vec::new();
+    for (key, value) in response_headers {
+        let Some(header_name) = is_valid_trailer_header(key) else {
+            continue;
+        };
+        let name = header_name.as_str();
+        if connection_listed
+            .iter()
+            .any(|listed| listed.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        if let Some(allowlist) = trailer_name_allowlist
+            && !allowlist.contains(name)
+            && !is_reserved_grpc_web_terminal_metadata(name)
+        {
+            continue;
+        }
+        // Multi-value gRPC metadata is stored newline-joined in the string map
+        // (see `collect_buffered_grpc_trailers`). Emit each occurrence as its
+        // own trailer line; reject any occurrence that fails value safety so a
+        // single hostile duplicate cannot smuggle CR/LF past the filter.
+        for occurrence in value.split('\n') {
+            if is_valid_trailer_value(occurrence) {
+                eligible.push((name.to_string(), occurrence.to_string()));
+            }
+        }
+    }
+    // Deterministic ordering: sort by name, then keep relative occurrence
+    // order for duplicates of the same name (stable sort).
+    eligible.sort_by(|a, b| a.0.cmp(b.0));
+
     let mut trailer_payload = Vec::new();
     let mut has_grpc_status = false;
-    for (key, value) in response_headers {
-        // Include grpc-* trailers and any custom trailing metadata
-        if let Some(header_name) = is_valid_trailer_header(key)
-            && is_valid_trailer_value(value)
-        {
-            if header_name.as_str() == "grpc-status" {
-                // Only a present, numeric grpc-status is a valid terminal
-                // status. An empty (`grpc-status:`) or non-numeric
-                // (`grpc-status: abc`) value is malformed — skip forwarding it
-                // so the synthesized mapped status below is emitted instead of
-                // passing a bogus status (or duplicating it).
-                let Ok(code) = value.trim().parse::<u32>() else {
-                    continue;
-                };
-                has_grpc_status = true;
-                // Emit the normalized (parsed) value, not the raw header, so the
-                // forwarded frame is self-consistent with what was validated
-                // (e.g. any surrounding OWS is dropped).
-                trailer_payload.extend_from_slice(b"grpc-status: ");
-                trailer_payload.extend_from_slice(code.to_string().as_bytes());
-                trailer_payload.extend_from_slice(b"\r\n");
+    for (name, value) in eligible {
+        if name == "grpc-status" {
+            // Only a present, numeric grpc-status is a valid terminal
+            // status. An empty (`grpc-status:`) or non-numeric
+            // (`grpc-status: abc`) value is malformed — skip forwarding it
+            // so the synthesized mapped status below is emitted instead of
+            // passing a bogus status (or duplicating it).
+            let Ok(code) = value.trim().parse::<u32>() else {
+                continue;
+            };
+            // Prefer the first valid grpc-status when duplicates are present.
+            if has_grpc_status {
                 continue;
             }
-            trailer_payload.extend_from_slice(header_name.as_str().as_bytes());
-            trailer_payload.extend_from_slice(b": ");
-            trailer_payload.extend_from_slice(value.as_bytes());
+            has_grpc_status = true;
+            // Emit the normalized (parsed) value, not the raw header, so the
+            // forwarded frame is self-consistent with what was validated
+            // (e.g. any surrounding OWS is dropped).
+            trailer_payload.extend_from_slice(b"grpc-status: ");
+            trailer_payload.extend_from_slice(code.to_string().as_bytes());
             trailer_payload.extend_from_slice(b"\r\n");
+            continue;
         }
+        trailer_payload.extend_from_slice(name.as_bytes());
+        trailer_payload.extend_from_slice(b": ");
+        trailer_payload.extend_from_slice(value.as_bytes());
+        trailer_payload.extend_from_slice(b"\r\n");
     }
 
     // A backend response without a present, numeric grpc-status is malformed /
@@ -1169,6 +1352,15 @@ impl Plugin for GrpcWebPlugin {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Always strip the internal trailer-name bridge header first so a
+        // preserved 206/226 (or any early-return path) cannot leak provenance
+        // metadata to the client. Promote into request metadata when present
+        // so a later allowed rewrite can still honor trailer provenance.
+        if let Some(encoded) = response_headers.remove(HEADER_GRPC_WEB_TRAILER_NAMES) {
+            ctx.metadata
+                .insert(META_GRPC_WEB_TRAILER_NAMES.to_string(), encoded);
+        }
+
         // The shared lifecycle cannot embed trailers or base64-rewrite a
         // preserved 206/226 representation. Leave its native headers coherent
         // with the untouched bytes instead of falsely labelling it gRPC-Web.
@@ -1270,7 +1462,7 @@ impl Plugin for GrpcWebPlugin {
         content_type: Option<&str>,
         response_headers: &HashMap<String, String>,
     ) -> Option<Vec<u8>> {
-        self.transform_grpc_web_response_body(body, content_type, response_headers, None)
+        self.transform_grpc_web_response_body(body, content_type, response_headers, None, None)
     }
 
     async fn transform_response_body_with_context(
@@ -1284,6 +1476,13 @@ impl Plugin for GrpcWebPlugin {
             .metadata
             .get(META_GRPC_WEB_HTTP_STATUS)
             .and_then(|value| value.parse::<u16>().ok());
-        self.transform_grpc_web_response_body(body, content_type, response_headers, http_status)
+        let allowlist = trailer_name_allowlist_from_metadata(&ctx.metadata);
+        self.transform_grpc_web_response_body(
+            body,
+            content_type,
+            response_headers,
+            http_status,
+            allowlist.as_ref(),
+        )
     }
 }

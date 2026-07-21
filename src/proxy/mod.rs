@@ -22080,6 +22080,17 @@ async fn handle_proxy_request_inner(
                         &response_headers,
                         &response_trailers,
                     );
+                // Provenance for the gRPC-Web body trailer frame: only names
+                // that arrived as backend trailers (plus reserved terminal
+                // metadata) may be embedded. Record even when the trailer map
+                // is empty so initial-header-only fields in the merged view
+                // cannot leak into the frame.
+                if crate::plugins::grpc_web::request_is_grpc_web_translated(&ctx) {
+                    crate::plugins::grpc_web::record_backend_trailer_names_for_frame(
+                        &mut ctx.metadata,
+                        &response_trailers,
+                    );
+                }
                 // Set when a gateway-authored terminal response encodes its
                 // gRPC status in the gRPC-Web BODY trailer frame instead of in
                 // the header/trailer maps, so the metadata refresh below does
@@ -30508,9 +30519,25 @@ async fn proxy_to_backend_mesh_mtls(
         // (UNKNOWN) for every RPC, since a trailer-borne grpc-status would
         // never reach it. Scoped to the translated flavor: plain-HTTP
         // buffered responses keep their headers untouched.
-        if is_grpc_web_translated && let Some(trailer_map) = backend_trailers {
+        //
+        // Also record trailer-name provenance so the body trailer frame embeds
+        // only backend trailers (plus reserved terminal metadata), not
+        // initial-header-only fields that happen to survive in the merged view.
+        // This path only holds `&RequestContext`, so provenance rides an
+        // internal response-header bridge that `grpc_web::after_proxy` promotes
+        // into metadata and strips before the client sees the response.
+        if is_grpc_web_translated {
             let mut backend_trailer_headers = HashMap::new();
-            grpc_proxy::collect_buffered_grpc_trailers(&trailer_map, &mut backend_trailer_headers);
+            if let Some(trailer_map) = backend_trailers {
+                grpc_proxy::collect_buffered_grpc_trailers(
+                    &trailer_map,
+                    &mut backend_trailer_headers,
+                );
+            }
+            crate::plugins::grpc_web::bridge_backend_trailer_names_for_frame(
+                &mut resp_headers,
+                &backend_trailer_headers,
+            );
             if !backend_trailer_headers.is_empty() {
                 let (merged_view, _header_shadowed_trailer_keys) =
                     grpc_proxy::build_grpc_plugin_header_view(

@@ -3128,7 +3128,17 @@ pub(crate) fn collect_buffered_grpc_trailers(
             continue;
         }
         if let Ok(vs) = v.to_str() {
-            out.insert(k.as_str().to_string(), vs.to_string());
+            // Preserve gRPC duplicate metadata semantics: HeaderMap yields each
+            // value separately, and the string-map representation joins them
+            // with newlines (same convention as multi-value Set-Cookie) so the
+            // gRPC-Web trailer-frame encoder can emit one `key: value\r\n` line
+            // per occurrence.
+            out.entry(k.as_str().to_string())
+                .and_modify(|existing| {
+                    existing.push('\n');
+                    existing.push_str(vs);
+                })
+                .or_insert_with(|| vs.to_string());
         }
     }
 }
@@ -3961,6 +3971,23 @@ mod tests {
                 "legitimate gRPC trailer `{name}` must be preserved",
             );
         }
+    }
+
+    #[test]
+    fn collect_buffered_grpc_trailers_preserves_duplicate_metadata() {
+        let mut trailer_map = hyper::HeaderMap::new();
+        trailer_map.insert("grpc-status", "0".parse().unwrap());
+        trailer_map.insert("request-id", "first".parse().unwrap());
+        trailer_map.append("request-id", "second".parse().unwrap());
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        collect_buffered_grpc_trailers(&trailer_map, &mut out);
+
+        assert_eq!(
+            out.get("request-id").map(String::as_str),
+            Some("first\nsecond"),
+            "duplicate gRPC metadata must be newline-joined for trailer-frame encoding"
+        );
     }
 
     #[test]

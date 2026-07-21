@@ -4415,6 +4415,15 @@ where
                     &resp.headers,
                     &resp.trailers,
                 );
+            // Same gRPC-Web trailer-frame provenance as the H1/H2 buffered path:
+            // record backend trailer names so the body frame does not copy
+            // initial-header-only fields from the merged plugin view.
+            if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) {
+                crate::plugins::grpc_web::record_backend_trailer_names_for_frame(
+                    &mut ctx.metadata,
+                    &resp.trailers,
+                );
+            }
             let mut authoritative_trailers_only_terminal_metadata = (resp.body.is_empty()
                 && resp.trailers.is_empty())
             .then(|| {

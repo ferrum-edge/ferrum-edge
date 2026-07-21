@@ -17515,7 +17515,11 @@ components:
         trailer frame synthesizes status from the official HTTP-to-gRPC client
         mapping (400→13, 401→16, 403→7, 404→12, 429/502/503/504→14, others→2);
         a valid supplied grpc-status remains authoritative. The client-visible
-        HTTP status is not rewritten to 200 on this path.
+        HTTP status is not rewritten to 200 on this path. The body trailer frame
+        preserves backend `grpc-status` / `grpc-message`, binary `*-bin`
+        metadata, and valid ASCII custom trailing metadata while excluding
+        hop-by-hop, forbidden, pseudo, connection-listed, and invalid
+        names/values; initial response headers are not copied into the frame.
       properties:
         expose_headers:
           type: array
