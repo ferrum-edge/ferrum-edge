@@ -693,8 +693,8 @@ fn test_public_docs_retain_instance_scoped_redis_semantics() {
 
     // Parse OpenAPI so folded YAML descriptions are checked as rendered text,
     // not raw source lines that may wrap mid-phrase.
-    let spec: serde_json::Value = serde_yaml::from_str(include_str!("../../../openapi.yaml"))
-        .expect("openapi.yaml parses");
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
     let ws_schema = &spec["components"]["schemas"]["WsRateLimitingConfig"];
     let schema_description = ws_schema["description"]
         .as_str()
