@@ -101,8 +101,8 @@ const MAX_PROCESS_ACTIVE_CLIENTS: u64 = 10_000;
 pub const MAX_REPLAY_REQUEST_BODY_BYTES: usize = 10_485_760;
 const MAX_PROCESS_RETAINED_BODY_BYTES: u64 = 67_108_864;
 
-const HEADER_TRIGGER_KEY: &str = "x-loadtesting-key";
-const HEADER_FANOUT: &str = "x-loadtesting-fanout";
+pub(crate) const HEADER_TRIGGER_KEY: &str = "x-loadtesting-key";
+pub(crate) const HEADER_FANOUT: &str = "x-loadtesting-fanout";
 const FANOUT_MARKER: &str = "1";
 const INVALID_ADDRESS_LABEL: &str = "invalid-gateway-address";
 

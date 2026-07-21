@@ -74,6 +74,7 @@ use std::time::Duration;
 use tracing::warn;
 use url::{Host, form_urlencoded};
 
+use super::load_testing::{HEADER_FANOUT, HEADER_TRIGGER_KEY};
 use super::utils::response_body::{
     BoundedReadError, measure_response_body_bounded, parse_max_response_body_bytes,
 };
@@ -90,8 +91,6 @@ use crate::proxy::headers::{
 /// response over a fire-and-forget task.
 const DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_IN_FLIGHT_MIRRORS: usize = 256;
-const LOAD_TESTING_TRIGGER_HEADER: &str = "x-loadtesting-key";
-const LOAD_TESTING_FANOUT_HEADER: &str = "x-loadtesting-fanout";
 
 fn strip_query_params(url: &str) -> &str {
     url.split_once('?').map_or(url, |(base, _)| base)
@@ -162,6 +161,13 @@ impl RequestMirror {
             && !path.starts_with('/')
         {
             return Err("request_mirror: 'mirror_path' must start with '/'".to_string());
+        }
+        if let Some(path) = &mirror_path
+            && (path.contains('?') || path.contains('#'))
+        {
+            return Err(
+                "request_mirror: 'mirror_path' must not contain a query or fragment".to_string(),
+            );
         }
 
         let percentage = optional_f64(config, "percentage")?.unwrap_or(100.0);
@@ -444,7 +450,7 @@ impl Plugin for RequestMirror {
         let mut mirror_headers = filter_secondary_request_headers(
             headers,
             SecondaryRequestHostPolicy::Strip,
-            &[LOAD_TESTING_TRIGGER_HEADER, LOAD_TESTING_FANOUT_HEADER],
+            &[HEADER_TRIGGER_KEY, HEADER_FANOUT],
         );
         // gRPC mirrors need `te: trailers` after the generic strip removes `te`.
         synthesize_grpc_te_trailers_if_needed(&mut mirror_headers);

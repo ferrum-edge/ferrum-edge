@@ -186,6 +186,8 @@ pub fn filter_secondary_request_headers(
 ///
 /// Mirrors [`strip_backend_request_headers_for_grpc`] for builders that work
 /// from a materialised `Vec<(String, String)>` rather than `http::HeaderMap`.
+/// Callers must use an HTTP/2-capable target for native gRPC; HTTP/1.1 is not a
+/// supported native-gRPC mirror transport.
 pub fn synthesize_grpc_te_trailers_if_needed(headers: &mut Vec<(String, String)>) {
     let is_grpc = headers.iter().any(|(name, value)| {
         name.eq_ignore_ascii_case("content-type") && content_type_is_grpc(value)

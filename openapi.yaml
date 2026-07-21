@@ -16949,9 +16949,11 @@ components:
         via a `tokio::sync::watch` channel and surfaced through transaction
         logs. Outbound mirror headers use Ferrum's canonical secondary-request
         sanitizer (Connection-listed hop-by-hop, Trailer, framing, Ferrum
-        request-only markers, and proxy-owned X-Forwarded-* identity); Host is
-        derived from the mirror URL; native gRPC mirrors re-synthesise te:
-        trailers; the mirror request-target preserves the raw query (after the
+        request-only markers, and proxy-owned X-Forwarded-* identity); these
+        forwarding fields are stripped rather than regenerated, so mirrors do
+        not receive Ferrum-authored X-Forwarded-* identity. Host is derived from
+        the mirror URL. Native gRPC mirrors require HTTP/2 and re-synthesise te:
+        trailers. The mirror request-target preserves the raw query (after the
         same auth credential strips as primary) including repeated pairs,
         order, flags, empty values, +, percent escapes, and non-ASCII encoded
         bytes.
@@ -16974,7 +16976,8 @@ components:
           description: "Transport protocol used for the mirror request."
         mirror_path:
           type: string
-          description: "Override path used for the mirror request. When omitted, the original request path is used."
+          pattern: '^$|^/[^?#]*$'
+          description: "Override path used for the mirror request. Must start with `/` and cannot contain a query or fragment. Empty is treated as omitted; when omitted, the original request path is used."
         percentage:
           type: number
           format: double

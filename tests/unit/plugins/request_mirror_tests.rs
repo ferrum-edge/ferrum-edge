@@ -286,6 +286,22 @@ fn test_mirror_path_must_start_with_slash() {
 }
 
 #[test]
+fn test_mirror_path_rejects_query_and_fragment_syntax() {
+    for mirror_path in ["/shadow?src=config", "/shadow#fragment"] {
+        let error = RequestMirror::new(
+            &json!({ "mirror_host": "mirror.local", "mirror_path": mirror_path }),
+            PluginHttpClient::default(),
+        )
+        .err()
+        .expect("query and fragment syntax must be rejected");
+        assert!(
+            error.contains("'mirror_path' must not contain a query or fragment"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[test]
 fn test_empty_mirror_host_is_error() {
     let result = RequestMirror::new(&json!({ "mirror_host": "" }), PluginHttpClient::default());
     assert!(result.is_err());
