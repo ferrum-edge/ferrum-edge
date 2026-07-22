@@ -67,6 +67,7 @@ async fn spawn_gateway(backend_port: u16) -> (GatewayHarness, u16, tempfile::Tem
             "response_body_mode": "buffer",
             "plugins": [{"plugin_config_id": "soap-utf16-security"}]
         }],
+        "consumers": [],
         "upstreams": [],
         "plugin_configs": [{
             "id": "soap-utf16-security",
