@@ -436,17 +436,7 @@ async fn test_session_meta_connection_id_survives_reload_style_plugin_resnapshot
     let (reloaded_plugin, reloaded_captured) = CapturingDisconnectPlugin::new();
     let _reloaded_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(reloaded_plugin)];
 
-    fire_ws_framed_disconnect_hooks(
-        &admission_plugins,
-        "proxy-live",
-        meta,
-        1,
-        1,
-        4,
-        4,
-        None,
-    )
-    .await;
+    fire_ws_framed_disconnect_hooks(&admission_plugins, "proxy-live", meta, 1, 1, 4, 4, None).await;
 
     let admission = admission_captured.lock().unwrap();
     let reloaded = reloaded_captured.lock().unwrap();

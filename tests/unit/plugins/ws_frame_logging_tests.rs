@@ -470,10 +470,7 @@ async fn concurrent_sessions_share_connection_id_across_frame_and_disconnect() {
         .await;
 
     let events = capture.events();
-    let frames: Vec<_> = events
-        .iter()
-        .filter(|e| e.event.is_none())
-        .collect();
+    let frames: Vec<_> = events.iter().filter(|e| e.event.is_none()).collect();
     let disconnects: Vec<_> = events
         .iter()
         .filter(|e| e.event.as_deref() == Some("disconnect"))
