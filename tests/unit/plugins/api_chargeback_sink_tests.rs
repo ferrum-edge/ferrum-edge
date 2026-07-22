@@ -733,16 +733,27 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
             ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
         plugin.start_background_tasks().expect("chargeback start");
         plugin.commit_background_tasks();
-        let node_dirs: Vec<_> = fs::read_dir(temp.path())
-            .unwrap()
-            .flatten()
-            .map(|entry| entry.path())
-            .filter(|path| path.is_dir())
-            .collect();
+        // Committed spool preparation is intentionally asynchronous: the
+        // replayer wakes on the publication gate and creates/probes live
+        // storage on its first tick. Validation and pre-commit staging must
+        // not create this directory.
+        let mut node_dirs = Vec::new();
+        for _ in 0..50 {
+            node_dirs = fs::read_dir(temp.path())
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect();
+            if node_dirs.len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert_eq!(
             node_dirs.len(),
             1,
-            "enabled spool should create exactly one node directory"
+            "committed spool should create exactly one node directory"
         );
         let day = node_dirs[0].join("20260524");
         fs::create_dir_all(&day).unwrap();
