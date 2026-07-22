@@ -690,6 +690,7 @@ async fn test_statsd_websocket_session_metrics_and_opt_in() {
         error_class: Some(ErrorClass::ReadWriteTimeout),
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata: HashMap::new(),
     };
     let mut buf = String::new();
@@ -941,6 +942,7 @@ async fn test_statsd_ws_disconnect_collector_emits_session_once() {
         error_class: None,
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata: HashMap::new(),
     };
     plugin.on_ws_disconnect(&ctx).await;

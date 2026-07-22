@@ -697,6 +697,143 @@ async fn test_ws_frame_logging_e2e() {
     println!("test_ws_frame_logging_e2e PASSED");
 }
 
+/// Concurrent sessions must share one process-local `connection_id` between
+/// frame and disconnect `ws_frame_log` events (issue #2560).
+#[ignore]
+#[tokio::test]
+async fn test_ws_frame_logging_connection_id_correlates_frame_and_disconnect() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::{Arc, Mutex};
+
+    let (backend_port, backend_listener) = bind_ws_backend_listener().await;
+    let echo_handle = tokio::spawn(start_ws_echo_server(backend_listener));
+
+    let temp_dir = TempDir::new().unwrap();
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config_with_plugins(
+        &config_path,
+        backend_port,
+        r#"  - id: "ws-logging"
+    plugin_name: "ws_frame_logging"
+    scope: "proxy"
+    proxy_id: "ws-echo-proxy"
+    enabled: true
+    config:
+      log_level: "info""#,
+        r#"      - plugin_config_id: "ws-logging""#,
+    );
+
+    let admin_http_port = std::net::TcpListener::bind("127.0.0.1:0")
+        .ok()
+        .and_then(|l| l.local_addr().ok())
+        .map(|a| a.port())
+        .unwrap_or(0);
+    let gateway_port = free_port().await;
+    let log_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_lines_reader = Arc::clone(&log_lines);
+
+    let mut gateway = std::process::Command::new(gateway_binary_path())
+        .env("FERRUM_MODE", "file")
+        .env("FERRUM_FILE_CONFIG_PATH", config_path.to_str().unwrap())
+        .env("FERRUM_PROXY_HTTP_PORT", gateway_port.to_string())
+        .env("FERRUM_ADMIN_HTTP_PORT", admin_http_port.to_string())
+        .env("FERRUM_ADMIN_HTTPS_PORT", "0")
+        .env("FERRUM_POOL_WARMUP_ENABLED", "false")
+        // Admit info-level ws_frame_log records (frame + disconnect).
+        .env("FERRUM_LOG_LEVEL", "info")
+        .env("RUST_LOG", "ws_frame_log=info")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn gateway");
+
+    let stdout = gateway.stdout.take().expect("piped stdout");
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if line.contains("ws_frame_log") || line.contains("connection_id") {
+                log_lines_reader.lock().unwrap().push(line);
+            }
+        }
+    });
+
+    wait_for_gateway(gateway_port)
+        .await
+        .expect("gateway readiness");
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws_a, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect session A");
+    let (mut ws_b, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("connect session B");
+
+    ws_a.send(Message::Text("a1".into())).await.unwrap();
+    ws_b.send(Message::Text("b1".into())).await.unwrap();
+    let _ = ws_a.next().await.unwrap().unwrap();
+    let _ = ws_b.next().await.unwrap().unwrap();
+
+    ws_b.send(Message::Close(None)).await.unwrap();
+    let _ = ws_b.next().await;
+    ws_a.send(Message::Close(None)).await.unwrap();
+    let _ = ws_a.next().await;
+
+    // Allow disconnect hooks to flush structured logs.
+    sleep(Duration::from_millis(500)).await;
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+
+    let logs = log_lines.lock().unwrap().clone();
+    assert!(
+        !logs.is_empty(),
+        "expected ws_frame_log output; got none (check FERRUM_LOG_LEVEL / RUST_LOG)"
+    );
+
+    let mut frame_ids = std::collections::HashSet::new();
+    let mut disconnect_ids = std::collections::HashSet::new();
+    for line in &logs {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("target").and_then(|t| t.as_str()) != Some("ws_frame_log") {
+            continue;
+        }
+        let Some(id) = value.get("connection_id").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let is_disconnect = value.get("event").and_then(|e| e.as_str()) == Some("disconnect")
+            || value
+                .get("message")
+                .and_then(|m| m.as_str())
+                .is_some_and(|m| m.contains("session ended"));
+        if is_disconnect {
+            disconnect_ids.insert(id);
+        } else if value.get("frame_type").is_some()
+            || value
+                .get("message")
+                .and_then(|m| m.as_str())
+                .is_some_and(|m| m.contains("WebSocket frame"))
+        {
+            frame_ids.insert(id);
+        }
+    }
+
+    assert!(
+        frame_ids.len() >= 2,
+        "expected distinct frame connection_ids for concurrent sessions; frames={frame_ids:?} logs={logs:?}"
+    );
+    assert_eq!(
+        disconnect_ids, frame_ids,
+        "each session's disconnect must reuse its frame-stream connection_id; frames={frame_ids:?} disconnects={disconnect_ids:?} logs={logs:?}"
+    );
+
+    println!("test_ws_frame_logging_connection_id_correlates_frame_and_disconnect PASSED");
+}
+
 // ============================================================================
 // ws_rate_limiting E2E
 // ============================================================================

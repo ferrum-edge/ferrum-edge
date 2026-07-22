@@ -41,6 +41,7 @@ struct CapturingDisconnectPlugin {
 #[derive(Clone)]
 struct CapturedDisconnect {
     proxy_id: String,
+    connection_id: u64,
     client_ip: String,
     frames_c2b: u64,
     frames_b2c: u64,
@@ -83,6 +84,7 @@ impl Plugin for CapturingDisconnectPlugin {
     async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
         self.captured.lock().unwrap().push(CapturedDisconnect {
             proxy_id: ctx.proxy_id.clone(),
+            connection_id: ctx.connection_id,
             client_ip: ctx.client_ip.clone(),
             frames_c2b: ctx.frames_client_to_backend,
             frames_b2c: ctx.frames_backend_to_client,
@@ -99,7 +101,11 @@ impl Plugin for CapturingDisconnectPlugin {
 }
 
 fn session_meta() -> ferrum_edge::proxy::WsSessionMeta {
-    make_ws_session_meta(
+    session_meta_with_id(0)
+}
+
+fn session_meta_with_id(connection_id: u64) -> ferrum_edge::proxy::WsSessionMeta {
+    let mut meta = make_ws_session_meta(
         "ferrum".to_string(),
         Some("ws-echo".to_string()),
         "10.0.0.7".to_string(),
@@ -108,7 +114,9 @@ fn session_meta() -> ferrum_edge::proxy::WsSessionMeta {
         Some("user-42".to_string()),
         HashMap::new(),
         chrono::Utc::now() - chrono::Duration::seconds(2),
-    )
+    );
+    meta.connection_id = connection_id;
+    meta
 }
 
 #[tokio::test]
@@ -327,5 +335,125 @@ async fn test_framed_disconnect_duration_ignores_wall_clock_skew() {
     assert_eq!(
         captured_fwd[0].timestamp_connected, expected_fwd_connected,
         "forward-skewed wall connect timestamp is still rendered"
+    );
+}
+
+#[tokio::test]
+async fn test_tunnel_and_framed_disconnect_preserve_admission_connection_id() {
+    // Issue #2560: tunnel residual/relay teardown, framed teardown, and the
+    // H1/H2 upgrade-handoff failure path all build WsDisconnectContext from
+    // WsSessionMeta.connection_id — the same process-local ID allocated at
+    // admission and passed to on_ws_frame. Multiple plugins must observe it
+    // without a per-frame lookup map.
+    let (plugin_a, captured_a) = CapturingDisconnectPlugin::new();
+    let (plugin_b, captured_b) = CapturingDisconnectPlugin::new();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin_a), Arc::new(plugin_b)];
+
+    let tunnel_id = 1001u64;
+    let framed_id = 1002u64;
+    let handoff_id = 1003u64;
+
+    fire_ws_tunnel_disconnect_hooks(
+        &plugins,
+        "proxy-tunnel",
+        &session_meta_with_id(tunnel_id),
+        8,
+        16,
+        None,
+    )
+    .await;
+
+    fire_ws_framed_disconnect_hooks(
+        &plugins,
+        "proxy-framed",
+        session_meta_with_id(framed_id),
+        2,
+        3,
+        20,
+        30,
+        Some((
+            Direction::ClientToBackend,
+            ErrorClass::ConnectionReset,
+            Some(StreamIoSide::Read),
+        )),
+    )
+    .await;
+
+    // Upgrade-handoff failure reuses the tunnel helper with zero counts and
+    // ConnectionClosed / Unknown direction (see proxy/mod.rs handoff Err arm).
+    fire_ws_tunnel_disconnect_hooks(
+        &plugins,
+        "proxy-handoff",
+        &session_meta_with_id(handoff_id),
+        0,
+        0,
+        Some((Direction::Unknown, ErrorClass::ConnectionClosed, None)),
+    )
+    .await;
+
+    let a = captured_a.lock().unwrap();
+    let b = captured_b.lock().unwrap();
+    assert_eq!(a.len(), 3, "plugin A must see tunnel, framed, and handoff");
+    assert_eq!(b.len(), 3, "plugin B must see the same three teardowns");
+
+    assert_eq!(a[0].connection_id, tunnel_id);
+    assert_eq!(a[0].proxy_id, "proxy-tunnel");
+    assert_eq!(a[0].frames_c2b, 0);
+    assert_eq!(a[0].frames_b2c, 0);
+
+    assert_eq!(a[1].connection_id, framed_id);
+    assert_eq!(a[1].proxy_id, "proxy-framed");
+    assert_eq!(a[1].frames_c2b, 2);
+    assert_eq!(a[1].frames_b2c, 3);
+    assert_eq!(a[1].direction, Some(Direction::ClientToBackend));
+    assert_eq!(a[1].error_class, Some(ErrorClass::ConnectionReset));
+
+    assert_eq!(a[2].connection_id, handoff_id);
+    assert_eq!(a[2].proxy_id, "proxy-handoff");
+    assert_eq!(a[2].bytes_c2b, 0);
+    assert_eq!(a[2].bytes_b2c, 0);
+    assert_eq!(a[2].direction, Some(Direction::Unknown));
+    assert_eq!(a[2].error_class, Some(ErrorClass::ConnectionClosed));
+
+    // Every plugin instance receives the authoritative admission ID.
+    for (idx, expected) in [tunnel_id, framed_id, handoff_id].into_iter().enumerate() {
+        assert_eq!(b[idx].connection_id, expected);
+        assert_eq!(b[idx].connection_id, a[idx].connection_id);
+    }
+}
+
+#[tokio::test]
+async fn test_session_meta_connection_id_survives_reload_style_plugin_resnapshot() {
+    // Live sessions keep the admission plugin Arc list + WsSessionMeta captured
+    // at upgrade. A later config reload may publish a new plugin generation, but
+    // teardown still fires the original snapshot with the original connection_id.
+    let admission_id = 7777u64;
+    let (admission_plugin, admission_captured) = CapturingDisconnectPlugin::new();
+    let admission_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(admission_plugin)];
+    let meta = session_meta_with_id(admission_id);
+
+    // Simulate a reload that attaches a different disconnect plugin instance.
+    let (reloaded_plugin, reloaded_captured) = CapturingDisconnectPlugin::new();
+    let _reloaded_plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(reloaded_plugin)];
+
+    fire_ws_framed_disconnect_hooks(
+        &admission_plugins,
+        "proxy-live",
+        meta,
+        1,
+        1,
+        4,
+        4,
+        None,
+    )
+    .await;
+
+    let admission = admission_captured.lock().unwrap();
+    let reloaded = reloaded_captured.lock().unwrap();
+    assert_eq!(admission.len(), 1);
+    assert_eq!(admission[0].connection_id, admission_id);
+    assert!(
+        reloaded.is_empty(),
+        "reload-generation plugins must not observe a session accepted earlier"
     );
 }

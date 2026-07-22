@@ -24,6 +24,7 @@ struct CapturedWsLog {
     preview: Option<String>,
     event: Option<String>,
     correlation_id: Option<String>,
+    connection_id: Option<u64>,
     configured_level: Option<String>,
 }
 
@@ -70,6 +71,7 @@ where
             preview: visitor.preview,
             event: visitor.event,
             correlation_id: visitor.correlation_id,
+            connection_id: visitor.connection_id,
             configured_level: visitor.configured_level,
         });
     }
@@ -80,10 +82,23 @@ struct WsLogVisitor {
     preview: Option<String>,
     event: Option<String>,
     correlation_id: Option<String>,
+    connection_id: Option<u64>,
     configured_level: Option<String>,
 }
 
 impl tracing::field::Visit for WsLogVisitor {
+    fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+        if field.name() == "connection_id" {
+            self.connection_id = Some(value);
+        }
+    }
+
+    fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+        if field.name() == "connection_id" && value >= 0 {
+            self.connection_id = Some(value as u64);
+        }
+    }
+
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         if field.name() == "preview" {
             self.preview = Some(value.to_string());
@@ -105,6 +120,11 @@ impl tracing::field::Visit for WsLogVisitor {
             self.correlation_id = Some(format!("{value:?}").trim_matches('"').to_string());
         } else if field.name() == "configured_level" {
             self.configured_level = Some(format!("{value:?}").trim_matches('"').to_string());
+        } else if field.name() == "connection_id" {
+            let rendered = format!("{value:?}").trim_matches('"').to_string();
+            if let Ok(parsed) = rendered.parse::<u64>() {
+                self.connection_id = Some(parsed);
+            }
         }
     }
 }
@@ -142,6 +162,13 @@ fn install_filtered_ws_log_capture(
 }
 
 fn disconnect_context(metadata: HashMap<String, String>) -> WsDisconnectContext {
+    disconnect_context_with_id(0, metadata)
+}
+
+fn disconnect_context_with_id(
+    connection_id: u64,
+    metadata: HashMap<String, String>,
+) -> WsDisconnectContext {
     WsDisconnectContext {
         namespace: "ferrum".to_string(),
         proxy_id: "ws-proxy".to_string(),
@@ -149,6 +176,7 @@ fn disconnect_context(metadata: HashMap<String, String>) -> WsDisconnectContext 
         client_ip: "127.0.0.1".to_string(),
         backend_target: "ws://127.0.0.1:9001/socket".to_string(),
         listen_port: 8000,
+        connection_id,
         duration_ms: 1.0,
         frames_client_to_backend: 1,
         frames_backend_to_client: 1,
@@ -415,6 +443,69 @@ async fn disconnect_log_falls_back_to_legacy_custom_correlation_metadata() {
         event.correlation_id.as_deref(),
         Some("canonical-request-id")
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_sessions_share_connection_id_across_frame_and_disconnect() {
+    // Issue #2560: frame events already carry connection_id; disconnect must
+    // emit the same admission ID so interleaved concurrent sessions remain
+    // joinable without a per-frame lookup map.
+    let capture = WsLogCapture::default();
+    let _guard = install_ws_log_capture(&capture);
+    let logger = WsFrameLogging::new(&json!({})).expect("valid WebSocket logger config");
+
+    let session_a = 41u64;
+    let session_b = 42u64;
+    let msg_a = Message::Text("alpha".into());
+    let msg_b = Message::Text("beta".into());
+
+    log_frame(&logger, session_a, &msg_a).await;
+    log_frame(&logger, session_b, &msg_b).await;
+    log_frame(&logger, session_a, &msg_a).await;
+    logger
+        .on_ws_disconnect(&disconnect_context_with_id(session_b, HashMap::new()))
+        .await;
+    logger
+        .on_ws_disconnect(&disconnect_context_with_id(session_a, HashMap::new()))
+        .await;
+
+    let events = capture.events();
+    let frames: Vec<_> = events
+        .iter()
+        .filter(|e| e.event.is_none())
+        .collect();
+    let disconnects: Vec<_> = events
+        .iter()
+        .filter(|e| e.event.as_deref() == Some("disconnect"))
+        .collect();
+
+    assert_eq!(frames.len(), 3, "expected three frame events: {events:?}");
+    assert_eq!(
+        disconnects.len(),
+        2,
+        "expected two disconnect events: {events:?}"
+    );
+    assert_eq!(frames[0].connection_id, Some(session_a));
+    assert_eq!(frames[1].connection_id, Some(session_b));
+    assert_eq!(frames[2].connection_id, Some(session_a));
+    assert_eq!(disconnects[0].connection_id, Some(session_b));
+    assert_eq!(disconnects[1].connection_id, Some(session_a));
+
+    for &id in &[session_a, session_b] {
+        let frame_ids: Vec<_> = frames
+            .iter()
+            .filter_map(|e| e.connection_id)
+            .filter(|cid| *cid == id)
+            .collect();
+        assert!(
+            !frame_ids.is_empty(),
+            "session {id} must appear in frame stream"
+        );
+        assert!(
+            disconnects.iter().any(|e| e.connection_id == Some(id)),
+            "session {id} disconnect must reuse frame-stream connection_id"
+        );
+    }
 }
 
 // === on_ws_frame always returns None (never transforms) ===

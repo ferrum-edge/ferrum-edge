@@ -399,7 +399,9 @@ WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy �
 
 ### Connection Tracking
 
-Each WebSocket connection is assigned a `connection_id` — a monotonic `u64` counter unique per WebSocket connection. Plugins use this identifier for per-connection state tracking (e.g., per-connection rate limit buckets, per-connection frame counters).
+Each WebSocket connection is assigned a `connection_id` — a monotonic `u64` counter unique within a single gateway process. Plugins use this identifier for per-connection state tracking (e.g., per-connection rate limit buckets, per-connection frame counters). The same admission ID is passed to every `on_ws_frame` call and copied into `WsDisconnectContext` at teardown so frame and disconnect observers share one session key without a lookup map.
+
+The identifier is **process-local**, not globally unique across gateway instances. Operators aggregating multi-instance logs must join on `(gateway_instance_id, proxy_id, connection_id)` (or an equivalent host/process identity + `proxy_id` + `connection_id` tuple).
 
 ### Frame Rejection
 

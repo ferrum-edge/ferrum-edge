@@ -1323,6 +1323,17 @@ pub struct WsDisconnectContext {
     pub backend_target: String,
     /// Listener port on the gateway that accepted the upgrade.
     pub listen_port: u16,
+    /// Process-local accepted WebSocket session ID allocated at upgrade
+    /// admission (`ProxyState.ws_connection_counter`).
+    ///
+    /// Identical to the `connection_id` passed to every `on_ws_frame` call for
+    /// this session, including H1/H2/H3 relay teardown, peer close/error,
+    /// plugin cancellation, idle/drain timeout, and H1/H2 upgrade-handoff
+    /// failure. The value is **not** globally unique across gateway processes;
+    /// operators aggregating logs from multiple instances must join on
+    /// `(gateway_instance_id, proxy_id, connection_id)` (or an equivalent
+    /// host/process identity + `proxy_id` + `connection_id` tuple).
+    pub connection_id: u64,
     /// Total session lifetime in milliseconds (upgrade → close).
     pub duration_ms: f64,
     /// Number of frames proxied from client toward backend.

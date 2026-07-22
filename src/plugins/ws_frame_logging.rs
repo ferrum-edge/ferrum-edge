@@ -5,6 +5,10 @@
 //!
 //! Each frame log entry includes: proxy_id, connection_id, direction,
 //! frame type, payload size in bytes, and an optional payload fingerprint.
+//! Disconnect events on the same `ws_frame_log` target reuse that admission
+//! `connection_id` so operators can join the terminal record to the frame
+//! stream. The ID is process-local; multi-instance aggregation must include a
+//! gateway instance identity alongside `proxy_id` and `connection_id`.
 //!
 //! This plugin never transforms or drops frames — it is purely observational.
 //!
@@ -531,8 +535,9 @@ impl Plugin for WsFrameLogging {
     async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
         // Match the frame-level log's structure so operators can correlate
         // the session end with the per-frame stream on the same `ws_frame_log`
-        // target. Direction/error_class/frames are always emitted so even
-        // clean closes produce a final record suitable for session accounting.
+        // target via shared `connection_id`. Direction/error_class/frames are
+        // always emitted so even clean closes produce a final record suitable
+        // for session accounting.
         let direction_label = match ctx.direction {
             Some(Direction::ClientToBackend) => "client_to_backend",
             Some(Direction::BackendToClient) => "backend_to_client",
@@ -553,11 +558,14 @@ impl Plugin for WsFrameLogging {
 
         // Pick a tracing macro at the plugin's configured level so that log
         // targets routed by `ws_frame_log` match the frame output volume.
+        // `connection_id` is the same process-local admission ID carried on
+        // every frame event for this session (see `WsDisconnectContext`).
         match self.log_level {
             LogLevel::Trace => tracing::trace!(
                 target: "ws_frame_log",
                 namespace = %ctx.namespace,
                 proxy_id = %ctx.proxy_id,
+                connection_id = ctx.connection_id,
                 proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
                 client_ip = %ctx.client_ip,
                 backend_target = %ctx.backend_target,
@@ -577,6 +585,7 @@ impl Plugin for WsFrameLogging {
                 target: "ws_frame_log",
                 namespace = %ctx.namespace,
                 proxy_id = %ctx.proxy_id,
+                connection_id = ctx.connection_id,
                 proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
                 client_ip = %ctx.client_ip,
                 backend_target = %ctx.backend_target,
@@ -596,6 +605,7 @@ impl Plugin for WsFrameLogging {
                 target: "ws_frame_log",
                 namespace = %ctx.namespace,
                 proxy_id = %ctx.proxy_id,
+                connection_id = ctx.connection_id,
                 proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
                 client_ip = %ctx.client_ip,
                 backend_target = %ctx.backend_target,
@@ -615,6 +625,7 @@ impl Plugin for WsFrameLogging {
                 target: "ws_frame_log",
                 namespace = %ctx.namespace,
                 proxy_id = %ctx.proxy_id,
+                connection_id = ctx.connection_id,
                 proxy_name = %ctx.proxy_name.as_deref().unwrap_or("-"),
                 client_ip = %ctx.client_ip,
                 backend_target = %ctx.backend_target,
