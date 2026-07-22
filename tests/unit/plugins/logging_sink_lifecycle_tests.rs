@@ -921,7 +921,8 @@ fn chargeback_rejects_empty_and_nul_spool_dir_shape() {
     let mut empty = chargeback_sink_config(&tempfile::tempdir().expect("tempdir"));
     empty["spool"]["dir"] = json!("");
     let err = ApiChargebackSink::new(&empty, client(), "default")
-        .expect_err("empty spool.dir must fail shape validation");
+        .err()
+        .expect("empty spool.dir must fail shape validation");
     assert!(
         err.contains("spool.dir") && err.contains("empty"),
         "expected empty spool.dir error, got: {err}"
@@ -930,7 +931,8 @@ fn chargeback_rejects_empty_and_nul_spool_dir_shape() {
     let mut nul = chargeback_sink_config(&tempfile::tempdir().expect("tempdir"));
     nul["spool"]["dir"] = json!("spool\u{0000}dir");
     let err = ApiChargebackSink::new(&nul, client(), "default")
-        .expect_err("NUL spool.dir must fail shape validation");
+        .err()
+        .expect("NUL spool.dir must fail shape validation");
     assert!(
         err.contains("spool.dir") && err.contains("NUL"),
         "expected NUL spool.dir error, got: {err}"
