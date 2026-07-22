@@ -33,9 +33,7 @@ fn extract_istio_crd_kinds(source: &str) -> Vec<String> {
         .find("pub const ISTIO_CRDS")
         .expect("ISTIO_CRDS declaration");
     let after = &source[start..];
-    let end = after
-        .find("\n];")
-        .expect("ISTIO_CRDS closing bracket");
+    let end = after.find("\n];").expect("ISTIO_CRDS closing bracket");
     let block = &after[..end];
     let mut kinds = Vec::new();
     for line in block.lines() {
@@ -74,9 +72,7 @@ fn extract_supported_status_kinds(source: &str) -> BTreeSet<String> {
             }
             if key_end < bytes.len() {
                 let kind = &block[key_start..key_end];
-                if kind
-                    .chars()
-                    .all(|c| c.is_ascii_alphabetic())
+                if kind.chars().all(|c| c.is_ascii_alphabetic())
                     && kind.starts_with(|c: char| c.is_ascii_uppercase())
                     && kind.len() > 3
                 {
@@ -94,7 +90,10 @@ fn extract_supported_status_kinds(source: &str) -> BTreeSet<String> {
 #[test]
 fn istio_crds_are_exactly_the_nine_watched_status_kinds() {
     let kinds = extract_istio_crd_kinds(WATCHER_RS);
-    let expected: Vec<String> = WATCHED_STATUS_KINDS.iter().map(|k| (*k).to_string()).collect();
+    let expected: Vec<String> = WATCHED_STATUS_KINDS
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
     assert_eq!(
         kinds, expected,
         "ISTIO_CRDS kind list drifted from the documented nine watched/status kinds"
@@ -108,7 +107,10 @@ fn istio_crds_are_exactly_the_nine_watched_status_kinds() {
 #[test]
 fn status_writer_supported_kinds_match_istio_crds() {
     let status_kinds = extract_supported_status_kinds(ISTIO_STATUS_RS);
-    let expected: BTreeSet<_> = WATCHED_STATUS_KINDS.iter().map(|k| (*k).to_string()).collect();
+    let expected: BTreeSet<_> = WATCHED_STATUS_KINDS
+        .iter()
+        .map(|k| (*k).to_string())
+        .collect();
     assert_eq!(
         status_kinds, expected,
         "is_supported_istio_kind must stay lock-step with ISTIO_CRDS"
@@ -185,7 +187,9 @@ fn configuration_md_rejects_stale_istio_capability_claims() {
         "docs/configuration.md must state port-level TLS is applied"
     );
     assert!(
-        CONFIGURATION_MD.contains("negative-match siblings `notMethods`, `notPaths`, `notHosts`, and `notPorts`"),
+        CONFIGURATION_MD.contains(
+            "negative-match siblings `notMethods`, `notPaths`, `notHosts`, and `notPorts`"
+        ),
         "docs/configuration.md must document negative-match translation"
     );
     assert!(
