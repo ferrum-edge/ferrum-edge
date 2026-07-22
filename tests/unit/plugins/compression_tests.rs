@@ -796,9 +796,11 @@ async fn test_406_via_shared_after_proxy_chokepoint() {
             .await
             .expect("shared after_proxy chokepoint must produce 406");
     assert_eq!(status, 406);
-    assert_eq!(
-        headers.get("vary").map(String::as_str),
-        Some("Accept-Encoding")
+    assert!(
+        headers
+            .get("vary")
+            .is_some_and(|vary| vary.eq_ignore_ascii_case("Accept-Encoding")),
+        "cached Vary field-name tokens are case-insensitive"
     );
     assert_eq!(
         headers.get("content-type").map(String::as_str),
