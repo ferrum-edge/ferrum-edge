@@ -955,7 +955,14 @@ fn swagger_base_path_bases(root: &Value) -> Result<Vec<String>, ExtractError> {
             if base_path.is_empty() || base_path == "/" {
                 return Ok(vec![SERVER_BASE_ROOT.to_string()]);
             }
-            let pathname = server_url_pathname(base_path, "basePath")?;
+            if !base_path.starts_with('/') || base_path.contains(['?', '#']) {
+                return Err(ExtractError::MalformedExtension {
+                    which: "basePath",
+                    error: "Swagger basePath must be an absolute path without query or fragment"
+                        .to_string(),
+                });
+            }
+            let pathname = server_url_pathname(base_path, "basePath", "basePath")?;
             Ok(vec![pathname])
         }
         Some(_) => Err(ExtractError::MalformedExtension {
@@ -1011,7 +1018,11 @@ fn openapi_server_bases(
             object.get("variables"),
             &format!("{location}[{index}]"),
         )?;
-        let pathname = server_url_pathname(&substituted, &format!("{location}[{index}].url"))?;
+        let pathname = server_url_pathname(
+            &substituted,
+            &format!("{location}[{index}].url"),
+            "servers",
+        )?;
         if seen.insert(pathname.clone()) {
             bases.push(pathname);
         }
@@ -1039,6 +1050,12 @@ fn substitute_server_variables(
     let mut out = String::with_capacity(url.len());
     let mut chars = url.chars().peekable();
     while let Some(ch) = chars.next() {
+        if ch == '}' {
+            return Err(ExtractError::MalformedExtension {
+                which: "servers",
+                error: format!("{location}.url has an unmatched closing server-variable brace"),
+            });
+        }
         if ch != '{' {
             out.push(ch);
             continue;
@@ -1064,11 +1081,12 @@ fn substitute_server_variables(
                 error: format!("{location}.url has an unclosed server variable"),
             });
         }
-        let name = name.trim();
-        if name.is_empty() {
+        if name.is_empty() || name.trim() != name {
             return Err(ExtractError::MalformedExtension {
                 which: "servers",
-                error: format!("{location}.url has an empty server variable name"),
+                error: format!(
+                    "{location}.url has an empty or whitespace-padded server variable name"
+                ),
             });
         }
         let Some(vars) = variable_map else {
@@ -1136,18 +1154,23 @@ fn substitute_server_variables(
 /// Extract the pathname from a relative or absolute server URL / Swagger basePath.
 ///
 /// Authority, scheme, query, and fragment never enter the matcher. The pathname is
-/// kept literally (no percent-decoding, no `.`/`..` resolution) so encoded or
-/// traversal-like text cannot create a validation bypass.
-fn server_url_pathname(raw: &str, location: &str) -> Result<String, ExtractError> {
+/// kept in URL serialization form (percent escapes stay escaped) so it matches
+/// `http::Uri::path()` on the request boundary. Relative references resolve
+/// against a synthetic root because uploaded specs have no document URL.
+fn server_url_pathname(
+    raw: &str,
+    location: &str,
+    error_surface: &'static str,
+) -> Result<String, ExtractError> {
     if raw.is_empty() {
         return Err(ExtractError::MalformedExtension {
-            which: "servers",
+            which: error_surface,
             error: format!("{location} must not be empty"),
         });
     }
     if raw.chars().any(|ch| ch.is_control() || ch == '\\') {
         return Err(ExtractError::MalformedExtension {
-            which: "servers",
+            which: error_surface,
             error: format!("{location} contains control characters or backslashes"),
         });
     }
@@ -1158,52 +1181,52 @@ fn server_url_pathname(raw: &str, location: &str) -> Result<String, ExtractError
         .map(|(head, _)| head)
         .unwrap_or(without_fragment);
 
-    let pathname = if let Some(scheme_sep) = without_query.find("://") {
-        let after_scheme = &without_query[scheme_sep + 3..];
-        pathname_after_authority(after_scheme)
-    } else if let Some(rest) = without_query.strip_prefix("//") {
-        // Scheme-relative URL: //host/path
-        pathname_after_authority(rest)
-    } else if without_query.starts_with('/') {
-        without_query.to_string()
-    } else {
+    if without_query.split('/').any(is_url_dot_segment) {
         return Err(ExtractError::MalformedExtension {
-            which: "servers",
-            error: format!(
-                "{location} must be an absolute URI or an absolute-path reference so a safe request pathname can be derived (got '{raw}')"
-            ),
+            which: error_surface,
+            error: format!("{location} contains a '.' or '..' path segment"),
         });
-    };
-
-    validate_safe_server_pathname(&pathname, location)
-}
-
-fn pathname_after_authority(after_scheme: &str) -> String {
-    if after_scheme.is_empty() {
-        return SERVER_BASE_ROOT.to_string();
     }
-    let path_offset = if after_scheme.starts_with('[') {
-        // IPv6 authority: [host]:port/path
-        match after_scheme.find(']') {
-            Some(end) => {
-                let rest = &after_scheme[end + 1..];
-                rest.find('/').map(|i| end + 1 + i)
-            }
-            None => after_scheme.find('/'),
-        }
+
+    let parsed = if without_query.starts_with("//") {
+        Url::parse(&format!("http:{without_query}"))
     } else {
-        after_scheme.find('/')
-    };
-    match path_offset {
-        Some(i) => after_scheme[i..].to_string(),
-        None => SERVER_BASE_ROOT.to_string(),
+        match Url::parse(without_query) {
+            Ok(absolute) => Ok(absolute),
+            Err(url::ParseError::RelativeUrlWithoutBase) => Url::parse("http://ferrum.invalid/")
+                .and_then(|base| base.join(without_query)),
+            Err(error) => Err(error),
+        }
     }
+    .map_err(|error| ExtractError::MalformedExtension {
+        which: error_surface,
+        error: format!("{location} is not a valid server URL: {error}"),
+    })?;
+    if parsed.cannot_be_a_base() {
+        return Err(ExtractError::MalformedExtension {
+            which: error_surface,
+            error: format!("{location} does not identify a hierarchical request path"),
+        });
+    }
+
+    validate_safe_server_pathname(parsed.path(), location, error_surface)
 }
 
-fn validate_safe_server_pathname(pathname: &str, location: &str) -> Result<String, ExtractError> {
+fn is_url_dot_segment(segment: &str) -> bool {
+    matches!(
+        segment.to_ascii_lowercase().as_str(),
+        "." | ".." | "%2e" | ".%2e" | "%2e." | "%2e%2e"
+    )
+}
+
+fn validate_safe_server_pathname(
+    pathname: &str,
+    location: &str,
+    error_surface: &'static str,
+) -> Result<String, ExtractError> {
     if pathname.is_empty() || !pathname.starts_with('/') {
         return Err(ExtractError::MalformedExtension {
-            which: "servers",
+            which: error_surface,
             error: format!(
                 "{location} pathname must be an absolute path starting with '/' (got '{pathname}')"
             ),
@@ -1211,7 +1234,7 @@ fn validate_safe_server_pathname(pathname: &str, location: &str) -> Result<Strin
     }
     if pathname.chars().any(|ch| ch.is_control() || ch == '\\') {
         return Err(ExtractError::MalformedExtension {
-            which: "servers",
+            which: error_surface,
             error: format!("{location} pathname contains control characters or backslashes"),
         });
     }
@@ -1221,18 +1244,13 @@ fn validate_safe_server_pathname(pathname: &str, location: &str) -> Result<Strin
 
     // Normalize trailing slash on non-root bases so joins use a single slash boundary.
     let trimmed = pathname.trim_end_matches('/');
-    // Reject empty segments (`//`) and `.` / `..` segments without normalizing them
-    // away — normalization would create a bypass relative to the wire request path.
+    // Dot-segment input is rejected before URL parsing so parser normalization
+    // cannot silently change the matcher. Empty segments remain literal and
+    // safe because the generated operation regex is fully anchored.
     for segment in trimmed.split('/').skip(1) {
-        if segment.is_empty() {
-            return Err(ExtractError::MalformedExtension {
-                which: "servers",
-                error: format!("{location} pathname '{pathname}' contains an empty path segment"),
-            });
-        }
         if segment == "." || segment == ".." {
             return Err(ExtractError::MalformedExtension {
-                which: "servers",
+                which: error_surface,
                 error: format!(
                     "{location} pathname '{pathname}' contains a '.' or '..' segment and cannot produce a safe absolute request path"
                 ),

@@ -668,7 +668,32 @@ fn traversal_like_server_pathname_fails_closed() {
 }
 
 #[test]
-fn relative_non_absolute_server_url_fails_closed() {
+fn percent_encoded_traversal_server_pathname_fails_closed() {
+    let spec = format!(
+        r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "Encoded Traversal", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "servers": [{{"url": "/v1/%2e%2E/admin"}}],
+  "paths": {{
+    "/pets": {{
+      "get": {{"responses": {{"200": {{"description": "ok"}}}}}}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+
+    let err = extract_err(&spec);
+    assert!(
+        matches!(err, ExtractError::MalformedExtension { which: "servers", .. }),
+        "percent-encoded traversal pathname must fail closed: {err}"
+    );
+}
+
+#[test]
+fn relative_non_absolute_server_url_resolves_from_synthetic_document_root() {
     let spec = format!(
         r##"{{
   "openapi": "3.1.0",
@@ -685,10 +710,64 @@ fn relative_non_absolute_server_url_fails_closed() {
         proxy = proxy_block()
     );
 
+    let config = extract_validator_config(&spec);
+    assert_eq!(
+        op_templates(&config),
+        vec![(
+            "GET".to_string(),
+            "/v1/pets".to_string(),
+            "^/v1/pets$".to_string()
+        )]
+    );
+}
+
+#[test]
+fn malformed_absolute_server_authority_fails_closed() {
+    let spec = format!(
+        r##"{{
+  "openapi": "3.1.0",
+  "info": {{"title": "Malformed Authority", "version": "1.0.0"}},
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "servers": [{{"url": "https://[::1/v1"}}],
+  "paths": {{
+    "/pets": {{
+      "get": {{"responses": {{"200": {{"description": "ok"}}}}}}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+
     let err = extract_err(&spec);
     assert!(
         matches!(err, ExtractError::MalformedExtension { which: "servers", .. }),
-        "non-absolute relative URL must fail closed: {err}"
+        "malformed absolute authority must fail closed: {err}"
+    );
+}
+
+#[test]
+fn swagger_base_path_rejects_absolute_url() {
+    let spec = format!(
+        r##"{{
+  "swagger": "2.0",
+  "info": {{"title": "Bad Swagger Base", "version": "1.0.0"}},
+  "basePath": "https://api.example.com/v1",
+  "x-ferrum-validate": true,
+  "x-ferrum-proxy": {proxy},
+  "paths": {{
+    "/pets": {{
+      "get": {{"responses": {{"200": {{"description": "ok"}}}}}}
+    }}
+  }}
+}}"##,
+        proxy = proxy_block()
+    );
+
+    let err = extract_err(&spec);
+    assert!(
+        matches!(err, ExtractError::MalformedExtension { which: "basePath", .. }),
+        "Swagger basePath absolute URL must fail closed: {err}"
     );
 }
 

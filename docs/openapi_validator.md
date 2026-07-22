@@ -54,10 +54,10 @@ The importer generates a proxy-scoped `openapi_validator` plugin, resolves local
 OpenAPI path keys are relative to the applicable Server Object; Swagger 2.0 path keys are relative to `basePath`. The importer prepends the effective server pathname when generating each operation's `path_template` and `path_regex`, so runtime matching against the full inbound URI path stays consistent across HTTP/1.x, HTTP/2, and HTTP/3:
 
 - **Precedence (OpenAPI 3.x):** operation-level `servers` override Path Item `servers`, which override root `servers`. Absence at a narrower scope inherits the next outer scope. Swagger 2.0 uses document `basePath` only.
-- **Pathname only:** relative absolute-path URLs (`/v1`) and absolute / scheme-relative URIs contribute only the pathname. Scheme, authority, query, and fragment never enter the matcher.
+- **Pathname only:** absolute-path references (`/v1`), relative references (`v1`), and absolute / scheme-relative URIs contribute only the pathname. Because uploaded specs have no document URL, relative references resolve from a synthetic document root. Scheme, authority, query, and fragment never enter the matcher.
 - **Variables:** `{name}` placeholders use the Server Variable Object `default` only. Declared `enum` values are not expanded into additional matchers. Missing defaults, defaults outside `enum`, malformed braces, and defaults containing `{`, `}`, `?`, or `#` fail closed at import.
 - **Multiple servers:** one generated operation entry per distinct effective pathname, in document order, with equivalent pathnames deduplicated. Root-only servers (`https://api.example.com`) and absent servers keep raw Paths-key matching.
-- **Joining:** exactly one slash boundary between base and Paths key; Paths-key `/` under a non-root base yields the base itself. Empty segments and `.` / `..` segments in server pathnames fail closed rather than normalizing into a bypass.
+- **Joining:** exactly one slash boundary between base and Paths key; Paths-key `/` under a non-root base yields the base itself. Raw or percent-encoded `.` / `..` segments fail closed before URL parsing can normalize them. Empty segments remain literal and safe because generated operation regexes are fully anchored.
 - **Path Item `$ref`:** effective `servers` on the resolved Path Item (including sibling overlays) participate in the same precedence rules.
 
 Local reference forms resolved at import time:
