@@ -49,6 +49,17 @@ paths:
 
 The importer generates a proxy-scoped `openapi_validator` plugin, resolves local Path Item and schema `$ref`s, converts Swagger 2.0 and OpenAPI 3.0 schemas to Draft 7-compatible JSON Schema, and keeps OpenAPI 3.1+ schemas on Draft 2020-12.
 
+### Server base paths
+
+OpenAPI path keys are relative to the applicable Server Object; Swagger 2.0 path keys are relative to `basePath`. The importer prepends the effective server pathname when generating each operation's `path_template` and `path_regex`, so runtime matching against the full inbound URI path stays consistent across HTTP/1.x, HTTP/2, and HTTP/3:
+
+- **Precedence (OpenAPI 3.x):** operation-level `servers` override Path Item `servers`, which override root `servers`. Absence at a narrower scope inherits the next outer scope. Swagger 2.0 uses document `basePath` only.
+- **Pathname only:** relative absolute-path URLs (`/v1`) and absolute / scheme-relative URIs contribute only the pathname. Scheme, authority, query, and fragment never enter the matcher.
+- **Variables:** `{name}` placeholders use the Server Variable Object `default` only. Declared `enum` values are not expanded into additional matchers. Missing defaults, defaults outside `enum`, malformed braces, and defaults containing `{`, `}`, `?`, or `#` fail closed at import.
+- **Multiple servers:** one generated operation entry per distinct effective pathname, in document order, with equivalent pathnames deduplicated. Root-only servers (`https://api.example.com`) and absent servers keep raw Paths-key matching.
+- **Joining:** exactly one slash boundary between base and Paths key; Paths-key `/` under a non-root base yields the base itself. Empty segments and `.` / `..` segments in server pathnames fail closed rather than normalizing into a bypass.
+- **Path Item `$ref`:** effective `servers` on the resolved Path Item (including sibling overlays) participate in the same precedence rules.
+
 Local reference forms resolved at import time:
 
 - **Path Item Object `$ref`** (Swagger 2.0 and OpenAPI 3.x): references such as `#/components/pathItems/Pets` or `#/paths/~1shared` are resolved before HTTP methods are enumerated, so reusable Path Item definitions contribute operations to the generated table. Sibling Path Item fields overlay the referenced object (OpenAPI leaves conflicts undefined; Ferrum uses sibling-wins). External Path Item refs, unresolved local Path Item refs, and cyclic/deep Path Item chains fail closed with the same `UnsupportedExternalRef` / `SchemaReference` / `SchemaTooDeep` admission errors as schema refs.
@@ -162,7 +173,7 @@ The generated plugin config has this shape:
 | `fail_on_missing_response_schema` | `false` | Reject responses whose status/content type has no schema and no `default` schema. |
 | `max_body_bytes` | `1048576` | Maximum raw body size and per-layer decoded size while undoing `Content-Encoding` chains. |
 | `schema_draft` | generated | Sole authoritative draft selector: `draft7`, `draft2020-12`, or `auto`. Emitted only at the top level; operations do not carry a draft field. |
-| `operations` | required | Generated per-operation schema table. Request and response media schemas are ordinary JSON Schema objects or OpenAPI 3.1 boolean schemas (`true` / `false`). |
+| `operations` | required | Generated per-operation schema table. Each entry's `path_template` / `path_regex` include the effective server/`basePath` pathname (one entry per distinct server pathname). Request and response media schemas are ordinary JSON Schema objects or OpenAPI 3.1 boolean schemas (`true` / `false`). |
 | `bypass.paths` | `[]` | Regexes that skip validation when the request path matches. |
 | `bypass.methods` | `[]` | HTTP methods that skip validation. |
 | `bypass.consumers` | `[]` | Authenticated identities or mapped consumer usernames that skip validation. |

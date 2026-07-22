@@ -16927,14 +16927,19 @@ components:
           description: Uppercase HTTP method.
         path_template:
           type: string
-          description: OpenAPI path template, used for metadata and path specificity ordering.
+          description: >-
+            Effective OpenAPI path template used for metadata and path specificity
+            ordering. When generated from a spec, this is the Paths key joined to the
+            effective Server Object pathname (OpenAPI 3.x) or Swagger `basePath`, with
+            one entry per distinct server pathname when multiple servers apply.
         path_regex:
           type: string
           description: >-
-            Regex used to match the request path, compiled at plugin load.
-            Auto-generated specs derive it from the path template; operator-supplied
-            patterns are automatically anchored as `^(?:...)$` (full-path match) so a
-            loose pattern cannot substring-match an unintended superstring path.
+            Regex used to match the full inbound request path, compiled at plugin load.
+            Auto-generated specs derive it from the effective path template (including
+            server/`basePath` prefix); operator-supplied patterns are automatically
+            anchored as `^(?:...)$` (full-path match) so a loose pattern cannot
+            substring-match an unintended superstring path.
         operation_label:
           type: string
           description: Optional metadata label. Defaults to "`METHOD path_template`".

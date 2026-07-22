@@ -9,5 +9,6 @@ mod admin_validation_tests;
 mod api_specs_path_item_ref_tests;
 mod api_specs_readonly_required_tests;
 mod api_specs_schema_anchor_tests;
+mod api_specs_server_base_path_tests;
 mod mesh_remote_clusters_tests;
 mod openapi_validator_generated_config_contract_tests;

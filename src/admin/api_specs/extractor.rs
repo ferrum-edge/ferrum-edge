@@ -837,6 +837,15 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
         return Ok(Vec::new());
     };
     let resolver = LocalSchemaResolver::build(root, version)?;
+    let root_server_bases = if version == "2.0" {
+        swagger_base_path_bases(root)?
+    } else {
+        // Absent root `servers` inherits raw Paths-key matching (no base prefix).
+        match openapi_server_bases(root.get("servers"), "servers")? {
+            None => vec![SERVER_BASE_ROOT.to_string()],
+            Some(bases) => bases,
+        }
+    };
     let mut operations = Vec::new();
     // Draft selection is emitted once on the top-level openapi_validator config
     // (`schema_draft`). Runtime compiles every operation with that selector;
@@ -845,6 +854,8 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
         // Resolve Path Item `$ref` (including `components.pathItems` and chained
         // local refs) before looking up HTTP method keys. Without this step,
         // referenced operations never enter the generated validator table.
+        // Sibling Path Item fields (including `servers`) overlay the referenced
+        // object, so effective servers on resolved Path Items remain correct.
         let resolved_path_item = resolve_path_item(
             root,
             path_item,
@@ -856,9 +867,32 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
         let Some(path_object) = resolved_path_item.as_object() else {
             continue;
         };
+        let path_item_bases = if version == "2.0" {
+            None
+        } else {
+            openapi_server_bases(
+                path_object.get("servers"),
+                &format!("paths.{path_template}.servers"),
+            )?
+        };
         for method in HTTP_METHODS {
             let Some(operation) = path_object.get(*method).and_then(Value::as_object) else {
                 continue;
+            };
+            let effective_bases = if version == "2.0" {
+                root_server_bases.clone()
+            } else {
+                // Operation servers > Path Item servers > root servers.
+                // Absence at a narrower scope inherits the next outer scope.
+                match openapi_server_bases(
+                    operation.get("servers"),
+                    &format!("paths.{path_template}.{method}.servers"),
+                )? {
+                    Some(bases) => bases,
+                    None => path_item_bases
+                        .clone()
+                        .unwrap_or_else(|| root_server_bases.clone()),
+                }
             };
             let request_body = if version == "2.0" {
                 extract_swagger_request_body(root, path_object, operation, version, &resolver)?
@@ -870,30 +904,369 @@ fn extract_operation_schemas(root: &Value, version: &str) -> Result<Vec<Value>, 
             } else {
                 extract_openapi_responses(root, operation, version, &resolver)?
             };
-            let mut entry = Map::new();
-            entry.insert(
-                "method".to_string(),
-                Value::String(method.to_ascii_uppercase()),
-            );
-            entry.insert(
-                "path_template".to_string(),
-                Value::String(path_template.clone()),
-            );
-            entry.insert(
-                "path_regex".to_string(),
-                Value::String(path_template_to_regex(path_template)?),
-            );
-            if let Some((required, content)) = request_body {
-                entry.insert("request_required".to_string(), Value::Bool(required));
-                entry.insert("request_body".to_string(), json!({ "content": content }));
+
+            // One matcher per distinct effective pathname. Equivalent server
+            // pathnames are deduplicated while preserving document order.
+            let mut seen_templates = HashSet::new();
+            for base in &effective_bases {
+                let effective_template = join_server_base_and_path(base, path_template)?;
+                if !seen_templates.insert(effective_template.clone()) {
+                    continue;
+                }
+                let mut entry = Map::new();
+                entry.insert(
+                    "method".to_string(),
+                    Value::String(method.to_ascii_uppercase()),
+                );
+                entry.insert(
+                    "path_template".to_string(),
+                    Value::String(effective_template.clone()),
+                );
+                entry.insert(
+                    "path_regex".to_string(),
+                    Value::String(path_template_to_regex(&effective_template)?),
+                );
+                if let Some((required, content)) = &request_body {
+                    entry.insert("request_required".to_string(), Value::Bool(*required));
+                    entry.insert(
+                        "request_body".to_string(),
+                        json!({ "content": content.clone() }),
+                    );
+                }
+                if !responses.is_empty() {
+                    entry.insert("responses".to_string(), Value::Object(responses.clone()));
+                }
+                operations.push(Value::Object(entry));
             }
-            if !responses.is_empty() {
-                entry.insert("responses".to_string(), Value::Object(responses));
-            }
-            operations.push(Value::Object(entry));
         }
     }
     Ok(operations)
+}
+
+/// Sentinel / normalized root server pathname: join leaves the Paths key unchanged.
+const SERVER_BASE_ROOT: &str = "/";
+
+/// Swagger 2.0 `basePath` → effective server pathname bases for operation matchers.
+fn swagger_base_path_bases(root: &Value) -> Result<Vec<String>, ExtractError> {
+    match root.get("basePath") {
+        None => Ok(vec![SERVER_BASE_ROOT.to_string()]),
+        Some(Value::Null) => Ok(vec![SERVER_BASE_ROOT.to_string()]),
+        Some(Value::String(base_path)) => {
+            if base_path.is_empty() || base_path == "/" {
+                return Ok(vec![SERVER_BASE_ROOT.to_string()]);
+            }
+            let pathname = server_url_pathname(base_path, "basePath")?;
+            Ok(vec![pathname])
+        }
+        Some(_) => Err(ExtractError::MalformedExtension {
+            which: "basePath",
+            error: "basePath must be a string".to_string(),
+        }),
+    }
+}
+
+/// OpenAPI 3.x `servers` → distinct effective pathnames, or `None` when absent (inherit).
+///
+/// Explicit empty arrays fail closed. Each server URL contributes only its pathname
+/// (authority, scheme, query, and fragment never enter matchers). Server variables
+/// are substituted with declared defaults only — enum members are not explored.
+fn openapi_server_bases(
+    servers: Option<&Value>,
+    location: &str,
+) -> Result<Option<Vec<String>>, ExtractError> {
+    let Some(servers) = servers else {
+        return Ok(None);
+    };
+    let Some(entries) = servers.as_array() else {
+        return Err(ExtractError::MalformedExtension {
+            which: "servers",
+            error: format!("{location} must be an array of Server Objects"),
+        });
+    };
+    if entries.is_empty() {
+        return Err(ExtractError::MalformedExtension {
+            which: "servers",
+            error: format!("{location} must not be an empty array"),
+        });
+    }
+
+    let mut bases = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(object) = entry.as_object() else {
+            return Err(ExtractError::MalformedExtension {
+                which: "servers",
+                error: format!("{location}[{index}] must be a Server Object"),
+            });
+        };
+        let url = object
+            .get("url")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ExtractError::MalformedExtension {
+                which: "servers",
+                error: format!("{location}[{index}].url is required and must be a string"),
+            })?;
+        let substituted = substitute_server_variables(
+            url,
+            object.get("variables"),
+            &format!("{location}[{index}]"),
+        )?;
+        let pathname = server_url_pathname(&substituted, &format!("{location}[{index}].url"))?;
+        if seen.insert(pathname.clone()) {
+            bases.push(pathname);
+        }
+    }
+    Ok(Some(bases))
+}
+
+/// Substitute `{variable}` placeholders using Server Variable Object defaults.
+fn substitute_server_variables(
+    url: &str,
+    variables: Option<&Value>,
+    location: &str,
+) -> Result<String, ExtractError> {
+    let variable_map = match variables {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(map)) => Some(map),
+        Some(_) => {
+            return Err(ExtractError::MalformedExtension {
+                which: "servers",
+                error: format!("{location}.variables must be an object"),
+            });
+        }
+    };
+
+    let mut out = String::with_capacity(url.len());
+    let mut chars = url.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '{' {
+            out.push(ch);
+            continue;
+        }
+        let mut name = String::new();
+        let mut closed = false;
+        for inner in chars.by_ref() {
+            if inner == '}' {
+                closed = true;
+                break;
+            }
+            if inner == '{' {
+                return Err(ExtractError::MalformedExtension {
+                    which: "servers",
+                    error: format!("{location}.url has nested or malformed server variables"),
+                });
+            }
+            name.push(inner);
+        }
+        if !closed {
+            return Err(ExtractError::MalformedExtension {
+                which: "servers",
+                error: format!("{location}.url has an unclosed server variable"),
+            });
+        }
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ExtractError::MalformedExtension {
+                which: "servers",
+                error: format!("{location}.url has an empty server variable name"),
+            });
+        }
+        let Some(vars) = variable_map else {
+            return Err(ExtractError::MalformedExtension {
+                which: "servers",
+                error: format!(
+                    "{location}.url references server variable '{name}' but variables are missing"
+                ),
+            });
+        };
+        let Some(var_obj) = vars.get(name).and_then(Value::as_object) else {
+            return Err(ExtractError::MalformedExtension {
+                which: "servers",
+                error: format!(
+                    "{location}.variables.{name} is required for substitution in url"
+                ),
+            });
+        };
+        let Some(default) = var_obj.get("default").and_then(Value::as_str) else {
+            return Err(ExtractError::MalformedExtension {
+                which: "servers",
+                error: format!(
+                    "{location}.variables.{name}.default is required and must be a string"
+                ),
+            });
+        };
+        if let Some(enum_values) = var_obj.get("enum") {
+            let Some(enum_arr) = enum_values.as_array() else {
+                return Err(ExtractError::MalformedExtension {
+                    which: "servers",
+                    error: format!("{location}.variables.{name}.enum must be an array"),
+                });
+            };
+            let allowed: Vec<&str> = enum_arr.iter().filter_map(Value::as_str).collect();
+            if allowed.len() != enum_arr.len() {
+                return Err(ExtractError::MalformedExtension {
+                    which: "servers",
+                    error: format!(
+                        "{location}.variables.{name}.enum entries must be strings"
+                    ),
+                });
+            }
+            if !allowed.is_empty() && !allowed.contains(&default) {
+                return Err(ExtractError::MalformedExtension {
+                    which: "servers",
+                    error: format!(
+                        "{location}.variables.{name}.default must be one of the declared enum values"
+                    ),
+                });
+            }
+        }
+        if default.contains(['{', '}', '?', '#']) {
+            return Err(ExtractError::MalformedExtension {
+                which: "servers",
+                error: format!(
+                    "{location}.variables.{name}.default contains characters that cannot be safely substituted into a server URL"
+                ),
+            });
+        }
+        out.push_str(default);
+    }
+    Ok(out)
+}
+
+/// Extract the pathname from a relative or absolute server URL / Swagger basePath.
+///
+/// Authority, scheme, query, and fragment never enter the matcher. The pathname is
+/// kept literally (no percent-decoding, no `.`/`..` resolution) so encoded or
+/// traversal-like text cannot create a validation bypass.
+fn server_url_pathname(raw: &str, location: &str) -> Result<String, ExtractError> {
+    if raw.is_empty() {
+        return Err(ExtractError::MalformedExtension {
+            which: "servers",
+            error: format!("{location} must not be empty"),
+        });
+    }
+    if raw.chars().any(|ch| ch.is_control() || ch == '\\') {
+        return Err(ExtractError::MalformedExtension {
+            which: "servers",
+            error: format!("{location} contains control characters or backslashes"),
+        });
+    }
+
+    let without_fragment = raw.split_once('#').map(|(head, _)| head).unwrap_or(raw);
+    let without_query = without_fragment
+        .split_once('?')
+        .map(|(head, _)| head)
+        .unwrap_or(without_fragment);
+
+    let pathname = if let Some(scheme_sep) = without_query.find("://") {
+        let after_scheme = &without_query[scheme_sep + 3..];
+        pathname_after_authority(after_scheme)
+    } else if let Some(rest) = without_query.strip_prefix("//") {
+        // Scheme-relative URL: //host/path
+        pathname_after_authority(rest)
+    } else if without_query.starts_with('/') {
+        without_query.to_string()
+    } else {
+        return Err(ExtractError::MalformedExtension {
+            which: "servers",
+            error: format!(
+                "{location} must be an absolute URI or an absolute-path reference so a safe request pathname can be derived (got '{raw}')"
+            ),
+        });
+    };
+
+    validate_safe_server_pathname(&pathname, location)
+}
+
+fn pathname_after_authority(after_scheme: &str) -> String {
+    if after_scheme.is_empty() {
+        return SERVER_BASE_ROOT.to_string();
+    }
+    let path_offset = if after_scheme.starts_with('[') {
+        // IPv6 authority: [host]:port/path
+        match after_scheme.find(']') {
+            Some(end) => {
+                let rest = &after_scheme[end + 1..];
+                rest.find('/').map(|i| end + 1 + i)
+            }
+            None => after_scheme.find('/'),
+        }
+    } else {
+        after_scheme.find('/')
+    };
+    match path_offset {
+        Some(i) => after_scheme[i..].to_string(),
+        None => SERVER_BASE_ROOT.to_string(),
+    }
+}
+
+fn validate_safe_server_pathname(pathname: &str, location: &str) -> Result<String, ExtractError> {
+    if pathname.is_empty() || !pathname.starts_with('/') {
+        return Err(ExtractError::MalformedExtension {
+            which: "servers",
+            error: format!(
+                "{location} pathname must be an absolute path starting with '/' (got '{pathname}')"
+            ),
+        });
+    }
+    if pathname.chars().any(|ch| ch.is_control() || ch == '\\') {
+        return Err(ExtractError::MalformedExtension {
+            which: "servers",
+            error: format!("{location} pathname contains control characters or backslashes"),
+        });
+    }
+    if pathname == "/" {
+        return Ok(SERVER_BASE_ROOT.to_string());
+    }
+
+    // Normalize trailing slash on non-root bases so joins use a single slash boundary.
+    let trimmed = pathname.trim_end_matches('/');
+    // Reject empty segments (`//`) and `.` / `..` segments without normalizing them
+    // away — normalization would create a bypass relative to the wire request path.
+    for segment in trimmed.split('/').skip(1) {
+        if segment.is_empty() {
+            return Err(ExtractError::MalformedExtension {
+                which: "servers",
+                error: format!("{location} pathname '{pathname}' contains an empty path segment"),
+            });
+        }
+        if segment == "." || segment == ".." {
+            return Err(ExtractError::MalformedExtension {
+                which: "servers",
+                error: format!(
+                    "{location} pathname '{pathname}' contains a '.' or '..' segment and cannot produce a safe absolute request path"
+                ),
+            });
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Join a server/base pathname with an OpenAPI Paths key.
+///
+/// Root / no-path servers (`/`) preserve raw Paths-key matching. Otherwise the
+/// join uses exactly one slash boundary; the Paths-key root `/` yields the base
+/// itself. Query/fragment never appear — Paths keys and bases are path-only.
+fn join_server_base_and_path(base: &str, path_key: &str) -> Result<String, ExtractError> {
+    if path_key.is_empty() || !path_key.starts_with('/') {
+        return Err(ExtractError::MalformedExtension {
+            which: "paths",
+            error: format!("OpenAPI path key '{path_key}' must be an absolute path"),
+        });
+    }
+    if path_key.contains(['?', '#']) {
+        return Err(ExtractError::MalformedExtension {
+            which: "paths",
+            error: format!("OpenAPI path key '{path_key}' must not contain query or fragment"),
+        });
+    }
+    if base == SERVER_BASE_ROOT {
+        return Ok(path_key.to_string());
+    }
+    if path_key == "/" {
+        return Ok(base.to_string());
+    }
+    Ok(format!("{base}{path_key}"))
 }
 
 /// Resolve a Path Item Object that may be supplied through a local `$ref`.
