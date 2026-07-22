@@ -460,6 +460,9 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
         )
     );
     assert!(output.contains(
+        "ferrum_node_agent_cni_socket_lifecycle_total{reason=\"handoff_publication_error\"} 0"
+    ));
+    assert!(output.contains(
         "ferrum_node_agent_cni_socket_lifecycle_total{reason=\"shutdown_cleanup_error\"} 0"
     ));
     assert!(output.contains("# TYPE ferrum_node_agent_capture_state gauge"));

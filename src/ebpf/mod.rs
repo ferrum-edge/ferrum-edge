@@ -293,8 +293,8 @@ pub struct NodeAgentMetrics {
     pub cni_calls: [[AtomicU64; 3]; 3],
     /// CNI socket lifecycle failures split by a closed reason set. These
     /// process-lifetime counters distinguish a refused live-owner overlap from
-    /// stale cleanup, publication identity, and shutdown cleanup failures.
-    pub cni_socket_lifecycle: [AtomicU64; 5],
+    /// stale cleanup, publication/identity, and shutdown cleanup failures.
+    pub cni_socket_lifecycle: [AtomicU64; 6],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,7 +313,7 @@ pub struct NodeAgentMetricsSnapshot {
     pub cni_calls: [[u64; 3]; 3],
     /// Snapshot of [`NodeAgentMetrics::cni_socket_lifecycle`], indexed by
     /// [`CniSocketLifecycleReason`].
-    pub cni_socket_lifecycle: [u64; 5],
+    pub cni_socket_lifecycle: [u64; 6],
 }
 
 /// Closed set of verbs tracked by [`NodeAgentMetrics::cni_calls`].
@@ -371,7 +371,8 @@ pub enum CniSocketLifecycleReason {
     OwnershipIoError = 1,
     StaleSocketCleanupError = 2,
     HandoffIdentityError = 3,
-    ShutdownCleanupError = 4,
+    HandoffPublicationError = 4,
+    ShutdownCleanupError = 5,
 }
 
 impl CniSocketLifecycleReason {
@@ -381,16 +382,18 @@ impl CniSocketLifecycleReason {
             Self::OwnershipIoError => "ownership_io_error",
             Self::StaleSocketCleanupError => "stale_socket_cleanup_error",
             Self::HandoffIdentityError => "handoff_identity_error",
+            Self::HandoffPublicationError => "handoff_publication_error",
             Self::ShutdownCleanupError => "shutdown_cleanup_error",
         }
     }
 
-    pub fn all() -> [Self; 5] {
+    pub fn all() -> [Self; 6] {
         [
             Self::OwnershipConflict,
             Self::OwnershipIoError,
             Self::StaleSocketCleanupError,
             Self::HandoffIdentityError,
+            Self::HandoffPublicationError,
             Self::ShutdownCleanupError,
         ]
     }
@@ -405,7 +408,7 @@ impl NodeAgentMetrics {
                     self.cni_calls[verb as usize][outcome as usize].load(Ordering::Relaxed);
             }
         }
-        let mut cni_socket_lifecycle = [0u64; 5];
+        let mut cni_socket_lifecycle = [0u64; 6];
         for reason in CniSocketLifecycleReason::all() {
             cni_socket_lifecycle[reason as usize] =
                 self.cni_socket_lifecycle[reason as usize].load(Ordering::Relaxed);
@@ -480,6 +483,7 @@ impl Default for NodeAgentMetrics {
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             ],
             cni_socket_lifecycle: [
+                AtomicU64::new(0),
                 AtomicU64::new(0),
                 AtomicU64::new(0),
                 AtomicU64::new(0),

@@ -255,9 +255,13 @@ pub fn spawn_cni_listener(
             }
         };
         if let Err(err) = std::fs::rename(&stage.socket_path, &socket_path) {
+            metrics.record_cni_socket_lifecycle(
+                crate::ebpf::CniSocketLifecycleReason::HandoffPublicationError,
+            );
             error!(
                 socket_path = %socket_path,
                 error = %err,
+                reason = "handoff_publication_error",
                 "Failed to publish node-agent CNI socket; CNI plugin path will fall back to kube-rs watcher"
             );
             cleanup_private_socket_stage(&stage);

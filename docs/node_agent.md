@@ -506,9 +506,10 @@ The chart writes the file at a numeric prefix (`00-`) so kubelet selects the gen
 Socket lifecycle failures use
 `ferrum_node_agent_cni_socket_lifecycle_total{reason}` with the closed reasons
 `ownership_conflict`, `ownership_io_error`, `stale_socket_cleanup_error`,
-`handoff_identity_error`, and `shutdown_cleanup_error`. The corresponding
-structured log carries the same `reason`; an ownership conflict is an explicit
-startup refusal, not stale-file recovery.
+`handoff_identity_error`, `handoff_publication_error`, and
+`shutdown_cleanup_error`. The corresponding structured log carries the same
+`reason`; an ownership conflict is an explicit startup refusal, not stale-file
+recovery.
 
 ### Deferred follow-ups (not in scope for this PR)
 
