@@ -1680,12 +1680,19 @@ impl Plugin for SoapWsSecurity {
             };
         }
 
+        // Keep authenticated identities local until every validation that
+        // borrows the decoded request body has completed. Besides avoiding a
+        // mutable borrow of `ctx` while `body` may borrow its raw bytes, this
+        // prevents partially-authenticated metadata from escaping a later
+        // X.509 or SAML rejection.
+        let mut authenticated_username = None;
+        let mut authenticated_saml_subject = None;
+
         // Validate UsernameToken
         if self.username_token_enabled {
             match self.validate_username_token(&security_block) {
                 Ok(username) => {
-                    ctx.metadata
-                        .insert("soap_ws_username".to_string(), username);
+                    authenticated_username = Some(username);
                     debug!(
                         content_type = %content_type,
                         "soap_ws_security: UsernameToken validated"
@@ -1734,10 +1741,7 @@ impl Plugin for SoapWsSecurity {
         if self.saml_enabled {
             match self.validate_saml_assertion(&security_block, envelope, now) {
                 Ok(name_id) => {
-                    if let Some(subject) = name_id {
-                        ctx.metadata
-                            .insert("soap_ws_saml_subject".to_string(), subject);
-                    }
+                    authenticated_saml_subject = name_id;
                     debug!("soap_ws_security: SAML assertion accepted");
                 }
                 Err(e) => {
@@ -1749,6 +1753,15 @@ impl Plugin for SoapWsSecurity {
                     };
                 }
             }
+        }
+
+        if let Some(username) = authenticated_username {
+            ctx.metadata
+                .insert("soap_ws_username".to_string(), username);
+        }
+        if let Some(subject) = authenticated_saml_subject {
+            ctx.metadata
+                .insert("soap_ws_saml_subject".to_string(), subject);
         }
 
         PluginResult::Continue
