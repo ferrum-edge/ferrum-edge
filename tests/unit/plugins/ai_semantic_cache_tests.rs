@@ -3716,12 +3716,8 @@ async fn complex_provider_native_inputs_build_semantic_keys_without_collisions()
         )
         .await;
         assert!(
-            run_before_proxy_get_status(
-                &plugin,
-                &serde_json::to_string(&lookup).unwrap(),
-                None,
-            )
-            .await,
+            run_before_proxy_get_status(&plugin, &serde_json::to_string(&lookup).unwrap(), None,)
+                .await,
             "same-family structured prompt variants should semantic-hit"
         );
     }
