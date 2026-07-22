@@ -3075,10 +3075,7 @@ fn next_content_type_parameter(
     }
 
     let name_start = i;
-    while i < bytes.len()
-        && bytes[i] != b'='
-        && bytes[i] != b';'
-        && !bytes[i].is_ascii_whitespace()
+    while i < bytes.len() && bytes[i] != b'=' && bytes[i] != b';' && !bytes[i].is_ascii_whitespace()
     {
         i += 1;
     }
@@ -3312,15 +3309,14 @@ fn decode_utf16(payload: &[u8], big_endian: bool) -> Result<String, SoapBodyDeco
             if !(0xDC00..=0xDFFF).contains(&low) {
                 return Err(SoapBodyDecodeError::MalformedEncoding);
             }
-            let code =
-                0x10000 + (((u32::from(unit) - 0xD800) << 10) | (u32::from(low) - 0xDC00));
+            let code = 0x10000 + (((u32::from(unit) - 0xD800) << 10) | (u32::from(low) - 0xDC00));
             out.push(char::from_u32(code).ok_or(SoapBodyDecodeError::MalformedEncoding)?);
         } else if (0xDC00..=0xDFFF).contains(&unit) {
             return Err(SoapBodyDecodeError::MalformedEncoding);
         } else {
             // Non-surrogate BMP units are always valid scalar values.
-            let ch = char::from_u32(u32::from(unit))
-                .ok_or(SoapBodyDecodeError::MalformedEncoding)?;
+            let ch =
+                char::from_u32(u32::from(unit)).ok_or(SoapBodyDecodeError::MalformedEncoding)?;
             out.push(ch);
         }
     }

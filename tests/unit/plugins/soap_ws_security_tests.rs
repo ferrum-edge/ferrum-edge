@@ -2573,10 +2573,7 @@ fn decode_rejects_quoted_pair_escape_in_charset() {
     let xml = wrap_soap(&fresh_timestamp());
     let err = soap_decode_xml_body_for_test(xml.as_bytes(), r#"text/xml; charset="utf\-8""#)
         .expect_err("quoted-pair escapes in charset must fail closed");
-    assert!(
-        err.contains("unsupported character encoding"),
-        "got: {err}"
-    );
+    assert!(err.contains("unsupported character encoding"), "got: {err}");
 }
 
 #[test]
@@ -2595,17 +2592,18 @@ fn decode_rejects_semicolon_bearing_quoted_charset_label() {
     let xml = wrap_soap(&fresh_timestamp());
     let err = soap_decode_xml_body_for_test(xml.as_bytes(), r#"text/xml; charset="utf-8;x""#)
         .expect_err("semicolon inside quoted charset label is not a utf-8 label");
-    assert!(
-        err.contains("unsupported character encoding"),
-        "got: {err}"
-    );
+    assert!(err.contains("unsupported character encoding"), "got: {err}");
 }
 
 #[test]
 fn decode_rejects_bomless_charsetless_utf16le_xml() {
     let xml = r#"<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body/></soap:Envelope>"#;
     let bytes = encode_utf16_le_no_bom(xml);
-    assert_eq!(&bytes[..2], &[0x3c, 0x00], "fixture must be BOM-less UTF-16LE '<'");
+    assert_eq!(
+        &bytes[..2],
+        &[0x3c, 0x00],
+        "fixture must be BOM-less UTF-16LE '<'"
+    );
     let err = soap_decode_xml_body_for_test(&bytes, "text/xml")
         .expect_err("BOM-less charset-less UTF-16LE XML must fail closed");
     assert!(err.contains("conflicting or ambiguous"), "got: {err}");
@@ -2618,7 +2616,11 @@ fn decode_rejects_bomless_charsetless_utf16be_xml() {
     for unit in xml.encode_utf16() {
         bytes.extend_from_slice(&unit.to_be_bytes());
     }
-    assert_eq!(&bytes[..2], &[0x00, 0x3c], "fixture must be BOM-less UTF-16BE '<'");
+    assert_eq!(
+        &bytes[..2],
+        &[0x00, 0x3c],
+        "fixture must be BOM-less UTF-16BE '<'"
+    );
     let err = soap_decode_xml_body_for_test(&bytes, "application/soap+xml")
         .expect_err("BOM-less charset-less UTF-16BE XML must fail closed");
     assert!(err.contains("conflicting or ambiguous"), "got: {err}");
@@ -2630,10 +2632,7 @@ fn decode_rejects_bomless_utf16_xml_declared_as_utf8() {
     let le = encode_utf16_le_no_bom(xml);
     let le_err = soap_decode_xml_body_for_test(&le, "text/xml; charset=utf-8")
         .expect_err("UTF-16LE bytes declared as UTF-8 must fail closed");
-    assert!(
-        le_err.contains("conflicting or ambiguous"),
-        "got: {le_err}"
-    );
+    assert!(le_err.contains("conflicting or ambiguous"), "got: {le_err}");
 
     let mut be = Vec::new();
     for unit in xml.encode_utf16() {
@@ -2641,10 +2640,7 @@ fn decode_rejects_bomless_utf16_xml_declared_as_utf8() {
     }
     let be_err = soap_decode_xml_body_for_test(&be, "application/soap+xml; charset=utf-8")
         .expect_err("UTF-16BE bytes declared as UTF-8 must fail closed");
-    assert!(
-        be_err.contains("conflicting or ambiguous"),
-        "got: {be_err}"
-    );
+    assert!(be_err.contains("conflicting or ambiguous"), "got: {be_err}");
 }
 
 #[test]
@@ -2793,7 +2789,10 @@ async fn metadata_text_fallback_validates_utf8_xml_declaration() {
     ctx.metadata
         .insert("request_body".to_string(), body.to_string());
     let mut headers = HashMap::new();
-    headers.insert("content-type".to_string(), "text/xml; charset=utf-8".to_string());
+    headers.insert(
+        "content-type".to_string(),
+        "text/xml; charset=utf-8".to_string(),
+    );
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(is_reject(&result));
     assert_eq!(reject_status(&result), 415);
