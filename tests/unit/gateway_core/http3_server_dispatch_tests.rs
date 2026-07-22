@@ -186,53 +186,86 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .expect("H3 terminal provider dispatch must remain bounded");
     assert!(terminal_dispatch.contains("collect_h3_request_body_with_deadline("));
     assert!(terminal_dispatch.contains("drain_h3_request_body("));
-    for (failure, next_failure, sends_response) in [
-        ("Ok(None)", "H3RequestBodyReadError::Read(error)", true),
-        (
-            "H3RequestBodyReadError::Read(error)",
-            "H3RequestBodyReadError::TimedOut",
-            false,
-        ),
-        (
-            "H3RequestBodyReadError::TimedOut",
-            "H3RequestBodyReadError::DeadlineExceeded",
-            true,
-        ),
-    ] {
-        let branch = terminal_dispatch
-            .split(failure)
-            .nth(1)
-            .unwrap_or_else(|| panic!("missing terminal upload branch: {failure}"))
-            .split(next_failure)
-            .next()
-            .expect("bounded terminal upload branch");
-        assert!(
-            branch.contains("halt_cancelled_h3_upload("),
-            "cancelled terminal H3 uploads must STOP_SENDING before rejection work"
-        );
-        assert_eq!(
-            branch
-                .matches("finalize_h3_terminal_body_read_rejection(")
-                .count(),
-            1
-        );
-        if sends_response {
-            let finalize = branch
-                .find("finalize_h3_terminal_body_read_rejection(")
-                .expect("terminal upload rejection finalizer");
-            let send = branch
-                .find("send_h3_plugin_reject_flavor_aware(")
-                .expect("terminal upload rejection send");
-            assert!(finalize < send);
-            assert!(branch.contains("&rejection.body"));
-            assert!(branch.contains("&rejection.headers"));
-        } else {
-            assert!(
-                !branch.contains("send_h3_plugin_reject_flavor_aware("),
-                "a disconnected H3 stream must finalize cleanup without attempting a write"
-            );
-        }
-    }
+    // Ok(None): idle recv after a completed oversize drain — write first, then halt.
+    // Read: client gone — halt, finalize cleanup, no response write.
+    // TimedOut: mid-recv_data cancel — write under post-deadline grace with
+    // halt_recv=false; STOP_SENDING would unwrap-abort h3-quinn's empty slot.
+    let oversize = terminal_dispatch
+        .split("Ok(None)")
+        .nth(1)
+        .expect("missing terminal upload branch: Ok(None)")
+        .split("H3RequestBodyReadError::Read(error)")
+        .next()
+        .expect("bounded terminal upload branch");
+    assert_eq!(
+        oversize
+            .matches("finalize_h3_terminal_body_read_rejection(")
+            .count(),
+        1
+    );
+    let oversize_finalize = oversize
+        .find("finalize_h3_terminal_body_read_rejection(")
+        .expect("terminal upload rejection finalizer");
+    let oversize_send = oversize
+        .find("send_h3_plugin_reject_flavor_aware(")
+        .expect("terminal upload rejection send");
+    let oversize_halt = oversize
+        .find("halt_cancelled_h3_upload(")
+        .expect("oversize terminal upload must STOP_SENDING after the response");
+    assert!(oversize_finalize < oversize_send && oversize_send < oversize_halt);
+    assert!(oversize.contains("&rejection.body"));
+    assert!(oversize.contains("&rejection.headers"));
+
+    let disconnected = terminal_dispatch
+        .split("H3RequestBodyReadError::Read(error)")
+        .nth(1)
+        .expect("missing terminal upload branch: Read")
+        .split("H3RequestBodyReadError::TimedOut")
+        .next()
+        .expect("bounded terminal upload branch");
+    let disconnected_halt = disconnected
+        .find("halt_cancelled_h3_upload(")
+        .expect("disconnected terminal upload must STOP_SENDING");
+    let disconnected_finalize = disconnected
+        .find("finalize_h3_terminal_body_read_rejection(")
+        .expect("disconnected terminal upload rejection finalizer");
+    assert!(disconnected_halt < disconnected_finalize);
+    assert!(
+        !disconnected.contains("send_h3_plugin_reject_flavor_aware("),
+        "a disconnected H3 stream must finalize cleanup without attempting a write"
+    );
+
+    let timed_out = terminal_dispatch
+        .split("H3RequestBodyReadError::TimedOut")
+        .nth(1)
+        .expect("missing terminal upload branch: TimedOut")
+        .split("H3RequestBodyReadError::DeadlineExceeded")
+        .next()
+        .expect("bounded terminal upload branch");
+    assert_eq!(
+        timed_out
+            .matches("finalize_h3_terminal_body_read_rejection(")
+            .count(),
+        1
+    );
+    let timed_out_finalize = timed_out
+        .find("finalize_h3_terminal_body_read_rejection(")
+        .expect("timed-out terminal upload rejection finalizer");
+    let timed_out_send = timed_out
+        .find("send_h3_plugin_reject_flavor_aware_with_recv_halt(")
+        .expect("timed-out terminal upload must use the recv-halt-aware sender");
+    assert!(timed_out_finalize < timed_out_send);
+    assert!(timed_out.contains("&rejection.body"));
+    assert!(timed_out.contains("&rejection.headers"));
+    assert!(
+        timed_out.contains("false,\n                    )\n                    .await?;"),
+        "timed-out terminal upload must pass halt_recv=false after mid-recv cancel"
+    );
+    assert!(
+        !timed_out.contains("halt_cancelled_h3_upload("),
+        "timed-out mid-recv cancel must not STOP_SENDING the invalid receive slot"
+    );
+
     assert!(terminal_dispatch.contains("H3RequestBodyReadError::DeadlineExceeded"));
     assert!(terminal_dispatch.contains("finalize_h3_upload_deadline_rejection("));
 }
@@ -375,8 +408,13 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
         .find("H3RequestBodyReadError::")
         .map_or(timed_out.len(), |offset| offset + 1);
     let timed_out = &timed_out[..timed_out_end];
-    assert!(timed_out.contains("write_grpc_error_for_request("));
+    assert!(timed_out.contains("write_grpc_error_for_request_with_recv_halt("));
     assert!(timed_out.contains("ctx,"));
+    assert!(
+        timed_out.contains("false,\n                )"),
+        "timed-out bridge upload must skip STOP_SENDING after mid-recv cancel"
+    );
+    assert!(timed_out.contains("await_post_deadline_terminal_response_write("));
     let deadline = body
         .find("H3RequestBodyReadError::DeadlineExceeded")
         .expect("missing deadline upload branch");
@@ -390,7 +428,7 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
     assert!(deadline.contains("log_rejected_request("));
 
     let writer = source
-        .find("async fn write_grpc_error_for_request<S>(")
+        .find("async fn write_grpc_error_for_request_with_recv_halt<S>(")
         .expect("request-aware H3 gRPC error writer must remain present");
     let writer = &source[writer..];
     let writer_end = writer
@@ -398,7 +436,8 @@ fn h3_grpc_web_upload_deadlines_use_request_aware_writer() {
         .expect("request-aware H3 gRPC error writer must remain bounded");
     let writer = &writer[..writer_end];
     assert!(writer.contains("translated_error_response("));
-    assert!(writer.contains("write_reject_with_headers("));
+    assert!(writer.contains("write_reject_with_headers_and_recv_halt("));
+    assert!(writer.contains("write_grpc_error_send_with_policy("));
 }
 
 #[test]

@@ -350,7 +350,7 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
         2,
         "too-large and read bridge exits must STOP_SENDING; cancel exits must not"
     );
-    assert!(bridge.contains("write_grpc_error_send_with_policy("));
+    assert!(bridge.contains("write_grpc_error_for_request_with_recv_halt("));
     assert!(bridge.contains("write_final_body_reject("));
 
     let timed_out = bridge
@@ -363,6 +363,11 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
     assert!(
         !timed_out.contains("halt_request_body(stream)"),
         "timed-out bridge arm must skip STOP_SENDING after mid-recv cancel"
+    );
+    assert!(
+        timed_out.contains("write_grpc_error_for_request_with_recv_halt(")
+            && timed_out.contains("false,"),
+        "timed-out bridge arm must stay request-aware while passing halt_recv=false"
     );
     assert!(
         timed_out.contains("await_post_deadline_terminal_response_write("),

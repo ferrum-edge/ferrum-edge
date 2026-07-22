@@ -4032,17 +4032,20 @@ where
                     current_cb_target_key.as_deref(),
                     cb_retry_probe_slot_available,
                 );
-                // Send-only writer: mid-recv_data cancel leaves h3-quinn's recv
-                // slot None, so STOP_SENDING would unwrap-abort under panic=abort.
-                // Quinn Drop still stops the peer when the stream is released.
-                // Bound the terminal write with the shared post-deadline grace.
-                let write = write_grpc_error_send_with_policy(
+                // Request-aware writer with halt_recv=false: mid-recv_data cancel
+                // leaves h3-quinn's recv slot None, so STOP_SENDING would
+                // unwrap-abort under panic=abort. Quinn Drop still stops the peer
+                // when the stream is released. Keep gRPC-Web trailer-frame shaping
+                // via ctx, and bound the terminal write with the shared grace.
+                let write = write_grpc_error_for_request_with_recv_halt(
                     stream,
+                    ctx,
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     "Request body read timed out",
                     backend_start,
                     0,
                     initial_response_header_policy_plugins,
+                    false,
                 );
                 return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
                     write,
@@ -7313,6 +7316,36 @@ async fn write_grpc_error_for_request<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    write_grpc_error_for_request_with_recv_halt(
+        stream,
+        ctx,
+        grpc_status,
+        grpc_message,
+        backend_start,
+        bytes_sent,
+        initial_response_header_policy_plugins,
+        true,
+    )
+    .await
+}
+
+/// Request-aware gRPC error writer with explicit recv-half control.
+/// Mid-`recv_data` cancel paths pass `halt_recv=false` so STOP_SENDING cannot
+/// unwrap-abort h3-quinn's empty recv slot under `panic = "abort"`.
+#[allow(clippy::too_many_arguments)]
+async fn write_grpc_error_for_request_with_recv_halt<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    grpc_status: u32,
+    grpc_message: &str,
+    backend_start: Instant,
+    bytes_sent: u64,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    halt_recv: bool,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
     if let Some(mut translated) =
         crate::plugins::grpc_web::translated_error_response(ctx, grpc_status, grpc_message)
     {
@@ -7322,26 +7355,39 @@ where
             None,
         );
         crate::proxy::insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, grpc_message);
-        return write_reject_with_headers(
+        return write_reject_with_headers_and_recv_halt(
             stream,
             StatusCode::OK,
             &translated.body,
             &translated.headers,
             backend_start,
             bytes_sent,
+            halt_recv,
         )
         .await;
     }
 
-    write_grpc_error_with_policy(
-        stream,
-        grpc_status,
-        grpc_message,
-        backend_start,
-        bytes_sent,
-        initial_response_header_policy_plugins,
-    )
-    .await
+    if halt_recv {
+        write_grpc_error_with_policy(
+            stream,
+            grpc_status,
+            grpc_message,
+            backend_start,
+            bytes_sent,
+            initial_response_header_policy_plugins,
+        )
+        .await
+    } else {
+        write_grpc_error_send_with_policy(
+            stream,
+            grpc_status,
+            grpc_message,
+            backend_start,
+            bytes_sent,
+            initial_response_header_policy_plugins,
+        )
+        .await
+    }
 }
 
 /// Send-only gRPC error writer: writes the trailers-only gRPC error

@@ -707,6 +707,12 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
     let plugin_reject_sends = source
         .matches("send_h3_plugin_reject_flavor_aware(")
         .count();
+    // TimedOut terminal uploads call the recv-halt variant directly (halt_recv=
+    // false). Exclude its definition and the thin aware() wrapper's internal call.
+    let direct_recv_halt_plugin_rejects = source
+        .matches("send_h3_plugin_reject_flavor_aware_with_recv_halt(")
+        .count()
+        .saturating_sub(2);
     let terminal_finalizer = source
         .split("async fn finalize_h3_terminal_body_read_rejection(")
         .nth(1)
@@ -749,7 +755,7 @@ fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
             + shared_terminal_reject_sends;
     assert_eq!(
         effective_plugin_committed_boundaries,
-        plugin_reject_sends + 1,
+        plugin_reject_sends + direct_recv_halt_plugin_rejects + 1,
         "every plugin-aware reject send needs one direct or shared committed boundary; the extra count is the second helper definition"
     );
 
