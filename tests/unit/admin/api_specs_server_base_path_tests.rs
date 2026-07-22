@@ -60,8 +60,7 @@ async fn assert_matches(plugin: &OpenapiValidator, method: &str, path: &str) {
     }
     assert!(
         ctx.metadata
-            .get("openapi_validator.matched_operation")
-            .is_some(),
+            .contains_key("openapi_validator.matched_operation"),
         "{method} {path} must record matched_operation metadata"
     );
 }
@@ -578,7 +577,7 @@ fn path_item_ref_with_servers_uses_effective_base() {
         vec![(
             "GET".to_string(),
             "/from-sibling/pets".to_string(),
-            "^/from-sibling/pets$".to_string()
+            "^/from\\-sibling/pets$".to_string()
         )],
         "sibling Path Item servers must overlay referenced servers"
     );
