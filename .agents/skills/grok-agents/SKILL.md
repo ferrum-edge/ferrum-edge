@@ -62,7 +62,8 @@ one long-lived execution session:
 `--effort medium|high|xhigh|max` is accepted for CLI parity with sibling skills but is ignored —
 the Cursor Grok harness has no effort tiers. Do not claim an effort level was applied.
 
-The launcher pins `grok-4.5` with no model params, verifies the worktree root, loads
+The launcher pins `grok-4.5` with `fast=false` (the non-Fast inference variant, so runs do not
+consume fast credits), verifies the worktree root, loads
 `CURSOR_API_KEY` from the environment or Conductor keychain, and executes through Conductor's
 bundled Node runtime and `@cursor/sdk`. Delete the temporary prompt after the worker exits.
 

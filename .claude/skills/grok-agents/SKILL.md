@@ -29,7 +29,7 @@ prompt file outside the repo, then launch:
 the Cursor Grok harness has no effort tiers. Do not claim an effort level was applied.
 
 Non-negotiables:
-- The launcher pins **`grok-4.5`** (no model params) through Conductor's bundled Node + `@cursor/sdk`.
+- The launcher pins **`grok-4.5`** with `fast=false` (non-Fast variant, no fast credits) through Conductor's bundled Node + `@cursor/sdk`.
 - `CURSOR_API_KEY` must be available (env or Conductor provider keychain). Do not print it.
 - Run each dispatch as a **background / long-lived task**; prefer one task per agent.
 - **Parallel cap: 7** unless the user sets a lower limit.

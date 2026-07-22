@@ -193,14 +193,18 @@ async function main() {
     throw new Error(`Prompt file is empty: ${args.promptFile}`);
   }
 
-  const model = { id: "grok-4.5" };
+  // Pin the non-Fast inference variant. Cursor's default for grok-4.5 is the
+  // Fast variant (canonical SKU cursor-grok-4.5-high-fast), which bills fast
+  // credits. Supplying params: fast=false selects the standard variant. The
+  // value is the STRING "false", the parameter form @cursor/sdk expects.
+  const model = { id: "grok-4.5", params: [{ id: "fast", value: "false" }] };
 
   const { Agent } = loadCursorSdk();
   const agentId = `grok-agents-${randomUUID()}`;
   const name = args.name?.trim() || "grok-4.5";
 
   process.stderr.write(
-    `[grok-agents] launching local Cursor agent model=grok-4.5 cwd=${args.worktree} id=${agentId}\n`,
+    `[grok-agents] launching local Cursor agent model=grok-4.5 fast=false cwd=${args.worktree} id=${agentId}\n`,
   );
 
   const agent = await Agent.create({
