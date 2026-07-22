@@ -1480,6 +1480,8 @@ fn is_forbidden_grpc_web_trailer_name(name: &str) -> bool {
                 | "content-encoding"
                 | "content-disposition"
                 | "content-range"
+                | "set-cookie"
+                | "set-cookie2"
                 | "host"
                 | "accept"
                 | "accept-encoding"

@@ -1537,6 +1537,14 @@ fn test_build_trailer_frame_preserves_ascii_custom_and_bin_metadata() {
     headers.insert("quota-remaining".to_string(), "7".to_string());
     headers.insert("trace-proto-bin".to_string(), "AQID".to_string());
     headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert(
+        "set-cookie".to_string(),
+        "session=SECRET; HttpOnly; Secure".to_string(),
+    );
+    headers.insert(
+        "set-cookie2".to_string(),
+        "legacy=SECRET2; HttpOnly".to_string(),
+    );
     headers.insert("x-grpc-web".to_string(), "1".to_string());
     headers.insert(
         "proxy-authenticate".to_string(),
@@ -1558,6 +1566,10 @@ fn test_build_trailer_frame_preserves_ascii_custom_and_bin_metadata() {
     assert!(trailer_str.contains("quota-remaining: 7"));
     assert!(trailer_str.contains("trace-proto-bin: AQID"));
     assert!(!trailer_str.contains("content-type"));
+    assert!(!trailer_str.contains("set-cookie"));
+    assert!(!trailer_str.contains("set-cookie2"));
+    assert!(!trailer_str.contains("SECRET"));
+    assert!(!trailer_str.contains("SECRET2"));
     assert!(!trailer_str.contains("x-grpc-web"));
     assert!(!trailer_str.contains("proxy-authenticate"));
     assert!(!trailer_str.contains("keep-alive"));
