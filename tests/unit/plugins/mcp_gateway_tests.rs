@@ -5339,7 +5339,10 @@ async fn composed_governor_keeps_public_policy_name_across_aggregate_tool_rewrit
             "initial governor pass must allow public name (emit_metadata={emit_metadata})"
         );
         assert!(
-            matches!(mcp.before_proxy(&mut ctx, &mut headers).await, PluginResult::Continue),
+            matches!(
+                mcp.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
             "mcp_gateway must route the allowlisted public tool (emit_metadata={emit_metadata})"
         );
         if emit_metadata {
