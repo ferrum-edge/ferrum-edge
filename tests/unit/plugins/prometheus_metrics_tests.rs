@@ -430,9 +430,8 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
     metrics.record_cni_socket_lifecycle(
         ferrum_edge::ebpf::CniSocketLifecycleReason::OwnershipConflict,
     );
-    metrics.record_cni_socket_lifecycle(
-        ferrum_edge::ebpf::CniSocketLifecycleReason::OwnershipIoError,
-    );
+    metrics
+        .record_cni_socket_lifecycle(ferrum_edge::ebpf::CniSocketLifecycleReason::OwnershipIoError);
 
     registry.set_node_agent_metrics(metrics);
     let output = registry.render_uncached();
@@ -450,12 +449,16 @@ async fn test_registry_renders_node_agent_metrics_when_registered() {
     );
     assert!(output.contains("ferrum_node_agent_pod_annotation_updates_failed_total 4"));
     assert!(output.contains("# TYPE ferrum_node_agent_cni_socket_lifecycle_total counter"));
-    assert!(output.contains(
-        "ferrum_node_agent_cni_socket_lifecycle_total{reason=\"ownership_conflict\"} 1"
-    ));
-    assert!(output.contains(
-        "ferrum_node_agent_cni_socket_lifecycle_total{reason=\"ownership_io_error\"} 1"
-    ));
+    assert!(
+        output.contains(
+            "ferrum_node_agent_cni_socket_lifecycle_total{reason=\"ownership_conflict\"} 1"
+        )
+    );
+    assert!(
+        output.contains(
+            "ferrum_node_agent_cni_socket_lifecycle_total{reason=\"ownership_io_error\"} 1"
+        )
+    );
     assert!(output.contains(
         "ferrum_node_agent_cni_socket_lifecycle_total{reason=\"shutdown_cleanup_error\"} 0"
     ));

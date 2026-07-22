@@ -992,7 +992,10 @@ mod tests {
             .expect("conflicting listener must fail promptly")
             .expect("conflicting listener task should not panic");
 
-        assert_eq!(SocketIdentity::from_path(&socket_path).unwrap(), owner_identity);
+        assert_eq!(
+            SocketIdentity::from_path(&socket_path).unwrap(),
+            owner_identity
+        );
         assert_eq!(
             contender_metrics.snapshot().cni_socket_lifecycle
                 [crate::ebpf::CniSocketLifecycleReason::OwnershipConflict as usize],
@@ -1083,8 +1086,8 @@ mod tests {
     async fn stale_unix_socket_is_recovered_after_ownership_lock() {
         let dir = tempfile::tempdir().unwrap();
         let socket_path = dir.path().join("node-agent-cni.sock");
-        let stale = std::os::unix::net::UnixListener::bind(&socket_path)
-            .expect("create stale Unix socket");
+        let stale =
+            std::os::unix::net::UnixListener::bind(&socket_path).expect("create stale Unix socket");
         drop(stale);
         SocketIdentity::from_path(&socket_path).expect("stale socket inode must remain");
         let socket_path_str = socket_path.to_string_lossy().to_string();
