@@ -575,11 +575,13 @@ impl RedisRateLimitClient {
     }
 
     /// Establish (or reuse) the cached ConnectionManager for tests.
+    #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn connect_cached_for_test(&self) -> bool {
         self.get_connection().await.is_some()
     }
 
     /// Establish a dedicated ConnectionManager for tests.
+    #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn connect_dedicated_for_test(&self) -> bool {
         self.get_dedicated_connection().await.is_some()
     }
@@ -589,6 +591,7 @@ impl RedisRateLimitClient {
     /// Uses the same Ferrum timeout wiring as the background recovery checker
     /// (inner `AsyncConnectionConfig` + defensive outer bound). DNS screening
     /// still happens first and remains outside the connection timeout.
+    #[allow(dead_code)] // public support used by the external integration-test target
     pub async fn health_check_connect_for_test(&self) -> bool {
         let url = match self.resolve_url().await {
             RedisEndpoint::Url(url) => url,
@@ -616,11 +619,13 @@ impl RedisRateLimitClient {
     }
 
     /// Connection-timeout duration installed into redis-rs configs (tests).
+    #[allow(dead_code)] // public support used by the external integration-test target
     pub fn connection_timeout_for_test(&self) -> Duration {
         self.connect_timeout()
     }
 
     /// Manager-config connection timeout observed by redis-rs (tests).
+    #[allow(dead_code)] // public support used by the external integration-test target
     pub fn connection_manager_timeout_for_test(&self) -> Option<Duration> {
         self.connection_manager_config().connection_timeout()
     }
@@ -716,6 +721,7 @@ impl RedisRateLimitClient {
     /// redis-rs async connection config carrying Ferrum's connection-attempt timeout.
     ///
     /// Used by the health-check path (multiplexed connection, not ConnectionManager).
+    #[allow(dead_code)] // reachable only through public external-test support in binary builds
     fn async_connection_config(&self) -> redis::AsyncConnectionConfig {
         redis::AsyncConnectionConfig::new().set_connection_timeout(Some(self.connect_timeout()))
     }
