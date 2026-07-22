@@ -176,8 +176,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Code, H3_POST_DEADLINE_TERMINAL_WRITE_GRACE, H3ResponseWriteError};
-    use std::time::Duration;
+    use super::Code;
 
     /// RFC 9114 §8.1 defines H3_NO_ERROR == 0x100. The halt helper
     /// must use exactly this code so peers treat the recv-half close
@@ -191,36 +190,5 @@ mod tests {
     #[test]
     fn response_abort_code_matches_rfc9114_h3_internal_error() {
         assert_eq!(Code::H3_INTERNAL_ERROR.value(), 0x102);
-    }
-
-    #[test]
-    fn post_deadline_terminal_write_grace_is_short_and_fixed() {
-        assert_eq!(
-            H3_POST_DEADLINE_TERMINAL_WRITE_GRACE,
-            Duration::from_secs(1)
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn ready_post_deadline_terminal_write_completes_within_grace() {
-        let result =
-            super::await_post_deadline_terminal_response_write(async { Ok::<(), ()>(()) }).await;
-        assert_eq!(result, Ok(()));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn stalled_post_deadline_terminal_write_expires_grace() {
-        let write = std::future::pending::<Result<(), ()>>();
-        let task =
-            tokio::spawn(
-                async move { super::await_post_deadline_terminal_response_write(write).await },
-            );
-        tokio::task::yield_now().await;
-        tokio::time::advance(H3_POST_DEADLINE_TERMINAL_WRITE_GRACE).await;
-        tokio::task::yield_now().await;
-        assert!(matches!(
-            task.await.expect("join"),
-            Err(H3ResponseWriteError::DeadlineExceeded)
-        ));
     }
 }

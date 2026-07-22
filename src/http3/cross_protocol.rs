@@ -3983,7 +3983,8 @@ where
         {
             Ok(Some(b)) => b,
             Ok(None) => {
-                crate::http3::stream_util::halt_request_body(stream);
+                // Default writer emits HEADERS then STOP_SENDING; do not reverse
+                // that order with a pre-write halt (would duplicate STOP_SENDING).
                 release_cross_protocol_circuit_breaker_probe_on_admission_reject(
                     state,
                     proxy,
@@ -4002,7 +4003,6 @@ where
                 .await;
             }
             Err(super::server::H3RequestBodyReadError::Read(e)) => {
-                crate::http3::stream_util::halt_request_body(stream);
                 warn!(
                     proxy_id = %proxy.id,
                     error = %e,
@@ -4053,8 +4053,18 @@ where
                 .await
                 {
                     Ok(outcome) => Ok(outcome),
-                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => {
-                        Err(error)
+                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                        // Client reset the response half after rejection was
+                        // selected — keep accounting rather than dropping the
+                        // already-rejected request as a bare transport Err.
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            StatusCode::OK.as_u16(),
+                            0,
+                            backend_start,
+                            0,
+                            true,
+                        ))
                     }
                     Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                         crate::http3::stream_util::abort_response_stream(stream);
@@ -6955,7 +6965,16 @@ where
             .await
             {
                 Ok(outcome) => Ok(outcome),
-                Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    Ok(terminal_deadline_write_aborted_outcome(
+                        StatusCode::OK.as_u16(),
+                        0,
+                        backend_start,
+                        bytes_sent,
+                        true,
+                    ))
+                }
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                     crate::http3::stream_util::abort_response_stream(stream);
                     Ok(terminal_deadline_write_aborted_outcome(
@@ -6988,7 +7007,16 @@ where
             .await
             {
                 Ok(outcome) => Ok(outcome),
-                Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    Ok(terminal_deadline_write_aborted_outcome(
+                        normalized.http_status.as_u16(),
+                        0,
+                        backend_start,
+                        bytes_sent,
+                        true,
+                    ))
+                }
                 Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                     crate::http3::stream_util::abort_response_stream(stream);
                     Ok(terminal_deadline_write_aborted_outcome(
@@ -7014,7 +7042,16 @@ where
         );
         match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
             Ok(outcome) => Ok(outcome),
-            Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+            Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                crate::http3::stream_util::abort_response_stream(stream);
+                Ok(terminal_deadline_write_aborted_outcome(
+                    normalized.http_status.as_u16(),
+                    0,
+                    backend_start,
+                    bytes_sent,
+                    true,
+                ))
+            }
             Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                 crate::http3::stream_util::abort_response_stream(stream);
                 Ok(terminal_deadline_write_aborted_outcome(
@@ -7217,7 +7254,16 @@ where
     // flow-control wait cannot retain the task past the grace.
     match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
         Ok(outcome) => Ok(outcome),
-        Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+        Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+            crate::http3::stream_util::abort_response_stream(stream);
+            Ok(terminal_deadline_write_aborted_outcome(
+                normalized.http_status.as_u16(),
+                0,
+                backend_start,
+                bytes_sent,
+                true,
+            ))
+        }
         Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
             crate::http3::stream_util::abort_response_stream(stream);
             Ok(terminal_deadline_write_aborted_outcome(

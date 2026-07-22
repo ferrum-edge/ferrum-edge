@@ -342,14 +342,16 @@ fn h3_cross_protocol_bridge_halts_cancelled_buffered_uploads() {
     let bridge = &source[start..start + end];
     assert!(bridge.contains("collect_h3_request_body_with_deadline("));
     assert!(bridge.contains("drain_h3_body("));
-    // too-large and read still STOP_SENDING (recv half is idle). Timed-out /
-    // deadline drains cancel mid-recv_data and must skip STOP_SENDING so
-    // h3-quinn cannot unwrap-abort under panic=abort.
+    // too-large and read rely on write_grpc_error_for_request (HEADERS then
+    // halt). Pre-write STOP_SENDING would reverse that order and duplicate the
+    // writer's halt. Timed-out / deadline drains cancel mid-recv_data and must
+    // skip STOP_SENDING so h3-quinn cannot unwrap-abort under panic=abort.
     assert_eq!(
         bridge.matches("halt_request_body(stream)").count(),
-        2,
-        "too-large and read bridge exits must STOP_SENDING; cancel exits must not"
+        0,
+        "too-large/read must not pre-halt before write_grpc_error_for_request; cancel exits must not STOP_SENDING"
     );
+    assert!(bridge.contains("write_grpc_error_for_request("));
     assert!(bridge.contains("write_grpc_error_for_request_with_recv_halt("));
     assert!(bridge.contains("write_final_body_reject("));
 

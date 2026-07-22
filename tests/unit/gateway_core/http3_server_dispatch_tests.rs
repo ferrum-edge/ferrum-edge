@@ -186,7 +186,8 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
         .expect("H3 terminal provider dispatch must remain bounded");
     assert!(terminal_dispatch.contains("collect_h3_request_body_with_deadline("));
     assert!(terminal_dispatch.contains("drain_h3_request_body("));
-    // Ok(None): idle recv after a completed oversize drain — write first, then halt.
+    // Ok(None): idle recv after a completed oversize drain — the flavor-aware
+    // writer already halts after HEADERS; do not duplicate STOP_SENDING.
     // Read: client gone — halt, finalize cleanup, no response write.
     // TimedOut: mid-recv_data cancel — write under post-deadline grace with
     // halt_recv=false; STOP_SENDING would unwrap-abort h3-quinn's empty slot.
@@ -209,10 +210,11 @@ fn h3_terminal_body_read_failures_commit_dedup_cleanup_once() {
     let oversize_send = oversize
         .find("send_h3_plugin_reject_flavor_aware(")
         .expect("terminal upload rejection send");
-    let oversize_halt = oversize
-        .find("halt_cancelled_h3_upload(")
-        .expect("oversize terminal upload must STOP_SENDING after the response");
-    assert!(oversize_finalize < oversize_send && oversize_send < oversize_halt);
+    assert!(oversize_finalize < oversize_send);
+    assert!(
+        !oversize.contains("halt_cancelled_h3_upload("),
+        "oversize terminal upload must rely on the writer's post-HEADERS halt"
+    );
     assert!(oversize.contains("&rejection.body"));
     assert!(oversize.contains("&rejection.headers"));
 
@@ -779,6 +781,14 @@ fn h3_send_only_terminal_rejection_write_is_deadline_bounded() {
     assert!(!writer.contains("await_terminal_response_write_before_deadline("));
     assert!(writer.contains("abort_response_stream(stream)"));
     assert!(writer.contains("terminal_deadline_write_aborted_outcome("));
+    assert!(
+        writer.contains("H3ResponseWriteError::Write(_)"),
+        "client-reset post-deadline writes must map to an accounting outcome"
+    );
+    assert!(
+        writer.contains("bytes_sent,\n                true,"),
+        "client-reset post-deadline writes must report client_disconnected"
+    );
     assert!(writer.contains("bytes_sent,\n                false,"));
     let grace_arm = writer
         .split("H3ResponseWriteError::DeadlineExceeded")

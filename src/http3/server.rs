@@ -2000,7 +2000,6 @@ async fn handle_h3_request(
                     initial_response_header_policy_plugins.as_ref(),
                 )
                 .await?;
-                halt_cancelled_h3_upload(&mut stream);
                 return Ok(());
             }
             Err(H3RequestBodyReadError::Read(error)) => {
@@ -2184,7 +2183,6 @@ async fn handle_h3_request(
                         initial_response_header_policy_plugins.as_ref(),
                     )
                     .await?;
-                    halt_cancelled_h3_upload(&mut stream);
                     return Ok(());
                 }
                 Err(H3RequestBodyReadError::Read(error)) => {
@@ -2440,7 +2438,6 @@ async fn handle_h3_request(
                     initial_response_header_policy_plugins.as_ref(),
                 )
                 .await?;
-                halt_cancelled_h3_upload(&mut stream);
                 return Ok(());
             }
             Err(H3RequestBodyReadError::Read(error)) => {
@@ -3221,7 +3218,6 @@ async fn handle_h3_request(
                         &rejection.headers,
                     )
                     .await?;
-                    halt_cancelled_h3_upload(&mut stream);
                     return Ok(());
                 }
                 Err(H3RequestBodyReadError::Read(error)) => {
@@ -3598,7 +3594,6 @@ async fn handle_h3_request(
                         initial_response_header_policy_plugins.as_ref(),
                     )
                     .await?;
-                    halt_cancelled_h3_upload(&mut stream);
                     return Ok(());
                 }
                 Err(H3RequestBodyReadError::Read(error)) => {
@@ -4242,7 +4237,6 @@ async fn handle_h3_request(
                                 initial_response_header_policy_plugins.as_ref(),
                             )
                             .await?;
-                            halt_cancelled_h3_upload(&mut stream);
                             return Ok(());
                         }
                         Err(H3RequestBodyReadError::Read(error)) => {
@@ -5446,7 +5440,6 @@ async fn handle_h3_request(
                     initial_response_header_policy_plugins.as_ref(),
                 )
                 .await?;
-                halt_cancelled_h3_upload(&mut stream);
                 return Ok(());
             }
             Err(H3RequestBodyReadError::Read(error)) => {

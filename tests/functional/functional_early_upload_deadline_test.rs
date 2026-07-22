@@ -78,6 +78,125 @@ fn early_body_proxy_yaml(backend_port: u16, backend_read_timeout_ms: u64) -> Str
     serde_yaml::to_string(&config).expect("yaml")
 }
 
+/// Early-body proxy for browser gRPC-Web: grpc_web + cors + request_mirror.
+/// `backend_read_timeout_ms = 0` disables the operator whole-upload bound so a
+/// short absolute `grpc-timeout` is the sole early-drain ceiling.
+fn early_grpc_web_upload_proxy_yaml(backend_port: u16) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "early-grpc-web-upload",
+            "listen_path": "/upload",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": false,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 0,
+            "backend_write_timeout_ms": 2000,
+            "plugins": [
+                {"plugin_config_id": "early-grpc-web"},
+                {"plugin_config_id": "early-cors"},
+                {"plugin_config_id": "early-mirror-grpc-web"}
+            ],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "early-grpc-web",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "early-grpc-web-upload",
+                "enabled": true,
+                "config": {},
+            },
+            {
+                "id": "early-cors",
+                "plugin_name": "cors",
+                "scope": "proxy",
+                "proxy_id": "early-grpc-web-upload",
+                "enabled": true,
+                "config": {"allowed_origins": ["https://app.example"]},
+            },
+            {
+                "id": "early-mirror-grpc-web",
+                "plugin_name": "request_mirror",
+                "scope": "proxy",
+                "proxy_id": "early-grpc-web-upload",
+                "enabled": true,
+                "config": {
+                    "mirror_host": "127.0.0.1",
+                    "mirror_port": 9,
+                    "mirror_protocol": "http",
+                    "mirror_request_body": true,
+                    "percentage": 100,
+                },
+            }
+        ],
+    });
+    serde_yaml::to_string(&config).expect("yaml")
+}
+
+fn grpc_web_frames(body: &[u8]) -> Vec<(u8, &[u8])> {
+    let mut frames = Vec::new();
+    let mut remaining = body;
+    while remaining.len() >= 5 {
+        let flag = remaining[0];
+        let len =
+            u32::from_be_bytes([remaining[1], remaining[2], remaining[3], remaining[4]]) as usize;
+        if remaining.len() < 5 + len {
+            break;
+        }
+        frames.push((flag, &remaining[5..5 + len]));
+        remaining = &remaining[5 + len..];
+    }
+    frames
+}
+
+fn assert_grpc_web_deadline_browser_contract(response: &Http3Response) {
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "gRPC-Web deadline rejections ride HTTP 200"
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/grpc-web"),
+        "browser-facing content-type must remain gRPC-Web"
+    );
+    assert!(
+        !response.headers.contains_key("grpc-status")
+            && !response.headers.contains_key("grpc-message"),
+        "terminal gRPC-Web metadata must remain in the body trailer frame"
+    );
+    assert_eq!(
+        response
+            .headers
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("https://app.example"),
+        "deadline rejection must stamp synchronous CORS headers"
+    );
+    let trailer_payload = grpc_web_frames(response.body_bytes.as_ref())
+        .into_iter()
+        .find_map(|(flag, payload)| (flag == 0x80).then_some(payload))
+        .unwrap_or_else(|| {
+            panic!(
+                "missing gRPC-Web trailer frame in {:?}",
+                response.body_bytes
+            )
+        });
+    let trailer_text = String::from_utf8_lossy(trailer_payload);
+    assert!(
+        trailer_text.contains("grpc-status: 4\r\n"),
+        "expected DEADLINE_EXCEEDED (4) trailer frame, got: {trailer_text}"
+    );
+}
+
 async fn spawn_ok_backend() -> (u16, ScriptedHttp1Backend) {
     let reservation = reserve_port().await.expect("reserve backend");
     let port = reservation.port;
@@ -166,6 +285,17 @@ async fn h3_post_stalled_body(
     content_type: &'static str,
     grpc_timeout: Option<&'static str>,
 ) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
+    h3_post_stalled_body_with_origin(url, host, addr, content_type, grpc_timeout, None).await
+}
+
+async fn h3_post_stalled_body_with_origin(
+    url: &str,
+    host: &str,
+    addr: SocketAddr,
+    content_type: &'static str,
+    grpc_timeout: Option<&'static str>,
+    origin: Option<&'static str>,
+) -> Result<Http3Response, Box<dyn std::error::Error + Send + Sync>> {
     let provider = rustls::crypto::ring::default_provider();
     let mut client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -193,6 +323,9 @@ async fn h3_post_stalled_body(
         .header(http::header::CONTENT_TYPE, content_type);
     if let Some(timeout) = grpc_timeout {
         req = req.header("grpc-timeout", timeout);
+    }
+    if let Some(origin) = origin {
+        req = req.header(http::header::ORIGIN, origin);
     }
     let req = req.body(())?;
     let mut stream = send_request.send_request(req).await?;
@@ -377,6 +510,42 @@ async fn h3_zero_operator_timeout_still_honors_native_grpc_absolute_deadline() {
     assert!(
         elapsed < Duration::from_secs(2),
         "absolute RPC deadline must fire promptly, elapsed={elapsed:?}"
+    );
+    gateway.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_stalled_early_grpc_web_upload_honors_absolute_deadline_and_cors() {
+    // Stalled early upload with Content-Type: application/grpc-web and a short
+    // absolute grpc-timeout. Operator whole-upload bound is disabled so the RPC
+    // deadline alone cancels the drain and shapes the browser-facing contract.
+    let (backend_port, _backend) = spawn_ok_backend().await;
+    let (mut gateway, https_port) =
+        spawn_h3_gateway(early_grpc_web_upload_proxy_yaml(backend_port)).await;
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(10))
+        .await
+        .expect("proxy ready");
+
+    let url = format!("https://127.0.0.1:{https_port}/upload");
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, https_port));
+    let started = Instant::now();
+    let response = h3_post_stalled_body_with_origin(
+        &url,
+        "localhost",
+        addr,
+        "application/grpc-web",
+        Some("100m"),
+        Some("https://app.example"),
+    )
+    .await
+    .expect("deadline-capped gRPC-Web H3 early upload");
+    let elapsed = started.elapsed();
+    assert_grpc_web_deadline_browser_contract(&response);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "absolute RPC deadline must fire promptly for gRPC-Web early upload, elapsed={elapsed:?}"
     );
     gateway.shutdown();
 }
