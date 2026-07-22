@@ -99,7 +99,9 @@ fn plugin(bootstrap: &str, topic: &str, overrides: Value) -> KafkaLogging {
         .unwrap_or_else(|error| panic!("construct kafka_logging for topic {topic}: {error}"));
     plugin
         .start_background_tasks()
-        .unwrap_or_else(|error| panic!("start kafka_logging background tasks for topic {topic}: {error}"));
+        .unwrap_or_else(|error| {
+            panic!("start kafka_logging background tasks for topic {topic}: {error}")
+        });
     plugin.commit_background_tasks();
     plugin
 }
