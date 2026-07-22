@@ -990,11 +990,19 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
         .collect();
     assert_eq!(
         access_logs.len(),
-        1,
-        "errors_only must exclude translated status 0 and emit translated status 7; logs:\n{logs}"
+        2,
+        "errors_only must exclude translated status 0 and emit translated status 7 plus the HTTP 406 rejection; logs:\n{logs}"
     );
-    assert_eq!(access_logs[0]["response_status_code"], 200);
-    assert_eq!(access_logs[0]["grpc_status"], 7);
+    let translated_failure = access_logs
+        .iter()
+        .find(|entry| entry["grpc_status"] == 7)
+        .expect("translated status-7 failure log");
+    assert_eq!(translated_failure["response_status_code"], 200);
+    let accept_rejection = access_logs
+        .iter()
+        .find(|entry| entry["response_status_code"] == 406)
+        .expect("HTTP 406 Accept-rejection log");
+    assert_eq!(accept_rejection["request_path"], "/success/echo.Echo/Unary");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     let charges = loop {
