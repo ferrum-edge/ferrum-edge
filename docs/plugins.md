@@ -2966,6 +2966,7 @@ Modifies response headers and JSON body fields before sending to the client. Whe
 config:
   rules:
     - operation: add
+      target: header             # required: header or body
       key: "X-Powered-By"
       value: "Ferrum-Gateway"
     - operation: rename
@@ -2975,15 +2976,19 @@ config:
     - operation: remove
       target: body
       key: "items.0"              # numeric segment removes an array element
+    - operation: add
+      target: body
+      key: "enabled"
+      value: true                 # native JSON types / null are valid for body
 ```
 
-Header rules default to `target: header` (no `target` field required). Body rules require explicit `target: body`.
+`target` is required on every rule — there is no default. Header rules must set `target: header`; body rules must set `target: body`.
 
 **Valid targets for `response_transformer` are `header` and `body` ONLY** — unlike `request_transformer`, there is no `query` target (query parameters are part of the request, not the response). Configs specifying `target: query` are rejected at plugin load time.
 
-**Operations and required fields** match `request_transformer` (see the table above). The same validation rules apply: unknown operations, unknown targets (valid here: `header` or `body`), missing `value` on add/update, missing `new_key` on rename, and CR/LF in header values are all rejected at plugin load time. Non-string values for `target`, `operation`, `key`, `value`, or `new_key` are also rejected (no silent coercion).
+**Operations and required fields** match `request_transformer` (see the table above). The same validation rules apply: unknown operations, unknown targets (valid here: `header` or `body`), missing `value` on add/update, missing `new_key` on rename, and CR/LF in header values are all rejected at plugin load time. Non-string values for `target`, `operation`, `key`, or `new_key` are also rejected (no silent coercion). Header `value` must be a string; body `value` accepts any JSON type including explicit `null` (see below).
 
-Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.
+Body rules support the same dot-notation features as `request_transformer`: nested paths, array indexing, and `\.` escape. Native JSON scalars, objects, arrays, and explicit `null` are accepted on body `add` / `update`. String values that parse as JSON are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` values on `add` / `update` body rules are preserved — setting a field to `null` is a legitimate operation.
 
 ### `security_headers`
 

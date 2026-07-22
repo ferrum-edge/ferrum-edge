@@ -15492,7 +15492,10 @@ components:
         Plugin: response_transformer — Modifies response headers and JSON
         body. Same validation rules as request_transformer (unknown
         operations / targets, missing value / new_key, and CR/LF in header
-        values are rejected at plugin load time).
+        values are rejected at plugin load time). Every rule must set an
+        explicit `target` (`header` or `body`); there is no default. Valid
+        targets are `header` and `body` only — unlike request_transformer,
+        there is no `query` target.
 
         When `apply_route_overrides: true`, the plugin consumes per-rule
         header transforms published by `mesh_route_dispatch` onto
@@ -15503,30 +15506,14 @@ components:
         rules:
           type: array
           items:
-            type: object
-            required: [operation, key]
-            properties:
-              operation:
-                type: string
-                enum: [add, remove, update, rename]
-              target:
-                type: string
-                enum: [header, body]
-                default: header
-              key:
-                type: string
-                description: |
-                  Header name or dot-notation body path. Body paths support
-                  nested objects, array indexing ('items.0'), and
-                  backslash-escaped literal dots.
-              value:
-                type: string
-                description: |
-                  Required for add/update. Header values must not contain CR
-                  or LF.
-              new_key:
-                type: string
-                description: Required for rename operations.
+            oneOf:
+              - $ref: "#/components/schemas/ResponseTransformerHeaderRule"
+              - $ref: "#/components/schemas/ResponseTransformerBodyRule"
+            discriminator:
+              propertyName: target
+              mapping:
+                header: "#/components/schemas/ResponseTransformerHeaderRule"
+                body: "#/components/schemas/ResponseTransformerBodyRule"
         apply_route_overrides:
           type: boolean
           default: false
@@ -15546,6 +15533,64 @@ components:
           description: >-
             Fallback when `runtime_overlay_scope` is configured but the RTDS
             overlay has no boolean value for that key.
+
+    ResponseTransformerHeaderRule:
+      type: object
+      required: [operation, target, key]
+      properties:
+        operation:
+          type: string
+          enum: [add, remove, update, rename]
+          description: |
+            add: insert if absent (does not overwrite).
+            update: write the header value.
+            remove: delete the header.
+            rename: move old → new header name.
+        target:
+          type: string
+          const: header
+        key:
+          type: string
+          description: HTTP header name.
+        value:
+          type: string
+          description: |
+            Required for add/update. Must be a string and must not contain
+            CR or LF.
+        new_key:
+          type: string
+          description: Required for rename operations.
+
+    ResponseTransformerBodyRule:
+      type: object
+      required: [operation, target, key]
+      properties:
+        operation:
+          type: string
+          enum: [add, remove, update, rename]
+          description: |
+            add: insert if absent (does not overwrite).
+            update: write, creating intermediate objects as needed.
+            remove: delete the field.
+            rename: move old → new, with rollback if the destination is unreachable.
+        target:
+          type: string
+          const: body
+        key:
+          type: string
+          description: |
+            Dot-notation body path. Supports nested objects, array indexing
+            ('items.0'), and backslash-escaped literal dots.
+        value:
+          description: |
+            Required for add/update. Accepts any JSON value — strings,
+            numbers, booleans, objects, arrays, and explicit null.
+            Strings that parse as JSON (e.g., "42", "true", '{"a":1}')
+            are inserted as the parsed type at runtime; otherwise kept
+            as a JSON string.
+        new_key:
+          type: string
+          description: Required for rename operations.
 
     SecurityHeadersConfig:
       type: object

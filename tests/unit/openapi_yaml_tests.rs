@@ -3351,7 +3351,11 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
             &spec,
             component,
             &json!({
-                "rules": [{"operation": "remove", "key": "x-review-pin"}],
+                "rules": [{
+                    "operation": "remove",
+                    "target": "header",
+                    "key": "x-review-pin"
+                }],
                 "runtime_overlay_scope": " \t "
             }),
             false,
@@ -3412,6 +3416,187 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
         json!({"abort": null, "delay": null}),
     ] {
         assert_component_validity(&spec, "FaultInjectionConfig", &invalid, false);
+    }
+}
+
+#[test]
+fn response_transformer_schema_matches_runtime_target_and_value_contract() {
+    use ferrum_edge::plugins::response_transformer::ResponseTransformer;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+
+    let rules_items = spec
+        .pointer("/components/schemas/ResponseTransformerConfig/properties/rules/items")
+        .expect("ResponseTransformerConfig.rules.items exists");
+    assert!(
+        rules_items.get("oneOf").is_some(),
+        "response_transformer rules must be target-discriminated oneOf variants"
+    );
+    assert_eq!(
+        rules_items["discriminator"]["propertyName"],
+        json!("target")
+    );
+
+    for (variant, expected_target) in [
+        ("ResponseTransformerHeaderRule", "header"),
+        ("ResponseTransformerBodyRule", "body"),
+    ] {
+        let schema = spec
+            .pointer(&format!("/components/schemas/{variant}"))
+            .unwrap_or_else(|| panic!("{variant} schema exists"));
+        let required = schema["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{variant}.required is an array"));
+        assert!(
+            required.iter().any(|value| value == "target"),
+            "{variant} must require target"
+        );
+        assert_eq!(
+            schema["properties"]["target"]["const"],
+            json!(expected_target)
+        );
+        assert!(
+            schema["properties"]["target"].get("default").is_none(),
+            "{variant}.target must not advertise a default"
+        );
+    }
+
+    assert_eq!(
+        spec.pointer("/components/schemas/ResponseTransformerHeaderRule/properties/value/type")
+            .expect("header value type"),
+        &json!("string")
+    );
+    assert!(
+        spec.pointer("/components/schemas/ResponseTransformerBodyRule/properties/value/type")
+            .is_none(),
+        "body value must remain unconstrained JSON (including null)"
+    );
+
+    let runtime_overlay = spec
+        .pointer("/components/schemas/ResponseTransformerConfig/properties/runtime_overlay_scope")
+        .expect("runtime_overlay_scope remains published");
+    assert_eq!(runtime_overlay["type"], json!("string"));
+    assert_eq!(runtime_overlay["minLength"], json!(1));
+    assert_eq!(runtime_overlay["pattern"], json!("\\S"));
+    assert_eq!(
+        spec.pointer("/components/schemas/ResponseTransformerConfig/properties/default_enabled")
+            .expect("default_enabled remains published")["default"],
+        json!(true)
+    );
+
+    for config in [
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": "blue"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "header",
+                "key": "X-Internal"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "body",
+                "key": "enabled",
+                "value": true
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "body",
+                "key": "count",
+                "value": 42
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "body",
+                "key": "optional_field",
+                "value": null
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "body",
+                "key": "meta",
+                "value": {"a": 1}
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "body",
+                "key": "tags",
+                "value": ["a", "b"]
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "x-audit",
+                "value": "enabled"
+            }],
+            "runtime_overlay_scope": "internal",
+            "default_enabled": false
+        }),
+    ] {
+        assert_component_validity(&spec, "ResponseTransformerConfig", &config, true);
+        assert!(
+            ResponseTransformer::new(&config).is_ok(),
+            "runtime rejected OpenAPI-valid response_transformer config: {config}"
+        );
+    }
+
+    for config in [
+        json!({
+            "rules": [{
+                "operation": "add",
+                "key": "X-Color",
+                "value": "blue"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": true
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "add",
+                "target": "header",
+                "key": "X-Color",
+                "value": 1
+            }]
+        }),
+        json!({
+            "rules": [{
+                "operation": "remove",
+                "target": "header",
+                "key": "x-review-pin"
+            }],
+            "runtime_overlay_scope": " \t "
+        }),
+    ] {
+        assert_component_validity(&spec, "ResponseTransformerConfig", &config, false);
+        assert!(
+            ResponseTransformer::new(&config).is_err(),
+            "runtime accepted OpenAPI-invalid response_transformer config: {config}"
+        );
     }
 }
 
