@@ -3470,7 +3470,9 @@ async fn provider_family_semantic_hit_and_instruction_isolation() {
 #[tokio::test]
 async fn messages_semantic_scope_isolates_tool_state_and_native_controls() {
     let mock_server = MockServer::start().await;
-    mount_embedding_mock(&mock_server, 8).await;
+    // One embedding for the staged base entry plus one for each of the five
+    // deliberately isolated variants below.
+    mount_embedding_mock(&mock_server, 6).await;
     let plugin = make_plugin(semantic_config(&mock_server));
 
     let base = json!({
