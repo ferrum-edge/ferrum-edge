@@ -2402,7 +2402,7 @@ At least one rate window must be configured in every rule. Do not combine the cu
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:rate_limiting` when namespace is `"ferrum"` |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
@@ -3515,7 +3515,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql` | Redis key namespace prefix. Defaults to `ferrum:graphql` when namespace is `"ferrum"`. Must be non-empty when set. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be ≥ 1) |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds (must be ≥ 1) |
+| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be ≥ 1). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable (must be ≥ 1) |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
@@ -3595,7 +3595,7 @@ Enables per-method access control and rate limiting for canonical gRPC paths (`/
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:grpc_method_router` | Redis key namespace prefix. Defaults to `ferrum:grpc_method_router` when namespace is `"ferrum"` |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |

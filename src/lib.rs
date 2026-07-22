@@ -1110,6 +1110,7 @@ pub mod _test_support {
 
     // ── plugins/utils/redis_rate_limiter ─────────────────────────────────────
     pub use crate::plugins::utils::redis_rate_limiter::RedisConfig;
+    pub use crate::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
 
     pub fn redis_config_url_with_ip(config: &RedisConfig, ip: std::net::IpAddr) -> String {
         config.url_with_resolved_ip(ip)
@@ -1125,7 +1126,6 @@ pub mod _test_support {
         config: RedisConfig,
         url: &str,
     ) -> Result<(Option<String>, Option<String>), String> {
-        use crate::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
         let client = RedisRateLimitClient::new(config, None, false, None);
         let redis_client = client.build_client(url).map_err(|e| e.to_string())?;
         let info = redis_client.get_connection_info();
@@ -1133,6 +1133,10 @@ pub mod _test_support {
             info.redis_settings().username().map(|s| s.to_string()),
             info.redis_settings().password().map(|s| s.to_string()),
         ))
+    }
+
+    pub fn redis_rate_limit_client_for_test(config: RedisConfig) -> RedisRateLimitClient {
+        RedisRateLimitClient::new(config, None, false, None)
     }
 
     // ── config/db_loader ─────────────────────────────────────────────────────

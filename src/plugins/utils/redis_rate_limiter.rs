@@ -28,6 +28,13 @@
 //! for non-TLS connections; TLS connections keep the original hostname for SNI but
 //! pre-warm the DNS cache entry.
 //!
+//! Gateway DNS screening/resolution runs **before** the Redis connection-attempt
+//! timeout begins. The configured timeout covers TCP connect, TLS handshake (when
+//! enabled), and the Redis protocol handshake against the screened URL. For TLS
+//! hostnames the redis crate may re-resolve at dial time (see the accepted
+//! limitation on [`RedisConfig::url_with_resolved_ip`]); that crate-internal
+//! resolution is inside the connection timeout.
+//!
 //! # TLS
 //!
 //! Supports TLS via `rediss://` URL scheme (note the double-s). CA verification
@@ -86,7 +93,14 @@ pub struct RedisConfig {
     pub key_prefix: String,
     /// Connection pool size (number of multiplexed connections).
     pub pool_size: usize,
-    /// Redis connection timeout in seconds.
+    /// Effective Redis connection-attempt timeout in seconds.
+    ///
+    /// Passed into redis-rs [`redis::aio::ConnectionManagerConfig`] /
+    /// [`redis::AsyncConnectionConfig`] (not only an outer `tokio::time::timeout`)
+    /// so values above the crate's one-second default take effect. Covers TCP
+    /// connect, TLS handshake when enabled, and Redis protocol handshake on
+    /// cached, dedicated, and health-check paths. Gateway `DnsCache` screening
+    /// happens before this timeout starts (see module-level DNS notes).
     pub connect_timeout_seconds: u64,
     /// Interval in seconds for health check pings when Redis is marked unavailable.
     pub health_check_interval_seconds: u64,
@@ -397,6 +411,12 @@ enum RedisEndpoint {
     ResolveFailed,
 }
 
+/// Failure classifying a Redis connection attempt after DNS screening succeeded.
+enum ConnectAttemptError {
+    Redis(redis::RedisError),
+    Timeout,
+}
+
 /// Screen + resolve the Redis endpoint through the gateway DNS cache, NEVER
 /// returning an unscreened address. Shared by the hot-path connect (`resolve_url`)
 /// AND the background recovery checker so neither can hand an unscreened host to
@@ -554,6 +574,57 @@ impl RedisRateLimitClient {
         self.available.load(Ordering::Relaxed)
     }
 
+    /// Establish (or reuse) the cached ConnectionManager for tests.
+    pub async fn connect_cached_for_test(&self) -> bool {
+        self.get_connection().await.is_some()
+    }
+
+    /// Establish a dedicated ConnectionManager for tests.
+    pub async fn connect_dedicated_for_test(&self) -> bool {
+        self.get_dedicated_connection().await.is_some()
+    }
+
+    /// Run one health-check-style multiplexed connect+PING for tests.
+    ///
+    /// Uses the same Ferrum timeout wiring as the background recovery checker
+    /// (inner `AsyncConnectionConfig` + defensive outer bound). DNS screening
+    /// still happens first and remains outside the connection timeout.
+    pub async fn health_check_connect_for_test(&self) -> bool {
+        let url = match self.resolve_url().await {
+            RedisEndpoint::Url(url) => url,
+            RedisEndpoint::EgressDenied | RedisEndpoint::ResolveFailed => return false,
+        };
+        let client = match self.build_client(&url) {
+            Ok(client) => client,
+            Err(_) => return false,
+        };
+        let connect_timeout = self.connect_timeout();
+        let async_config = self.async_connection_config();
+        let mut conn = match tokio::time::timeout(
+            connect_timeout,
+            client.get_multiplexed_async_connection_with_config(&async_config),
+        )
+        .await
+        {
+            Ok(Ok(conn)) => conn,
+            Ok(Err(_)) | Err(_) => return false,
+        };
+        redis::cmd("PING")
+            .query_async::<String>(&mut conn)
+            .await
+            .is_ok()
+    }
+
+    /// Connection-timeout duration installed into redis-rs configs (tests).
+    pub fn connection_timeout_for_test(&self) -> Duration {
+        self.connect_timeout()
+    }
+
+    /// Manager-config connection timeout observed by redis-rs (tests).
+    pub fn connection_manager_timeout_for_test(&self) -> Option<Duration> {
+        self.connection_manager_config().connection_timeout()
+    }
+
     /// Resolve the Redis hostname via the gateway's DNS cache and build the
     /// connection URL with the resolved IP (for non-TLS) or the original
     /// hostname (for TLS, to preserve SNI).
@@ -628,6 +699,47 @@ impl RedisRateLimitClient {
         Ok(conn_info)
     }
 
+    /// Duration used as the effective Redis connection-attempt timeout.
+    fn connect_timeout(&self) -> Duration {
+        Duration::from_secs(self.config.connect_timeout_seconds)
+    }
+
+    /// redis-rs manager config carrying Ferrum's connection-attempt timeout.
+    ///
+    /// The crate default is one second; without this, outer `tokio::time::timeout`
+    /// wrappers cannot extend attempts past that inner cap.
+    fn connection_manager_config(&self) -> redis::aio::ConnectionManagerConfig {
+        redis::aio::ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(self.connect_timeout()))
+    }
+
+    /// redis-rs async connection config carrying Ferrum's connection-attempt timeout.
+    ///
+    /// Used by the health-check path (multiplexed connection, not ConnectionManager).
+    fn async_connection_config(&self) -> redis::AsyncConnectionConfig {
+        redis::AsyncConnectionConfig::new().set_connection_timeout(Some(self.connect_timeout()))
+    }
+
+    /// Establish a ConnectionManager with Ferrum's timeout on both the inner
+    /// redis-rs config and a defensive outer `tokio::time::timeout` bound.
+    async fn connect_manager(
+        &self,
+        client: redis::Client,
+    ) -> Result<redis::aio::ConnectionManager, ConnectAttemptError> {
+        let connect_timeout = self.connect_timeout();
+        let manager_config = self.connection_manager_config();
+        match tokio::time::timeout(
+            connect_timeout,
+            redis::aio::ConnectionManager::new_with_config(client, manager_config),
+        )
+        .await
+        {
+            Ok(Ok(manager)) => Ok(manager),
+            Ok(Err(error)) => Err(ConnectAttemptError::Redis(error)),
+            Err(_) => Err(ConnectAttemptError::Timeout),
+        }
+    }
+
     /// Get or create the Redis connection, establishing it lazily.
     ///
     /// Fast path (hot): lock-free `ArcSwap::load()` — O(1) atomic load.
@@ -681,11 +793,8 @@ impl RedisRateLimitClient {
             }
         };
 
-        let connect_timeout = Duration::from_secs(self.config.connect_timeout_seconds);
-        match tokio::time::timeout(connect_timeout, redis::aio::ConnectionManager::new(client))
-            .await
-        {
-            Ok(Ok(manager)) => {
+        match self.connect_manager(client).await {
+            Ok(manager) => {
                 self.available.store(true, Ordering::Relaxed);
                 info!(
                     redis_url = %self.config.url,
@@ -696,7 +805,7 @@ impl RedisRateLimitClient {
                 self.connection.store(Arc::new(Some(manager.clone())));
                 Some(manager)
             }
-            Ok(Err(e)) => {
+            Err(ConnectAttemptError::Redis(e)) => {
                 warn!(
                     redis_url = %self.config.url,
                     error = %e,
@@ -706,7 +815,7 @@ impl RedisRateLimitClient {
                 self.start_health_checker_if_needed();
                 None
             }
-            Err(_) => {
+            Err(ConnectAttemptError::Timeout) => {
                 warn!(
                     redis_url = %self.config.url,
                     timeout_seconds = self.config.connect_timeout_seconds,
@@ -757,15 +866,12 @@ impl RedisRateLimitClient {
             }
         };
 
-        let connect_timeout = Duration::from_secs(self.config.connect_timeout_seconds);
-        match tokio::time::timeout(connect_timeout, redis::aio::ConnectionManager::new(client))
-            .await
-        {
-            Ok(Ok(manager)) => {
+        match self.connect_manager(client).await {
+            Ok(manager) => {
                 self.available.store(true, Ordering::Relaxed);
                 Some(manager)
             }
-            Ok(Err(e)) => {
+            Err(ConnectAttemptError::Redis(e)) => {
                 warn!(
                     redis_url = %self.config.url,
                     error = %e,
@@ -775,7 +881,7 @@ impl RedisRateLimitClient {
                 self.start_health_checker_if_needed();
                 None
             }
-            Err(_) => {
+            Err(ConnectAttemptError::Timeout) => {
                 warn!(
                     redis_url = %self.config.url,
                     timeout_seconds = self.config.connect_timeout_seconds,
@@ -810,6 +916,7 @@ impl RedisRateLimitClient {
         let config = self.config.clone();
         let dns_cache = self.dns_cache.clone();
         let interval = Duration::from_secs(self.config.health_check_interval_seconds);
+        let connect_timeout = self.connect_timeout();
         let tls_no_verify = self.tls_no_verify;
         let tls_ca_bundle_pem = self.tls_ca_bundle_pem.clone();
 
@@ -832,6 +939,10 @@ impl RedisRateLimitClient {
                 // ACL credentials from `config.username` / `config.password` are
                 // injected via ConnectionInfo so health-check pings authenticate
                 // with the same principal as the main connection.
+                //
+                // Connection attempts use the same Ferrum timeout as cached/
+                // dedicated paths (inner AsyncConnectionConfig + defensive outer
+                // bound). Gateway DNS screening above is outside that timeout.
                 let result: Result<(), redis::RedisError> = async {
                     use redis::IntoConnectionInfo;
                     let is_tls = url.starts_with("rediss://");
@@ -862,7 +973,23 @@ impl RedisRateLimitClient {
                     } else {
                         redis::Client::open(conn_info)?
                     };
-                    let mut conn = client.get_multiplexed_async_connection().await?;
+                    let async_config = redis::AsyncConnectionConfig::new()
+                        .set_connection_timeout(Some(connect_timeout));
+                    let mut conn = match tokio::time::timeout(
+                        connect_timeout,
+                        client.get_multiplexed_async_connection_with_config(&async_config),
+                    )
+                    .await
+                    {
+                        Ok(Ok(conn)) => conn,
+                        Ok(Err(error)) => return Err(error),
+                        Err(_) => {
+                            return Err(redis::RedisError::from((
+                                redis::ErrorKind::Io,
+                                "Redis health-check connection attempt timed out",
+                            )));
+                        }
+                    };
                     redis::cmd("PING").query_async::<String>(&mut conn).await?;
                     Ok::<(), redis::RedisError>(())
                 }

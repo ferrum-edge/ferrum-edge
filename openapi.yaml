@@ -15846,7 +15846,12 @@ components:
         redis_connect_timeout_seconds:
           type: integer
           default: 5
-          description: Redis connection timeout in seconds
+          description: >-
+            Effective Redis connection-attempt timeout in seconds. Applied to the
+            redis-rs inner connection config for cached, dedicated, and health-check
+            paths (TCP connect, TLS handshake when enabled, Redis protocol handshake).
+            Gateway DNS screening/resolution of the Redis hostname runs before this
+            timeout starts.
         redis_health_check_interval_seconds:
           type: integer
           default: 5
@@ -17432,7 +17437,12 @@ components:
           type: integer
           minimum: 1
           default: 5
-          description: Redis connection timeout in seconds
+          description: >-
+            Effective Redis connection-attempt timeout in seconds (must be ≥ 1).
+            Applied to the redis-rs inner connection config for cached, dedicated,
+            and health-check paths (TCP connect, TLS handshake when enabled, Redis
+            protocol handshake). Gateway DNS screening/resolution of the Redis
+            hostname runs before this timeout starts.
         redis_health_check_interval_seconds:
           type: integer
           minimum: 1
@@ -17542,7 +17552,12 @@ components:
           type: integer
           minimum: 1
           default: 5
-          description: Redis connection timeout in seconds
+          description: >-
+            Effective Redis connection-attempt timeout in seconds (must be ≥ 1).
+            Applied to the redis-rs inner connection config for cached, dedicated,
+            and health-check paths (TCP connect, TLS handshake when enabled, Redis
+            protocol handshake). Gateway DNS screening/resolution of the Redis
+            hostname runs before this timeout starts.
         redis_health_check_interval_seconds:
           type: integer
           minimum: 1
