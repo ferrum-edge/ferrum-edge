@@ -3,6 +3,8 @@
 use ferrum_edge::_test_support::{
     kafka_logging_probe_byte_budget_before_serialize_for_test,
     kafka_logging_probe_reserve_before_serialize_for_test,
+    kafka_logging_serialize_http_with_config_for_test,
+    kafka_logging_serialize_stream_with_config_for_test,
     kafka_logging_validate_producer_admission_for_test,
 };
 use ferrum_edge::plugins::kafka_logging::{
@@ -934,6 +936,54 @@ async fn test_kafka_logging_byte_budget_saturation_and_release() {
     assert_eq!(
         after.retained_bytes, 0,
         "finalize must drain Ferrum retained bytes"
+    );
+}
+
+#[test]
+fn test_kafka_logging_schema_only_applies_to_matching_summary_type() {
+    let http = create_test_transaction_summary();
+    let stream = create_test_stream_transaction_summary();
+
+    let stream_only_schema = json!({
+        "schema": {
+            "summary_type": "stream",
+            "omit": ["protocol"]
+        }
+    });
+    let http_value = kafka_logging_serialize_http_with_config_for_test(&stream_only_schema, &http)
+        .expect("HTTP serialization should succeed with a stream-only schema");
+    assert!(
+        http_value.get("http_method").is_some(),
+        "stream-only schemas must not remove native HTTP audit fields: {http_value}"
+    );
+    assert!(
+        http_value.get("request_path").is_some(),
+        "stream-only schemas must not remove native HTTP path fields: {http_value}"
+    );
+
+    let http_only_schema = json!({
+        "schema": {
+            "summary_type": "http",
+            "omit": ["request_path"]
+        }
+    });
+    let stream_value =
+        kafka_logging_serialize_stream_with_config_for_test(&http_only_schema, &stream)
+            .expect("stream serialization should succeed with an HTTP-only schema");
+    assert!(
+        stream_value.get("protocol").is_some(),
+        "HTTP-only schemas must not remove native stream connection fields: {stream_value}"
+    );
+    assert!(
+        stream_value.get("listen_port").is_some(),
+        "HTTP-only schemas must not remove native stream listener fields: {stream_value}"
+    );
+
+    let matching_http = kafka_logging_serialize_http_with_config_for_test(&http_only_schema, &http)
+        .expect("matching HTTP schema should serialize");
+    assert!(
+        matching_http.get("request_path").is_none(),
+        "matching HTTP schema should still be applied: {matching_http}"
     );
 }
 

@@ -685,6 +685,20 @@ pub mod _test_support {
         crate::plugins::kafka_logging::validate_producer_admission(config, http_client)
     }
 
+    pub fn kafka_logging_serialize_http_with_config_for_test(
+        config: &serde_json::Value,
+        summary: &crate::plugins::TransactionSummary,
+    ) -> Result<serde_json::Value, String> {
+        crate::plugins::kafka_logging::serialize_http_with_config_for_test(config, summary)
+    }
+
+    pub fn kafka_logging_serialize_stream_with_config_for_test(
+        config: &serde_json::Value,
+        summary: &crate::plugins::StreamTransactionSummary,
+    ) -> Result<serde_json::Value, String> {
+        crate::plugins::kafka_logging::serialize_stream_with_config_for_test(config, summary)
+    }
+
     /// Deterministic probe: channel reservation must precede serialization so
     /// an oversized summary rejected by a full Ferrum channel never increments
     /// the oversize counter.
