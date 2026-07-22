@@ -49,9 +49,14 @@ fn build_admin_metrics_without_proxy_state_matches_empty_skeleton() {
 
 #[test]
 fn circuit_breaker_target_semantics_direct_vs_upstream() {
-    let direct = AdminMetricsCircuitBreaker::from_cache_key("proxy-a", "closed", 0, 0);
-    let per_target =
-        AdminMetricsCircuitBreaker::from_cache_key("proxy-b::10.0.2.1:8080", "open", 5, 0);
+    let direct = AdminMetricsCircuitBreaker::direct_backend("proxy-a", "closed", 0, 0);
+    let per_target = AdminMetricsCircuitBreaker::upstream_target(
+        "proxy-b",
+        "10.0.2.1:8080",
+        "open",
+        5,
+        0,
+    );
 
     let direct_json = serde_json::to_value(&direct).expect("direct serializes");
     let target_json = serde_json::to_value(&per_target).expect("target serializes");

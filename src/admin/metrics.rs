@@ -11,6 +11,9 @@ use std::collections::BTreeMap;
 
 /// Operating modes that construct an [`crate::admin::AdminState`] and serve
 /// authenticated `GET /admin/metrics`.
+// The binary target does not consume this contract inventory directly; the
+// repository's external unit/OpenAPI contract suites do.
+#[allow(dead_code)]
 pub const ADMIN_METRICS_MODES: &[&str] = &["database", "file", "cp", "dp", "mesh", "node_agent"];
 
 /// Top-level authenticated `/admin/metrics` payload.
@@ -448,6 +451,9 @@ pub fn build_admin_metrics(
 /// Canonical fixtures covering every mode and the circuit-breaker / health
 /// variants the OpenAPI contract must accept. Used by contract tests so the
 /// typed model remains the single source of truth for response shape.
+// External test crates consume this helper through the library target; the
+// separately compiled binary target has no production caller.
+#[allow(dead_code)]
 pub fn contract_fixtures() -> Vec<AdminMetrics> {
     let mut fixtures = Vec::new();
 
@@ -499,6 +505,7 @@ pub fn contract_fixtures() -> Vec<AdminMetrics> {
     fixtures
 }
 
+#[allow(dead_code)] // Called by the external contract-fixture entry point.
 fn proxy_serving_fixture(mode: &str) -> AdminMetrics {
     let mut metrics = empty_proxy_metrics(mode);
     metrics.gateway.config_source_status = if mode == "database" {
@@ -538,6 +545,7 @@ fn proxy_serving_fixture(mode: &str) -> AdminMetrics {
     metrics
 }
 
+#[allow(dead_code)] // Called by the external contract-fixture entry point.
 fn sample_database_polling() -> DatabaseDeltaPollMetricsSnapshot {
     DatabaseDeltaPollMetricsSnapshot {
         rejected_deltas_total: 0,
