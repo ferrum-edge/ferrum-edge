@@ -876,6 +876,21 @@ impl ApiChargebackSink {
         runtime.logger.try_send(event);
         invalidate_status_cache();
     }
+
+    /// Whether this instance currently owns the process-global `ACTIVE_SINK`
+    /// diagnostics slot. Staging (`start_background_tasks`) must leave this
+    /// false; only [`Plugin::commit_background_tasks`] publishes ownership.
+    #[allow(dead_code)] // lifecycle tests observe pre/post-commit publication
+    pub fn owns_active_sink(&self) -> bool {
+        let Some(runtime) = self.runtime.get() else {
+            return false;
+        };
+        active_sink()
+            .load_full()
+            .as_ref()
+            .as_ref()
+            .is_some_and(|published| Arc::ptr_eq(published, runtime))
+    }
 }
 
 impl Drop for ApiChargebackSink {

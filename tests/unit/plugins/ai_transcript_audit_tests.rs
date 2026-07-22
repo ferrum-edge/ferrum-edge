@@ -186,6 +186,9 @@ async fn capture_roundtrip(config_overrides: Value, resp_body: &[u8]) -> Vec<Val
         loopback_http_client(),
     )
     .expect("valid config");
+    // Live delivery fixtures must stage then commit the deferred batching worker.
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin
@@ -2437,6 +2440,8 @@ async fn records_per_minute_limit_drops_excess() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let headers = json_headers();
     for _ in 0..3 {
         let mut ctx = make_ctx();
@@ -3342,6 +3347,8 @@ async fn request_derived_model_and_tool_names_are_redacted() {
         loopback_http_client(),
     )
     .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let mut ctx = make_ctx();
     let headers = json_headers();
     plugin

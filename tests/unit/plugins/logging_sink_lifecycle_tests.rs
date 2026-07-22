@@ -15,9 +15,10 @@ use ferrum_edge::plugins::api_chargeback_sink::{self, ApiChargebackSink};
 use ferrum_edge::plugins::kafka_logging::KafkaLogging;
 use ferrum_edge::plugins::utils::PluginHttpClient;
 use ferrum_edge::plugins::{
-    Plugin, ai_transcript_audit::AiTranscriptAudit, http_logging::HttpLogging,
-    loki_logging::LokiLogging, statsd_logging::StatsdLogging, tcp_logging::TcpLogging,
-    udp_logging::UdpLogging, validate_plugin_config, ws_logging::WsLogging,
+    Plugin, PluginFailurePolicy, ai_transcript_audit::AiTranscriptAudit,
+    http_logging::HttpLogging, loki_logging::LokiLogging, plugin_failure_policy,
+    statsd_logging::StatsdLogging, tcp_logging::TcpLogging, udp_logging::UdpLogging,
+    validate_plugin_config, ws_logging::WsLogging,
 };
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -222,7 +223,25 @@ fn file_mode_validate_pipeline_accepts_each_worker_backed_sink() {
 fn file_mode_validate_pipeline_rejects_malformed_sink_fields() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
+    // Constructors / validate_plugin_config must reject every malformed case
+    // synchronously (runtime-free). This pins semantic validation in `new`
+    // even when file-mode OptionalFailOpen soft-warns and omits the instance.
     for (name, config, needle) in malformed_sink_cases() {
+        let error = validate_plugin_config(name, &config)
+            .expect_err(&format!("{name}: expected constructor validation failure"));
+        assert!(
+            error.contains(needle),
+            "{name}: validate_plugin_config should name the bad field/hint '{needle}', got: {error}"
+        );
+    }
+
+    // KeepLastKnownGood sinks must also fail closed through the file-mode
+    // load path used by `ferrum-edge validate`. OptionalFailOpen sinks warn
+    // and omit rather than aborting the surrounding snapshot (docs/plugins.md).
+    for (name, config, needle) in malformed_sink_cases() {
+        if plugin_failure_policy(name) == Some(PluginFailurePolicy::OptionalFailOpen) {
+            continue;
+        }
         let spec_path = tmp.path().join(format!("{name}-bad.json"));
         write_file_mode_spec(&spec_path, name, &config);
         let error = load_file_mode_spec(&spec_path)
@@ -424,7 +443,7 @@ async fn kafka_generation_registers_only_after_commit() {
 }
 
 #[tokio::test]
-#[serial_test::serial(api_chargeback_sink_lifecycle_secret)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn chargeback_activation_failure_publishes_no_active_sink() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let spool = tmp.path().join("missing-secret-spool");
@@ -475,7 +494,15 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
     plugin
         .start_background_tasks()
         .expect("activation retries after secret is present");
+    assert!(
+        !plugin.owns_active_sink(),
+        "start must not publish ACTIVE_SINK before commit"
+    );
     plugin.commit_background_tasks();
+    assert!(
+        plugin.owns_active_sink(),
+        "successful commit must publish ACTIVE_SINK for this instance"
+    );
     let status: Value =
         serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status json");
     assert_eq!(
@@ -525,6 +552,7 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
 }
 
 #[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn logging_sink_live_construction_starts_workers_idempotently() {
     let tmp = tempfile::tempdir().expect("tempdir");
 
@@ -712,7 +740,7 @@ async fn deferred_batching_logger_staged_drop_exits_without_flush() {
 }
 
 #[tokio::test]
-#[serial_test::serial(api_chargeback_sink_lifecycle_spool)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn chargeback_spool_replay_and_snapshot_stay_dormant_until_commit() {
     use std::fs;
     use std::time::Duration;
@@ -782,12 +810,12 @@ async fn chargeback_spool_replay_and_snapshot_stay_dormant_until_commit() {
         planted_bytes,
         "spool file must remain untouched before commit"
     );
-    let status: Value =
-        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
-    assert_eq!(
-        status.get("enabled").and_then(Value::as_bool),
-        Some(false),
-        "ACTIVE_SINK must stay unpublished before commit"
+    // ACTIVE_SINK is process-global; assert instance ownership rather than
+    // global emptiness so parallel non-lifecycle suite members cannot flake
+    // this dormancy proof. Publication must wait for commit.
+    assert!(
+        !plugin.owns_active_sink(),
+        "ACTIVE_SINK must stay unpublished for this staged instance before commit"
     );
 
     // Drop without commit: workers must exit without spool side effects.

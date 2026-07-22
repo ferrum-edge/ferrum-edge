@@ -494,6 +494,10 @@ async fn test_loki_overlapping_plugin_generations_use_distinct_emitter_stream_la
     // domain or a Loki stream even when their operator config is identical.
     let first = LokiLogging::new(&config, default_client()).unwrap();
     let second = LokiLogging::new(&config, default_client()).unwrap();
+    first.start_background_tasks().expect("first live start");
+    first.commit_background_tasks();
+    second.start_background_tasks().expect("second live start");
+    second.commit_background_tasks();
     first.log(&create_test_transaction_summary()).await;
     second.log(&create_test_transaction_summary()).await;
 
