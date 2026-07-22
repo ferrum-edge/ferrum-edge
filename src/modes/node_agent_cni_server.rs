@@ -434,6 +434,23 @@ fn acquire_socket_ownership(socket_path: &str) -> std::io::Result<Option<File>> 
     // alive until that task exits. `flock` does not access Rust-managed memory.
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result == 0 {
+        // Detect a rename-and-replace between open and lock acquisition. Without
+        // this fence, two generations could hold locks on different inodes that
+        // merely used the same pathname at different instants.
+        let path_metadata = std::fs::symlink_metadata(&lock_path)?;
+        if !path_metadata.file_type().is_file()
+            || path_metadata.nlink() != 1
+            || path_metadata.dev() != lock_metadata.dev()
+            || path_metadata.ino() != lock_metadata.ino()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "CNI socket ownership lock '{}' changed identity during acquisition",
+                    lock_path.display()
+                ),
+            ));
+        }
         return Ok(Some(file));
     }
     let error = std::io::Error::last_os_error();
