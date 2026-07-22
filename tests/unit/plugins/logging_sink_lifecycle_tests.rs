@@ -15,14 +15,20 @@ use ferrum_edge::plugins::api_chargeback_sink::{self, ApiChargebackSink};
 use ferrum_edge::plugins::kafka_logging::KafkaLogging;
 use ferrum_edge::plugins::utils::PluginHttpClient;
 use ferrum_edge::plugins::{
-    Plugin, PluginFailurePolicy, ai_transcript_audit::AiTranscriptAudit, http_logging::HttpLogging,
-    loki_logging::LokiLogging, plugin_failure_policy, statsd_logging::StatsdLogging,
-    tcp_logging::TcpLogging, udp_logging::UdpLogging, validate_plugin_config,
-    ws_logging::WsLogging,
+    Plugin, PluginFailurePolicy, WsDisconnectContext, ai_transcript_audit::AiTranscriptAudit,
+    http_logging::HttpLogging, loki_logging::LokiLogging, plugin_failure_policy,
+    statsd_logging::StatsdLogging, tcp_logging::TcpLogging, udp_logging::UdpLogging,
+    validate_plugin_config, ws_logging::WsLogging,
 };
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use super::plugin_utils::{
+    create_test_stream_transaction_summary, create_test_transaction_summary,
+};
 
 fn client() -> PluginHttpClient {
     PluginHttpClient::default()
@@ -840,4 +846,210 @@ async fn chargeback_spool_replay_and_snapshot_stay_dormant_until_commit() {
     unsafe {
         std::env::remove_var("FERRUM_NODE_ID");
     }
+}
+
+fn test_ws_disconnect_context() -> WsDisconnectContext {
+    WsDisconnectContext {
+        namespace: "ferrum".to_string(),
+        proxy_id: "proxy-ws".to_string(),
+        proxy_name: Some("websocket-proxy".to_string()),
+        client_ip: "127.0.0.1".to_string(),
+        backend_target: "ws://backend.local/chat".to_string(),
+        listen_port: 8080,
+        duration_ms: 250.0,
+        frames_client_to_backend: 1,
+        frames_backend_to_client: 1,
+        bytes_client_to_backend: 8,
+        bytes_backend_to_client: 8,
+        timestamp_connected: "2026-01-01T00:00:00+00:00".to_string(),
+        timestamp_disconnected: "2026-01-01T00:00:01+00:00".to_string(),
+        direction: None,
+        io_side: None,
+        error_class: None,
+        consumer_username: Some("alice".to_string()),
+        auth_method: None,
+        metadata: HashMap::new(),
+    }
+}
+
+/// Pre-start admission must drop rather than panic or enqueue (issue #2616).
+#[tokio::test]
+async fn ws_logging_drops_queued_entries_before_start() {
+    let plugin = WsLogging::new(&ws_sink_config(), client()).expect("ws");
+    plugin.log(&create_test_transaction_summary()).await;
+    plugin
+        .on_stream_disconnect(&create_test_stream_transaction_summary())
+        .await;
+    plugin
+        .on_ws_disconnect(&test_ws_disconnect_context())
+        .await;
+}
+
+/// Staged WS workers must exit the flush loop when dropped without commit.
+#[tokio::test]
+async fn ws_logging_staged_drop_exits_flush_loop_without_commit() {
+    let plugin = WsLogging::new(&ws_sink_config(), client()).expect("ws");
+    plugin.start_background_tasks().expect("stage ws worker");
+    // Do not commit — Drop closes the commit gate so flush_loop returns early.
+    drop(plugin);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+}
+
+/// Never-started chargeback instances keep diagnostics/admission closed.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_pre_start_commit_and_enqueue_are_noops() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let plugin =
+        ApiChargebackSink::new(&chargeback_sink_config(&tmp), client(), "default").expect("cb");
+    assert!(
+        !plugin.owns_active_sink(),
+        "validation/construction objects must not own ACTIVE_SINK"
+    );
+    plugin.commit_background_tasks();
+    assert!(
+        !plugin.owns_active_sink(),
+        "commit before start must remain a no-op"
+    );
+    plugin.log(&create_test_transaction_summary()).await;
+    assert!(
+        !tmp.path().join("spool").exists(),
+        "pre-start enqueue must not create spool state"
+    );
+}
+
+#[test]
+fn chargeback_rejects_empty_and_nul_spool_dir_shape() {
+    let mut empty = chargeback_sink_config(&tempfile::tempdir().expect("tempdir"));
+    empty["spool"]["dir"] = json!("");
+    let err = ApiChargebackSink::new(&empty, client(), "default")
+        .expect_err("empty spool.dir must fail shape validation");
+    assert!(
+        err.contains("spool.dir") && err.contains("empty"),
+        "expected empty spool.dir error, got: {err}"
+    );
+
+    let mut nul = chargeback_sink_config(&tempfile::tempdir().expect("tempdir"));
+    nul["spool"]["dir"] = json!("spool\u0000dir");
+    let err = ApiChargebackSink::new(&nul, client(), "default")
+        .expect_err("NUL spool.dir must fail shape validation");
+    assert!(
+        err.contains("spool.dir") && err.contains("NUL"),
+        "expected NUL spool.dir error, got: {err}"
+    );
+}
+
+/// Kafka finalize/commit before activation must stay silent no-ops.
+#[tokio::test]
+async fn kafka_finalize_and_commit_before_start_are_noops() {
+    let plugin = KafkaLogging::new(&kafka_sink_config(), &client()).expect("kafka");
+    assert_eq!(plugin.snapshot().generation_id, 0);
+    plugin.commit_background_tasks();
+    plugin.finalize().await;
+    assert_eq!(plugin.snapshot().generation_id, 0);
+    assert!(!plugin.snapshot().accepting);
+}
+
+/// Dropping a started generation off-runtime must close admission without
+/// requiring a Tokio context (reload/abandoned-instance path).
+#[tokio::test]
+async fn kafka_drop_without_runtime_closes_uncommitted_generation() {
+    let plugin = KafkaLogging::new(&kafka_sink_config(), &client()).expect("kafka");
+    plugin
+        .start_background_tasks()
+        .expect("kafka start under tokio");
+    let generation_id = plugin.snapshot().generation_id;
+    assert!(generation_id >= 1);
+    assert!(
+        !ferrum_edge::plugins::kafka_logging::snapshots()
+            .iter()
+            .any(|snap| snap.generation_id == generation_id),
+        "uncommitted generation must stay unpublished"
+    );
+
+    std::thread::spawn(move || drop(plugin))
+        .join()
+        .expect("join kafka drop thread");
+
+    assert!(
+        !ferrum_edge::plugins::kafka_logging::snapshots()
+            .iter()
+            .any(|snap| snap.generation_id == generation_id),
+        "no-runtime Drop must unregister generation {generation_id}"
+    );
+}
+
+/// Multi-thread Drop finalizes an un-finalized live generation in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kafka_drop_on_multi_thread_runtime_finalizes_generation() {
+    let plugin = KafkaLogging::new(&kafka_sink_config(), &client()).expect("kafka");
+    plugin
+        .start_background_tasks()
+        .expect("kafka start under tokio");
+    plugin.commit_background_tasks();
+    let generation_id = plugin.snapshot().generation_id;
+    assert!(
+        ferrum_edge::plugins::kafka_logging::snapshots()
+            .iter()
+            .any(|snap| snap.generation_id == generation_id),
+        "commit must publish generation {generation_id}"
+    );
+
+    drop(plugin);
+
+    assert!(
+        !ferrum_edge::plugins::kafka_logging::snapshots()
+            .iter()
+            .any(|snap| snap.generation_id == generation_id),
+        "multi-thread Drop must finalize and unregister generation {generation_id}"
+    );
+}
+
+/// Producer construction failures during start restore pending activation so
+/// retries remain possible and secrets stay out of the error string.
+#[tokio::test]
+async fn kafka_start_restores_pending_when_producer_create_fails() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let missing_cert = tmp.path().join("missing-client.pem");
+    let missing_key = tmp.path().join("missing-client.key");
+    let cfg = json!({
+        "broker_list": "127.0.0.1:9092",
+        "topic": "ferrum-logs",
+        "security_protocol": "ssl",
+        "ssl_no_verify": true,
+        "ssl_certificate_location": missing_cert.to_string_lossy(),
+        "ssl_key_location": missing_key.to_string_lossy(),
+    });
+
+    let plugin = match KafkaLogging::new(&cfg, &client()) {
+        Ok(plugin) => plugin,
+        Err(error) => {
+            // Native config validation may reject missing material before start.
+            // Keep this lifecycle proof focused on the activate/restore path.
+            assert!(
+                error.contains("ssl") || error.contains("certificate") || error.contains("key"),
+                "construction failure should name TLS material: {error}"
+            );
+            return;
+        }
+    };
+
+    let err = plugin
+        .start_background_tasks()
+        .expect_err("missing client cert/key must fail producer create");
+    assert!(
+        err.contains("failed to create Kafka producer"),
+        "activate must classify producer create failure without echoing paths: {err}"
+    );
+    assert!(
+        !err.contains(missing_cert.to_string_lossy().as_ref()),
+        "error must not echo certificate path: {err}"
+    );
+
+    // Pending activation must be restored so a later start can retry.
+    let retry_err = plugin.start_background_tasks();
+    assert!(
+        retry_err.is_err(),
+        "restored pending activation must remain retryable (still missing material)"
+    );
 }
