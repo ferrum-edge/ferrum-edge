@@ -424,3 +424,214 @@ fn plugin_consumers_parse_connect_timeout_above_one_second() {
         );
     }
 }
+
+// ── redis_pool_size cardinality / selection (issue #2304) ─────────────────
+//
+// Before the fix, `redis_pool_size` was parsed and validated but every instance
+// cached exactly one ConnectionManager. These tests prove configured pool size
+// controls runtime cardinality and round-robin selection — not merely parsing.
+
+#[test]
+fn pool_size_controls_client_cardinality_for_named_consumers() {
+    // rate_limiting / graphql / grpc_method_router all construct RedisRateLimitClient
+    // through RedisConfig / RateLimitBackend::from_plugin_config.
+    for (prefix, pool_size) in [
+        ("ferrum:rate_limiting", 1_usize),
+        ("ferrum:graphql", 3_usize),
+        ("ferrum:grpc_method_router", 8_usize),
+    ] {
+        let config = RedisConfig::from_plugin_config(
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0",
+                "redis_pool_size": pool_size,
+            }),
+            prefix,
+        )
+        .expect("parse")
+        .expect("redis mode");
+        assert_eq!(config.pool_size, pool_size);
+        assert_eq!(config.key_prefix, prefix);
+        let client = redis_rate_limit_client_for_test(config);
+        assert_eq!(
+            client.pool_size_for_test(),
+            pool_size,
+            "client pool must match redis_pool_size for {prefix}"
+        );
+        assert_eq!(
+            client.cached_pool_cardinality_for_test(),
+            0,
+            "pool slots must be empty before lazy establishment"
+        );
+    }
+}
+
+#[test]
+fn pool_slot_selection_is_deterministic_round_robin() {
+    let mut config = make_config("redis://127.0.0.1:6379/0", false);
+    config.pool_size = 4;
+    let client = redis_rate_limit_client_for_test(config);
+    assert_eq!(
+        client.select_slot_indexes_for_test(10),
+        vec![0, 1, 2, 3, 0, 1, 2, 3, 0, 1]
+    );
+
+    let mut config = make_config("redis://127.0.0.1:6379/0", false);
+    config.pool_size = 1;
+    let single = redis_rate_limit_client_for_test(config);
+    assert_eq!(single.select_slot_indexes_for_test(5), vec![0, 0, 0, 0, 0]);
+}
+
+#[tokio::test]
+async fn pool_size_one_establishes_single_tcp_connection() {
+    let (port, shutdown, accepts) = spawn_delayed_redis_handshake_server(None).await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.pool_size = 1;
+    config.health_check_interval_seconds = 60;
+    let client = redis_rate_limit_client_for_test(config);
+
+    assert_eq!(client.warm_pool_for_test().await, 1);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 1);
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        1,
+        "pool_size=1 must open exactly one multiplexed TCP connection"
+    );
+
+    // Re-warming must reuse the cached manager, not dial again.
+    assert_eq!(client.warm_pool_for_test().await, 1);
+    assert_eq!(accepts.load(Ordering::Relaxed), 1);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn pool_size_four_establishes_four_tcp_connections() {
+    let (port, shutdown, accepts) = spawn_delayed_redis_handshake_server(None).await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.pool_size = 4;
+    config.health_check_interval_seconds = 60;
+    let client = redis_rate_limit_client_for_test(config);
+
+    assert_eq!(client.warm_pool_for_test().await, 4);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 4);
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        4,
+        "pool_size=4 must open four multiplexed TCP connections"
+    );
+
+    // Second warm must reuse all slots.
+    assert_eq!(client.warm_pool_for_test().await, 4);
+    assert_eq!(accepts.load(Ordering::Relaxed), 4);
+    assert_eq!(client.cached_pool_cardinality_for_test(), 4);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn pool_clear_on_reconnect_drops_all_slots_then_reestablishes() {
+    let (port, shutdown, accepts) = spawn_delayed_redis_handshake_server(None).await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.pool_size = 3;
+    config.health_check_interval_seconds = 60;
+    let client = redis_rate_limit_client_for_test(config);
+
+    assert_eq!(client.warm_pool_for_test().await, 3);
+    assert_eq!(accepts.load(Ordering::Relaxed), 3);
+
+    // Reconnect clearing must wipe every slot (partial-failure / mark_unavailable path).
+    client.clear_pool_for_test();
+    assert_eq!(client.cached_pool_cardinality_for_test(), 0);
+
+    assert_eq!(client.warm_pool_for_test().await, 3);
+    assert_eq!(
+        accepts.load(Ordering::Relaxed),
+        6,
+        "after clear, all three slots must dial again"
+    );
+    assert_eq!(client.cached_pool_cardinality_for_test(), 3);
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn named_consumer_pool_sizes_produce_matching_tcp_cardinality() {
+    // End-to-end for the three issue-named consumers: parse their config shape,
+    // construct the shared client, and prove TCP accepts == redis_pool_size.
+    for (prefix, pool_size) in [
+        ("ferrum:rate_limiting", 2_usize),
+        ("ferrum:graphql", 5_usize),
+        ("ferrum:grpc_method_router", 3_usize),
+    ] {
+        let (port, shutdown, accepts) = spawn_delayed_redis_handshake_server(None).await;
+        let config = RedisConfig::from_plugin_config(
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": format!("redis://127.0.0.1:{port}/0"),
+                "redis_pool_size": pool_size,
+                "redis_health_check_interval_seconds": 60,
+            }),
+            prefix,
+        )
+        .expect("parse")
+        .expect("redis mode");
+        let client = redis_rate_limit_client_for_test(config);
+        assert_eq!(client.pool_size_for_test(), pool_size);
+        assert_eq!(client.warm_pool_for_test().await, pool_size);
+        assert_eq!(
+            accepts.load(Ordering::Relaxed),
+            pool_size,
+            "{prefix}: TCP accepts must equal redis_pool_size={pool_size}"
+        );
+        assert_eq!(client.cached_pool_cardinality_for_test(), pool_size);
+        let _ = shutdown.send(());
+    }
+}
+
+#[test]
+fn rate_limit_backend_from_plugin_config_honors_pool_size_for_named_consumers() {
+    use ferrum_edge::plugins::utils::http_client::PluginHttpClient;
+    use ferrum_edge::plugins::utils::rate_limit::{
+        DynamicHttpRateLimitAlgorithm, RateLimitBackend,
+    };
+
+    let http = PluginHttpClient::default();
+    let algorithm = DynamicHttpRateLimitAlgorithm::new();
+
+    for (plugin_name, pool_size) in [
+        ("rate_limiting", 1_usize),
+        ("graphql", 4_usize),
+        ("grpc_method_router", 7_usize),
+    ] {
+        let backend: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+            RateLimitBackend::from_plugin_config(
+                plugin_name,
+                &json!({
+                    "sync_mode": "redis",
+                    "redis_url": "redis://127.0.0.1:6379/0",
+                    "redis_pool_size": pool_size,
+                    "redis_health_check_interval_seconds": 60,
+                }),
+                &http,
+                algorithm.clone(),
+            )
+            .expect("failover backend");
+        assert!(matches!(backend, RateLimitBackend::Failover(_)));
+        assert_eq!(
+            backend.redis_pool_size_for_test(),
+            Some(pool_size),
+            "{plugin_name}: RateLimitBackend must retain redis_pool_size"
+        );
+    }
+
+    let local: RateLimitBackend<String, DynamicHttpRateLimitAlgorithm> =
+        RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({"sync_mode": "local"}),
+            &http,
+            algorithm,
+        )
+        .expect("local backend");
+    assert_eq!(local.redis_pool_size_for_test(), None);
+}

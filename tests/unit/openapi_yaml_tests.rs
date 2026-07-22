@@ -1606,6 +1606,31 @@ fn grpc_method_router_schema_matches_runtime_validation() {
 }
 
 #[test]
+fn rate_limiting_config_schema_requires_redis_pool_size_minimum() {
+    // Issue #2304: redis_pool_size remains operator-facing and must advertise
+    // minimum: 1 in OpenAPI to match RedisConfig admission (rejects 0).
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/RateLimitingConfig")
+        .expect("RateLimitingConfig component exists");
+    assert_eq!(schema["properties"]["redis_pool_size"]["minimum"], json!(1));
+    assert_eq!(schema["properties"]["redis_pool_size"]["default"], json!(4));
+
+    // Named consumers from the issue scope also keep the field with minimum ≥ 1.
+    for schema_name in ["GraphqlConfig", "GrpcMethodRouterConfig"] {
+        let consumer = spec
+            .pointer(&format!("/components/schemas/{schema_name}"))
+            .unwrap_or_else(|| panic!("{schema_name} component exists"));
+        assert_eq!(
+            consumer["properties"]["redis_pool_size"]["minimum"],
+            json!(1),
+            "{schema_name} must keep redis_pool_size.minimum=1"
+        );
+    }
+}
+
+#[test]
 fn graphql_config_schema_matches_runtime_validation() {
     use ferrum_edge::plugins::create_plugin;
     use ferrum_edge::plugins::graphql::GRAPHQL_CONFIG_KEYS;

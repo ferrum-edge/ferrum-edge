@@ -8572,8 +8572,9 @@ components:
           description: Key prefix for all Redis keys
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be greater than zero.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -8645,8 +8646,9 @@ components:
           description: Key prefix for all Redis keys
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be greater than zero.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -16105,8 +16107,9 @@ components:
           description: Key prefix for all Redis keys (namespace isolation)
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be greater than zero.
         redis_username:
           type: string
           description: Redis username for ACL-based authentication (Redis 6+)
@@ -18637,8 +18640,9 @@ components:
         redis_pool_size:
           type: integer
           format: uint64
+          minimum: 1
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be greater than zero.
         redis_connect_timeout_seconds:
           type: integer
           format: uint64
@@ -18879,8 +18883,9 @@ components:
           description: Key prefix for all Redis keys
         redis_pool_size:
           type: integer
+          minimum: 1
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be greater than zero.
         redis_username:
           type: string
           description: Redis username for ACL authentication

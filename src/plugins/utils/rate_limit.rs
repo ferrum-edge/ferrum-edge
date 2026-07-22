@@ -681,6 +681,18 @@ where
             Self::Failover(failover) => failover.warmup_hostname(),
         }
     }
+
+    /// Configured Redis ConnectionManager pool size when this backend uses Redis.
+    ///
+    /// Test-support only: proves `redis_pool_size` flowed from plugin config into
+    /// the shared [`RedisRateLimitClient`] (issue #2304).
+    #[allow(dead_code)] // used by the external unit-test target
+    pub fn redis_pool_size_for_test(&self) -> Option<usize> {
+        match self {
+            Self::Local(_) => None,
+            Self::Failover(failover) => Some(failover.primary.redis_client.pool_size_for_test()),
+        }
+    }
 }
 
 /// Shared consumer cleanup branch: below-cap prune vs over-cap force eviction.
