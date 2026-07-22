@@ -25,8 +25,7 @@ use std::collections::HashMap;
 use tracing::debug;
 
 use super::utils::size_limit::{
-    SizeLimiter, reject_with_limit, required_positive_u64,
-    transferable_content_length_over_limit,
+    SizeLimiter, reject_with_limit, required_positive_u64, transferable_content_length_over_limit,
 };
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{Plugin, PluginResult, RequestContext};
