@@ -1838,9 +1838,15 @@ async fn test_transform_policy_set_preserves_shadowed_collision_trailer_in_body_
     assert!(!payload.contains("gateway-enforced"));
 }
 
-#[tokio::test]
-async fn test_transform_with_provenance_uses_true_shadowed_trailer_value() {
-    let plugin = create_plugin_default();
+/// Owner-staged context plus the compatibility header view for the shadowed
+/// `x-shared-meta` collision fixture. Fresh per scenario: response translation
+/// is exactly-once per RequestContext under multi-instance ownership.
+async fn owner_staged_shadowed_trailer_fixture(
+    plugin: &std::sync::Arc<dyn Plugin>,
+) -> (
+    ferrum_edge::plugins::RequestContext,
+    HashMap<String, String>,
+) {
     let mut ctx = create_grpc_web_context("application/grpc-web");
     plugin.on_request_received(&mut ctx).await;
 
@@ -1861,7 +1867,15 @@ async fn test_transform_with_provenance_uses_true_shadowed_trailer_value() {
         "application/grpc-web".to_string(),
     );
     merged_view.insert("grpc-status".to_string(), "0".to_string());
+    (ctx, merged_view)
+}
 
+#[tokio::test]
+async fn test_transform_with_provenance_uses_true_shadowed_trailer_value() {
+    let plugin = create_plugin_default();
+
+    // Untouched compatibility view recovers the true shadowed trailer value.
+    let (mut ctx, merged_view) = owner_staged_shadowed_trailer_fixture(&plugin).await;
     let output = plugin
         .transform_response_body_with_context(
             &mut ctx,
@@ -1875,6 +1889,8 @@ async fn test_transform_with_provenance_uses_true_shadowed_trailer_value() {
     assert!(payload.contains("x-shared-meta: trailer-value\r\n"));
     assert!(!payload.contains("x-shared-meta: initial-value\r\n"));
 
+    // Later genuine rewrite wins on a fresh owner-staged request context.
+    let (mut ctx, mut merged_view) = owner_staged_shadowed_trailer_fixture(&plugin).await;
     merged_view.insert("x-shared-meta".to_string(), "sanitized".to_string());
     let output = plugin
         .transform_response_body_with_context(
@@ -1889,6 +1905,8 @@ async fn test_transform_with_provenance_uses_true_shadowed_trailer_value() {
     assert!(payload.contains("x-shared-meta: sanitized\r\n"));
     assert!(!payload.contains("trailer-value"));
 
+    // Later removal stays removed on a fresh owner-staged request context.
+    let (mut ctx, mut merged_view) = owner_staged_shadowed_trailer_fixture(&plugin).await;
     merged_view.remove("x-shared-meta");
     let output = plugin
         .transform_response_body_with_context(
