@@ -119,6 +119,16 @@ impl PluginExtTestHarness {
 }
 
 /// Echo backend that returns request info as JSON.
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 async fn start_echo_backend(
     port: u16,
 ) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
@@ -158,12 +168,15 @@ async fn start_echo_backend(
                 }
 
                 let mut request_body = String::new();
+                let mut request_body_hex = String::new();
                 if content_length > 0 {
                     let mut body_buf = vec![0u8; content_length];
                     if tokio::io::AsyncReadExt::read_exact(&mut buf_reader, &mut body_buf)
                         .await
                         .is_ok()
                     {
+                        // Lossless hex of the exact wire bytes (incl. UTF-16 BOM).
+                        request_body_hex = hex_encode(&body_buf);
                         request_body = String::from_utf8_lossy(&body_buf).to_string();
                     }
                 }
@@ -173,6 +186,7 @@ async fn start_echo_backend(
                     "path": path,
                     "headers": headers,
                     "body": request_body,
+                    "body_hex": request_body_hex,
                 });
                 let body_str = body.to_string();
                 let response = format!(
@@ -1118,6 +1132,18 @@ async fn test_plugin_soap_ws_security_utf16le_username_token() {
         status, 200,
         "UTF-16LE SOAP UsernameToken should be proxied, got {status}: {response_body}"
     );
+    let echoed: serde_json::Value =
+        serde_json::from_str(&response_body).expect("echo backend returns JSON");
+    let expected_hex = hex_encode(&utf16le);
+    assert_eq!(
+        echoed["body_hex"].as_str(),
+        Some(expected_hex.as_str()),
+        "backend must receive the original UTF-16LE wire bytes including BOM"
+    );
+    assert!(
+        expected_hex.starts_with("fffe"),
+        "fixture must include a UTF-16LE BOM on the wire"
+    );
 
     let h2_client = reqwest::Client::builder()
         .http2_prior_knowledge()
@@ -1127,7 +1153,7 @@ async fn test_plugin_soap_ws_security_utf16le_username_token() {
         .post(format!("{}/soap-utf16le/service", harness.proxy_base_url))
         .header("Content-Type", "application/soap+xml; charset=utf-16")
         .header("SOAPAction", "GetData")
-        .body(utf16le)
+        .body(utf16le.clone())
         .send()
         .await
         .expect("H2 UTF-16 request failed");
@@ -1135,6 +1161,14 @@ async fn test_plugin_soap_ws_security_utf16le_username_token() {
         h2_resp.status().as_u16(),
         200,
         "UTF-16LE SOAP UsernameToken must validate on H2"
+    );
+    let h2_body = h2_resp.text().await.unwrap_or_default();
+    let h2_echoed: serde_json::Value =
+        serde_json::from_str(&h2_body).expect("H2 echo backend returns JSON");
+    assert_eq!(
+        h2_echoed["body_hex"].as_str(),
+        Some(expected_hex.as_str()),
+        "H2 backend must receive the original UTF-16LE wire bytes including BOM"
     );
 }
 
