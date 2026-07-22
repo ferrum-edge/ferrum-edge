@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
@@ -1687,6 +1687,7 @@ pub struct SpoolManager {
     node_id: Arc<str>,
     metrics: Arc<SinkMetrics>,
     last_drop_warn_at: AtomicI64,
+    live_storage_prepared: AtomicBool,
     write_lock: Mutex<()>,
 }
 
@@ -1696,29 +1697,27 @@ impl SpoolManager {
         node_id: Arc<str>,
         metrics: Arc<SinkMetrics>,
     ) -> Result<Self, String> {
-        ensure_private_dir(&cfg.dir)?;
-        ensure_private_dir(&cfg.dir.join(node_id.as_ref()))?;
-        warn_on_sibling_spool_dirs(&cfg.dir, node_id.as_ref());
-        let manager = Self {
+        Ok(Self {
             cfg,
             node_id,
             metrics,
             last_drop_warn_at: AtomicI64::new(0),
+            live_storage_prepared: AtomicBool::new(false),
             write_lock: Mutex::new(()),
-        };
-        // Crash-left *.tmp files consume disk but are incomplete; delete them
-        // before any quota decision so ownership accounting matches durable state.
-        manager.reconcile_stale_temp_files()?;
-        Ok(manager)
+        })
     }
 
     #[allow(dead_code)]
     pub fn for_tests(cfg: SpoolSettings, node_id: &str) -> Result<Self, String> {
-        Self::new(
+        let manager = Self::new(
             cfg,
             Arc::<str>::from(node_id.to_string()),
             Arc::new(SinkMetrics::default()),
-        )
+        )?;
+        // Test callers model a committed/live sink and retain the historical
+        // eager startup validation contract.
+        manager.prepare_live_storage()?;
+        Ok(manager)
     }
 
     pub fn write_events(&self, events: &[ChargeEvent]) -> Result<PathBuf, String> {
@@ -1729,6 +1728,7 @@ impl SpoolManager {
             .write_lock
             .lock()
             .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        self.prepare_live_storage_locked()?;
         // Size the pending encoded file before admission so max_bytes is a hard
         // ceiling over existing owned bytes plus this write.
         let body = serialize_json_each_row(events)?;
@@ -1756,6 +1756,30 @@ impl SpoolManager {
         write_private_file_atomically(&tmp_path, &final_path, &bytes)?;
         invalidate_status_cache();
         Ok(final_path)
+    }
+
+    /// Prepare mutable spool state only for a committed generation. Candidate
+    /// staging must not create directories, write probes, or reconcile files.
+    fn prepare_live_storage(&self) -> Result<(), String> {
+        let _guard = self
+            .write_lock
+            .lock()
+            .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        self.prepare_live_storage_locked()
+    }
+
+    fn prepare_live_storage_locked(&self) -> Result<(), String> {
+        ensure_private_dir(&self.cfg.dir)?;
+        ensure_private_dir(&self.cfg.dir.join(self.node_id.as_ref()))?;
+        if self.live_storage_prepared.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        warn_on_sibling_spool_dirs(&self.cfg.dir, self.node_id.as_ref());
+        // Crash-left *.tmp files consume disk but are incomplete; delete them
+        // only after publication and before any live quota decision.
+        self.reconcile_stale_temp_files()?;
+        self.live_storage_prepared.store(true, Ordering::Release);
+        Ok(())
     }
 
     pub fn scan_stats(&self) -> Result<SpoolStats, String> {
@@ -2219,6 +2243,14 @@ fn start_spool_replayer(
         let mut timer = tokio::time::interval(Duration::from_secs(replay_interval_secs));
         loop {
             timer.tick().await;
+            if let Err(error) = spool.prepare_live_storage() {
+                warn!(
+                    plugin = PLUGIN_NAME,
+                    error = %error,
+                    "Chargeback sink live spool preparation failed"
+                );
+                continue;
+            }
             if let Err(error) = replay_spool_once(&spool, &flush_config).await {
                 warn!(plugin = PLUGIN_NAME, error = %error, "Chargeback sink spool replay failed");
             }

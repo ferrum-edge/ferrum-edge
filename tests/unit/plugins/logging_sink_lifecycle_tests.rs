@@ -781,19 +781,27 @@ async fn chargeback_spool_replay_and_snapshot_stay_dormant_until_commit() {
     });
 
     let plugin = ApiChargebackSink::new(&cfg, client(), "default").expect("chargeback");
-    plugin
-        .start_background_tasks()
-        .expect("stage chargeback with spool+snapshot");
 
-    // Plant an invalid-UTF8 replay candidate under the owned node tree. If the
-    // replayer ticks before commit it quarantines the file (side effect).
+    // Plant an invalid-UTF8 replay candidate and a crash-left temp before
+    // staging. A candidate-generation SpoolManager must neither quarantine the
+    // former nor reconcile/delete the latter before cache publication.
     let planted = spool_dir
         .join("lifecycle-spool-node")
         .join("20200101")
         .join("planted.ndjson");
     fs::create_dir_all(planted.parent().expect("parent")).expect("mkdir day dir");
     fs::write(&planted, [0xff, 0xfe, 0xfd]).expect("write corrupt spool bytes");
+    let stale_tmp = planted.with_file_name("crash-left.ndjson.tmp");
+    fs::write(&stale_tmp, b"partial").expect("write stale temp bytes");
     let planted_bytes = fs::metadata(&planted).expect("meta").len();
+
+    plugin
+        .start_background_tasks()
+        .expect("stage chargeback with spool+snapshot");
+    assert!(
+        stale_tmp.exists(),
+        "staging must not reconcile stale spool files before commit"
+    );
 
     // Give both interval timers a chance to fire if they were not gated.
     tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -828,6 +836,10 @@ async fn chargeback_spool_replay_and_snapshot_stay_dormant_until_commit() {
     assert!(
         !planted.with_file_name("planted.ndjson.corrupt").exists(),
         "dropping an uncommitted chargeback sink must not quarantine spool files"
+    );
+    assert!(
+        stale_tmp.exists(),
+        "dropping an uncommitted chargeback sink must not reconcile stale spool files"
     );
     unsafe {
         std::env::remove_var("FERRUM_NODE_ID");
