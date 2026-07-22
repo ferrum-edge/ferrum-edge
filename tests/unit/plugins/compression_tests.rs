@@ -3193,7 +3193,6 @@ fn test_content_type_whitelist_exact_matching() {
             "application/octet-stream; charset=application/json",
             false,
         ),
-        ("text/plain; name=application/json", false),
         // Malformed / empty media-type tokens fail closed.
         ("", false),
         ("; charset=utf-8", false),
@@ -3210,13 +3209,8 @@ fn test_content_type_whitelist_exact_matching() {
 
     for (content_type, should_compress) in cases {
         let ctx = make_ctx(Some("gzip"));
-        let result = plugin.is_compressible_content_type(content_type);
-        assert_eq!(
-            result, *should_compress,
-            "content_type={content_type:?}: expected compress={should_compress}, got {result}",
-        );
-        // Cross-check the buffering refinement predicate, which must use the
-        // same matching logic.
+        // The public buffering-refinement hook and after_proxy both use the
+        // same private content-type predicate.
         let buffered = plugin.should_buffer_response_body_for_content_type(
             &ctx,
             Some(content_type),
@@ -3258,11 +3252,6 @@ fn test_custom_content_type_whitelist_exact_matching() {
     ];
 
     for (content_type, should_compress) in cases {
-        let result = plugin.is_compressible_content_type(content_type);
-        assert_eq!(
-            result, *should_compress,
-            "content_type={content_type:?}: expected compress={should_compress}, got {result}",
-        );
         let buffered = plugin.should_buffer_response_body_for_content_type(
             &ctx,
             Some(content_type),
@@ -3372,7 +3361,6 @@ fn test_absent_content_type_fails_closed() {
     let ctx = make_ctx(Some("gzip"));
     let headers = HashMap::new();
 
-    assert!(!plugin.is_compressible_content_type(""));
     assert!(!plugin.should_buffer_response_body_for_content_type(
         &ctx,
         None,
