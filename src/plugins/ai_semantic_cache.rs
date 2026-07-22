@@ -161,19 +161,32 @@ const RESPONSE_SHAPE_FIELDS: &[&str] = &[
     "modalities",
     "prediction",
     "service_tier",
+    "reasoning",
+    "text",
+    "max_tool_calls",
+    "truncation",
+    "verbosity",
+    "audio",
+    "web_search_options",
+    "thinking",
+    "stop_sequences",
+    "additionalModelRequestFields",
 ];
 
 /// Provider-native tool / response-shape fields for Gemini / Vertex requests.
 const GEMINI_SHAPE_FIELDS: &[&str] = &[
     "tools",
     "toolConfig",
+    "tool_config",
     "functionDeclarations",
     "safetySettings",
+    "safety_settings",
 ];
 
 /// Provider-native tool / response-shape fields for Cohere v1 chat requests.
 const COHERE_SHAPE_FIELDS: &[&str] = &[
     "tools",
+    "tool_choice",
     "tool_results",
     "documents",
     "response_format",
@@ -618,15 +631,9 @@ impl AiSemanticCache {
         let mut key_input = String::with_capacity(512);
         let mut has_part = false;
 
-        append_identity_key_parts(
-            self,
-            ctx,
-            body,
-            family,
-            &mut key_input,
-            &mut has_part,
-        );
+        append_identity_key_parts(self, ctx, body, family, &mut key_input, &mut has_part);
         append_family_prompt_exact_key(family, body, &mut key_input, &mut has_part)?;
+        append_family_conversation_state(family, body, &mut key_input, &mut has_part)?;
         append_family_instruction_exact_key(family, body, &mut key_input, &mut has_part);
 
         if let Some(fingerprint) = multimodal_fingerprint {
@@ -651,15 +658,9 @@ impl AiSemanticCache {
         let mut key_input = String::with_capacity(512);
         let mut has_part = false;
 
-        append_identity_key_parts(
-            self,
-            ctx,
-            body,
-            family,
-            &mut key_input,
-            &mut has_part,
-        );
+        append_identity_key_parts(self, ctx, body, family, &mut key_input, &mut has_part);
         append_family_semantic_role_scope(family, body, &mut key_input, &mut has_part)?;
+        append_family_conversation_state(family, body, &mut key_input, &mut has_part)?;
         append_family_instruction_scope(family, body, &mut key_input, &mut has_part);
 
         if let Some(fingerprint) = multimodal_fingerprint {
@@ -1097,18 +1098,25 @@ fn start_key_part(buffer: &mut String, has_part: &mut bool) {
 fn classify_cache_request_family(body: &Value) -> Option<CacheRequestFamily> {
     let object = body.as_object()?;
 
-    let has_messages = object
-        .get("messages")
-        .is_some_and(|value| value.is_array());
-    let has_contents = object.contains_key("contents");
-    let has_chat_history = object.contains_key("chat_history");
+    let has_messages = object.get("messages").is_some_and(|value| value.is_array());
+    let has_gemini_markers = object.contains_key("contents")
+        || object.contains_key("systemInstruction")
+        || object.contains_key("system_instruction")
+        || object.contains_key("generationConfig");
+    let has_chat_history = object
+        .get("chat_history")
+        .is_some_and(Value::is_array);
     // Cohere v1 current-turn field. Do not treat it as Cohere when a `messages`
     // array is present — that body belongs to the Messages family (OpenAI /
     // Anthropic / Cohere v2).
-    let has_cohere_message = object.contains_key("message") && !has_messages;
+    let has_cohere_message = object
+        .get("message")
+        .is_some_and(Value::is_string)
+        && !has_messages;
     let has_prompt = object.contains_key("prompt");
     let has_inputs = object.contains_key("inputs");
-    let has_input_text = object.contains_key("inputText");
+    let has_titan_markers =
+        object.contains_key("inputText") || object.contains_key("textGenerationConfig");
     let has_responses_markers = object.contains_key("input")
         || object.contains_key("instructions")
         || object.contains_key("previous_response_id");
@@ -1136,7 +1144,7 @@ fn classify_cache_request_family(body: &Value) -> Option<CacheRequestFamily> {
     if has_responses && !set_family(CacheRequestFamily::Responses) {
         return None;
     }
-    if has_contents && !set_family(CacheRequestFamily::Gemini) {
+    if has_gemini_markers && !set_family(CacheRequestFamily::Gemini) {
         return None;
     }
     if (has_chat_history || has_cohere_message) && !set_family(CacheRequestFamily::Cohere) {
@@ -1148,7 +1156,7 @@ fn classify_cache_request_family(body: &Value) -> Option<CacheRequestFamily> {
     if has_inputs && !set_family(CacheRequestFamily::Tgi) {
         return None;
     }
-    if has_input_text && !set_family(CacheRequestFamily::Titan) {
+    if has_titan_markers && !set_family(CacheRequestFamily::Titan) {
         return None;
     }
 
@@ -1192,12 +1200,7 @@ fn append_identity_key_parts(
     }
 }
 
-fn append_json_field(
-    body: &Value,
-    field: &str,
-    key_input: &mut String,
-    has_part: &mut bool,
-) {
+fn append_json_field(body: &Value, field: &str, key_input: &mut String, has_part: &mut bool) {
     if let Some(value) = body.get(field) {
         start_key_part(key_input, has_part);
         key_input.push_str(field);
@@ -1246,6 +1249,21 @@ fn append_family_generation_controls(
             if matches!(family, CacheRequestFamily::Messages) {
                 append_json_field(body, "inferenceConfig", key_input, has_part);
             }
+            if matches!(family, CacheRequestFamily::Cohere) {
+                for field in [
+                    "k",
+                    "stop_sequences",
+                    "frequency_penalty",
+                    "presence_penalty",
+                    "raw_prompting",
+                    "return_likelihoods",
+                    "safety_mode",
+                    "prompt_truncation",
+                    "max_input_tokens",
+                ] {
+                    append_json_field(body, field, key_input, has_part);
+                }
+            }
         }
         CacheRequestFamily::Gemini => {
             append_json_field(body, "generationConfig", key_input, has_part);
@@ -1292,6 +1310,133 @@ fn append_family_shape_fields(
     if let Some(stream) = body.get("stream").and_then(|s| s.as_bool()) {
         start_key_part(key_input, has_part);
         let _ = write!(key_input, "stream:{stream}");
+    }
+}
+
+/// Append provider-native conversation structure that is not prompt text.
+///
+/// This keeps assistant tool calls, tool-result identifiers, message names,
+/// Responses item types/roles, and other sibling state in both the exact key
+/// and semantic scope. Text-bearing fields stay out of this fragment because
+/// exact prompt extraction and the embedding input own them; non-text content
+/// parts are isolated by the multimodal fingerprint.
+fn append_family_conversation_state(
+    family: CacheRequestFamily,
+    body: &Value,
+    key_input: &mut String,
+    has_part: &mut bool,
+) -> Option<()> {
+    start_key_part(key_input, has_part);
+    key_input.push_str("state:");
+
+    match family {
+        CacheRequestFamily::Messages => {
+            key_input.push_str("messages:");
+            append_object_array_state(body.get("messages")?, &["content"], key_input)?;
+        }
+        CacheRequestFamily::Responses => {
+            key_input.push_str("responses:");
+            match body.get("input") {
+                None => key_input.push_str("none"),
+                Some(Value::String(_)) => key_input.push_str("string"),
+                Some(Value::Object(object)) => {
+                    key_input.push_str("object:");
+                    append_object_state(object, &["content", "text"], key_input);
+                }
+                Some(Value::Array(items)) => {
+                    key_input.push_str("array:");
+                    for item in items {
+                        match item {
+                            Value::String(_) => key_input.push_str("string;"),
+                            Value::Object(object) => {
+                                key_input.push_str("object:");
+                                append_object_state(
+                                    object,
+                                    &["content", "text"],
+                                    key_input,
+                                );
+                            }
+                            _ => return None,
+                        }
+                    }
+                }
+                Some(_) => return None,
+            }
+        }
+        CacheRequestFamily::Gemini => {
+            key_input.push_str("contents:");
+            append_object_array_state(body.get("contents")?, &["parts"], key_input)?;
+        }
+        CacheRequestFamily::Cohere => {
+            key_input.push_str("cohere:");
+            if let Some(history) = body.get("chat_history") {
+                append_object_array_state(history, &["message", "content"], key_input)?;
+            } else {
+                key_input.push_str("no_history;");
+            }
+            key_input.push_str(if body.get("message").is_some() {
+                "current_message"
+            } else {
+                "no_current_message"
+            });
+        }
+        CacheRequestFamily::LegacyPrompt => {
+            append_value_shape(body.get("prompt")?, key_input);
+        }
+        CacheRequestFamily::Tgi => {
+            append_value_shape(body.get("inputs")?, key_input);
+        }
+        CacheRequestFamily::Titan => key_input.push_str("string"),
+    }
+    Some(())
+}
+
+fn append_object_array_state(
+    value: &Value,
+    excluded_fields: &[&str],
+    key_input: &mut String,
+) -> Option<()> {
+    let items = value.as_array()?;
+    let _ = write!(key_input, "{}:", items.len());
+    for item in items {
+        let object = item.as_object()?;
+        append_object_state(object, excluded_fields, key_input);
+    }
+    Some(())
+}
+
+fn append_object_state(
+    object: &serde_json::Map<String, Value>,
+    excluded_fields: &[&str],
+    key_input: &mut String,
+) {
+    key_input.push('{');
+    for (field, value) in object {
+        if excluded_fields.contains(&field.as_str()) {
+            continue;
+        }
+        append_len_prefixed(key_input, field);
+        key_input.push('=');
+        let _ = write!(key_input, "{value}");
+        key_input.push(';');
+    }
+    key_input.push('}');
+}
+
+fn append_value_shape(value: &Value, key_input: &mut String) {
+    match value {
+        Value::String(_) => key_input.push_str("string"),
+        Value::Array(items) => {
+            let _ = write!(key_input, "array:{}:", items.len());
+            for item in items {
+                append_value_shape(item, key_input);
+                key_input.push(';');
+            }
+        }
+        Value::Object(_) => key_input.push_str("object"),
+        Value::Number(_) => key_input.push_str("number"),
+        Value::Bool(_) => key_input.push_str("bool"),
+        Value::Null => key_input.push_str("null"),
     }
 }
 
@@ -1345,7 +1490,47 @@ fn extract_responses_input_text(input: &Value) -> String {
     }
 }
 
-fn push_responses_item_text(item: &Value, texts: &mut Vec<&str>) {
+fn append_responses_prompt_exact_key(input: &Value, key_input: &mut String) -> Option<()> {
+    match input {
+        Value::String(text) => {
+            key_input.push_str("string:");
+            append_len_prefixed(key_input, &normalize_text(text));
+        }
+        Value::Array(items) => {
+            let _ = write!(key_input, "array:{}:", items.len());
+            for item in items {
+                append_responses_prompt_item(item, key_input)?;
+            }
+        }
+        Value::Object(_) => {
+            key_input.push_str("object:");
+            append_responses_prompt_item(input, key_input)?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
+fn append_responses_prompt_item(item: &Value, key_input: &mut String) -> Option<()> {
+    if let Some(text) = item.as_str() {
+        key_input.push_str("string:");
+        append_len_prefixed(key_input, &normalize_text(text));
+        return Some(());
+    }
+    let object = item.as_object()?;
+    key_input.push_str("item:");
+    append_len_prefixed(
+        key_input,
+        object
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("input"),
+    );
+    append_len_prefixed(key_input, &extract_responses_input_text(item));
+    Some(())
+}
+
+fn push_responses_item_text<'a>(item: &'a Value, texts: &mut Vec<&'a str>) {
     if let Some(text) = item.as_str() {
         texts.push(text);
         return;
@@ -1362,19 +1547,13 @@ fn push_responses_item_text(item: &Value, texts: &mut Vec<&str>) {
                 && let Some(text) = part.get("text").and_then(|t| t.as_str())
             {
                 texts.push(text);
-            } else if part.get("type").and_then(|t| t.as_str()) == Some("input_text")
-                && let Some(text) = part.get("text").and_then(|t| t.as_str())
-            {
-                texts.push(text);
             }
         }
     }
 
     if let Some(text) = object.get("text").and_then(|t| t.as_str()) {
         let item_type = object.get("type").and_then(|t| t.as_str());
-        if item_type.is_none()
-            || matches!(item_type, Some("input_text" | "text" | "output_text"))
-        {
+        if item_type.is_none() || matches!(item_type, Some("input_text" | "text" | "output_text")) {
             texts.push(text);
         }
     }
@@ -1390,18 +1569,16 @@ fn append_family_prompt_exact_key(
         CacheRequestFamily::Messages => {
             let messages = body.get("messages").and_then(|m| m.as_array())?;
             start_key_part(key_input, has_part);
-            for (index, msg) in messages.iter().enumerate() {
-                if index > 0 {
-                    key_input.push('|');
-                }
+            key_input.push_str("messages:");
+            for msg in messages {
+                msg.as_object()?;
                 let role = msg
                     .get("role")
                     .and_then(|r| r.as_str())
                     .unwrap_or("unknown");
                 let content = extract_message_content(msg);
-                key_input.push_str(role);
-                key_input.push(':');
-                key_input.push_str(&content);
+                append_len_prefixed(key_input, role);
+                append_len_prefixed(key_input, &content);
             }
             Some(())
         }
@@ -1409,17 +1586,16 @@ fn append_family_prompt_exact_key(
             start_key_part(key_input, has_part);
             key_input.push_str("input:");
             if let Some(input) = body.get("input") {
-                key_input.push_str(&extract_responses_input_text(input));
+                append_responses_prompt_exact_key(input, key_input)?;
             }
             Some(())
         }
         CacheRequestFamily::Gemini => {
             let contents = body.get("contents").and_then(|c| c.as_array())?;
             start_key_part(key_input, has_part);
-            for (index, content) in contents.iter().enumerate() {
-                if index > 0 {
-                    key_input.push('|');
-                }
+            key_input.push_str("contents:");
+            for content in contents {
+                content.as_object()?;
                 let role = content
                     .get("role")
                     .and_then(|r| r.as_str())
@@ -1429,20 +1605,16 @@ fn append_family_prompt_exact_key(
                     .and_then(|p| p.as_array())
                     .map(|parts| extract_gemini_parts_text(parts))
                     .unwrap_or_default();
-                key_input.push_str(role);
-                key_input.push(':');
-                key_input.push_str(&text);
+                append_len_prefixed(key_input, role);
+                append_len_prefixed(key_input, &text);
             }
             Some(())
         }
         CacheRequestFamily::Cohere => {
             start_key_part(key_input, has_part);
-            let mut wrote = false;
             if let Some(history) = body.get("chat_history").and_then(|h| h.as_array()) {
                 for msg in history {
-                    if wrote {
-                        key_input.push('|');
-                    }
+                    msg.as_object()?;
                     let role = msg
                         .get("role")
                         .and_then(|r| r.as_str())
@@ -1452,18 +1624,13 @@ fn append_family_prompt_exact_key(
                         .or_else(|| msg.get("content"))
                         .and_then(|c| c.as_str())
                         .unwrap_or("");
-                    key_input.push_str(role);
-                    key_input.push(':');
-                    key_input.push_str(&normalize_text(content));
-                    wrote = true;
+                    append_len_prefixed(key_input, role);
+                    append_len_prefixed(key_input, &normalize_text(content));
                 }
             }
             if let Some(message) = body.get("message").and_then(|m| m.as_str()) {
-                if wrote {
-                    key_input.push('|');
-                }
-                key_input.push_str("user:");
-                key_input.push_str(&normalize_text(message));
+                append_len_prefixed(key_input, "user");
+                append_len_prefixed(key_input, &normalize_text(message));
             }
             Some(())
         }
@@ -1539,9 +1706,7 @@ fn append_family_instruction_exact_key(
                 key_input.push_str(&normalize_text(preamble));
             }
         }
-        CacheRequestFamily::LegacyPrompt
-        | CacheRequestFamily::Tgi
-        | CacheRequestFamily::Titan => {}
+        CacheRequestFamily::LegacyPrompt | CacheRequestFamily::Tgi | CacheRequestFamily::Titan => {}
     }
 }
 
@@ -1720,9 +1885,7 @@ fn append_family_instruction_scope(
                 }
             }
         }
-        CacheRequestFamily::LegacyPrompt
-        | CacheRequestFamily::Tgi
-        | CacheRequestFamily::Titan => {}
+        CacheRequestFamily::LegacyPrompt | CacheRequestFamily::Tgi | CacheRequestFamily::Titan => {}
     }
 }
 
@@ -1852,14 +2015,16 @@ fn normalize_prompt_value(value: &Value) -> String {
     match value {
         Value::String(text) => normalize_text(text),
         Value::Array(items) => {
-            let mut texts = Vec::with_capacity(items.len());
+            let mut normalized = String::new();
+            let _ = write!(normalized, "array:{}:", items.len());
             for item in items {
-                match item {
-                    Value::String(text) => texts.push(normalize_text(text)),
-                    other => texts.push(normalize_text(&other.to_string())),
-                }
+                let text = match item {
+                    Value::String(text) => normalize_text(text),
+                    other => normalize_text(&other.to_string()),
+                };
+                append_len_prefixed(&mut normalized, &text);
             }
-            texts.join(" ")
+            normalized
         }
         other => normalize_text(&other.to_string()),
     }
@@ -2057,10 +2222,9 @@ fn responses_item_has_multimodal_parts(item: &Value) -> bool {
         return content_has_multimodal_parts(content, PartDialect::OpenAi);
     }
     match object.get("type").and_then(|t| t.as_str()) {
-        Some("input_text" | "text" | "output_text") => object
-            .get("text")
-            .and_then(|t| t.as_str())
-            .is_none(),
+        Some("input_text" | "text" | "output_text") => {
+            object.get("text").and_then(|t| t.as_str()).is_none()
+        }
         Some(_) => true,
         None => object.get("text").and_then(|t| t.as_str()).is_none(),
     }
@@ -2106,11 +2270,7 @@ fn build_multimodal_fingerprint(body: &Value) -> Option<String> {
         }
         Some(CacheRequestFamily::Responses) => {
             if let Some(input) = body.get("input") {
-                append_responses_multimodal_fingerprint(
-                    &mut descriptor,
-                    &mut has_part,
-                    input,
-                );
+                append_responses_multimodal_fingerprint(&mut descriptor, &mut has_part, input);
             }
         }
         Some(CacheRequestFamily::Gemini) => {
@@ -2185,9 +2345,7 @@ fn append_responses_multimodal_fingerprint(
         Value::String(_) => {}
         Value::Array(items) => {
             for (index, item) in items.iter().enumerate() {
-                append_responses_item_multimodal_fingerprint(
-                    buffer, has_part, Some(index), item,
-                );
+                append_responses_item_multimodal_fingerprint(buffer, has_part, Some(index), item);
             }
         }
         other => {

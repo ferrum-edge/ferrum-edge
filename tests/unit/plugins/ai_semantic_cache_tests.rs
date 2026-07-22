@@ -3031,6 +3031,54 @@ async fn openai_responses_tools_and_previous_response_isolation() {
 }
 
 #[tokio::test]
+async fn openai_responses_item_roles_isolate_identical_text() {
+    let user_input = json!({
+        "model": "gpt-4.1",
+        "input": [{
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Continue."}]
+        }]
+    });
+    let assistant_input = json!({
+        "model": "gpt-4.1",
+        "input": [{
+            "role": "assistant",
+            "content": [{"type": "input_text", "text": "Continue."}]
+        }]
+    });
+    assert_exact_miss_for_variant(user_input, assistant_input, br#""ok""#).await;
+}
+
+#[tokio::test]
+async fn messages_native_tool_call_state_isolates_exact_keys() {
+    let paris = json!({
+        "model": "gpt-4.1",
+        "messages": [{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{\"city\":\"Paris\"}"}
+            }]
+        }]
+    });
+    let lyon = json!({
+        "model": "gpt-4.1",
+        "messages": [{
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{\"city\":\"Lyon\"}"}
+            }]
+        }]
+    });
+    assert_exact_miss_for_variant(paris, lyon, br#""ok""#).await;
+}
+
+#[tokio::test]
 async fn gemini_contents_exact_hit_and_generation_config_isolation() {
     let body = json!({
         "model": "gemini-2.5-flash",
@@ -3306,7 +3354,10 @@ async fn provider_family_semantic_hit_and_instruction_isolation() {
     .await;
     match result {
         PluginResult::RejectBinary { headers, body, .. } => {
-            assert_eq!(headers.get("x-ai-cache-match").map(String::as_str), Some("semantic"));
+            assert_eq!(
+                headers.get("x-ai-cache-match").map(String::as_str),
+                Some("semantic")
+            );
             assert_eq!(&body[..], br#"{"city":"Paris"}"#);
             assert_eq!(
                 ctx.metadata.get("ai_cache_match").map(String::as_str),
@@ -3350,13 +3401,13 @@ async fn provider_family_semantic_hit_and_instruction_isolation() {
         br#"{"city":"Paris"}"#,
     )
     .await;
-    let hit = run_before_proxy_get_status(
-        &plugin,
-        &serde_json::to_string(&responses2).unwrap(),
-        None,
-    )
-    .await;
-    assert!(hit, "Responses family should semantic-hit within one instruction scope");
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&responses2).unwrap(), None)
+            .await;
+    assert!(
+        hit,
+        "Responses family should semantic-hit within one instruction scope"
+    );
 
     let responses_isolated = json!({
         "model": "gpt-4.1",
@@ -3399,8 +3450,7 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
     )
     .await;
     assert!(
-        run_before_proxy_get_status(&plugin, &serde_json::to_string(&cohere2).unwrap(), None)
-            .await
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&cohere2).unwrap(), None).await
     );
     let cohere_isolated = json!({
         "model": "command-r",
@@ -3424,8 +3474,13 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
         "inputs": "What city is France's capital?",
         "parameters": {"temperature": 0.0}
     });
-    store_response(&plugin, &serde_json::to_string(&tgi1).unwrap(), None, br#""Paris""#)
-        .await;
+    store_response(
+        &plugin,
+        &serde_json::to_string(&tgi1).unwrap(),
+        None,
+        br#""Paris""#,
+    )
+    .await;
     assert!(
         run_before_proxy_get_status(&plugin, &serde_json::to_string(&tgi2).unwrap(), None).await
     );
@@ -3434,8 +3489,12 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
         "parameters": {"temperature": 1.0}
     });
     assert!(
-        !run_before_proxy_get_status(&plugin, &serde_json::to_string(&tgi_isolated).unwrap(), None)
-            .await
+        !run_before_proxy_get_status(
+            &plugin,
+            &serde_json::to_string(&tgi_isolated).unwrap(),
+            None
+        )
+        .await
     );
 
     let titan1 = json!({
@@ -3492,7 +3551,8 @@ async fn distinct_families_do_not_exact_or_semantic_collide() {
     )
     .await;
 
-    let (ctx, result) = run_before_proxy(&plugin, &serde_json::to_string(&gemini).unwrap(), None).await;
+    let (ctx, result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&gemini).unwrap(), None).await;
     assert!(
         matches!(result, PluginResult::Continue),
         "Gemini body must not exact-hit a Messages-family entry"
