@@ -584,12 +584,15 @@ fn parse_error_class(common: RuleCommon, raw: &Value) -> Result<ErrorClassRule, 
                 common.name
             )
         })?;
-        let class = error_class_from_str(name).ok_or_else(|| {
-            format!(
-                "proxy_alerts: rule '{}': unknown error class '{name}'",
-                common.name
-            )
-        })?;
+        // Deserialize through ErrorClass's authoritative serde contract so a
+        // newly added runtime class cannot drift from proxy_alerts admission.
+        let class = serde_json::from_value::<ErrorClass>(Value::String(name.to_string()))
+            .map_err(|_| {
+                format!(
+                    "proxy_alerts: rule '{}': unknown error class '{name}'",
+                    common.name
+                )
+            })?;
         if !classes.contains(&class) {
             classes.push(class);
         }
@@ -958,27 +961,6 @@ fn read_optional_bool(config: &Value, key: &str, context: &str) -> Result<Option
             .as_bool()
             .map(Some)
             .ok_or_else(|| format!("{context}: '{key}' must be a boolean")),
-    }
-}
-
-fn error_class_from_str(s: &str) -> Option<ErrorClass> {
-    match s {
-        "connection_timeout" => Some(ErrorClass::ConnectionTimeout),
-        "connection_refused" => Some(ErrorClass::ConnectionRefused),
-        "connection_reset" => Some(ErrorClass::ConnectionReset),
-        "connection_closed" => Some(ErrorClass::ConnectionClosed),
-        "dns_lookup_error" => Some(ErrorClass::DnsLookupError),
-        "tls_error" => Some(ErrorClass::TlsError),
-        "read_write_timeout" => Some(ErrorClass::ReadWriteTimeout),
-        "client_disconnect" => Some(ErrorClass::ClientDisconnect),
-        "protocol_error" => Some(ErrorClass::ProtocolError),
-        "response_body_too_large" => Some(ErrorClass::ResponseBodyTooLarge),
-        "request_body_too_large" => Some(ErrorClass::RequestBodyTooLarge),
-        "connection_pool_error" => Some(ErrorClass::ConnectionPoolError),
-        "port_exhaustion" => Some(ErrorClass::PortExhaustion),
-        "graceful_remote_close" => Some(ErrorClass::GracefulRemoteClose),
-        "request_error" => Some(ErrorClass::RequestError),
-        _ => None,
     }
 }
 

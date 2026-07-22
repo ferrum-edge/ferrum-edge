@@ -288,6 +288,65 @@ fn rejects_unknown_error_class_in_rule() {
 }
 
 #[test]
+fn error_class_rules_accept_and_observe_every_runtime_label() {
+    let classes = [
+        ErrorClass::ConnectionTimeout,
+        ErrorClass::ConnectionRefused,
+        ErrorClass::ConnectionReset,
+        ErrorClass::ConnectionClosed,
+        ErrorClass::DnsLookupError,
+        ErrorClass::TlsError,
+        ErrorClass::ReadWriteTimeout,
+        ErrorClass::ClientDisconnect,
+        ErrorClass::ProtocolError,
+        ErrorClass::ResponseBodyTooLarge,
+        ErrorClass::RequestBodyTooLarge,
+        ErrorClass::ConnectionPoolError,
+        ErrorClass::PortExhaustion,
+        ErrorClass::GracefulRemoteClose,
+        ErrorClass::DispatchPolicyRejected,
+        ErrorClass::RequestError,
+    ];
+    let labels: Vec<&str> = classes.iter().map(ErrorClass::as_str).collect();
+    let parsed = ferrum_edge::plugins::proxy_alerts::config::ProxyAlertsConfig::parse(&json!({
+        "channels": {
+            "c": { "type": "webhook", "url": "https://example.com", "body_template": "x" }
+        },
+        "rules": [{
+            "name": "runtime_errors",
+            "type": "error_class",
+            "classes": labels,
+            "threshold_count": 1,
+            "channels": ["c"]
+        }]
+    }))
+    .expect("every runtime ErrorClass label should compile as an alert rule");
+
+    let specs = parsed
+        .rules
+        .iter()
+        .map(|rule| (rule.id(), rule.window_spec()))
+        .collect();
+    let store = WindowStore::new(specs);
+    for class in classes {
+        let summary = TransactionSummary {
+            namespace: "ferrum".to_string(),
+            proxy_id: Some("p1".to_string()),
+            error_class: Some(class),
+            ..TransactionSummary::default()
+        };
+        let observation = parsed.rules[0]
+            .observe(SampleInput::Http(&summary), &store, 1_000)
+            .expect("configured runtime error class should be observed");
+        assert!(
+            observation.breach,
+            "{} should trigger the rule",
+            class.as_str()
+        );
+    }
+}
+
+#[test]
 fn rejects_invalid_quiet_hours_time() {
     let mut cfg = minimal_config();
     cfg["quiet_hours_utc"] = json!([{ "from": "25:00", "to": "06:00" }]);
