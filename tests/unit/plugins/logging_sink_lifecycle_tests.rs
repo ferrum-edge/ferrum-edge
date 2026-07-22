@@ -930,7 +930,7 @@ fn chargeback_rejects_empty_and_nul_spool_dir_shape() {
     );
 
     let mut nul = chargeback_sink_config(&tempfile::tempdir().expect("tempdir"));
-    nul["spool"]["dir"] = json!("spool\u0000dir");
+    nul["spool"]["dir"] = json!("spool\u{0000}dir");
     let err = ApiChargebackSink::new(&nul, client(), "default")
         .expect_err("NUL spool.dir must fail shape validation");
     assert!(
