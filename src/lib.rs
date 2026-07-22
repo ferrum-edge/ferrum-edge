@@ -1927,8 +1927,8 @@ pub mod _test_support {
     /// gateway grace. Callers in paused-time tests must advance simulated time
     /// by [`h3_post_deadline_terminal_write_grace_for_test`] before awaiting the
     /// handle — this helper intentionally never calls Tokio `test-util` APIs.
-    pub fn spawn_stalled_h3_post_deadline_terminal_write_for_test()
-    -> tokio::task::JoinHandle<bool> {
+    pub fn spawn_stalled_h3_post_deadline_terminal_write_for_test() -> tokio::task::JoinHandle<bool>
+    {
         let write = std::future::pending::<Result<(), ()>>();
         tokio::spawn(async move {
             matches!(
