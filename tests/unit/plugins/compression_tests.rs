@@ -3135,3 +3135,248 @@ async fn test_before_proxy_without_buffered_body_falls_back_to_strip() {
     assert!(!headers.contains_key("content-encoding"));
     assert!(!headers.contains_key("content-length"));
 }
+
+// ────────────── #2357: exact media-type content-type matching ──────────────
+//
+// The compression content-type whitelist must match only the trimmed media-type
+// token before the first semicolon, ASCII case-insensitively, against the
+// validated configured `content_types`. It must NOT use substring matching, so
+// lexical near-misses and parameter-only occurrences are rejected.
+
+/// Table of (response content-type, expected to compress) for the default
+/// whitelist. Exercises exact types, mixed case, parameters, near-misses,
+/// parameter-only occurrences, and malformed/empty values.
+#[test]
+fn test_content_type_whitelist_exact_matching() {
+    let plugin = make_plugin(json!({}));
+    let headers = HashMap::new();
+
+    // (content_type, should_compress)
+    let cases: &[(&str, bool)] = &[
+        // Exact types in the default whitelist.
+        ("application/json", true),
+        ("application/javascript", true),
+        ("application/xml", true),
+        ("application/xhtml+xml", true),
+        ("text/html", true),
+        ("text/plain", true),
+        ("text/css", true),
+        ("text/xml", true),
+        ("text/javascript", true),
+        ("image/svg+xml", true),
+        // Mixed case — ASCII case-insensitive match.
+        ("Application/JSON", true),
+        ("APPLICATION/JSON", true),
+        ("Text/Html", true),
+        ("APPLICATION/XML", true),
+        // Parameters are stripped before matching.
+        ("application/json; charset=utf-8", true),
+        ("application/json; charset=UTF-8", true),
+        ("application/json; charset=utf-8; boundary=xyz", true),
+        ("text/html ; charset=utf-8", true),
+        ("application/json;charset=utf-8", true),
+        ("application/json\t; charset=utf-8", true),
+        // Near-misses must NOT match.
+        ("application/jsonp", false),
+        ("application/json-patch-binary", false),
+        ("application/jsonpatched", false),
+        ("application/json2", false),
+        ("text/htm", false),
+        ("text/htmlx", false),
+        ("text/javascriptish", false),
+        // Parameter-only occurrences must NOT match.
+        (
+            "application/octet-stream; profile=\"application/json\"",
+            false,
+        ),
+        (
+            "application/octet-stream; charset=application/json",
+            false,
+        ),
+        ("text/plain; name=application/json", false),
+        // Malformed / empty media-type tokens fail closed.
+        ("", false),
+        ("; charset=utf-8", false),
+        (" ; charset=utf-8", false),
+        (";", false),
+        ("\t\n", false),
+        // Non-whitelisted types.
+        ("image/png", false),
+        ("application/octet-stream", false),
+        ("application/pdf", false),
+        ("application/grpc", false),
+        ("text/event-stream", false),
+    ];
+
+    for (content_type, should_compress) in cases {
+        let ctx = make_ctx(Some("gzip"));
+        let result = plugin.is_compressible_content_type(content_type);
+        assert_eq!(
+            result, *should_compress,
+            "content_type={content_type:?}: expected compress={should_compress}, got {result}",
+        );
+        // Cross-check the buffering refinement predicate, which must use the
+        // same matching logic.
+        let buffered = plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some(content_type),
+            200,
+            &headers,
+        );
+        assert_eq!(
+            buffered, *should_compress,
+            "content_type={content_type:?}: buffering refinement disagrees with is_compressible_content_type (expected {should_compress}, got {buffered})",
+        );
+    }
+}
+
+/// Custom content_types whitelist must also use exact media-type matching.
+#[test]
+fn test_custom_content_type_whitelist_exact_matching() {
+    let plugin = make_plugin(json!({
+        "content_types": ["application/vnd.api+json", "text/csv"]
+    }));
+    let headers = HashMap::new();
+    let ctx = make_ctx(Some("gzip"));
+
+    let cases: &[(&str, bool)] = &[
+        ("application/vnd.api+json", true),
+        ("application/vnd.api+json; charset=utf-8", true),
+        ("APPLICATION/VND.API+JSON", true),
+        ("text/csv", true),
+        ("text/csv; charset=us-ascii", true),
+        // Near-misses must not match.
+        ("application/vnd.api+jsonp", false),
+        ("application/vnd.api+json-patch", false),
+        ("application/vnd.api+jsonish", false),
+        ("text/csvp", false),
+        // Parameter-only occurrences must not match.
+        ("application/octet-stream; profile=\"application/vnd.api+json\"", false),
+        // Standard JSON is NOT in the custom whitelist.
+        ("application/json", false),
+        ("application/json; charset=utf-8", false),
+    ];
+
+    for (content_type, should_compress) in cases {
+        let result = plugin.is_compressible_content_type(content_type);
+        assert_eq!(
+            result, *should_compress,
+            "content_type={content_type:?}: expected compress={should_compress}, got {result}",
+        );
+        let buffered = plugin.should_buffer_response_body_for_content_type(
+            &ctx,
+            Some(content_type),
+            200,
+            &headers,
+        );
+        assert_eq!(
+            buffered, *should_compress,
+            "content_type={content_type:?}: buffering refinement disagrees (expected {should_compress}, got {buffered})",
+        );
+    }
+}
+
+/// The same content-type predicate that controls buffering refinement must
+/// also control `after_proxy` eligibility: a near-miss content-type that is
+/// NOT whitelisted must not be compressed (no `Content-Encoding` set), while
+/// an exact match with parameters IS compressed.
+#[tokio::test]
+async fn test_after_proxy_eligibility_matches_exact_whitelist() {
+    let plugin = make_plugin(json!({
+        "min_content_length": 10,
+    }));
+
+    // Near-miss: must NOT compress.
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/jsonp".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(
+        !resp_headers.contains_key("content-encoding"),
+        "near-miss 'application/jsonp' must not be compressed"
+    );
+
+    // Exact match with parameters: must compress.
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert(
+        "content-type".to_string(),
+        "application/json; charset=utf-8".to_string(),
+    );
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(
+        resp_headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "exact match 'application/json; charset=utf-8' must be compressed"
+    );
+
+    // Parameter-only occurrence: must NOT compress.
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert(
+        "content-type".to_string(),
+        "application/octet-stream; profile=\"application/json\"".to_string(),
+    );
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(
+        !resp_headers.contains_key("content-encoding"),
+        "parameter-only occurrence must not be compressed"
+    );
+}
+
+/// Malformed/empty content-type values must fail closed (no compression, no
+/// buffering) rather than matching or panicking.
+#[tokio::test]
+async fn test_malformed_content_type_fails_closed() {
+    let plugin = make_plugin(json!({
+        "min_content_length": 10,
+    }));
+
+    for content_type in ["", "; charset=utf-8", " ; ", ";"] {
+        let mut ctx = make_ctx(Some("gzip"));
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), content_type.to_string());
+        resp_headers.insert("content-length".to_string(), "1000".to_string());
+
+        plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+        assert!(
+            !resp_headers.contains_key("content-encoding"),
+            "malformed content_type={content_type:?} must not be compressed"
+        );
+    }
+}
+
+/// A content-type absent from the response headers must fail closed (no
+/// compression, no buffering).
+#[test]
+fn test_absent_content_type_fails_closed() {
+    let plugin = make_plugin(json!({}));
+    let ctx = make_ctx(Some("gzip"));
+    let headers = HashMap::new();
+
+    assert!(!plugin.is_compressible_content_type(""));
+    assert!(!plugin.should_buffer_response_body_for_content_type(
+        &ctx,
+        None,
+        200,
+        &headers
+    ));
+}

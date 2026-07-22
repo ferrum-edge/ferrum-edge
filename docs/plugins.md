@@ -3078,6 +3078,8 @@ On-the-fly response compression and request decompression. Negotiates the best a
 
 **Default content types:** `application/json`, `application/javascript`, `application/xml`, `application/xhtml+xml`, `text/html`, `text/plain`, `text/css`, `text/xml`, `text/javascript`, `image/svg+xml`
 
+**Content-type matching:** The whitelist is matched as an exact media-type token: the response `Content-Type` is split on the first semicolon, the token is trimmed, and compared ASCII case-insensitively against each configured entry. Parameters (e.g. `; charset=utf-8`) are ignored, so `application/json; charset=utf-8` matches `application/json`. Substring matching is intentionally avoided, so lexical near-misses such as `application/jsonp` or `application/json-patch-binary` do **not** match `application/json`, and parameter-only occurrences such as `application/octet-stream; profile="application/json"` do **not** match `application/json`. An empty or malformed media-type token fails closed (no match).
+
 **Response compression skip conditions** (checked in order):
 1. Response status is 204 or 304
 2. Request has `Cache-Control: no-transform` (skips gateway response compression only)

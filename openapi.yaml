@@ -15650,7 +15650,7 @@ components:
           type: array
           items:
             type: string
-          description: "Content-type whitelist. Defaults to 10 common text/application types"
+          description: "Content-type whitelist. Defaults to 10 common text/application types. Matched as an exact media-type token (before the first semicolon, ASCII case-insensitive); parameters like ; charset=utf-8 are ignored. Substring matching is not used, so application/jsonp does not match application/json."
         remove_accept_encoding:
           type: boolean
           default: true

@@ -420,10 +420,25 @@ impl CompressionPlugin {
     }
 
     /// Check if the content type is eligible for compression.
+    ///
+    /// Matches only the trimmed media-type token before the first semicolon,
+    /// ASCII case-insensitively, against the validated configured
+    /// `content_types` (stored lowercased at construction). This avoids lexical
+    /// near-misses such as `application/jsonp` matching `application/json`, and
+    /// parameter-only occurrences such as
+    /// `application/octet-stream; profile="application/json"`.
+    ///
+    /// An empty or whitespace-only media-type token (e.g. `; charset=utf-8` or
+    /// an empty `Content-Type`) fails closed: it matches nothing.
     fn is_compressible_content_type(&self, content_type: &str) -> bool {
-        self.config.content_types.iter().any(|content_type_rule| {
-            contains_ascii_case_insensitive(content_type, content_type_rule)
-        })
+        let media_type = content_type.split(';').next().unwrap_or("").trim();
+        if media_type.is_empty() {
+            return false;
+        }
+        self.config
+            .content_types
+            .iter()
+            .any(|rule| media_type.eq_ignore_ascii_case(rule))
     }
 
     fn compress(&self, algo: Algorithm, data: &[u8]) -> Result<Vec<u8>, String> {
@@ -600,15 +615,6 @@ fn parse_content_types(config: &Value) -> Result<Vec<String>, String> {
     }
 
     Ok(content_types)
-}
-
-fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
-    let needle = needle.as_bytes();
-    !needle.is_empty()
-        && haystack
-            .as_bytes()
-            .windows(needle.len())
-            .any(|window| window.eq_ignore_ascii_case(needle))
 }
 
 fn supported_request_encoding(value: &str) -> Option<&'static str> {
