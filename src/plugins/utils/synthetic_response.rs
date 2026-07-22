@@ -1,19 +1,23 @@
 //! Shared synthetic-response wire semantics for H1/H2/H3.
 //!
-//! Plugin short-circuits and gateway reject writers must agree on when a final
-//! response may carry content bytes. HEAD responses keep representation
-//! metadata (including `Content-Length`) but never emit a message body.
-//! Statuses 204/205/304 never carry content.
+//! Plugin short-circuits, size-limit fast paths, and gateway reject writers must
+//! agree on when a final response may carry content bytes. HEAD responses keep
+//! representation metadata (including `Content-Length`) but never emit a
+//! message body. Informational `1xx` responses and statuses 204/205/304 never
+//! carry content (RFC 9110 §6.4.1 / §15.2).
 
 use std::collections::HashMap;
 
 /// Statuses that must not carry a message body (RFC 9110).
 #[inline]
 pub fn status_forbids_response_body(status: u16) -> bool {
-    matches!(status, 204 | 205 | 304)
+    matches!(status, 204 | 205 | 304) || (100..200).contains(&status)
 }
 
 /// Whether the wire response must omit content bytes for this method/status.
+///
+/// Shared across H1/H2/H3 so response-size and synthetic-response paths cannot
+/// drift on body presence.
 #[inline]
 pub fn synthetic_response_omits_body(method: &str, status: u16) -> bool {
     method.eq_ignore_ascii_case("HEAD") || status_forbids_response_body(status)
@@ -23,10 +27,10 @@ pub fn synthetic_response_omits_body(method: &str, status: u16) -> bool {
 ///
 /// For `HEAD`, preserves (or installs) `Content-Length` equal to the
 /// representation size that a GET would have returned, then returns `true`.
-/// For 204/205/304, strips `Content-Length` and returns `true`. All other
-/// responses leave headers unchanged and return `false`. The caller clears or
-/// substitutes its body only when this returns `true`, avoiding a body clone on
-/// the ordinary response path.
+/// For `1xx` and 204/205/304, strips `Content-Length` and returns `true`. All
+/// other responses leave headers unchanged and return `false`. The caller
+/// clears or substitutes its body only when this returns `true`, avoiding a
+/// body clone on the ordinary response path.
 ///
 /// H1 note: Hyper still synthesizes `Content-Length: 0` for ordinary empty
 /// bodies on status 205 (it special-cases only 204/304). Reject finalizers
@@ -43,7 +47,7 @@ pub fn prepare_synthetic_response_wire(
     }
 
     // HEAD keeps representation metadata unless the status itself forbids a
-    // body; 204/205/304 (including HEAD+those statuses) strip Content-Length.
+    // body; 1xx/204/205/304 (including HEAD+those statuses) strip Content-Length.
     if method.eq_ignore_ascii_case("HEAD") && !status_forbids_response_body(status) {
         if !headers
             .keys()

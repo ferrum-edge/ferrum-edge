@@ -3423,7 +3423,7 @@ Enforces per-proxy response body size limits. Rejects with HTTP 502.
 | `require_buffered_check` | bool | `false` | Force response body buffering to verify actual final size when `Content-Length` is absent. Adds memory overhead — only enable when needed. |
 
 Enforcement happens in two places:
-- `after_proxy` rejects oversized `Content-Length` response headers via the fast path (no body buffering required).
+- `after_proxy` rejects oversized `Content-Length` via the fast path when the response can transfer a body (no body buffering required). Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) may advertise a representation `Content-Length` while transferring zero body bytes and are not rejected on that declaration alone; body-bearing responses (including `206`) keep exact-boundary enforcement (`Content-Length == max_bytes` passes).
 - `on_final_response_body` re-checks the final post-transform body when buffering is active (either via `require_buffered_check: true` or because another plugin requires response buffering).
 
 For streaming responses without `Content-Length` where buffering is disabled, the global `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` limit applies via the gateway's `SizeLimitedStreamingResponse` adapter (frame-by-frame enforcement, no buffering).

@@ -6,7 +6,10 @@
 //!
 //! Two enforcement paths:
 //! 1. **Content-Length fast path** (`after_proxy`): rejects immediately when the
-//!    backend response Content-Length header declares a body larger than allowed.
+//!    backend response Content-Length header declares a transferable body larger
+//!    than allowed. Bodyless responses (`HEAD`, `1xx`, `204`/`205`/`304`) skip
+//!    this check because their Content-Length describes a representation, not
+//!    transferred body bytes.
 //! 2. **Final body check** (`on_final_response_body`): when response buffering is
 //!    active (either from `require_buffered_check: true` or because another plugin
 //!    requires buffering), the final client-visible byte length is verified after
@@ -22,7 +25,8 @@ use std::collections::HashMap;
 use tracing::debug;
 
 use super::utils::size_limit::{
-    SizeLimiter, content_length_over_limit, reject_with_limit, required_positive_u64,
+    SizeLimiter, reject_with_limit, required_positive_u64,
+    transferable_content_length_over_limit,
 };
 use super::utils::sse::{is_text_event_stream_media_type, original_response_is_event_stream};
 use super::{Plugin, PluginResult, RequestContext};
@@ -130,15 +134,22 @@ impl Plugin for ResponseSizeLimiting {
     async fn after_proxy(
         &self,
         ctx: &mut RequestContext,
-        _response_status: u16,
+        response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if !self.is_enabled() {
             return PluginResult::Continue;
         }
 
-        // Fast path: check Content-Length response header
-        if let Some(len) = content_length_over_limit(response_headers, self.max_size_bytes()) {
+        // Fast path: reject oversized Content-Length only when the response can
+        // transfer a body. HEAD / 1xx / 204 / 205 / 304 may advertise a
+        // representation length while sending zero body bytes.
+        if let Some(len) = transferable_content_length_over_limit(
+            &ctx.method,
+            response_status,
+            response_headers,
+            self.max_size_bytes(),
+        ) {
             debug!(
                 plugin = self.plugin_name(),
                 content_length = len,

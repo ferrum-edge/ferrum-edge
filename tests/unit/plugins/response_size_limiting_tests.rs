@@ -6,9 +6,13 @@ use serde_json::json;
 use std::collections::HashMap;
 
 fn make_ctx() -> RequestContext {
+    make_ctx_with_method("GET")
+}
+
+fn make_ctx_with_method(method: &str) -> RequestContext {
     RequestContext::new(
         "127.0.0.1".to_string(),
-        "GET".to_string(),
+        method.to_string(),
         "/api".to_string(),
     )
 }
@@ -108,6 +112,65 @@ async fn test_invalid_content_length_passes() {
     headers.insert("content-length".to_string(), "bad".to_string());
 
     let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+// === Bodyless response semantics (issue #2343) ===
+// after_proxy is the shared H1/H2/H3 Content-Length fast path; method/status
+// coverage here applies to every HTTP-family protocol path.
+
+#[tokio::test]
+async fn test_oversized_content_length_on_head_passes() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    let mut ctx = make_ctx_with_method("HEAD");
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "10485760".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 200, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "HEAD may advertise representation Content-Length without a body"
+    );
+}
+
+#[tokio::test]
+async fn test_oversized_content_length_on_304_passes() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "10485760".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 304, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "304 may carry representation Content-Length with no message body"
+    );
+}
+
+#[tokio::test]
+async fn test_oversized_content_length_on_206_still_rejects() {
+    // Body-bearing control: partial content still transfers body bytes.
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "10485760".to_string());
+
+    match plugin.after_proxy(&mut ctx, 206, &mut headers).await {
+        PluginResult::Reject { status_code, .. } => {
+            assert_eq!(status_code, 502);
+        }
+        _ => panic!("Expected Reject for oversized body-bearing 206"),
+    }
+}
+
+#[tokio::test]
+async fn test_body_bearing_exact_boundary_still_passes_for_206() {
+    let plugin = ResponseSizeLimiting::new(&json!({"max_bytes": 1024})).unwrap();
+    let mut ctx = make_ctx();
+    let mut headers = HashMap::new();
+    headers.insert("content-length".to_string(), "1024".to_string());
+
+    let result = plugin.after_proxy(&mut ctx, 206, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
 }
 

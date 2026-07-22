@@ -62,6 +62,26 @@ pub fn content_length_over_limit(
         .filter(|len| (*len as u128) > max_bytes)
 }
 
+/// Content-Length fast-path overrun for responses that actually transfer a body.
+///
+/// Bodyless semantics (`HEAD`, `1xx`, `204`/`205`/`304`) may advertise a
+/// representation `Content-Length` while transferring zero body bytes
+/// (RFC 9110 §8.6 / §6.4.1). Those declarations must not trip a body-size
+/// limit. Body-bearing responses (including `206`) keep exact-boundary
+/// enforcement (`Content-Length == max_bytes` passes).
+pub fn transferable_content_length_over_limit(
+    method: &str,
+    status: u16,
+    headers: &HashMap<String, String>,
+    max_bytes: u128,
+) -> Option<u64> {
+    if super::synthetic_response::synthetic_response_omits_body(method, status) {
+        None
+    } else {
+        content_length_over_limit(headers, max_bytes)
+    }
+}
+
 pub fn rejection_body(error: &str, limit: u128) -> String {
     let escaped_error = match serde_json::to_string(error) {
         Ok(value) => value,
@@ -151,6 +171,39 @@ mod tests {
 
         headers.insert("content-length".to_string(), "not-a-number".to_string());
         assert_eq!(content_length_over_limit(&headers, 10), None);
+    }
+
+    #[test]
+    fn transferable_content_length_skips_bodyless_semantics() {
+        let mut headers = HashMap::new();
+        headers.insert("content-length".to_string(), "11".to_string());
+
+        assert_eq!(
+            transferable_content_length_over_limit("HEAD", 200, &headers, 10),
+            None
+        );
+        assert_eq!(
+            transferable_content_length_over_limit("GET", 304, &headers, 10),
+            None
+        );
+        assert_eq!(
+            transferable_content_length_over_limit("GET", 100, &headers, 10),
+            None
+        );
+        assert_eq!(
+            transferable_content_length_over_limit("GET", 204, &headers, 10),
+            None
+        );
+        // Body-bearing control (including 206) retains exact-boundary enforcement.
+        assert_eq!(
+            transferable_content_length_over_limit("GET", 206, &headers, 10),
+            Some(11)
+        );
+        headers.insert("content-length".to_string(), "10".to_string());
+        assert_eq!(
+            transferable_content_length_over_limit("GET", 206, &headers, 10),
+            None
+        );
     }
 
     #[test]

@@ -12,8 +12,12 @@ fn head_and_no_body_statuses_omit_wire_content() {
     assert!(synthetic_response_omits_body("GET", 204));
     assert!(synthetic_response_omits_body("GET", 205));
     assert!(synthetic_response_omits_body("GET", 304));
+    assert!(synthetic_response_omits_body("GET", 100));
+    assert!(synthetic_response_omits_body("GET", 101));
     assert!(!synthetic_response_omits_body("GET", 503));
+    assert!(!synthetic_response_omits_body("GET", 206));
     assert!(status_forbids_response_body(204));
+    assert!(status_forbids_response_body(103));
     assert!(!status_forbids_response_body(503));
 }
 
@@ -57,7 +61,7 @@ fn prepare_head_preserves_existing_content_length_case_insensitively() {
 
 #[test]
 fn prepare_no_body_status_strips_content_length() {
-    for status in [204u16, 205, 304] {
+    for status in [100u16, 204, 205, 304] {
         let mut headers = HashMap::new();
         headers.insert("content-length".to_string(), "99".to_string());
         assert!(
