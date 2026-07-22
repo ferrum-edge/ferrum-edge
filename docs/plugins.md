@@ -3456,7 +3456,7 @@ streaming ceiling is not silently substituted for the configured route limit.
 
 ### `response_caching`
 
-Caches final client-visible HTTP responses in gateway memory. The cache key includes the matched proxy, request method, path, optional raw query-string hash, authenticated identity when present, an optional anonymous marker, and any request headers selected by plugin config, backend `Vary`, or credential/session safety rules.
+Caches final client-visible HTTP responses in gateway memory. The cache key includes the matched proxy, request method, path, optional raw query-string hash, authenticated identity when present, an optional anonymous marker, and any request headers selected by plugin config, backend `Vary`, or credential/session safety rules. Cacheability is separate from method safety: methods outside `cacheable_methods` bypass lookup/storage, but invalidation runs only for methods with unsafe semantics (`POST`, `PUT`, `PATCH`, `DELETE`, and extension methods); safe methods (`GET`, `HEAD`, `OPTIONS`, `TRACE`) never invalidate even when excluded from `cacheable_methods`.
 
 **Priority:** 3500
 **Protocol:** HTTP only
@@ -3478,7 +3478,7 @@ Configuration must be a top-level object. The only accepted keys are `ttl_second
 | `cache_key_include_query` | bool | `true` | Include the exact raw query string in the cache key as a SHA-256 hash |
 | `cache_key_include_consumer` | bool | `false` | Allow caching authenticated responses under their isolated identity key even when the backend does not send `public`, `must-revalidate`, or `s-maxage`; also add an `_anon` key partition for unauthenticated requests. Authenticated requests are always keyed by the hashed effective identity. |
 | `add_cache_status_header` | bool | `true` | Add `X-Cache-Status` (`MISS`, `HIT`, `BYPASS`, `REVALIDATED`) to downstream responses |
-| `invalidate_on_unsafe_methods` | bool | `true` | Invalidate cached entries for the same path prefix on non-cacheable methods such as `POST`, `PUT`, `PATCH`, and `DELETE` |
+| `invalidate_on_unsafe_methods` | bool | `true` | Invalidate cached entries for the matched path prefix on non-cacheable methods with unsafe semantics (`POST`, `PUT`, `PATCH`, `DELETE`, and any extension method). Safe methods (`GET`, `HEAD`, `OPTIONS`, `TRACE`) never invalidate even when excluded from `cacheable_methods` |
 
 Behavior:
 - Multiple `response_caching` instances on one proxy each receive a process-unique runtime staging id. Request metadata for base key, status, predictor key, request timing, and header snapshot is namespaced as `response_caching.<instance_id>.*`, so sibling instances with different query, consumer, Vary, method, SSE, or status policies cannot overwrite one another's staged inputs. Bypass, HIT, and REVALIDATED paths clear only the current instance's lookup staging. Reload reconstructions mint a new id and never read or clear a retired generation's namespaced keys.

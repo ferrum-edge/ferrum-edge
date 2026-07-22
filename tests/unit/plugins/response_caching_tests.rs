@@ -1376,6 +1376,279 @@ async fn test_post_invalidates_cached_get() {
     assert!(matches!(result, PluginResult::Continue));
 }
 
+#[tokio::test]
+async fn test_options_does_not_invalidate_cached_get() {
+    let plugin = default_plugin();
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/items",
+        200,
+        &HashMap::new(),
+        b"[\"item1\"]",
+    )
+    .await;
+
+    // OPTIONS is a safe method — it must bypass the cache without invalidating.
+    let mut ctx = make_ctx("OPTIONS", "/api/items");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
+
+    // GET should still be a HIT — OPTIONS must not have invalidated it.
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+}
+
+#[tokio::test]
+async fn test_trace_does_not_invalidate_cached_get() {
+    let plugin = default_plugin();
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/items",
+        200,
+        &HashMap::new(),
+        b"[\"item1\"]",
+    )
+    .await;
+
+    // TRACE is a safe method — it must bypass the cache without invalidating.
+    let mut ctx = make_ctx("TRACE", "/api/items");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
+
+    // GET should still be a HIT — TRACE must not have invalidated it.
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+}
+
+#[tokio::test]
+async fn test_head_non_cacheable_does_not_invalidate_cached_get() {
+    // Configure HEAD as non-cacheable (excluded from cacheable_methods).
+    let plugin = plugin_with_config(json!({
+        "cacheable_methods": ["GET"]
+    }));
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/items",
+        200,
+        &HashMap::new(),
+        b"[\"item1\"]",
+    )
+    .await;
+
+    // HEAD is a safe method — even though it is excluded from cacheable_methods,
+    // it must bypass the cache without invalidating the cached GET entry.
+    let mut ctx = make_ctx("HEAD", "/api/items");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
+
+    // GET should still be a HIT — HEAD must not have invalidated it.
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+}
+
+#[tokio::test]
+async fn test_put_invalidates_cached_get() {
+    let plugin = default_plugin();
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/items",
+        200,
+        &HashMap::new(),
+        b"[\"item1\"]",
+    )
+    .await;
+
+    assert!(is_reject(
+        plugin
+            .before_proxy(&mut make_ctx("GET", "/api/items"), &mut HashMap::new())
+            .await,
+    ));
+
+    // PUT is unsafe — it must invalidate the cached GET entry.
+    plugin
+        .before_proxy(&mut make_ctx("PUT", "/api/items"), &mut HashMap::new())
+        .await;
+
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_patch_invalidates_cached_get() {
+    let plugin = default_plugin();
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/items",
+        200,
+        &HashMap::new(),
+        b"[\"item1\"]",
+    )
+    .await;
+
+    assert!(is_reject(
+        plugin
+            .before_proxy(&mut make_ctx("GET", "/api/items"), &mut HashMap::new())
+            .await,
+    ));
+
+    // PATCH is unsafe — it must invalidate the cached GET entry.
+    plugin
+        .before_proxy(&mut make_ctx("PATCH", "/api/items"), &mut HashMap::new())
+        .await;
+
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_delete_invalidates_cached_get() {
+    let plugin = default_plugin();
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/items",
+        200,
+        &HashMap::new(),
+        b"[\"item1\"]",
+    )
+    .await;
+
+    assert!(is_reject(
+        plugin
+            .before_proxy(&mut make_ctx("GET", "/api/items"), &mut HashMap::new())
+            .await,
+    ));
+
+    // DELETE is unsafe — it must invalidate the cached GET entry.
+    plugin
+        .before_proxy(&mut make_ctx("DELETE", "/api/items"), &mut HashMap::new())
+        .await;
+
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_extension_method_invalidates_cached_get() {
+    // Extension methods are treated as unsafe (fail-safe): with no explicit
+    // contract declaring them safe, invalidation is the conservative choice.
+    let plugin = default_plugin();
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/items",
+        200,
+        &HashMap::new(),
+        b"[\"item1\"]",
+    )
+    .await;
+
+    assert!(is_reject(
+        plugin
+            .before_proxy(&mut make_ctx("GET", "/api/items"), &mut HashMap::new())
+            .await,
+    ));
+
+    // PURGE is an extension method not in the safe set — it must invalidate.
+    plugin
+        .before_proxy(&mut make_ctx("PURGE", "/api/items"), &mut HashMap::new())
+        .await;
+
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue));
+}
+
+#[tokio::test]
+async fn test_safe_method_bypass_status_is_set() {
+    // Safe non-cacheable methods must report BYPASS (not HIT/MISS) and must
+    // not leave lookup staging behind.
+    let plugin = default_plugin();
+
+    cache_response(
+        &plugin,
+        "GET",
+        "/api/items",
+        200,
+        &HashMap::new(),
+        b"[\"item1\"]",
+    )
+    .await;
+
+    for method in ["OPTIONS", "TRACE"] {
+        let mut ctx = make_ctx(method, "/api/items");
+        let mut headers = HashMap::new();
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "{method} should bypass"
+        );
+        assert_eq!(
+            ctx.metadata
+                .get(&staging_key(&plugin, "cache_status"))
+                .unwrap(),
+            "BYPASS",
+            "{method} should report BYPASS"
+        );
+        assert!(
+            !ctx.metadata.contains_key(&staging_key(&plugin, "cache_base_key")),
+            "{method} must not leave cache_base_key staging behind"
+        );
+    }
+
+    // GET should still be a HIT.
+    let mut ctx = make_ctx("GET", "/api/items");
+    let mut headers = HashMap::new();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+}
+
 // === Max entry size ===
 
 #[tokio::test]

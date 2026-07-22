@@ -895,6 +895,34 @@ impl ResponseCaching {
         self.config.cacheable_methods.iter().any(|m| m == method)
     }
 
+    /// Check if the request method has unsafe semantics that warrant cache
+    /// invalidation.
+    ///
+    /// Cacheability (membership in `cacheable_methods`) is intentionally
+    /// separate from method safety: an operator who configures
+    /// `cacheable_methods: ["GET"]` still wants `HEAD`, `OPTIONS`, and `TRACE`
+    /// lookups to bypass the cache without nuking cached `GET` entries.
+    ///
+    /// RFC 9110 §9.1.1 defines the safe methods as `GET`, `HEAD`, `OPTIONS`,
+    /// and `TRACE` — those that do not alter server state. They never
+    /// invalidate cached entries even when excluded from `cacheable_methods`.
+    ///
+    /// `POST`, `PUT`, `PATCH`, and `DELETE` are unsafe by definition and
+    /// always invalidate (when `invalidate_on_unsafe_methods` is enabled).
+    ///
+    /// Extension/unknown methods are treated as unsafe (fail-safe): with no
+    /// explicit contract declaring them safe, invalidating is the conservative
+    /// choice that prevents serving a stale cached representation after a
+    /// state-changing extension method. An operator who knows an extension
+    /// method is safe can add it to `cacheable_methods` (which bypasses
+    /// lookup/storage) — but that does not suppress invalidation, so a safe
+    /// extension method that is NOT in `cacheable_methods` still invalidates.
+    /// To fully suppress invalidation for a safe extension method, add it to
+    /// `cacheable_methods` and set `invalidate_on_unsafe_methods: false`.
+    fn is_unsafe_method(method: &str) -> bool {
+        !matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE")
+    }
+
     fn cache_lookup_vary_headers(&self, base_key: &str) -> Vec<String> {
         self.vary_index
             .get(base_key)
@@ -1516,7 +1544,13 @@ impl Plugin for ResponseCaching {
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
         if !self.is_cacheable_method(&ctx.method) {
-            if self.config.invalidate_on_unsafe_methods {
+            // Cacheability is separate from method safety: only methods with
+            // unsafe semantics (POST, PUT, PATCH, DELETE, and extension
+            // methods) invalidate cached entries. Safe methods (GET, HEAD,
+            // OPTIONS, TRACE) bypass lookup/storage without invalidating, so
+            // an operator who configures `cacheable_methods: ["GET"]` does
+            // not lose cached GET entries to a HEAD/OPTIONS/TRACE request.
+            if self.config.invalidate_on_unsafe_methods && Self::is_unsafe_method(&ctx.method) {
                 self.invalidate_path(ctx);
             }
             // Clear only this instance's staging so a sibling cache keeps
