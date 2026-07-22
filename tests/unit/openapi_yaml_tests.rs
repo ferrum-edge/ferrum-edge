@@ -3453,7 +3453,10 @@ fn request_transformer_schema_matches_runtime_target_and_value_contract() {
             required.iter().any(|value| value == "target"),
             "{variant} must require target"
         );
-        assert_eq!(schema["properties"]["target"]["const"], json!(expected_target));
+        assert_eq!(
+            schema["properties"]["target"]["const"],
+            json!(expected_target)
+        );
         assert!(
             schema["properties"]["target"].get("default").is_none(),
             "{variant}.target must not advertise a default"
