@@ -2041,7 +2041,7 @@ async fn handle_h3_request(
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     grpc_message,
                     initial_response_header_policy_plugins.as_ref(),
-                false,
+                    false,
                 )
                 .await?;
                 return Ok(());
@@ -2225,7 +2225,7 @@ async fn handle_h3_request(
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                         grpc_message,
                         initial_response_header_policy_plugins.as_ref(),
-                    false,
+                        false,
                     )
                     .await?;
                     return Ok(());
@@ -2481,7 +2481,7 @@ async fn handle_h3_request(
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     grpc_message,
                     initial_response_header_policy_plugins.as_ref(),
-                false,
+                    false,
                 )
                 .await?;
                 return Ok(());
@@ -3265,7 +3265,7 @@ async fn handle_h3_request(
                         rejection.http_status,
                         &rejection.body,
                         &rejection.headers,
-                    false,
+                        false,
                     )
                     .await?;
                     return Ok(());
@@ -3661,7 +3661,7 @@ async fn handle_h3_request(
                         crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                         grpc_message,
                         initial_response_header_policy_plugins.as_ref(),
-                    false,
+                        false,
                     )
                     .await?;
                     return Ok(());
@@ -4328,7 +4328,7 @@ async fn handle_h3_request(
                                 crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                                 grpc_message,
                                 initial_response_header_policy_plugins.as_ref(),
-                            false,
+                                false,
                             )
                             .await?;
                             return Ok(());
@@ -5505,7 +5505,7 @@ async fn handle_h3_request(
                     crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
                     grpc_message,
                     initial_response_header_policy_plugins.as_ref(),
-                false,
+                    false,
                 )
                 .await?;
                 return Ok(());
@@ -10937,7 +10937,15 @@ async fn send_h3_plugin_reject_flavor_aware_with_recv_halt(
             .await;
         }
 
-        send_h3_reject_flavor_aware_with_recv_halt(stream, flavor, http_status, body, headers, halt_recv).await
+        send_h3_reject_flavor_aware_with_recv_halt(
+            stream,
+            flavor,
+            http_status,
+            body,
+            headers,
+            halt_recv,
+        )
+        .await
     };
     // Operator timeout / mid-recv cancel paths pass halt_recv=false; bound the
     // same way so flow-control cannot retain the task after the upload bound.
@@ -11283,7 +11291,12 @@ async fn send_h3_reject_flavor_aware(
     headers: &HashMap<String, String>,
 ) -> Result<(), anyhow::Error> {
     send_h3_reject_flavor_aware_with_recv_halt(
-        stream, flavor, http_status, http_body, headers, true,
+        stream,
+        flavor,
+        http_status,
+        http_body,
+        headers,
+        true,
     )
     .await
 }
@@ -11344,7 +11357,8 @@ async fn send_h3_reject_flavor_aware_with_header_state(
             let mut finalized_headers = headers.clone();
             crate::http3::websocket::finalize_h3_websocket_reject_headers(&mut finalized_headers);
             if !headers_finalized && !reject_response_sets_content_type(&finalized_headers) {
-                finalized_headers.insert("content-type".to_string(), "application/json".to_string());
+                finalized_headers
+                    .insert("content-type".to_string(), "application/json".to_string());
             }
             return send_h3_finalized_reject_response_with_recv_halt(
                 stream,
@@ -11357,20 +11371,32 @@ async fn send_h3_reject_flavor_aware_with_header_state(
         }
         if headers_finalized {
             return send_h3_finalized_reject_response_with_recv_halt(
-                stream, http_status, http_body, headers, halt_recv,
+                stream,
+                http_status,
+                http_body,
+                headers,
+                halt_recv,
             )
             .await;
         }
         if reject_response_sets_content_type(headers) {
             return send_h3_finalized_reject_response_with_recv_halt(
-                stream, http_status, http_body, headers, halt_recv,
+                stream,
+                http_status,
+                http_body,
+                headers,
+                halt_recv,
             )
             .await;
         }
         let mut headers = headers.clone();
         headers.insert("content-type".to_string(), "application/json".to_string());
         return send_h3_finalized_reject_response_with_recv_halt(
-            stream, http_status, http_body, &headers, halt_recv,
+            stream,
+            http_status,
+            http_body,
+            &headers,
+            halt_recv,
         )
         .await;
     }

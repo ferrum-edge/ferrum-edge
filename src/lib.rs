@@ -1923,21 +1923,19 @@ pub mod _test_support {
         )
     }
 
-    /// Return true when a stalled post-deadline terminal rejection write is
-    /// cancelled by [`crate::http3::stream_util::H3_POST_DEADLINE_TERMINAL_WRITE_GRACE`].
-    pub async fn stalled_h3_post_deadline_terminal_write_expires_for_test() -> bool {
+    /// Spawn a stalled post-deadline terminal rejection write under the shared
+    /// gateway grace. Callers in paused-time tests must advance simulated time
+    /// by [`h3_post_deadline_terminal_write_grace_for_test`] before awaiting the
+    /// handle — this helper intentionally never calls Tokio `test-util` APIs.
+    pub fn spawn_stalled_h3_post_deadline_terminal_write_for_test()
+    -> tokio::task::JoinHandle<bool> {
         let write = std::future::pending::<Result<(), ()>>();
-        let task = tokio::spawn(async move {
-            crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await
-        });
-        tokio::task::yield_now().await;
-        tokio::time::advance(crate::http3::stream_util::H3_POST_DEADLINE_TERMINAL_WRITE_GRACE)
-            .await;
-        tokio::task::yield_now().await;
-        matches!(
-            task.await.expect("join"),
-            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
-        )
+        tokio::spawn(async move {
+            matches!(
+                crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await,
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
+            )
+        })
     }
 
     pub fn h3_post_deadline_terminal_write_grace_for_test() -> std::time::Duration {

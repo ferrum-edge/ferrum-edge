@@ -817,9 +817,15 @@ async fn ready_h3_post_deadline_terminal_write_completes_within_grace() {
 
 #[tokio::test(start_paused = true)]
 async fn stalled_h3_post_deadline_terminal_write_expires_grace() {
+    let task = ferrum_edge::_test_support::spawn_stalled_h3_post_deadline_terminal_write_for_test();
+    tokio::task::yield_now().await;
+    tokio::time::advance(
+        ferrum_edge::_test_support::h3_post_deadline_terminal_write_grace_for_test(),
+    )
+    .await;
+    tokio::task::yield_now().await;
     assert!(
-        ferrum_edge::_test_support::stalled_h3_post_deadline_terminal_write_expires_for_test()
-            .await,
+        task.await.expect("join"),
         "a flow-control-blocked post-deadline rejection write must not outlive the grace"
     );
 }
@@ -866,7 +872,9 @@ fn h3_native_and_cross_protocol_cancel_writers_use_post_deadline_grace() {
         "gRPC-Web, native gRPC, and plain terminal-deadline branches must share the grace helper"
     );
     assert_eq!(
-        final_reject.matches("abort_response_stream(stream)").count(),
+        final_reject
+            .matches("abort_response_stream(stream)")
+            .count(),
         3
     );
     let timed_out = cross

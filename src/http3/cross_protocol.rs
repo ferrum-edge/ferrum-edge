@@ -6755,7 +6755,13 @@ where
     S: RecvStream + SendStream<Bytes>,
 {
     write_reject_with_headers_and_recv_halt(
-        stream, status, body, headers, backend_start, bytes_sent, true,
+        stream,
+        status,
+        body,
+        headers,
+        backend_start,
+        bytes_sent,
+        true,
     )
     .await
 }
@@ -6971,12 +6977,8 @@ where
     } else if matches!(flavor, HttpFlavor::Grpc) {
         if terminal_gateway_deadline {
             // Send-only: skip STOP_SENDING after mid-recv_data cancel.
-            let write = write_normalized_grpc_reject_send(
-                stream,
-                &normalized,
-                backend_start,
-                bytes_sent,
-            );
+            let write =
+                write_normalized_grpc_reject_send(stream, &normalized, backend_start, bytes_sent);
             return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
                 write,
             )
