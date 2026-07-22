@@ -1572,7 +1572,14 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
                     // gRPC error response (HTTP 200 + `application/grpc`) instead of
                     // the plugin-transformed response.
                     let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
-                        Ok(Frame::data(Bytes::from_static(b"grpc-payload"))),
+                        // One valid uncompressed gRPC DATA message: flag 0x00,
+                        // 12-byte big-endian payload length, then `grpc-payload`.
+                        // Keeping this fixture protocol-correct lets gRPC-Web
+                        // assertions parse through the data frame and count the
+                        // terminal trailer frames appended after it.
+                        Ok(Frame::data(Bytes::from_static(
+                            b"\x00\x00\x00\x00\x0cgrpc-payload",
+                        ))),
                         Ok(Frame::trailers(trailers)),
                     ];
                     let body = StreamBody::new(tokio_stream::iter(frames));
@@ -1999,28 +2006,56 @@ async fn grpc_buffered_security_policy_stays_initial_without_relocating_trailers
 /// `grpc_web` plugin re-encodes terminal status as a gRPC-Web trailer frame
 /// appended to the body and relabels the content-type, so also emitting the
 /// reconciled native TRAILERS frame would double-signal terminal status.
+fn count_grpc_web_trailer_frames(mut body: &[u8]) -> usize {
+    let mut count = 0;
+    while body.len() >= 5 {
+        let flag = body[0];
+        let payload_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+        let Some(frame_len) = 5usize.checked_add(payload_len) else {
+            break;
+        };
+        if body.len() < frame_len {
+            break;
+        }
+        if flag & 0x80 != 0 {
+            count += 1;
+        }
+        body = &body[frame_len..];
+    }
+    count
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_web_transformed_response_suppresses_native_trailers() {
     let (backend_addr, _backend_handle) = start_grpc_backend_with_trailer_fixture().await;
 
     let mut proxy = create_grpc_proxy("grpc-web-no-native-trailers", "/grpc", backend_addr.port());
     proxy.response_body_mode = ResponseBodyMode::Buffer;
-    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
-        plugin_config_id: "grpc-web-bridge".to_string(),
-    }];
+    proxy.plugins = vec![
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-bridge".to_string(),
+        },
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-bridge-sibling".to_string(),
+        },
+    ];
     let plugin = PluginConfig {
         id: "grpc-web-bridge".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
         enabled: true,
-        config: serde_json::json!({}),
+        config: serde_json::json!({"expose_headers": ["x-grpc-web-owner"]}),
         scope: PluginScope::Proxy,
         proxy_id: Some("grpc-web-no-native-trailers".to_string()),
-        priority_override: None,
+        priority_override: Some(250),
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
+    let mut sibling = plugin.clone();
+    sibling.id = "grpc-web-bridge-sibling".to_string();
+    sibling.config = serde_json::json!({"expose_headers": ["x-grpc-web-sibling"]});
+    sibling.priority_override = Some(270);
     let cookie_transformer = PluginConfig {
         id: "grpc-web-cookie-transformer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -2047,7 +2082,7 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     security_headers.config["remove"] = serde_json::json!(["Set-Cookie", "X-Powered-By"]);
     let state = create_test_proxy_state_with_plugins(
         vec![proxy],
-        vec![plugin, cookie_transformer, security_headers],
+        vec![plugin, sibling, cookie_transformer, security_headers],
     );
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
@@ -2064,6 +2099,7 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     let mut content_type: Option<String> = None;
     let mut security_policy: Option<String> = None;
     let mut hsts: Option<String> = None;
+    let mut expose_headers: Option<String> = None;
     let mut content_length: Option<usize> = None;
     let mut had_grpc_status_header = true;
     let mut had_set_cookie_header = true;
@@ -2108,6 +2144,11 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
             .get("strict-transport-security")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        expose_headers = response
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         content_length = response
             .headers()
             .get("content-length")
@@ -2150,6 +2191,9 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     assert_eq!(status, 200);
     assert_eq!(security_policy.as_deref(), Some("gateway-enforced"));
     assert_eq!(hsts.as_deref(), Some("max-age=31536000; includeSubDomains"));
+    let expose_headers = expose_headers.expect("gRPC-Web expose headers");
+    assert!(expose_headers.contains("x-grpc-web-owner"));
+    assert!(expose_headers.contains("x-grpc-web-sibling"));
     assert_eq!(
         content_type.as_deref(),
         Some("application/grpc-web+proto"),
@@ -2179,9 +2223,10 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
          (status is already embedded as a gRPC-Web trailer frame in the body)"
     );
     // The appended gRPC-Web trailer frame is flagged 0x80.
-    assert!(
-        body_bytes.contains(&0x80),
-        "gRPC-Web body must contain a trailer frame (flag 0x80)"
+    assert_eq!(
+        count_grpc_web_trailer_frames(&body_bytes),
+        1,
+        "two effective grpc_web instances must emit one terminal frame"
     );
 }
 
@@ -2447,9 +2492,14 @@ async fn grpc_web_text_keeps_security_policy_in_initial_headers() {
     let (backend_addr, _backend_handle) = start_grpc_backend_with_trailer_fixture().await;
     let mut proxy = create_grpc_proxy("grpc-web-text-security", "/grpc", backend_addr.port());
     proxy.response_body_mode = ResponseBodyMode::Buffer;
-    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
-        plugin_config_id: "grpc-web-text-bridge".to_string(),
-    }];
+    proxy.plugins = vec![
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-text-bridge".to_string(),
+        },
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-text-bridge-sibling".to_string(),
+        },
+    ];
     let grpc_web = PluginConfig {
         id: "grpc-web-text-bridge".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -2458,15 +2508,19 @@ async fn grpc_web_text_keeps_security_policy_in_initial_headers() {
         config: serde_json::json!({}),
         scope: PluginScope::Proxy,
         proxy_id: Some("grpc-web-text-security".to_string()),
-        priority_override: None,
+        priority_override: Some(250),
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
+    let mut grpc_web_sibling = grpc_web.clone();
+    grpc_web_sibling.id = "grpc-web-text-bridge-sibling".to_string();
+    grpc_web_sibling.priority_override = Some(270);
     let state = create_test_proxy_state_with_plugins(
         vec![proxy],
         vec![
             grpc_web,
+            grpc_web_sibling,
             security_headers_plugin("grpc-web-text-security-headers"),
         ],
     );
@@ -2549,7 +2603,11 @@ async fn grpc_web_text_keeps_security_policy_in_initial_headers() {
         "text response never carried successful terminal status ({} decoded bytes)",
         last_body.len()
     );
-    assert!(last_body.contains(&0x80));
+    assert_eq!(
+        count_grpc_web_trailer_frames(&last_body),
+        1,
+        "text mode must be decoded and re-encoded exactly once"
+    );
 }
 
 /// #2041 regression: when the backend exchange FAILS gateway-side for a

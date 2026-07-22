@@ -8490,9 +8490,12 @@ components:
         exhausted, the plugin sends a WebSocket close frame (RFC 6455 close code
         1008 — Policy Violation) to both client and backend. Both directions
         (client→backend and backend→client) consume from the same per-connection
-        bucket. Supports centralized Redis-backed mode for cross-instance
-        coordination of frame counters. Counter storage supports only local
-        memory and Redis; database-backed counters are intentionally unsupported.
+        bucket. Redis mode (`sync_mode: "redis"`) externalizes those
+        per-connection counters under a per-plugin/gateway-instance key
+        namespace; it does not coordinate a portable frame budget across
+        gateway instances, reconnects, or plugin rebuilds. Counter storage
+        supports only local memory and Redis; database-backed counters are
+        intentionally unsupported.
       properties:
         frames_per_second:
           type: integer
@@ -8521,7 +8524,11 @@ components:
           type: string
           enum: [local, redis]
           default: local
-          description: "Frame counter storage: 'local' (in-memory) or 'redis' (centralized). Database-backed counters are unsupported. Any RESP-compatible server works."
+          description: >-
+            Frame counter storage: 'local' (in-memory) or 'redis' (externalized
+            per-connection counters namespaced per plugin/gateway instance; not
+            a portable cross-instance budget). Database-backed counters are
+            unsupported. Any RESP-compatible server works.
         redis_url:
           type: string
           description: "Redis connection URL. Required when sync_mode is 'redis'."
@@ -12487,7 +12494,7 @@ components:
             metric:
               type: string
               enum: [backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms]
-              description: Latency metric to observe. `stream_duration_ms` applies to TCP/UDP/WebSocket sessions; the others apply to HTTP-family summaries.
+              description: Latency metric to observe. `stream_duration_ms` applies to TCP/UDP/DTLS/WebSocket sessions and is measured on a process-monotonic clock (not UTC wall time); connect/disconnect timestamps remain civil-clock values for rendering. The other metrics apply to HTTP-family summaries.
             percentile:
               type: integer
               minimum: 1
@@ -14463,7 +14470,7 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers request bodies with SOAP content types (text/xml, application/soap+xml, application/xml). At least one security feature must be enabled. Note: signature paths verify against the wire bytes of SignedInfo / referenced elements and do not yet apply Exclusive XML Canonicalization (xml-exc-c14n#); operators integrating with IdPs that strictly canonicalize should validate end-to-end."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers request bodies with SOAP content types (text/xml, application/soap+xml, application/xml). At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported)."
       properties:
         reject_missing_security_header:
           type: boolean
@@ -14569,24 +14576,26 @@ components:
                  More than one `<Assertion>` inside the WS-Security block is
                  rejected outright.
               2. Resolve the signing algorithm and confirm it is in `allowed_signature_algorithms`.
-              3. Verify each `<Reference>` digest against the assertion with its own
-                 `<Signature>` element removed (XMLDSIG enveloped-signature transform).
+              3. Verify each `<Reference>` digest after the supported transform chain
+                 (XMLDSIG enveloped-signature followed by Exclusive XML Canonicalization
+                 `xml-exc-c14n#`, including `InclusiveNamespaces PrefixList`).
                  The digest algorithm must be in `allowed_digest_algorithms`. At
                  least one Reference must target the enclosing Assertion ID.
               4. Match the signing certificate from `KeyInfo/X509Data/X509Certificate`
                  against `trusted_signing_certs` by SHA-256 fingerprint of the full DER
                  (leaf-cert trust — no CA chain validation; operators supply the IdP's
                  actual signing certificate(s) as published in IdP metadata).
-              5. Verify `<SignatureValue>` over the `<SignedInfo>` bytes using the matched
-                 cert's RSA public key.
+              5. Verify `<SignatureValue>` over exclusive-canonicalized `<SignedInfo>`
+                 (`xml-exc-c14n#`, including `InclusiveNamespaces PrefixList`) using the
+                 matched cert's RSA public key.
               6. Validate Issuer (must match `trusted_issuers`), NotBefore /
                  NotOnOrAfter (with `clock_skew_seconds` tolerance), and Audience
                  (if `audience` is configured).
               7. Extract the Subject NameID into `ctx.metadata["soap_ws_saml_subject"]`
                  for downstream plugins.
-            On any failure the request is rejected with HTTP 401. Signature paths use the
-            wire bytes of `SignedInfo` / referenced elements and do not currently apply
-            Exclusive XML Canonicalization (xml-exc-c14n#).
+            On any failure the request is rejected with HTTP 401. Unsupported
+            canonicalization or transform algorithms fail closed; inclusive c14n,
+            comments, XPath, XSLT, and other XMLDSIG transforms are not supported.
           properties:
             enabled:
               type: boolean
@@ -16463,11 +16472,14 @@ components:
           type: integer
           format: uint64
           minimum: 0
-          default: 10485760
           description: >-
-            Maximum decompressed protobuf payload size accepted from a gRPC
-            frame. Defaults to `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES`, or 10 MiB
-            when that setting is absent.
+            Maximum decompressed gRPC protobuf payload size in bytes for both
+            request and response validation. Nonnegative integer matching runtime
+            `usize` parsing. `0` disables the decompressed cap. When omitted,
+            inherits `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that value parses
+            as an unsigned integer; otherwise falls back to 10 MiB (10485760).
+            No static OpenAPI default is advertised because the effective value
+            can be environment-derived.
 
     OpenapiValidatorConfig:
       type: object
@@ -16750,8 +16762,14 @@ components:
         handshakes: a match short-circuits only the HTTP handshake response and
         does not establish or mock an upgraded WebSocket frame stream. Unknown
         top-level and per-rule keys are rejected; the free-form headers map
-        remains open for string-valued response headers. Runtime construction
-        is the authoritative final boundary.
+        remains open for string-valued response headers. Status codes must be
+        final (200–599) or 101 for a synthetic WebSocket handshake; other
+        informational statuses are rejected. A configured 101 fails closed
+        with 500 when the matching request is not an actual WebSocket
+        handshake. HEAD omits content bytes while keeping representation
+        Content-Length; 204/205/304 omit body and Content-Length on every
+        frontend (H1/H2/H3). Runtime construction and request-flavor
+        enforcement are the authoritative final boundaries.
       required:
         - rules
       properties:
@@ -16788,11 +16806,15 @@ components:
                 minimum: 100
                 maximum: 599
                 description: >-
-                  HTTP status code to return (default 200). Values outside
-                  100–599 are rejected. Status 101 on an HTTP/1.1 WebSocket
-                  upgrade, or a success-like 200 on HTTP/2 / HTTP/3 Extended
-                  CONNECT, is still only a synthetic HTTP handshake response;
-                  it does not create an upgraded frame stream.
+                  HTTP status code to return (default 200). Must be a final
+                  status 200–599, or 101 for a synthetic WebSocket handshake
+                  response. Other informational statuses (100, 102–199) and
+                  values outside 100–599 are rejected at construction rather
+                  than coerced. Status 101 on an HTTP/1.1 WebSocket upgrade, or
+                  a success-like 200 on HTTP/2 / HTTP/3 Extended CONNECT, is
+                  still only a synthetic HTTP handshake response; it does not
+                  create an upgraded frame stream. A 101 rule that matches an
+                  ordinary HTTP request fails closed with status 500.
               headers:
                 type: object
                 additionalProperties:
@@ -16800,7 +16822,12 @@ components:
                 description: Response headers (default content-type application/json)
               body:
                 type: string
-                description: Response body string
+                description: >-
+                  Response body string (default empty). On the wire, HEAD
+                  responses omit content bytes while keeping representation
+                  Content-Length. Statuses 204, 205, and 304 omit both the body
+                  and Content-Length even when this field is non-empty. Shared
+                  synthetic-response finalization keeps H1, H2, and H3 aligned.
               delay_ms:
                 type: integer
                 format: uint64
@@ -16854,7 +16881,10 @@ components:
         Omitted optional fields select defaults; runtime also treats explicit
         null on optional fields as omitted. Matching replay bodies have a hard
         10 MiB plugin-local ceiling and active local/fan-out replay work shares
-        a 64 MiB process-wide retained-body budget.
+        a 64 MiB process-wide retained-body budget. Synthetic and fan-out
+        headers reuse the canonical secondary-request sanitizer shared with
+        request_mirror (Connection-listed hop-by-hop, Trailer, framing, Ferrum
+        markers, proxy-owned X-Forwarded-*), preserving Host for routing.
       required:
         - key
         - concurrent_clients
@@ -16951,7 +16981,16 @@ components:
         for the mirror response and mirror failures never propagate to the
         client. Mirror response metadata (status, size, latency) is captured
         via a `tokio::sync::watch` channel and surfaced through transaction
-        logs.
+        logs. Outbound mirror headers use Ferrum's canonical secondary-request
+        sanitizer (Connection-listed hop-by-hop, Trailer, framing, Ferrum
+        request-only markers, and proxy-owned X-Forwarded-* identity); these
+        forwarding fields are stripped rather than regenerated, so mirrors do
+        not receive Ferrum-authored X-Forwarded-* identity. Host is derived from
+        the mirror URL. Native gRPC mirrors require HTTP/2 and re-synthesise te:
+        trailers. The mirror request-target preserves the raw query (after the
+        same auth credential strips as primary) including repeated pairs,
+        order, flags, empty values, +, percent escapes, and non-ASCII encoded
+        bytes.
       required:
         - mirror_host
       properties:
@@ -16971,7 +17010,8 @@ components:
           description: "Transport protocol used for the mirror request."
         mirror_path:
           type: string
-          description: "Override path used for the mirror request. When omitted, the original request path is used."
+          pattern: '^$|^/[^?#]*$'
+          description: "Override path used for the mirror request. Must start with `/` and cannot contain a query or fragment. Empty is treated as omitted; when omitted, the original request path is used."
         percentage:
           type: number
           format: double
@@ -17527,6 +17567,9 @@ components:
         metadata, and valid ASCII custom trailing metadata while excluding
         hop-by-hop, forbidden, pseudo, connection-listed, and invalid
         names/values; initial response headers are not copied into the frame.
+        Multiple effective instances are supported: the first in configured
+        order owns body translation exactly once; siblings union expose_headers
+        only.
       properties:
         expose_headers:
           type: array
@@ -17535,7 +17578,8 @@ components:
           description: >-
             Additional response headers to include in
             Access-Control-Expose-Headers for browser CORS compatibility.
-            grpc-status and grpc-message are always exposed.
+            grpc-status and grpc-message are always exposed. Multiple grpc_web
+            instances union their lists in configured order.
 
     GrpcDeadlineConfig:
       type: object
@@ -18207,8 +18251,11 @@ components:
           description: Enable TLS for Redis connection
         redis_key_prefix:
           type: string
-          default: "ferrum:ai_semantic_cache"
-          description: Redis key namespace prefix
+          description: >-
+            Redis key namespace prefix. When omitted, the runtime derives
+            `{FERRUM_NAMESPACE}:ai_cache` (for example `ferrum:ai_cache` when
+            the namespace is `ferrum`). No static OpenAPI default is advertised
+            because the value depends on the gateway namespace.
         redis_pool_size:
           type: integer
           format: uint64
@@ -18395,8 +18442,7 @@ components:
         token_limit:
           type: integer
           minimum: 1
-          default: 100000
-          description: Maximum tokens allowed per window
+          description: Required maximum tokens allowed per window. Omission is rejected at construction; there is no default.
         window_seconds:
           type: integer
           minimum: 1
@@ -19936,6 +19982,15 @@ components:
               type: integer
               minimum: 1
               default: 10737418240
+              description: |
+                Hard ceiling on total encoded on-disk bytes owned by this sink under
+                spool.dir for the local node_id (after compression). Counts active
+                spool files (*.ndjson / *.ndjson.zst), in-progress atomic-write temps
+                (*.tmp), and quarantined (*.corrupt) files. A pending write is sized
+                before admission under the spool write lock; oldest owned files are
+                dropped until the incoming encoded file fits. If one encoded batch
+                still cannot fit, the write is rejected rather than exceeding the
+                ceiling.
             replay_interval_secs:
               type: integer
               minimum: 1
@@ -20113,8 +20168,10 @@ components:
               type: boolean
             files:
               type: integer
+              description: Count of owned spool files (active data, temps, and quarantined).
             bytes:
               type: integer
+              description: Total encoded on-disk bytes for owned spool files (active data, temps, and quarantined).
             drops_total:
               type: integer
             last_replay_at:

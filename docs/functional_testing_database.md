@@ -429,9 +429,9 @@ docker stop mongo-test && docker rm mongo-test
 
 ## References
 
-- [Database Mode Documentation](../README.md#database-mode)
+- [Database Mode Documentation](../README.md#database-mode-sqlite)
 - [MongoDB Deployment Guide](mongodb.md)
 - [Admin API Reference](../README.md#admin-api)
-- [JWT Authentication](../README.md#jwt-authentication)
-- [Proxy Configuration](../README.md#proxy-configuration)
+- [JWT Authentication](configuration.md#authentication)
+- [Proxy Configuration](configuration.md#proxy-listener)
 - [Database TLS Configuration](database_tls.md)

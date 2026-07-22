@@ -1,6 +1,6 @@
 apiVersion: v2
 name: ferrum-gateway
-description: Ferrum Edge core gateway (database, file, control-plane, and data-plane modes)
+description: Ferrum Edge core gateway (database, file, control-plane, and data-plane modes; migrate is an external Job)
 type: application
 version: 0.1.0
 appVersion: "0.9.0"

@@ -795,6 +795,7 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
             "auth_mode": "single",
             "plugins": [
                 {"plugin_config_id": "grpc-web-success"},
+                {"plugin_config_id": "grpc-web-success-sibling"},
                 {"plugin_config_id": "grpc-web-success-key-auth"},
                 {"plugin_config_id": "grpc-web-success-chargeback"}
             ],
@@ -814,7 +815,17 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
                 "scope": "proxy",
                 "proxy_id": "h3-grpc-web-success",
                 "enabled": true,
-                "config": {},
+                "priority_override": 250,
+                "config": {"expose_headers": ["x-grpc-web-owner"]},
+            },
+            {
+                "id": "grpc-web-success-sibling",
+                "plugin_name": "grpc_web",
+                "scope": "proxy",
+                "proxy_id": "h3-grpc-web-success",
+                "enabled": true,
+                "priority_override": 270,
+                "config": {"expose_headers": ["x-grpc-web-sibling"]},
             },
             {
                 "id": "grpc-web-success-key-auth",
@@ -870,11 +881,23 @@ async fn h3_grpc_web_success_uses_grpc_backend_and_preserves_trailer_frame() {
             .and_then(|value| value.to_str().ok()),
         Some("application/grpc-web+proto")
     );
+    let expose_headers = response
+        .headers
+        .get("access-control-expose-headers")
+        .and_then(|value| value.to_str().ok())
+        .expect("gRPC-Web expose headers");
+    assert!(expose_headers.contains("x-grpc-web-owner"));
+    assert!(expose_headers.contains("x-grpc-web-sibling"));
     assert!(
         response.trailers.is_none(),
         "gRPC-Web must not leak native H3 trailers"
     );
     let frames = grpc_web_frames(&response.body_bytes);
+    assert_eq!(
+        frames.iter().filter(|(flag, _)| *flag & 0x80 != 0).count(),
+        1,
+        "two effective H3 grpc_web instances must emit one terminal frame"
+    );
     assert_eq!(
         frames.first().map(|(flag, body)| (*flag, *body)),
         Some((0, b"pong".as_slice()))

@@ -59,9 +59,15 @@
 //!   - **path**: Non-empty path relative to a prefix listen_path, full path
 //!     for exact/regex/root/host-only scopes, or regex with `~` prefix
 //!     (required)
-//!   - **status_code**: HTTP status to return (default: 200; must be 100–599)
+//!   - **status_code**: HTTP status to return (default: 200). Must be a final
+//!     status `200–599`, or `101` for a synthetic WebSocket handshake response.
+//!     Other informational statuses (`100`, `102`–`199`) are rejected — a mock
+//!     cannot emit a 1xx as a body-bearing final response.
 //!   - **headers**: Response headers (default: `{"content-type": "application/json"}`)
-//!   - **body**: Response body string (default: empty)
+//!   - **body**: Response body string (default: empty). On the wire, `HEAD`
+//!     responses omit content bytes while keeping representation metadata
+//!     (including `Content-Length`). Statuses `204`/`205`/`304` omit both the
+//!     body and `Content-Length`, even when a non-empty `body` is configured.
 //!   - **delay_ms**: Simulated latency in milliseconds (default: 0, max
 //!     3,600,000 = 1 hour; larger values are rejected at construction)
 //! - **passthrough_on_no_match**: If true, requests not matching any rule
@@ -69,6 +75,8 @@
 //!
 //! Unknown top-level and per-rule keys are rejected at construction. The
 //! free-form `headers` map remains open for arbitrary string-valued headers.
+//! HEAD / no-body wire shape is applied by the shared synthetic-response
+//! finalizer so H1, H2, and H3 stay aligned.
 
 use async_trait::async_trait;
 use http::{
@@ -326,7 +334,21 @@ fn optional_status_code(rule_val: &Map<String, Value>, rule_idx: usize) -> Resul
         ));
     }
 
-    Ok(raw as u16)
+    let status = raw as u16;
+    // A mock short-circuit is a single final response. Unsupported
+    // informational statuses cannot be followed by a non-1xx final response, so
+    // reject them at construction. Status 101 remains allowed solely for a
+    // synthetic WebSocket handshake response (still not an upgraded frame
+    // stream).
+    if (100..200).contains(&status) && status != 101 {
+        return Err(format!(
+            "response_mock: rule[{rule_idx}] 'status_code' {status} is an unsupported \
+             informational status; use a final status (200–599), or 101 only for a \
+             synthetic WebSocket handshake response"
+        ));
+    }
+
+    Ok(status)
 }
 
 #[async_trait]
@@ -385,6 +407,20 @@ impl Plugin for ResponseMock {
         };
 
         if let Some(rule) = self.find_match(&ctx.method, match_path) {
+            // 101 is a valid terminal response only at a WebSocket handshake
+            // boundary. The request flavor is stamped before plugin hooks and
+            // cannot be forged by mutable request headers. Fail closed instead
+            // of emitting an informational-only response on ordinary HTTP.
+            if rule.status_code == 101 && !ctx.has_websocket_response_boundary() {
+                let mut headers = HashMap::new();
+                headers.insert("content-type".to_string(), "application/json".to_string());
+                return PluginResult::Reject {
+                    status_code: 500,
+                    body: r#"{"error":"response_mock status 101 requires a WebSocket handshake"}"#
+                        .to_string(),
+                    headers,
+                };
+            }
             if rule.delay_ms > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(rule.delay_ms)).await;
             }

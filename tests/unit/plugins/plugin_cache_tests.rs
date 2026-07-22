@@ -97,6 +97,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "body_validator" => json!({"required_fields": ["name"]}),
         "graphql" => json!({"max_depth": 100}),
         "grpc_method_router" => json!({"allow_methods": ["test.Svc/Method"]}),
+        "grpc_deadline" => json!({"max_deadline_ms": 30000}),
         "ai_rate_limiter" => json!({"token_limit": 100000}),
         "cors" => json!({"allowed_origins": ["*"]}),
         "response_caching" => json!({"ttl_seconds": 60}),
@@ -107,6 +108,31 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
         "jwks_auth" => {
             json!({"providers": [{"jwks_uri": "http://127.0.0.1:9/.well-known/jwks.json"}]})
         }
+        "oauth2_introspection" => json!({
+            "providers": [{
+                "introspection_endpoint": "http://127.0.0.1:9/introspect",
+                "client_auth": {"method": "none"}
+            }]
+        }),
+        "oidc_relying_party" => json!({
+            "providers": [{
+                "issuer": "https://issuer.example.com",
+                "authorization_endpoint": "https://issuer.example.com/authorize",
+                "token_endpoint": "https://issuer.example.com/token",
+                "jwks_uri": "https://issuer.example.com/jwks",
+                "client_id": "ferrum-gateway",
+                "client_auth": {"method": "client_secret_basic", "client_secret": "secret"},
+                "scopes": ["openid", "profile"],
+                "redirect_uri": "https://app.example.com/oauth/callback",
+                "callback_path": "/oauth/callback",
+                "logout_path": "/oauth/logout"
+            }],
+            "session": {
+                "store": "cookie",
+                "encryption_secret": "01234567890123456789012345678901"
+            },
+            "behavior": {"trusted_redirect_hosts": ["app.example.com"]}
+        }),
         "udp_rate_limiting" => json!({"datagrams_per_second": 1000}),
         "serverless_function" => {
             json!({"provider": "azure_functions", "function_url": "https://example.com/func"})
@@ -123,8 +149,115 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
             "runtime_overlay_scope": "checkout"
         }),
         "udp_logging" => json!({"host": "127.0.0.1", "port": 9514}),
+        "statsd_logging" => json!({"host": "127.0.0.1", "port": 8125}),
+        "loki_logging" => json!({"endpoint_url": "http://localhost:3100/loki/api/v1/push"}),
         "kafka_logging" => json!({"broker_list": "localhost:9092", "topic": "test-logs"}),
         "request_deduplication" => json!({}),
+        "response_mock" => json!({"rules": [{"path": "/test", "body": "mock"}]}),
+        "openapi_validator" => json!({
+            "operations": [{
+                "method": "GET",
+                "path_template": "/health",
+                "path_regex": "^/health$",
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "type": "object"
+                            }
+                        }
+                    }
+                }
+            }]
+        }),
+        "ai_federation" => {
+            json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})
+        }
+        "ai_stream_router" => json!({
+            "providers": [{
+                "name": "test",
+                "provider_type": "openai",
+                "endpoint": "https://api.openai.com/v1/chat/completions",
+                "api_key": "sk-test",
+                "model_patterns": ["gpt-*"]
+            }]
+        }),
+        "mcp_gateway" => json!({
+            "mode": "transparent_proxy",
+            "endpoint": {"path": "/mcp"},
+            "servers": {
+                "tools": {
+                    "upstream_url": "http://mcp-gateway.example/mcp",
+                    "namespace": "tools"
+                }
+            }
+        }),
+        "a2a_gateway" => json!({
+            "mode": "transparent_proxy",
+            "endpoint": {
+                "path": "/a2a",
+                "agent_card_path": "/.well-known/agent-card.json",
+                "grpc_services": ["lf.a2a.v1.A2AService"]
+            }
+        }),
+        "ai_semantic_firewall" => json!({
+            "provider": {
+                "type": "openai_compatible_embeddings",
+                "endpoint": "http://127.0.0.1:9/v1/embeddings",
+                "request_timeout_ms": 100
+            }
+        }),
+        "ai_tool_governor" => json!({
+            "tools": { "github.create_pr": { "action": "allow" } }
+        }),
+        "ai_transcript_audit" => json!({
+            "sink": {"endpoint_url": "http://localhost:9200/audit"}
+        }),
+        "ldap_auth" => json!({
+            "ldap_url": "ldaps://ldap.example.com:636",
+            "bind_dn_template": "uid={username},ou=users,dc=example,dc=com"
+        }),
+        "spec_expose" => json!({"spec_url": "https://example.com/openapi.yaml"}),
+        "api_chargeback" => {
+            json!({"pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}]})
+        }
+        "api_chargeback_sink" => json!({
+            "clickhouse": {
+                "url": "http://127.0.0.1:8123",
+                "database": "default",
+                "table": "ferrum_charge_events"
+            },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.00001}],
+            "spool": {"enabled": false}
+        }),
+        "ai_response_guard" => json!({"pii_patterns": ["ssn"], "action": "reject"}),
+        "ai_request_guard" => json!({"max_messages": 100}),
+        "transaction_log_schema" => {
+            json!({"schemas": {"default": {"summary_type": "both"}}})
+        }
+        "mesh_route_dispatch" => json!({
+            "rules": [{
+                "match": {"methods": ["GET"]},
+                "destination": {"upstream_id": "canary"}
+            }]
+        }),
+        "mesh_outbound_registry" => {
+            json!({"registry": ["reviews.default.svc.cluster.local"]})
+        }
+        "opa" => json!({
+            "opa_host": "http://127.0.0.1:8181",
+            "policy_path": "ferrum/authz/allow"
+        }),
+        "proxy_alerts" => json!({
+            "channels": {
+                "ops": { "type": "slack", "webhook_url": "https://hooks.slack.com/x" }
+            },
+            "rules": [{
+                "name": "r", "type": "error_rate",
+                "status_codes": [500], "threshold_percent": 5.0,
+                "channels": ["ops"]
+            }]
+        }),
         _ => json!({}),
     }
 }
@@ -7757,4 +7890,113 @@ fn rejected_ai_semantic_cache_unknown_key_reload_retains_last_known_good() {
             "rejected candidate must retain the last-known-good ai_semantic_cache generation"
         );
     }
+}
+
+#[tokio::test]
+async fn grpc_web_global_shadowed_by_two_scoped_instances_unions_expose_headers_once() {
+    // Global grpc_web is replaced by same-named scoped instances; both scoped
+    // configs remain effective. Distinct priority_override values make the
+    // earlier instance (250) claim translation ownership while the later one
+    // (270) only unions expose_headers — body translation stays exactly once.
+    let global = make_plugin_config_with_json(
+        "grpc-web-global",
+        "grpc_web",
+        json!({"expose_headers": ["x-global-only"]}),
+        PluginScope::Global,
+        None,
+    );
+    let mut early = make_plugin_config_with_json(
+        "grpc-web-early",
+        "grpc_web",
+        json!({"expose_headers": ["x-early"]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    early.priority_override = Some(250);
+    let mut late = make_plugin_config_with_json(
+        "grpc-web-late",
+        "grpc_web",
+        json!({"expose_headers": ["x-late"]}),
+        PluginScope::Proxy,
+        Some("p1"),
+    );
+    late.priority_override = Some(270);
+
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["grpc-web-early", "grpc-web-late"],
+        )],
+        vec![global, early, late],
+    );
+    let cache = PluginCache::new(&config).expect("multi-instance grpc_web cache");
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let grpc_web_plugins: Vec<_> = plugins
+        .iter()
+        .filter(|plugin| plugin.name() == "grpc_web")
+        .cloned()
+        .collect();
+    assert_eq!(
+        grpc_web_plugins.len(),
+        2,
+        "scoped instances replace the global; both scoped remain"
+    );
+    assert!(grpc_web_plugins[0].priority() < grpc_web_plugins[1].priority());
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/svc.Method".to_string(),
+    );
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+    assert!(matches!(
+        run_request_received_chain(&grpc_web_plugins, &mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(ctx.metadata.contains_key("grpc_web.owner"));
+    assert_eq!(
+        ctx.metadata.get("grpc_web_mode").map(String::as_str),
+        Some("binary")
+    );
+
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+    assert!(matches!(
+        run_after_proxy_chain(&grpc_web_plugins, &mut ctx, &mut response_headers).await,
+        PluginResult::Continue
+    ));
+
+    let expose = response_headers
+        .get("access-control-expose-headers")
+        .expect("expose headers");
+    assert!(expose.contains("x-early"), "got {expose}");
+    assert!(expose.contains("x-late"), "got {expose}");
+    assert!(
+        !expose.contains("x-global-only"),
+        "shadowed global expose list must not apply: {expose}"
+    );
+
+    let mut body = Vec::new();
+    for plugin in &grpc_web_plugins {
+        if let Some(next) = plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                response_headers.get("content-type").map(String::as_str),
+                &response_headers,
+            )
+            .await
+        {
+            body = next;
+        }
+    }
+    assert_eq!(body[0], 0x80);
+    // Empty backend body → a single trailer frame (flag + 4-byte length + payload).
+    assert_eq!(body.iter().filter(|b| **b == 0x80).count(), 1);
+    assert!(body.len() >= 5);
 }

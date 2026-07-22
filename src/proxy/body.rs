@@ -366,6 +366,35 @@ impl http_body::Body for BufferedGrpcBody {
     }
 }
 
+/// Immediately-EOF body that never advertises an exact length.
+///
+/// Used for HTTP 205 responses so Hyper does not synthesize
+/// `Content-Length: 0` the way it does for ordinary empty `Full` bodies.
+struct EmptyUnknownLengthBody {
+    done: bool,
+}
+
+impl http_body::Body for EmptyUnknownLengthBody {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        self.done = true;
+        Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::new()
+    }
+}
+
 impl ProxyBody {
     /// Create a buffered body from bytes.
     pub fn full(data: impl Into<Bytes>) -> Self {
@@ -409,6 +438,23 @@ impl ProxyBody {
             success_on_drop_after_bytes: None,
             polled: AtomicBool::new(false),
             _held_frontend_grpc_upload: None,
+        }
+    }
+
+    /// Empty body for a finalized response status.
+    ///
+    /// Hyper's HTTP/1 server auto-inserts `Content-Length: 0` for empty
+    /// `is_end_stream()` bodies on every status except 204/304 (and 1xx /
+    /// successful CONNECT). RFC 9110 forbids content on 205 as well, and
+    /// Ferrum's synthetic contract strips `Content-Length` for 204/205/304.
+    /// For 205, use an immediately-EOF body with an unknown size hint so
+    /// Hyper frames with chunked TE (H1) or END_STREAM without synthesizing
+    /// `Content-Length` (H2) instead of advertising `Content-Length: 0`.
+    pub fn empty_for_response_status(status: u16) -> Self {
+        if status == 205 {
+            Self::streaming(Box::pin(EmptyUnknownLengthBody { done: false }))
+        } else {
+            Self::empty()
         }
     }
 

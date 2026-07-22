@@ -3415,6 +3415,93 @@ async fn optional_builtin_plugin_fields_match_runtime_and_openapi() {
     }
 }
 
+#[test]
+fn body_validator_grpc_max_decompressed_size_bytes_stays_in_openapi_docs_and_runtime() {
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let property = spec
+        .pointer(
+            "/components/schemas/BodyValidatorConfig/properties/grpc_max_decompressed_size_bytes",
+        )
+        .expect("BodyValidatorConfig must publish grpc_max_decompressed_size_bytes");
+    assert_eq!(property["type"], json!("integer"));
+    assert_eq!(property["format"], json!("uint64"));
+    assert_eq!(property["minimum"], json!(0));
+    assert!(
+        property.get("default").is_none(),
+        "environment-derived omission semantics cannot be represented by a static OpenAPI default"
+    );
+
+    let description = property["description"]
+        .as_str()
+        .expect("grpc_max_decompressed_size_bytes description");
+    for contract in [
+        "`0` disables the decompressed cap",
+        "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
+        "parses as an unsigned integer",
+        "10 MiB",
+        "request and response",
+        "No static OpenAPI default",
+    ] {
+        assert!(
+            description.contains(contract),
+            "BodyValidatorConfig.grpc_max_decompressed_size_bytes description missing `{contract}`"
+        );
+    }
+
+    assert_component_validity(
+        &spec,
+        "BodyValidatorConfig",
+        &json!({"grpc_max_decompressed_size_bytes": 0}),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "BodyValidatorConfig",
+        &json!({"grpc_max_decompressed_size_bytes": -1}),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "BodyValidatorConfig",
+        &json!({"grpc_max_decompressed_size_bytes": "10"}),
+        false,
+    );
+
+    let plugin_docs = include_str!("../../docs/plugins.md");
+    let docs = plugin_docs
+        .split("### `body_validator`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("body_validator docs section");
+    assert!(
+        docs.contains("`grpc_max_decompressed_size_bytes`"),
+        "docs/plugins.md body_validator section missing `grpc_max_decompressed_size_bytes`"
+    );
+    for contract in [
+        "`0` disables the decompressed cap",
+        "FERRUM_MAX_REQUEST_BODY_SIZE_BYTES",
+        "parses as an unsigned integer",
+        "10 MiB",
+        "request and response",
+    ] {
+        assert!(
+            docs.contains(contract),
+            "docs/plugins.md body_validator section missing `{contract}`"
+        );
+    }
+
+    let runtime = include_str!("../../src/plugins/body_validator.rs");
+    assert!(
+        runtime.contains("optional_usize(config, \"grpc_max_decompressed_size_bytes\")?"),
+        "runtime must keep accepting grpc_max_decompressed_size_bytes"
+    );
+    assert!(
+        runtime.contains("fn default_grpc_max_decompressed_size_bytes"),
+        "runtime must keep environment-derived omission fallback"
+    );
+}
+
 fn assert_component_validity(
     spec: &serde_json::Value,
     component: &str,
@@ -4493,12 +4580,20 @@ fn grpc_web_schema_matches_the_strict_runtime_shape() {
         "grpc_web docs must describe non-gRPC HTTP status synthesis"
     );
     assert!(
+        grpc_web_docs.contains("Multiple instances:"),
+        "grpc_web docs must describe multi-instance ownership and expose_headers union"
+    );
+    assert!(
         description.contains("HTTP-to-gRPC client mapping"),
         "GrpcWebConfig OpenAPI description must document status synthesis"
     );
     assert!(
         description.contains("not rewritten to 200"),
         "GrpcWebConfig OpenAPI description must document client-visible HTTP status contract"
+    );
+    assert!(
+        description.contains("Multiple effective instances"),
+        "GrpcWebConfig OpenAPI description must document multi-instance translation ownership"
     );
 }
 
@@ -7255,6 +7350,37 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(description.contains("WebSocket"));
     assert!(description.contains("frame stream"));
     assert!(
+        description.contains("204")
+            && description.contains("205")
+            && description.contains("304")
+            && description.contains("HEAD"),
+        "ResponseMockConfig must document HEAD/no-body wire constraints: {description}"
+    );
+    let status_desc = rule["properties"]["status_code"]["description"]
+        .as_str()
+        .expect("status_code description");
+    assert!(
+        status_desc.contains("informational") && status_desc.contains("rejected"),
+        "status_code must document informational rejection: {status_desc}"
+    );
+    assert!(
+        status_desc.contains("101") && status_desc.contains("200–599"),
+        "status_code must document 101 + final range: {status_desc}"
+    );
+    assert!(
+        status_desc.contains("ordinary HTTP request") && status_desc.contains("500"),
+        "status_code must document the non-WebSocket 101 failure: {status_desc}"
+    );
+    let body_desc = rule["properties"]["body"]["description"]
+        .as_str()
+        .expect("body description");
+    assert!(
+        body_desc.contains("HEAD")
+            && body_desc.contains("204")
+            && body_desc.contains("Content-Length"),
+        "body must document HEAD/no-body wire semantics: {body_desc}"
+    );
+    assert!(
         rule["properties"]["path"]["description"]
             .as_str()
             .expect("path description")
@@ -7274,7 +7400,7 @@ fn response_mock_schema_matches_strict_runtime_contract() {
             "rules": [{
                 "method": "GET",
                 "path": "/users",
-                "status_code": 100,
+                "status_code": 101,
                 "headers": {"x-mock": "true", "content-type": "text/plain"},
                 "body": "ok",
                 "delay_ms": 0
@@ -7285,6 +7411,13 @@ fn response_mock_schema_matches_strict_runtime_contract() {
                 "path": "/api/v1",
                 "status_code": 599,
                 "body": "exact-listen-path"
+            }]
+        }),
+        json!({
+            "rules": [{
+                "path": "/empty",
+                "status_code": 204,
+                "body": "must-not-be-sent"
             }]
         }),
     ] {
@@ -7306,6 +7439,8 @@ fn response_mock_schema_matches_strict_runtime_contract() {
         json!({"rules": [{"path": "", "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "method": "", "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 99, "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "status_code": 100, "body": "ok"}]}),
+        json!({"rules": [{"path": "/health", "status_code": 103, "body": "ok"}]}),
         json!({"rules": [{"path": "/health", "status_code": 600, "body": "ok"}]}),
         json!({"rules": [{"body": "missing-path"}]}),
         json!({"rules": []}),
@@ -7317,9 +7452,23 @@ fn response_mock_schema_matches_strict_runtime_contract() {
             }]
         }),
     ] {
+        // OpenAPI keeps minimum 100 / maximum 599; runtime rejects unsupported
+        // informational statuses (100, 102–199) as the authoritative boundary.
+        let runtime_err = ResponseMock::new(&invalid).is_err();
+        if invalid
+            .pointer("/rules/0/status_code")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|code| matches!(code, 100 | 103))
+        {
+            assert!(
+                runtime_err,
+                "informational status must fail runtime: {invalid}"
+            );
+            continue;
+        }
         assert_component_validity(&spec, "ResponseMockConfig", &invalid, false);
         assert!(
-            ResponseMock::new(&invalid).is_err(),
+            runtime_err,
             "schema-invalid config unexpectedly passed runtime: {invalid}"
         );
     }
@@ -7330,6 +7479,8 @@ fn response_mock_schema_matches_strict_runtime_contract() {
     assert!(guide.contains("WebSocket handshake contract"));
     assert!(guide.contains("never establishes an upgraded frame stream"));
     assert!(guide.contains("Unknown top-level and per-rule keys are rejected"));
+    assert!(guide.contains("Status / body wire semantics"));
+    assert!(guide.contains("informational statuses"));
 
     let matrix = include_str!("../../docs/plugin_execution_order.md");
     assert!(
@@ -7420,6 +7571,86 @@ fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
 }
 
 #[test]
+fn ai_semantic_cache_openapi_redis_key_prefix_matches_runtime_namespace_default() {
+    use ferrum_edge::config::types::DEFAULT_NAMESPACE;
+    use ferrum_edge::plugins::PluginHttpClient;
+    use ferrum_edge::plugins::ai_semantic_cache::AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX;
+    use ferrum_edge::plugins::utils::redis_rate_limiter::RedisConfig;
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let prop = spec
+        .pointer("/components/schemas/AiSemanticCacheConfig/properties/redis_key_prefix")
+        .expect("AiSemanticCacheConfig.redis_key_prefix exists");
+
+    // Namespace dependence cannot be expressed as a static OpenAPI default;
+    // advertising one previously caused schema-driven clients to send
+    // `ferrum:ai_semantic_cache` while omitted configs used `ferrum:ai_cache`.
+    assert!(
+        prop.get("default").is_none(),
+        "redis_key_prefix must not advertise a static OpenAPI default; got {:?}",
+        prop.get("default")
+    );
+
+    let description = prop["description"]
+        .as_str()
+        .expect("redis_key_prefix description");
+    assert!(
+        description.contains("{FERRUM_NAMESPACE}:ai_cache"),
+        "OpenAPI must document the namespace-derived runtime default"
+    );
+    assert!(
+        description.contains("ferrum:ai_cache"),
+        "OpenAPI must state the default-namespace example accurately"
+    );
+    assert!(
+        !description.contains("ai_semantic_cache"),
+        "stale OpenAPI prefix ferrum:ai_semantic_cache must not remain in the description"
+    );
+
+    let http_client = PluginHttpClient::default();
+    let namespace = http_client.namespace();
+    assert_eq!(namespace, DEFAULT_NAMESPACE);
+    assert_eq!(AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX, "ai_cache");
+    let expected_default = format!("{namespace}:{AI_SEMANTIC_CACHE_DEFAULT_REDIS_KEY_SUFFIX}");
+    assert_eq!(expected_default, "ferrum:ai_cache");
+
+    let redis = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0"
+        }),
+        &expected_default,
+    )
+    .expect("valid redis config")
+    .expect("redis mode enabled");
+    assert_eq!(
+        redis.key_prefix, expected_default,
+        "omitted redis_key_prefix must use the namespace-derived default"
+    );
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `ai_semantic_cache`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("ai_semantic_cache docs section");
+    assert!(
+        section.contains("`\"{FERRUM_NAMESPACE}:ai_cache\"`")
+            || section.contains("`{FERRUM_NAMESPACE}:ai_cache`"),
+        "docs/plugins.md must keep the namespace-derived redis_key_prefix default"
+    );
+    assert!(
+        section.contains("`ferrum:ai_cache`") || section.contains("ferrum:ai_cache"),
+        "docs/plugins.md must keep the default-namespace redis_key_prefix example"
+    );
+    assert!(
+        !section.contains("ferrum:ai_semantic_cache"),
+        "docs must not advertise the stale OpenAPI prefix"
+    );
+}
+
+#[test]
 fn api_chargeback_schema_closes_unknown_keys() {
     use ferrum_edge::plugins::api_chargeback::API_CHARGEBACK_CONFIG_KEYS;
 
@@ -7478,5 +7709,56 @@ fn api_chargeback_schema_closes_unknown_keys() {
     assert!(
         section.contains("bandwith_pricing") || section.contains("silently"),
         "docs/plugins.md api_chargeback section must warn about misspelled pricing dimensions"
+    );
+}
+
+#[test]
+fn ai_rate_limiter_token_limit_required_without_default_contract() {
+    use ferrum_edge::plugins::{PluginHttpClient, ai_rate_limiter::AiRateLimiter};
+
+    // Contract (#2263): `token_limit` is required at runtime and must not publish
+    // a misleading OpenAPI/docs default of 100000.
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let schema = spec
+        .pointer("/components/schemas/AiRateLimiterConfig")
+        .expect("AiRateLimiterConfig schema");
+
+    assert_eq!(schema["required"], json!(["token_limit"]));
+    assert!(
+        schema["properties"]["token_limit"].get("default").is_none(),
+        "token_limit must not publish a default — runtime requires the field"
+    );
+    let description = schema["properties"]["token_limit"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        description.to_ascii_lowercase().contains("required"),
+        "OpenAPI description must label token_limit as required: {description}"
+    );
+
+    let err = AiRateLimiter::new(&json!({}), PluginHttpClient::default())
+        .err()
+        .expect("empty ai_rate_limiter config must fail");
+    assert!(
+        err.contains("token_limit"),
+        "runtime must reject missing token_limit: {err}"
+    );
+    AiRateLimiter::new(&json!({"token_limit": 100000}), PluginHttpClient::default())
+        .expect("explicit token_limit must construct");
+
+    let guide = include_str!("../../docs/plugins.md");
+    let section = guide
+        .split("### `ai_rate_limiter`")
+        .nth(1)
+        .and_then(|rest| rest.split("\n### `").next())
+        .expect("ai_rate_limiter docs section");
+    assert!(
+        section.contains("| `token_limit` | Integer | *(required)* |"),
+        "docs must label token_limit as required"
+    );
+    assert!(
+        !section.contains("| `token_limit` | Integer | `100000` |"),
+        "docs must not claim a 100000 default for token_limit"
     );
 }

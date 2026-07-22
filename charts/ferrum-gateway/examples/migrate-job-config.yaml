@@ -1,0 +1,79 @@
+# Explicit migrate mode: persist an on-disk config file version migration.
+#
+# For FERRUM_MIGRATE_ACTION=config the Job needs a writable config path. This
+# example mounts a pre-staged writable PVC and migrates `/work/config.yaml` in
+# place. The result remains on the PVC after the Job exits; publish it through
+# your platform's normal volume workflow, then roll file-mode gateways to the
+# migrated content. A ConfigMap mount cannot be the output because it is
+# read-only, and an `emptyDir` would discard the only migrated copy with the
+# Pod.
+#
+# Prerequisite: create/populate a ReadWriteOnce PVC named
+# `ferrum-file-config-migration` with `config.yaml` at its root.
+#
+#   kubectl -n ferrum apply -f charts/ferrum-gateway/examples/migrate-job-config.yaml
+#   kubectl -n ferrum logs job/ferrum-migrate-config
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ferrum-migrate-config
+  namespace: ferrum
+  labels:
+    app.kubernetes.io/name: ferrum-gateway
+    app.kubernetes.io/component: migrate
+    ferrum.edge/migrate-action: config
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-gateway
+        app.kubernetes.io/component: migrate
+        ferrum.edge/migrate-action: config
+    spec:
+      restartPolicy: Never
+      serviceAccountName: default
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ferrum-edge
+          image: ferrumedge/ferrum-edge:0.9.0
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: FERRUM_MODE
+              value: migrate
+            - name: FERRUM_MIGRATE_ACTION
+              value: config
+            - name: FERRUM_FILE_CONFIG_PATH
+              value: /work/config.yaml
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: work
+              mountPath: /work
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: work
+          persistentVolumeClaim:
+            claimName: ferrum-file-config-migration

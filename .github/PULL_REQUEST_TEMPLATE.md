@@ -45,7 +45,7 @@ Fixes # (issue number)
 
 ## Checklist
 
-- [ ] I have read the [CONTRIBUTING.md](CONTRIBUTING.md) guide
+- [ ] I have read the [CONTRIBUTING.md](../CONTRIBUTING.md) guide
 - [ ] I have added tests that prove my fix is effective or that my feature works
 - [ ] I have updated the documentation accordingly (if applicable)
 - [ ] My changes don't introduce new clippy warnings

@@ -1,0 +1,79 @@
+# Explicit migrate mode: apply pending database schema migrations, then exit.
+#
+# Neither ferrum-gateway nor ferrum-mesh deploys FERRUM_MODE=migrate. Use this
+# Job as a pre-deploy / operator-controlled step. database and cp chart installs
+# still auto-apply pending core schema migrations on startup; this Job is for
+# explicit control (and pairs with status / dry-run examples).
+#
+# Prerequisites (same Secrets as examples/database-values.yaml):
+#   kubectl -n ferrum create secret generic ferrum-gateway-db \
+#     --from-literal=url='postgres://ferrum:<percent-encoded-pw>@postgres.ferrum.svc:5432/ferrum'
+#
+# Pin image.tag to the same tag as the gateway Deployment. Do not run overlapping
+# migrate-up Jobs against the same database.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ferrum-migrate-up
+  namespace: ferrum
+  labels:
+    app.kubernetes.io/name: ferrum-gateway
+    app.kubernetes.io/component: migrate
+    ferrum.edge/migrate-action: up
+spec:
+  backoffLimit: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ferrum-gateway
+        app.kubernetes.io/component: migrate
+        ferrum.edge/migrate-action: up
+    spec:
+      restartPolicy: Never
+      # Prefer the same ServiceAccount as the gateway Deployment when the Job
+      # needs matching IRSA / Workload Identity / imagePullSecrets.
+      serviceAccountName: default
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ferrum-edge
+          image: ferrumedge/ferrum-edge:0.9.0
+          imagePullPolicy: IfNotPresent
+          args: ["run"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          env:
+            - name: FERRUM_MODE
+              value: migrate
+            - name: FERRUM_MIGRATE_ACTION
+              value: up
+            - name: FERRUM_DB_TYPE
+              value: postgres
+            - name: FERRUM_DB_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ferrum-gateway-db
+                  key: url
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+      volumes:
+        - name: tmp
+          emptyDir: {}

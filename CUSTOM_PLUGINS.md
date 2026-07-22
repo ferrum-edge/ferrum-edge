@@ -306,10 +306,13 @@ matches and that proxy's `allowed_methods` check succeeds. At that point
 applicable global and proxy/proxy-group-scoped plugins. An unmatched request
 returns 404 without running any global or scoped `on_request_received` hook. A
 matched request with a disallowed method returns 405 without running either
-kind of hook. Native gRPC requests must also use `POST` before this hook runs.
+kind of ordinary request hook, but still emits one terminal transaction summary
+(`metadata.rejection_phase = "allowed_methods"`) from the protocol-filtered
+plugin-cache view. Native gRPC requests must also use `POST` before this hook runs.
 A matched non-POST native gRPC request is rejected before global or scoped
-hooks even when `allowed_methods` permits it. H1, H2, and H3 share these blind
-spots. Terminal transaction logging is separate; do not use this ordinary
+hooks even when `allowed_methods` permits it. H1, H2, and H3 share the
+ordinary-hook blind spots for unmatched 404 and gRPC non-POST admission.
+Terminal transaction logging is separate; do not use this ordinary
 request hook as a count of every connection or response the gateway handled.
 
 **`before_proxy` header parameter**: In `before_proxy`, always read request headers from the `headers` parameter, **not** from `ctx.headers`. The proxy handler avoids cloning the headers HashMap when no plugin modifies them — it moves headers out of `ctx.headers` into the `headers` parameter via `std::mem::take()`, leaving `ctx.headers` empty during the call. After `before_proxy` completes, headers are moved back. This means `ctx.headers.get("content-type")` returns `None` inside `before_proxy`, while `headers.get("content-type")` returns the actual value. If your plugin calls helper methods that need request headers, pass the `headers` parameter through rather than reading `ctx.headers` in the helper. This only affects `before_proxy` — other phases like `authenticate` and `on_request_received` can safely read `ctx.headers`.
@@ -1422,7 +1425,7 @@ rows until an operator drops them deliberately.
 See `custom_plugins/examples/example_audit_plugin.rs` (build with
 `FERRUM_CUSTOM_PLUGINS=example_audit_plugin`) for a full working example that
 demonstrates:
-- Multi-version migrations (V1: create table + indexes, V2: add composite index)
+- Multi-version migrations (V3: create table + indexes, V4: add composite index)
 - PostgreSQL overrides (including `DOUBLE PRECISION`)
 - MySQL overrides (`VARCHAR` sizing) with exact drop/recreate index reconciliation
 - Multi-statement SQL (CREATE TABLE + CREATE INDEX in one migration)

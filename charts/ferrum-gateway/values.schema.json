@@ -6,8 +6,8 @@
   "properties": {
     "mode": {
       "type": "string",
-      "description": "Core gateway operating mode. mesh/injector/node_agent live in the ferrum-mesh chart.",
-      "enum": ["database", "file", "cp", "dp"]
+      "description": "Known Ferrum binary mode. The chart renders database/file/cp/dp; template validation directs mesh/injector/node_agent to ferrum-mesh and migrate to the external pre-deploy Job workflow.",
+      "enum": ["database", "file", "cp", "dp", "mesh", "injector", "node_agent", "migrate"]
     },
     "replicaCount": {
       "type": "integer",

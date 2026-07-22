@@ -3,6 +3,8 @@
 # This chart deploys the Ferrum Edge binary in one of the CORE gateway operating
 # modes: database, file, cp (control plane), or dp (data plane). The mesh,
 # injector, and node_agent modes live in the separate `ferrum-mesh` chart.
+# Explicit `migrate` mode is NOT chart-deployed — use the external Job examples
+# under `examples/migrate-job-*.yaml` (see docs/kubernetes_deployment.md).
 #
 # Secrets (admin JWT, DB URL, CP/DP gRPC JWT) are NEVER generated or rendered
 # into ConfigMaps by this chart. Provide them as inline values (dev only) or,
@@ -14,7 +16,8 @@
 #   file     - read-only admin + proxy; config from a mounted YAML/JSON file
 #   cp       - read/write admin, no proxy; distributes config to DPs over gRPC
 #   dp       - read-only admin + proxy; pulls config from one or more CPs
-# Any other value (mesh/injector/node_agent/migrate) fails at template time.
+# mesh/injector/node_agent fail with a pointer to ferrum-mesh. migrate fails
+# with a pointer to the external Job examples (not another chart).
 # -----------------------------------------------------------------------------
 mode: file
 

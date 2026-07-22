@@ -9872,6 +9872,7 @@ async fn handle_websocket_request_authenticated(
         auth_method: ctx.auth_method,
         metadata: clone_log_metadata(&ctx),
         session_start: chrono::Utc::now(),
+        session_start_mono: Instant::now(),
     };
     tokio::spawn(async move {
         let _ws_lb_guard = ws_lb_guard;
@@ -11173,7 +11174,11 @@ pub struct WsSessionMeta {
     pub consumer_username: Option<String>,
     pub auth_method: Option<&'static str>,
     pub metadata: HashMap<String, String>,
+    /// Civil/UTC connect time for human-readable `timestamp_connected` only.
     pub session_start: chrono::DateTime<chrono::Utc>,
+    /// Process-monotonic connect instant used for `duration_ms`. Wall-clock
+    /// corrections must not freeze, clamp, or inflate WebSocket session duration.
+    pub session_start_mono: Instant,
 }
 
 /// Fire `on_ws_disconnect` for the tunnel-mode path, where raw
@@ -11205,10 +11210,8 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
     if ws_disconnect_plugins.is_empty() {
         return;
     }
+    let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
     let disconnected_at = chrono::Utc::now();
-    let disconnect_duration_ms = (disconnected_at - session_meta.session_start)
-        .num_milliseconds()
-        .max(0) as f64;
     let disconnect_ctx = crate::plugins::WsDisconnectContext {
         namespace: session_meta.namespace.clone(),
         proxy_id: proxy_id.to_string(),
@@ -11229,6 +11232,59 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         consumer_username: session_meta.consumer_username.clone(),
         auth_method: session_meta.auth_method,
         metadata: session_meta.metadata.clone(),
+    };
+    for plugin in ws_disconnect_plugins {
+        plugin.on_ws_disconnect(&disconnect_ctx).await;
+    }
+}
+
+/// Fire `on_ws_disconnect` for the framed (parsed) WebSocket path.
+///
+/// Unlike tunnel mode, framed mode reports real frame counters. Duration still
+/// comes from `session_start_mono` (`Instant`); wall `session_start` is only
+/// used for `timestamp_connected` rendering. Takes `session_meta` by value
+/// because the framed relay consumes it at teardown.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn fire_ws_framed_disconnect_hooks(
+    ws_disconnect_plugins: &[Arc<dyn Plugin>],
+    proxy_id: &str,
+    session_meta: WsSessionMeta,
+    frames_client_to_backend: u64,
+    frames_backend_to_client: u64,
+    bytes_client_to_backend: u64,
+    bytes_backend_to_client: u64,
+    failure: Option<(
+        crate::plugins::Direction,
+        retry::ErrorClass,
+        Option<tcp_proxy::StreamIoSide>,
+    )>,
+) {
+    if ws_disconnect_plugins.is_empty() {
+        return;
+    }
+    let disconnect_duration_ms = session_meta.session_start_mono.elapsed().as_millis() as f64;
+    let disconnected_at = chrono::Utc::now();
+    let disconnect_ctx = crate::plugins::WsDisconnectContext {
+        namespace: session_meta.namespace,
+        proxy_id: proxy_id.to_string(),
+        proxy_name: session_meta.proxy_name,
+        client_ip: session_meta.client_ip,
+        backend_target: session_meta.backend_target,
+        listen_port: session_meta.listen_port,
+        duration_ms: disconnect_duration_ms,
+        frames_client_to_backend,
+        frames_backend_to_client,
+        bytes_client_to_backend,
+        bytes_backend_to_client,
+        timestamp_connected: session_meta.session_start.to_rfc3339(),
+        timestamp_disconnected: disconnected_at.to_rfc3339(),
+        direction: failure.as_ref().map(|(d, _, _)| *d),
+        io_side: failure.as_ref().and_then(|(_, _, side)| *side),
+        error_class: failure.map(|(_, c, _)| c),
+        consumer_username: session_meta.consumer_username,
+        auth_method: session_meta.auth_method,
+        metadata: session_meta.metadata,
     };
     for plugin in ws_disconnect_plugins {
         plugin.on_ws_disconnect(&disconnect_ctx).await;
@@ -12428,37 +12484,17 @@ where
     // have wound down. When no plugin opted in the list is empty and we skip
     // the whole block — zero overhead for deployments that don't observe
     // WebSocket sessions.
-    if !ws_disconnect_plugins.is_empty() {
-        let disconnected_at = chrono::Utc::now();
-        let disconnect_duration_ms = (disconnected_at - session_meta.session_start)
-            .num_milliseconds()
-            .max(0) as f64;
-        let failure = first_failure.get().cloned();
-        let disconnect_ctx = crate::plugins::WsDisconnectContext {
-            namespace: session_meta.namespace,
-            proxy_id: proxy_id.to_string(),
-            proxy_name: session_meta.proxy_name,
-            client_ip: session_meta.client_ip,
-            backend_target: session_meta.backend_target,
-            listen_port: session_meta.listen_port,
-            duration_ms: disconnect_duration_ms,
-            frames_client_to_backend: frames_c2b.load(Ordering::Relaxed),
-            frames_backend_to_client: frames_b2c.load(Ordering::Relaxed),
-            bytes_client_to_backend: bytes_c2b.load(Ordering::Relaxed),
-            bytes_backend_to_client: bytes_b2c.load(Ordering::Relaxed),
-            timestamp_connected: session_meta.session_start.to_rfc3339(),
-            timestamp_disconnected: disconnected_at.to_rfc3339(),
-            direction: failure.as_ref().map(|(d, _, _)| *d),
-            io_side: failure.as_ref().and_then(|(_, _, side)| *side),
-            error_class: failure.map(|(_, c, _)| c),
-            consumer_username: session_meta.consumer_username,
-            auth_method: session_meta.auth_method,
-            metadata: session_meta.metadata,
-        };
-        for plugin in &ws_disconnect_plugins {
-            plugin.on_ws_disconnect(&disconnect_ctx).await;
-        }
-    }
+    fire_ws_framed_disconnect_hooks(
+        &ws_disconnect_plugins,
+        proxy_id,
+        session_meta,
+        frames_c2b.load(Ordering::Relaxed),
+        frames_b2c.load(Ordering::Relaxed),
+        bytes_c2b.load(Ordering::Relaxed),
+        bytes_b2c.load(Ordering::Relaxed),
+        first_failure.get().cloned(),
+    )
+    .await;
 
     debug!("WebSocket proxy connection closed for {}", proxy_id);
     Ok(())
@@ -13990,7 +14026,7 @@ pub async fn log_rejected_request(
     rejection_phase: &str,
     plugin_execution_ns: u64,
 ) {
-    log_rejected_request_with_path(
+    log_rejected_request_with_path_and_backend_state(
         plugins,
         ctx,
         status_code,
@@ -13998,6 +14034,33 @@ pub async fn log_rejected_request(
         rejection_phase,
         plugin_execution_ns,
         None,
+        true,
+    )
+    .await;
+}
+
+/// Run logging plugins for a rejection that occurred before backend contact.
+///
+/// The summary retains matched-proxy attribution but deliberately omits
+/// `backend_target`: configuration identifies where a request might have gone,
+/// not a destination that Ferrum actually contacted.
+pub async fn log_pre_backend_rejected_request(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &str,
+    plugin_execution_ns: u64,
+) {
+    log_rejected_request_with_path_and_backend_state(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        None,
+        false,
     )
     .await;
 }
@@ -14017,6 +14080,30 @@ pub(crate) async fn log_rejected_request_with_path(
     rejection_phase: &str,
     plugin_execution_ns: u64,
     request_path_override: Option<&str>,
+) {
+    log_rejected_request_with_path_and_backend_state(
+        plugins,
+        ctx,
+        status_code,
+        start_time,
+        rejection_phase,
+        plugin_execution_ns,
+        request_path_override,
+        true,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn log_rejected_request_with_path_and_backend_state(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+    status_code: u16,
+    start_time: Instant,
+    rejection_phase: &str,
+    plugin_execution_ns: u64,
+    request_path_override: Option<&str>,
+    include_backend_target: bool,
 ) {
     if plugins.is_empty() {
         return;
@@ -14066,15 +14153,19 @@ pub(crate) async fn log_rejected_request_with_path(
             .unwrap_or_else(|| ctx.path.clone()),
         proxy_id: proxy.map(|p| p.id.clone()),
         proxy_name: proxy.and_then(|p| p.name.clone()),
-        backend_target: proxy.map(|p| {
-            // Host-only proxies (listen_path None) have no prefix to strip.
-            // `ctx.path` is intentionally used here (not the override) because
-            // `backend_target` should reflect the rewritten path that would
-            // have been sent to the backend.
-            let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
-            let url = build_backend_url(p, &ctx.path, "", strip_len);
-            strip_query_params(&url).to_string()
-        }),
+        backend_target: if include_backend_target {
+            proxy.map(|p| {
+                // Host-only proxies (listen_path None) have no prefix to strip.
+                // `ctx.path` is intentionally used here (not the override) because
+                // `backend_target` should reflect the rewritten path that would
+                // have been sent to the backend.
+                let strip_len = p.listen_path.as_deref().map(str::len).unwrap_or(0);
+                let url = build_backend_url(p, &ctx.path, "", strip_len);
+                strip_query_params(&url).to_string()
+            })
+        } else {
+            None
+        },
         response_status_code: status_code,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: total_ms,
@@ -15393,7 +15484,10 @@ fn build_response_from_normalized_reject(reject: NormalizedRejectResponse) -> Re
     );
 
     let body = if reject.body.is_empty() {
-        ProxyBody::empty()
+        // Status-aware empty body: 205 must not advertise Content-Length on H1
+        // (Hyper would otherwise synthesize `Content-Length: 0` for ordinary
+        // empty Full bodies; 204/304 are already special-cased upstream).
+        ProxyBody::empty_for_response_status(reject.http_status.as_u16())
     } else {
         ProxyBody::full(Bytes::from(reject.body))
     };
@@ -18323,7 +18417,10 @@ async fn handle_proxy_request_inner(
         .get_initial_response_header_policy_plugins(&proxy.id, request_protocol);
     let is_grpc_request = request_protocol == ProxyProtocol::Grpc;
 
-    // Per-proxy HTTP method filtering (checked before plugins to save work)
+    // Per-proxy HTTP method filtering (checked before plugins to save work).
+    // Ordinary request hooks stay skipped, but terminal transaction logging
+    // still runs from the protocol-filtered plugin-cache view so sinks can
+    // attribute the matched-proxy 405.
     if let Some(ref allowed) = proxy.allowed_methods
         && !allowed.iter().any(|m| m.eq_ignore_ascii_case(&method))
     {
@@ -18343,10 +18440,28 @@ async fn handle_proxy_request_inner(
             initial_response_header_policy_plugins.as_ref(),
         );
         restore_authoritative_allow_header(&mut reject.headers, &allow_header);
+        // Empty plugin list: do not run after_proxy / request hooks merely to
+        // shape the response. Logging uses a separate immutable cache view.
         let grpc_web_response =
             build_grpc_web_reject_response(&[], &mut ctx, grpc_web_response_content_type, &reject)
                 .await;
-        record_status(&state, reject.http_status.as_u16());
+        // Metrics and transaction logs keep the admission status (405) even when
+        // native gRPC reshapes the client-visible HTTP status to trailers-only
+        // 200 + grpc-status.
+        record_status(&state, StatusCode::METHOD_NOT_ALLOWED.as_u16());
+        let logging_plugins = epoch
+            .plugin_cache
+            .request_view(&proxy.id, request_protocol)
+            .plugins();
+        log_pre_backend_rejected_request(
+            &logging_plugins,
+            &ctx,
+            StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+            start_time,
+            "allowed_methods",
+            0,
+        )
+        .await;
         if let Some(response) = grpc_web_response {
             return Ok(response);
         }
