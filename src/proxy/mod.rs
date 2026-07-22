@@ -15411,9 +15411,7 @@ pub(crate) fn normalize_reject_response(
     if !is_grpc_request || grpc_web_accept_rejected {
         let mut normalized_headers = headers
             .iter()
-            .filter(|(name, _)| {
-                !crate::plugins::grpc_web::is_internal_grpc_web_bridge_header(name)
-            })
+            .filter(|(name, _)| !crate::plugins::grpc_web::is_internal_grpc_web_bridge_header(name))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<HashMap<_, _>>();
         normalized_headers

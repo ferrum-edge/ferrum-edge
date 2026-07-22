@@ -10581,8 +10581,7 @@ async fn send_h3_grpc_web_reject_with_recv_halt(
     // H1/H2 `normalize_reject_response`. Do not rewrite them into a gRPC-Web
     // trailer-frame response with HTTP 200.
     if crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers) {
-        let normalized =
-            crate::proxy::normalize_reject_response(http_status, body, headers, true);
+        let normalized = crate::proxy::normalize_reject_response(http_status, body, headers, true);
         return send_h3_finalized_reject_response_with_recv_halt(
             stream,
             normalized.http_status,
@@ -10691,38 +10690,37 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
     // `adopt_gateway_rejection` rather than restarting provenance.
     ctx.begin_rejection_deadline_response_header_provenance(headers);
 
-    let (committed_status, committed_headers, committed_body) = if let Some(content_type) =
-        grpc_web_response_content_type
-    {
-        // Keep Accept negotiation 406s on the HTTP/JSON wire contract for
-        // committed observers (chargeback, exporters), matching the sender.
-        if crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers) {
-            let normalized =
-                crate::proxy::normalize_reject_response(http_status, body, headers, true);
-            (normalized.http_status, normalized.headers, normalized.body)
+    let (committed_status, committed_headers, committed_body) =
+        if let Some(content_type) = grpc_web_response_content_type {
+            // Keep Accept negotiation 406s on the HTTP/JSON wire contract for
+            // committed observers (chargeback, exporters), matching the sender.
+            if crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers) {
+                let normalized =
+                    crate::proxy::normalize_reject_response(http_status, body, headers, true);
+                (normalized.http_status, normalized.headers, normalized.body)
+            } else {
+                let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, body, headers);
+                let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
+                    content_type,
+                    grpc_status,
+                    grpc_message.as_ref(),
+                );
+                crate::proxy::finalize_grpc_web_error_response_headers(
+                    &mut translated,
+                    &[],
+                    Some(headers),
+                );
+                (StatusCode::OK, translated.headers, translated.body)
+            }
         } else {
-            let (grpc_status, grpc_message) = h3_grpc_reject_signal(http_status, body, headers);
-            let mut translated = crate::plugins::grpc_web::error_response_for_content_type(
-                content_type,
-                grpc_status,
-                grpc_message.as_ref(),
+            let normalized = crate::proxy::normalize_reject_response(
+                http_status,
+                body,
+                headers,
+                matches!(flavor, HttpFlavor::Grpc),
             );
-            crate::proxy::finalize_grpc_web_error_response_headers(
-                &mut translated,
-                &[],
-                Some(headers),
-            );
-            (StatusCode::OK, translated.headers, translated.body)
-        }
-    } else {
-        let normalized = crate::proxy::normalize_reject_response(
-            http_status,
-            body,
-            headers,
-            matches!(flavor, HttpFlavor::Grpc),
-        );
-        (normalized.http_status, normalized.headers, normalized.body)
-    };
+            (normalized.http_status, normalized.headers, normalized.body)
+        };
 
     for (index, plugin) in plugins.iter().enumerate() {
         if !plugin.requires_response_committed_hook() {
