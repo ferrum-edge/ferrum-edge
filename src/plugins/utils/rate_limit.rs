@@ -2543,14 +2543,14 @@ mod tests {
         let http_client = http_client_with_shards("ferrum", 256);
         let backend: RateLimitBackend<String, TestAlgorithm> =
             RateLimitBackend::from_plugin_config(
-            "rate_limiting",
-            &json!({"sync_mode": "local"}),
-            &http_client,
-            TestAlgorithm {
-                redis_ok: Arc::new(AtomicBool::new(true)),
-            },
-        )
-        .expect("local backend constructs");
+                "rate_limiting",
+                &json!({"sync_mode": "local"}),
+                &http_client,
+                TestAlgorithm {
+                    redis_ok: Arc::new(AtomicBool::new(true)),
+                },
+            )
+            .expect("local backend constructs");
 
         assert!(matches!(backend, RateLimitBackend::Local(_)));
         assert_eq!(backend.local_map_shard_amount(), 256);
@@ -2565,17 +2565,17 @@ mod tests {
         let http_client = http_client_with_shards("ferrum", 128);
         let backend: RateLimitBackend<String, TestAlgorithm> =
             RateLimitBackend::from_plugin_config(
-            "rate_limiting",
-            &json!({
-                "sync_mode": "redis",
-                "redis_url": "redis://127.0.0.1:6379/0",
-            }),
-            &http_client,
-            TestAlgorithm {
-                redis_ok: Arc::new(AtomicBool::new(true)),
-            },
-        )
-        .expect("redis failover backend constructs");
+                "rate_limiting",
+                &json!({
+                    "sync_mode": "redis",
+                    "redis_url": "redis://127.0.0.1:6379/0",
+                }),
+                &http_client,
+                TestAlgorithm {
+                    redis_ok: Arc::new(AtomicBool::new(true)),
+                },
+            )
+            .expect("redis failover backend constructs");
 
         assert!(matches!(backend, RateLimitBackend::Failover(_)));
         assert_eq!(backend.local_map_shard_amount(), 128);
@@ -2592,8 +2592,7 @@ mod tests {
         assert_eq!(expected, 128);
         assert_eq!(http_client.pool_shard_amount(), expected);
 
-        let local: RateLimitBackend<String, TestAlgorithm> =
-            RateLimitBackend::from_plugin_config(
+        let local: RateLimitBackend<String, TestAlgorithm> = RateLimitBackend::from_plugin_config(
             "rate_limiting",
             &json!({}),
             &http_client,
@@ -2604,17 +2603,17 @@ mod tests {
         .expect("local backend constructs");
         let failover: RateLimitBackend<String, TestAlgorithm> =
             RateLimitBackend::from_plugin_config(
-            "rate_limiting",
-            &json!({
-                "sync_mode": "redis",
-                "redis_url": "redis://127.0.0.1:6379/0",
-            }),
-            &http_client,
-            TestAlgorithm {
-                redis_ok: Arc::new(AtomicBool::new(true)),
-            },
-        )
-        .expect("redis failover backend constructs");
+                "rate_limiting",
+                &json!({
+                    "sync_mode": "redis",
+                    "redis_url": "redis://127.0.0.1:6379/0",
+                }),
+                &http_client,
+                TestAlgorithm {
+                    redis_ok: Arc::new(AtomicBool::new(true)),
+                },
+            )
+            .expect("redis failover backend constructs");
 
         assert_eq!(local.local_map_shard_amount(), expected);
         assert_eq!(failover.local_map_shard_amount(), expected);
@@ -2628,14 +2627,14 @@ mod tests {
 
         let backend: RateLimitBackend<String, TestAlgorithm> =
             RateLimitBackend::from_plugin_config(
-            "rate_limiting",
-            &json!({"sync_mode": "local"}),
-            &http_client,
-            TestAlgorithm {
-                redis_ok: Arc::new(AtomicBool::new(true)),
-            },
-        )
-        .expect("local backend constructs");
+                "rate_limiting",
+                &json!({"sync_mode": "local"}),
+                &http_client,
+                TestAlgorithm {
+                    redis_ok: Arc::new(AtomicBool::new(true)),
+                },
+            )
+            .expect("local backend constructs");
 
         assert_eq!(backend.local_map_shard_amount(), expected);
     }
