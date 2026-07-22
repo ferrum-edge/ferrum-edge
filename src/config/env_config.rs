@@ -2087,11 +2087,13 @@ pub struct EnvConfig {
     /// Default: 10000.
     pub circuit_breaker_cache_max_entries: usize,
     /// DashMap shard count for hot pool/cache maps (HTTP/H2/gRPC connection
-    /// pools, DNS cache, per-IP request counters, router prefix/regex
-    /// caches). DashMap defaults to `4 * num_cpus`, which is fine for small
-    /// maps but starves on write contention at high cardinality (1K+ unique
-    /// pool keys, distinct DNS hosts, distinct client IPs). Higher shard
-    /// counts give concurrent inserts more independent locks.
+    /// pools, DNS cache, per-IP request counters, TCP connection-throttle
+    /// counters, router prefix/regex caches, and shared local/Redis-fallback
+    /// rate-limiter token-state maps). DashMap defaults to `4 * num_cpus`,
+    /// which is fine for small maps but starves on write contention at high
+    /// cardinality (1K+ unique pool keys, distinct DNS hosts, distinct
+    /// client IPs). Higher shard counts give concurrent inserts more
+    /// independent locks.
     ///
     /// Resolution: `0` (default) auto-derives `next_power_of_two(max(64,
     /// num_cpus * 16))` — 64 on small dev hosts, 256 on a 16-core box,

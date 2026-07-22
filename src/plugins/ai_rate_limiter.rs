@@ -255,6 +255,12 @@ impl AiRateLimiter {
         })
     }
 
+    /// Local/fallback DashMap shard count. Test-only; not a production API.
+    #[cfg(test)]
+    pub(crate) fn local_map_shard_amount(&self) -> usize {
+        self.limiter.local_map_shard_amount()
+    }
+
     fn rate_key(&self, ctx: &RequestContext) -> String {
         if self.limit_by == "consumer"
             && let Some(identity) = ctx.effective_identity()

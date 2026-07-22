@@ -77,6 +77,12 @@ impl WsRateLimiting {
         })
     }
 
+    /// Local/fallback DashMap shard count. Test-only; not a production API.
+    #[cfg(test)]
+    pub(crate) fn local_map_shard_amount(&self) -> usize {
+        self.limiter.local_map_shard_amount()
+    }
+
     pub(crate) fn redis_connection_scope_key(&self, proxy_id: &str, connection_id: u64) -> String {
         let mut key = String::with_capacity(self.redis_instance_id.len() + proxy_id.len() + 22);
         key.push_str(&self.redis_instance_id);

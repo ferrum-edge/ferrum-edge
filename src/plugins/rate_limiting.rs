@@ -66,6 +66,12 @@ impl RateLimiting {
         })
     }
 
+    /// Local/fallback DashMap shard count. Test-only; not a production API.
+    #[cfg(test)]
+    pub(crate) fn local_map_shard_amount(&self) -> usize {
+        self.limiter.local_map_shard_amount()
+    }
+
     fn maybe_evict_stale_entries(&self) {
         let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
         if !request.is_multiple_of(EVICTION_CHECK_INTERVAL_REQUESTS) {

@@ -123,10 +123,16 @@ where
     K: Eq + Hash + Clone,
     A: RateLimitAlgorithm,
 {
-    pub fn new(algorithm: A) -> Self {
+    /// Build a local limiter whose hot-path state map uses `shard_amount`.
+    ///
+    /// Callers must pass an already-normalized effective shard count (for
+    /// example [`PluginHttpClient::pool_shard_amount`]). This constructor does
+    /// not re-normalize so `FERRUM_POOL_SHARD_AMOUNT` zero/explicit behavior is
+    /// applied exactly once at the HTTP-client boundary.
+    pub fn new(algorithm: A, shard_amount: usize) -> Self {
         Self {
             algorithm,
-            state: DashMap::new(),
+            state: DashMap::with_shard_amount(shard_amount),
         }
     }
 
@@ -180,6 +186,14 @@ where
 
     pub fn contains_key(&self, key: &K) -> bool {
         self.state.contains_key(key)
+    }
+
+    /// DashMap shard count for the local token-state map. Test-only so
+    /// production builds do not expose limiter debug state.
+    #[cfg(test)]
+    pub fn shard_amount(&self) -> usize {
+        use dashmap::Map;
+        self.state._shard_count()
     }
 }
 
@@ -372,7 +386,10 @@ where
         http_client: &PluginHttpClient,
         algorithm: A,
     ) -> Result<Self, String> {
-        let local = LocalLimiter::new(algorithm.clone());
+        // Normalize once via PluginHttpClient so local-only and Redis-fallback
+        // maps share the same effective FERRUM_POOL_SHARD_AMOUNT.
+        let shard_amount = http_client.pool_shard_amount();
+        let local = LocalLimiter::new(algorithm.clone(), shard_amount);
         match RedisLimiter::new(plugin_name, config, http_client, algorithm) {
             Ok(Some(redis)) => Ok(Self::Failover(FailoverLimiter::new(
                 plugin_name,
@@ -381,6 +398,16 @@ where
             ))),
             Ok(None) => Ok(Self::Local(local)),
             Err(err) => Err(err),
+        }
+    }
+
+    /// Shard count of the local-only map or Redis-fallback map. Test-only so
+    /// production builds do not expose limiter debug state.
+    #[cfg(test)]
+    pub fn local_map_shard_amount(&self) -> usize {
+        match self {
+            Self::Local(local) => local.shard_amount(),
+            Self::Failover(failover) => failover.fallback.shard_amount(),
         }
     }
 
@@ -1769,6 +1796,10 @@ mod tests {
     }
 
     fn namespaced_http_client(namespace: &str) -> PluginHttpClient {
+        http_client_with_shards(namespace, 0)
+    }
+
+    fn http_client_with_shards(namespace: &str, pool_shard_amount: usize) -> PluginHttpClient {
         PluginHttpClient::new(
             &PoolConfig::default(),
             DnsCache::new(DnsConfig::default()),
@@ -1781,7 +1812,7 @@ mod tests {
             namespace,
             crate::config::BackendEgressPolicy::unrestricted(),
             std::sync::Arc::new(Vec::new()),
-            0,
+            pool_shard_amount,
         )
     }
 
@@ -2411,10 +2442,13 @@ mod tests {
 
     #[tokio::test]
     async fn local_http_limiter_denies_after_limit() {
-        let limiter = LocalLimiter::new(HttpRateLimitAlgorithm::new(vec![RateLimitWindowSpec {
-            limit: 2,
-            duration: Duration::from_secs(60),
-        }]));
+        let limiter = LocalLimiter::new(
+            HttpRateLimitAlgorithm::new(vec![RateLimitWindowSpec {
+                limit: 2,
+                duration: Duration::from_secs(60),
+            }]),
+            crate::util::sharding::pool_shard_amount(0),
+        );
         let op = RequestUnit;
 
         assert!(limiter.check("ip:1".to_string(), &op).allowed);
@@ -2427,9 +2461,12 @@ mod tests {
 
     #[test]
     fn local_limiter_enforce_capacity_removes_excess_entries() {
-        let limiter = LocalLimiter::new(TestAlgorithm {
-            redis_ok: Arc::new(AtomicBool::new(true)),
-        });
+        let limiter = LocalLimiter::new(
+            TestAlgorithm {
+                redis_ok: Arc::new(AtomicBool::new(true)),
+            },
+            crate::util::sharding::pool_shard_amount(0),
+        );
         let op = TestOp;
 
         for idx in 0..5 {
@@ -2448,7 +2485,10 @@ mod tests {
         let algorithm = TestAlgorithm {
             redis_ok: Arc::new(AtomicBool::new(true)),
         };
-        let local: LocalLimiter<String, TestAlgorithm> = LocalLimiter::new(algorithm.clone());
+        let local: LocalLimiter<String, TestAlgorithm> = LocalLimiter::new(
+            algorithm.clone(),
+            http_client.pool_shard_amount(),
+        );
         let redis = test_redis_limiter(&http_client, algorithm);
 
         let _limiter = FailoverLimiter::new("rate_limiting", redis, local);
@@ -2461,7 +2501,7 @@ mod tests {
         let algorithm = TestAlgorithm {
             redis_ok: Arc::clone(&redis_ok),
         };
-        let local = LocalLimiter::new(algorithm.clone());
+        let local = LocalLimiter::new(algorithm.clone(), http_client.pool_shard_amount());
         let redis = test_redis_limiter(&http_client, algorithm);
         let limiter = FailoverLimiter::new("rate_limiting", redis, local);
         let op = TestOp;
@@ -2498,5 +2538,251 @@ mod tests {
 
         assert_eq!(default.key_prefix(), "ferrum:rate_limiting");
         assert_eq!(tenant.key_prefix(), "tenant-a:rate_limiting");
+    }
+
+    #[test]
+    fn from_plugin_config_local_backend_honors_explicit_http_client_shard_amount() {
+        let http_client = http_client_with_shards("ferrum", 256);
+        let backend = RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({"sync_mode": "local"}),
+            &http_client,
+            TestAlgorithm {
+                redis_ok: Arc::new(AtomicBool::new(true)),
+            },
+        )
+        .expect("local backend constructs");
+
+        assert!(matches!(backend, RateLimitBackend::Local(_)));
+        assert_eq!(backend.local_map_shard_amount(), 256);
+        assert_eq!(
+            backend.local_map_shard_amount(),
+            http_client.pool_shard_amount()
+        );
+    }
+
+    #[test]
+    fn from_plugin_config_redis_fallback_honors_explicit_http_client_shard_amount() {
+        let http_client = http_client_with_shards("ferrum", 128);
+        let backend = RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0",
+            }),
+            &http_client,
+            TestAlgorithm {
+                redis_ok: Arc::new(AtomicBool::new(true)),
+            },
+        )
+        .expect("redis failover backend constructs");
+
+        assert!(matches!(backend, RateLimitBackend::Failover(_)));
+        assert_eq!(backend.local_map_shard_amount(), 128);
+        assert_eq!(
+            backend.local_map_shard_amount(),
+            http_client.pool_shard_amount()
+        );
+    }
+
+    #[test]
+    fn from_plugin_config_normalizes_non_power_of_two_shard_override_once() {
+        let http_client = http_client_with_shards("ferrum", 100);
+        let expected = crate::util::sharding::pool_shard_amount(100);
+        assert_eq!(expected, 128);
+        assert_eq!(http_client.pool_shard_amount(), expected);
+
+        let local = RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({}),
+            &http_client,
+            TestAlgorithm {
+                redis_ok: Arc::new(AtomicBool::new(true)),
+            },
+        )
+        .expect("local backend constructs");
+        let failover = RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0",
+            }),
+            &http_client,
+            TestAlgorithm {
+                redis_ok: Arc::new(AtomicBool::new(true)),
+            },
+        )
+        .expect("redis failover backend constructs");
+
+        assert_eq!(local.local_map_shard_amount(), expected);
+        assert_eq!(failover.local_map_shard_amount(), expected);
+    }
+
+    #[test]
+    fn from_plugin_config_zero_shard_override_keeps_auto_behavior() {
+        let http_client = http_client_with_shards("ferrum", 0);
+        let expected = crate::util::sharding::pool_shard_amount(0);
+        assert_eq!(http_client.pool_shard_amount(), expected);
+
+        let backend = RateLimitBackend::from_plugin_config(
+            "rate_limiting",
+            &json!({"sync_mode": "local"}),
+            &http_client,
+            TestAlgorithm {
+                redis_ok: Arc::new(AtomicBool::new(true)),
+            },
+        )
+        .expect("local backend constructs");
+
+        assert_eq!(backend.local_map_shard_amount(), expected);
+    }
+
+    #[test]
+    fn shared_limiter_consumers_honor_explicit_http_client_shard_amount() {
+        let http_client = http_client_with_shards("ferrum", 256);
+        let expected = http_client.pool_shard_amount();
+        assert_eq!(expected, 256);
+
+        let rate_limiting = crate::plugins::rate_limiting::RateLimiting::new(
+            &json!({
+                "limits": [{
+                    "scope": "default",
+                    "window_seconds": 60,
+                    "max_requests": 10
+                }]
+            }),
+            http_client.clone(),
+        )
+        .expect("rate_limiting constructs");
+        assert_eq!(rate_limiting.local_map_shard_amount(), expected);
+
+        let ai = crate::plugins::ai_rate_limiter::AiRateLimiter::new(
+            &json!({"token_limit": 1000, "window_seconds": 60}),
+            http_client.clone(),
+        )
+        .expect("ai_rate_limiter constructs");
+        assert_eq!(ai.local_map_shard_amount(), expected);
+
+        let graphql = crate::plugins::graphql::GraphqlPlugin::new(
+            &json!({
+                "type_rate_limits": {
+                    "query": {"max_requests": 10, "window_seconds": 60}
+                }
+            }),
+            http_client.clone(),
+        )
+        .expect("graphql constructs");
+        assert_eq!(graphql.local_map_shard_amount(), expected);
+
+        let grpc = crate::plugins::grpc_method_router::GrpcMethodRouter::new(
+            &json!({
+                "method_rate_limits": {
+                    "/pkg.Svc/Method": {"max_requests": 10, "window_seconds": 60}
+                }
+            }),
+            http_client.clone(),
+        )
+        .expect("grpc_method_router constructs");
+        assert_eq!(grpc.local_map_shard_amount(), expected);
+
+        let ws = crate::plugins::ws_rate_limiting::WsRateLimiting::new(
+            &json!({"frames_per_second": 100}),
+            http_client.clone(),
+        )
+        .expect("ws_rate_limiting constructs");
+        assert_eq!(ws.local_map_shard_amount(), expected);
+
+        let udp = crate::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(
+            &json!({"datagrams_per_second": 100}),
+            http_client.clone(),
+        )
+        .expect("udp_rate_limiting constructs");
+        assert_eq!(udp.local_map_shard_amount(), expected);
+    }
+
+    #[test]
+    fn shared_limiter_consumers_redis_fallback_honors_explicit_shard_amount() {
+        let http_client = http_client_with_shards("ferrum", 64);
+        let expected = http_client.pool_shard_amount();
+        assert_eq!(expected, 64);
+        let redis = json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0",
+        });
+
+        let rate_limiting = crate::plugins::rate_limiting::RateLimiting::new(
+            &json!({
+                "limits": [{
+                    "scope": "default",
+                    "window_seconds": 60,
+                    "max_requests": 10
+                }],
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0",
+            }),
+            http_client.clone(),
+        )
+        .expect("rate_limiting redis constructs");
+        assert_eq!(rate_limiting.local_map_shard_amount(), expected);
+
+        let mut ai_config = json!({"token_limit": 1000, "window_seconds": 60});
+        ai_config
+            .as_object_mut()
+            .expect("object")
+            .extend(redis.as_object().expect("object").clone());
+        let ai = crate::plugins::ai_rate_limiter::AiRateLimiter::new(&ai_config, http_client.clone())
+            .expect("ai_rate_limiter redis constructs");
+        assert_eq!(ai.local_map_shard_amount(), expected);
+
+        let mut graphql_config = json!({
+            "type_rate_limits": {
+                "query": {"max_requests": 10, "window_seconds": 60}
+            }
+        });
+        graphql_config
+            .as_object_mut()
+            .expect("object")
+            .extend(redis.as_object().expect("object").clone());
+        let graphql =
+            crate::plugins::graphql::GraphqlPlugin::new(&graphql_config, http_client.clone())
+                .expect("graphql redis constructs");
+        assert_eq!(graphql.local_map_shard_amount(), expected);
+
+        let mut grpc_config = json!({
+            "method_rate_limits": {
+                "/pkg.Svc/Method": {"max_requests": 10, "window_seconds": 60}
+            }
+        });
+        grpc_config
+            .as_object_mut()
+            .expect("object")
+            .extend(redis.as_object().expect("object").clone());
+        let grpc = crate::plugins::grpc_method_router::GrpcMethodRouter::new(
+            &grpc_config,
+            http_client.clone(),
+        )
+        .expect("grpc_method_router redis constructs");
+        assert_eq!(grpc.local_map_shard_amount(), expected);
+
+        let mut ws_config = json!({"frames_per_second": 100});
+        ws_config
+            .as_object_mut()
+            .expect("object")
+            .extend(redis.as_object().expect("object").clone());
+        let ws = crate::plugins::ws_rate_limiting::WsRateLimiting::new(&ws_config, http_client.clone())
+            .expect("ws_rate_limiting redis constructs");
+        assert_eq!(ws.local_map_shard_amount(), expected);
+
+        let mut udp_config = json!({"datagrams_per_second": 100});
+        udp_config
+            .as_object_mut()
+            .expect("object")
+            .extend(redis.as_object().expect("object").clone());
+        let udp = crate::plugins::udp_rate_limiting::UdpRateLimiting::new_with_http_client(
+            &udp_config,
+            http_client,
+        )
+        .expect("udp_rate_limiting redis constructs");
+        assert_eq!(udp.local_map_shard_amount(), expected);
     }
 }

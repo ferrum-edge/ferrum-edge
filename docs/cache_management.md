@@ -106,7 +106,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### Rate Limiting
 
-**What it stores:** Per-key (IP or consumer) rate counters with sliding window timestamps or token bucket state.
+**What it stores:** Per-key (IP or consumer) rate counters with sliding window timestamps or token bucket state. The local (and Redis-fallback) DashMap uses the normalized `FERRUM_POOL_SHARD_AMOUNT`.
 
 **Default limit:** 100,000 entries (hardcoded `MAX_STATE_ENTRIES`).
 
@@ -116,7 +116,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### AI Rate Limiter
 
-**What it stores:** Per-key token usage counters for AI/LLM rate limiting.
+**What it stores:** Per-key token usage counters for AI/LLM rate limiting. The local (and Redis-fallback) DashMap uses the normalized `FERRUM_POOL_SHARD_AMOUNT`.
 
 **Default limit:** 100,000 entries (hardcoded `MAX_STATE_ENTRIES`).
 
@@ -126,7 +126,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### WebSocket Rate Limiting
 
-**What it stores:** Per-connection frame rate counters using token bucket algorithm.
+**What it stores:** Per-connection frame rate counters using token bucket algorithm. The local (and Redis-fallback) DashMap uses the normalized `FERRUM_POOL_SHARD_AMOUNT`.
 
 **Default limit:** 50,000 entries (hardcoded `MAX_STATE_ENTRIES`).
 
@@ -136,7 +136,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### UDP Rate Limiting
 
-**What it stores:** Per-client-IP datagram and byte rate counters.
+**What it stores:** Per-client-IP datagram and byte rate counters. The local (and Redis-fallback) DashMap uses the normalized `FERRUM_POOL_SHARD_AMOUNT`.
 
 **Default limit:** 100,000 entries (hardcoded `MAX_STATE_ENTRIES`).
 
@@ -146,7 +146,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### GraphQL Rate Limiting
 
-**What it stores:** Per-key rate counters for GraphQL per-operation rate limiting.
+**What it stores:** Per-key rate counters for GraphQL per-operation rate limiting. The local (and Redis-fallback) DashMap uses the normalized `FERRUM_POOL_SHARD_AMOUNT`.
 
 **Default limit:** 100,000 entries (hardcoded `MAX_STATE_ENTRIES`).
 
@@ -156,7 +156,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 ### gRPC Method Router Rate Limiting
 
-**What it stores:** Per-key rate counters for gRPC per-method rate limiting.
+**What it stores:** Per-key rate counters for gRPC per-method rate limiting. The local (and Redis-fallback) DashMap uses the normalized `FERRUM_POOL_SHARD_AMOUNT`.
 
 **Default limit:** 100,000 entries (hardcoded `MAX_STATE_ENTRIES`).
 

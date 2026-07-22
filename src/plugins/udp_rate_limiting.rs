@@ -66,6 +66,12 @@ impl UdpRateLimiting {
         })
     }
 
+    /// Local/fallback DashMap shard count. Test-only; not a production API.
+    #[cfg(test)]
+    pub(crate) fn local_map_shard_amount(&self) -> usize {
+        self.limiter.local_map_shard_amount()
+    }
+
     fn redis_ip_key(client_ip: &str) -> String {
         let mut key = String::with_capacity(3 + client_ip.len());
         key.push_str("ip:");

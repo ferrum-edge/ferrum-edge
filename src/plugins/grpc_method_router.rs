@@ -151,6 +151,12 @@ impl GrpcMethodRouter {
         })
     }
 
+    /// Local/fallback DashMap shard count. Test-only; not a production API.
+    #[cfg(test)]
+    pub(crate) fn local_map_shard_amount(&self) -> usize {
+        self.limiter.local_map_shard_amount()
+    }
+
     /// Evict entries with no recent activity to bound memory.
     fn evict_stale_entries(&self) {
         let request = self.request_counter.fetch_add(1, Ordering::Relaxed);
