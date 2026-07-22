@@ -740,15 +740,13 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
                 && last_text_vary
                     .as_deref()
                     .is_some_and(|vary| vary.split(',').any(|token| token.trim() == "Accept"))
+                && let Ok(decoded) = BASE64.decode(&encoded)
+                && decoded
+                    .windows(b"grpc-status: 0".len())
+                    .any(|window| window == b"grpc-status: 0")
             {
-                if let Ok(decoded) = BASE64.decode(&encoded)
-                    && decoded
-                        .windows(b"grpc-status: 0".len())
-                        .any(|window| window == b"grpc-status: 0")
-                {
-                    text_ok = true;
-                    break;
-                }
+                text_ok = true;
+                break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
