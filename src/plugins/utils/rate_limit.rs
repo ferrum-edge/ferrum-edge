@@ -2541,7 +2541,8 @@ mod tests {
     #[test]
     fn from_plugin_config_local_backend_honors_explicit_http_client_shard_amount() {
         let http_client = http_client_with_shards("ferrum", 256);
-        let backend = RateLimitBackend::from_plugin_config(
+        let backend: RateLimitBackend<String, TestAlgorithm> =
+            RateLimitBackend::from_plugin_config(
             "rate_limiting",
             &json!({"sync_mode": "local"}),
             &http_client,
@@ -2562,7 +2563,8 @@ mod tests {
     #[test]
     fn from_plugin_config_redis_fallback_honors_explicit_http_client_shard_amount() {
         let http_client = http_client_with_shards("ferrum", 128);
-        let backend = RateLimitBackend::from_plugin_config(
+        let backend: RateLimitBackend<String, TestAlgorithm> =
+            RateLimitBackend::from_plugin_config(
             "rate_limiting",
             &json!({
                 "sync_mode": "redis",
@@ -2590,7 +2592,8 @@ mod tests {
         assert_eq!(expected, 128);
         assert_eq!(http_client.pool_shard_amount(), expected);
 
-        let local = RateLimitBackend::from_plugin_config(
+        let local: RateLimitBackend<String, TestAlgorithm> =
+            RateLimitBackend::from_plugin_config(
             "rate_limiting",
             &json!({}),
             &http_client,
@@ -2599,7 +2602,8 @@ mod tests {
             },
         )
         .expect("local backend constructs");
-        let failover = RateLimitBackend::from_plugin_config(
+        let failover: RateLimitBackend<String, TestAlgorithm> =
+            RateLimitBackend::from_plugin_config(
             "rate_limiting",
             &json!({
                 "sync_mode": "redis",
@@ -2622,7 +2626,8 @@ mod tests {
         let expected = crate::util::sharding::pool_shard_amount(0);
         assert_eq!(http_client.pool_shard_amount(), expected);
 
-        let backend = RateLimitBackend::from_plugin_config(
+        let backend: RateLimitBackend<String, TestAlgorithm> =
+            RateLimitBackend::from_plugin_config(
             "rate_limiting",
             &json!({"sync_mode": "local"}),
             &http_client,
