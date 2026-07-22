@@ -323,6 +323,8 @@ async fn try_send_batch_threshold_triggers_flush() {
         },
     );
 
+    logger.commit();
+
     logger.try_send(1);
     logger.try_send(2);
 
@@ -349,6 +351,8 @@ async fn reserved_slot_excludes_concurrent_reservation_until_send() {
         },
     );
 
+    logger.commit();
+
     let permit = logger.try_reserve().expect("first slot must reserve");
     assert!(
         logger.try_reserve().is_none(),
@@ -365,6 +369,8 @@ async fn dropping_unused_reservation_releases_capacity() {
         test_logger_config("batching_logger_reserve_drop", 1, 1),
         move |_batch: Vec<u32>| async move { Ok(()) },
     );
+
+    logger.commit();
 
     let permit = logger.try_reserve().expect("first slot must reserve");
     drop(permit);
@@ -400,6 +406,8 @@ async fn oversized_batch_size_is_capped_before_flush_loop() {
         },
     );
 
+    logger.commit();
+
     for value in 0..MAX_BATCH_SIZE {
         logger.try_send(value);
     }
@@ -429,6 +437,8 @@ async fn interval_timer_flushes_partial_batch() {
             }
         },
     );
+
+    logger.commit();
 
     logger.try_send(7);
 
@@ -460,6 +470,8 @@ async fn retry_policy_retries_failed_flushes() {
             }
         },
     );
+
+    logger.commit();
 
     logger.try_send(9);
 
@@ -493,6 +505,8 @@ async fn exhausted_retries_log_and_drop_batch() {
             },
         );
 
+        logger.commit();
+
         logger.try_send(1);
         wait_for_flush(&notify).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -523,6 +537,8 @@ async fn dropping_logger_drains_remaining_entries() {
         },
     );
 
+    logger.commit();
+
     logger.try_send(42);
     drop(logger);
 
@@ -549,6 +565,8 @@ async fn full_channel_warns_once_per_rate_limit_window() {
                 Ok(())
             },
         );
+
+        logger.commit();
 
         logger.try_send(1);
         for value in 2..10 {
@@ -590,6 +608,8 @@ async fn high_water_hook_fires_without_overflow_hook() {
             Ok(())
         },
     );
+
+    logger.commit();
 
     assert!(logger.try_send(1));
     assert!(!logger.try_send(2));
@@ -642,6 +662,8 @@ async fn single_attempt_flush_reuses_owned_batch_without_clone() {
         },
     );
 
+    logger.commit();
+
     logger.try_send(CloneTracked::new(11, Arc::clone(&clone_count)));
 
     wait_for_flush(&notify).await;
@@ -674,6 +696,8 @@ async fn retries_clone_only_before_final_attempt() {
             }
         },
     );
+
+    logger.commit();
 
     logger.try_send(CloneTracked::new(22, Arc::clone(&clone_count)));
 

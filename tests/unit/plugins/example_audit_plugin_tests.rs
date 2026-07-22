@@ -580,6 +580,7 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
         plugin
             .start_background_tasks()
             .expect("missing FERRUM_DB_URL must degrade to Ok, not wedge reload");
+        plugin.commit_background_tasks();
     }
 
     // MongoDB is not a SQL sink for this example; degrade the same way.
@@ -592,6 +593,7 @@ async fn test_log_and_stream_hooks_enqueue_without_panic() {
         plugin
             .start_background_tasks()
             .expect("MongoDB backend must degrade to Ok, not wedge reload");
+        plugin.commit_background_tasks();
     }
 
     // Hooks remain panic-free even when the worker was not started.
@@ -693,6 +695,7 @@ async fn test_persists_http_and_stream_rows_against_sqlite() {
         plugin
             .start_background_tasks()
             .expect("worker should start with FERRUM_DB_URL");
+        plugin.commit_background_tasks();
     }
 
     let metadata_prefix = "k".repeat(128);

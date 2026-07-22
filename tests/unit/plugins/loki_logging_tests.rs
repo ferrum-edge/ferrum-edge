@@ -376,6 +376,7 @@ async fn test_loki_logging_entry_budget_exact_boundary_includes_dynamic_labels()
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let proxy_id = "123e4567-e89b-12d3-a456-426614174000";
     let summary = ferrum_edge::plugins::TransactionSummary {
         namespace: "0".to_string(),
@@ -434,6 +435,7 @@ async fn test_loki_timestamps_are_strictly_monotonic_within_and_across_batches()
     .unwrap();
     plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let source_timestamps = [
         "2026-07-15T12:00:04Z",
         "2026-07-15T12:00:03Z",
@@ -531,6 +533,7 @@ async fn test_loki_stream_disconnects_keep_source_time_in_line_and_emit_in_queue
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let mut first = create_test_stream_transaction_summary();
     first.timestamp_disconnected = "2026-07-15T12:00:02Z".to_string();
     let mut second = first.clone();
@@ -604,6 +607,7 @@ async fn test_loki_status_260_is_terminal_and_diagnostics_are_redacted() {
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
     wait_for_requests(&server, 1).await;
     for _ in 0..100 {
@@ -659,6 +663,7 @@ async fn test_loki_retries_408_429_and_5xx() {
         config["max_retries"] = json!(1);
         let plugin = LokiLogging::new(&config, default_client()).unwrap();
         plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
         plugin.log(&create_test_transaction_summary()).await;
         wait_for_requests(&server, 2).await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -696,6 +701,7 @@ async fn test_loki_accepts_empty_200_but_rejects_nonempty_200_without_retry() {
     config["max_retries"] = json!(2);
     let plugin = LokiLogging::new(&config, default_client()).unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
     wait_for_requests(&server, 1).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -736,6 +742,7 @@ async fn test_loki_committed_204_drain_anomaly_is_not_retried() {
     config["max_retries"] = json!(2);
     let plugin = LokiLogging::new(&config, default_client()).unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
     wait_for_requests(&server, 1).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -769,6 +776,7 @@ async fn test_loki_gzip_body_and_header_are_reused_across_retry() {
     config["max_retries"] = json!(1);
     let plugin = LokiLogging::new(&config, default_client()).unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let mut summary = create_test_transaction_summary();
     summary.request_path = "/gzip-retry-canary".to_string();
     plugin.log(&summary).await;
@@ -812,6 +820,7 @@ async fn test_loki_oversized_entry_is_dropped_before_a_small_entry_is_sent() {
     let plugin = LokiLogging::new(&config, default_client()).unwrap();
     plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let canary = "oversized-entry-secret-canary";
     let mut oversized = create_test_transaction_summary();
     oversized.request_path = format!("/{canary}/{}", "x".repeat(32768));
@@ -848,6 +857,7 @@ async fn test_loki_retained_content_budget_bounds_buffered_entries() {
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     for _ in 0..100 {
         plugin.log(&create_test_transaction_summary()).await;
     }
@@ -893,6 +903,7 @@ async fn test_loki_retained_content_budget_is_released_after_delivery() {
     .unwrap();
     plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let large_path = "x".repeat(1800);
     let mut first = create_test_transaction_summary();
     first.request_path = format!("/first-budget-canary/{large_path}");
@@ -955,6 +966,7 @@ async fn test_loki_logging_with_authorization_header() {
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     assert_eq!(plugin.name(), "loki_logging");
 
     let summary = create_test_transaction_summary();
@@ -1088,6 +1100,7 @@ async fn test_loki_logging_custom_batch_config() {
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     assert_eq!(plugin.name(), "loki_logging");
 }
 
@@ -1106,6 +1119,7 @@ async fn test_loki_logging_buffer_accepts_multiple_entries() {
     .unwrap();
     plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
     for _ in 0..100 {
         plugin.log(&summary).await;
@@ -1127,6 +1141,7 @@ async fn test_loki_logging_buffer_full_drops_gracefully() {
     .unwrap();
     plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
     for _ in 0..20 {
         plugin.log(&summary).await;
@@ -1146,6 +1161,7 @@ async fn test_loki_logging_unreachable_endpoint_graceful() {
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
@@ -1164,6 +1180,7 @@ async fn test_loki_logging_stream_disconnect_does_not_panic() {
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let summary = create_test_stream_transaction_summary();
 
     plugin.on_stream_disconnect(&summary).await;
@@ -1298,6 +1315,7 @@ async fn test_loki_reuses_http11_connection_across_successful_batches() {
     config["max_retries"] = json!(0);
     let plugin = LokiLogging::new(&config, default_client()).unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
     plugin.log(&create_test_transaction_summary()).await;
     wait_for_loki_count(&requests, 2).await;
@@ -1317,6 +1335,7 @@ async fn test_loki_reuses_http11_connection_across_retry() {
     config["retry_delay_ms"] = json!(1);
     let plugin = LokiLogging::new(&config, default_client()).unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     plugin.log(&create_test_transaction_summary()).await;
     wait_for_loki_count(&requests, 2).await;
     assert_eq!(
@@ -1370,6 +1389,7 @@ async fn test_loki_stalled_ack_drain_timeout_does_not_block_indefinitely() {
     config["max_retries"] = json!(0);
     let plugin = LokiLogging::new(&config, default_client()).unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     // Second request only arrives if the drain timeout unblocks the worker
     // instead of waiting out the peer's 30s stall.
     plugin.log(&create_test_transaction_summary()).await;

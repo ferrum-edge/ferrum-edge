@@ -224,6 +224,7 @@ async fn test_tcp_logging_log_does_not_panic() {
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
 
     // Should not panic — entry is queued and background task handles the failure
@@ -247,6 +248,7 @@ async fn test_tcp_logging_stream_disconnect_does_not_panic() {
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let summary = create_test_stream_transaction_summary();
 
     plugin.on_stream_disconnect(&summary).await;
@@ -327,6 +329,7 @@ async fn test_tcp_logging_custom_batch_config() {
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     assert_eq!(plugin.name(), "tcp_logging");
 }
 
@@ -346,6 +349,7 @@ async fn test_tcp_logging_buffer_accepts_multiple_entries() {
     .unwrap();
     plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
     for _ in 0..100 {
         plugin.log(&summary).await;
@@ -369,6 +373,7 @@ async fn test_tcp_logging_buffer_full_drops_gracefully() {
     .unwrap();
     plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
     // Send more entries than buffer_capacity — excess should be dropped
     for _ in 0..20 {

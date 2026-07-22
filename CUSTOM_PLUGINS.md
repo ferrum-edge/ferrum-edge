@@ -342,9 +342,11 @@ response body:
 
 For potentially slow I/O, use an explicitly bounded channel whose sender,
 worker, cancellation state, and retry budget are owned by the plugin instance.
-Start the worker in `start_background_tasks()` only after the cache generation
-is accepted, define an explicit queue-full policy, and close/signal the worker
-when the instance is dropped. Do not spawn one unbounded task per transaction.
+Stage the worker in `start_background_tasks()` during cache construction (workers
+must stay dormant / gated), release it from `commit_background_tasks()` only
+after the cache generation is atomically installed, define an explicit
+queue-full policy, and close/signal the worker when the instance is dropped. Do
+not spawn one unbounded task per transaction.
 Because `Drop` cannot await and runtime shutdown can still cancel a worker,
 durability-sensitive sinks should persist records before acknowledging them or
 hand off to an external collector with its own drain protocol; a custom plugin

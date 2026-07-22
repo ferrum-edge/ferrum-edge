@@ -6197,18 +6197,24 @@ pub trait Plugin: Send + Sync {
         None
     }
 
-    /// Starts runtime-owned background work after the complete plugin-cache
+    /// Stages runtime-owned background work after the complete plugin-cache
     /// generation has validated and before it is published. Constructors must
     /// remain pure because offline validation invokes them without a runtime.
-    /// Implementations must be idempotent and stop owned work when dropped.
+    ///
+    /// Fallible setup (producers, TLS clients, spool directories, channel
+    /// construction) belongs here. Spawned workers must stay dormant — gated
+    /// on [`Self::commit_background_tasks`] — so a generation that later fails
+    /// registry/cache commit cannot perform network, spool, or export side
+    /// effects. Implementations must be idempotent; dropping an uncommitted
+    /// instance must cancel staged workers without side effects.
     fn start_background_tasks(&self) -> Result<(), String> {
         Ok(())
     }
 
-    /// Publishes process-global runtime state after the complete plugin-cache
-    /// generation has been atomically installed. Implementations must be
-    /// infallible and idempotent: all fallible setup belongs in
-    /// [`Self::start_background_tasks`].
+    /// Releases staged workers and publishes process-global runtime state after
+    /// the complete plugin-cache generation has been atomically installed.
+    /// Implementations must be infallible and idempotent: all fallible setup
+    /// belongs in [`Self::start_background_tasks`].
     fn commit_background_tasks(&self) {}
 
     /// Returns `true` if this plugin participates in the authorization phase.

@@ -120,6 +120,7 @@ async fn grpc_per_event_exports_billable_and_raw_terminal_statuses() {
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
     plugin.start_background_tasks().expect("chargeback start");
 
+    plugin.commit_background_tasks();
     plugin.log(&grpc_summary("grpc-ok", "0")).await;
     plugin.log(&grpc_summary("grpc-unavailable", "14")).await;
 
@@ -910,6 +911,7 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
     config["batch"]["size"] = json!(1);
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
     plugin.start_background_tasks().expect("chargeback start");
+    plugin.commit_background_tasks();
     assert!(plugin.requires_ws_disconnect_hooks());
 
     plugin
@@ -958,6 +960,7 @@ async fn connect_method_is_not_classified_as_websocket() {
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
     plugin.start_background_tasks().expect("chargeback start");
 
+    plugin.commit_background_tasks();
     plugin
         .log(&TransactionSummary {
             namespace: "ferrum".to_string(),

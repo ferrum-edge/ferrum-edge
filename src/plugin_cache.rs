@@ -2957,6 +2957,10 @@ fn collect_active_jwks_requirements(
     requirements
 }
 
+/// Stage fallible background setup for every distinct plugin instance in a
+/// not-yet-published generation. Workers must remain dormant until
+/// [`commit_background_tasks`] runs after atomic installation; failure here
+/// drops the staged maps and cancels any gated tasks without side effects.
 fn start_background_tasks(
     proxy_map: &ProxyPluginMap,
     globals: &[Arc<dyn Plugin>],
@@ -2979,6 +2983,8 @@ fn start_background_tasks(
     Ok(())
 }
 
+/// Release staged workers and publish process-global sink state after the
+/// generation has been installed. Must stay infallible and idempotent.
 fn commit_background_tasks(proxy_map: &ProxyPluginMap, globals: &[Arc<dyn Plugin>]) {
     let mut committed = HashSet::new();
     for plugin in globals

@@ -17,10 +17,10 @@
 //! Construction (`new`) is runtime-free: it parses and admits configuration
 //! without creating a `ThreadedProducer`, spawning a Ferrum flush worker, or
 //! registering a generation. Fallible producer/logger construction and local
-//! lifecycle ownership happen in [`Plugin::start_background_tasks`]. Process-
-//! global active-generation publication is deferred to
-//! [`Plugin::commit_background_tasks`] after PluginCache atomically installs
-//! the generation that owns this instance.
+//! lifecycle ownership happen in [`Plugin::start_background_tasks`]; the Ferrum
+//! flush worker stays dormant until [`Plugin::commit_background_tasks`].
+//! Process-global active-generation publication is also deferred to commit
+//! after PluginCache atomically installs the generation that owns this instance.
 //!
 //! Graceful shutdown and reload atomically stop admission, await every
 //! already-reserved/transient admit, await the batching worker, then await one
@@ -1642,6 +1642,7 @@ pub(crate) async fn probe_reserve_before_serialize_for_test(
             }
         },
     );
+    logger.commit();
     let Some(handle) = logger.handle() else {
         return (0, 0);
     };
@@ -1710,6 +1711,7 @@ pub(crate) async fn probe_byte_budget_before_serialize_for_test(
         },
         |_batch| async { Ok(()) },
     );
+    logger.commit();
     let Some(handle) = logger.handle() else {
         drop(held_lease);
         let _ = logger.close_and_await().await;
@@ -2028,6 +2030,14 @@ impl Plugin for KafkaLogging {
         let Some(generation) = self.generation.get() else {
             return;
         };
+        // Release the Ferrum flush worker before process-global registration so
+        // diagnostics cannot advertise a live generation whose worker is still
+        // dormant. register_generation stays idempotent via entry().or_insert.
+        if let Ok(guard) = generation.logger.lock()
+            && let Some(logger) = guard.as_ref()
+        {
+            logger.commit();
+        }
         register_generation(Arc::clone(generation));
     }
 

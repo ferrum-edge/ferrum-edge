@@ -6,9 +6,10 @@
 //! non-blockingly, and a shared background task drains the queue in
 //! configurable batch sizes with a flush interval timer.
 //!
-//! Construction is runtime-free. The flush worker starts only from
-//! [`Plugin::start_background_tasks`] after the plugin-cache generation that
-//! owns this instance is accepted.
+//! Construction is runtime-free. The flush worker is staged from
+//! [`Plugin::start_background_tasks`] and released from
+//! [`Plugin::commit_background_tasks`] after the plugin-cache generation that
+//! owns this instance is atomically installed.
 //!
 //! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
 //! `LogEntry` union type, and uses the shared `PluginHttpClient` for
@@ -107,6 +108,10 @@ impl Plugin for HttpLogging {
                 let flush_config = flush_config.clone();
                 async move { send_batch(&flush_config, batch).await }
             })
+    }
+
+    fn commit_background_tasks(&self) {
+        self.logger.commit();
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {

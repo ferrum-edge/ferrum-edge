@@ -4,9 +4,11 @@
 //! Offline `ferrum-edge validate` loads a file-mode spec through
 //! [`ferrum_edge::config::file_loader::load_config_from_file`] without a Tokio
 //! runtime and without calling `start_background_tasks`. These regressions prove
-//! that shared pipeline stays panic-free and side-effect-free, and that live
-//! construction still activates workers through the shared plugin-cache lifecycle
-//! hook.
+//! that shared pipeline stays panic-free and side-effect-free. Live generations
+//! stage workers in `start_background_tasks` and release them only from
+//! `commit_background_tasks` after PluginCache publication — including proofs
+//! that spool replay/snapshot stay dormant until commit and that staged drop
+//! exits without flush side effects.
 
 use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::plugins::api_chargeback_sink::{self, ApiChargebackSink};
@@ -324,6 +326,7 @@ async fn kafka_generation_id_allocated_only_on_activation() {
     first
         .start_background_tasks()
         .expect("kafka start under tokio");
+    first.commit_background_tasks();
     let first_id = first.snapshot().generation_id;
     assert!(
         first_id >= 1,
@@ -338,6 +341,7 @@ async fn kafka_generation_id_allocated_only_on_activation() {
 
     let second = KafkaLogging::new(&kafka_sink_config(), &client()).expect("kafka");
     second.start_background_tasks().expect("second kafka start");
+    second.commit_background_tasks();
     let second_id = second.snapshot().generation_id;
     assert!(
         second_id > first_id,
@@ -480,7 +484,7 @@ async fn chargeback_activation_failure_publishes_no_active_sink() {
         "successful activation must publish ACTIVE_SINK"
     );
 
-    // A later staged generation may start its owned workers before the cache
+    // A later staged generation may stage its owned workers before the cache
     // swap, but it must not displace diagnostics for the committed live sink.
     let mut staged_cfg = cfg.clone();
     staged_cfg["pricing_version"] = Value::String("staged-v2".to_string());
@@ -526,37 +530,51 @@ async fn logging_sink_live_construction_starts_workers_idempotently() {
 
     let http = HttpLogging::new(&http_sink_config(), client()).expect("http");
     http.start_background_tasks().expect("http start");
+    http.commit_background_tasks();
     http.start_background_tasks()
         .expect("http start idempotent");
+    http.commit_background_tasks();
 
     let tcp = TcpLogging::new(&tcp_sink_config(), client()).expect("tcp");
     tcp.start_background_tasks().expect("tcp start");
+    tcp.commit_background_tasks();
     tcp.start_background_tasks().expect("tcp start idempotent");
+    tcp.commit_background_tasks();
 
     let udp = UdpLogging::new(&udp_sink_config(), client()).expect("udp");
     udp.start_background_tasks().expect("udp start");
+    udp.commit_background_tasks();
     udp.start_background_tasks().expect("udp start idempotent");
+    udp.commit_background_tasks();
 
     let statsd = StatsdLogging::new(&statsd_sink_config(), client()).expect("statsd");
     statsd.start_background_tasks().expect("statsd start");
+    statsd.commit_background_tasks();
     statsd
         .start_background_tasks()
         .expect("statsd start idempotent");
+    statsd.commit_background_tasks();
 
     let loki = LokiLogging::new(&loki_sink_config(), client()).expect("loki");
     loki.start_background_tasks().expect("loki start");
+    loki.commit_background_tasks();
     loki.start_background_tasks()
         .expect("loki start idempotent");
+    loki.commit_background_tasks();
 
     let ws = WsLogging::new(&ws_sink_config(), client()).expect("ws");
     ws.start_background_tasks().expect("ws start");
+    ws.commit_background_tasks();
     ws.start_background_tasks().expect("ws start idempotent");
+    ws.commit_background_tasks();
 
     let kafka = KafkaLogging::new(&kafka_sink_config(), &client()).expect("kafka");
     kafka.start_background_tasks().expect("kafka start");
+    kafka.commit_background_tasks();
     kafka
         .start_background_tasks()
         .expect("kafka start idempotent");
+    kafka.commit_background_tasks();
     assert!(kafka.snapshot().accepting);
     assert!(kafka.snapshot().generation_id >= 1);
     kafka.finalize().await;
@@ -582,18 +600,22 @@ async fn logging_sink_live_construction_starts_workers_idempotently() {
     chargeback
         .start_background_tasks()
         .expect("chargeback start");
+    chargeback.commit_background_tasks();
     chargeback
         .start_background_tasks()
         .expect("chargeback start idempotent");
+    chargeback.commit_background_tasks();
     let _ = tmp;
 
     let transcript = AiTranscriptAudit::new(&transcript_sink_config(), client()).expect("audit");
     transcript
         .start_background_tasks()
         .expect("transcript start");
+    transcript.commit_background_tasks();
     transcript
         .start_background_tasks()
         .expect("transcript start idempotent");
+    transcript.commit_background_tasks();
 }
 
 #[tokio::test]
@@ -636,7 +658,16 @@ async fn deferred_batching_logger_leaves_no_worker_when_never_started() {
         )
         .expect("start under tokio");
     assert!(logger.is_started());
+    assert!(!logger.is_committed());
     assert!(logger.try_send(7));
+    // Staged but uncommitted: the flush callback must stay dormant.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        seen.lock().expect("lock").is_empty(),
+        "flush must not run before commit"
+    );
+    logger.commit();
+    assert!(logger.is_committed());
     for _ in 0..50 {
         if !seen.lock().expect("lock").is_empty() {
             break;
@@ -644,4 +675,137 @@ async fn deferred_batching_logger_leaves_no_worker_when_never_started() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(seen.lock().expect("lock").as_slice(), &[7]);
+}
+
+#[tokio::test]
+async fn deferred_batching_logger_staged_drop_exits_without_flush() {
+    use ferrum_edge::plugins::utils::{BatchConfig, DeferredBatchingLogger, RetryPolicy};
+    use std::time::Duration;
+
+    let flushed = Arc::new(AtomicUsize::new(0));
+    let logger = DeferredBatchingLogger::<u32>::new();
+    let flushed_cb = Arc::clone(&flushed);
+    logger
+        .start(
+            "deferred_batching_logger_drop_test",
+            BatchConfig {
+                batch_size: 1,
+                flush_interval: Duration::from_millis(10),
+                buffer_capacity: 8,
+                retry: RetryPolicy::fixed(1, Duration::from_millis(0)),
+                plugin_name: "deferred_batching_logger_drop_test",
+            },
+            move |batch| {
+                flushed_cb.fetch_add(batch.len(), Ordering::SeqCst);
+                async move { Ok(()) }
+            },
+        )
+        .expect("stage under tokio");
+    assert!(logger.try_send(9));
+    drop(logger);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        flushed.load(Ordering::SeqCst),
+        0,
+        "dropping an uncommitted staged logger must not flush"
+    );
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_lifecycle_spool)]
+async fn chargeback_spool_replay_and_snapshot_stay_dormant_until_commit() {
+    use std::fs;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let spool_dir = tmp.path().join("spool");
+    // Pin node id so the planted replay candidate lands in the owned tree.
+    // SAFETY: serial test-only env mutation.
+    unsafe {
+        std::env::set_var("FERRUM_NODE_ID", "lifecycle-spool-node");
+    }
+
+    let cfg = json!({
+        "mode": "snapshot",
+        "clickhouse": {
+            "url": "http://127.0.0.1:9",
+            "database": "ferrum",
+            "table": "charges_raw",
+            "timeout_ms": 200
+        },
+        "batch": {"size": 10, "flush_interval_ms": 60000, "buffer_capacity": 10},
+        "retry": {"max_attempts": 1, "initial_delay_ms": 1, "max_delay_ms": 1, "jitter": false},
+        "spool": {
+            "enabled": true,
+            "dir": spool_dir.to_string_lossy(),
+            "max_bytes": 1_048_576,
+            "replay_interval_secs": 1,
+            "compression": "none"
+        },
+        "snapshot": {
+            "interval_secs": 1,
+            "cleanup_interval_secs": 3600,
+            "stale_entry_ttl_secs": 3600
+        },
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+        "pricing_version": "test-v1",
+        "currency": "USD"
+    });
+
+    let plugin = ApiChargebackSink::new(&cfg, client(), "default").expect("chargeback");
+    plugin
+        .start_background_tasks()
+        .expect("stage chargeback with spool+snapshot");
+
+    // Plant an invalid-UTF8 replay candidate under the owned node tree. If the
+    // replayer ticks before commit it quarantines the file (side effect).
+    let planted = spool_dir
+        .join("lifecycle-spool-node")
+        .join("20200101")
+        .join("planted.ndjson");
+    fs::create_dir_all(planted.parent().expect("parent")).expect("mkdir day dir");
+    fs::write(&planted, [0xff, 0xfe, 0xfd]).expect("write corrupt spool bytes");
+    let planted_bytes = fs::metadata(&planted).expect("meta").len();
+
+    // Give both interval timers a chance to fire if they were not gated.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(
+        planted.exists(),
+        "spool replayer must not consume files before commit"
+    );
+    assert!(
+        !planted
+            .with_file_name("planted.ndjson.corrupt")
+            .exists(),
+        "spool replayer must not quarantine files before commit"
+    );
+    assert_eq!(
+        fs::metadata(&planted).expect("meta").len(),
+        planted_bytes,
+        "spool file must remain untouched before commit"
+    );
+    let status: Value =
+        serde_json::from_str(&api_chargeback_sink::render_status_json()).expect("status");
+    assert_eq!(
+        status.get("enabled").and_then(Value::as_bool),
+        Some(false),
+        "ACTIVE_SINK must stay unpublished before commit"
+    );
+
+    // Drop without commit: workers must exit without spool side effects.
+    drop(plugin);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        planted.exists(),
+        "dropping an uncommitted chargeback sink must not replay/delete spool files"
+    );
+    assert!(
+        !planted
+            .with_file_name("planted.ndjson.corrupt")
+            .exists(),
+        "dropping an uncommitted chargeback sink must not quarantine spool files"
+    );
+    unsafe {
+        std::env::remove_var("FERRUM_NODE_ID");
+    }
 }

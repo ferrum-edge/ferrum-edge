@@ -191,7 +191,8 @@ impl UdpLogging {
     ///
     /// Used by shared plugin validation / Admin surfaces. Runtime construction
     /// still goes through [`Self::new`], which reuses the same parser and then
-    /// defers the flush worker to [`Plugin::start_background_tasks`].
+    /// defers the flush worker to [`Plugin::start_background_tasks`] /
+    /// [`Plugin::commit_background_tasks`].
     /// Registration remains `OptionalFailOpen`: a failed enabled instance is
     /// omitted from the published cache rather than retaining last-known-good.
     pub(crate) fn validate_config(
@@ -615,6 +616,10 @@ impl Plugin for UdpLogging {
                 let state = Arc::clone(&state);
                 async move { send_batch(&flush_config, &state, batch).await }
             })
+    }
+
+    fn commit_background_tasks(&self) {
+        self.logger.commit();
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {

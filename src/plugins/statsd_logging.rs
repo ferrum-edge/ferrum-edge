@@ -615,6 +615,10 @@ impl Plugin for StatsdLogging {
             })
     }
 
+    fn commit_background_tasks(&self) {
+        self.logger.commit();
+    }
+
     async fn log(&self, summary: &TransactionSummary) {
         // Mirror/shadow summaries are internal backend probes, not client
         // traffic — match prometheus_metrics and exclude them from request

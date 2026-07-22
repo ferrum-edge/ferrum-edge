@@ -1352,6 +1352,10 @@ impl Plugin for AiTranscriptAudit {
         )
     }
 
+    fn commit_background_tasks(&self) {
+        self.logger.commit();
+    }
+
     fn warmup_hostnames(&self) -> Vec<String> {
         vec![self.endpoint_hostname.clone()]
     }

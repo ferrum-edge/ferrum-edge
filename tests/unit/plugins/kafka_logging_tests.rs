@@ -26,6 +26,7 @@ fn start_kafka_logging(plugin: &KafkaLogging) {
     plugin
         .start_background_tasks()
         .expect("kafka_logging live tests require start_background_tasks");
+    plugin.commit_background_tasks();
 }
 
 #[tokio::test]

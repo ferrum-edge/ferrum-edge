@@ -22,6 +22,7 @@ fn start_http_logging(plugin: &HttpLogging) {
     plugin
         .start_background_tasks()
         .expect("http_logging live tests require start_background_tasks");
+    plugin.commit_background_tasks();
 }
 
 async fn spawn_http_logging_keepalive_server(

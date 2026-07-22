@@ -7,7 +7,9 @@
 //! Construction (`new`) is runtime-free shape validation: it does not create
 //! spool directories, materialize secrets, build a dedicated TLS client, spawn
 //! the batching worker / background tasks, or publish `ACTIVE_SINK`. Live
-//! activation happens only from [`Plugin::start_background_tasks`].
+//! staging happens from [`Plugin::start_background_tasks`]; workers stay
+//! dormant until [`Plugin::commit_background_tasks`] after PluginCache
+//! publication.
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -25,6 +27,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
+use tokio::sync::watch;
 use url::Url;
 
 #[cfg(unix)]
@@ -32,7 +35,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use super::chargeback::pricing::{ChargeComputation, PricingConfig};
 use super::chargeback::{HttpBillingOutcome, http_billing_outcome};
-use super::utils::{BatchConfig, BatchingLogger, LoggerHooks, PluginHttpClient, RetryPolicy};
+use super::utils::{
+    BatchConfig, BatchingLogger, LoggerHooks, PluginHttpClient, RetryPolicy, wait_until_committed,
+};
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::dns::DnsCacheResolver;
 
@@ -655,15 +660,15 @@ impl ApiChargebackSink {
     }
 
     fn activate(&self) -> Result<(), String> {
-        // Fallible setup first: no flush worker, no background tasks, and no
-        // ACTIVE_SINK publication until ownership can be committed atomically.
+        // Fallible setup first. Staged workers share one commit gate and stay
+        // dormant until commit_background_tasks; ACTIVE_SINK stays unpublished.
         let parsed_url = parse_clickhouse_url(&self.config.clickhouse.url)?;
         let endpoint = sanitized_endpoint(&parsed_url);
         let insert_url = build_insert_url(&parsed_url, &self.config.clickhouse);
         let password = resolve_password_ref(self.config.clickhouse.password_ref.as_deref())?;
         let http = build_clickhouse_http_client(&self.config.clickhouse, &self.http_client)?;
-        // Build the spool-replay client before spawning so a TLS/file failure
-        // cannot orphan an already-running BatchingLogger or replayer task.
+        // Build the spool-replay client before staging so a TLS/file failure
+        // cannot orphan an already-staged BatchingLogger or replayer task.
         let replay_http = if self.config.spool.enabled {
             Some(build_clickhouse_http_client(
                 &self.config.clickhouse,
@@ -742,7 +747,8 @@ impl ApiChargebackSink {
             high_watermark_percent: 80,
         };
 
-        let logger = BatchingLogger::spawn_with_hooks(
+        let (commit_tx, commit_rx) = watch::channel(false);
+        let logger = BatchingLogger::spawn_with_hooks_on_commit_gate(
             BatchConfig {
                 batch_size: self.config.batch.size,
                 flush_interval: Duration::from_millis(self.config.batch.flush_interval_ms),
@@ -759,6 +765,8 @@ impl ApiChargebackSink {
                 plugin_name: PLUGIN_NAME,
             },
             hooks,
+            commit_tx,
+            commit_rx,
             {
                 let flush_config = flush_config.clone();
                 move |batch| {
@@ -796,6 +804,7 @@ impl ApiChargebackSink {
                 },
                 self.config.batch.size,
                 self.config.spool.replay_interval_secs,
+                runtime.logger.commit_sender().subscribe(),
             ));
         }
 
@@ -807,17 +816,18 @@ impl ApiChargebackSink {
                 Arc::clone(&self.config),
                 Arc::clone(&self.node_id),
                 self.namespace.clone(),
+                runtime.logger.commit_sender().subscribe(),
             ));
             Some(accumulator)
         } else {
             None
         };
 
-        // Commit ownership. Abort every spawned task on any failure so infinite
+        // Stage ownership. Abort every staged task on any failure so infinite
         // replayer/snapshot loops cannot outlive a rejected activation. The
         // BatchingLogger is owned by `runtime` and is not published to
-        // ACTIVE_SINK until commit succeeds; dropping `runtime` closes its
-        // channel. ACTIVE_SINK is published only after `self.runtime` is set.
+        // ACTIVE_SINK until commit succeeds; dropping `runtime` cancels its
+        // commit gate. ACTIVE_SINK is published only after `self.runtime` is set.
         let abort_tasks = |tasks: &mut Vec<tokio::task::JoinHandle<()>>| {
             for task in tasks.drain(..) {
                 task.abort();
@@ -935,6 +945,9 @@ impl Plugin for ApiChargebackSink {
         let Some(runtime) = self.runtime.get() else {
             return;
         };
+        // Release flush/replay/snapshot dormancy before publishing diagnostics
+        // so the live instance cannot appear active while workers are gated.
+        runtime.logger.commit();
         let current = active_sink().load_full();
         if current
             .as_ref()
@@ -2182,8 +2195,12 @@ fn start_spool_replayer(
     flush_config: ClickHouseFlushConfig,
     _batch_size: usize,
     replay_interval_secs: u64,
+    commit_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        if !wait_until_committed(commit_rx).await {
+            return;
+        }
         let mut timer = tokio::time::interval(Duration::from_secs(replay_interval_secs));
         loop {
             timer.tick().await;
@@ -2590,8 +2607,12 @@ fn start_snapshot_task(
     config: Arc<ApiChargebackSinkConfig>,
     node_id: Arc<str>,
     _namespace: String,
+    commit_rx: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        if !wait_until_committed(commit_rx).await {
+            return;
+        }
         let mut snapshot_timer =
             tokio::time::interval(Duration::from_secs(config.snapshot.interval_secs));
         let mut cleanup_timer =

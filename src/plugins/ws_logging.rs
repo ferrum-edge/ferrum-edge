@@ -42,7 +42,7 @@ use super::utils::log_schema::{
 };
 use super::utils::{
     BatchConfigDefaults, MAX_BATCH_SIZE, MAX_BUFFER_CAPACITY, PluginHttpClient,
-    validate_batch_config,
+    validate_batch_config, wait_until_committed,
 };
 use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
@@ -427,6 +427,8 @@ pub struct WsLogging {
     buffer_capacity: usize,
     pending_config: Mutex<Option<WsConfig>>,
     sender: OnceLock<mpsc::Sender<QueuedEntry>>,
+    /// Releases the staged flush/connect loop after PluginCache publication.
+    commit_tx: OnceLock<watch::Sender<bool>>,
     start_lock: Mutex<()>,
     schema: Option<Arc<SummarySchema>>,
     byte_budget: Arc<WsByteBudget>,
@@ -607,6 +609,7 @@ impl WsLogging {
             buffer_capacity,
             pending_config: Mutex::new(Some(ws_config)),
             sender: OnceLock::new(),
+            commit_tx: OnceLock::new(),
             start_lock: Mutex::new(()),
             schema,
             byte_budget: Arc::new(WsByteBudget::new(buffer_max_bytes)),
@@ -887,7 +890,7 @@ impl Plugin for WsLogging {
         })?;
 
         // Take pending config under the start lock. On any failure before the
-        // sender is published, restore it so activation remains retryable.
+        // sender is staged, restore it so activation remains retryable.
         let ws_config = {
             let mut pending = self
                 .pending_config
@@ -900,6 +903,17 @@ impl Plugin for WsLogging {
         };
 
         let (sender, receiver) = mpsc::channel(self.buffer_capacity);
+        let (commit_tx, commit_rx) = watch::channel(false);
+        // Under start_lock both OnceLocks are empty; set the commit gate first
+        // so a theoretical sender collision can still restore pending config.
+        if self.commit_tx.set(commit_tx).is_err() {
+            if let Ok(mut pending) = self.pending_config.lock() {
+                *pending = Some(ws_config);
+            }
+            return Err(
+                "ws_logging: commit gate already staged; refusing duplicate activation".to_string(),
+            );
+        }
         if self.sender.set(sender).is_err() {
             if let Ok(mut pending) = self.pending_config.lock() {
                 *pending = Some(ws_config);
@@ -909,10 +923,17 @@ impl Plugin for WsLogging {
                     .to_string(),
             );
         }
-        // Sender is published: Drop of WsLogging closes the channel and the
-        // flush loop exits. Config is intentionally consumed on success.
-        tokio::spawn(flush_loop(receiver, ws_config));
+        // Sender is staged: Drop of WsLogging closes the channel / commit gate
+        // and the flush loop exits without connect/flush side effects when
+        // commit never ran. Config is intentionally consumed on success.
+        tokio::spawn(flush_loop(receiver, ws_config, commit_rx));
         Ok(())
+    }
+
+    fn commit_background_tasks(&self) {
+        if let Some(commit_tx) = self.commit_tx.get() {
+            let _ = commit_tx.send(true);
+        }
     }
 
     fn requires_ws_disconnect_hooks(&self) -> bool {
@@ -941,7 +962,19 @@ impl Plugin for WsLogging {
 
 /// Background task that maintains a persistent WebSocket connection and
 /// flushes batched log entries as JSON text messages.
-async fn flush_loop(mut receiver: mpsc::Receiver<QueuedEntry>, cfg: WsConfig) {
+///
+/// Remains dormant until the owning PluginCache generation commits; dropping
+/// the commit sender without publication exits with no connect/flush work.
+async fn flush_loop(
+    mut receiver: mpsc::Receiver<QueuedEntry>,
+    cfg: WsConfig,
+    commit_rx: watch::Receiver<bool>,
+) {
+    if !wait_until_committed(commit_rx).await {
+        drop(receiver);
+        return;
+    }
+
     if cfg.endpoint_url.is_empty() {
         while receiver.recv().await.is_some() {}
         return;

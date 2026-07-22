@@ -807,6 +807,10 @@ impl Plugin for LokiLogging {
             })
     }
 
+    fn commit_background_tasks(&self) {
+        self.logger.commit();
+    }
+
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
         match self.schema.as_ref().filter(|s| s.applies_to_stream()) {
             Some(schema) => {

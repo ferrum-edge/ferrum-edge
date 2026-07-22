@@ -286,6 +286,7 @@ fn start_background_tasks(plugin: &JwksAuth) {
     plugin
         .start_background_tasks()
         .expect("test runtime should start JWKS tasks");
+    plugin.commit_background_tasks();
 }
 
 // ─── Basic Plugin Tests ────────────────────────────────────────────────

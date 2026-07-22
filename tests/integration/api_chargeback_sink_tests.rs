@@ -59,6 +59,7 @@ async fn clickhouse_insert_round_trip_when_configured() {
     plugin
         .start_background_tasks()
         .expect("chargeback live integration requires start_background_tasks");
+    plugin.commit_background_tasks();
     let mut metadata = HashMap::new();
     metadata.insert("request_id".to_string(), "it-request".to_string());
     let summary = TransactionSummary {

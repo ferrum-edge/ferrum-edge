@@ -748,11 +748,12 @@ transaction hook sequentially:
 
 Potentially slow sinks should use an explicitly bounded, plugin-owned handoff.
 Own the queue, worker, cancellation state, and retry budget in the plugin;
-start the worker from `start_background_tasks()` after cache acceptance; define
-queue-full behavior; and signal intake closure when the plugin is dropped. Do
-not spawn an unbounded task per transaction. Because `Drop` cannot await and
-runtime shutdown can still cancel a worker, durable delivery needs persistence
-or an external collector with an explicit drain protocol.
+stage the worker from `start_background_tasks()` (dormant until publication) and
+release it from `commit_background_tasks()` after atomic cache installation;
+define queue-full behavior; and signal intake closure when the plugin is
+dropped. Do not spawn an unbounded task per transaction. Because `Drop` cannot
+await and runtime shutdown can still cancel a worker, durable delivery needs
+persistence or an external collector with an explicit drain protocol.
 
 Relative ordering within the logging band (9000–9300) determines invocation
 order but otherwise does not change lifecycle phase semantics.

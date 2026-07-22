@@ -106,6 +106,7 @@ use uuid::Uuid;
 use crate::config::migrations::CustomPluginMigration;
 use crate::plugins::utils::{
     BatchConfig, BatchConfigDefaults, BatchingLogger, build_batch_config, validate_batch_config,
+    wait_until_committed,
 };
 use crate::plugins::{
     ALL_PROTOCOLS, Plugin, PluginHttpClient, ProxyProtocol, StreamTransactionSummary,
@@ -827,8 +828,12 @@ impl Plugin for ExampleAuditPlugin {
 
         let retention_pool = pool.clone();
         let retention_days = self.retention_days;
+        let retention_commit = logger.commit_sender().subscribe();
         let retention_task = runtime
             .spawn(async move {
+                if !wait_until_committed(retention_commit).await {
+                    return;
+                }
                 run_retention(retention_pool, dialect, retention_days).await;
             })
             .abort_handle();
@@ -838,6 +843,12 @@ impl Plugin for ExampleAuditPlugin {
         let _ = self.retention_task.set(retention_task);
 
         Ok(())
+    }
+
+    fn commit_background_tasks(&self) {
+        if let Some(logger) = self.logger.get() {
+            logger.commit();
+        }
     }
 
     /// Record each HTTP-family transaction. Buffered handlers await this hook;

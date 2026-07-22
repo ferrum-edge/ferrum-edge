@@ -283,6 +283,10 @@ impl Plugin for TcpLogging {
             })
     }
 
+    fn commit_background_tasks(&self) {
+        self.logger.commit();
+    }
+
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
         self.logger.try_send(summary.into());
     }

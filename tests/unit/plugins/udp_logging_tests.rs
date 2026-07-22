@@ -282,6 +282,7 @@ async fn test_udp_logging_stream_disconnect_does_not_panic() {
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     let summary = create_test_stream_transaction_summary();
 
     plugin.on_stream_disconnect(&summary).await;
@@ -304,6 +305,7 @@ async fn test_udp_logging_buffer_accepts_multiple_entries() {
     .unwrap();
     plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
     for _ in 0..100 {
         plugin.log(&summary).await;
@@ -327,6 +329,7 @@ async fn test_udp_logging_buffer_full_drops_gracefully() {
     .unwrap();
     plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
     // Send more entries than buffer_capacity — excess should be dropped
     for _ in 0..20 {
@@ -414,6 +417,7 @@ async fn test_udp_logging_custom_batch_config() {
     )
     .unwrap();
     plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
     assert_eq!(plugin.name(), "udp_logging");
 }
 
@@ -1062,6 +1066,7 @@ async fn test_udp_logging_plain_udp_dns_address_change_rebuilds_sender() {
     .expect("construct");
     plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
     poll_until(
@@ -1108,6 +1113,7 @@ async fn test_udp_logging_dtls_dns_address_change_rebuilds_association() {
     .expect("construct dtls logger");
     plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     // Force the first resolve through the one-shot hook so the bind port in
     // config cannot race with the DTLS server's ephemeral port.
     plugin.set_next_resolve_addr_for_test(addr_a);
@@ -1162,6 +1168,7 @@ async fn test_udp_logging_dtls_retains_association_when_replacement_handshake_fa
     .expect("construct dtls logger");
     plugin.start_background_tasks().expect("live start");
 
+    plugin.commit_background_tasks();
     plugin.set_next_resolve_addr_for_test(addr_a);
     let summary = create_test_transaction_summary();
     plugin.log(&summary).await;
