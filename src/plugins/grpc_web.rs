@@ -1423,9 +1423,8 @@ fn trailing_trailer_suffix_start(data: &[u8]) -> Option<usize> {
     let mut suffix_start: Option<usize> = None;
     while pos + 5 <= data.len() {
         let flag = data[pos];
-        let len =
-            u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
-                as usize;
+        let len = u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+            as usize;
         let frame_start = pos;
         pos += 5;
         if pos + len > data.len() {

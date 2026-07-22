@@ -1670,7 +1670,10 @@ fn test_truncate_trailing_trailer_frames_suffix_and_malformed() {
         frame.extend_from_slice(b"pong");
         frame
     };
-    let t1 = build_trailer_frame(&HashMap::from([("grpc-status".to_string(), "0".to_string())]));
+    let t1 = build_trailer_frame(&HashMap::from([(
+        "grpc-status".to_string(),
+        "0".to_string(),
+    )]));
     let t2 = build_trailer_frame(&HashMap::from([
         ("grpc-status".to_string(), "0".to_string()),
         ("request-id".to_string(), "a".to_string()),
@@ -1823,10 +1826,7 @@ fn test_mesh_sync_then_discard_matches_h2_parity() {
         Some("0"),
         "reserved terminal metadata remains until finalize"
     );
-    assert_eq!(
-        trailers.get("grpc-status").map(String::as_str),
-        Some("0")
-    );
+    assert_eq!(trailers.get("grpc-status").map(String::as_str), Some("0"));
     assert!(!trailers.contains_key("request-id"));
     assert!(!trailers.contains_key("x-shared"));
 
@@ -2185,10 +2185,9 @@ fn test_capture_bridged_trailer_split_fails_closed_on_corrupt_shadowed_payload()
         "not-valid-base64!!!".to_string(),
     );
 
-    let split = ferrum_edge::plugins::grpc_web::capture_bridged_trailer_split_for_policy(
-        &response_headers,
-    )
-    .expect("names provenance still present");
+    let split =
+        ferrum_edge::plugins::grpc_web::capture_bridged_trailer_split_for_policy(&response_headers)
+            .expect("names provenance still present");
 
     assert_eq!(
         split.trailers.get("grpc-status").map(String::as_str),
