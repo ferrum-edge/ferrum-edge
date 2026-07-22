@@ -1097,9 +1097,12 @@ pub fn negotiate_response_media_type(
         return Err(GrpcWebAcceptError::NotAcceptable);
     }
 
-    // Candidate representations are the request format in both wire modes plus
-    // every explicitly requested format. A refusal for one exact suffix must
-    // not poison another acceptable suffix in the same binary/text mode.
+    // Candidate representations are the request message format in both wire
+    // modes. Accept selects the wire encoding; Ferrum does not transcode the
+    // message payload between proto/json/thrift/custom formats. Treat an absent
+    // request suffix as the protocol's implicit `+proto`, while allowing an
+    // explicit Accept `+proto` to make that suffix visible on the response.
+    let request_effective_format = request.format_suffix.as_deref().unwrap_or("proto");
     let mut candidates = vec![
         GrpcWebMediaType {
             mode: GrpcWebMode::Binary,
@@ -1112,12 +1115,16 @@ pub fn negotiate_response_media_type(
     ];
     for range in &ranges {
         if let AcceptRangeKind::Exact(mode) = range.kind {
+            let candidate_suffix = range
+                .format_suffix
+                .clone()
+                .or_else(|| request.format_suffix.clone());
+            if candidate_suffix.as_deref().unwrap_or("proto") != request_effective_format {
+                continue;
+            }
             let candidate = GrpcWebMediaType {
                 mode,
-                format_suffix: range
-                    .format_suffix
-                    .clone()
-                    .or_else(|| request.format_suffix.clone()),
+                format_suffix: candidate_suffix,
             };
             if !candidates.contains(&candidate) {
                 candidates.push(candidate);

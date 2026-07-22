@@ -1459,7 +1459,7 @@ fn test_accept_negotiation_lists_weights_wildcards_and_suffixes() {
             Some(
                 "text/html, Application/Grpc-Web-Text+Thrift; level=1; Q=0.7, application/grpc-web+json;q=0.2",
             ),
-            "application/grpc-web-text+thrift",
+            "application/grpc-web+json",
         ),
         (
             "application/grpc-web+json",
@@ -1481,7 +1481,7 @@ fn test_accept_negotiation_lists_weights_wildcards_and_suffixes() {
         (
             "application/grpc-web+json",
             Some("application/grpc-web-text+proto;q=0.9, application/grpc-web-text+json;q=0.2"),
-            "application/grpc-web-text+proto",
+            "application/grpc-web-text+json",
         ),
     ] {
         assert_eq!(
@@ -1499,6 +1499,7 @@ fn test_accept_negotiation_lists_weights_wildcards_and_suffixes() {
         "application/grpc-web;q=broken",
         "application/grpc-web; note=\"unterminated",
         "text/html, application/grpc-website",
+        "application/grpc-web-text+thrift",
         "application/grpc-web;q=0, application/grpc-web-text;q=0, */*;q=0",
     ] {
         assert!(

@@ -3569,6 +3569,7 @@ On the response path, `grpc_web` embeds HTTP/2 trailers — `grpc-status`, `grpc
 
 - Absent or empty `Accept` defaults to the request `Content-Type`'s mode and message-format suffix.
 - Lists, parameters, quality values (`q=`), and wildcards (`*/*`, `application/*`) are honored; more specific entries override wildcards, and an explicit `q=0` refusal is not revived by `*`.
+- `Accept` selects binary versus text encoding but does not transcode message payloads. An exact media range with a different `+proto` / `+json` / `+thrift` / custom suffix is ineligible; the negotiated response preserves the request's effective message format (a missing suffix means `+proto`).
 - A present `Accept` that is structurally malformed, or that refuses every gRPC-Web representation the gateway can produce, fails closed with HTTP `406 Not Acceptable`.
 - Translated responses and gateway-generated gRPC-Web errors emit `Vary: Accept` (merged with any existing `Vary` value) so shared caches cannot mix binary, text, or message-format variants.
 - When `Accept` selects text while `Content-Type` is binary (or the reverse), request decoding and response encoding stay independent.
