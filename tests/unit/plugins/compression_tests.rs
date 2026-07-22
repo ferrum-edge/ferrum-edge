@@ -3189,10 +3189,7 @@ fn test_content_type_whitelist_exact_matching() {
             "application/octet-stream; profile=\"application/json\"",
             false,
         ),
-        (
-            "application/octet-stream; charset=application/json",
-            false,
-        ),
+        ("application/octet-stream; charset=application/json", false),
         // Malformed / empty media-type tokens fail closed.
         ("", false),
         ("; charset=utf-8", false),
@@ -3245,7 +3242,10 @@ fn test_custom_content_type_whitelist_exact_matching() {
         ("application/vnd.api+jsonish", false),
         ("text/csvp", false),
         // Parameter-only occurrences must not match.
-        ("application/octet-stream; profile=\"application/vnd.api+json\"", false),
+        (
+            "application/octet-stream; profile=\"application/vnd.api+json\"",
+            false,
+        ),
         // Standard JSON is NOT in the custom whitelist.
         ("application/json", false),
         ("application/json; charset=utf-8", false),
@@ -3361,10 +3361,5 @@ fn test_absent_content_type_fails_closed() {
     let ctx = make_ctx(Some("gzip"));
     let headers = HashMap::new();
 
-    assert!(!plugin.should_buffer_response_body_for_content_type(
-        &ctx,
-        None,
-        200,
-        &headers
-    ));
+    assert!(!plugin.should_buffer_response_body_for_content_type(&ctx, None, 200, &headers));
 }
