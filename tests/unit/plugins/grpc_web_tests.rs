@@ -37,6 +37,14 @@ fn grpc_web_trailer_payload(body: &[u8]) -> String {
     String::from_utf8(body[5..].to_vec()).unwrap()
 }
 
+fn trailing_grpc_web_trailer_payload(body: &[u8]) -> String {
+    let flag_pos = body
+        .iter()
+        .rposition(|byte| *byte == ferrum_edge::_test_support::GRPC_FRAME_TRAILER)
+        .expect("trailing gRPC-Web trailer frame");
+    grpc_web_trailer_payload(&body[flag_pos..])
+}
+
 // ── Plugin creation ──
 
 #[test]
@@ -1576,6 +1584,133 @@ fn test_sync_trailer_frame_refuses_malformed_draft_body() {
         )
     );
     assert_eq!(body, original);
+}
+
+/// H1/H2/H3 buffered gRPC-Web must sync the body trailer frame from the
+/// reconciled wire trailer map *before* retiring application trailers.
+///
+/// A properly framed DATA+TRAILER draft (the H3→H2 bridge shape) makes sync
+/// succeed; discarding first would leave only `grpc-status` and rebuild a
+/// sparse frame. Unframed backend bytes accidentally mask that ordering bug
+/// because truncate-then-sync fails closed and keeps the transform draft.
+#[test]
+fn test_sync_before_discard_preserves_custom_trailers_on_framed_body() {
+    let backend_headers = HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let backend_trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "abc-123\nabc-456".to_string()),
+        ("trace-proto-bin".to_string(), "AQID".to_string()),
+    ]);
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    plugin_view.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+
+    // Proper length-prefixed DATA frame + transform-phase trailer draft.
+    let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x04];
+    body.extend_from_slice(b"pong");
+    body.extend(ferrum_edge::_test_support::build_trailer_frame(&plugin_view));
+
+    let mut wire_trailers = backend_trailers.clone();
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        None,
+    );
+    assert!(
+        ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut body,
+            Some("application/grpc-web"),
+            &wire_trailers,
+            Some(200),
+        ),
+        "framed DATA+TRAILER draft must sync from reconciled trailers"
+    );
+    ferrum_edge::_test_support::discard_grpc_application_trailers_after_body_rewrite_for_test(
+        &mut plugin_view,
+        &mut wire_trailers,
+        &[],
+    );
+    assert_eq!(
+        wire_trailers.get("grpc-status").map(String::as_str),
+        Some("0")
+    );
+    assert!(!wire_trailers.contains_key("request-id"));
+
+    let payload = trailing_grpc_web_trailer_payload(&body);
+    assert!(
+        payload.contains("request-id: abc-123\r\n"),
+        "sync-before-discard must keep ASCII custom trailers: {payload}"
+    );
+    assert!(
+        payload.contains("request-id: abc-456\r\n"),
+        "sync-before-discard must keep duplicate ASCII trailers: {payload}"
+    );
+    assert!(
+        payload.contains("trace-proto-bin: AQID\r\n"),
+        "sync-before-discard must keep binary trailers: {payload}"
+    );
+}
+
+/// Inverse of [`test_sync_before_discard_preserves_custom_trailers_on_framed_body`]:
+/// discard-then-sync on a framed body is the exact H3 provenance-loss shape.
+#[test]
+fn test_discard_before_sync_on_framed_body_drops_custom_trailers() {
+    let backend_headers = HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let backend_trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "abc-123\nabc-456".to_string()),
+        ("trace-proto-bin".to_string(), "AQID".to_string()),
+    ]);
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    plugin_view.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+
+    let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x04];
+    body.extend_from_slice(b"pong");
+    body.extend(ferrum_edge::_test_support::build_trailer_frame(&plugin_view));
+
+    let mut wire_trailers = backend_trailers;
+    ferrum_edge::_test_support::discard_grpc_application_trailers_after_body_rewrite_for_test(
+        &mut plugin_view,
+        &mut wire_trailers,
+        &[],
+    );
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        None,
+    );
+    assert!(
+        ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut body,
+            Some("application/grpc-web"),
+            &wire_trailers,
+            Some(200),
+        )
+    );
+    let payload = trailing_grpc_web_trailer_payload(&body);
+    assert!(
+        payload.contains("grpc-status: 0\r\n"),
+        "reserved status must remain: {payload}"
+    );
+    assert!(
+        !payload.contains("request-id"),
+        "discard-before-sync must demonstrate custom-trailer loss on framed bodies: {payload}"
+    );
+    assert!(
+        !payload.contains("trace-proto-bin"),
+        "discard-before-sync must demonstrate binary-trailer loss on framed bodies: {payload}"
+    );
 }
 
 #[tokio::test]

@@ -22227,7 +22227,16 @@ async fn handle_proxy_request_inner(
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
                 }
 
-                let mut buffered_initial_response_header_policy_state = if !after_proxy_rejected {
+                // Take policy state for wire reconciliation after transforms.
+                // Retiring compatibility-view application trailers is deferred
+                // until after reconcile + gRPC-Web body-frame sync: discarding
+                // first leaves only reserved terminal keys, and sync would
+                // rebuild a sparse trailer frame that drops ASCII/binary custom
+                // metadata (the H3 framed-body failure mode).
+                let (
+                    mut buffered_initial_response_header_policy_state,
+                    defer_application_trailer_discard,
+                ) = if !after_proxy_rejected {
                     let phase_start = Instant::now();
                     // Keep buffered gRPC-Web conversion keyed to the original
                     // request when the hook-visible response headers are still
@@ -22275,30 +22284,23 @@ async fn handle_proxy_request_inner(
                             grpc_web_response_content_type.is_some();
                     }
                     response_body_rejected |= response_replaced;
-                    // Take policy state for wire reconciliation. Record genuine
-                    // transform-phase edits BEFORE retiring stale
-                    // compatibility-view trailers below. The discard removes
-                    // trailer-only names from the merged view; if it ran first, a
-                    // policy-owned initial header whose name the backend also
-                    // sent as a trailer would look like a later intentional
-                    // removal, and the policy would drop its desired value
-                    // instead of replaying it into initial HEADERS.
+                    // Record genuine transform-phase edits BEFORE later
+                    // trailer retirement. The discard removes trailer-only
+                    // names from the merged view; if it ran before this
+                    // recording, a policy-owned initial header whose name the
+                    // backend also sent as a trailer would look like a later
+                    // intentional removal.
                     let mut policy_state = ctx.take_buffered_initial_response_header_policy();
                     if let Some(policy_state) = policy_state.as_mut() {
                         Arc::make_mut(policy_state)
                             .record_later_response_header_mutations(&mut plugin_response_headers);
                     }
-                    if !response_replaced && representation_rewritten {
-                        grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
-                            &mut plugin_response_headers,
-                            &mut response_trailers,
-                            &header_shadowed_trailer_keys,
-                        );
-                    }
+                    let defer_application_trailer_discard =
+                        !response_replaced && representation_rewritten;
                     plugin_execution_ns += phase_start.elapsed().as_nanos() as u64;
-                    policy_state
+                    (policy_state, defer_application_trailer_discard)
                 } else {
-                    None
+                    (None, false)
                 };
 
                 if !after_proxy_rejected && !response_body_rejected {
@@ -22435,6 +22437,15 @@ async fn handle_proxy_request_inner(
                                 response_body.len().to_string(),
                             );
                         }
+                    }
+                    // Retire compatibility-view application trailers only after
+                    // the body frame has been synced from the reconciled map.
+                    if defer_application_trailer_discard {
+                        grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+                            &mut plugin_response_headers,
+                            &mut response_trailers,
+                            &header_shadowed_trailer_keys,
+                        );
                     }
                     response_headers = plugin_response_headers;
                 }

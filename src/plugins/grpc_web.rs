@@ -1215,8 +1215,11 @@ fn resolve_trailer_frame_value(
 /// frame built from already-reconciled wire trailers.
 ///
 /// Called after [`crate::proxy::grpc_proxy::reconcile_grpc_trailers_from_view`]
-/// so body-framed trailers match native H2/H3 policy semantics even when the
-/// transform-phase draft frame still saw the post-policy merged view.
+/// and *before* [`crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite`]
+/// so body-framed trailers match native H2/H3 policy semantics — including
+/// ASCII/binary custom metadata — even when the transform-phase draft frame
+/// still saw the post-policy merged view. Callers that discard application
+/// trailers first leave only reserved terminal keys and rebuild a sparse frame.
 pub fn sync_translated_body_trailer_frame_from_trailers(
     body: &mut Vec<u8>,
     content_type: Option<&str>,

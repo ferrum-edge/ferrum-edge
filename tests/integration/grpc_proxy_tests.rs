@@ -2236,8 +2236,14 @@ async fn start_grpc_backend_with_custom_trailer_fixture()
                         hyper::header::HeaderValue::from_static("Basic realm=backend"),
                     );
 
+                    // Emit a length-prefixed gRPC DATA frame (not raw bytes).
+                    // Unframed payloads make gRPC-Web trailer sync fail closed
+                    // and accidentally hide discard-before-sync regressions that
+                    // only surface on properly framed H3→H2 bridge bodies.
+                    let mut data_frame = vec![0x00, 0x00, 0x00, 0x00, 0x0c];
+                    data_frame.extend_from_slice(b"grpc-payload");
                     let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
-                        Ok(Frame::data(Bytes::from_static(b"grpc-payload"))),
+                        Ok(Frame::data(Bytes::from(data_frame))),
                         Ok(Frame::trailers(trailers)),
                     ];
                     let body = StreamBody::new(tokio_stream::iter(frames));

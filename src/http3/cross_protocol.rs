@@ -4764,22 +4764,18 @@ where
             }
             // Mirror the main buffered gRPC path: take policy state for wire
             // reconciliation and record genuine transform-phase edits before
-            // retiring stale compatibility-view trailers, so a policy-owned
-            // initial header the backend also sent as a trailer is not mistaken
-            // for a later intentional removal.
+            // later trailer retirement. Discarding application trailers here
+            // (before reconcile + gRPC-Web body-frame sync) would leave only
+            // reserved terminal keys and sync would rebuild a sparse frame
+            // that drops ASCII/binary custom metadata on properly framed
+            // H3→H2 bodies.
             let mut buffered_initial_response_header_policy_state =
                 ctx.take_buffered_initial_response_header_policy();
             if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
                 Arc::make_mut(policy_state)
                     .record_later_response_header_mutations(&mut plugin_response_headers);
             }
-            if representation_rewritten {
-                crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
-                    &mut plugin_response_headers,
-                    &mut response_trailers,
-                    &header_shadowed_trailer_keys,
-                );
-            }
+            let defer_application_trailer_discard = representation_rewritten;
             if !response_body_rejected {
                 for plugin in plugins.iter() {
                     let result = match crate::plugins::await_grpc_deadline(
@@ -4873,6 +4869,15 @@ where
                         response_body.len().to_string(),
                     );
                 }
+            }
+            // Retire compatibility-view application trailers only after the
+            // body frame has been synced from the reconciled map.
+            if defer_application_trailer_discard {
+                crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+                    &mut plugin_response_headers,
+                    &mut response_trailers,
+                    &header_shadowed_trailer_keys,
+                );
             }
             // Admission retains the pristine backend status; transaction
             // metadata follows the post-hook status that the H3 client sees.
