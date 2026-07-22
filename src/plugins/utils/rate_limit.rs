@@ -2485,10 +2485,8 @@ mod tests {
         let algorithm = TestAlgorithm {
             redis_ok: Arc::new(AtomicBool::new(true)),
         };
-        let local: LocalLimiter<String, TestAlgorithm> = LocalLimiter::new(
-            algorithm.clone(),
-            http_client.pool_shard_amount(),
-        );
+        let local: LocalLimiter<String, TestAlgorithm> =
+            LocalLimiter::new(algorithm.clone(), http_client.pool_shard_amount());
         let redis = test_redis_limiter(&http_client, algorithm);
 
         let _limiter = FailoverLimiter::new("rate_limiting", redis, local);
@@ -2730,8 +2728,9 @@ mod tests {
             .as_object_mut()
             .expect("object")
             .extend(redis.as_object().expect("object").clone());
-        let ai = crate::plugins::ai_rate_limiter::AiRateLimiter::new(&ai_config, http_client.clone())
-            .expect("ai_rate_limiter redis constructs");
+        let ai =
+            crate::plugins::ai_rate_limiter::AiRateLimiter::new(&ai_config, http_client.clone())
+                .expect("ai_rate_limiter redis constructs");
         assert_eq!(ai.local_map_shard_amount(), expected);
 
         let mut graphql_config = json!({
@@ -2769,8 +2768,9 @@ mod tests {
             .as_object_mut()
             .expect("object")
             .extend(redis.as_object().expect("object").clone());
-        let ws = crate::plugins::ws_rate_limiting::WsRateLimiting::new(&ws_config, http_client.clone())
-            .expect("ws_rate_limiting redis constructs");
+        let ws =
+            crate::plugins::ws_rate_limiting::WsRateLimiting::new(&ws_config, http_client.clone())
+                .expect("ws_rate_limiting redis constructs");
         assert_eq!(ws.local_map_shard_amount(), expected);
 
         let mut udp_config = json!({"datagrams_per_second": 100});
