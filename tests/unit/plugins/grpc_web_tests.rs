@@ -288,6 +288,7 @@ async fn test_accept_rejection_stays_http_406_and_internal_marker_is_consumed() 
     for accept in [
         "text/html",
         "application/grpc-web;q=bogus",
+        "application/grpc-web;q=broken",
         "application/grpc-web;q=0, application/grpc-web-text;q=0",
         "application/grpc-web-text; note=\"unterminated",
     ] {
@@ -1495,6 +1496,7 @@ fn test_accept_negotiation_lists_weights_wildcards_and_suffixes() {
         "application/grpc-web;q=-1",
         "application/grpc-web;q=0.1234",
         "application/grpc-web;q=0.5;q=0.4",
+        "application/grpc-web;q=broken",
         "application/grpc-web; note=\"unterminated",
         "text/html, application/grpc-website",
         "application/grpc-web;q=0, application/grpc-web-text;q=0, */*;q=0",

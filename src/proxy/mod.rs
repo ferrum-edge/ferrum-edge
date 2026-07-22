@@ -15406,15 +15406,13 @@ pub(crate) fn normalize_reject_response(
     headers: &HashMap<String, String>,
     is_grpc_request: bool,
 ) -> NormalizedRejectResponse {
-    let grpc_web_accept_rejected = headers.keys().any(|name| {
-        name.eq_ignore_ascii_case(crate::plugins::grpc_web::HEADER_GRPC_WEB_ACCEPT_REJECTED)
-    });
+    let grpc_web_accept_rejected =
+        crate::plugins::grpc_web::reject_headers_mark_accept_not_acceptable(headers);
     if !is_grpc_request || grpc_web_accept_rejected {
         let mut normalized_headers = headers
             .iter()
             .filter(|(name, _)| {
-                !name
-                    .eq_ignore_ascii_case(crate::plugins::grpc_web::HEADER_GRPC_WEB_ACCEPT_REJECTED)
+                !crate::plugins::grpc_web::is_internal_grpc_web_bridge_header(name)
             })
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect::<HashMap<_, _>>();

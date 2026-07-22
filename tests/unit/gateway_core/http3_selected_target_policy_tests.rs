@@ -672,6 +672,50 @@ async fn h3_reject_committed_timeout_selects_status_four_and_runs_remaining_hook
 }
 
 #[test]
+fn h3_grpc_web_accept_rejection_keeps_http_406_contract() {
+    let source = include_str!("../../../src/http3/server.rs");
+    let send_start = source
+        .find("async fn send_h3_grpc_web_reject_with_recv_halt(")
+        .expect("gRPC-Web reject sender must remain present");
+    let send_end = source[send_start..]
+        .find("pub(crate) async fn run_h3_reject_response_committed_hooks(")
+        .map(|offset| send_start + offset)
+        .expect("gRPC-Web sender must remain bounded");
+    let send = &source[send_start..send_end];
+    assert!(
+        send.contains("reject_headers_mark_accept_not_acceptable(")
+            && send.contains("normalize_reject_response("),
+        "H3 gRPC-Web reject sender must preserve Accept negotiation HTTP 406 via the shared normalizer"
+    );
+
+    let committed_start = source
+        .find("async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(")
+        .expect("bounded committed-hook helper must remain present");
+    let committed = &source[committed_start..];
+    let committed_end = committed
+        .find("async fn finalize_h3_upload_deadline_rejection(")
+        .expect("committed-hook helper boundary must remain present");
+    let committed = &committed[..committed_end];
+    assert!(
+        committed.contains("reject_headers_mark_accept_not_acceptable("),
+        "H3 committed reject observers must see Accept negotiation as HTTP 406, not gRPC-Web 200"
+    );
+
+    let log_start = source
+        .find("fn h3_reject_log_status_and_metadata(")
+        .expect("H3 reject log helper must remain present");
+    let log = &source[log_start..];
+    let log_end = log
+        .find("pub(crate) fn replace_buffered_h3_response_with_grpc_deadline(")
+        .expect("H3 reject log helper boundary must remain present");
+    let log = &log[..log_end];
+    assert!(
+        log.contains("reject_headers_mark_accept_not_acceptable("),
+        "H3 reject logging must keep Accept negotiation failures as HTTP 406"
+    );
+}
+
+#[test]
 fn h3_plugin_reject_commit_is_not_deferred_to_send_helpers() {
     let source = include_str!("../../../src/http3/server.rs");
     let send_start = source

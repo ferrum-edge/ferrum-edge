@@ -168,6 +168,20 @@ pub(crate) fn is_internal_grpc_web_bridge_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case(HEADER_GRPC_WEB_SHADOWED_TRAILERS)
         || name.eq_ignore_ascii_case(HEADER_GRPC_WEB_ACCEPT_REJECTED)
 }
+
+/// True when reject headers carry the Accept-negotiation failure marker.
+///
+/// Callers on H1/H2/H3 must keep that rejection as HTTP `406` JSON rather than
+/// rewriting it into an HTTP-200 gRPC / gRPC-Web status response.
+#[inline]
+pub(crate) fn reject_headers_mark_accept_not_acceptable(
+    headers: &std::collections::HashMap<String, String>,
+) -> bool {
+    headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case(HEADER_GRPC_WEB_ACCEPT_REJECTED))
+}
+
 /// Instance id (decimal) of the `grpc_web` instance that claimed translation
 /// for this request. Present only after a successful `on_request_received`
 /// claim — never inferred from plugin-writable client input.
