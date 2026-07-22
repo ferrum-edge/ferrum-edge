@@ -41,6 +41,12 @@ use crate::cni::rpc::{CniRpcRequest, CniRpcResponse};
 use crate::ebpf::NodeAgentMetrics;
 
 #[cfg(unix)]
+use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::time::Duration;
@@ -91,6 +97,11 @@ pub fn cni_work_channel() -> (CniWorkSender, CniWorkReceiver) {
 /// binary sees a structured error rather than the kubelet killing it.
 #[cfg(unix)]
 const MAIN_LOOP_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
+/// A legacy generation may predate the lifetime lock. Refuse to unlink its
+/// socket when a short local connect probe succeeds or cannot be resolved
+/// promptly; only a definitive refused/missing endpoint is stale.
+#[cfg(unix)]
+const CNI_SOCKET_OWNER_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Spawn the CNI Unix-socket listener.
 ///
@@ -98,10 +109,13 @@ const MAIN_LOOP_REPLY_TIMEOUT: Duration = Duration::from_secs(3);
 /// signaled. On every accept it forwards the parsed request to the main
 /// node-agent loop and pipes the answer back to the client.
 ///
-/// Pre-existing socket file at `socket_path` is removed before bind (we
-/// just restarted; an old socket file from a previous instance would
-/// make bind fail). Parent directory is created with mode 0755 if
-/// missing — installs that pre-create the dir do not change anything.
+/// A sibling advisory-lock file is held for the listener's entire lifetime.
+/// Startup refuses to evict a live owner; only after acquiring the lock does it
+/// remove a stale socket left by a crashed generation. Shutdown compares the
+/// published socket's device/inode identity before unlinking, so an older
+/// generation can never remove a replacement published at the same pathname.
+/// Parent directories are created when missing; installs that pre-create the
+/// directory do not change anything.
 #[cfg(unix)]
 pub fn spawn_cni_listener(
     socket_path: String,
@@ -110,13 +124,76 @@ pub fn spawn_cni_listener(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(err) = prepare_socket_path(&socket_path).await {
+        if let Err(err) = prepare_socket_parent(&socket_path).await {
             error!(
                 socket_path = %socket_path,
                 error = %err,
-                "Failed to prepare node-agent CNI socket path; CNI plugin path will fall back to kube-rs watcher"
+                reason = "ownership_io_error",
+                "Failed to prepare node-agent CNI socket parent; CNI plugin path will fall back to kube-rs watcher"
+            );
+            metrics.record_cni_socket_lifecycle(
+                crate::ebpf::CniSocketLifecycleReason::OwnershipIoError,
             );
             return;
+        }
+
+        // The lock file is deliberately retained on disk. Deleting it would
+        // let two processes lock different inodes for the same socket path.
+        // Closing `_ownership_lock` at task exit releases the kernel lock.
+        let _ownership_lock = match acquire_socket_ownership(&socket_path) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                metrics.record_cni_socket_lifecycle(
+                    crate::ebpf::CniSocketLifecycleReason::OwnershipConflict,
+                );
+                error!(
+                    socket_path = %socket_path,
+                    lock_path = %socket_ownership_lock_path(&socket_path).display(),
+                    reason = "ownership_conflict",
+                    "Another live node-agent owns the CNI socket; refusing to replace it and falling back to the kube-rs watcher"
+                );
+                return;
+            }
+            Err(err) => {
+                metrics.record_cni_socket_lifecycle(
+                    crate::ebpf::CniSocketLifecycleReason::OwnershipIoError,
+                );
+                error!(
+                    socket_path = %socket_path,
+                    lock_path = %socket_ownership_lock_path(&socket_path).display(),
+                    error = %err,
+                    reason = "ownership_io_error",
+                    "Failed to acquire node-agent CNI socket ownership; falling back to the kube-rs watcher"
+                );
+                return;
+            }
+        };
+
+        match prepare_socket_after_lock(&socket_path).await {
+            Ok(SocketPreparation::Ready) => {}
+            Ok(SocketPreparation::LiveLegacyOwner) => {
+                metrics.record_cni_socket_lifecycle(
+                    crate::ebpf::CniSocketLifecycleReason::OwnershipConflict,
+                );
+                error!(
+                    socket_path = %socket_path,
+                    reason = "ownership_conflict",
+                    "A live pre-lock node-agent still owns the CNI socket; refusing to evict it and falling back to the kube-rs watcher"
+                );
+                return;
+            }
+            Err(err) => {
+                error!(
+                    socket_path = %socket_path,
+                    error = %err,
+                    reason = "stale_socket_cleanup_error",
+                    "Failed to classify or remove stale node-agent CNI socket after acquiring ownership; CNI plugin path will fall back to kube-rs watcher"
+                );
+                metrics.record_cni_socket_lifecycle(
+                    crate::ebpf::CniSocketLifecycleReason::StaleSocketCleanupError,
+                );
+                return;
+            }
         }
 
         // bind() creates the socket inode world-reachable (mode 0777 & ~umask)
@@ -161,6 +238,22 @@ pub fn spawn_cni_listener(
             cleanup_private_socket_stage(&stage);
             return;
         }
+        let published_identity = match SocketIdentity::from_path(&stage.socket_path) {
+            Ok(identity) => identity,
+            Err(err) => {
+                metrics.record_cni_socket_lifecycle(
+                    crate::ebpf::CniSocketLifecycleReason::HandoffIdentityError,
+                );
+                error!(
+                    socket_path = %socket_path,
+                    error = %err,
+                    reason = "handoff_identity_error",
+                    "Failed to identify staged node-agent CNI socket; refusing publication"
+                );
+                cleanup_private_socket_stage(&stage);
+                return;
+            }
+        };
         if let Err(err) = std::fs::rename(&stage.socket_path, &socket_path) {
             error!(
                 socket_path = %socket_path,
@@ -171,6 +264,36 @@ pub fn spawn_cni_listener(
             return;
         }
         cleanup_private_socket_stage(&stage);
+        match SocketIdentity::from_path(&socket_path) {
+            Ok(current) if current == published_identity => {}
+            Ok(current) => {
+                metrics.record_cni_socket_lifecycle(
+                    crate::ebpf::CniSocketLifecycleReason::HandoffIdentityError,
+                );
+                error!(
+                    socket_path = %socket_path,
+                    expected_device = published_identity.device,
+                    expected_inode = published_identity.inode,
+                    actual_device = current.device,
+                    actual_inode = current.inode,
+                    reason = "handoff_identity_error",
+                    "Published CNI socket identity changed before verification; dropping the unnamed listener without unlinking the replacement"
+                );
+                return;
+            }
+            Err(err) => {
+                metrics.record_cni_socket_lifecycle(
+                    crate::ebpf::CniSocketLifecycleReason::HandoffIdentityError,
+                );
+                error!(
+                    socket_path = %socket_path,
+                    error = %err,
+                    reason = "handoff_identity_error",
+                    "Published CNI socket could not be verified; dropping the listener"
+                );
+                return;
+            }
+        }
         info!(
             socket_path = %socket_path,
             "Node-agent CNI listener bound; ferrum-cni binary may now forward ADD/DEL/CHECK calls"
@@ -216,12 +339,32 @@ pub fn spawn_cni_listener(
 
         info!(
             socket_path = %socket_path,
-            "Node-agent CNI listener shutting down; removing socket file"
+            "Node-agent CNI listener shutting down; checking socket ownership before cleanup"
         );
-        if let Err(err) = tokio::fs::remove_file(&socket_path).await
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(socket_path = %socket_path, error = %err, "Failed to remove CNI socket file on shutdown");
+        match remove_published_socket_if_owned(&socket_path, published_identity).await {
+            Ok(OwnedSocketCleanup::Removed | OwnedSocketCleanup::AlreadyMissing) => {}
+            Ok(OwnedSocketCleanup::ReplacementPreserved { current }) => {
+                info!(
+                    socket_path = %socket_path,
+                    owned_device = published_identity.device,
+                    owned_inode = published_identity.inode,
+                    current_device = current.device,
+                    current_inode = current.inode,
+                    reason = "replacement_preserved",
+                    "CNI socket path now belongs to another generation; preserving the replacement"
+                );
+            }
+            Err(err) => {
+                metrics.record_cni_socket_lifecycle(
+                    crate::ebpf::CniSocketLifecycleReason::ShutdownCleanupError,
+                );
+                warn!(
+                    socket_path = %socket_path,
+                    error = %err,
+                    reason = "shutdown_cleanup_error",
+                    "Failed to remove owned CNI socket file on shutdown"
+                );
+            }
         }
     })
 }
@@ -247,15 +390,174 @@ pub fn spawn_cni_listener(
 }
 
 #[cfg(unix)]
-async fn prepare_socket_path(socket_path: &str) -> std::io::Result<()> {
+async fn prepare_socket_parent(socket_path: &str) -> std::io::Result<()> {
     if let Some(parent) = Path::new(socket_path).parent()
         && !parent.as_os_str().is_empty()
     {
         tokio::fs::create_dir_all(parent).await?;
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn socket_ownership_lock_path(socket_path: &str) -> PathBuf {
+    PathBuf::from(format!("{socket_path}.lock"))
+}
+
+/// Acquire the stable, process-lifetime advisory lock for one configured CNI
+/// socket path. `Ok(None)` means another live Ferrum generation owns it.
+#[cfg(unix)]
+fn acquire_socket_ownership(socket_path: &str) -> std::io::Result<Option<File>> {
+    let lock_path = socket_ownership_lock_path(socket_path);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&lock_path)?;
+    let lock_metadata = file.metadata()?;
+    if !lock_metadata.file_type().is_file() || lock_metadata.nlink() != 1 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "CNI socket ownership lock '{}' must be a single-link regular file",
+                lock_path.display()
+            ),
+        ));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+
+    // SAFETY: `file` owns a valid descriptor for the lifetime of this call and
+    // is returned to the listener task on success, keeping the advisory lock
+    // alive until that task exits. `flock` does not access Rust-managed memory.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        return Ok(Some(file));
+    }
+    let error = std::io::Error::last_os_error();
+    let raw_error = error.raw_os_error();
+    if raw_error == Some(libc::EWOULDBLOCK) || raw_error == Some(libc::EAGAIN) {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SocketPreparation {
+    Ready,
+    LiveLegacyOwner,
+}
+
+/// Classify a pre-existing pathname only while the lifetime lock proves no
+/// cooperating generation owns it. A successful or inconclusive connect probe
+/// protects a live legacy (pre-lock) generation; only a definitive refused or
+/// missing endpoint is removed as stale.
+#[cfg(unix)]
+async fn prepare_socket_after_lock(socket_path: &str) -> std::io::Result<SocketPreparation> {
+    let metadata = match std::fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SocketPreparation::Ready);
+        }
+        Err(err) => return Err(err),
+    };
+
+    if metadata.file_type().is_socket() {
+        match timeout(
+            CNI_SOCKET_OWNER_PROBE_TIMEOUT,
+            UnixStream::connect(socket_path),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                return Ok(SocketPreparation::LiveLegacyOwner);
+            }
+            Err(_elapsed) => return Ok(SocketPreparation::LiveLegacyOwner),
+            Ok(Err(err))
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) => {}
+            Ok(Err(err)) => return Err(err),
+        }
+    }
+
     match tokio::fs::remove_file(socket_path).await {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(SocketPreparation::Ready),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(SocketPreparation::Ready),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SocketIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+impl SocketIdentity {
+    fn from_path(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let path = path.as_ref();
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_socket() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("'{}' is not a Unix socket", path.display()),
+            ));
+        }
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnedSocketCleanup {
+    Removed,
+    AlreadyMissing,
+    ReplacementPreserved { current: SocketIdentity },
+}
+
+#[cfg(unix)]
+async fn remove_published_socket_if_owned(
+    socket_path: &str,
+    owned: SocketIdentity,
+) -> std::io::Result<OwnedSocketCleanup> {
+    let current = match SocketIdentity::from_path(socket_path) {
+        Ok(identity) => identity,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(OwnedSocketCleanup::AlreadyMissing);
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidData => {
+            // A non-socket replacement is never ours. Report a sentinel
+            // identity in the structured log without following symlinks.
+            return Ok(OwnedSocketCleanup::ReplacementPreserved {
+                current: SocketIdentity {
+                    device: 0,
+                    inode: 0,
+                },
+            });
+        }
+        Err(err) => return Err(err),
+    };
+    if current != owned {
+        return Ok(OwnedSocketCleanup::ReplacementPreserved { current });
+    }
+
+    match tokio::fs::remove_file(socket_path).await {
+        Ok(()) => Ok(OwnedSocketCleanup::Removed),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(OwnedSocketCleanup::AlreadyMissing)
+        }
         Err(err) => Err(err),
     }
 }
@@ -541,6 +843,29 @@ mod tests {
     use crate::cni::rpc::{CniRpcRequest, RpcVerb};
     use std::collections::HashMap;
 
+    #[cfg(unix)]
+    async fn wait_for_socket(path: &Path) -> SocketIdentity {
+        for _ in 0..200 {
+            if let Ok(identity) = SocketIdentity::from_path(path) {
+                return identity;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("listener did not publish Unix socket '{}'", path.display());
+    }
+
+    #[cfg(unix)]
+    async fn stop_listener(
+        shutdown: tokio::sync::watch::Sender<bool>,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        let _ = shutdown.send(true);
+        tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("listener should stop promptly")
+            .expect("listener task should not panic");
+    }
+
     #[test]
     fn pod_event_from_request_strips_optional_fields() {
         let request = CniRpcRequest {
@@ -631,8 +956,150 @@ mod tests {
             "private staging directory must not linger after publish"
         );
 
-        let _ = shutdown_tx.send(true);
-        handle.abort();
+        stop_listener(shutdown_tx, handle).await;
+        assert!(!socket_path.exists(), "owned socket must be removed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_owner_conflict_is_refused_without_replacing_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("node-agent-cni.sock");
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
+        let (owner_work, _owner_rx) = cni_work_channel();
+        let owner_metrics = Arc::new(NodeAgentMetrics::default());
+        let (owner_shutdown, owner_shutdown_rx) = tokio::sync::watch::channel(false);
+        let owner = spawn_cni_listener(
+            socket_path_str.clone(),
+            owner_work,
+            owner_metrics,
+            owner_shutdown_rx,
+        );
+        let owner_identity = wait_for_socket(&socket_path).await;
+
+        let (contender_work, _contender_rx) = cni_work_channel();
+        let contender_metrics = Arc::new(NodeAgentMetrics::default());
+        let (_contender_shutdown, contender_shutdown_rx) = tokio::sync::watch::channel(false);
+        let contender = spawn_cni_listener(
+            socket_path_str,
+            contender_work,
+            contender_metrics.clone(),
+            contender_shutdown_rx,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), contender)
+            .await
+            .expect("conflicting listener must fail promptly")
+            .expect("conflicting listener task should not panic");
+
+        assert_eq!(SocketIdentity::from_path(&socket_path).unwrap(), owner_identity);
+        assert_eq!(
+            contender_metrics.snapshot().cni_socket_lifecycle
+                [crate::ebpf::CniSocketLifecycleReason::OwnershipConflict as usize],
+            1
+        );
+
+        stop_listener(owner_shutdown, owner).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_legacy_owner_without_lock_is_probed_and_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("node-agent-cni.sock");
+        let legacy = UnixListener::bind(&socket_path).expect("legacy listener bind");
+        let legacy_identity = SocketIdentity::from_path(&socket_path).unwrap();
+
+        let (work, _rx) = cni_work_channel();
+        let metrics = Arc::new(NodeAgentMetrics::default());
+        let (_shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let contender = spawn_cni_listener(
+            socket_path.to_string_lossy().to_string(),
+            work,
+            metrics.clone(),
+            shutdown_rx,
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), contender)
+            .await
+            .expect("legacy-owner probe must finish promptly")
+            .expect("contender task should not panic");
+
+        assert_eq!(
+            SocketIdentity::from_path(&socket_path).unwrap(),
+            legacy_identity,
+            "legacy live owner must not be unlinked"
+        );
+        assert_eq!(
+            metrics.snapshot().cni_socket_lifecycle
+                [crate::ebpf::CniSocketLifecycleReason::OwnershipConflict as usize],
+            1
+        );
+
+        drop(legacy);
+        std::fs::remove_file(&socket_path).expect("remove legacy test socket");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn old_generation_shutdown_preserves_replacement_socket_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("node-agent-cni.sock");
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
+        let (work, _rx) = cni_work_channel();
+        let metrics = Arc::new(NodeAgentMetrics::default());
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let old = spawn_cni_listener(socket_path_str.clone(), work, metrics, shutdown_rx);
+        let old_identity = wait_for_socket(&socket_path).await;
+
+        // Emulate an explicitly coordinated successor that has already
+        // published while the old listener still drains. It intentionally
+        // bypasses the lifetime lock so this test directly exercises the
+        // shutdown inode fence that protects such a handoff.
+        let stage = create_private_socket_stage(&socket_path_str).expect("replacement stage");
+        let replacement = UnixListener::bind(&stage.socket_path).expect("replacement bind");
+        set_socket_perms(&stage.socket_path).expect("replacement permissions");
+        let replacement_identity = SocketIdentity::from_path(&stage.socket_path).unwrap();
+        assert_ne!(replacement_identity, old_identity);
+        std::fs::rename(&stage.socket_path, &socket_path).expect("publish replacement");
+        cleanup_private_socket_stage(&stage);
+
+        stop_listener(shutdown, old).await;
+        assert_eq!(
+            SocketIdentity::from_path(&socket_path).unwrap(),
+            replacement_identity,
+            "old generation must not unlink the replacement"
+        );
+        let fresh = UnixStream::connect(&socket_path)
+            .await
+            .expect("fresh client must still connect to replacement");
+        drop(fresh);
+        drop(replacement);
+        std::fs::remove_file(&socket_path).expect("remove replacement test socket");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_unix_socket_is_recovered_after_ownership_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("node-agent-cni.sock");
+        let stale = std::os::unix::net::UnixListener::bind(&socket_path)
+            .expect("create stale Unix socket");
+        drop(stale);
+        SocketIdentity::from_path(&socket_path).expect("stale socket inode must remain");
+        let socket_path_str = socket_path.to_string_lossy().to_string();
+
+        let (work, _rx) = cni_work_channel();
+        let metrics = Arc::new(NodeAgentMetrics::default());
+        let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+        let listener = spawn_cni_listener(socket_path_str, work, metrics.clone(), shutdown_rx);
+        wait_for_socket(&socket_path).await;
+        assert_eq!(
+            metrics.snapshot().cni_socket_lifecycle
+                [crate::ebpf::CniSocketLifecycleReason::OwnershipConflict as usize],
+            0
+        );
+        stop_listener(shutdown, listener).await;
     }
 
     #[cfg(unix)]

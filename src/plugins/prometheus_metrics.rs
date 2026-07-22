@@ -2330,6 +2330,28 @@ impl MetricsRegistry {
                 &ns_label,
             );
 
+            output.push_str(
+                "# HELP ferrum_node_agent_cni_socket_lifecycle_total Node-agent CNI socket lifecycle failures by bounded reason.\n",
+            );
+            output.push_str("# TYPE ferrum_node_agent_cni_socket_lifecycle_total counter\n");
+            for reason in crate::ebpf::CniSocketLifecycleReason::all() {
+                let value = snapshot.cni_socket_lifecycle[reason as usize];
+                if ns_label.is_empty() {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_cni_socket_lifecycle_total{{reason=\"{}\"}} {}\n",
+                        reason.label(),
+                        value,
+                    ));
+                } else {
+                    output.push_str(&format!(
+                        "ferrum_node_agent_cni_socket_lifecycle_total{{reason=\"{}\"{}}} {}\n",
+                        reason.label(),
+                        ns_label,
+                        value,
+                    ));
+                }
+            }
+
             // Capture-state gauge — one hot label from a closed set. This is
             // the readiness/condition surface operators alert on; the
             // topology-degraded gauge below explains the first degradation

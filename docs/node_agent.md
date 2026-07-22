@@ -460,10 +460,21 @@ The Helm chart at `charts/ferrum-mesh/` ships an opt-in CNI installer init conta
 
 Manual install (no Helm): copy `ferrum-cni` to `/opt/cni/bin/` on every node, write a chained `.conflist` in `/etc/cni/net.d/` that preserves the primary CNI plugin/IPAM and appends Ferrum, ensure `/var/run/ferrum/` is writable, set `FERRUM_NODE_AGENT_CNI_ENABLED=true`. The default Unix socket path is `/var/run/ferrum/node-agent-cni.sock` (override via `FERRUM_NODE_AGENT_CNI_SOCKET_PATH`).
 
+The listener holds a sibling `<socket>.lock` advisory lock for its complete
+lifetime. A second live node-agent generation refuses to replace the active
+owner and continues with watcher reconciliation; after a crash, the kernel
+releases the lock and the next generation removes the stale socket before
+publishing. A short fail-closed connect probe also preserves a live socket from
+an older Ferrum version that predates the lock. Publication retains the
+socket's device/inode identity, and
+shutdown unlinks the well-known path only when it still names that identity,
+so a draining old generation cannot remove an explicitly coordinated
+replacement.
+
 ### Fallback semantics
 
 - **Default disabled.** `nodeAgent.cni.enabled=false` (chart) / `FERRUM_NODE_AGENT_CNI_ENABLED=false` (env) keeps the kube-rs watcher as the sole enrollment path. Existing operators upgrade with zero behavior change.
-- **Enabled but UDS unreachable.** If the listener fails to bind (permission error on the parent dir, port held by a stale process), the node-agent logs `error!` and continues running with the watcher path active. The CNI binary on the host will then fail every kubelet invocation with `IpcFailed`, and kubelet will eventually mark the pod creation as failed — at which point the operator must either fix the UDS or roll back the chained CNI config. The watcher path will still enroll already-scheduled pods.
+- **Enabled but UDS unreachable.** If the listener fails to bind (permission error on the parent dir or another live generation holds the ownership lock), the node-agent logs `error!` and continues running with the watcher path active. Stale socket files from crashed owners are recovered only after the new process acquires that lock. The CNI binary on the host will then fail every kubelet invocation with `IpcFailed`, and kubelet will eventually mark the pod creation as failed — at which point the operator must either fix the UDS or roll back the chained CNI config. The watcher path will still enroll already-scheduled pods.
 - **CNI plugin installed but node-agent not running.** Same effect as above: kubelet sees a CNI error and may delay sandbox setup. The watcher path is irrelevant here because the node-agent process is absent.
 - **CNI plugin enabled, node-agent running, watcher disabled.** Not a supported configuration. The watcher is the source of truth for enrollment; the CNI hook only acknowledges sandbox-setup events to close the race window.
 
@@ -491,6 +502,13 @@ The chart writes the file at a numeric prefix (`00-`) so kubelet selects the gen
 ### Observability
 
 `/metrics` exposes `ferrum_node_agent_cni_calls_total{verb,outcome}` with closed labels (`verb ∈ {add,del,check}`, `outcome ∈ {success,rejected,error}`). Bounded cardinality (9 series at most). Reset on process restart. Operators use this to confirm the CNI plugin is the primary enrollment path (`success` rate climbs) versus the watcher fallback (`success` rate stays at 0 even though pods are enrolled).
+
+Socket lifecycle failures use
+`ferrum_node_agent_cni_socket_lifecycle_total{reason}` with the closed reasons
+`ownership_conflict`, `ownership_io_error`, `stale_socket_cleanup_error`,
+`handoff_identity_error`, and `shutdown_cleanup_error`. The corresponding
+structured log carries the same `reason`; an ownership conflict is an explicit
+startup refusal, not stale-file recovery.
 
 ### Deferred follow-ups (not in scope for this PR)
 

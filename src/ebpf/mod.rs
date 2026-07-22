@@ -291,6 +291,10 @@ pub struct NodeAgentMetrics {
     /// kube-rs watcher fallback is doing all the work. Read by the
     /// Prometheus render path and reset only on process restart.
     pub cni_calls: [[AtomicU64; 3]; 3],
+    /// CNI socket lifecycle failures split by a closed reason set. These
+    /// process-lifetime counters distinguish a refused live-owner overlap from
+    /// stale cleanup, publication identity, and shutdown cleanup failures.
+    pub cni_socket_lifecycle: [AtomicU64; 5],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,6 +311,9 @@ pub struct NodeAgentMetricsSnapshot {
     /// (`add`/`del`/`check`); the inner axis is outcome
     /// (`success`/`rejected`/`error`).
     pub cni_calls: [[u64; 3]; 3],
+    /// Snapshot of [`NodeAgentMetrics::cni_socket_lifecycle`], indexed by
+    /// [`CniSocketLifecycleReason`].
+    pub cni_socket_lifecycle: [u64; 5],
 }
 
 /// Closed set of verbs tracked by [`NodeAgentMetrics::cni_calls`].
@@ -356,6 +363,39 @@ impl CniCallOutcome {
     }
 }
 
+/// Closed reasons for node-agent CNI socket lifecycle failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+pub enum CniSocketLifecycleReason {
+    OwnershipConflict = 0,
+    OwnershipIoError = 1,
+    StaleSocketCleanupError = 2,
+    HandoffIdentityError = 3,
+    ShutdownCleanupError = 4,
+}
+
+impl CniSocketLifecycleReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OwnershipConflict => "ownership_conflict",
+            Self::OwnershipIoError => "ownership_io_error",
+            Self::StaleSocketCleanupError => "stale_socket_cleanup_error",
+            Self::HandoffIdentityError => "handoff_identity_error",
+            Self::ShutdownCleanupError => "shutdown_cleanup_error",
+        }
+    }
+
+    pub fn all() -> [Self; 5] {
+        [
+            Self::OwnershipConflict,
+            Self::OwnershipIoError,
+            Self::StaleSocketCleanupError,
+            Self::HandoffIdentityError,
+            Self::ShutdownCleanupError,
+        ]
+    }
+}
+
 impl NodeAgentMetrics {
     pub fn snapshot(&self) -> NodeAgentMetricsSnapshot {
         let mut cni_calls = [[0u64; 3]; 3];
@@ -364,6 +404,11 @@ impl NodeAgentMetrics {
                 cni_calls[verb as usize][outcome as usize] =
                     self.cni_calls[verb as usize][outcome as usize].load(Ordering::Relaxed);
             }
+        }
+        let mut cni_socket_lifecycle = [0u64; 5];
+        for reason in CniSocketLifecycleReason::all() {
+            cni_socket_lifecycle[reason as usize] =
+                self.cni_socket_lifecycle[reason as usize].load(Ordering::Relaxed);
         }
         NodeAgentMetricsSnapshot {
             pods_enrolled: self.pods_enrolled.load(Ordering::Relaxed),
@@ -378,6 +423,7 @@ impl NodeAgentMetrics {
             topology_degraded_reason: *self.topology_degraded_reason.load_full().as_ref(),
             capture_state: self.capture_state.load_full().as_ref(),
             cni_calls,
+            cni_socket_lifecycle,
         }
     }
 
@@ -412,6 +458,10 @@ impl NodeAgentMetrics {
     pub fn record_cni_call(&self, verb: CniCallVerb, outcome: CniCallOutcome) {
         self.cni_calls[verb as usize][outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn record_cni_socket_lifecycle(&self, reason: CniSocketLifecycleReason) {
+        self.cni_socket_lifecycle[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 impl Default for NodeAgentMetrics {
@@ -428,6 +478,13 @@ impl Default for NodeAgentMetrics {
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            ],
+            cni_socket_lifecycle: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
             ],
         }
     }
