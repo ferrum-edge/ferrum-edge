@@ -281,8 +281,8 @@ async fn password_ref_rejects_disabled_tls_verification() {
 
 /// Issue #2627: OpenAPI must reject the same required/cross-field failures the
 /// constructor rejects, and admit each minimal valid pricing shape.
-#[test]
-fn openapi_schema_matches_runtime_admission_boundaries() {
+#[tokio::test]
+async fn openapi_schema_matches_runtime_admission_boundaries() {
     use ferrum_edge::plugins::validate_plugin_config;
 
     let spec: Value =
@@ -499,8 +499,7 @@ fn openapi_schema_matches_runtime_admission_boundaries() {
         "inverted retry bounds remain schema-admitted when OpenAPI cannot compare fields"
     );
     let retry_err = validate_plugin_config("api_chargeback_sink", &inverted_retry)
-        .err()
-        .expect("inverted retry bounds must fail runtime admission");
+        .expect_err("inverted retry bounds must fail runtime admission");
     assert!(
         retry_err.contains("retry.max_delay_ms must be >= retry.initial_delay_ms"),
         "unexpected retry admission error: {retry_err}"
