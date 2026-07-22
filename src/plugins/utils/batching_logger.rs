@@ -301,6 +301,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
     }
 
     /// Whether [`Self::commit`] has already released this worker.
+    #[allow(dead_code)] // External lifecycle tests observe pre/post-publication state.
     pub fn is_committed(&self) -> bool {
         self.committed.load(Ordering::Acquire)
     }
@@ -483,10 +484,12 @@ impl<T: Send + 'static> DeferredBatchingLogger<T> {
         }
     }
 
+    #[allow(dead_code)] // External lifecycle tests observe staged activation.
     pub fn is_started(&self) -> bool {
         self.logger.get().is_some()
     }
 
+    #[allow(dead_code)] // Test/support consumers inspect the staged logger directly.
     pub fn get(&self) -> Option<&BatchingLogger<T>> {
         self.logger.get()
     }
@@ -555,6 +558,7 @@ impl<T: Send + 'static> DeferredBatchingLogger<T> {
     }
 
     /// Whether the staged logger has been released by [`Self::commit`].
+    #[allow(dead_code)] // External lifecycle tests observe pre/post-publication state.
     pub fn is_committed(&self) -> bool {
         self.logger.get().is_some_and(BatchingLogger::is_committed)
     }
