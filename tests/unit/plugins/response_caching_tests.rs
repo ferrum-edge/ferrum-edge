@@ -1768,19 +1768,19 @@ async fn test_if_none_match_returns_304_from_cache() {
 async fn test_if_none_match_parses_entity_tag_lists_without_partial_matches() {
     let plugin = default_plugin();
     let cases = [
-        (
-            "quoted comma",
-            r#""alpha,beta""#,
-            r#""alpha,beta""#,
-            true,
-        ),
+        ("quoted comma", r#""alpha,beta""#, r#""alpha,beta""#, true),
         (
             "quoted comma in list",
             r#""other", "alpha,beta", W/"last""#,
             r#""alpha,beta""#,
             true,
         ),
-        ("weak comparison", r#"W/"alpha,beta""#, r#""alpha,beta""#, true),
+        (
+            "weak comparison",
+            r#"W/"alpha,beta""#,
+            r#""alpha,beta""#,
+            true,
+        ),
         ("wildcard", " \t*\t ", r#""alpha,beta""#, true),
         (
             "optional whitespace",
