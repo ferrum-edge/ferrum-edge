@@ -116,6 +116,8 @@ where
 {
     algorithm: A,
     state: DashMap<K, A::State>,
+    #[cfg(test)]
+    shard_amount: usize,
 }
 
 impl<K, A> LocalLimiter<K, A>
@@ -133,6 +135,8 @@ where
         Self {
             algorithm,
             state: DashMap::with_shard_amount(shard_amount),
+            #[cfg(test)]
+            shard_amount,
         }
     }
 
@@ -192,8 +196,7 @@ where
     /// production builds do not expose limiter debug state.
     #[cfg(test)]
     pub fn shard_amount(&self) -> usize {
-        use dashmap::Map;
-        self.state._shard_count()
+        self.shard_amount
     }
 }
 
