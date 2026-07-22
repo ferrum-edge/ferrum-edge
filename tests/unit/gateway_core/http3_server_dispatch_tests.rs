@@ -924,7 +924,8 @@ fn h3_native_and_cross_protocol_cancel_writers_use_post_deadline_grace() {
         final_reject
             .matches("abort_response_stream(stream)")
             .count(),
-        3
+        6,
+        "each terminal-deadline branch must abort on both write failure and grace expiry"
     );
     let timed_out = cross
         .split("Err(super::server::H3RequestBodyReadError::TimedOut) => {")
