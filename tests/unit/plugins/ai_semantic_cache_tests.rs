@@ -3470,15 +3470,17 @@ async fn provider_family_semantic_hit_and_instruction_isolation() {
 #[tokio::test]
 async fn messages_semantic_scope_isolates_tool_state_and_native_controls() {
     let mock_server = MockServer::start().await;
-    // One embedding for the staged base entry plus one for each of the five
+    // One embedding for the staged base entry plus one for each of the seven
     // deliberately isolated variants below.
-    mount_embedding_mock(&mock_server, 6).await;
+    mount_embedding_mock(&mock_server, 8).await;
     let plugin = make_plugin(semantic_config(&mock_server));
 
     let base = json!({
         "model": "gpt-4.1",
         "max_completion_tokens": 32,
+        "top_k": 4,
         "stop_sequences": ["END"],
+        "toolConfig": {"tools": [{"toolSpec": {"name": "lookup"}}]},
         "messages": [
             {
                 "role": "assistant",
@@ -3519,6 +3521,12 @@ async fn messages_semantic_scope_isolates_tool_state_and_native_controls() {
     let mut changed_stop = base.clone();
     changed_stop["stop_sequences"] = json!(["STOP"]);
     variants.push(changed_stop);
+    let mut changed_top_k = base.clone();
+    changed_top_k["top_k"] = json!(40);
+    variants.push(changed_top_k);
+    let mut changed_tool_config = base.clone();
+    changed_tool_config["toolConfig"]["tools"][0]["toolSpec"]["name"] = json!("search");
+    variants.push(changed_tool_config);
 
     for variant in variants {
         assert!(

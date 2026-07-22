@@ -147,6 +147,7 @@ const CLEANUP_INTERVAL_SECONDS: u64 = 30;
 const RESPONSE_SHAPE_FIELDS: &[&str] = &[
     "tools",
     "tool_choice",
+    "toolConfig",
     "response_format",
     "seed",
     "logit_bias",
@@ -1242,6 +1243,7 @@ fn append_family_generation_controls(
                 }
             }
             if matches!(family, CacheRequestFamily::Messages) {
+                append_json_field(body, "top_k", key_input, has_part);
                 append_json_field(body, "inferenceConfig", key_input, has_part);
             }
             if matches!(family, CacheRequestFamily::Cohere) {
