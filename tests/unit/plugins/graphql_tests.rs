@@ -169,6 +169,14 @@ fn test_graphql_accepts_closed_redis_and_named_operation_shapes() {
             "redis_health_check_interval_seconds": 1
         }),
         json!({
+            "type_rate_limits": {
+                "query": { "max_requests": 10, "window_seconds": 60 }
+            },
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_connect_timeout_seconds": 5
+        }),
+        json!({
             "max_depth": 5,
             "sync_mode": "local",
             "redis_url": "redis://cache.internal:6379/0",

@@ -578,6 +578,23 @@ async fn test_rate_limiting_warmup_hostnames_for_redis() {
     );
 }
 
+#[test]
+fn test_rate_limiting_accepts_redis_connect_timeout_above_one_second() {
+    // Issue #2310: values above the redis-rs 1s default must remain admissible
+    // and flow into the shared Redis client.
+    let plugin = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "sync_mode": "redis",
+        "redis_url": "redis://cache.internal:6379/0",
+        "redis_connect_timeout_seconds": 5
+    }));
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["cache.internal".to_string()]
+    );
+}
+
 #[tokio::test]
 async fn test_rate_limiting_different_ips_independent() {
     let config = json!({

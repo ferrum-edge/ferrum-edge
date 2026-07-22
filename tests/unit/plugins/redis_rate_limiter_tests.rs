@@ -1,6 +1,15 @@
-use ferrum_edge::_test_support::{RedisConfig, redis_client_credentials, redis_config_url_with_ip};
+use ferrum_edge::_test_support::{
+    RedisConfig, redis_client_credentials, redis_config_url_with_ip,
+    redis_rate_limit_client_for_test,
+};
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 
 fn make_config(url: &str, tls: bool) -> RedisConfig {
     RedisConfig {
@@ -224,4 +233,194 @@ fn test_from_plugin_config_parses_valid_redis_mode() {
     assert_eq!(config.health_check_interval_seconds, 3);
     assert_eq!(config.username.as_deref(), Some("svc"));
     assert_eq!(config.password.as_deref(), Some("secret"));
+}
+
+// ── Connection-attempt timeout wiring (issue #2310) ───────────────────────
+//
+// redis-rs 1.2.1 defaults ConnectionManager/AsyncConnectionConfig timeouts to
+// one second. Ferrum must install `redis_connect_timeout_seconds` into those
+// inner configs so values above one second are effective. Assertions below are
+// outcome-based (success/failure / config equality), not wall-clock ranges.
+
+#[test]
+fn connect_timeout_is_installed_into_redis_manager_config_above_and_below_one_second() {
+    for seconds in [1_u64, 2, 5, 30] {
+        let mut config = make_config("redis://127.0.0.1:6379/0", false);
+        config.connect_timeout_seconds = seconds;
+        let client = redis_rate_limit_client_for_test(config);
+        assert_eq!(
+            client.connection_timeout_for_test(),
+            Duration::from_secs(seconds)
+        );
+        assert_eq!(
+            client.connection_manager_timeout_for_test(),
+            Some(Duration::from_secs(seconds)),
+            "inner ConnectionManagerConfig must carry Ferrum timeout ({seconds}s), not the crate 1s default"
+        );
+    }
+}
+
+/// Accept TCP, optionally delay, then answer every RESP array command with +OK.
+///
+/// Used to simulate a Redis endpoint whose protocol handshake is delayed after
+/// TCP accept (the failure mode in issue #2310).
+async fn spawn_delayed_redis_handshake_server(
+    handshake_delay: Option<Duration>,
+) -> (u16, oneshot::Sender<()>, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("local_addr").port();
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let accepts_task = Arc::clone(&accepts);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                accepted = listener.accept() => {
+                    let Ok((mut stream, _)) = accepted else { break; };
+                    accepts_task.fetch_add(1, Ordering::Relaxed);
+                    let delay = handshake_delay;
+                    tokio::spawn(async move {
+                        if let Some(delay) = delay {
+                            tokio::time::sleep(delay).await;
+                        }
+                        let mut buf = vec![0_u8; 4096];
+                        loop {
+                            match stream.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    // Rough RESP command count: each top-level array
+                                    // begins with '*'. Enough for CLIENT SETINFO pipelines.
+                                    let commands = buf[..n].iter().filter(|&&b| b == b'*').count().max(1);
+                                    let mut reply = Vec::new();
+                                    for _ in 0..commands {
+                                        reply.extend_from_slice(b"+OK\r\n");
+                                    }
+                                    if stream.write_all(&reply).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    (port, shutdown_tx, accepts)
+}
+
+#[tokio::test]
+async fn connect_timeout_above_one_second_allows_delayed_redis_handshake() {
+    // Handshake completes after >1s. With the buggy crate default (1s) this
+    // fails; with Ferrum's configured 5s inner timeout it must succeed.
+    let (port, shutdown, _accepts) =
+        spawn_delayed_redis_handshake_server(Some(Duration::from_millis(1500))).await;
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 5;
+    config.health_check_interval_seconds = 60;
+    let client = redis_rate_limit_client_for_test(config);
+
+    assert!(
+        client.connect_cached_for_test().await,
+        "cached path must honor redis_connect_timeout_seconds > 1s"
+    );
+
+    // Fresh client for dedicated path (cached manager is already warm).
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 5;
+    config.health_check_interval_seconds = 60;
+    let dedicated = redis_rate_limit_client_for_test(config);
+    assert!(
+        dedicated.connect_dedicated_for_test().await,
+        "dedicated path must honor redis_connect_timeout_seconds > 1s"
+    );
+
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 5;
+    config.health_check_interval_seconds = 60;
+    let health = redis_rate_limit_client_for_test(config);
+    assert!(
+        health.health_check_connect_for_test().await,
+        "health-check path must honor redis_connect_timeout_seconds > 1s"
+    );
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn connect_timeout_of_one_second_fails_closed_on_hung_handshake() {
+    // Accept, then delay the Redis protocol reply far beyond the configured
+    // timeout. A 1s Ferrum timeout must fail closed on every path. Outcomes
+    // only — no elapsed-time assertions.
+    let (port, shutdown, accepts) =
+        spawn_delayed_redis_handshake_server(Some(Duration::from_secs(30))).await;
+
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 1;
+    config.health_check_interval_seconds = 60;
+    let client = redis_rate_limit_client_for_test(config);
+    assert!(
+        !client.connect_cached_for_test().await,
+        "cached path must fail closed when handshake exceeds 1s timeout"
+    );
+    assert!(
+        !client.is_available(),
+        "failed connect must mark Redis unavailable for local fallback"
+    );
+    assert!(
+        accepts.load(Ordering::Relaxed) >= 1,
+        "server must have accepted at least one dial attempt"
+    );
+
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 1;
+    config.health_check_interval_seconds = 60;
+    let dedicated = redis_rate_limit_client_for_test(config);
+    assert!(
+        !dedicated.connect_dedicated_for_test().await,
+        "dedicated path must fail closed when handshake exceeds 1s timeout"
+    );
+
+    let mut config = make_config(&format!("redis://127.0.0.1:{port}/0"), false);
+    config.connect_timeout_seconds = 1;
+    config.health_check_interval_seconds = 60;
+    let health = redis_rate_limit_client_for_test(config);
+    assert!(
+        !health.health_check_connect_for_test().await,
+        "health-check path must fail closed when handshake exceeds 1s timeout"
+    );
+
+    let _ = shutdown.send(());
+}
+
+#[test]
+fn plugin_consumers_parse_connect_timeout_above_one_second() {
+    // rate_limiting / graphql / grpc_method_router all share RedisConfig parsing.
+    // Prove each consumer's documented default prefix + a >1s timeout parses.
+    for (prefix, seconds) in [
+        ("ferrum:rate_limiting", 5_u64),
+        ("ferrum:graphql", 2_u64),
+        ("ferrum:grpc_method_router", 10_u64),
+    ] {
+        let config = RedisConfig::from_plugin_config(
+            &json!({
+                "sync_mode": "redis",
+                "redis_url": "redis://127.0.0.1:6379/0",
+                "redis_connect_timeout_seconds": seconds,
+            }),
+            prefix,
+        )
+        .expect("parse")
+        .expect("redis mode");
+        assert_eq!(config.connect_timeout_seconds, seconds);
+        assert_eq!(config.key_prefix, prefix);
+        let client = redis_rate_limit_client_for_test(config);
+        assert_eq!(
+            client.connection_manager_timeout_for_test(),
+            Some(Duration::from_secs(seconds))
+        );
+    }
 }

@@ -672,6 +672,28 @@ fn test_warmup_hostnames_for_redis() {
     );
 }
 
+#[test]
+fn test_accepts_redis_connect_timeout_above_one_second() {
+    // Issue #2310: values above the redis-rs 1s default must remain admissible.
+    let plugin = create_plugin(
+        "grpc_method_router",
+        &json!({
+            "method_rate_limits": {
+                "/svc/M": { "max_requests": 5, "window_seconds": 60 }
+            },
+            "sync_mode": "redis",
+            "redis_url": "redis://cache.internal:6379/0",
+            "redis_connect_timeout_seconds": 5
+        }),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        plugin.warmup_hostnames(),
+        vec!["cache.internal".to_string()]
+    );
+}
+
 // ── Constructor validation: rate-limit specs ──
 
 #[test]

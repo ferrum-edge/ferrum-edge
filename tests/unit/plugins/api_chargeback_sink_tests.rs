@@ -265,6 +265,248 @@ async fn password_ref_requires_https_clickhouse_url() {
 }
 
 #[tokio::test]
+async fn password_ref_rejects_disabled_tls_verification() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!("https://localhost:8443");
+    config["clickhouse"]["password_ref"] = json!("FERRUM_CLICKHOUSE_PASSWORD");
+    config["clickhouse"]["tls"] = json!({ "insecure_skip_verify": true });
+
+    let error = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+        Ok(_) => panic!("password_ref with insecure_skip_verify should be rejected"),
+        Err(error) => error,
+    };
+    assert!(error.contains("password_ref cannot be used when ClickHouse TLS"));
+}
+
+/// Issue #2627: OpenAPI must reject the same required/cross-field failures the
+/// constructor rejects, and admit each minimal valid pricing shape.
+#[tokio::test]
+async fn openapi_schema_matches_runtime_admission_boundaries() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let spec: Value =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let sink_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/ApiChargebackSinkConfig",
+        "components": spec["components"].clone()
+    });
+    let sink_validator = jsonschema::draft202012::options()
+        .build(&sink_schema)
+        .expect("ApiChargebackSinkConfig schema compiles");
+    let plugin_schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$ref": "#/components/schemas/PluginConfig",
+        "components": spec["components"].clone()
+    });
+    let plugin_validator = jsonschema::draft202012::options()
+        .build(&plugin_schema)
+        .expect("PluginConfig schema compiles");
+
+    // Disable the default on-disk spool so runtime admission does not depend on
+    // creating /var/lib/ferrum/chargeback-spool in the unit-test environment.
+    let minimal_pricing_shapes = [
+        json!({
+            "clickhouse": { "url": "https://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+        }),
+        json!({
+            "clickhouse": { "url": "https://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "bandwidth_pricing": {"price_per_byte_sent": 0.000001}
+        }),
+        json!({
+            "clickhouse": { "url": "https://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "bandwidth_pricing": {"price_per_byte_received": 0.000002}
+        }),
+        json!({
+            "clickhouse": { "url": "https://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "stream_connection_pricing": {"price_per_connection": 0.1}
+        }),
+        json!({
+            "clickhouse": {
+                "url": "http://clickhouse.example:8123",
+                "password_ref": "   "
+            },
+            "spool": { "enabled": false },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+        }),
+        json!({
+            "clickhouse": { "url": "HTTPS://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+        }),
+    ];
+    for config in &minimal_pricing_shapes {
+        assert!(
+            sink_validator.validate(config).is_ok(),
+            "minimal pricing shape should be schema-valid: {config}"
+        );
+        assert!(
+            validate_plugin_config("api_chargeback_sink", config).is_ok(),
+            "minimal pricing shape should pass runtime admission: {config}"
+        );
+    }
+
+    let missing_config_entry = json!({
+        "plugin_name": "api_chargeback_sink",
+        "scope": "global",
+        "enabled": true
+    });
+    assert!(
+        plugin_validator.validate(&missing_config_entry).is_err(),
+        "PluginConfig must require config for api_chargeback_sink"
+    );
+    let complete_entry = json!({
+        "plugin_name": "api_chargeback_sink",
+        "scope": "global",
+        "enabled": true,
+        "config": {
+            "clickhouse": { "url": "https://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+        }
+    });
+    assert!(
+        plugin_validator.validate(&complete_entry).is_ok(),
+        "PluginConfig must accept a runtime-valid api_chargeback_sink entry"
+    );
+
+    let schema_and_runtime_invalid = [
+        (
+            "missing clickhouse",
+            json!({
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        ("empty config object", json!({})),
+        (
+            "clickhouse without pricing",
+            json!({
+                "clickhouse": { "url": "https://clickhouse.example:8443" },
+                "spool": { "enabled": false }
+            }),
+        ),
+        (
+            "zero-only bandwidth pricing",
+            json!({
+                "clickhouse": { "url": "https://clickhouse.example:8443" },
+                "spool": { "enabled": false },
+                "bandwidth_pricing": {
+                    "price_per_byte_sent": 0.0,
+                    "price_per_byte_received": 0.0
+                }
+            }),
+        ),
+        (
+            "zero-only stream pricing",
+            json!({
+                "clickhouse": { "url": "https://clickhouse.example:8443" },
+                "spool": { "enabled": false },
+                "stream_connection_pricing": { "price_per_connection": 0.0 }
+            }),
+        ),
+        (
+            "snapshot without spool",
+            json!({
+                "mode": "snapshot",
+                "spool": { "enabled": false },
+                "clickhouse": { "url": "https://clickhouse.example:8443" },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "password_ref over http",
+            json!({
+                "clickhouse": {
+                    "url": "http://clickhouse.example:8123",
+                    "password_ref": "FERRUM_CLICKHOUSE_PASSWORD"
+                },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "password_ref with insecure_skip_verify",
+            json!({
+                "clickhouse": {
+                    "url": "https://clickhouse.example:8443",
+                    "password_ref": "FERRUM_CLICKHOUSE_PASSWORD",
+                    "tls": { "insecure_skip_verify": true }
+                },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "password_ref with verify_hostname disabled",
+            json!({
+                "clickhouse": {
+                    "url": "https://clickhouse.example:8443",
+                    "password_ref": "FERRUM_CLICKHOUSE_PASSWORD",
+                    "tls": { "verify_hostname": false }
+                },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "url with user-info",
+            json!({
+                "clickhouse": { "url": "https://user:pass@clickhouse.example:8443" },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "url without host",
+            json!({
+                "clickhouse": { "url": "https://?query=1" },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+    ];
+    for (label, config) in schema_and_runtime_invalid {
+        assert!(
+            sink_validator.validate(&config).is_err(),
+            "{label} must be schema-invalid: {config}"
+        );
+        assert!(
+            validate_plugin_config("api_chargeback_sink", &config).is_err(),
+            "{label} must be runtime-rejected: {config}"
+        );
+    }
+
+    // OpenAPI cannot express max_delay_ms >= initial_delay_ms; document and
+    // cover both layers so inverted retry bounds stay constructor-gated.
+    let inverted_retry = json!({
+        "clickhouse": { "url": "https://clickhouse.example:8443" },
+        "spool": { "enabled": false },
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+        "retry": {
+            "initial_delay_ms": 1000,
+            "max_delay_ms": 100
+        }
+    });
+    assert!(
+        sink_validator.validate(&inverted_retry).is_ok(),
+        "inverted retry bounds remain schema-admitted when OpenAPI cannot compare fields"
+    );
+    let retry_err = validate_plugin_config("api_chargeback_sink", &inverted_retry)
+        .expect_err("inverted retry bounds must fail runtime admission");
+    assert!(
+        retry_err.contains("retry.max_delay_ms must be >= retry.initial_delay_ms"),
+        "unexpected retry admission error: {retry_err}"
+    );
+}
+
+#[tokio::test]
 async fn password_ref_must_use_ferrum_prefix() {
     let temp = tempfile::tempdir().unwrap();
     let mut config = valid_config(temp.path());

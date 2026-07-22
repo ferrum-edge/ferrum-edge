@@ -1408,15 +1408,20 @@ or an auth proxy that injects the `Authorization: Bearer <token>` header.
 ### `api_chargeback_sink`
 
 Exports durable charge events or snapshot deltas to ClickHouse using the same
-pricing blocks as `api_chargeback`. It supports per-event mode for
-transaction-level provenance, snapshot mode for lower ingest volume, an on-disk
-spool for ClickHouse outages, `GET /charges/sink/status`, and Prometheus metrics
-under `/metrics`. See [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md)
-for DDL, configuration, spool sizing, replay, and reconciliation guidance.
-Ordinary HTTP is priced by wire status. Native gRPC and translated gRPC-Web use
-the same canonical effective-status mapping documented for `api_chargeback`;
-durable events retain the billable `status_code`, raw `http_status_code`, and
-normalized final `grpc_status` as separate fields.
+pricing blocks as `api_chargeback`. Config is required: `clickhouse.url` plus
+at least one nonempty pricing dimension (`pricing_tiers`, `bandwidth_pricing`,
+or `stream_connection_pricing` with `PricingConfig::has_any_pricing`
+semantics). It supports per-event mode for transaction-level provenance,
+snapshot mode for lower ingest volume (requires `spool.enabled=true`), an
+on-disk spool for ClickHouse outages, `GET /charges/sink/status`, and
+Prometheus metrics under `/metrics`. See
+[plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
+configuration, OpenAPI/runtime admission layers, spool sizing, replay, and
+reconciliation guidance. Set `FERRUM_NODE_ID` for stable spool ownership on
+persistent storage. Ordinary HTTP is priced by wire status. Native gRPC and
+translated gRPC-Web use the same canonical effective-status mapping documented
+for `api_chargeback`; durable events retain the billable `status_code`, raw
+`http_status_code`, and normalized final `grpc_status` as separate fields.
 
 **Priority:** 9351
 
@@ -2402,7 +2407,7 @@ At least one rate window must be configured in every rule. Do not combine the cu
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:rate_limiting` when namespace is `"ferrum"` |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
@@ -2911,7 +2916,7 @@ Modifies request headers, query parameters, and JSON body fields before proxying
 config:
   rules:
     - operation: add       # add, remove, update, rename
-      target: header       # header, query, body (default: header)
+      target: header       # required: header, query, or body
       key: "X-Custom"
       value: "my-value"
     - operation: rename
@@ -2929,6 +2934,10 @@ config:
       target: body
       key: "meta.weird\\.key"     # \. = literal dot in a key
       value: "escaped"
+    - operation: add
+      target: body
+      key: "enabled"
+      value: true                 # native JSON types / null are valid for body
 ```
 
 **Operations and required fields** — validated at plugin load time; malformed rules reject the plugin config with a 400 (admin API), fail startup in file mode, or reject the new DB/CP reload snapshot while the gateway keeps serving the prior good config:
@@ -2940,7 +2949,7 @@ config:
 | `remove` | `key` | No-op if the field is absent. |
 | `rename` | `key`, `new_key` | `old → new`; if the destination path is unreachable, the value is restored at the old path (no data loss). Array indices (numeric segments) are rejected at plugin load time in `key` or `new_key` — see note below. |
 
-**Valid `target` values:** `header`, `query`, `body`. Omitted `target` defaults to `header`. Unknown targets are rejected at plugin construction. Non-string values for `target`, `operation`, `key`, `value`, or `new_key` are also rejected — the plugin does not silently coerce numbers, booleans, or objects into strings.
+**Valid `target` values:** `header`, `query`, `body`. `target` is required on every rule — there is no default. Unknown targets are rejected at plugin construction. Non-string values for `target`, `operation`, `key`, or `new_key` are also rejected — the plugin does not silently coerce numbers, booleans, or objects into strings. Header and query `value` must be strings; body `value` accepts any JSON type including explicit `null` (see below).
 
 **Header value constraints:** header `value` must not contain CR (`\r`) or LF (`\n`) — rejected at plugin load time as defence against header injection.
 
@@ -2948,7 +2957,7 @@ config:
 - **Nested objects** — `user.address.city`.
 - **Array indexing** — numeric segments index into arrays: `items.0.name`. Arrays are not auto-grown; out-of-bounds indices fail silently at request time (the rule is skipped for that request).
 - **Literal dots in keys** — escape with `\.`: `meta.weird\.key` targets a key literally named `weird.key`.
-- **Typed values** — string values that parse as JSON (e.g., `"42"`, `"true"`, `"null"`, `"{\"a\":1}"`) are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` (`value: null` in YAML/JSON) is preserved — `add` / `update` body rules with `value: null` set the target field to JSON null.
+- **Typed values** — native JSON scalars, objects, arrays, and explicit `null` are accepted on body `add` / `update`. String values that parse as JSON (e.g., `"42"`, `"true"`, `"null"`, `"{\"a\":1}"`) are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` (`value: null` in YAML/JSON) is preserved — `add` / `update` body rules with `value: null` set the target field to JSON null.
 
 **`rename` does not support array indices in `key` or `new_key`.** Array mutation is ambiguous for rename (move? swap? overwrite?) and would risk data loss — `Vec::remove` shifts elements leftward, so a `rename("items.0" → "items.1")` on `["A","B","C"]` would silently drop `"C"`. Configs with numeric segments in a rename path are rejected at plugin load time. To relocate elements within an array, use `remove` followed by `add`. Escaped numeric segments (`counts\.0` — a literal key named `counts.0`) are still accepted.
 
@@ -3263,7 +3272,7 @@ representations explicitly outside the configured response-body scan scope.
 | `name` | string | `id` | Human-readable rule name. |
 | `category` | string | required | Category label, such as `sqli`, `xss`, or `custom`. |
 | `severity` | string | `medium` | `info`, `low`, `medium`, `high`, or `critical`. |
-| `target` | string/object | required | Scan target. Object targets support `type`, optional non-empty `names` only for request header values, and `path` only for JSON-path body rules. |
+| `target` | string/object | required | Scan target. Strings cover every target except `body_json_path` (object-only). Object form uses `type`; optional non-empty `names` only for `header_values`/`request_headers`; required non-empty `path` only for `body_json_path`. Aliases `request_headers`, `request_query`, `request_path`, `request_url`, `request_method`, and `request_body` are accepted. |
 | `match_kind` | string | `regex` | `regex`, `literal`, `contains`, `equals`, `luhn`, or `cidr`. |
 | `pattern` | string | `""` | Pattern text. Required except for `luhn` rules. CIDR rules accept an IP or CIDR range. |
 | `action` | string | global default | `enforce`, `monitor`, or `disabled`. |
@@ -3272,9 +3281,12 @@ representations explicitly outside the configured response-body scan scope.
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
 | `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries share exact-match and trailing-`*` prefix forms with `global_exemptions.paths`, but `~regex` anchoring differs: rule `conditions.paths` compile the text after `~` as an operator-authored, unanchored regex evaluated with Rust regex `is_match`, so they may match anywhere in the path unless the pattern itself is anchored (for example `~^/admin(?:/|$)`). A floating match such as `~api` therefore matches both `/api/users` and `/v1/api-keys`. Exact and prefix forms are unchanged and are not regex-anchored. |
 
-Supported targets: `header_names`, `header_values`, `query_keys`,
-`query_values`, `cookies`, `url_path`, `full_url`, `method`, `body_text`,
-`body_json_path`, `response_headers`, and `response_body`.
+Supported targets: `header_names`, `header_values` (optional non-empty
+`names`), `query_keys`, `query_values`, `cookies`, `url_path`, `full_url`,
+`method`, `body_text`, `body_json_path` (object with required non-empty
+`path`), `response_headers`, and `response_body`. Aliases:
+`request_headers`, `request_query`, `request_path`, `request_url`,
+`request_method`, `request_body`.
 
 CIDR rules on free-form body text are heuristic token scans. They are useful
 for tightly scoped private-address leakage checks, but broad response-body CIDR
@@ -3525,7 +3537,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql` | Redis key namespace prefix. Defaults to `ferrum:graphql` when namespace is `"ferrum"`. Must be non-empty when set. |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be ≥ 1) |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds (must be ≥ 1) |
+| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be ≥ 1). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable (must be ≥ 1) |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
@@ -3605,7 +3617,7 @@ Enables per-method access control and rate limiting for canonical gRPC paths (`/
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:grpc_method_router` | Redis key namespace prefix. Defaults to `ferrum:grpc_method_router` when namespace is `"ferrum"` |
 | `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections |
-| `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
+| `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
 | `redis_password` | String (optional) | — | Redis password |
