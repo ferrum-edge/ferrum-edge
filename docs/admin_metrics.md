@@ -76,6 +76,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 {
   "gateway": {
     "mode": "database",
+    "ferrum_version": "0.9.0",
     "uptime_seconds": 86472,
     "total_requests": 2594832,
     "status_codes_total": {
@@ -172,10 +173,13 @@ curl -s -H "Authorization: Bearer $TOKEN" \
     "unhealthy_targets": [
       {
         "target": "10.0.3.12:8080",
+        "type": "active",
         "since_epoch_ms": 1711720800000
       },
       {
+        "proxy_id": "proxy-legacy-billing",
         "target": "10.0.5.7:8080",
+        "type": "passive",
         "since_epoch_ms": 1711720920000
       }
     ]
@@ -216,6 +220,10 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   },
   "rate_limiting": {
     "tracked_key_count": 4217
+  },
+  "tcp_connection_throttle": {
+    "enforcement_scope": "process_local",
+    "replica_limit_behavior": "configured_limit_per_replica"
   }
 }
 ```
@@ -228,7 +236,8 @@ Top-level gateway info and throughput counters.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `mode` | string | Operating mode: `database`, `file`, `cp`, or `dp` |
+| `mode` | string | Operating mode that constructed this AdminState: `database`, `file`, `cp`, `dp`, `mesh`, or `node_agent` |
+| `ferrum_version` | string | Ferrum Edge binary version |
 | `uptime_seconds` | integer | Seconds since the gateway process started |
 | `total_requests` | integer | Total requests processed since the gateway started (cumulative counter) |
 | `status_codes_total` | object | Cumulative map of HTTP status code (string key) to total count since startup |
@@ -269,7 +278,7 @@ Array of circuit breaker states. For proxies with upstream targets, each target 
 | Field | Type | Description |
 |-------|------|-------------|
 | `proxy_id` | string | ID of the proxy this circuit breaker protects |
-| `target` | string | *(optional)* Upstream target `host:port` this breaker is scoped to. Absent for direct-backend proxies |
+| `target` | string | *(optional)* Upstream target `host:port` this breaker is scoped to. Present for per-target (upstream) breakers; omitted for direct-backend (per-proxy) breakers |
 | `state` | string | Current state: `closed` (normal), `open` (rejecting with 503), or `half_open` (probing for recovery) |
 | `failure_count` | integer | Consecutive failures in the current state. In `closed`, this increments toward the failure threshold. In `open`, it reflects the count that triggered the opening |
 | `success_count` | integer | Consecutive successes during `half_open`. When this reaches `success_threshold`, the circuit closes and the proxy recovers |
@@ -289,9 +298,11 @@ Health check state showing which upstream targets are currently marked unhealthy
 |-------|------|-------------|
 | `unhealthy_target_count` | integer | Number of targets currently unhealthy |
 | `unhealthy_targets[].target` | string | Target in `host:port` format |
+| `unhealthy_targets[].type` | string | `active` for periodic probe failures; `passive` for failures observed on proxied requests |
+| `unhealthy_targets[].proxy_id` | string | *(conditional)* Proxy that owns a passive entry. Required when `type` is `passive`; omitted when `type` is `active` |
 | `unhealthy_targets[].since_epoch_ms` | integer | Unix epoch milliseconds when the target was marked unhealthy |
 
-Targets are marked unhealthy by either **passive** health checks (monitoring proxied request failures) or **active** health checks (periodic HTTP/TCP/UDP probes). Once healthy again, they are removed from this list and re-included in load balancing.
+Targets are marked unhealthy by either **passive** health checks (monitoring proxied request failures; always include `proxy_id`) or **active** health checks (periodic HTTP/TCP/UDP probes; upstream-scoped, no `proxy_id`). Once healthy again, they are removed from this list and re-included in load balancing.
 
 ### `load_balancers`
 
@@ -377,6 +388,6 @@ Pre-built hash map indexes for O(1) credential lookup during authentication. The
 
 The endpoint caches responses for 5 seconds, so polling faster than every 5 seconds wastes bandwidth without gaining fresher data. A **10-second interval** is a good default for dashboards.
 
-### CP Mode
+### Modes without proxy state
 
-In Control Plane (`cp`) mode, the gateway has no proxy state (it only manages config and distributes it to Data Planes). The response will return zero values for all runtime fields while still reporting the gateway mode and config counts.
+In Control Plane (`cp`) and node-agent (`node_agent`) modes, the process has no proxy state. The response returns zero values for runtime counters, empty `connection_pools` / `caches` objects, and still reports `gateway.mode`. Mesh mode serves the full proxy-backed payload with `gateway.mode` set to `mesh`.

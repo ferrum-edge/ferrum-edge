@@ -1511,6 +1511,12 @@ paths:
         object states that its configured concurrent-connection limit is
         process-local and independently enforced per replica.
 
+        Served in every mode that constructs an AdminState:
+        `database`, `file`, `cp`, `dp`, `mesh`, and `node_agent`. Modes without
+        proxy state (`cp`, `node_agent`) return zeroed runtime counters. JWT
+        authentication is required; this endpoint never returns unauthenticated
+        detail.
+
         The response is cached for 5 seconds to avoid performance impact from
         frequent polling. The `X-Cache` response header indicates `hit` or `miss`.
 
@@ -10545,8 +10551,9 @@ components:
           items:
             $ref: "#/components/schemas/AdminMetricsCircuitBreaker"
           description: |
-            Per-proxy circuit breaker states. Only proxies with circuit breaker
-            config that have been accessed appear here.
+            Circuit breaker states for direct-backend proxies (no `target`) and
+            per-upstream-target breakers (`target` = `host:port`). Only proxies
+            with circuit breaker config that have been accessed appear here.
         health_check:
           $ref: "#/components/schemas/AdminMetricsHealthCheck"
         load_balancers:
@@ -10581,8 +10588,11 @@ components:
       properties:
         mode:
           type: string
-          enum: [database, file, cp, dp]
-          description: Operating mode (set by FERRUM_MODE)
+          enum: [database, file, cp, dp, mesh, node_agent]
+          description: |
+            Operating mode that constructed this AdminState (set by FERRUM_MODE).
+            Every mode that serves authenticated `GET /admin/metrics` is listed:
+            `database`, `file`, `cp`, `dp`, `mesh`, and `node_agent`.
         ferrum_version:
           type: string
           description: Ferrum Edge binary version
@@ -10698,15 +10708,26 @@ components:
     AdminMetricsCircuitBreaker:
       type: object
       description: |
-        Circuit breaker state for a single proxy. Three states:
+        Circuit breaker state for a single proxy or upstream target. Three states:
         - **closed**: Normal operation, requests pass through
         - **open**: Failures exceeded threshold, requests rejected with 503
         - **half_open**: Timeout elapsed, limited probe requests allowed to test recovery
+
+        Direct-backend proxies (no upstream) emit one per-proxy entry without
+        `target`. Proxies with upstream targets emit one independent breaker per
+        target and include `target` as `host:port`.
       required: [proxy_id, state, failure_count, success_count]
       properties:
         proxy_id:
           type: string
           description: ID of the proxy this circuit breaker protects
+        target:
+          type: string
+          description: |
+            Upstream target `host:port` this breaker is scoped to. Present for
+            per-target (upstream) breakers; omitted for direct-backend
+            (per-proxy) breakers.
+          example: "10.0.2.1:8080"
         state:
           type: string
           enum: [closed, open, half_open]
@@ -10721,6 +10742,50 @@ components:
             Consecutive successes during half_open state. When this reaches the
             configured success_threshold, the circuit closes (recovers).
 
+    AdminMetricsUnhealthyTarget:
+      type: object
+      description: |
+        One unhealthy target excluded from load balancing. Active health checks
+        are upstream-scoped (`type=active`, no `proxy_id`). Passive health checks
+        are proxy-scoped (`type=passive` and always include `proxy_id`).
+      required: [target, type, since_epoch_ms]
+      properties:
+        proxy_id:
+          type: string
+          description: |
+            Proxy that owns this passive health entry. Required when
+            `type` is `passive`; omitted when `type` is `active`.
+        target:
+          type: string
+          description: "Target in host:port format"
+          example: "10.0.3.12:8080"
+        type:
+          type: string
+          enum: [active, passive]
+          description: |
+            `active` for periodic probe failures; `passive` for failures
+            observed on proxied requests.
+        since_epoch_ms:
+          type: integer
+          format: int64
+          description: Unix epoch milliseconds when the target was marked unhealthy
+      allOf:
+        - if:
+            properties:
+              type:
+                const: passive
+            required: [type]
+          then:
+            required: [proxy_id]
+        - if:
+            properties:
+              type:
+                const: active
+            required: [type]
+          then:
+            not:
+              required: [proxy_id]
+
     AdminMetricsHealthCheck:
       type: object
       description: |
@@ -10734,17 +10799,7 @@ components:
         unhealthy_targets:
           type: array
           items:
-            type: object
-            required: [target, since_epoch_ms]
-            properties:
-              target:
-                type: string
-                description: "Target in host:port format"
-                example: "10.0.3.12:8080"
-              since_epoch_ms:
-                type: integer
-                format: int64
-                description: Unix epoch milliseconds when the target was marked unhealthy
+            $ref: "#/components/schemas/AdminMetricsUnhealthyTarget"
 
     AdminMetricsLoadBalancers:
       type: object

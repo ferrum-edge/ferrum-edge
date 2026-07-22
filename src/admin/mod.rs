@@ -8,6 +8,7 @@ pub(crate) mod crud;
 pub mod jwt_auth;
 pub mod mesh_config_drift;
 pub mod mesh_remote_clusters;
+pub mod metrics;
 pub mod spec_codec;
 mod tls_management;
 
@@ -5185,6 +5186,20 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
     Ok(resp)
 }
 
+fn build_metrics(state: &AdminState) -> metrics::AdminMetrics {
+    let database_polling = if state.mode == "database" {
+        crate::plugins::prometheus_metrics::global_registry().database_delta_poll_metrics_snapshot()
+    } else {
+        None
+    };
+    metrics::build_admin_metrics(
+        &state.mode,
+        state.db.is_some(),
+        state.proxy_state.as_ref(),
+        database_polling,
+    )
+}
+
 async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let ttl_ms = state
         .proxy_state
@@ -5223,234 +5238,6 @@ async fn handle_metrics_runtime(state: &AdminState) -> Result<Response<Full<Byte
         .body(Full::new(body_bytes))
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("{}"))));
     Ok(resp)
-}
-
-fn build_metrics(state: &AdminState) -> Value {
-    if let Some(ref ps) = state.proxy_state {
-        let config = ps.current_config();
-        let rps = ps.request_count.load(Ordering::Relaxed);
-        let uptime_seconds = ps.started_at.elapsed().as_secs();
-
-        // Status codes
-        let mut status_codes = serde_json::Map::new();
-        for entry in ps.status_counts.iter() {
-            status_codes.insert(
-                entry.key().to_string(),
-                json!(entry.value().load(Ordering::Relaxed)),
-            );
-        }
-
-        // Connection pools
-        let http_pool_stats = ps.connection_pool.get_stats();
-        let grpc_pool_size = ps.grpc_pool.pool_size();
-        let http2_pool_size = ps.http2_pool.pool_size();
-        let h3_pool_size = ps.h3_pool.pool_size();
-
-        // Circuit breakers
-        let cb_snapshot = ps.circuit_breaker_cache.snapshot();
-        let circuit_breakers: Vec<Value> = cb_snapshot
-            .iter()
-            .map(|(key, state, failures, successes)| {
-                // Keys are "proxy_id" (direct backend) or "proxy_id::host:port" (upstream target)
-                if let Some((proxy_id, target)) = key.split_once("::") {
-                    json!({
-                        "proxy_id": proxy_id,
-                        "target": target,
-                        "state": state,
-                        "failure_count": failures,
-                        "success_count": successes,
-                    })
-                } else {
-                    json!({
-                        "proxy_id": key,
-                        "state": state,
-                        "failure_count": failures,
-                        "success_count": successes,
-                    })
-                }
-            })
-            .collect();
-
-        // Health check — merge active (upstream-scoped) and passive (proxy-scoped) maps
-        let mut unhealthy_targets: Vec<Value> = ps
-            .health_checker
-            .active_unhealthy_targets
-            .iter()
-            .map(|entry| {
-                json!({
-                    "target": entry.key().clone(),
-                    "type": "active",
-                    "since_epoch_ms": *entry.value(),
-                })
-            })
-            .collect();
-        for proxy_entry in ps.health_checker.passive_health.iter() {
-            let proxy_id = proxy_entry.key();
-            for target_entry in proxy_entry.value().unhealthy.iter() {
-                unhealthy_targets.push(json!({
-                    "proxy_id": proxy_id.clone(),
-                    "target": target_entry.key().clone(),
-                    "type": "passive",
-                    "since_epoch_ms": *target_entry.value(),
-                }));
-            }
-        }
-
-        // Load balancers
-        let lb_snapshot = ps.load_balancer_cache.active_connections_snapshot();
-        let mut lb_map = serde_json::Map::new();
-        for (upstream_id, targets) in &lb_snapshot {
-            let mut target_map = serde_json::Map::new();
-            for (target, count) in targets {
-                target_map.insert(target.clone(), json!(count));
-            }
-            lb_map.insert(upstream_id.clone(), Value::Object(target_map));
-        }
-
-        // Router cache
-        let (prefix_entries, regex_entries, prefix_evictions, regex_evictions, max_entries) =
-            ps.router_cache.cache_stats();
-
-        // DNS cache
-        let dns_cache_size = ps.dns_cache.cache_len();
-
-        // Consumer index
-        let (
-            keyauth_count,
-            basic_count,
-            mtls_count,
-            jwt_count,
-            hmac_count,
-            identity_count,
-            total_consumers,
-        ) = ps.consumer_index.auth_type_counts();
-
-        // Rate limiter keys
-        let rate_limiter_keys = ps.plugin_cache.total_rate_limiter_keys();
-
-        // Config source
-        let config_source_status = if state.db.is_some() { "online" } else { "n/a" };
-
-        // Windowed per-second status code rates
-        let mut sc_per_second = serde_json::Map::new();
-        for entry in ps.windowed_metrics.status_codes_per_second.iter() {
-            sc_per_second.insert(
-                entry.key().to_string(),
-                json!(entry.value().load(Ordering::Relaxed)),
-            );
-        }
-
-        let mut metrics = json!({
-            "gateway": {
-                "mode": state.mode,
-                "ferrum_version": crate::FERRUM_VERSION,
-                "uptime_seconds": uptime_seconds,
-                "total_requests": rps,
-                "status_codes_total": status_codes,
-                "requests_per_second": ps.windowed_metrics.requests_per_second.load(Ordering::Relaxed),
-                "status_codes_per_second": Value::Object(sc_per_second),
-                "metrics_window_seconds": ps.windowed_metrics.window_seconds,
-                "config_last_updated_at": config.loaded_at.to_rfc3339(),
-                "config_source_status": config_source_status,
-                "proxy_count": config.proxies.len(),
-                "consumer_count": config.consumers.len(),
-                "upstream_count": config.upstreams.len(),
-                "plugin_config_count": config.plugin_configs.len(),
-            },
-            "connection_pools": {
-                "http": {
-                    "total_pools": http_pool_stats.total_pools,
-                    "max_idle_per_host": http_pool_stats.max_idle_per_host,
-                    "idle_timeout_seconds": http_pool_stats.idle_timeout_seconds,
-                    "entries_per_host": http_pool_stats.entries_per_host,
-                },
-                "grpc": {
-                    "total_connections": grpc_pool_size,
-                },
-                "http2": {
-                    "total_connections": http2_pool_size,
-                },
-                "http3": {
-                    "total_connections": h3_pool_size,
-                },
-            },
-            "circuit_breakers": circuit_breakers,
-            "health_check": {
-                "unhealthy_target_count": unhealthy_targets.len(),
-                "unhealthy_targets": unhealthy_targets,
-            },
-            "load_balancers": {
-                "active_connections": Value::Object(lb_map),
-            },
-            "caches": {
-                "router": {
-                    "prefix_cache_entries": prefix_entries,
-                    "regex_cache_entries": regex_entries,
-                    "prefix_eviction_count": prefix_evictions,
-                    "regex_eviction_count": regex_evictions,
-                    "max_cache_entries": max_entries,
-                },
-                "dns": {
-                    "cache_entries": dns_cache_size,
-                },
-            },
-            "consumer_index": {
-                "total_consumers": total_consumers,
-                "key_auth_credentials": keyauth_count,
-                "basic_auth_credentials": basic_count,
-                "mtls_credentials": mtls_count,
-                "jwt_credentials": jwt_count,
-                "hmac_credentials": hmac_count,
-                "identity_credentials": identity_count,
-            },
-            "rate_limiting": {
-                "tracked_key_count": rate_limiter_keys,
-            },
-            "tcp_connection_throttle": {
-                "enforcement_scope": "process_local",
-                "replica_limit_behavior": "configured_limit_per_replica",
-            },
-        });
-        if state.mode == "database"
-            && let Some(snapshot) = crate::plugins::prometheus_metrics::global_registry()
-                .database_delta_poll_metrics_snapshot()
-        {
-            metrics["database_polling"] =
-                serde_json::to_value(snapshot).unwrap_or_else(|_| json!(null));
-        }
-        metrics
-    } else {
-        // CP mode or no proxy state
-        json!({
-            "gateway": {
-                "mode": state.mode,
-                "ferrum_version": crate::FERRUM_VERSION,
-                "uptime_seconds": 0,
-                "total_requests": 0,
-                "status_codes_total": {},
-                "requests_per_second": 0,
-                "status_codes_per_second": {},
-                "metrics_window_seconds": 0,
-                "config_last_updated_at": null,
-                "config_source_status": "n/a",
-                "proxy_count": 0,
-                "consumer_count": 0,
-                "upstream_count": 0,
-                "plugin_config_count": 0,
-            },
-            "connection_pools": {},
-            "circuit_breakers": [],
-            "health_check": {"unhealthy_target_count": 0, "unhealthy_targets": []},
-            "load_balancers": {"active_connections": {}},
-            "caches": {},
-            "consumer_index": {"total_consumers": 0, "key_auth_credentials": 0, "basic_auth_credentials": 0, "mtls_credentials": 0, "jwt_credentials": 0, "hmac_credentials": 0, "identity_credentials": 0},
-            "rate_limiting": {"tracked_key_count": 0},
-            "tcp_connection_throttle": {
-                "enforcement_scope": "process_local",
-                "replica_limit_behavior": "configured_limit_per_replica",
-            },
-        })
-    }
 }
 
 // ---- Batch Create ----

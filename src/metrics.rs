@@ -15,8 +15,8 @@ use dashmap::DashMap;
 /// Per-second rate averages over a configurable window.
 ///
 /// Written exclusively by [`start_metrics_monitor`]; read by
-/// `admin::build_metrics()`.  All fields use `Ordering::Relaxed` —
-/// eventual consistency is fine for admin/observability data.
+/// `admin::metrics::build_admin_metrics()`.  All fields use `Ordering::Relaxed`
+/// — eventual consistency is fine for admin/observability data.
 pub struct WindowedMetrics {
     /// Average requests per second over the last completed window.
     pub requests_per_second: AtomicU64,

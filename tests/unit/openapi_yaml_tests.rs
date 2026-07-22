@@ -6731,6 +6731,113 @@ fn security_headers_schema_rejects_unknown_top_level_and_hsts_keys() {
 }
 
 #[test]
+fn admin_metrics_openapi_accepts_typed_mode_breaker_and_health_fixtures() {
+    use ferrum_edge::admin::metrics::{
+        ADMIN_METRICS_MODES, AdminMetricsUnhealthyTarget, contract_fixtures,
+    };
+
+    let spec: serde_json::Value =
+        serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
+    let docs = include_str!("../../docs/admin_metrics.md");
+    let mode_enum = spec
+        .pointer("/components/schemas/AdminMetricsGateway/properties/mode/enum")
+        .expect("AdminMetricsGateway.mode enum");
+    assert_eq!(
+        mode_enum,
+        &json!(["database", "file", "cp", "dp", "mesh", "node_agent"])
+    );
+    for mode in ADMIN_METRICS_MODES {
+        assert!(
+            docs.contains(mode),
+            "docs/admin_metrics.md must document mode {mode}"
+        );
+    }
+
+    let breaker = spec
+        .pointer("/components/schemas/AdminMetricsCircuitBreaker/properties/target")
+        .expect("circuit breaker target property");
+    assert!(breaker.get("type").is_some());
+    assert!(
+        docs.contains("per-target (upstream)")
+            && docs.contains("direct-backend (per-proxy)"),
+        "docs must describe direct vs per-target breaker semantics"
+    );
+
+    let unhealthy = spec
+        .pointer("/components/schemas/AdminMetricsUnhealthyTarget")
+        .expect("AdminMetricsUnhealthyTarget component");
+    assert_eq!(
+        unhealthy["properties"]["type"]["enum"],
+        json!(["active", "passive"])
+    );
+    assert!(docs.contains("`type` is `passive`"));
+    assert!(docs.contains("`type` is `active`"));
+
+    for fixture in contract_fixtures() {
+        let instance = serde_json::to_value(&fixture).expect("fixture serializes");
+        assert_component_validity(&spec, "AdminMetrics", &instance, true);
+    }
+
+    // Conditional semantics: passive requires proxy_id; active forbids it.
+    assert_component_validity(
+        &spec,
+        "AdminMetricsUnhealthyTarget",
+        &serde_json::to_value(AdminMetricsUnhealthyTarget::active("10.0.0.1:80", 1))
+            .expect("active"),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "AdminMetricsUnhealthyTarget",
+        &serde_json::to_value(AdminMetricsUnhealthyTarget::passive(
+            "proxy-a", "10.0.0.1:80", 1,
+        ))
+        .expect("passive"),
+        true,
+    );
+    assert_component_validity(
+        &spec,
+        "AdminMetricsUnhealthyTarget",
+        &json!({
+            "target": "10.0.0.1:80",
+            "type": "passive",
+            "since_epoch_ms": 1
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "AdminMetricsUnhealthyTarget",
+        &json!({
+            "proxy_id": "proxy-a",
+            "target": "10.0.0.1:80",
+            "type": "active",
+            "since_epoch_ms": 1
+        }),
+        false,
+    );
+    assert_component_validity(
+        &spec,
+        "AdminMetricsGateway",
+        &json!({
+            "mode": "injector",
+            "ferrum_version": "0.0.0",
+            "uptime_seconds": 0,
+            "total_requests": 0,
+            "status_codes_total": {},
+            "requests_per_second": 0,
+            "status_codes_per_second": {},
+            "metrics_window_seconds": 0,
+            "proxy_count": 0,
+            "consumer_count": 0,
+            "upstream_count": 0,
+            "plugin_config_count": 0
+        }),
+        false,
+    );
+}
+
+#[test]
 fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract() {
     let spec: serde_json::Value =
         serde_yaml::from_str(include_str!("../../openapi.yaml")).expect("openapi.yaml parses");
@@ -6741,7 +6848,7 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
     let plugin_docs = include_str!("../../docs/plugins.md");
     let cache_docs = include_str!("../../docs/cache_management.md");
     let source = include_str!("../../src/plugins/tcp_connection_throttle.rs");
-    let admin_source = include_str!("../../src/admin/mod.rs");
+    let metrics_source = include_str!("../../src/admin/metrics.rs");
 
     assert_eq!(schema["additionalProperties"], false);
     assert_component_validity(
@@ -6778,8 +6885,8 @@ fn tcp_connection_throttle_schema_docs_and_source_share_the_lifecycle_contract()
     assert!(source.contains("DashMap::with_shard_amount"));
     assert!(source.contains("entry.remove()"));
     assert!(!source.contains("tcp_connection_throttle.key"));
-    assert!(admin_source.contains(r#""enforcement_scope": "process_local""#));
-    assert!(admin_source.contains(r#""replica_limit_behavior": "configured_limit_per_replica""#));
+    assert!(metrics_source.contains(r#"enforcement_scope: "process_local""#));
+    assert!(metrics_source.contains(r#"replica_limit_behavior: "configured_limit_per_replica""#));
 
     let status_schema = spec
         .pointer("/components/schemas/AdminMetricsTcpConnectionThrottle")
