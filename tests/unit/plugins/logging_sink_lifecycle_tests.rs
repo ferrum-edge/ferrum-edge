@@ -1024,11 +1024,19 @@ async fn kafka_start_restores_pending_when_producer_create_fails() {
     let plugin = match KafkaLogging::new(&cfg, &client()) {
         Ok(plugin) => plugin,
         Err(error) => {
-            // Native config validation may reject missing material before start.
-            // Keep this lifecycle proof focused on the activate/restore path.
+            // Native config validation may reject missing material before start,
+            // and librdkafka versions disagree on whether the rejection names a
+            // TLS property or reports the bounded client-config category. Either
+            // way, preserve the fail-closed/redacted construction contract. Builds
+            // that defer the rejection continue below to exercise activate/restore.
             assert!(
-                error.contains("ssl") || error.contains("certificate") || error.contains("key"),
-                "construction failure should name TLS material: {error}"
+                error.contains("failed to validate Kafka producer config"),
+                "construction failure must retain the bounded validation context: {error}"
+            );
+            assert!(
+                !error.contains(missing_cert.to_string_lossy().as_ref())
+                    && !error.contains(missing_key.to_string_lossy().as_ref()),
+                "construction failure must not echo TLS material paths: {error}"
             );
             return;
         }
