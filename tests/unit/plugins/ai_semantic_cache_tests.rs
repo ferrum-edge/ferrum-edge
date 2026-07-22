@@ -3076,6 +3076,19 @@ async fn messages_native_tool_call_state_isolates_exact_keys() {
         }]
     });
     assert_exact_miss_for_variant(paris, lyon, br#""ok""#).await;
+
+    assert_exact_miss_for_variant(
+        json!({"messages": [{"role": "tool", "name": "lookup_a", "tool_call_id": "call_1", "content": "done"}]}),
+        json!({"messages": [{"role": "tool", "name": "lookup_b", "tool_call_id": "call_1", "content": "done"}]}),
+        br#""ok""#,
+    )
+    .await;
+    assert_exact_miss_for_variant(
+        json!({"messages": [{"role": "tool", "name": "lookup", "tool_call_id": "call_1", "content": "done"}]}),
+        json!({"messages": [{"role": "tool", "name": "lookup", "tool_call_id": "call_2", "content": "done"}]}),
+        br#""ok""#,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -3194,6 +3207,34 @@ async fn legacy_tgi_titan_generation_control_misses() {
             "textGenerationConfig": {"temperature": 1.0}
         }),
         br#""hi""#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn messages_provider_native_generation_controls_isolate_exact_keys() {
+    assert_exact_miss_for_variant(
+        json!({
+            "messages": [{"role": "user", "content": "Write a report"}],
+            "max_completion_tokens": 32
+        }),
+        json!({
+            "messages": [{"role": "user", "content": "Write a report"}],
+            "max_completion_tokens": 2048
+        }),
+        br#""short""#,
+    )
+    .await;
+    assert_exact_miss_for_variant(
+        json!({
+            "messages": [{"role": "user", "content": "Write a report"}],
+            "stop_sequences": ["END"]
+        }),
+        json!({
+            "messages": [{"role": "user", "content": "Write a report"}],
+            "stop_sequences": ["STOP"]
+        }),
+        br#""stopped""#,
     )
     .await;
 }
@@ -3424,6 +3465,70 @@ async fn provider_family_semantic_hit_and_instruction_isolation() {
         !isolated,
         "Responses semantic hits must not cross instructions scopes"
     );
+}
+
+#[tokio::test]
+async fn messages_semantic_scope_isolates_tool_state_and_native_controls() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 8).await;
+    let plugin = make_plugin(semantic_config(&mock_server));
+
+    let base = json!({
+        "model": "gpt-4.1",
+        "max_completion_tokens": 32,
+        "stop_sequences": ["END"],
+        "messages": [
+            {
+                "role": "assistant",
+                "name": "planner",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{\"city\":\"Paris\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            {"role": "user", "content": "What should I do next?"}
+        ]
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&base).unwrap(),
+        None,
+        br#""walk""#,
+    )
+    .await;
+
+    let mut variants = Vec::new();
+    let mut changed_name = base.clone();
+    changed_name["messages"][0]["name"] = json!("other_planner");
+    variants.push(changed_name);
+    let mut changed_tool_call = base.clone();
+    changed_tool_call["messages"][0]["tool_calls"][0]["function"]["arguments"] =
+        json!("{\"city\":\"Lyon\"}");
+    variants.push(changed_tool_call);
+    let mut changed_tool_call_id = base.clone();
+    changed_tool_call_id["messages"][1]["tool_call_id"] = json!("call_2");
+    variants.push(changed_tool_call_id);
+    let mut changed_max = base.clone();
+    changed_max["max_completion_tokens"] = json!(2048);
+    variants.push(changed_max);
+    let mut changed_stop = base.clone();
+    changed_stop["stop_sequences"] = json!(["STOP"]);
+    variants.push(changed_stop);
+
+    for variant in variants {
+        assert!(
+            !run_before_proxy_get_status(
+                &plugin,
+                &serde_json::to_string(&variant).unwrap(),
+                None
+            )
+            .await,
+            "semantic lookup must not cross message tool state or provider-native controls"
+        );
+    }
 }
 
 #[tokio::test]
