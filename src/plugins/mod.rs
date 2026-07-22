@@ -6202,11 +6202,13 @@ pub trait Plugin: Send + Sync {
     /// remain pure because offline validation invokes them without a runtime.
     ///
     /// Fallible producer/client construction, secret resolution, and channel
-    /// construction belong here. Ferrum-owned workers must stay dormant —
-    /// gated on [`Self::commit_background_tasks`] — so a generation that later
-    /// fails registry/cache commit cannot flush, export, replay, or mutate live
-    /// spool state. Implementations must be idempotent; dropping an uncommitted
-    /// instance must cancel its staged workers.
+    /// construction belong here. Workers capable of externally visible writes,
+    /// exports, replay, or live-state mutation must stay dormant — gated on
+    /// [`Self::commit_background_tasks`] — so a generation that later fails
+    /// registry/cache commit has no such side effects. Read-only discovery or
+    /// refresh workers may stage earlier when their implementation documents
+    /// that lifecycle. Implementations must be idempotent; dropping an
+    /// uncommitted instance must cancel every staged worker it owns.
     fn start_background_tasks(&self) -> Result<(), String> {
         Ok(())
     }

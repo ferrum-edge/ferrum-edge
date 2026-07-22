@@ -132,6 +132,13 @@ accepts the whole file as one insert. Unreadable spool files are renamed with a
 by an interrupted atomic write are deleted at spool startup and after a failed
 write/rename so they cannot accumulate indefinitely.
 
+Offline validation and candidate-generation staging do not create, chmod, or
+probe `spool.dir`. After cache publication, the committed replayer prepares and
+write-probes the private spool directories before replay or admission. A failed
+probe is persistent operational evidence: status reports `spool.available=false`,
+`chargeback_sink_spool_available` is `0`, and
+`chargeback_sink_spool_prepare_failures_total` increments until storage recovers.
+
 `spool.max_bytes` is a hard ceiling on **encoded** on-disk bytes owned by this
 sink under `<spool.dir>/<node_id>/` (after compression when `compression` is
 `zstd`). The budget and status/metrics count every retained file class:
@@ -199,6 +206,8 @@ size, replay timestamps, and export counters. `/metrics` includes:
 - `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, and quarantined)
 - `chargeback_sink_spool_files` (owned file count across those same classes)
 - `chargeback_sink_spool_drops_total`
+- `chargeback_sink_spool_available` (1 only while committed storage is writable)
+- `chargeback_sink_spool_prepare_failures_total`
 - `chargeback_sink_export_latency_seconds`
 - `chargeback_sink_snapshot_emits_total` in snapshot mode
 

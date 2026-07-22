@@ -448,6 +448,8 @@ struct SinkMetrics {
     failure_reasons: FailureReasonCounters,
     queue_high_water_hits_total: AtomicU64,
     spool_drops_total: AtomicU64,
+    spool_available: AtomicBool,
+    spool_prepare_failures_total: AtomicU64,
     snapshot_emits_total: AtomicU64,
     last_success_at: AtomicI64,
     last_failure_at: AtomicI64,
@@ -465,6 +467,8 @@ impl Default for SinkMetrics {
             failure_reasons: FailureReasonCounters::default(),
             queue_high_water_hits_total: AtomicU64::new(0),
             spool_drops_total: AtomicU64::new(0),
+            spool_available: AtomicBool::new(false),
+            spool_prepare_failures_total: AtomicU64::new(0),
             snapshot_emits_total: AtomicU64::new(0),
             last_success_at: AtomicI64::new(0),
             last_failure_at: AtomicI64::new(0),
@@ -1091,7 +1095,7 @@ pub fn render_status_json() -> String {
             "pricing_version": null,
             "clickhouse": null,
             "queue": {"depth": 0, "capacity": 0, "high_water_hits_total": 0},
-            "spool": {"enabled": false, "files": 0, "bytes": 0, "drops_total": 0, "last_replay_at": null},
+            "spool": {"enabled": false, "available": false, "prepare_failures_total": 0, "files": 0, "bytes": 0, "drops_total": 0, "last_replay_at": null},
             "export": {
                 "events_enqueued_total": 0,
                 "events_exported_total": 0,
@@ -1147,6 +1151,8 @@ impl SinkRuntime {
             },
             "spool": {
                 "enabled": spool_enabled,
+                "available": spool_enabled && self.metrics.spool_available.load(Ordering::Acquire),
+                "prepare_failures_total": self.metrics.spool_prepare_failures_total.load(Ordering::Relaxed),
                 "files": spool_files,
                 "bytes": spool_bytes,
                 "drops_total": self.metrics.spool_drops_total.load(Ordering::Relaxed),
@@ -1242,6 +1248,22 @@ impl SinkRuntime {
         output.push_str(&format!(
             "chargeback_sink_spool_drops_total {}\n",
             metrics.spool_drops_total.load(Ordering::Relaxed)
+        ));
+        output.push_str("# HELP chargeback_sink_spool_available Whether committed spool storage is currently writable (1) or unavailable (0).\n");
+        output.push_str("# TYPE chargeback_sink_spool_available gauge\n");
+        output.push_str(&format!(
+            "chargeback_sink_spool_available {}\n",
+            if metrics.spool_available.load(Ordering::Acquire) {
+                1
+            } else {
+                0
+            }
+        ));
+        output.push_str("# HELP chargeback_sink_spool_prepare_failures_total Chargeback sink committed spool storage preparation failures.\n");
+        output.push_str("# TYPE chargeback_sink_spool_prepare_failures_total counter\n");
+        output.push_str(&format!(
+            "chargeback_sink_spool_prepare_failures_total {}\n",
+            metrics.spool_prepare_failures_total.load(Ordering::Relaxed)
         ));
         output.push_str("# HELP chargeback_sink_export_latency_seconds Chargeback sink ClickHouse export latency in seconds.\n");
         output.push_str("# TYPE chargeback_sink_export_latency_seconds histogram\n");
@@ -1403,8 +1425,8 @@ fn validate_config(config: &ApiChargebackSinkConfig) -> Result<(), String> {
                 "{PLUGIN_NAME}: spool.replay_interval_secs must be at least 1"
             ));
         }
-        // Shape-only: do not mkdir/chmod/probe here — that is deferred to
-        // SpoolManager::new inside start_background_tasks.
+        // Shape-only: do not mkdir/chmod/probe here. Live storage preparation
+        // starts only after the candidate generation is committed.
         validate_spool_dir_shape(&config.spool.dir)?;
     } else if config.mode == SinkMode::Snapshot {
         return Err(format!(
@@ -1476,7 +1498,7 @@ fn validate_spool_dir_shape(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err(format!("{PLUGIN_NAME}: spool.dir must not be empty"));
     }
-    // Reject obviously unusable relative placeholders without touching the FS.
+    // Reject NUL-containing paths without touching the filesystem.
     let display = path.to_string_lossy();
     if display.contains('\0') {
         return Err(format!(
@@ -1769,11 +1791,38 @@ impl SpoolManager {
     }
 
     fn prepare_live_storage_locked(&self) -> Result<(), String> {
-        ensure_private_dir(&self.cfg.dir)?;
-        ensure_private_dir(&self.cfg.dir.join(self.node_id.as_ref()))?;
-        if self.live_storage_prepared.load(Ordering::Acquire) {
+        let result = self.prepare_live_storage_locked_inner();
+        let available = result.is_ok();
+        let changed = self
+            .metrics
+            .spool_available
+            .swap(available, Ordering::AcqRel)
+            != available;
+        if !available {
+            self.metrics
+                .spool_prepare_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if changed || !available {
+            invalidate_status_cache();
+        }
+        result
+    }
+
+    fn prepare_live_storage_locked_inner(&self) -> Result<(), String> {
+        let node_dir = self.cfg.dir.join(self.node_id.as_ref());
+        // Avoid repeated chmod/write probes on every batch and replay tick.
+        // If an operator removes either live directory, fall through and
+        // securely recreate/re-probe it instead of creating permissive parents
+        // implicitly from the later day-directory write.
+        if self.live_storage_prepared.load(Ordering::Acquire)
+            && self.cfg.dir.is_dir()
+            && node_dir.is_dir()
+        {
             return Ok(());
         }
+        ensure_private_dir(&self.cfg.dir)?;
+        ensure_private_dir(&node_dir)?;
         warn_on_sibling_spool_dirs(&self.cfg.dir, self.node_id.as_ref());
         // Crash-left *.tmp files consume disk but are incomplete; delete them
         // only after publication and before any live quota decision.

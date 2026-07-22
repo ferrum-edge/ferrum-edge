@@ -2050,9 +2050,11 @@ impl Plugin for KafkaLogging {
         // Release the Ferrum flush worker before process-global registration so
         // diagnostics cannot advertise a live generation whose worker is still
         // dormant. register_generation stays idempotent via entry().or_insert.
-        if let Ok(guard) = generation.logger.lock()
-            && let Some(logger) = guard.as_ref()
-        {
+        let guard = match generation.logger.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(logger) = guard.as_ref() {
             logger.commit();
         }
         register_generation(Arc::clone(generation));
