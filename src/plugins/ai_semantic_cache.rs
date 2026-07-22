@@ -2076,12 +2076,11 @@ impl Plugin for AiSemanticCache {
         {
             hosts.push(hostname.clone());
         }
-        if let Some(ref redis) = self.redis_client {
-            if let Some(hostname) = redis.warmup_hostname()
-                && !hosts.contains(&hostname)
-            {
-                hosts.push(hostname);
-            }
+        if let Some(ref redis) = self.redis_client
+            && let Some(hostname) = redis.warmup_hostname()
+            && !hosts.contains(&hostname)
+        {
+            hosts.push(hostname);
         }
         hosts
     }
@@ -2587,6 +2586,7 @@ mod tests {
         SemanticConfig {
             provider,
             endpoint: "http://127.0.0.1:1/embeddings".to_string(),
+            warmup_hostname: None,
             model: Some("test-embedding-model".to_string()),
             api_key: Some("test-key".to_string()),
             auth_header: provider.default_auth_header().to_string(),
