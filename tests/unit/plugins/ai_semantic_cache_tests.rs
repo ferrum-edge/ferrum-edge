@@ -3641,6 +3641,170 @@ async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
 }
 
 #[tokio::test]
+async fn complex_provider_native_inputs_build_semantic_keys_without_collisions() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 6).await;
+    let plugin = make_plugin(semantic_config(&mock_server));
+
+    let responses_pairs = [
+        (
+            json!({
+                "model": "gpt-4.1",
+                "input": [
+                    "Seed context",
+                    {"role": "user", "content": "Capital of France?"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Considering it"}]
+                    },
+                    {"type": "input_text", "text": "Answer briefly"}
+                ]
+            }),
+            json!({
+                "model": "gpt-4.1",
+                "input": [
+                    "Different seed",
+                    {"role": "user", "content": "Which city is France's capital?"},
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Working on it"}]
+                    },
+                    {"type": "input_text", "text": "Use one word"}
+                ]
+            }),
+        ),
+        (
+            json!({
+                "model": "command-r",
+                "chat_history": [
+                    {"role": "SYSTEM", "message": "Use facts."},
+                    {"role": "USER", "message": "Capital of France?"},
+                    {"role": "CHATBOT", "content": ""},
+                    {"message": "Relevant context"}
+                ],
+                "message": "Answer briefly."
+            }),
+            json!({
+                "model": "command-r",
+                "chat_history": [
+                    {"role": "SYSTEM", "message": "Use facts."},
+                    {"role": "USER", "message": "Which city is France's capital?"},
+                    {"role": "CHATBOT", "content": ""},
+                    {"message": "Different context"}
+                ],
+                "message": "Use one word."
+            }),
+        ),
+        (
+            json!({
+                "model": "legacy-model",
+                "prompt": ["Capital", {"country": "France"}, 1, true, null]
+            }),
+            json!({
+                "model": "legacy-model",
+                "prompt": ["Largest city", {"country": "France"}, 2, false, null]
+            }),
+        ),
+    ];
+
+    for (stored, lookup) in responses_pairs {
+        store_response(
+            &plugin,
+            &serde_json::to_string(&stored).unwrap(),
+            None,
+            br#""semantic""#,
+        )
+        .await;
+        assert!(
+            run_before_proxy_get_status(
+                &plugin,
+                &serde_json::to_string(&lookup).unwrap(),
+                None,
+            )
+            .await,
+            "same-family structured prompt variants should semantic-hit"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reject_mode_detects_provider_native_multimodal_shapes() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "cache_multimodal": "reject"
+    }));
+
+    let cases = [
+        (json!({"input": "plain Responses text"}), false),
+        (
+            json!({"input": {"type": "input_text", "text": "plain text"}}),
+            false,
+        ),
+        (json!({"input": {"text": "plain untyped text"}}), false),
+        (json!({"input": 7}), true),
+        (json!({"input": {"type": "input_text"}}), true),
+        (
+            json!({"input": {"type": "input_image", "image_url": "image.png"}}),
+            true,
+        ),
+        (
+            json!({
+                "contents": [{"parts": [{"text": "plain Gemini text"}]}],
+                "systemInstruction": "plain instruction"
+            }),
+            false,
+        ),
+        (
+            json!({
+                "contents": [{"parts": [{"functionCall": {"name": "lookup"}}]}]
+            }),
+            true,
+        ),
+        (
+            json!({
+                "contents": [{"parts": [{"text": "plain Gemini text"}]}],
+                "systemInstruction": {
+                    "parts": [{"inlineData": {"mimeType": "image/png", "data": "aaa"}}]
+                }
+            }),
+            true,
+        ),
+        (
+            json!({
+                "contents": [{"parts": [{"text": "plain Gemini text"}]}],
+                "systemInstruction": [{"text": "plain instruction"}]
+            }),
+            false,
+        ),
+        (
+            json!({
+                "messages": [{"role": "user", "content": null}],
+                "system": null
+            }),
+            false,
+        ),
+        (
+            json!({
+                "messages": [{"role": "user", "content": "plain text"}],
+                "system": {"type": "image", "image_url": "system.png"}
+            }),
+            true,
+        ),
+    ];
+
+    for (body, multimodal) in cases {
+        let body_str = serde_json::to_string(&body).unwrap();
+        let (ctx, result) = run_before_proxy(&plugin, &body_str, None).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata.get("ai_cache_status").map(String::as_str),
+            Some(if multimodal { "BYPASS" } else { "MISS" }),
+            "unexpected reject-mode classification for {body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn distinct_families_do_not_exact_or_semantic_collide() {
     let mock_server = MockServer::start().await;
     mount_embedding_mock(&mock_server, 2).await;
