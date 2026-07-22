@@ -20015,7 +20015,7 @@ components:
               type: string
               format: uri
               minLength: 1
-              pattern: '^https?://[^/@]+(?:[/:?#]|$)'
+              pattern: '^[hH][tT][tT][pP][sS]?://(?![^/?#]*@)(?:\[[^\]\s]+\]|[^/?#:\s]+)(?::[0-9]+)?(?:[/?#]\S*)?$'
               description: ClickHouse HTTP endpoint. Must use http:// or https://, include a host, and must not contain user-info (use username/password_ref instead).
             database:
               type: string
@@ -20034,15 +20034,16 @@ components:
               description: Optional ClickHouse HTTP Basic username.
             password_ref:
               type: string
-              pattern: '^(|FERRUM_[A-Za-z0-9_]+)$'
+              pattern: '^\s*(?:FERRUM_.*)?\s*$'
               description: |
                 FERRUM_* environment variable containing the ClickHouse password,
                 often materialized at startup from an existing `_FILE`, `_VAULT`,
                 `_AWS`, `_AZURE`, or `_GCP` secret suffix. Empty values are treated
                 as unset. Because the password is sent via HTTP Basic auth,
                 `clickhouse.url` must use `https://` and TLS certificate/hostname
-                verification must stay enabled when this is nonempty. Runtime
-                additionally requires the referenced env var to be set.
+                verification must stay enabled when this is nonempty after
+                trimming. Empty or whitespace-only values are treated as unset.
+                Runtime additionally requires the referenced env var to be set.
             tls:
               type: object
               additionalProperties: false

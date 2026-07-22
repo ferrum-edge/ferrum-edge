@@ -327,6 +327,19 @@ fn openapi_schema_matches_runtime_admission_boundaries() {
             "spool": { "enabled": false },
             "stream_connection_pricing": {"price_per_connection": 0.1}
         }),
+        json!({
+            "clickhouse": {
+                "url": "http://clickhouse.example:8123",
+                "password_ref": "   "
+            },
+            "spool": { "enabled": false },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+        }),
+        json!({
+            "clickhouse": { "url": "HTTPS://clickhouse.example:8443" },
+            "spool": { "enabled": false },
+            "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+        }),
     ];
     for config in &minimal_pricing_shapes {
         assert!(
@@ -446,6 +459,14 @@ fn openapi_schema_matches_runtime_admission_boundaries() {
             "url with user-info",
             json!({
                 "clickhouse": { "url": "https://user:pass@clickhouse.example:8443" },
+                "spool": { "enabled": false },
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
+            }),
+        ),
+        (
+            "url without host",
+            json!({
+                "clickhouse": { "url": "https://?query=1" },
                 "spool": { "enabled": false },
                 "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}]
             }),
