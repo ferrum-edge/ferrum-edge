@@ -15410,6 +15410,8 @@ components:
         and JSON body. Rules are validated at plugin load time; unknown
         operations or targets, missing `value` on add/update, missing
         `new_key` on rename, and CR/LF in header values are rejected.
+        Every rule must set an explicit `target` (`header`, `query`, or
+        `body`); there is no default.
 
         When `apply_route_overrides: true`, the plugin also consumes per-rule
         header transforms published by `mesh_route_dispatch` onto
@@ -15428,40 +15430,16 @@ components:
         rules:
           type: array
           items:
-            type: object
-            required: [operation, key]
-            properties:
-              operation:
-                type: string
-                enum: [add, remove, update, rename]
-                description: |
-                  add: insert if absent (does not overwrite). Note: this is
-                  the historical Ferrum semantics, not Istio's "append to
-                  multi-value" semantics — use `update` to overwrite.
-                  update: write, creating intermediate objects as needed.
-                  remove: delete the field.
-                  rename: move old → new, with rollback if the destination is unreachable.
-              target:
-                type: string
-                enum: [header, query, body]
-                default: header
-              key:
-                type: string
-                description: |
-                  Header name, query param, or dot-notation body path. Body
-                  paths support nested objects ('user.address.city'), array
-                  indexing via numeric segments ('items.0.name'), and
-                  backslash-escaped literal dots ('meta.weird\\.key').
-              value:
-                type: string
-                description: |
-                  Required for add/update. For body rules, strings that parse
-                  as JSON (e.g., "42", "true", '{"a":1}') are inserted as the
-                  parsed type; otherwise kept as a JSON string. Header values
-                  must not contain CR or LF.
-              new_key:
-                type: string
-                description: Required for rename operations.
+            oneOf:
+              - $ref: "#/components/schemas/RequestTransformerHeaderRule"
+              - $ref: "#/components/schemas/RequestTransformerQueryRule"
+              - $ref: "#/components/schemas/RequestTransformerBodyRule"
+            discriminator:
+              propertyName: target
+              mapping:
+                header: "#/components/schemas/RequestTransformerHeaderRule"
+                query: "#/components/schemas/RequestTransformerQueryRule"
+                body: "#/components/schemas/RequestTransformerBodyRule"
         apply_route_overrides:
           type: boolean
           default: false
@@ -15485,6 +15463,93 @@ components:
           description: >-
             Fallback when `runtime_overlay_scope` is configured but the RTDS
             overlay has no boolean value for that key.
+
+    RequestTransformerHeaderRule:
+      type: object
+      required: [operation, target, key]
+      properties:
+        operation:
+          type: string
+          enum: [add, remove, update, rename]
+          description: |
+            add: insert if absent (does not overwrite). Note: this is
+            the historical Ferrum semantics, not Istio's "append to
+            multi-value" semantics — use `update` to overwrite.
+            update: write the header value.
+            remove: delete the header.
+            rename: move old → new header name.
+        target:
+          type: string
+          const: header
+        key:
+          type: string
+          description: HTTP header name.
+        value:
+          type: string
+          description: |
+            Required for add/update. Must be a string and must not contain
+            CR or LF.
+        new_key:
+          type: string
+          description: Required for rename operations.
+
+    RequestTransformerQueryRule:
+      type: object
+      required: [operation, target, key]
+      properties:
+        operation:
+          type: string
+          enum: [add, remove, update, rename]
+          description: |
+            add: insert if absent (does not overwrite).
+            update: write the query parameter value.
+            remove: delete the query parameter.
+            rename: move old → new query parameter name.
+        target:
+          type: string
+          const: query
+        key:
+          type: string
+          description: Query parameter name.
+        value:
+          type: string
+          description: Required for add/update. Must be a string.
+        new_key:
+          type: string
+          description: Required for rename operations.
+
+    RequestTransformerBodyRule:
+      type: object
+      required: [operation, target, key]
+      properties:
+        operation:
+          type: string
+          enum: [add, remove, update, rename]
+          description: |
+            add: insert if absent (does not overwrite).
+            update: write, creating intermediate objects as needed.
+            remove: delete the field.
+            rename: move old → new, with rollback if the destination is unreachable.
+        target:
+          type: string
+          const: body
+        key:
+          type: string
+          description: |
+            Dot-notation body path. Supports nested objects
+            ('user.address.city'), array indexing via numeric segments
+            ('items.0.name'), and backslash-escaped literal dots
+            ('meta.weird\\.key').
+        value:
+          description: |
+            Required for add/update. Accepts any JSON value — strings,
+            numbers, booleans, objects, arrays, and explicit null.
+            Strings that parse as JSON (e.g., "42", "true", '{"a":1}')
+            are inserted as the parsed type at runtime; otherwise kept
+            as a JSON string.
+        new_key:
+          type: string
+          description: Required for rename operations.
 
     ResponseTransformerConfig:
       type: object

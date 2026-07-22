@@ -2911,7 +2911,7 @@ Modifies request headers, query parameters, and JSON body fields before proxying
 config:
   rules:
     - operation: add       # add, remove, update, rename
-      target: header       # header, query, body (default: header)
+      target: header       # required: header, query, or body
       key: "X-Custom"
       value: "my-value"
     - operation: rename
@@ -2929,6 +2929,10 @@ config:
       target: body
       key: "meta.weird\\.key"     # \. = literal dot in a key
       value: "escaped"
+    - operation: add
+      target: body
+      key: "enabled"
+      value: true                 # native JSON types / null are valid for body
 ```
 
 **Operations and required fields** — validated at plugin load time; malformed rules reject the plugin config with a 400 (admin API), fail startup in file mode, or reject the new DB/CP reload snapshot while the gateway keeps serving the prior good config:
@@ -2940,7 +2944,7 @@ config:
 | `remove` | `key` | No-op if the field is absent. |
 | `rename` | `key`, `new_key` | `old → new`; if the destination path is unreachable, the value is restored at the old path (no data loss). Array indices (numeric segments) are rejected at plugin load time in `key` or `new_key` — see note below. |
 
-**Valid `target` values:** `header`, `query`, `body`. Omitted `target` defaults to `header`. Unknown targets are rejected at plugin construction. Non-string values for `target`, `operation`, `key`, `value`, or `new_key` are also rejected — the plugin does not silently coerce numbers, booleans, or objects into strings.
+**Valid `target` values:** `header`, `query`, `body`. `target` is required on every rule — there is no default. Unknown targets are rejected at plugin construction. Non-string values for `target`, `operation`, `key`, or `new_key` are also rejected — the plugin does not silently coerce numbers, booleans, or objects into strings. Header and query `value` must be strings; body `value` accepts any JSON type including explicit `null` (see below).
 
 **Header value constraints:** header `value` must not contain CR (`\r`) or LF (`\n`) — rejected at plugin load time as defence against header injection.
 
@@ -2948,7 +2952,7 @@ config:
 - **Nested objects** — `user.address.city`.
 - **Array indexing** — numeric segments index into arrays: `items.0.name`. Arrays are not auto-grown; out-of-bounds indices fail silently at request time (the rule is skipped for that request).
 - **Literal dots in keys** — escape with `\.`: `meta.weird\.key` targets a key literally named `weird.key`.
-- **Typed values** — string values that parse as JSON (e.g., `"42"`, `"true"`, `"null"`, `"{\"a\":1}"`) are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` (`value: null` in YAML/JSON) is preserved — `add` / `update` body rules with `value: null` set the target field to JSON null.
+- **Typed values** — native JSON scalars, objects, arrays, and explicit `null` are accepted on body `add` / `update`. String values that parse as JSON (e.g., `"42"`, `"true"`, `"null"`, `"{\"a\":1}"`) are inserted as the parsed type; otherwise they remain JSON strings. Explicit JSON `null` (`value: null` in YAML/JSON) is preserved — `add` / `update` body rules with `value: null` set the target field to JSON null.
 
 **`rename` does not support array indices in `key` or `new_key`.** Array mutation is ambiguous for rename (move? swap? overwrite?) and would risk data loss — `Vec::remove` shifts elements leftward, so a `rename("items.0" → "items.1")` on `["A","B","C"]` would silently drop `"C"`. Configs with numeric segments in a rename path are rejected at plugin load time. To relocate elements within an array, use `remove` followed by `add`. Escaped numeric segments (`counts\.0` — a literal key named `counts.0`) are still accepted.
 
