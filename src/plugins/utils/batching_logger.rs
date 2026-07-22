@@ -275,14 +275,8 @@ impl<T: Send + 'static> BatchingLogger<T> {
                 drop(receiver);
                 return;
             }
-            run_flush_loop_with_hooks(
-                cfg,
-                receiver,
-                worker_queue_depth,
-                flush,
-                on_failed_batch,
-            )
-            .await;
+            run_flush_loop_with_hooks(cfg, receiver, worker_queue_depth, flush, on_failed_batch)
+                .await;
         });
 
         Self {
@@ -562,9 +556,7 @@ impl<T: Send + 'static> DeferredBatchingLogger<T> {
 
     /// Whether the staged logger has been released by [`Self::commit`].
     pub fn is_committed(&self) -> bool {
-        self.logger
-            .get()
-            .is_some_and(BatchingLogger::is_committed)
+        self.logger.get().is_some_and(BatchingLogger::is_committed)
     }
 
     /// Non-blocking send. Returns `false` when the worker has not started yet

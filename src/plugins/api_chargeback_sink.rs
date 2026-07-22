@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::warn;
 use tokio::sync::watch;
+use tracing::warn;
 use url::Url;
 
 #[cfg(unix)]

@@ -774,9 +774,7 @@ async fn chargeback_spool_replay_and_snapshot_stay_dormant_until_commit() {
         "spool replayer must not consume files before commit"
     );
     assert!(
-        !planted
-            .with_file_name("planted.ndjson.corrupt")
-            .exists(),
+        !planted.with_file_name("planted.ndjson.corrupt").exists(),
         "spool replayer must not quarantine files before commit"
     );
     assert_eq!(
@@ -800,9 +798,7 @@ async fn chargeback_spool_replay_and_snapshot_stay_dormant_until_commit() {
         "dropping an uncommitted chargeback sink must not replay/delete spool files"
     );
     assert!(
-        !planted
-            .with_file_name("planted.ndjson.corrupt")
-            .exists(),
+        !planted.with_file_name("planted.ndjson.corrupt").exists(),
         "dropping an uncommitted chargeback sink must not quarantine spool files"
     );
     unsafe {
