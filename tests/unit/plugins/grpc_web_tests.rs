@@ -1595,7 +1595,8 @@ fn test_sync_trailer_frame_refuses_malformed_draft_body() {
 /// because truncate-then-sync fails closed and keeps the transform draft.
 #[test]
 fn test_sync_before_discard_preserves_custom_trailers_on_framed_body() {
-    let backend_headers = HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let backend_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
     let backend_trailers = HashMap::from([
         ("grpc-status".to_string(), "0".to_string()),
         ("request-id".to_string(), "abc-123\nabc-456".to_string()),
@@ -1611,7 +1612,9 @@ fn test_sync_before_discard_preserves_custom_trailers_on_framed_body() {
     // Proper length-prefixed DATA frame + transform-phase trailer draft.
     let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x04];
     body.extend_from_slice(b"pong");
-    body.extend(ferrum_edge::_test_support::build_trailer_frame(&plugin_view));
+    body.extend(ferrum_edge::_test_support::build_trailer_frame(
+        &plugin_view,
+    ));
 
     let mut wire_trailers = backend_trailers.clone();
     grpc_proxy::reconcile_grpc_trailers_from_view(
@@ -1660,7 +1663,8 @@ fn test_sync_before_discard_preserves_custom_trailers_on_framed_body() {
 /// discard-then-sync on a framed body is the exact H3 provenance-loss shape.
 #[test]
 fn test_discard_before_sync_on_framed_body_drops_custom_trailers() {
-    let backend_headers = HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let backend_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
     let backend_trailers = HashMap::from([
         ("grpc-status".to_string(), "0".to_string()),
         ("request-id".to_string(), "abc-123\nabc-456".to_string()),
@@ -1675,7 +1679,9 @@ fn test_discard_before_sync_on_framed_body_drops_custom_trailers() {
 
     let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x04];
     body.extend_from_slice(b"pong");
-    body.extend(ferrum_edge::_test_support::build_trailer_frame(&plugin_view));
+    body.extend(ferrum_edge::_test_support::build_trailer_frame(
+        &plugin_view,
+    ));
 
     let mut wire_trailers = backend_trailers;
     ferrum_edge::_test_support::discard_grpc_application_trailers_after_body_rewrite_for_test(
