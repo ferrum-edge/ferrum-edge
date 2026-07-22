@@ -827,10 +827,7 @@ impl RedisRateLimitClient {
     }
 
     /// Establish (or reuse) the ConnectionManager for a specific pool slot.
-    async fn get_or_connect_slot(
-        &self,
-        idx: usize,
-    ) -> Option<redis::aio::ConnectionManager> {
+    async fn get_or_connect_slot(&self, idx: usize) -> Option<redis::aio::ConnectionManager> {
         let slot = &self.pool[idx];
 
         // Fast path: lock-free read via ArcSwap
