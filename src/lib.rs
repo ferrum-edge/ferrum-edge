@@ -719,9 +719,51 @@ pub mod _test_support {
         )
     }
 
+    pub fn soap_decode_xml_body_for_test(
+        bytes: &[u8],
+        content_type: &str,
+    ) -> Result<String, String> {
+        crate::plugins::soap_ws_security::decode_soap_xml_body_for_test(bytes, content_type)
+    }
+
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
     pub fn classify_stream_error(error: &anyhow::Error) -> crate::retry::ErrorClass {
         crate::proxy::tcp_proxy::classify_stream_error(error)
+    }
+
+    /// Mirror the TCP accept-loop disconnect summary contract: `duration_ms`
+    /// from process-monotonic `Instant`, RFC3339 connect/disconnect stamps
+    /// from civil/UTC wall clocks only. Used by parity regression tests for
+    /// issue #2624 (WebSocket/UDP/DTLS must match this split).
+    pub fn tcp_stream_summary_from_clocks_for_test(
+        connected_mono: std::time::Instant,
+        connected_wall_at: chrono::DateTime<chrono::Utc>,
+        disconnected_wall_at: chrono::DateTime<chrono::Utc>,
+    ) -> crate::plugins::StreamTransactionSummary {
+        crate::plugins::StreamTransactionSummary {
+            namespace: "ferrum".to_string(),
+            proxy_id: "tcp-proxy".to_string(),
+            proxy_name: Some("TCP Proxy".to_string()),
+            client_ip: "10.0.0.1".to_string(),
+            consumer_username: None,
+            auth_method: None,
+            backend_target: "10.0.0.2:9000".to_string(),
+            backend_resolved_ip: Some("10.0.0.2".to_string()),
+            protocol: "tcp".to_string(),
+            listen_port: 9000,
+            // Production: `connected_at.elapsed().as_millis() as f64`
+            duration_ms: connected_mono.elapsed().as_millis() as f64,
+            bytes_sent: 0,
+            bytes_received: 0,
+            connection_error: None,
+            error_class: None,
+            disconnect_direction: None,
+            disconnect_cause: Some(crate::plugins::DisconnectCause::GracefulShutdown),
+            timestamp_connected: connected_wall_at.to_rfc3339(),
+            timestamp_disconnected: disconnected_wall_at.to_rfc3339(),
+            sni_hostname: None,
+            metadata: Default::default(),
+        }
     }
 
     /// Resolve the DestinationRule `connectionPool.tcp.maxConnections` cap a
@@ -1009,6 +1051,23 @@ pub mod _test_support {
         duration: std::time::Duration,
     ) {
         plugin.advance_clock_for_tests(duration);
+    }
+
+    pub fn response_caching_staging_metadata_key_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+        suffix: &str,
+    ) -> String {
+        plugin.staging_metadata_key_for_tests(suffix)
+    }
+
+    pub fn response_caching_instance_id_for_test(
+        plugin: &crate::plugins::response_caching::ResponseCaching,
+    ) -> u64 {
+        plugin.instance_id_for_tests()
+    }
+
+    pub fn response_cache_hit_for_test(ctx: &crate::plugins::RequestContext) -> bool {
+        ctx.response_cache_hit()
     }
 
     pub fn response_caching_current_total_size_for_test(
@@ -1317,6 +1376,45 @@ pub mod _test_support {
         http_status: Option<u16>,
     ) -> Vec<u8> {
         crate::plugins::grpc_web::build_trailer_frame(response_headers, http_status)
+    }
+
+    pub fn sync_translated_body_trailer_frame_from_trailers(
+        body: &mut Vec<u8>,
+        content_type: Option<&str>,
+        reconciled_trailers: &HashMap<String, String>,
+        http_status: Option<u16>,
+    ) -> bool {
+        crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+            body,
+            content_type,
+            reconciled_trailers,
+            http_status,
+        )
+    }
+
+    pub fn truncate_trailing_trailer_frames_for_test(data: &mut Vec<u8>) -> bool {
+        crate::plugins::grpc_web::truncate_trailing_trailer_frames(data)
+    }
+
+    pub fn begin_buffered_initial_response_header_policy_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        header_names: std::sync::Arc<Vec<String>>,
+        initial_headers: &HashMap<String, String>,
+        merged_headers: &HashMap<String, String>,
+    ) {
+        ctx.begin_buffered_initial_response_header_policy(
+            header_names,
+            initial_headers,
+            merged_headers,
+        );
+    }
+
+    pub fn record_buffered_initial_response_header_plugin_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        plugin: &dyn crate::plugins::Plugin,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        ctx.record_buffered_initial_response_header_plugin(plugin, response_headers);
     }
 
     pub fn http_response_status_to_grpc_status(http_status: u16) -> u32 {
@@ -1883,6 +1981,37 @@ pub mod _test_support {
         )
     }
 
+    /// Return true when an immediately-ready post-deadline terminal rejection
+    /// write completes under the shared gateway grace.
+    pub async fn ready_h3_post_deadline_terminal_write_completes_for_test() -> bool {
+        matches!(
+            crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                std::future::ready(Ok::<(), ()>(())),
+            )
+            .await,
+            Ok(())
+        )
+    }
+
+    /// Spawn a stalled post-deadline terminal rejection write under the shared
+    /// gateway grace. Callers in paused-time tests must advance simulated time
+    /// by [`h3_post_deadline_terminal_write_grace_for_test`] before awaiting the
+    /// handle — this helper intentionally never calls Tokio `test-util` APIs.
+    pub fn spawn_stalled_h3_post_deadline_terminal_write_for_test() -> tokio::task::JoinHandle<bool>
+    {
+        let write = std::future::pending::<Result<(), ()>>();
+        tokio::spawn(async move {
+            matches!(
+                crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await,
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded)
+            )
+        })
+    }
+
+    pub fn h3_post_deadline_terminal_write_grace_for_test() -> std::time::Duration {
+        crate::http3::stream_util::H3_POST_DEADLINE_TERMINAL_WRITE_GRACE
+    }
+
     pub fn grpc_deadline_can_send_terminal_status_for_test(bytes_streamed: u64) -> bool {
         crate::http3::stream_util::grpc_deadline_can_send_terminal_status(bytes_streamed)
     }
@@ -2102,6 +2231,35 @@ pub mod _test_support {
             auth_method: None,
             metadata,
             session_start,
+            // Duration is Instant-based; wall `session_start` is rendering-only.
+            session_start_mono: std::time::Instant::now(),
+        }
+    }
+
+    /// Test helper that pins both wall and monotonic WebSocket session starts.
+    #[allow(clippy::too_many_arguments)]
+    pub fn make_ws_session_meta_with_mono(
+        namespace: String,
+        proxy_name: Option<String>,
+        client_ip: String,
+        backend_target: String,
+        listen_port: u16,
+        consumer_username: Option<String>,
+        metadata: HashMap<String, String>,
+        session_start: chrono::DateTime<chrono::Utc>,
+        session_start_mono: std::time::Instant,
+    ) -> crate::proxy::WsSessionMeta {
+        crate::proxy::WsSessionMeta {
+            namespace,
+            proxy_name,
+            client_ip,
+            backend_target,
+            listen_port,
+            consumer_username,
+            auth_method: None,
+            metadata,
+            session_start,
+            session_start_mono,
         }
     }
 
@@ -2121,6 +2279,37 @@ pub mod _test_support {
             ws_disconnect_plugins,
             proxy_id,
             session_meta,
+            bytes_client_to_backend,
+            bytes_backend_to_client,
+            failure,
+        )
+        .await
+    }
+
+    /// Framed (parsed) WebSocket disconnect entry point — mirrors production
+    /// teardown in `run_websocket_proxy` so unit tests can assert Instant-based
+    /// `duration_ms` with non-zero frame counters.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fire_ws_framed_disconnect_hooks(
+        ws_disconnect_plugins: &[Arc<dyn Plugin>],
+        proxy_id: &str,
+        session_meta: crate::proxy::WsSessionMeta,
+        frames_client_to_backend: u64,
+        frames_backend_to_client: u64,
+        bytes_client_to_backend: u64,
+        bytes_backend_to_client: u64,
+        failure: Option<(
+            crate::plugins::Direction,
+            crate::retry::ErrorClass,
+            Option<StreamIoSide>,
+        )>,
+    ) {
+        crate::proxy::fire_ws_framed_disconnect_hooks(
+            ws_disconnect_plugins,
+            proxy_id,
+            session_meta,
+            frames_client_to_backend,
+            frames_backend_to_client,
             bytes_client_to_backend,
             bytes_backend_to_client,
             failure,
@@ -2283,5 +2472,96 @@ pub mod _test_support {
 
     pub fn udp_logging_dtls_send_timeout_secs_for_test() -> u64 {
         crate::plugins::udp_logging::UDP_LOGGING_DTLS_SEND_TIMEOUT.as_secs()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum EarlyUploadWaitError {
+        TimedOut,
+        DeadlineExceeded,
+        Read,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum EarlyUploadBoundKind {
+        OperatorTimeout,
+        RpcDeadline,
+    }
+
+    pub fn compose_early_upload_bound_for_test(
+        absolute_deadline: Option<tokio::time::Instant>,
+        operator_timeout_ms: u64,
+    ) -> Option<(tokio::time::Instant, EarlyUploadBoundKind)> {
+        crate::proxy::compose_early_upload_bound(absolute_deadline, operator_timeout_ms).map(
+            |(deadline, kind)| {
+                let kind = match kind {
+                    crate::proxy::EarlyUploadBoundKind::OperatorTimeout => {
+                        EarlyUploadBoundKind::OperatorTimeout
+                    }
+                    crate::proxy::EarlyUploadBoundKind::RpcDeadline => {
+                        EarlyUploadBoundKind::RpcDeadline
+                    }
+                };
+                (deadline, kind)
+            },
+        )
+    }
+
+    pub fn early_upload_phase_needs_fresh_drain_for_test(
+        prebuffered_body: &Option<Vec<u8>>,
+    ) -> bool {
+        crate::proxy::early_upload_phase_needs_fresh_drain(prebuffered_body)
+    }
+
+    pub async fn collect_h1h2_request_body_with_deadline_for_test<F, T, E>(
+        collect: F,
+        deadline: Option<tokio::time::Instant>,
+        request_body_read_timeout_ms: u64,
+    ) -> Result<Result<T, E>, EarlyUploadWaitError>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        match crate::proxy::collect_request_body_with_deadline(
+            collect,
+            deadline,
+            request_body_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(result) => Ok(result),
+            Err(crate::proxy::RequestBodyWaitError::TimedOut) => {
+                Err(EarlyUploadWaitError::TimedOut)
+            }
+            Err(crate::proxy::RequestBodyWaitError::DeadlineExceeded) => {
+                Err(EarlyUploadWaitError::DeadlineExceeded)
+            }
+        }
+    }
+
+    pub async fn collect_h3_request_body_with_deadline_for_test<F, T, E>(
+        collect: F,
+        deadline: Option<tokio::time::Instant>,
+        request_body_read_timeout_ms: u64,
+    ) -> Result<T, EarlyUploadWaitError>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        match crate::http3::server::collect_h3_request_body_with_deadline(
+            collect,
+            deadline,
+            request_body_read_timeout_ms,
+        )
+        .await
+        {
+            Ok(value) => Ok(value),
+            Err(crate::http3::server::H3RequestBodyReadError::TimedOut) => {
+                Err(EarlyUploadWaitError::TimedOut)
+            }
+            Err(crate::http3::server::H3RequestBodyReadError::DeadlineExceeded) => {
+                Err(EarlyUploadWaitError::DeadlineExceeded)
+            }
+            Err(crate::http3::server::H3RequestBodyReadError::Read(_)) => {
+                Err(EarlyUploadWaitError::Read)
+            }
+        }
     }
 }

@@ -11,61 +11,198 @@
 //! and HTTP/3 (RFC 9113 §8.2.2 / RFC 9114 §4.2), and the proxy's plugin
 //! pipeline lowercases keys at admission, so callers may match against these
 //! predicates without a separate normalisation step.
+//!
+//! Secondary-request builders (`request_mirror`, `load_testing`) call the
+//! hot-path predicates below directly (via
+//! [`is_secondary_request_strip_header`]), so newly added strip arms are
+//! honored automatically. The `*_NAMES` consts are the same inventory as the
+//! predicates — generated together — and exist for documentation and tests
+//! that enumerate the closed set, not as a second allowlist that must be kept
+//! in sync by hand.
 
-/// Returns `true` for headers that must NOT be forwarded on a backend
-/// request. This is the union of:
-///
-/// - **RFC 9110 §7.6.1 hop-by-hop headers (request-direction set):**
-///   `connection`, `keep-alive`, `proxy-authorization`, `proxy-connection`,
-///   `te`, `trailer`, `transfer-encoding`, `upgrade`.
-///
-/// - **`content-length`:** managed by the transport layer. Reqwest
-///   recomputes it from the body, hyper H2 frames the body via DATA frames
-///   so any forwarded value is informational only, h3 likewise frames via
-///   QUIC streams. Forwarding an upstream value risks disagreeing with the
-///   actual body length when a request_transformer plugin mutated the body
-///   without correcting the header — the backend may reject the mismatch
-///   per RFC 9110 §8.6.
-///
-/// - **`x-ferrum-original-content-encoding`:** internal Ferrum marker used
-///   by the compression plugin to track the pre-compression encoding;
-///   never forward to the backend.
-///
-/// - **`x-grpc-web-mode`:** internal grpc_web plugin marker used only between
-///   request header and body plugin phases; never forward to the backend.
-///
-/// `name` is expected to be lowercase.
-#[inline]
-pub fn is_backend_request_strip_header(name: &str) -> bool {
-    matches!(
-        name,
-        "connection"
-            | "content-length"
-            | "keep-alive"
-            | "proxy-authorization"
-            | "proxy-connection"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-            | "x-ferrum-original-content-encoding"
-            | "x-grpc-web-mode"
-    )
+/// Expand one closed header-name inventory into both a `&[&str]` const and the
+/// matching hot-path `matches!` predicate so documentation inventories cannot
+/// drift from the predicate arms.
+macro_rules! define_header_name_set {
+    (
+        $(#[$const_meta:meta])*
+        $const_vis:vis const $const_name:ident;
+        $(#[$fn_meta:meta])*
+        $fn_vis:vis fn $fn_name:ident;
+        [$($name:literal),+ $(,)?]
+    ) => {
+        $(#[$const_meta])*
+        $const_vis const $const_name: &[&str] = &[$($name),+];
+
+        $(#[$fn_meta])*
+        #[inline]
+        $fn_vis fn $fn_name(name: &str) -> bool {
+            matches!(name, $($name)|+)
+        }
+    };
 }
 
-/// Returns true for request metadata headers that Ferrum regenerates before
-/// sending to HTTP backends.
+define_header_name_set! {
+    // Public inventory is consumed by library tests, not the binary target.
+    #[allow(dead_code)]
+    /// Closed set of lowercase names stripped by
+    /// [`is_backend_request_strip_header`]. Secondary-request builders call that
+    /// predicate directly; this const is the shared inventory for docs/tests.
+    pub const BACKEND_REQUEST_STRIP_HEADER_NAMES;
+    /// Returns `true` for headers that must NOT be forwarded on a backend
+    /// request. This is the union of:
+    ///
+    /// - **RFC 9110 §7.6.1 hop-by-hop headers (request-direction set):**
+    ///   `connection`, `keep-alive`, `proxy-authorization`, `proxy-connection`,
+    ///   `te`, `trailer`, `transfer-encoding`, `upgrade`.
+    ///
+    /// - **`content-length`:** managed by the transport layer. Reqwest
+    ///   recomputes it from the body, hyper H2 frames the body via DATA frames
+    ///   so any forwarded value is informational only, h3 likewise frames via
+    ///   QUIC streams. Forwarding an upstream value risks disagreeing with the
+    ///   actual body length when a request_transformer plugin mutated the body
+    ///   without correcting the header — the backend may reject the mismatch
+    ///   per RFC 9110 §8.6.
+    ///
+    /// - **`x-ferrum-original-content-encoding`:** internal Ferrum marker used
+    ///   by the compression plugin to track the pre-compression encoding;
+    ///   never forward to the backend.
+    ///
+    /// - **`x-grpc-web-mode`:** internal grpc_web plugin marker used only between
+    ///   request header and body plugin phases; never forward to the backend.
+    ///
+    /// `name` is expected to be lowercase.
+    pub fn is_backend_request_strip_header;
+    [
+        "connection",
+        "content-length",
+        "keep-alive",
+        "proxy-authorization",
+        "proxy-connection",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "x-ferrum-original-content-encoding",
+        "x-grpc-web-mode",
+    ]
+}
+
+define_header_name_set! {
+    // Public inventory is consumed by library tests, not the binary target.
+    #[allow(dead_code)]
+    /// Closed set of lowercase proxy-owned forwarding identity headers stripped
+    /// before Ferrum regenerates them on primary dispatch (and before secondary
+    /// request builders copy the materialised map).
+    pub const PROXY_GENERATED_FORWARDING_HEADER_NAMES;
+    /// Returns true for request metadata headers that Ferrum regenerates before
+    /// sending to HTTP backends.
+    ///
+    /// These are not hop-by-hop headers, but copying the client-supplied field and
+    /// then adding Ferrum's canonical value creates duplicate metadata. In
+    /// particular, duplicated `X-Forwarded-For` can make a backend observe the
+    /// untrusted client value twice after normal comma folding.
+    pub fn is_proxy_generated_forwarding_header;
+    ["x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"]
+}
+
+/// Whether client `Host` / authority should survive secondary-request filtering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondaryRequestHostPolicy {
+    /// Drop client `Host` so the outbound HTTP client derives authority from
+    /// the target URL (shadow / mirror destinations).
+    Strip,
+    /// Keep `Host` for host-based routing when the synthetic request re-enters
+    /// the gateway (load-testing loopback and peer fan-out).
+    Preserve,
+}
+
+/// Returns `true` when a materialised request header must not be copied onto a
+/// Ferrum-generated secondary request (mirror, load-test synthetic/fan-out).
 ///
-/// These are not hop-by-hop headers, but copying the client-supplied field and
-/// then adding Ferrum's canonical value creates duplicate metadata. In
-/// particular, duplicated `X-Forwarded-For` can make a backend observe the
-/// untrusted client value twice after normal comma folding.
+/// Applies the primary backend-request strip set, proxy-owned forwarding
+/// identity headers, RFC 9110 `Connection`-listed names (snapshot must be
+/// taken via [`parse_connection_listed_from_str_map`] before filtering), and
+/// the caller-selected [`SecondaryRequestHostPolicy`].
+///
+/// Comparison is ASCII case-insensitive so plugin-synthesised mixed-case keys
+/// cannot bypass the boundary.
 #[inline]
-pub fn is_proxy_generated_forwarding_header(name: &str) -> bool {
-    matches!(
-        name,
-        "x-forwarded-for" | "x-forwarded-proto" | "x-forwarded-host"
-    )
+pub fn is_secondary_request_strip_header(
+    name: &str,
+    connection_listed: &[String],
+    host_policy: SecondaryRequestHostPolicy,
+) -> bool {
+    let name_lower = name.to_ascii_lowercase();
+    if host_policy == SecondaryRequestHostPolicy::Strip && name_lower == "host" {
+        return true;
+    }
+    if connection_listed.iter().any(|listed| listed == &name_lower) {
+        return true;
+    }
+    is_backend_request_strip_header(&name_lower)
+        || is_proxy_generated_forwarding_header(&name_lower)
+}
+
+/// Filter a materialised request header map for a Ferrum-generated secondary
+/// request, honoring the same outbound protocol boundary as primary backend
+/// dispatch.
+///
+/// `extra_exclude` removes additional plugin-control names (for example
+/// load-testing trigger/fan-out headers) after the canonical strip. `Host`
+/// handling is selected via [`SecondaryRequestHostPolicy`].
+///
+/// Connection-listed names are snapshotted first so dynamic hop-by-hop tokens
+/// are removed even though `connection` itself is stripped by the static set.
+pub fn filter_secondary_request_headers(
+    headers: &std::collections::HashMap<String, String>,
+    host_policy: SecondaryRequestHostPolicy,
+    extra_exclude: &[&str],
+) -> Vec<(String, String)> {
+    let connection_listed = parse_connection_listed_from_str_map(headers);
+    headers
+        .iter()
+        .filter(|(name, _)| {
+            if extra_exclude
+                .iter()
+                .any(|excluded| name.eq_ignore_ascii_case(excluded))
+            {
+                return false;
+            }
+            !is_secondary_request_strip_header(name, &connection_listed, host_policy)
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// After generic secondary-request stripping, re-synthesise gRPC's mandatory
+/// `te: trailers` when the outbound request is native gRPC.
+///
+/// Uses the same delimiter-aware classifier as primary dispatch
+/// ([`crate::proxy::backend_dispatch::is_native_grpc_content_type`]): exact
+/// `application/grpc`, `application/grpc+…`, or parameters / trailing OWS —
+/// not a bare prefix match that would treat `application/grpcfoo` or
+/// `application/grpc-web` as gRPC.
+///
+/// Mirrors [`strip_backend_request_headers_for_grpc`] for builders that work
+/// from a materialised `Vec<(String, String)>` rather than `http::HeaderMap`.
+/// Callers must use an HTTP/2-capable target for native gRPC; HTTP/1.1 is not a
+/// supported native-gRPC mirror transport.
+pub fn synthesize_grpc_te_trailers_if_needed(headers: &mut Vec<(String, String)>) {
+    let is_grpc = headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type") && content_type_is_grpc(value)
+    });
+    if !is_grpc {
+        return;
+    }
+    headers.retain(|(name, _)| !name.eq_ignore_ascii_case("te"));
+    headers.push(("te".to_string(), "trailers".to_string()));
+}
+
+/// Allocation-free native-gRPC media-type check for secondary-request builders.
+#[inline]
+fn content_type_is_grpc(value: &str) -> bool {
+    crate::proxy::backend_dispatch::is_native_grpc_content_type(value.as_bytes())
 }
 
 /// Parse the lowercased header names listed in any `Connection` header(s),
@@ -311,13 +448,19 @@ pub fn merge_proxy_headers_and_strip_for_grpc(
     strip_backend_request_headers_for_grpc(headers);
 }
 
-/// Returns `true` for headers that must NOT be forwarded on a backend
-/// response, per RFC 9110 §7.6.1 (response-direction hop-by-hop set).
+/// Returns `true` for headers that must NOT cross the backend-response trust
+/// boundary: the RFC 9110 §7.6.1 response-direction hop-by-hop set plus
+/// Ferrum-owned internal response control fields.
 ///
 /// Note that this set differs from the request-direction set:
 /// `proxy-authenticate` is response-only, `proxy-authorization` is
 /// request-only. `content-length` is preserved on responses because the
 /// downstream client uses it for framing.
+///
+/// This boundary also strips Ferrum-owned response control fields. Those
+/// fields are injected only after backend response collection and must never
+/// be accepted from an untrusted backend: otherwise a backend could forge
+/// internal provenance consumed by a later trusted plugin phase.
 ///
 /// **Trailers**: this same predicate MUST be applied to backend response
 /// **trailers** (RFC 9110 §6.5 distinct concept). gRPC encodes
@@ -346,7 +489,17 @@ pub fn is_backend_response_strip_header(name: &str) -> bool {
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
-    )
+    ) || is_internal_response_control_header(name)
+}
+
+/// Ferrum-owned response fields used only between trusted proxy phases.
+///
+/// Use an ASCII-insensitive comparison because backend decoders normalize
+/// names but plugin-produced maps can still contain mixed-case keys before the
+/// final client-boundary sanitation pass.
+#[inline]
+fn is_internal_response_control_header(name: &str) -> bool {
+    crate::plugins::grpc_web::is_internal_grpc_web_bridge_header(name)
 }
 
 /// Case-insensitive final-wire counterpart for plugin-produced response maps.
@@ -505,6 +658,17 @@ mod tests {
         assert!(is_backend_request_strip_header(
             "x-ferrum-original-content-encoding"
         ));
+        assert!(is_backend_request_strip_header("x-grpc-web-mode"));
+    }
+
+    #[test]
+    fn backend_request_strip_inventory_is_single_source() {
+        // The const and predicate are expanded from one macro inventory; this
+        // only pins the documented closed-set size so accidental inventory
+        // edits remain visible in review. Secondary builders call the
+        // predicates directly and do not re-list these names.
+        assert_eq!(BACKEND_REQUEST_STRIP_HEADER_NAMES.len(), 11);
+        assert_eq!(PROXY_GENERATED_FORWARDING_HEADER_NAMES.len(), 3);
     }
 
     #[test]
@@ -558,6 +722,21 @@ mod tests {
                 is_backend_response_strip_header(name),
                 "RFC 9110 §7.6.1 response hop-by-hop header `{}` must be stripped",
                 name
+            );
+        }
+    }
+
+    #[test]
+    fn response_strip_rejects_backend_forged_grpc_web_bridge_fields() {
+        for name in [
+            crate::plugins::grpc_web::HEADER_GRPC_WEB_TRAILER_NAMES,
+            crate::plugins::grpc_web::HEADER_GRPC_WEB_SHADOWED_TRAILERS,
+            "X-Ferrum-Grpc-Web-Trailer-Names",
+            "X-Ferrum-Grpc-Web-Shadowed-Trailers",
+        ] {
+            assert!(
+                is_backend_response_strip_header(name),
+                "Ferrum-owned response control field `{name}` must be stripped"
             );
         }
     }

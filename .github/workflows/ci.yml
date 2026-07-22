@@ -924,7 +924,9 @@ jobs:
             filters: |
               functional_cors_protocol_test
               functional_grpc_test
+              functional_h3_soap_utf16_test
               functional_key_auth_query_test
+              functional_request_mirror_query_parity_test
               functional_load_testing_replay_test
               functional_passthrough_test
               functional_sse_test
@@ -953,6 +955,7 @@ jobs:
               functional_early_data_test
               functional_ws_origin_test
               functional_allowed_methods_test
+              functional_allowed_methods_logging_test
               functional_forwarded_via_headers_test
               functional_streaming_latency_tracking_test
               functional_streaming_outcome_accounting_test
@@ -965,6 +968,7 @@ jobs:
               functional_protocol_h3_body_limit_config_test
               functional_protocol_h2_body_limit_config_test
               functional_protocol_body_limit_config_test
+              functional_early_upload_deadline_test
               functional_h3_authority_validation_test
               functional_h3_local_policy_test
               functional_h3_grpc_web_test
@@ -2391,6 +2395,26 @@ jobs:
             echo "::error title=QUIC port without HTTPS listener::https-quic must require an active HTTPS listener"
             exit 1
           fi
+          # DOC-02: migrate is an external Job workflow, not a chart mode and not
+          # redirected to ferrum-mesh. mesh-family modes still point at ferrum-mesh.
+          # helm stays in this trusted workflow shell; the automation script only
+          # statically parses the captured stderr and repository contract files.
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=migrate \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/migrate-mode.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/migrate-mode.err"; then
+            echo "::error title=migrate mode rendered::mode=migrate must fail as an external Job contract"
+            exit 1
+          fi
+          if helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
+            --set mode=mesh \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/mesh-mode.yaml" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/mesh-mode.err"; then
+            echo "::error title=mesh mode rendered on gateway chart::mesh must fail with a ferrum-mesh pointer"
+            exit 1
+          fi
+          python3 -I .github/scripts/validate_migrate_k8s_contract.py \
+            --results-dir "$RUNNER_TEMP/ferrum-gateway-helm-results"
 
       - name: Upload core gateway chart diagnostics
         if: always()
@@ -2418,6 +2442,14 @@ jobs:
           chmod +x target/debug/ferrum-edge
           kind create cluster --name ferrum-helm --wait 120s
           kind load docker-image "$FERRUM_IMAGE" --name ferrum-helm
+
+      - name: Validate external migrate Job examples
+        run: |
+          set -euo pipefail
+          kubectl create namespace ferrum
+          for manifest in charts/ferrum-gateway/examples/migrate-job-*.yaml; do
+            kubectl apply --dry-run=server -f "$manifest" >/dev/null
+          done
 
       - name: Default install renders no unusable control plane
         run: |

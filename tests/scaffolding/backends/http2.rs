@@ -828,7 +828,9 @@ async fn run_script(
                         http::header::HeaderName::from_bytes(k.as_bytes()),
                         http::header::HeaderValue::from_str(&v),
                     ) {
-                        map.insert(name, val);
+                        // Use append so scripted duplicate metadata (gRPC
+                        // multi-value trailers) survives onto the wire.
+                        map.append(name, val);
                     }
                 }
                 sender

@@ -1002,10 +1002,9 @@ async fn test_response_cache_hit_preserves_identity_when_acceptable() {
             other => panic!("expected cache HIT reject, got {other:?}"),
         };
         assert_eq!(status, 200);
-        assert_eq!(
-            hit_ctx.metadata.get("cache_status").map(String::as_str),
-            Some("HIT")
-        );
+        assert!(ferrum_edge::_test_support::response_cache_hit_for_test(
+            &hit_ctx
+        ));
 
         let (final_status, final_body, final_headers) = finalize_plugin_rejection_parts_for_test(
             &plugins,
@@ -1067,8 +1066,10 @@ async fn test_security_rejection_not_replaced_by_406() {
         other => panic!("expected auth reject, got {other:?}"),
     };
     assert_eq!(status, 401);
-    // No cache_status marker — this is not a response_caching HIT.
-    assert!(!ctx.metadata.contains_key("cache_status"));
+    // No request-global hit marker — this is not a response_caching HIT.
+    assert!(!ferrum_edge::_test_support::response_cache_hit_for_test(
+        &ctx
+    ));
 
     let (final_status, final_body, final_headers) =
         finalize_plugin_rejection_parts_for_test(&plugins, &mut ctx, status, body, resp_headers)

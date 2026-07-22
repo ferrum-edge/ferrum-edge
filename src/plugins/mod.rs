@@ -45,6 +45,7 @@ pub mod api_chargeback_sink;
 pub mod basic_auth;
 pub mod body_validator;
 pub mod bot_detection;
+pub mod builtin_parity;
 pub mod chargeback;
 pub mod compression;
 pub mod correlation_id;
@@ -107,6 +108,10 @@ pub mod ws_logging;
 pub mod ws_message_size_limiting;
 pub mod ws_rate_limiting;
 
+pub use builtin_parity::{
+    BUILTIN_PLUGIN_PARITY_META, BuiltinPluginClassification, BuiltinPluginParityMeta,
+    builtin_plugin_parity_meta,
+};
 pub use utils::PluginHttpClient;
 
 use async_trait::async_trait;
@@ -1660,6 +1665,11 @@ pub struct RequestContext {
     /// backend or plugin-controlled `grpc-status`/`grpc-message` text must not
     /// unlock the write-biased terminal H3 completion path.
     gateway_deadline_response_selected: bool,
+    /// Monotonic request-global proof that at least one response-caching
+    /// instance served a HIT or REVALIDATED response. Kept outside public
+    /// metadata so sibling/custom plugins cannot clear or forge the signal
+    /// consumed by fail-closed response negotiation.
+    response_cache_hit: bool,
     /// Extra metadata plugins can attach
     pub metadata: HashMap<String, String>,
     /// Most complete built-in AI usage snapshot for Prometheus export.
@@ -2165,6 +2175,7 @@ impl RequestContext {
             grpc_deadline_at: None,
             grpc_deadline_header_is_remaining: false,
             gateway_deadline_response_selected: false,
+            response_cache_hit: false,
             metadata: HashMap::new(),
             ai_usage_export: None,
             ai_usage_export_token_prefix: None,
@@ -2430,6 +2441,14 @@ impl RequestContext {
         self.gateway_response_compression_algorithm
     }
 
+    pub(crate) fn mark_response_cache_hit(&mut self) {
+        self.response_cache_hit = true;
+    }
+
+    pub(crate) fn response_cache_hit(&self) -> bool {
+        self.response_cache_hit
+    }
+
     pub(crate) fn bind_authorized_backend_path(&mut self, path: String) {
         self.authorized_backend_path = Some(path);
     }
@@ -2465,10 +2484,31 @@ impl RequestContext {
         }
     }
 
+    /// Advance policy-owned initial-header state after a later response phase
+    /// mutates representation metadata (normalize / body transform).
+    pub(crate) fn record_buffered_initial_response_header_later_mutations(
+        &mut self,
+        response_headers: &mut HashMap<String, String>,
+    ) {
+        if let Some(state) = self.buffered_initial_response_header_policy_state.as_mut() {
+            Arc::make_mut(state).record_later_response_header_mutations(response_headers);
+        }
+    }
+
     pub(crate) fn take_buffered_initial_response_header_policy(
         &mut self,
     ) -> Option<Arc<BufferedInitialResponseHeaderPolicyState>> {
         self.buffered_initial_response_header_policy_state.take()
+    }
+
+    /// Borrow the buffered initial-response policy state while response body
+    /// transforms still need [`BufferedInitialResponseHeaderPolicyState`]
+    /// semantics (gRPC-Web trailer framing).
+    pub(crate) fn buffered_initial_response_header_policy(
+        &self,
+    ) -> Option<&BufferedInitialResponseHeaderPolicyState> {
+        self.buffered_initial_response_header_policy_state
+            .as_deref()
     }
 
     /// Capture the pristine backend header map before trusted response hooks
@@ -2759,6 +2799,7 @@ impl RequestContext {
             grpc_deadline_at: self.grpc_deadline_at,
             grpc_deadline_header_is_remaining: self.grpc_deadline_header_is_remaining,
             gateway_deadline_response_selected: self.gateway_deadline_response_selected,
+            response_cache_hit: self.response_cache_hit,
             // Omit `request_body` (the full buffered prompt): no
             // `on_final_request_body` hook reads it from the context — they all
             // take the body as a `&[u8]` parameter — so copying it here would burn
@@ -4953,7 +4994,7 @@ pub struct StreamTransactionSummary {
 /// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_transcript_audit (2924), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
-/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365) |
+/// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
 #[allow(dead_code)]
 pub mod priority {
     pub const OTEL_TRACING: u16 = 25;
@@ -5242,8 +5283,11 @@ pub trait Plugin: Send + Sync {
     /// and a matched route with a disallowed method returns 405, before any
     /// `on_request_received` hook runs. Consequently neither global nor scoped
     /// implementations observe those two early terminal paths on H1, H2, or H3.
-    /// Terminal transaction logging is a separate lifecycle concern and must
-    /// not be inferred from whether this ordinary request hook ran.
+    /// Matched-proxy `allowed_methods` 405 responses still emit one terminal
+    /// transaction summary (`rejection_phase = "allowed_methods"`) without
+    /// running this or other ordinary request-policy hooks. Terminal
+    /// transaction logging is a separate lifecycle concern and must not be
+    /// inferred from whether this ordinary request hook ran.
     async fn on_request_received(&self, _ctx: &mut RequestContext) -> PluginResult {
         PluginResult::Continue
     }
@@ -7160,6 +7204,15 @@ pub const BUILTIN_PLUGIN_REGISTRATIONS: &[PluginRegistration] = &[
     builtin_plugin("__mesh_bpf_metrics", PluginFailurePolicy::OptionalFailOpen),
     builtin_plugin("fault_injection", PluginFailurePolicy::KeepLastKnownGood),
 ];
+
+// Keep documentation/parity inventory linked in both the library crate (consumed
+// by integration tests) and the binary crate (same sources, separate compilation).
+// Length equality is a cheap compile-time guard; name set-equality remains in tests.
+const _: () = {
+    assert!(BUILTIN_PLUGIN_PARITY_META.len() == BUILTIN_PLUGIN_REGISTRATIONS.len());
+    let _: fn(&str) -> Option<&'static BuiltinPluginParityMeta> = builtin_plugin_parity_meta;
+    let _: BuiltinPluginClassification = BuiltinPluginClassification::Public;
+};
 
 pub fn builtin_plugin_registration(name: &str) -> Option<&'static PluginRegistration> {
     BUILTIN_PLUGIN_REGISTRATIONS

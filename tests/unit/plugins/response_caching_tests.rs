@@ -4,8 +4,9 @@ use super::plugin_utils::create_test_proxy;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
     advance_response_caching_clock_for_test, clone_log_metadata,
-    response_caching_current_total_size_for_test,
+    response_caching_current_total_size_for_test, response_caching_instance_id_for_test,
     response_caching_size_accounting_snapshot_for_test,
+    response_caching_staging_metadata_key_for_test,
 };
 use ferrum_edge::config::types::Consumer;
 use ferrum_edge::plugins::response_caching::{RESPONSE_CACHING_CONFIG_KEYS, ResponseCaching};
@@ -61,6 +62,19 @@ fn default_plugin() -> ResponseCaching {
 
 fn plugin_with_config(config: serde_json::Value) -> ResponseCaching {
     ResponseCaching::new(&config).unwrap()
+}
+
+fn staging_key(plugin: &ResponseCaching, suffix: &str) -> String {
+    response_caching_staging_metadata_key_for_test(plugin, suffix)
+}
+
+fn assert_status(plugin: &ResponseCaching, ctx: &RequestContext, expected: &str) {
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(plugin, "cache_status"))
+            .map(String::as_str),
+        Some(expected)
+    );
 }
 
 fn expect_reject(result: PluginResult) -> (u16, Vec<u8>, HashMap<String, String>) {
@@ -133,6 +147,34 @@ async fn cache_response(
     // on_final_response_body
     plugin
         .on_final_response_body(&mut ctx, status, &resp_headers, body)
+        .await;
+}
+
+// Simulate a backend refresh of an existing entry. A normal lookup would HIT
+// and short-circuit before any backend response exists; request no-cache keeps
+// the instance's store staging while bypassing that fresh entry.
+async fn replace_cached_response(
+    plugin: &ResponseCaching,
+    method: &str,
+    path: &str,
+    status: u16,
+    response_headers: &HashMap<String, String>,
+    body: &[u8],
+) {
+    let mut ctx = make_ctx(method, path);
+    let mut request_headers =
+        HashMap::from([("cache-control".to_string(), "no-cache".to_string())]);
+    assert!(matches!(
+        plugin.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
+
+    let mut response_headers = response_headers.clone();
+    plugin
+        .after_proxy(&mut ctx, status, &mut response_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, status, &response_headers, body)
         .await;
 }
 
@@ -368,8 +410,16 @@ async fn test_cache_miss_first_request() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(ctx.metadata.get("cache_status").unwrap(), "MISS");
-    assert!(ctx.metadata.contains_key("cache_base_key"));
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "MISS"
+    );
+    assert!(
+        ctx.metadata
+            .contains_key(&staging_key(&plugin, "cache_base_key"))
+    );
 }
 
 #[tokio::test]
@@ -384,7 +434,7 @@ async fn test_query_cache_key_avoids_raw_delimiter_collision() {
     assert!(matches!(attacker_result, PluginResult::Continue));
     let attacker_key = attacker_ctx
         .metadata
-        .get("cache_base_key")
+        .get(&staging_key(&plugin, "cache_base_key"))
         .expect("cache key should be stored")
         .clone();
 
@@ -396,7 +446,7 @@ async fn test_query_cache_key_avoids_raw_delimiter_collision() {
     assert!(matches!(victim_result, PluginResult::Continue));
     let victim_key = victim_ctx
         .metadata
-        .get("cache_base_key")
+        .get(&staging_key(&plugin, "cache_base_key"))
         .expect("cache key should be stored")
         .clone();
 
@@ -409,7 +459,7 @@ async fn base_cache_key_for_raw_query(plugin: &ResponseCaching, raw_query: &str)
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     ctx.metadata
-        .get("cache_base_key")
+        .get(&staging_key(plugin, "cache_base_key"))
         .expect("cache key should be stored")
         .clone()
 }
@@ -545,7 +595,13 @@ async fn test_upstream_age_near_freshness_expires_after_residency() {
         .before_proxy(&mut stale_ctx, &mut stale_headers)
         .await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(stale_ctx.metadata.get("cache_status").unwrap(), "MISS");
+    assert_eq!(
+        stale_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "MISS"
+    );
     assert_eq!(assert_size_accounting_exact(&plugin), 0);
 }
 
@@ -563,7 +619,11 @@ async fn test_ttl_expiry() {
     let mut headers = HashMap::new();
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    let status = ctx.metadata.get("cache_status").unwrap().as_str();
+    let status = ctx
+        .metadata
+        .get(&staging_key(&plugin, "cache_status"))
+        .unwrap()
+        .as_str();
     assert!(
         status == "MISS" || status == "PREDICTED-BYPASS",
         "expected MISS or PREDICTED-BYPASS, got {status}"
@@ -670,7 +730,9 @@ async fn test_old_date_reduces_remaining_freshness() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(
-        ctx.metadata.get("cache_status").unwrap(),
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
         "PREDICTED-BYPASS"
     );
 }
@@ -753,7 +815,9 @@ async fn test_overflowing_age_does_not_wrap_to_fresh() {
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert_eq!(
-        ctx.metadata.get("cache_status").unwrap(),
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
         "PREDICTED-BYPASS"
     );
 }
@@ -857,7 +921,13 @@ async fn test_fallback_ttl_freshness_accounts_for_age() {
         .before_proxy(&mut stale_ctx, &mut stale_headers)
         .await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(stale_ctx.metadata.get("cache_status").unwrap(), "MISS");
+    assert_eq!(
+        stale_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "MISS"
+    );
     assert_eq!(assert_size_accounting_exact(&plugin), 0);
 }
 
@@ -885,7 +955,12 @@ async fn test_client_no_cache_bypasses() {
     headers.insert("cache-control".to_string(), "no-cache".to_string());
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(ctx.metadata.get("cache_status").unwrap(), "BYPASS");
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
 }
 
 #[tokio::test]
@@ -915,7 +990,13 @@ async fn test_bypassed_stale_response_does_not_poison_fresh_entry() {
             .await,
         PluginResult::Continue
     ));
-    assert_eq!(bypass_ctx.metadata.get("cache_status").unwrap(), "BYPASS");
+    assert_eq!(
+        bypass_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
 
     let mut stale_headers = HashMap::new();
     stale_headers.insert("cache-control".to_string(), "max-age=60".to_string());
@@ -963,7 +1044,13 @@ async fn test_bypassed_zero_freshness_response_invalidates_existing_entry() {
             .await,
         PluginResult::Continue
     ));
-    assert_eq!(bypass_ctx.metadata.get("cache_status").unwrap(), "BYPASS");
+    assert_eq!(
+        bypass_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
 
     let mut zero_response_headers = HashMap::new();
     zero_response_headers.insert("cache-control".to_string(), "max-age=0".to_string());
@@ -980,7 +1067,10 @@ async fn test_bypassed_zero_freshness_response_invalidates_existing_entry() {
         plugin.before_proxy(&mut miss_ctx, &mut miss_headers).await,
         PluginResult::Continue
     ));
-    let status = miss_ctx.metadata.get("cache_status").unwrap();
+    let status = miss_ctx
+        .metadata
+        .get(&staging_key(&plugin, "cache_status"))
+        .unwrap();
     assert!(
         status == "MISS" || status == "PREDICTED-BYPASS",
         "expected MISS or PREDICTED-BYPASS after zero-freshness invalidation, got {status}"
@@ -1010,7 +1100,13 @@ async fn test_bypassed_zero_freshness_with_new_vary_invalidates_matched_entry() 
             .await,
         PluginResult::Continue
     ));
-    assert_eq!(bypass_ctx.metadata.get("cache_status").unwrap(), "BYPASS");
+    assert_eq!(
+        bypass_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
 
     let mut zero_response_headers = HashMap::new();
     zero_response_headers.insert("cache-control".to_string(), "max-age=0".to_string());
@@ -1155,9 +1251,17 @@ async fn test_bypassed_fresh_response_clears_stale_predictor() {
             .await,
         PluginResult::Continue
     ));
-    assert_eq!(bypass_ctx.metadata.get("cache_status").unwrap(), "BYPASS");
+    assert_eq!(
+        bypass_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
     assert!(
-        bypass_ctx.metadata.contains_key("cache_predict_key"),
+        bypass_ctx
+            .metadata
+            .contains_key(&staging_key(&plugin, "cache_predict_key")),
         "client no-cache bypass should preserve the matched cache key for refresh invalidation"
     );
 
@@ -1189,7 +1293,12 @@ async fn test_post_not_cached() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(ctx.metadata.get("cache_status").unwrap(), "BYPASS");
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
 }
 
 #[tokio::test]
@@ -1200,7 +1309,12 @@ async fn test_delete_not_cached() {
 
     let result = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(ctx.metadata.get("cache_status").unwrap(), "BYPASS");
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
 }
 
 // === Non-cacheable status codes ===
@@ -1600,7 +1714,10 @@ async fn test_zero_freshness_invalidates_only_matching_vary_variant() {
             .await,
         PluginResult::Continue
     ));
-    let status = br_miss_ctx.metadata.get("cache_status").unwrap();
+    let status = br_miss_ctx
+        .metadata
+        .get(&staging_key(&plugin, "cache_status"))
+        .unwrap();
     assert!(
         status == "MISS" || status == "PREDICTED-BYPASS",
         "expected MISS or PREDICTED-BYPASS after zero-freshness invalidation, got {status}"
@@ -2027,7 +2144,7 @@ async fn test_sensitive_header_snapshot_does_not_store_raw_session_headers() {
 
     let snapshot = ctx
         .metadata
-        .get("cache_request_headers_snapshot")
+        .get(&staging_key(&plugin, "cache_request_headers_snapshot"))
         .expect("cache header snapshot should be stashed");
     assert!(snapshot.contains("cookie"));
     assert!(snapshot.contains("proxy-authorization"));
@@ -2079,7 +2196,7 @@ async fn test_sensitive_configured_vary_header_snapshot_hashes_without_breaking_
 
     let snapshot = ctx
         .metadata
-        .get("cache_request_headers_snapshot")
+        .get(&staging_key(&plugin, "cache_request_headers_snapshot"))
         .expect("cache header snapshot should be stashed");
     assert!(snapshot.contains("x-api-key"));
     assert!(snapshot.contains("sha256-"));
@@ -2442,7 +2559,7 @@ async fn test_replacement_admission_uses_size_delta() {
     .await;
     assert!(assert_size_accounting_exact(&plugin) <= 450);
 
-    cache_response(
+    replace_cached_response(
         &plugin,
         "GET",
         "/api/replacement-delta",
@@ -2481,7 +2598,7 @@ async fn test_large_to_small_replacement_releases_capacity() {
     .await;
     assert!(assert_size_accounting_exact(&plugin) <= 430);
 
-    cache_response(
+    replace_cached_response(
         &plugin,
         "GET",
         "/api/replacement-shrink",
@@ -2520,7 +2637,7 @@ async fn test_rejected_replacement_preserves_old_entry_and_accounting() {
     .await;
     let before = assert_size_accounting_exact(&plugin);
 
-    cache_response(
+    replace_cached_response(
         &plugin,
         "GET",
         "/api/replacement-reject",
@@ -2575,7 +2692,12 @@ async fn test_total_size_limit_uses_saturating_add() {
         matches!(result, PluginResult::Continue),
         "Entry exceeding max_total_size_bytes should not be cached"
     );
-    assert_eq!(ctx.metadata.get("cache_status").unwrap(), "MISS");
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "MISS"
+    );
 }
 
 // === Set-Cookie safety ===
@@ -2610,7 +2732,11 @@ async fn test_set_cookie_response_not_cached() {
         matches!(result, PluginResult::Continue),
         "Response with Set-Cookie header must not be cached"
     );
-    let status = ctx.metadata.get("cache_status").unwrap().as_str();
+    let status = ctx
+        .metadata
+        .get(&staging_key(&plugin, "cache_status"))
+        .unwrap()
+        .as_str();
     assert!(
         status == "MISS" || status == "PREDICTED-BYPASS",
         "expected MISS or PREDICTED-BYPASS, got {status}"
@@ -2888,8 +3014,18 @@ async fn test_sse_request_bypasses_preexisting_cached_response() {
 
     let result = plugin.before_proxy(&mut sse_ctx, &mut sse_headers).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert_eq!(sse_ctx.metadata.get("cache_status").unwrap(), "BYPASS");
-    assert!(!sse_ctx.metadata.contains_key("cache_base_key"));
+    assert_eq!(
+        sse_ctx
+            .metadata
+            .get(&staging_key(&plugin, "cache_status"))
+            .unwrap(),
+        "BYPASS"
+    );
+    assert!(
+        !sse_ctx
+            .metadata
+            .contains_key(&staging_key(&plugin, "cache_base_key"))
+    );
 
     let mut bypass_headers = HashMap::new();
     plugin
@@ -3043,4 +3179,519 @@ async fn test_concurrent_stores_keep_size_bounded_and_non_wrapping() {
         total <= 4096,
         "total_size exceeded configured max_total_size_bytes: {total}"
     );
+}
+
+// === Multi-instance request-staging isolation (#2605) ===
+
+fn public_response_headers() -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+    headers
+}
+
+async fn run_two_instance_store_isolation(a_first: bool) {
+    let query_instance = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "cache_key_include_query": true,
+        "cache_key_include_consumer": false,
+        "vary_by_headers": [],
+        "cacheable_methods": ["GET", "HEAD"],
+        "cacheable_status_codes": [200],
+        "add_cache_status_header": true
+    }));
+    let consumer_vary_instance = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "cache_key_include_query": false,
+        "cache_key_include_consumer": true,
+        "vary_by_headers": ["x-tenant"],
+        "cacheable_methods": ["GET", "HEAD", "POST"],
+        "cacheable_status_codes": [200, 404],
+        "add_cache_status_header": true
+    }));
+
+    assert_ne!(
+        response_caching_instance_id_for_test(&query_instance),
+        response_caching_instance_id_for_test(&consumer_vary_instance),
+        "each response_caching constructor must mint a distinct staging namespace"
+    );
+
+    let (first, second) = if a_first {
+        (&query_instance, &consumer_vary_instance)
+    } else {
+        (&consumer_vary_instance, &query_instance)
+    };
+
+    let mut ctx = make_ctx_with_raw_query("GET", "/catalog", "sku=1&color=red");
+    ctx.identified_consumer = Some(Arc::new(make_consumer("c-1", "alice")));
+    ctx.headers
+        .insert("x-tenant".to_string(), "acme".to_string());
+    let mut headers = ctx.headers.clone();
+
+    assert!(matches!(
+        first.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    assert_status(first, &ctx, "MISS");
+    assert_status(second, &ctx, "MISS");
+
+    let first_base = ctx
+        .metadata
+        .get(&staging_key(first, "cache_base_key"))
+        .cloned()
+        .expect("first instance staged base key");
+    let second_base = ctx
+        .metadata
+        .get(&staging_key(second, "cache_base_key"))
+        .cloned()
+        .expect("second instance staged base key");
+    assert_ne!(
+        first_base, second_base,
+        "distinct query/consumer/Vary policies must stage independent base keys"
+    );
+    assert_ne!(
+        staging_key(first, "cache_status"),
+        staging_key(second, "cache_status")
+    );
+    assert!(
+        ctx.metadata.contains_key(&staging_key(
+            &consumer_vary_instance,
+            "cache_request_headers_snapshot"
+        )),
+        "Vary-aware instance must stash its own header snapshot"
+    );
+
+    let response_headers = public_response_headers();
+    first
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"first-body")
+        .await;
+    second
+        .on_final_response_body(&mut ctx, 200, &response_headers, b"second-body")
+        .await;
+
+    // Replay against each instance independently: each must HIT from the
+    // entry it stored under its own staging snapshot / key policy.
+    let mut replay = make_ctx_with_raw_query("GET", "/catalog", "sku=1&color=red");
+    replay.identified_consumer = Some(Arc::new(make_consumer("c-1", "alice")));
+    replay
+        .headers
+        .insert("x-tenant".to_string(), "acme".to_string());
+    let mut replay_headers = replay.headers.clone();
+    let first_hit = first.before_proxy(&mut replay, &mut replay_headers).await;
+    match first_hit {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(&body[..], b"first-body");
+        }
+        other => panic!("first instance should HIT its own entry, got {other:?}"),
+    }
+    assert_status(first, &replay, "HIT");
+
+    let mut replay2 = make_ctx_with_raw_query("GET", "/catalog", "sku=1&color=red");
+    replay2.identified_consumer = Some(Arc::new(make_consumer("c-1", "alice")));
+    replay2
+        .headers
+        .insert("x-tenant".to_string(), "acme".to_string());
+    let mut replay2_headers = replay2.headers.clone();
+    let second_hit = second
+        .before_proxy(&mut replay2, &mut replay2_headers)
+        .await;
+    match second_hit {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(&body[..], b"second-body");
+        }
+        other => panic!("second instance should HIT its own entry, got {other:?}"),
+    }
+    assert_status(second, &replay2, "HIT");
+}
+
+#[tokio::test]
+async fn multiple_instances_isolate_staging_in_both_priority_orders() {
+    run_two_instance_store_isolation(true).await;
+    run_two_instance_store_isolation(false).await;
+}
+
+#[tokio::test]
+async fn later_sibling_without_lookup_state_cannot_overwrite_hit_header() {
+    let hit_instance = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "add_cache_status_header": true
+    }));
+    let unvisited_sibling = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "add_cache_status_header": true
+    }));
+
+    let mut store_ctx = make_ctx("GET", "/header-owner");
+    let mut store_headers = HashMap::new();
+    assert!(matches!(
+        hit_instance
+            .before_proxy(&mut store_ctx, &mut store_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    let response_headers = public_response_headers();
+    hit_instance
+        .on_final_response_body(&mut store_ctx, 200, &response_headers, b"cached")
+        .await;
+
+    let mut hit_ctx = make_ctx("GET", "/header-owner");
+    let mut hit_headers = HashMap::new();
+    let PluginResult::RejectBinary { mut headers, .. } = hit_instance
+        .before_proxy(&mut hit_ctx, &mut hit_headers)
+        .await
+    else {
+        panic!("first instance must serve the cached response");
+    };
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("HIT")
+    );
+    assert!(ferrum_edge::_test_support::response_cache_hit_for_test(
+        &hit_ctx
+    ));
+
+    assert!(matches!(
+        unvisited_sibling
+            .after_proxy(&mut hit_ctx, 200, &mut headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("HIT"),
+        "an unvisited sibling must not synthesize MISS over the cache owner"
+    );
+    assert!(
+        !hit_ctx
+            .metadata
+            .contains_key(&staging_key(&unvisited_sibling, "cache_status")),
+        "the later sibling must remain without instance-private lookup state"
+    );
+}
+
+#[tokio::test]
+async fn global_hit_signal_is_monotonic_across_sibling_statuses() {
+    let hit_instance = plugin_with_config(json!({"ttl_seconds": 60}));
+    let miss_instance = plugin_with_config(json!({"ttl_seconds": 60}));
+
+    let mut store_ctx = make_ctx("GET", "/global-hit");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        hit_instance
+            .before_proxy(&mut store_ctx, &mut headers)
+            .await,
+        PluginResult::Continue
+    ));
+    hit_instance
+        .on_final_response_body(&mut store_ctx, 200, &public_response_headers(), b"cached")
+        .await;
+
+    let mut ctx = make_ctx("GET", "/global-hit");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        hit_instance.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::RejectBinary { .. }
+    ));
+    assert!(ferrum_edge::_test_support::response_cache_hit_for_test(
+        &ctx
+    ));
+
+    let mut sibling_headers = HashMap::new();
+    assert!(matches!(
+        miss_instance
+            .before_proxy(&mut ctx, &mut sibling_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_status(&miss_instance, &ctx, "MISS");
+    assert!(
+        ferrum_edge::_test_support::response_cache_hit_for_test(&ctx),
+        "a sibling MISS must not clear the request-global HIT signal"
+    );
+}
+
+#[tokio::test]
+async fn multiple_instances_method_and_sse_bypass_clear_only_own_staging() {
+    let cacheable = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "cacheable_methods": ["GET"],
+        "cacheable_status_codes": [200]
+    }));
+    let method_only_head = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "cacheable_methods": ["HEAD"],
+        "invalidate_on_unsafe_methods": false
+    }));
+
+    // Order A then B: cacheable stages, then method-bypass sibling.
+    let mut ctx = make_ctx("GET", "/mixed-method");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        cacheable.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&cacheable, &ctx, "MISS");
+    assert!(
+        ctx.metadata
+            .contains_key(&staging_key(&cacheable, "cache_base_key"))
+    );
+
+    assert!(matches!(
+        method_only_head.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&method_only_head, &ctx, "BYPASS");
+    assert!(
+        !ctx.metadata
+            .contains_key(&staging_key(&method_only_head, "cache_base_key"))
+    );
+    assert_status(&cacheable, &ctx, "MISS");
+    assert!(
+        ctx.metadata
+            .contains_key(&staging_key(&cacheable, "cache_base_key"))
+    );
+
+    // Reverse order: method bypass first, then cacheable stages.
+    let mut ctx = make_ctx("GET", "/mixed-method-rev");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        method_only_head.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&method_only_head, &ctx, "BYPASS");
+    assert!(matches!(
+        cacheable.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&cacheable, &ctx, "MISS");
+    assert!(
+        ctx.metadata
+            .contains_key(&staging_key(&cacheable, "cache_base_key"))
+    );
+    assert_status(&method_only_head, &ctx, "BYPASS");
+
+    // SSE bypass after a staged miss must not wipe the sibling's staging.
+    let sse_peer = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "cacheable_methods": ["GET", "POST"]
+    }));
+    let mut ctx = make_ctx("GET", "/mixed-sse");
+    let mut headers = HashMap::new();
+    assert!(matches!(
+        cacheable.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let staged_base = ctx
+        .metadata
+        .get(&staging_key(&cacheable, "cache_base_key"))
+        .cloned();
+    headers.insert("accept".to_string(), "text/event-stream".to_string());
+    assert!(matches!(
+        sse_peer.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&sse_peer, &ctx, "BYPASS");
+    assert_eq!(
+        ctx.metadata
+            .get(&staging_key(&cacheable, "cache_base_key"))
+            .cloned(),
+        staged_base
+    );
+    assert_status(&cacheable, &ctx, "MISS");
+
+    // Reverse: SSE bypass first, then cacheable stages independently.
+    let mut ctx = make_ctx("GET", "/mixed-sse-rev");
+    let mut headers = HashMap::new();
+    headers.insert("accept".to_string(), "text/event-stream".to_string());
+    assert!(matches!(
+        sse_peer.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&sse_peer, &ctx, "BYPASS");
+    headers.remove("accept");
+    assert!(matches!(
+        cacheable.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_status(&cacheable, &ctx, "MISS");
+    assert_status(&sse_peer, &ctx, "BYPASS");
+}
+
+#[tokio::test]
+async fn status_policy_divergence_does_not_cross_contaminate_stores() {
+    for a_first in [true, false] {
+        let only_200 = plugin_with_config(json!({
+            "ttl_seconds": 60,
+            "cacheable_status_codes": [200]
+        }));
+        let allows_404 = plugin_with_config(json!({
+            "ttl_seconds": 60,
+            "cacheable_status_codes": [200, 404]
+        }));
+
+        let (first, second) = if a_first {
+            (&only_200, &allows_404)
+        } else {
+            (&allows_404, &only_200)
+        };
+        let mut ctx = make_ctx("GET", "/status-policy");
+        let mut headers = HashMap::new();
+        assert!(matches!(
+            first.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            second.before_proxy(&mut ctx, &mut headers).await,
+            PluginResult::Continue
+        ));
+
+        let response_headers = public_response_headers();
+        first
+            .on_final_response_body(&mut ctx, 404, &response_headers, b"missing")
+            .await;
+        second
+            .on_final_response_body(&mut ctx, 404, &response_headers, b"missing")
+            .await;
+
+        let mut replay = make_ctx("GET", "/status-policy");
+        let mut replay_headers = HashMap::new();
+        let only_200_result = only_200
+            .before_proxy(&mut replay, &mut replay_headers)
+            .await;
+        assert!(
+            matches!(only_200_result, PluginResult::Continue),
+            "200-only instance must not store 404"
+        );
+        assert_status(&only_200, &replay, "PREDICTED-BYPASS");
+
+        let mut replay = make_ctx("GET", "/status-policy");
+        let mut replay_headers = HashMap::new();
+        let allows_404_result = allows_404
+            .before_proxy(&mut replay, &mut replay_headers)
+            .await;
+        match allows_404_result {
+            PluginResult::RejectBinary {
+                status_code, body, ..
+            } => {
+                assert_eq!(status_code, 404);
+                assert_eq!(&body[..], b"missing");
+            }
+            other => panic!("404-capable instance should HIT, got {other:?}"),
+        }
+        assert_status(&allows_404, &replay, "HIT");
+    }
+}
+
+#[tokio::test]
+async fn reload_generations_do_not_share_staging_namespaces() {
+    let generation_one = plugin_with_config(json!({
+        "ttl_seconds": 60,
+        "vary_by_headers": ["x-tenant"],
+        "cache_key_include_query": true
+    }));
+    let mut ctx = make_ctx_with_raw_query("GET", "/reload", "v=1");
+    ctx.headers
+        .insert("x-tenant".to_string(), "before".to_string());
+    let mut headers = ctx.headers.clone();
+    assert!(matches!(
+        generation_one.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let gen1_base_key = staging_key(&generation_one, "cache_base_key");
+    let gen1_status_key = staging_key(&generation_one, "cache_status");
+    let gen1_snapshot_key = staging_key(&generation_one, "cache_request_headers_snapshot");
+    assert!(ctx.metadata.contains_key(&gen1_base_key));
+    assert_eq!(
+        ctx.metadata.get(&gen1_status_key).map(String::as_str),
+        Some("MISS")
+    );
+    assert!(ctx.metadata.contains_key(&gen1_snapshot_key));
+
+    // A reload constructs a fresh instance with a new runtime id. It must not
+    // read or clear the retired generation's namespaced staging.
+    let generation_two = plugin_with_config(json!({
+        "ttl_seconds": 120,
+        "vary_by_headers": ["x-tenant"],
+        "cache_key_include_query": false,
+        "cacheable_status_codes": [200, 404]
+    }));
+    assert_ne!(
+        response_caching_instance_id_for_test(&generation_one),
+        response_caching_instance_id_for_test(&generation_two)
+    );
+
+    let mut gen2_headers = headers.clone();
+    gen2_headers.insert("accept".to_string(), "text/event-stream".to_string());
+    assert!(matches!(
+        generation_two
+            .before_proxy(&mut ctx, &mut gen2_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_status(&generation_two, &ctx, "BYPASS");
+    assert!(
+        !ctx.metadata
+            .contains_key(&staging_key(&generation_two, "cache_base_key")),
+        "SSE bypass must clear only the current generation's lookup staging"
+    );
+    assert!(
+        ctx.metadata.contains_key(&gen1_base_key),
+        "reload generation must not clear retired instance staging"
+    );
+    assert_eq!(
+        ctx.metadata.get(&gen1_status_key).map(String::as_str),
+        Some("MISS")
+    );
+    assert!(ctx.metadata.contains_key(&gen1_snapshot_key));
+
+    generation_one
+        .on_final_response_body(&mut ctx, 200, &public_response_headers(), b"gen1")
+        .await;
+
+    let mut replay = make_ctx_with_raw_query("GET", "/reload", "v=1");
+    replay
+        .headers
+        .insert("x-tenant".to_string(), "before".to_string());
+    let mut replay_headers = replay.headers.clone();
+    match generation_one
+        .before_proxy(&mut replay, &mut replay_headers)
+        .await
+    {
+        PluginResult::RejectBinary {
+            status_code, body, ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(&body[..], b"gen1");
+        }
+        other => panic!("retired generation should still HIT its own cache, got {other:?}"),
+    }
+
+    let mut replay = make_ctx_with_raw_query("GET", "/reload", "v=1");
+    replay
+        .headers
+        .insert("x-tenant".to_string(), "before".to_string());
+    let mut replay_headers = replay.headers.clone();
+    assert!(
+        matches!(
+            generation_two
+                .before_proxy(&mut replay, &mut replay_headers)
+                .await,
+            PluginResult::Continue
+        ),
+        "replacement generation must not inherit the retired generation's entries"
+    );
+    assert_status(&generation_two, &replay, "MISS");
 }

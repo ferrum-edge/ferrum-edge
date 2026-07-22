@@ -65,6 +65,7 @@ mod openapi_validator_tests;
 mod otel_tracing_tests;
 mod plugin_cache_tests;
 pub(crate) use plugin_cache_tests::minimal_plugin_config;
+mod plugin_doc_parity_tests;
 mod plugin_http_client_tests;
 mod plugin_integration_tests;
 mod plugin_utils_core_tests;

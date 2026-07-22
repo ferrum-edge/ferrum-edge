@@ -10,10 +10,25 @@
 //!
 //! See RFC 9114 §8.1 (H3 error codes) and RFC 9000 §4.5 (STOP_SENDING).
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use h3::error::Code;
 use h3::quic::{RecvStream, SendStream};
 use h3::server::RequestStream;
+
+/// Fixed gateway grace for writing an already-selected post-deadline /
+/// post-timeout terminal H3 rejection (tiny HEADERS / trailers / FIN).
+///
+/// Independent of the expired client RPC deadline: racing that `Instant`
+/// cancels on the first `Pending` poll and prevents response HEADERS from
+/// becoming observable, while an unbounded await lets a flow-control-blocked
+/// client retain the request task indefinitely (CWE-400 / CWE-770). One
+/// second is long enough for a ready QUIC peer to accept a tiny rejection
+/// under mild congestion, and short enough to bound retention when the peer
+/// withholds credit. Not the detached plugin-cleanup bound — that governs
+/// owned hook work, not the QUIC write.
+pub(crate) const H3_POST_DEADLINE_TERMINAL_WRITE_GRACE: Duration = Duration::from_secs(1);
 
 /// Result of a downstream HTTP/3 write that is bounded by the client's
 /// absolute RPC deadline.
@@ -70,6 +85,11 @@ where
 /// trailer write. Biasing the write here preserves the clean gRPC status when
 /// QUIC has credit, while a pending flow-control wait still loses immediately
 /// to the expired deadline and is cancelled by the caller's stream reset.
+///
+/// For already-selected post-upload-cancel rejections that must remain visible
+/// without unbounded retention, prefer
+/// [`await_post_deadline_terminal_response_write`] — it uses a fresh gateway
+/// grace instead of the expired client deadline.
 pub(crate) async fn await_terminal_response_write_before_deadline<F, T, E>(
     deadline: Option<tokio::time::Instant>,
     write: F,
@@ -91,6 +111,24 @@ where
     }
 }
 
+/// Await a post-deadline / post-timeout terminal rejection write under
+/// [`H3_POST_DEADLINE_TERMINAL_WRITE_GRACE`].
+///
+/// Biases the write so an immediately-ready HEADERS/FIN completes; a Pending
+/// flow-control wait is cancelled when the grace expires. Callers that see
+/// [`H3ResponseWriteError::DeadlineExceeded`] must
+/// [`abort_response_stream`] and must **not** call [`halt_request_body`] after
+/// a mid-`recv_data` cancel (h3-quinn's recv slot is `None`).
+pub(crate) async fn await_post_deadline_terminal_response_write<F, T, E>(
+    write: F,
+) -> Result<T, H3ResponseWriteError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    let grace_at = tokio::time::Instant::now() + H3_POST_DEADLINE_TERMINAL_WRITE_GRACE;
+    await_terminal_response_write_before_deadline(Some(grace_at), write).await
+}
+
 /// Signal the peer that we are done with the receive side of the
 /// request stream. Without this call, dropping the `RequestStream`
 /// surfaces as `RESET_STREAM(0x0)` on the QUIC wire — QUIC has no
@@ -99,16 +137,24 @@ where
 /// error" code. Using it tells the client its request was accepted and
 /// no further body bytes are needed.
 ///
-/// Safe to call after `finish()` / `send_response()` — the h3 crate
-/// records the code into the underlying QUIC stream which then sends
-/// the STOP_SENDING frame on the next write. This helper performs no
-/// heap work.
+/// Prefer calling this **after** response HEADERS/DATA/trailers/FIN are
+/// written. Do **not** call it after a drain cancelled mid-`recv_data` by
+/// timeout/deadline: h3-quinn keeps the `quinn::RecvStream` inside a
+/// `ReusableBoxFuture` while `poll_data` is `Pending`, leaving the outer
+/// `Option` as `None`, and `stop_sending` would `unwrap`-abort under
+/// `panic = "abort"`. Skip this helper in that case and let
+/// `quinn::RecvStream::drop` issue `STOP_SENDING(0)` when the
+/// `RequestStream` is released.
+///
+/// Safe to call after `finish()` / `send_response()` when the recv half is
+/// idle. Subsequent calls after a successful halt are ignored by quinn
+/// (`ClosedStream`).
 #[inline]
 pub(crate) fn halt_request_body<S>(stream: &mut RequestStream<S, Bytes>)
 where
     S: RecvStream,
 {
-    // stop_sending is required here: otherwise dropping the recv half
+    // stop_sending is required here: otherwise dropping an idle recv half
     // surfaces as RESET_STREAM(0x0) on the wire and clients log
     // "Remote reset: 0x0" + a truncated response.
     stream.stop_sending(Code::H3_NO_ERROR);

@@ -1047,7 +1047,29 @@ WebSocket transaction logging captures the HTTP upgrade handshake only. After th
 }
 ```
 
-Rejected requests have `backend_target: null` (no backend was contacted), latency fields at -1.0, and `metadata.rejection_phase` indicating which plugin phase rejected the request. Possible `rejection_phase` values: `authenticate`, `authorize`, `before_proxy`, `grpc_backend_error`, `websocket_backend_error`. Gateway-generated gRPC errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log sinks can distinguish gRPC failures even though the downstream HTTP status is `200`.
+Gateway admission rejections that occur before backend selection, including
+`allowed_methods`, have `backend_target: null`. Other rejection summaries may
+retain the matched proxy's configured target for attribution, but backend
+latency fields remain `-1.0`; a configured target in such a record is not proof
+that Ferrum contacted it. `metadata.rejection_phase` identifies the plugin
+phase or gateway admission gate that rejected the request. Possible values
+include `authenticate`, `authorize`, `before_proxy`, `allowed_methods`,
+`grpc_backend_error`, and `websocket_backend_error`. Gateway-generated gRPC
+errors also populate `metadata.grpc_status` and `metadata.grpc_message` so log
+sinks can distinguish gRPC failures even though the downstream HTTP status is
+`200`.
+
+##### Pre-plugin routing and method failures in transaction logs
+
+Terminal transaction logging is independent of ordinary request hooks:
+
+| Outcome | Status | Transaction log | Ordinary request hooks (`on_request_received`, auth, transform, mirror, …) |
+| --- | --- | --- | --- |
+| Unmatched route | 404 | Not emitted (no matched proxy / plugin-cache view) | Not run |
+| Matched proxy, method absent from `allowed_methods` | 405 (+ authoritative `Allow`) | Emitted once with `rejection_phase: "allowed_methods"`, matched proxy/namespace, method/path, and client identity available at that phase | Not run |
+| Matched native gRPC with non-`POST` method | protocol reject (typically 400 / gRPC `INVALID_ARGUMENT`) | Not emitted by the method-admission gate today | Not run |
+
+H1, H2, and H3 share this contract. The matched-proxy 405 path selects protocol-appropriate terminal logging/mirror hooks from one immutable plugin-cache generation and does not double-count with a later success path.
 
 #### Example: TCP Stream
 
@@ -1881,7 +1903,7 @@ Non-loopback plaintext `ldap://` endpoints are rejected by default because LDAP 
 
 Validates WS-Security headers in SOAP XML envelopes. Supports UsernameToken authentication (PasswordText and PasswordDigest), X.509 certificate signature verification, SAML 2.0 assertion validation with XMLDSIG signature verification, timestamp freshness checks, and nonce replay protection.
 
-The plugin buffers request bodies with SOAP content types (`text/xml`, `application/soap+xml`, `application/xml`) and parses the `wsse:Security` header from the SOAP envelope. Non-SOAP requests pass through untouched.
+The plugin buffers request bodies with SOAP content types (`text/xml`, `application/soap+xml`, `application/xml`) as raw bytes and decodes supported XML character encodings before parsing the `wsse:Security` header. Supported encodings are UTF-8 and UTF-16 (little- and big-endian). Encoding is resolved from an optional BOM and the `Content-Type` `charset` parameter; a BOM, charset, and XML declaration must agree, `charset=utf-16` without an endian BOM is rejected as ambiguous, and malformed or truncated byte sequences fail closed. Unsupported charsets return HTTP `415`; conflicting or malformed encodings return HTTP `415`/`400` respectively. Diagnostics never log the request body or credentials. The original wire bytes are forwarded unchanged to the backend so signature and representation semantics stay intact. Non-SOAP requests pass through untouched.
 
 > **XMLDSIG canonicalization support.** Both the WS-Security X.509 and SAML signature paths apply Exclusive XML Canonicalization (`xml-exc-c14n#`) to `<SignedInfo>` and referenced elements, including `InclusiveNamespaces PrefixList`. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n. Unsupported canonicalization or transform algorithms fail closed; inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported.
 
@@ -3440,6 +3462,7 @@ Configuration must be a top-level object. The only accepted keys are `ttl_second
 | `invalidate_on_unsafe_methods` | bool | `true` | Invalidate cached entries for the same path prefix on non-cacheable methods such as `POST`, `PUT`, `PATCH`, and `DELETE` |
 
 Behavior:
+- Multiple `response_caching` instances on one proxy each receive a process-unique runtime staging id. Request metadata for base key, status, predictor key, request timing, and header snapshot is namespaced as `response_caching.<instance_id>.*`, so sibling instances with different query, consumer, Vary, method, SSE, or status policies cannot overwrite one another's staged inputs. Bypass, HIT, and REVALIDATED paths clear only the current instance's lookup staging. Reload reconstructions mint a new id and never read or clear a retired generation's namespaced keys.
 - The plugin caches the final post-transform response body and headers, so cached hits include `response_transformer` output rather than the raw backend payload.
 - Backend `Vary` is honored automatically. If the origin returns `Vary: Accept-Encoding`, compressed and uncompressed representations are cached separately.
 - Freshness uses the response's corrected initial age plus cache residency time. Backend `Age` and valid `Date` headers are incorporated, `s-maxage` takes precedence over `max-age`, and cache hits replace any stored `Age` value with the current age.
@@ -3535,7 +3558,7 @@ Message-format suffixes (`+proto`, `+json`, `+thrift`, or another valid custom `
 
 On the request path, the plugin rewrites `content-type` to `application/grpc` so downstream plugins (`grpc_method_router`, `grpc_deadline`, etc.) treat the request as native gRPC. `grpc_method_router` may populate provisional client-method metadata at its priority, but its authorization and rate decision is deferred until the backend-effective path is finalized. Request-body decoding mode follows request `Content-Type` only.
 
-On the response path, `grpc_web` embeds HTTP/2 trailers (`grpc-status`, `grpc-message`, and custom trailing metadata) as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` to the **negotiated** gRPC-Web variant.
+On the response path, `grpc_web` embeds HTTP/2 trailers — `grpc-status`, `grpc-message`, binary `*-bin` metadata, and valid ASCII custom trailing metadata such as `request-id` — as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` to the **negotiated** gRPC-Web variant. Only backend trailer provenance is embedded: hop-by-hop, forbidden, pseudo, connection-listed, and invalid names or non-printable/CRLF values are stripped, and initial response headers are not copied into the trailer block. Duplicate metadata values are preserved as separate trailer lines; encoding order is deterministic by lowercase header name.
 
 **Response media-type negotiation:** Response encoding and the client-visible response `Content-Type` follow the request `Accept` header ([PROTOCOL-WEB.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md); RFC 9110 content negotiation):
 
@@ -3547,12 +3570,14 @@ On the response path, `grpc_web` embeds HTTP/2 trailers (`grpc-status`, `grpc-me
 
 **Malformed / non-gRPC backend responses:** When the backend or an intermediary returns a response without a present, numeric `grpc-status` (empty or non-numeric values count as absent), `grpc_web` synthesizes the trailer `grpc-status` from the official HTTP-to-gRPC client mapping ([http-grpc-status-mapping.md](https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md)): `400→INTERNAL(13)`, `401→UNAUTHENTICATED(16)`, `403→PERMISSION_DENIED(7)`, `404→UNIMPLEMENTED(12)`, `429/502/503/504→UNAVAILABLE(14)`, and every other HTTP status (including `200`) → `UNKNOWN(2)`. A valid supplied `grpc-status` remains authoritative and is never overridden by the HTTP status. Existing `grpc-message` / `grpc-status-details-bin` metadata is preserved when present; synthesis does not invent a message. The client-visible HTTP status is left unchanged on this path (Ferrum does not force HTTP `200` for translated gRPC-Web backend responses), so wire observers still see the backend/intermediary HTTP failure while gRPC-Web clients read the mapped code from the body trailer frame.
 
+**Multiple instances:** A proxy may carry several `grpc_web` configs (for example two proxy-scoped instances after a same-named global is shadowed, or distinct `priority_override` values). Body translation is not idempotent, so the first effective instance in configured order claims request-scoped ownership and performs content-type rewrite, text-mode request decode, response trailer-frame embedding, and text-mode base64 encode exactly once. Sibling instances keep namespaced per-instance staging and contribute only their `expose_headers` union into `Access-Control-Expose-Headers`. Missing or malformed owner staging fails closed (no second claim, no speculative body rewrite). Reload snapshots remain atomic: an in-flight request sees one plugin generation end-to-end on H1, H2, and H3.
+
 **Priority:** 260 (runs before `grpc_method_router` at 275)
 **Protocols:** HTTP, gRPC
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `expose_headers` | String[] | `[]` | Additional response headers to include in `Access-Control-Expose-Headers` for browser CORS compatibility. `grpc-status` and `grpc-message` are always exposed. |
+| `expose_headers` | String[] | `[]` | Additional response headers to include in `Access-Control-Expose-Headers` for browser CORS compatibility. `grpc-status` and `grpc-message` are always exposed. When multiple `grpc_web` instances are effective, their lists are unioned in configured order. |
 
 Config must be a JSON/YAML object whose only accepted key is `expose_headers`. Empty `{}` is valid and uses defaults. Explicit top-level `null`, arrays, strings, numbers, and booleans are rejected with `grpc_web: config must be an object` — `null` is not an alias for `{}`. Unknown or misspelled keys (for example `expose_header`) are rejected with path-qualified diagnostics and spelling suggestions. The shared constructor enforces this for admin API, file mode, database/CP validation, and DP snapshot application; a rejected reload keeps the last-known-good plugin generation (`KeepLastKnownGood`).
 
@@ -3669,7 +3694,7 @@ Mirror response metadata (status code, response size, latency) is logged as a se
 | `mirror_host` | String | **(required)** | Hostname or IP of the mirror target |
 | `mirror_port` | Integer | 80/443 | Port of the mirror target (default based on protocol) |
 | `mirror_protocol` | String | `"http"` | `"http"` or `"https"` |
-| `mirror_path` | String | _(none)_ | Override the request path for the mirror. When unset, uses the backend-effective authorized path if backend-path policy is active; otherwise uses the original request path |
+| `mirror_path` | String | _(none)_ | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, uses the backend-effective authorized path if backend-path policy is active; otherwise uses the original request path |
 | `percentage` | Float | `100.0` | Percentage of requests to mirror (0.0–100.0) |
 | `mirror_request_body` | Boolean | `true` | Whether to include the request body in the mirror request |
 | `max_response_body_bytes` | Integer | `1048576` | Cap on bytes read from a mirror response when sizing it. Only consulted when the response has no `content-length` header — streaming aborts as soon as the limit is crossed and the truncated count is recorded. The mirror task discards the bytes after sizing, so this only bounds memory pressure from a misbehaving mirror endpoint streaming an unbounded body to a fire-and-forget task. Default is 1 MiB |
@@ -3683,6 +3708,10 @@ enforcement. This prevents a rewritten, unauthorized client method from being
 replayed to the shadow destination. An explicit `mirror_path` remains an
 operator override, and proxies without backend-path policy retain the original
 request path default.
+
+**Outbound header boundary:** Mirror requests reuse Ferrum's canonical secondary-request sanitizer (the same backend-request strip predicates as primary dispatch — secondary builders call those predicates directly, so new strip arms are honored automatically). The filter snapshots RFC 9110 `Connection`-listed tokens before removing `Connection`, strips hop-by-hop / framing / `Trailer` / Ferrum request-only markers (`x-ferrum-original-content-encoding`, `x-grpc-web-mode`), drops client-supplied proxy-owned forwarding identity (`X-Forwarded-*`), and omits client `Host` so reqwest derives authority from the mirror URL. Forwarding identity is not regenerated for mirror traffic, so the mirror receives no Ferrum-authored `X-Forwarded-*` fields; this intentionally favors the off-mesh privacy/trust boundary over primary-vs-shadow identity-header parity. Reserved load-testing control headers are excluded defensively. On native gRPC mirrors (`application/grpc`, `application/grpc+…`, or parameters — not prefix-smuggled types such as `application/grpcfoo` / `application/grpc-web`), `te: trailers` is re-synthesised after the generic strip. Native gRPC mirror targets must support HTTP/2; HTTP/1.1 is not a supported native-gRPC mirror transport.
+
+**Query fidelity:** The mirror request-target prefers the original raw query string after the same auth credential strips primary dispatch applies (`auth.strip_query_param.*`), preserving repeated pairs, pair order, flag and empty parameters, `+`, encoded delimiters, percent escapes, and non-ASCII encoded bytes. The materialised single-value `query_params` map is used only when no raw query is available. Decoded `request_transformer` query-map mutations are not re-serialized onto the mirror URL, matching primary backend URL construction.
 
 ```yaml
 plugin_name: request_mirror
@@ -3710,7 +3739,7 @@ For multi-node deployments, `gateway_addresses` fans out once from the originati
 
 For HTTPS-only deployments that disable the HTTP listener, set `gateway_tls: true`. A resolved gateway port of `0` (Ferrum's disabled-listener sentinel from `FERRUM_PROXY_HTTP_PORT` / `FERRUM_PROXY_HTTPS_PORT`) is rejected at admission. Since the gateway's frontend cert typically won't match `127.0.0.1`, `gateway_tls_no_verify` defaults to `true` when TLS is enabled. This only affects the loopback connection — backend TLS uses the normal CA trust chain.
 
-**Request fidelity:** Matching triggers buffer the request body (binary-safe via `request_body_bytes`) and replay the exact buffered bytes for every accepted method that supplied a body (including DELETE/OPTIONS/extension methods — never silently rewritten to GET). Replay bodies have a hard 10 MiB plugin-local ceiling even when the global request-body limit is unlimited, and active local/fan-out replay work shares a 64 MiB process-wide retained-body budget; the strictest applicable limit wins. The original raw query string is preserved on every synthetic and fan-out request. Decoded query-map transforms are deliberately not serialized into the replay: the synthetic request re-enters the ordinary plugin pipeline, so configured query transforms apply exactly once without losing duplicate pairs or encoding. Requests with no key or a wrong key stay on the ordinary no-buffer hot path. Synthetic/fan-out headers snapshot RFC 9110 `Connection`-listed tokens before filtering, strip those names plus Ferrum's canonical backend/proxy-generated forwarding sets, and keep `Host` for host-based routing; client framing (`Content-Length` / `Transfer-Encoding`) is never copied — reqwest derives exact `Content-Length` from the attached body.
+**Request fidelity:** Matching triggers buffer the request body (binary-safe via `request_body_bytes`) and replay the exact buffered bytes for every accepted method that supplied a body (including DELETE/OPTIONS/extension methods — never silently rewritten to GET). Replay bodies have a hard 10 MiB plugin-local ceiling even when the global request-body limit is unlimited, and active local/fan-out replay work shares a 64 MiB process-wide retained-body budget; the strictest applicable limit wins. The original raw query string is preserved on every synthetic and fan-out request. Decoded query-map transforms are deliberately not serialized into the replay: the synthetic request re-enters the ordinary plugin pipeline, so configured query transforms apply exactly once without losing duplicate pairs or encoding. Requests with no key or a wrong key stay on the ordinary no-buffer hot path. Synthetic/fan-out headers reuse Ferrum's canonical secondary-request sanitizer shared with `request_mirror` and primary backend dispatch: snapshot RFC 9110 `Connection`-listed tokens before filtering, strip those names plus Ferrum's hop-by-hop / framing / `Trailer` / request-only marker / proxy-generated forwarding sets, and keep `Host` for host-based routing; client framing (`Content-Length` / `Transfer-Encoding`) is never copied — reqwest derives exact `Content-Length` from the attached body.
 
 **Completion metrics:** The finish log reports unambiguous counters — `attempted_requests`, `responses_received`, `responses_completed`, `responses_truncated`, `response_body_errors`, `request_timeouts`, non-timeout `transport_errors`, HTTP status classes, `worker_failures`, `cancelled_workers`, and separate `completed_requests_per_second` / `attempted_requests_per_second`. Cooperative cancellation counts affected workers instead of disappearing into a successful result. Outcome is `Success`, `Degraded`, `Failed`, or `Cancelled`. Attempt-only loops are never labeled as completed throughput. Consecutive request-build, transport, timeout, and response-stream errors use a cancellation-aware exponential backoff from 10 ms to 250 ms; a completed or cap-truncated response resets the backoff so valid load is not throttled.
 

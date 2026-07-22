@@ -4580,12 +4580,20 @@ fn grpc_web_schema_matches_the_strict_runtime_shape() {
         "grpc_web docs must describe non-gRPC HTTP status synthesis"
     );
     assert!(
+        grpc_web_docs.contains("Multiple instances:"),
+        "grpc_web docs must describe multi-instance ownership and expose_headers union"
+    );
+    assert!(
         description.contains("HTTP-to-gRPC client mapping"),
         "GrpcWebConfig OpenAPI description must document status synthesis"
     );
     assert!(
         description.contains("not rewritten to 200"),
         "GrpcWebConfig OpenAPI description must document client-visible HTTP status contract"
+    );
+    assert!(
+        description.contains("Multiple effective instances"),
+        "GrpcWebConfig OpenAPI description must document multi-instance translation ownership"
     );
 }
 
@@ -7169,6 +7177,16 @@ fn response_caching_schema_matches_strict_runtime_contract() {
     }
     assert!(docs.contains("KeepLastKnownGood"));
     assert!(docs.contains("Unknown keys are rejected"));
+    assert!(
+        docs.contains("response_caching.<instance_id>"),
+        "docs must describe per-instance request-staging isolation"
+    );
+    assert!(
+        schema["description"]
+            .as_str()
+            .is_some_and(|d| d.contains("response_caching.<instance_id>")),
+        "OpenAPI ResponseCachingConfig must describe per-instance staging isolation"
+    );
 
     for valid in [
         json!({}),

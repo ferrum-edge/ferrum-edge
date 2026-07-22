@@ -41,6 +41,9 @@ pub const DEFAULT_SENSITIVE_METADATA_KEYS: &[&str] = &[
     "x-auth-token",
     "x-csrf-token",
     "cache_request_headers_snapshot",
+    // Base64-encoded backend trailer values retained request-locally so
+    // gRPC-Web can distinguish same-name initial headers from true trailers.
+    "grpc_web_shadowed_trailers",
     "claim_header.",
     "bearer",
     "password",

@@ -1,5 +1,6 @@
 use ferrum_edge::_test_support::{
-    soap_count_wsu_id_occurrences_for_test, soap_exclusive_canonicalize_element_for_test,
+    soap_count_wsu_id_occurrences_for_test, soap_decode_xml_body_for_test,
+    soap_exclusive_canonicalize_element_for_test,
 };
 use ferrum_edge::plugins::soap_ws_security::SoapWsSecurity;
 use ferrum_edge::plugins::{HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, RequestContext, priority};
@@ -18,7 +19,52 @@ fn make_ctx_with_soap_body(body: &str) -> RequestContext {
         .insert("content-type".to_string(), "text/xml".to_string());
     ctx.metadata
         .insert("request_body".to_string(), body.to_string());
+    // Mirror the proxy handoff: plugins that opt into bytes receive the wire
+    // representation even when it is not UTF-8.
+    ctx.request_body_bytes = Some(bytes::Bytes::copy_from_slice(body.as_bytes()));
     ctx
+}
+
+fn make_ctx_with_soap_bytes(body: Vec<u8>, content_type: &str) -> RequestContext {
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/ws".to_string(),
+    );
+    ctx.headers
+        .insert("content-type".to_string(), content_type.to_string());
+    ctx.request_body_bytes = Some(bytes::Bytes::from(body));
+    ctx
+}
+
+fn soap_headers_with_content_type(content_type: &str) -> HashMap<String, String> {
+    let mut h = HashMap::new();
+    h.insert("content-type".to_string(), content_type.to_string());
+    h
+}
+
+fn encode_utf16_le(text: &str) -> Vec<u8> {
+    let mut out = vec![0xFF, 0xFE]; // BOM
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
+}
+
+fn encode_utf16_be(text: &str) -> Vec<u8> {
+    let mut out = vec![0xFE, 0xFF]; // BOM
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(&unit.to_be_bytes());
+    }
+    out
+}
+
+fn encode_utf16_le_no_bom(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for unit in text.encode_utf16() {
+        out.extend_from_slice(&unit.to_le_bytes());
+    }
+    out
 }
 
 fn soap_headers() -> HashMap<String, String> {
@@ -466,7 +512,8 @@ fn test_plugin_contract() {
     assert!(!plugin.modifies_request_body());
     assert!(plugin.requires_request_body_before_before_proxy());
     assert!(!plugin.requires_request_body_before_authenticate());
-    assert!(!plugin.needs_request_body_bytes());
+    assert!(plugin.needs_request_body_bytes());
+    assert!(!plugin.needs_request_body_text());
     assert!(plugin.requires_request_body_buffering());
     assert!(!plugin.requires_response_body_buffering());
     assert!(!plugin.applies_after_proxy_on_reject());
@@ -498,12 +545,17 @@ fn openapi_soap_ws_security_describes_exclusive_c14n_contract() {
             "{label} OpenAPI description must name InclusiveNamespaces PrefixList: {text}"
         );
         assert!(
-            !text.contains("wire bytes")
+            !text.contains("wire bytes of")
                 && !text.contains("do not yet apply")
                 && !text.contains("do not currently apply"),
             "{label} OpenAPI description must not claim wire-byte / missing-c14n verification: {text}"
         );
     }
+
+    assert!(
+        root.contains("Original wire bytes are preserved"),
+        "root OpenAPI description must state that original wire bytes are preserved: {root}"
+    );
 
     assert!(
         root.contains("enveloped-signature") && root.contains("exclusive c14n"),
@@ -1019,6 +1071,47 @@ async fn test_password_digest_valid() {
     assert!(
         matches!(result, PluginResult::Continue),
         "Expected Continue, got {:?}",
+        result
+    );
+    assert_eq!(ctx.metadata.get("soap_ws_username").unwrap(), "alice");
+}
+
+#[tokio::test]
+async fn test_password_digest_valid_over_utf16le_wire_bytes() {
+    let plugin = SoapWsSecurity::new(&username_token_digest_config()).unwrap();
+
+    let nonce_bytes = b"utf16-nonce-bytes";
+    let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, nonce_bytes);
+    let created = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string();
+
+    let mut data = Vec::new();
+    data.extend_from_slice(nonce_bytes);
+    data.extend_from_slice(created.as_bytes());
+    data.extend_from_slice(b"secret123");
+
+    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &data);
+    let digest_b64 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
+
+    let ut = format!(
+        r#"<wsse:UsernameToken>
+        <wsse:Username>alice</wsse:Username>
+        <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">{}</wsse:Password>
+        <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">{}</wsse:Nonce>
+        <wsu:Created>{}</wsu:Created>
+    </wsse:UsernameToken>"#,
+        digest_b64, nonce_b64, created
+    );
+    let body = wrap_soap(&ut);
+    let bytes = encode_utf16_le(&body);
+    let mut ctx = make_ctx_with_soap_bytes(bytes, "application/soap+xml; charset=utf-16");
+    let mut headers = soap_headers_with_content_type("application/soap+xml; charset=utf-16");
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "UTF-16LE PasswordDigest should validate after decode, got {:?}",
         result
     );
     assert_eq!(ctx.metadata.get("soap_ws_username").unwrap(), "alice");
@@ -1756,6 +1849,35 @@ async fn test_saml_valid_signed_assertion_accepted() {
 }
 
 #[tokio::test]
+async fn test_saml_valid_signed_assertion_accepted_over_utf16le() {
+    let bundle = saml_fixtures::IdpBundle::new();
+    let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
+
+    let assertion = saml_fixtures::AssertionBuilder::new(
+        "_assertion-utf16",
+        "https://idp.example.com/metadata",
+        "alice@example.com",
+    )
+    .build();
+
+    let body = wrap_saml_assertion(&assertion);
+    let bytes = encode_utf16_le(&body);
+    let mut ctx = make_ctx_with_soap_bytes(bytes, "application/soap+xml; charset=utf-16");
+    let mut headers = soap_headers_with_content_type("application/soap+xml; charset=utf-16");
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "UTF-16LE signed SAML should validate after decode, got {:?}",
+        result
+    );
+    assert_eq!(
+        ctx.metadata.get("soap_ws_saml_subject").map(String::as_str),
+        Some("alice@example.com"),
+        "Subject NameID must be exported as metadata after UTF-16 decode"
+    );
+}
+
+#[tokio::test]
 async fn test_saml_decodes_signed_authorization_fields_from_verified_dom() {
     let bundle = saml_fixtures::IdpBundle::new();
     let plugin = SoapWsSecurity::new(&saml_config(&bundle, None)).unwrap();
@@ -2263,6 +2385,443 @@ fn test_should_not_buffer_non_soap() {
     assert!(!plugin.should_buffer_request_body(&ctx));
 }
 
+// ── UTF-16 / charset hostile-input boundary tests ───────────────────────────
+
+#[test]
+fn decode_utf16le_with_bom_and_matching_charset() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let bytes = encode_utf16_le(&xml);
+    let decoded = soap_decode_xml_body_for_test(&bytes, "application/soap+xml; charset=utf-16")
+        .expect("UTF-16LE with BOM should decode");
+    assert!(decoded.contains("Envelope"));
+    assert!(decoded.contains("Timestamp"));
+}
+
+#[test]
+fn decode_utf16be_with_bom_and_matching_charset() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let bytes = encode_utf16_be(&xml);
+    let decoded =
+        soap_decode_xml_body_for_test(&bytes, "text/xml; charset=utf-16be").expect("UTF-16BE");
+    assert!(decoded.contains("Envelope"));
+}
+
+#[test]
+fn decode_utf8_with_bom_strips_bom() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let mut bytes = vec![0xEF, 0xBB, 0xBF];
+    bytes.extend_from_slice(xml.as_bytes());
+    let decoded =
+        soap_decode_xml_body_for_test(&bytes, "text/xml; charset=utf-8").expect("UTF-8 BOM");
+    assert!(!decoded.starts_with('\u{feff}'));
+    assert!(decoded.contains("Envelope"));
+}
+
+#[test]
+fn decode_rejects_utf16_charset_without_bom_or_endian() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let bytes = encode_utf16_le_no_bom(&xml);
+    let err = soap_decode_xml_body_for_test(&bytes, "text/xml; charset=utf-16")
+        .expect_err("ambiguous utf-16 without BOM must fail closed");
+    assert!(
+        err.contains("conflicting or ambiguous"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn decode_accepts_explicit_utf16le_charset_without_bom() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let bytes = encode_utf16_le_no_bom(&xml);
+    let decoded = soap_decode_xml_body_for_test(&bytes, "text/xml; charset=utf-16le")
+        .expect("explicit utf-16le does not require BOM");
+    assert!(decoded.contains("Envelope"));
+}
+
+#[test]
+fn decode_unicodefffe_label_uses_utf16be() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let mut bytes = Vec::new();
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    let decoded = soap_decode_xml_body_for_test(&bytes, "text/xml; charset=unicodeFFFE")
+        .expect("unicodeFFFE is a UTF-16BE label");
+    assert!(decoded.contains("Envelope"));
+}
+
+#[test]
+fn decode_rejects_bom_charset_conflict() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let bytes = encode_utf16_le(&xml);
+    let err = soap_decode_xml_body_for_test(&bytes, "text/xml; charset=utf-8")
+        .expect_err("UTF-16 BOM vs utf-8 charset must conflict");
+    assert!(
+        err.contains("conflicting or ambiguous"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn decode_rejects_utf16le_bom_with_utf16be_charset() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let bytes = encode_utf16_le(&xml);
+    let err = soap_decode_xml_body_for_test(&bytes, "text/xml; charset=utf-16be")
+        .expect_err("endian mismatch must conflict");
+    assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+}
+
+#[test]
+fn decode_rejects_xml_declaration_encoding_conflict() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd"
+                   xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+      <wsu:Timestamp wsu:Id="TS-1">
+        <wsu:Created>2099-01-01T00:00:00Z</wsu:Created>
+      </wsu:Timestamp>
+    </wsse:Security>
+  </soap:Header>
+  <soap:Body><GetPrice/></soap:Body>
+</soap:Envelope>"#;
+    let bytes = encode_utf16_le(xml);
+    let err = soap_decode_xml_body_for_test(&bytes, "text/xml; charset=utf-16")
+        .expect_err("UTF-16 wire with UTF-8 XML declaration must conflict");
+    assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+}
+
+#[test]
+fn decode_rejects_unsupported_charset() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let err = soap_decode_xml_body_for_test(xml.as_bytes(), "text/xml; charset=iso-8859-1")
+        .expect_err("latin-1 is unsupported");
+    assert!(err.contains("unsupported character encoding"), "got: {err}");
+}
+
+#[test]
+fn decode_rejects_truncated_utf16() {
+    let mut bytes = encode_utf16_le("<Envelope/>");
+    bytes.pop(); // leave an odd trailing byte after the BOM+payload
+    let err = soap_decode_xml_body_for_test(&bytes, "text/xml; charset=utf-16")
+        .expect_err("truncated UTF-16 must fail closed");
+    assert!(
+        err.contains("not valid for its character encoding"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn decode_rejects_malformed_utf16_surrogate() {
+    // Lone high surrogate U+D800 — invalid UTF-16.
+    let bytes = vec![0xFF, 0xFE, 0x00, 0xD8];
+    let err = soap_decode_xml_body_for_test(&bytes, "text/xml; charset=utf-16le")
+        .expect_err("lone surrogate must fail");
+    assert!(
+        err.contains("not valid for its character encoding"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn decode_rejects_duplicate_charset_parameters() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let err =
+        soap_decode_xml_body_for_test(xml.as_bytes(), "text/xml; charset=utf-8; charset=utf-16")
+            .expect_err("duplicate charset is ambiguous");
+    assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+}
+
+#[test]
+fn decode_rejects_unbalanced_charset_quotes() {
+    let xml = wrap_soap(&fresh_timestamp());
+    for content_type in [
+        "text/xml; charset=\"utf-8",
+        "text/xml; charset=utf-8\"",
+        "text/xml; charset='utf-8",
+    ] {
+        let err = soap_decode_xml_body_for_test(xml.as_bytes(), content_type)
+            .expect_err("unbalanced charset quotes must fail closed");
+        assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+    }
+}
+
+#[test]
+fn decode_accepts_charset_after_quoted_parameter_containing_semicolon() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let decoded = soap_decode_xml_body_for_test(
+        xml.as_bytes(),
+        "text/xml; boundary=\"part;boundary\"; charset=utf-8",
+    )
+    .expect("semicolon inside a quoted parameter must not split charset");
+    assert!(decoded.contains("Envelope"));
+}
+
+#[test]
+fn decode_accepts_quoted_charset_when_sibling_parameter_contains_semicolon() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let decoded = soap_decode_xml_body_for_test(
+        xml.as_bytes(),
+        "application/soap+xml; foo=\"a;b;c\"; charset=\"utf-8\"",
+    )
+    .expect("quoted charset after quoted semicolon-bearing param");
+    assert!(decoded.contains("Envelope"));
+}
+
+#[test]
+fn decode_rejects_quoted_pair_escape_in_charset() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let err = soap_decode_xml_body_for_test(xml.as_bytes(), r#"text/xml; charset="utf\-8""#)
+        .expect_err("quoted-pair escapes in charset must fail closed");
+    assert!(err.contains("unsupported character encoding"), "got: {err}");
+}
+
+#[test]
+fn decode_rejects_trailing_garbage_after_quoted_charset() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let err = soap_decode_xml_body_for_test(
+        xml.as_bytes(),
+        r#"text/xml; charset="utf-8"garbage; boundary=x"#,
+    )
+    .expect_err("trailing bytes after a quoted charset must fail closed");
+    assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+}
+
+#[test]
+fn decode_rejects_semicolon_bearing_quoted_charset_label() {
+    let xml = wrap_soap(&fresh_timestamp());
+    let err = soap_decode_xml_body_for_test(xml.as_bytes(), r#"text/xml; charset="utf-8;x""#)
+        .expect_err("semicolon inside quoted charset label is not a utf-8 label");
+    assert!(err.contains("unsupported character encoding"), "got: {err}");
+}
+
+#[test]
+fn decode_rejects_bomless_charsetless_utf16le_xml() {
+    let xml = r#"<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body/></soap:Envelope>"#;
+    let bytes = encode_utf16_le_no_bom(xml);
+    assert_eq!(
+        &bytes[..2],
+        &[0x3c, 0x00],
+        "fixture must be BOM-less UTF-16LE '<'"
+    );
+    let err = soap_decode_xml_body_for_test(&bytes, "text/xml")
+        .expect_err("BOM-less charset-less UTF-16LE XML must fail closed");
+    assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+}
+
+#[test]
+fn decode_rejects_bomless_charsetless_utf16be_xml() {
+    let xml = r#"<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body/></soap:Envelope>"#;
+    let mut bytes = Vec::new();
+    for unit in xml.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_be_bytes());
+    }
+    assert_eq!(
+        &bytes[..2],
+        &[0x00, 0x3c],
+        "fixture must be BOM-less UTF-16BE '<'"
+    );
+    let err = soap_decode_xml_body_for_test(&bytes, "application/soap+xml")
+        .expect_err("BOM-less charset-less UTF-16BE XML must fail closed");
+    assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+}
+
+#[test]
+fn decode_rejects_bomless_utf16_xml_declared_as_utf8() {
+    let xml = r#"<?xml version="1.0"?><soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"><soap:Body/></soap:Envelope>"#;
+    let le = encode_utf16_le_no_bom(xml);
+    let le_err = soap_decode_xml_body_for_test(&le, "text/xml; charset=utf-8")
+        .expect_err("UTF-16LE bytes declared as UTF-8 must fail closed");
+    assert!(le_err.contains("conflicting or ambiguous"), "got: {le_err}");
+
+    let mut be = Vec::new();
+    for unit in xml.encode_utf16() {
+        be.extend_from_slice(&unit.to_be_bytes());
+    }
+    let be_err = soap_decode_xml_body_for_test(&be, "application/soap+xml; charset=utf-8")
+        .expect_err("UTF-16BE bytes declared as UTF-8 must fail closed");
+    assert!(be_err.contains("conflicting or ambiguous"), "got: {be_err}");
+}
+
+#[test]
+fn decode_utf8_without_charset_still_accepts_ordinary_xml() {
+    let xml = wrap_soap(&fresh_timestamp());
+    assert_eq!(xml.as_bytes()[0], b'<');
+    assert_ne!(xml.as_bytes().get(1).copied(), Some(0x00));
+    let decoded = soap_decode_xml_body_for_test(xml.as_bytes(), "text/xml")
+        .expect("ordinary UTF-8 without charset must remain accepted");
+    assert!(decoded.contains("Envelope"));
+}
+
+#[test]
+fn xml_declaration_finds_encoding_after_misleading_attribute_value() {
+    let xml = r#"<?xml version="encoding" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body><GetPrice/></soap:Body>
+</soap:Envelope>"#;
+    let bytes = encode_utf16_le(xml);
+    let err = soap_decode_xml_body_for_test(&bytes, "text/xml; charset=utf-16")
+        .expect_err("the real XML declaration encoding must still be checked");
+    assert!(err.contains("conflicting or ambiguous"), "got: {err}");
+}
+
+#[test]
+fn xml_stylesheet_processing_instruction_is_not_an_xml_declaration() {
+    let xml = r#"<?xml-stylesheet type="text/xsl" href="style.xsl"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body><GetPrice/></soap:Body>
+</soap:Envelope>"#;
+    let decoded = soap_decode_xml_body_for_test(xml.as_bytes(), "text/xml; charset=utf-8")
+        .expect("xml-stylesheet processing instruction is not an XML declaration");
+    assert_eq!(decoded, xml);
+}
+
+#[tokio::test]
+async fn utf16le_username_token_validates_over_decoded_text() {
+    let plugin = SoapWsSecurity::new(&username_token_config()).unwrap();
+    let body = wrap_soap(
+        r#"<wsse:UsernameToken>
+      <wsse:Username>alice</wsse:Username>
+      <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordText">secret123</wsse:Password>
+    </wsse:UsernameToken>"#,
+    );
+    let bytes = encode_utf16_le(&body);
+    let mut ctx = make_ctx_with_soap_bytes(bytes.clone(), "application/soap+xml; charset=utf-16");
+    // Simulate H1/H2/H3 handoff: non-UTF-8 bytes must not populate request_body.
+    assert!(!ctx.metadata.contains_key("request_body"));
+    let mut headers = soap_headers_with_content_type("application/soap+xml; charset=utf-16");
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "UTF-16LE UsernameToken should validate, got {:?}",
+        result
+    );
+    assert_eq!(
+        ctx.metadata.get("soap_ws_username").map(String::as_str),
+        Some("alice")
+    );
+    // Backend-visible representation stays the original UTF-16 bytes.
+    assert_eq!(
+        ctx.request_body_bytes.as_ref().map(|b| b.as_ref()),
+        Some(bytes.as_slice())
+    );
+}
+
+#[tokio::test]
+async fn utf16be_timestamp_validates_over_decoded_text() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let body = wrap_soap(&fresh_timestamp());
+    let bytes = encode_utf16_be(&body);
+    let mut ctx = make_ctx_with_soap_bytes(bytes, "text/xml; charset=utf-16be");
+    let mut headers = soap_headers_with_content_type("text/xml; charset=utf-16be");
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "UTF-16BE timestamp envelope should validate, got {:?}",
+        result
+    );
+}
+
+#[tokio::test]
+async fn utf16_missing_security_still_rejects_after_decode() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let body = r#"<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+      <soap:Header></soap:Header>
+      <soap:Body><Test/></soap:Body>
+    </soap:Envelope>"#;
+    let mut ctx = make_ctx_with_soap_bytes(encode_utf16_le(body), "text/xml; charset=utf-16");
+    let mut headers = soap_headers_with_content_type("text/xml; charset=utf-16");
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert_eq!(reject_status(&result), 401);
+    assert!(reject_body(&result).contains("Security header is missing"));
+}
+
+#[tokio::test]
+async fn conflicting_charset_rejects_with_415_without_treating_as_empty() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let body = wrap_soap(&fresh_timestamp());
+    let mut ctx = make_ctx_with_soap_bytes(encode_utf16_le(&body), "text/xml; charset=utf-8");
+    let mut headers = soap_headers_with_content_type("text/xml; charset=utf-8");
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert_eq!(reject_status(&result), 415);
+    let body = reject_body(&result);
+    assert!(
+        body.contains("conflicting or ambiguous"),
+        "must not misclassify as empty body: {body}"
+    );
+    assert!(!body.contains("empty"));
+}
+
+#[tokio::test]
+async fn empty_request_body_bytes_still_reports_empty() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let mut ctx = make_ctx_with_soap_bytes(Vec::new(), "text/xml");
+    let mut headers = soap_headers();
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert_eq!(reject_status(&result), 400);
+    assert!(reject_body(&result).contains("SOAP request body is empty"));
+}
+
+#[tokio::test]
+async fn metadata_text_fallback_validates_utf8_xml_declaration() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let body = r#"<?xml version="1.0" encoding="UTF-16"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Header>
+    <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd">
+      <wsu:Timestamp xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+        <wsu:Created>2000-01-01T00:00:00Z</wsu:Created>
+        <wsu:Expires>2099-01-01T00:00:00Z</wsu:Expires>
+      </wsu:Timestamp>
+    </wsse:Security>
+  </soap:Header>
+  <soap:Body><GetPrice/></soap:Body>
+</soap:Envelope>"#;
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/ws".to_string(),
+    );
+    // Fixture-only path: metadata text without raw bytes.
+    ctx.metadata
+        .insert("request_body".to_string(), body.to_string());
+    let mut headers = HashMap::new();
+    headers.insert(
+        "content-type".to_string(),
+        "text/xml; charset=utf-8".to_string(),
+    );
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(is_reject(&result));
+    assert_eq!(reject_status(&result), 415);
+    assert!(
+        reject_body(&result).contains("conflicting or ambiguous"),
+        "metadata fallback must still validate the XML declaration: {}",
+        reject_body(&result)
+    );
+}
+
+#[tokio::test]
+async fn metadata_text_fallback_accepts_matching_utf8_declaration() {
+    let plugin = SoapWsSecurity::new(&timestamp_only_config()).unwrap();
+    let body = wrap_soap(&fresh_timestamp());
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/ws".to_string(),
+    );
+    ctx.metadata.insert("request_body".to_string(), body);
+    let mut headers = HashMap::new();
+    headers.insert("content-type".to_string(), "text/xml".to_string());
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "UTF-8 metadata fallback with a compatible declaration must still validate: {result:?}"
+    );
+}
+
 // ── Non-envelope request tests ──────────────────────────────────────────────
 
 #[tokio::test]
@@ -2644,6 +3203,26 @@ mod x509_roundtrip {
         assert!(
             matches!(result, PluginResult::Continue),
             "expected Continue with valid RSA signature, got {:?}",
+            result,
+        );
+    }
+
+    #[tokio::test]
+    async fn valid_rsa_signature_is_accepted_over_utf16be() {
+        let cert = mint_rsa_cert();
+        let cert_file = write_pem_to_tempfile(&cert.cert_pem);
+        let plugin = SoapWsSecurity::new(&x509_plugin_config(cert_file.path()))
+            .expect("plugin should construct with valid RSA cert");
+
+        let body = build_signed_soap_envelope(&cert);
+        let bytes = encode_utf16_be(&body);
+        let mut ctx = make_ctx_with_soap_bytes(bytes, "text/xml; charset=utf-16be");
+        let mut headers = soap_headers_with_content_type("text/xml; charset=utf-16be");
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "UTF-16BE signed X.509 envelope should validate after decode, got {:?}",
             result,
         );
     }

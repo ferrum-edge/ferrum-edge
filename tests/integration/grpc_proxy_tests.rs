@@ -587,7 +587,7 @@ async fn send_grpc_request(
     Ok((status, headers, body_bytes))
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestHttpVersion {
     H1,
     H2,
@@ -1708,6 +1708,9 @@ async fn start_grpc_backend_with_trailer_fixture() -> (SocketAddr, tokio::task::
                     let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
                         // One valid uncompressed gRPC DATA message: flag 0x00,
                         // 12-byte big-endian payload length, then `grpc-payload`.
+                        // Keeping this fixture protocol-correct lets gRPC-Web
+                        // assertions parse through the data frame and count the
+                        // terminal trailer frames appended after it.
                         Ok(Frame::data(Bytes::from_static(
                             b"\x00\x00\x00\x00\x0cgrpc-payload",
                         ))),
@@ -2137,28 +2140,56 @@ async fn grpc_buffered_security_policy_stays_initial_without_relocating_trailers
 /// `grpc_web` plugin re-encodes terminal status as a gRPC-Web trailer frame
 /// appended to the body and relabels the content-type, so also emitting the
 /// reconciled native TRAILERS frame would double-signal terminal status.
+fn count_grpc_web_trailer_frames(mut body: &[u8]) -> usize {
+    let mut count = 0;
+    while body.len() >= 5 {
+        let flag = body[0];
+        let payload_len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
+        let Some(frame_len) = 5usize.checked_add(payload_len) else {
+            break;
+        };
+        if body.len() < frame_len {
+            break;
+        }
+        if flag & 0x80 != 0 {
+            count += 1;
+        }
+        body = &body[frame_len..];
+    }
+    count
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn grpc_web_transformed_response_suppresses_native_trailers() {
     let (backend_addr, _backend_handle) = start_grpc_backend_with_trailer_fixture().await;
 
     let mut proxy = create_grpc_proxy("grpc-web-no-native-trailers", "/grpc", backend_addr.port());
     proxy.response_body_mode = ResponseBodyMode::Buffer;
-    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
-        plugin_config_id: "grpc-web-bridge".to_string(),
-    }];
+    proxy.plugins = vec![
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-bridge".to_string(),
+        },
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-bridge-sibling".to_string(),
+        },
+    ];
     let plugin = PluginConfig {
         id: "grpc-web-bridge".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
         plugin_name: "grpc_web".to_string(),
         enabled: true,
-        config: serde_json::json!({}),
+        config: serde_json::json!({"expose_headers": ["x-grpc-web-owner"]}),
         scope: PluginScope::Proxy,
         proxy_id: Some("grpc-web-no-native-trailers".to_string()),
-        priority_override: None,
+        priority_override: Some(250),
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
+    let mut sibling = plugin.clone();
+    sibling.id = "grpc-web-bridge-sibling".to_string();
+    sibling.config = serde_json::json!({"expose_headers": ["x-grpc-web-sibling"]});
+    sibling.priority_override = Some(270);
     let cookie_transformer = PluginConfig {
         id: "grpc-web-cookie-transformer".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -2185,7 +2216,7 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     security_headers.config["remove"] = serde_json::json!(["Set-Cookie", "X-Powered-By"]);
     let state = create_test_proxy_state_with_plugins(
         vec![proxy],
-        vec![plugin, cookie_transformer, security_headers],
+        vec![plugin, sibling, cookie_transformer, security_headers],
     );
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
@@ -2202,6 +2233,7 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     let mut content_type: Option<String> = None;
     let mut security_policy: Option<String> = None;
     let mut hsts: Option<String> = None;
+    let mut expose_headers: Option<String> = None;
     let mut content_length: Option<usize> = None;
     let mut had_grpc_status_header = true;
     let mut had_set_cookie_header = true;
@@ -2246,6 +2278,11 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
             .get("strict-transport-security")
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
+        expose_headers = response
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
         content_length = response
             .headers()
             .get("content-length")
@@ -2288,6 +2325,9 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     assert_eq!(status, 200);
     assert_eq!(security_policy.as_deref(), Some("gateway-enforced"));
     assert_eq!(hsts.as_deref(), Some("max-age=31536000; includeSubDomains"));
+    let expose_headers = expose_headers.expect("gRPC-Web expose headers");
+    assert!(expose_headers.contains("x-grpc-web-owner"));
+    assert!(expose_headers.contains("x-grpc-web-sibling"));
     assert_eq!(
         content_type.as_deref(),
         Some("application/grpc-web+proto"),
@@ -2317,10 +2357,265 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
          (status is already embedded as a gRPC-Web trailer frame in the body)"
     );
     // The appended gRPC-Web trailer frame is flagged 0x80.
-    assert!(
-        body_bytes.contains(&0x80),
-        "gRPC-Web body must contain a trailer frame (flag 0x80)"
+    assert_eq!(
+        count_grpc_web_trailer_frames(&body_bytes),
+        1,
+        "two effective grpc_web instances must emit one terminal frame"
     );
+}
+
+/// Backend that returns the acceptance-criteria trailer set for issue #2502:
+/// `grpc-status`, one ASCII custom trailer, one `-bin` trailer, duplicate
+/// metadata, a hop-by-hop trailer that must be filtered, and an initial-header
+/// field that must not be copied into the gRPC-Web trailer frame.
+async fn start_grpc_backend_with_custom_trailer_fixture()
+-> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        loop {
+            let (stream, _) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(_) => break,
+            };
+            let _ = stream.set_nodelay(true);
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+                let builder = Http2ServerBuilder::new(TokioExecutor::new());
+
+                let service = service_fn(move |_req: Request<Incoming>| async move {
+                    let mut trailers = hyper::HeaderMap::new();
+                    trailers.insert(
+                        hyper::header::HeaderName::from_static("grpc-status"),
+                        hyper::header::HeaderValue::from_static("0"),
+                    );
+                    trailers.insert(
+                        hyper::header::HeaderName::from_static("request-id"),
+                        hyper::header::HeaderValue::from_static("abc-123"),
+                    );
+                    trailers.append(
+                        hyper::header::HeaderName::from_static("request-id"),
+                        hyper::header::HeaderValue::from_static("abc-456"),
+                    );
+                    trailers.insert(
+                        hyper::header::HeaderName::from_static("trace-proto-bin"),
+                        hyper::header::HeaderValue::from_static("AQID"),
+                    );
+                    trailers.insert(
+                        hyper::header::HeaderName::from_static("x-shared-meta"),
+                        hyper::header::HeaderValue::from_static("trailer-value"),
+                    );
+                    trailers.insert(
+                        hyper::header::HeaderName::from_static("proxy-authenticate"),
+                        hyper::header::HeaderValue::from_static("Basic realm=backend"),
+                    );
+
+                    // Emit a length-prefixed gRPC DATA frame (not raw bytes).
+                    // Unframed payloads make gRPC-Web trailer sync fail closed
+                    // and accidentally hide discard-before-sync regressions that
+                    // only surface on properly framed H3→H2 bridge bodies.
+                    let mut data_frame = vec![0x00, 0x00, 0x00, 0x00, 0x0c];
+                    data_frame.extend_from_slice(b"grpc-payload");
+                    let frames: Vec<Result<Frame<Bytes>, std::convert::Infallible>> = vec![
+                        Ok(Frame::data(Bytes::from(data_frame))),
+                        Ok(Frame::trailers(trailers)),
+                    ];
+                    let body = StreamBody::new(tokio_stream::iter(frames));
+
+                    let response = Response::builder()
+                        .status(200)
+                        .header("content-type", "application/grpc")
+                        .header("x-powered-by", "initial-header-only")
+                        .header("x-shared-meta", "initial-value")
+                        .body(body)
+                        .unwrap();
+
+                    Ok::<_, hyper::Error>(response)
+                });
+
+                if let Err(e) = builder.serve_connection(io, service).await {
+                    eprintln!("Custom-trailer backend connection error: {}", e);
+                }
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, handle)
+}
+
+fn assert_grpc_web_custom_trailer_payload(payload: &str) {
+    assert!(
+        payload.contains("grpc-status: 0"),
+        "missing grpc-status in {payload}"
+    );
+    assert!(
+        payload.contains("request-id: abc-123"),
+        "missing ASCII custom trailer in {payload}"
+    );
+    assert!(
+        payload.contains("request-id: abc-456"),
+        "missing duplicate ASCII custom trailer in {payload}"
+    );
+    assert!(
+        payload.contains("trace-proto-bin: AQID"),
+        "missing binary custom trailer in {payload}"
+    );
+    assert!(
+        payload.contains("x-shared-meta: trailer-value"),
+        "header-shadowed metadata must use the backend trailer value in {payload}"
+    );
+    assert!(
+        !payload.contains("x-shared-meta: initial-value"),
+        "initial-header value replaced the true trailer value in {payload}"
+    );
+    assert!(
+        !payload.contains("proxy-authenticate"),
+        "hop-by-hop trailer leaked into gRPC-Web frame: {payload}"
+    );
+    assert!(
+        !payload.contains("x-powered-by"),
+        "initial-header-only field leaked into gRPC-Web frame: {payload}"
+    );
+}
+
+async fn grpc_web_custom_trailer_exchange(
+    gateway_addr: SocketAddr,
+    version: TestHttpVersion,
+    content_type: &str,
+    body: Bytes,
+) -> Vec<u8> {
+    let mut last_body = Vec::new();
+    for _attempt in 0..5 {
+        let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+        let _ = stream.set_nodelay(true);
+        let io = TokioIo::new(stream);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/grpc/my.Service/Unary")
+            .header("host", "localhost")
+            .header("content-type", content_type)
+            .body(Full::new(body.clone()))
+            .unwrap();
+        let response = match version {
+            TestHttpVersion::H1 => {
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await.unwrap();
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                sender.send_request(request).await.expect("H1 send")
+            }
+            TestHttpVersion::H2 => {
+                let (mut sender, conn) =
+                    hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+                        .await
+                        .unwrap();
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                sender.send_request(request).await.expect("H2 send")
+            }
+        };
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some(content_type)
+        );
+        last_body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes()
+            .to_vec();
+        if last_body
+            .windows(b"grpc-status: 0".len())
+            .any(|window| window == b"grpc-status: 0")
+            || (content_type.contains("grpc-web-text") && !last_body.is_empty())
+        {
+            return last_body;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    last_body
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_preserves_ascii_custom_trailers_on_h1_and_h2_binary_and_text() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let (backend_addr, _backend_handle) = start_grpc_backend_with_custom_trailer_fixture().await;
+    let mut proxy = create_grpc_proxy("grpc-web-custom-trailers", "/grpc", backend_addr.port());
+    proxy.response_body_mode = ResponseBodyMode::Buffer;
+    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
+        plugin_config_id: "grpc-web-custom-trailers".to_string(),
+    }];
+    let plugin = PluginConfig {
+        id: "grpc-web-custom-trailers".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "grpc_web".to_string(),
+        enabled: true,
+        config: serde_json::json!({}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("grpc-web-custom-trailers".to_string()),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    let binary_body = Bytes::from_static(&[0u8, 0, 0, 0, 0]);
+    for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
+        let body = grpc_web_custom_trailer_exchange(
+            gateway_addr,
+            version,
+            "application/grpc-web+proto",
+            binary_body.clone(),
+        )
+        .await;
+        assert!(
+            body.contains(&0x80),
+            "{version:?} binary response missing trailer frame"
+        );
+        let flag_pos = body.iter().rposition(|b| *b == 0x80).expect("trailer flag");
+        let payload = String::from_utf8_lossy(&body[flag_pos + 5..]);
+        assert_grpc_web_custom_trailer_payload(&payload);
+    }
+
+    let text_body = Bytes::from(BASE64.encode([0u8, 0, 0, 0, 0]));
+    for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
+        let body = grpc_web_custom_trailer_exchange(
+            gateway_addr,
+            version,
+            "application/grpc-web-text+proto",
+            text_body.clone(),
+        )
+        .await;
+        let decoded = BASE64
+            .decode(&body)
+            .unwrap_or_else(|err| panic!("{version:?} text body not base64: {err}; raw={body:?}"));
+        assert!(
+            decoded.contains(&0x80),
+            "{version:?} text response missing trailer frame"
+        );
+        let flag_pos = decoded
+            .iter()
+            .rposition(|b| *b == 0x80)
+            .expect("trailer flag");
+        let payload = String::from_utf8_lossy(&decoded[flag_pos + 5..]);
+        assert_grpc_web_custom_trailer_payload(&payload);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2331,9 +2626,14 @@ async fn grpc_web_text_keeps_security_policy_in_initial_headers() {
     let (backend_addr, _backend_handle) = start_grpc_backend_with_trailer_fixture().await;
     let mut proxy = create_grpc_proxy("grpc-web-text-security", "/grpc", backend_addr.port());
     proxy.response_body_mode = ResponseBodyMode::Buffer;
-    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
-        plugin_config_id: "grpc-web-text-bridge".to_string(),
-    }];
+    proxy.plugins = vec![
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-text-bridge".to_string(),
+        },
+        ferrum_edge::config::types::PluginAssociation {
+            plugin_config_id: "grpc-web-text-bridge-sibling".to_string(),
+        },
+    ];
     let grpc_web = PluginConfig {
         id: "grpc-web-text-bridge".to_string(),
         namespace: ferrum_edge::config::types::default_namespace(),
@@ -2342,15 +2642,19 @@ async fn grpc_web_text_keeps_security_policy_in_initial_headers() {
         config: serde_json::json!({}),
         scope: PluginScope::Proxy,
         proxy_id: Some("grpc-web-text-security".to_string()),
-        priority_override: None,
+        priority_override: Some(250),
         api_spec_id: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
+    let mut grpc_web_sibling = grpc_web.clone();
+    grpc_web_sibling.id = "grpc-web-text-bridge-sibling".to_string();
+    grpc_web_sibling.priority_override = Some(270);
     let state = create_test_proxy_state_with_plugins(
         vec![proxy],
         vec![
             grpc_web,
+            grpc_web_sibling,
             security_headers_plugin("grpc-web-text-security-headers"),
         ],
     );
@@ -2433,7 +2737,11 @@ async fn grpc_web_text_keeps_security_policy_in_initial_headers() {
         "text response never carried successful terminal status ({} decoded bytes)",
         last_body.len()
     );
-    assert!(last_body.contains(&0x80));
+    assert_eq!(
+        count_grpc_web_trailer_frames(&last_body),
+        1,
+        "text mode must be decoded and re-encoded exactly once"
+    );
 }
 
 /// #2041 regression: when the backend exchange FAILS gateway-side for a

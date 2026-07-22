@@ -1412,6 +1412,12 @@ pub(crate) fn grpc_admission_status_from_maps(
 /// Trailers take precedence over trailers-only initial headers, matching the
 /// wire protocol. Callers use this for transaction metadata and metrics while
 /// retaining HTTP 200 as the transport status.
+///
+/// Buffered collection joins duplicate `grpc-status` occurrences with LF (see
+/// [`collect_buffered_grpc_trailers`]). Prefer the first valid numeric
+/// occurrence — the same rule gRPC-Web trailer-frame emission uses — and reject
+/// CR-bearing fields so a hostile value cannot inject an additional logical
+/// status line into the parse of a single joined field.
 pub(crate) fn grpc_status_from_maps(
     trailers: &HashMap<String, String>,
     headers: &HashMap<String, String>,
@@ -1419,7 +1425,7 @@ pub(crate) fn grpc_status_from_maps(
     trailers
         .get("grpc-status")
         .or_else(|| headers.get("grpc-status"))
-        .map(|status| parse_grpc_status_value(status))
+        .map(|status| parse_grpc_status_joined_value(status))
 }
 
 /// Parse a peer-supplied gRPC status without allowing malformed values to look
@@ -1428,6 +1434,21 @@ pub(crate) fn grpc_status_from_maps(
 /// bucket.
 pub(crate) fn parse_grpc_status_value(status: &str) -> u32 {
     status.trim().parse::<u32>().unwrap_or(u32::MAX)
+}
+
+/// Parse a possibly LF-joined `grpc-status` field from the buffered string map.
+fn parse_grpc_status_joined_value(status: &str) -> u32 {
+    // Match gRPC-Web trailer-frame encoding: CR is never part of the LF-join
+    // representation, so its presence means a hostile/malformed field.
+    if status.contains('\r') {
+        return u32::MAX;
+    }
+    for occurrence in status.split('\n') {
+        if let Ok(code) = occurrence.trim().parse::<u32>() {
+            return code;
+        }
+    }
+    u32::MAX
 }
 
 /// Refresh transaction metadata from the final client-visible gRPC response.
@@ -3128,9 +3149,55 @@ pub(crate) fn collect_buffered_grpc_trailers(
             continue;
         }
         if let Ok(vs) = v.to_str() {
-            out.insert(k.as_str().to_string(), vs.to_string());
+            // Preserve gRPC duplicate metadata semantics: HeaderMap yields each
+            // value separately, and the string-map representation joins them
+            // with newlines (same convention as multi-value Set-Cookie) so the
+            // gRPC-Web trailer-frame encoder can emit one `key: value\r\n` line
+            // per occurrence.
+            out.entry(k.as_str().to_string())
+                .and_modify(|existing| {
+                    existing.push('\n');
+                    existing.push_str(vs);
+                })
+                .or_insert_with(|| vs.to_string());
         }
     }
+}
+
+/// Append one buffered string-map trailer entry onto a native wire `HeaderMap`.
+///
+/// [`collect_buffered_grpc_trailers`] joins duplicate metadata with LF.
+/// `HeaderValue::from_str` rejects embedded LF, so H2/H3 buffered emitters must
+/// split and [`HeaderMap::append`] each occurrence. A CR-bearing field is
+/// skipped entirely (matching gRPC-Web trailer-frame encoding) so injection
+/// cannot create an additional logical trailer line from a single map value.
+pub(crate) fn append_buffered_grpc_trailer_entry(
+    trailers: &mut hyper::HeaderMap,
+    name: &str,
+    joined_value: &str,
+) {
+    let Ok(header_name) = hyper::header::HeaderName::from_bytes(name.as_bytes()) else {
+        return;
+    };
+    if joined_value.contains('\r') {
+        return;
+    }
+    for occurrence in joined_value.split('\n') {
+        if let Ok(value) = hyper::header::HeaderValue::from_str(occurrence) {
+            trailers.append(header_name.clone(), value);
+        }
+    }
+}
+
+/// Build a native trailer `HeaderMap` from the buffered LF-joined string map.
+pub(crate) fn buffered_grpc_trailers_to_header_map(
+    map: &HashMap<String, String>,
+) -> hyper::HeaderMap {
+    let mut trailers = hyper::HeaderMap::new();
+    for (name, value) in map {
+        append_buffered_grpc_trailer_entry(&mut trailers, name, value);
+    }
+    trailers
 }
 
 /// Check if a request is a gRPC request based on content-type.
@@ -3323,6 +3390,24 @@ mod tests {
         assert_eq!(
             grpc_admission_status_from_maps(&malformed, &HashMap::new(), 200),
             500
+        );
+    }
+
+    #[test]
+    fn grpc_status_from_maps_uses_first_valid_lf_joined_occurrence() {
+        // collect_buffered_grpc_trailers joins duplicate grpc-status with LF.
+        // Prefer the first valid occurrence (matching gRPC-Web frame emit).
+        let trailers = HashMap::from([("grpc-status".to_string(), "0\n14".to_string())]);
+        assert_eq!(grpc_status_from_maps(&trailers, &HashMap::new()), Some(0));
+
+        let trailers = HashMap::from([("grpc-status".to_string(), "hostile\n7".to_string())]);
+        assert_eq!(grpc_status_from_maps(&trailers, &HashMap::new()), Some(7));
+
+        // CR injection must not yield a success parse of a smuggled suffix.
+        let trailers = HashMap::from([("grpc-status".to_string(), "0\r\n14".to_string())]);
+        assert_eq!(
+            grpc_status_from_maps(&trailers, &HashMap::new()),
+            Some(u32::MAX)
         );
     }
 
@@ -3961,6 +4046,53 @@ mod tests {
                 "legitimate gRPC trailer `{name}` must be preserved",
             );
         }
+    }
+
+    #[test]
+    fn collect_buffered_grpc_trailers_preserves_duplicate_metadata() {
+        let mut trailer_map = hyper::HeaderMap::new();
+        trailer_map.insert("grpc-status", "0".parse().unwrap());
+        trailer_map.insert("request-id", "first".parse().unwrap());
+        trailer_map.append("request-id", "second".parse().unwrap());
+
+        let mut out: HashMap<String, String> = HashMap::new();
+        collect_buffered_grpc_trailers(&trailer_map, &mut out);
+
+        assert_eq!(
+            out.get("request-id").map(String::as_str),
+            Some("first\nsecond"),
+            "duplicate gRPC metadata must be newline-joined for trailer-frame encoding"
+        );
+    }
+
+    #[test]
+    fn buffered_native_emit_splits_lf_joined_duplicates_including_grpc_status() {
+        // Native H2/H3 buffered emit must append each LF-separated occurrence;
+        // HeaderValue::from_str would otherwise drop the entire multi-value.
+        let joined = HashMap::from([
+            ("grpc-status".to_string(), "0\n14".to_string()),
+            ("request-id".to_string(), "first\nsecond".to_string()),
+        ]);
+        let wire = buffered_grpc_trailers_to_header_map(&joined);
+
+        let status: Vec<_> = wire
+            .get_all("grpc-status")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(status, vec!["0", "14"]);
+
+        let request_ids: Vec<_> = wire
+            .get_all("request-id")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(request_ids, vec!["first", "second"]);
+
+        // CR-bearing fields are skipped entirely (no partial injection).
+        let hostile = HashMap::from([("x-meta".to_string(), "ok\r\ninjected".to_string())]);
+        let wire = buffered_grpc_trailers_to_header_map(&hostile);
+        assert!(wire.get("x-meta").is_none());
     }
 
     #[test]

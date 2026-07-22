@@ -12494,7 +12494,7 @@ components:
             metric:
               type: string
               enum: [backend_total_ms, backend_ttfb_ms, total_ms, stream_duration_ms]
-              description: Latency metric to observe. `stream_duration_ms` applies to TCP/UDP/WebSocket sessions; the others apply to HTTP-family summaries.
+              description: Latency metric to observe. `stream_duration_ms` applies to TCP/UDP/DTLS/WebSocket sessions and is measured on a process-monotonic clock (not UTC wall time); connect/disconnect timestamps remain civil-clock values for rendering. The other metrics apply to HTTP-family summaries.
             percentile:
               type: integer
               minimum: 1
@@ -14470,7 +14470,7 @@ components:
 
     SoapWsSecurityConfig:
       type: object
-      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers request bodies with SOAP content types (text/xml, application/soap+xml, application/xml). At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported)."
+      description: "Plugin: soap_ws_security — Validates WS-Security headers in SOAP envelopes. Supports UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certificates with enveloped-signature transform, Issuer / NotBefore / NotOnOrAfter / Audience checks, and Subject NameID extraction), timestamp freshness, and nonce replay protection. Buffers SOAP content types (text/xml, application/soap+xml, application/xml) as raw bytes and decodes UTF-8 / UTF-16LE / UTF-16BE from BOM and Content-Type charset before validation; charset/BOM/XML-declaration conflicts and malformed encodings fail closed (415/400) without logging bodies. Original wire bytes are preserved for the backend. At least one security feature must be enabled. Both the X.509 and SAML signature paths apply Exclusive XML Canonicalization (xml-exc-c14n#) to SignedInfo and referenced elements, including InclusiveNamespaces PrefixList. Reference transform chains may contain the enveloped-signature transform followed by exclusive c14n; unsupported canonicalization or transform algorithms fail closed (inclusive c14n, comments, XPath, XSLT, and other XMLDSIG transforms are not supported)."
       properties:
         reject_missing_security_header:
           type: boolean
@@ -16881,7 +16881,10 @@ components:
         Omitted optional fields select defaults; runtime also treats explicit
         null on optional fields as omitted. Matching replay bodies have a hard
         10 MiB plugin-local ceiling and active local/fan-out replay work shares
-        a 64 MiB process-wide retained-body budget.
+        a 64 MiB process-wide retained-body budget. Synthetic and fan-out
+        headers reuse the canonical secondary-request sanitizer shared with
+        request_mirror (Connection-listed hop-by-hop, Trailer, framing, Ferrum
+        markers, proxy-owned X-Forwarded-*), preserving Host for routing.
       required:
         - key
         - concurrent_clients
@@ -16978,7 +16981,16 @@ components:
         for the mirror response and mirror failures never propagate to the
         client. Mirror response metadata (status, size, latency) is captured
         via a `tokio::sync::watch` channel and surfaced through transaction
-        logs.
+        logs. Outbound mirror headers use Ferrum's canonical secondary-request
+        sanitizer (Connection-listed hop-by-hop, Trailer, framing, Ferrum
+        request-only markers, and proxy-owned X-Forwarded-* identity); these
+        forwarding fields are stripped rather than regenerated, so mirrors do
+        not receive Ferrum-authored X-Forwarded-* identity. Host is derived from
+        the mirror URL. Native gRPC mirrors require HTTP/2 and re-synthesise te:
+        trailers. The mirror request-target preserves the raw query (after the
+        same auth credential strips as primary) including repeated pairs,
+        order, flags, empty values, +, percent escapes, and non-ASCII encoded
+        bytes.
       required:
         - mirror_host
       properties:
@@ -16998,7 +17010,8 @@ components:
           description: "Transport protocol used for the mirror request."
         mirror_path:
           type: string
-          description: "Override path used for the mirror request. When omitted, the original request path is used."
+          pattern: '^$|^/[^?#]*$'
+          description: "Override path used for the mirror request. Must start with `/` and cannot contain a query or fragment. Empty is treated as omitted; when omitted, the original request path is used."
         percentage:
           type: number
           format: double
@@ -17211,7 +17224,7 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
       additionalProperties: false
       properties:
         ttl_seconds:
@@ -17556,7 +17569,14 @@ components:
         trailer frame synthesizes status from the official HTTP-to-gRPC client
         mapping (400→13, 401→16, 403→7, 404→12, 429/502/503/504→14, others→2);
         a valid supplied grpc-status remains authoritative. The client-visible
-        HTTP status is not rewritten to 200 on this path.
+        HTTP status is not rewritten to 200 on this path. The body trailer frame
+        preserves backend `grpc-status` / `grpc-message`, binary `*-bin`
+        metadata, and valid ASCII custom trailing metadata while excluding
+        hop-by-hop, forbidden, pseudo, connection-listed, and invalid
+        names/values; initial response headers are not copied into the frame.
+        Multiple effective instances are supported: the first in configured
+        order owns body translation exactly once; siblings union expose_headers
+        only.
       properties:
         expose_headers:
           type: array
@@ -17565,7 +17585,8 @@ components:
           description: >-
             Additional response headers to include in
             Access-Control-Expose-Headers for browser CORS compatibility.
-            grpc-status and grpc-message are always exposed.
+            grpc-status and grpc-message are always exposed. Multiple grpc_web
+            instances union their lists in configured order.
 
     GrpcDeadlineConfig:
       type: object

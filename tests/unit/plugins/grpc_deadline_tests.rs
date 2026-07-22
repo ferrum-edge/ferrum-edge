@@ -4451,6 +4451,10 @@ async fn deadline_rebuild_keeps_a_route_override_add_that_reinstated_a_removed_h
 /// [`h3_grpc_web_requests_keep_the_http_protocol_key`]). The harness invokes
 /// the hook chain directly, so the native-gRPC context is used here; what is
 /// under test is the provenance bookkeeping, which is protocol-independent.
+/// Ownership is instance-local and gated on this instance's staged status, so
+/// `before_proxy` must run first on a cacheable method (gRPC-Web is POST; the
+/// default cacheable set is only GET/HEAD) with request headers, not the
+/// backend response map that later echoes `MISS`.
 #[tokio::test]
 async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
     use ferrum_edge::_test_support::{
@@ -4460,7 +4464,12 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
 
     let caching = create_plugin(
         "response_caching",
-        &json!({"add_cache_status_header": true}),
+        &json!({
+            "add_cache_status_header": true,
+            // gRPC / gRPC-Web requests are POST; enable caching so this instance
+            // stages a real MISS rather than the default-method BYPASS.
+            "cacheable_methods": ["POST"],
+        }),
     )
     .unwrap()
     .unwrap();
@@ -4470,6 +4479,15 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
     let mut ctx = create_grpc_context_with_timeout(None);
     set_grpc_deadline_budget_for_test(&mut ctx, Some(1_000));
 
+    let mut request_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    assert!(matches!(
+        after_proxy_plugins[0]
+            .before_proxy(&mut ctx, &mut request_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
     // The backend pre-populated the exact value the plugin is about to write.
     let mut headers = HashMap::from([
         ("content-type".to_string(), "application/grpc".to_string()),
@@ -4478,6 +4496,12 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
     assert!(
         !run_after_proxy_hooks_for_test(&after_proxy_plugins, &mut ctx, 200, &mut headers).await,
         "response_caching must not reject the buffered response"
+    );
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS"),
+        "before_proxy must stage an instance-local MISS so after_proxy writes \
+         the telemetry value under ownership test"
     );
 
     set_grpc_deadline_budget_for_test(&mut ctx, Some(0));
@@ -4508,9 +4532,9 @@ async fn deadline_rebuild_keeps_an_exact_value_cache_status_telemetry_header() {
 /// actually written. Direct trait-level coverage keeps the two in step for the
 /// plugins whose end-to-end deadline path is exercised above only for
 /// `response_caching`.
-#[test]
-fn exact_value_telemetry_decorators_declare_only_what_they_write() {
-    let ctx = create_test_context();
+#[tokio::test]
+async fn exact_value_telemetry_decorators_declare_only_what_they_write() {
+    let mut ctx = create_test_context();
 
     let caching = create_plugin(
         "response_caching",
@@ -4518,6 +4542,12 @@ fn exact_value_telemetry_decorators_declare_only_what_they_write() {
     )
     .unwrap()
     .unwrap();
+    assert!(!caching.owns_deadline_response_header(&ctx, "x-cache-status"));
+    let mut request_headers = HashMap::new();
+    assert!(matches!(
+        caching.before_proxy(&mut ctx, &mut request_headers).await,
+        PluginResult::Continue
+    ));
     assert!(caching.owns_deadline_response_header(&ctx, "x-cache-status"));
     assert!(caching.owns_deadline_response_header(&ctx, "X-Cache-Status"));
     assert!(!caching.owns_deadline_response_header(&ctx, "x-other"));

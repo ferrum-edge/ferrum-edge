@@ -91,11 +91,6 @@ const DEFAULT_CONTENT_TYPES: &[&str] = &[
 const UNCOMPRESSIBLE_STATUS_CODES: &[u16] = &[204, 205, 304];
 
 const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
-/// Metadata key set by `response_caching` for the current request's lookup
-/// outcome (`HIT`, `MISS`, …). Used to scope reject-path 406 replacement to
-/// cache HITs of identity variants without masking auth/policy rejections.
-const RESPONSE_CACHE_STATUS_METADATA_KEY: &str = "cache_status";
-const RESPONSE_CACHE_HIT_STATUS: &str = "HIT";
 const REQUEST_NO_TRANSFORM_METADATA_KEY: &str = "compression:request_no_transform";
 const RESPONSE_ALGORITHM_METADATA_KEY: &str = "compression:algorithm";
 
@@ -415,9 +410,7 @@ impl CompressionPlugin {
     /// identity variants. Other synthetic/auth/policy rejections keep their
     /// original status so negotiation does not mask security denials.
     fn is_response_cache_hit(ctx: &RequestContext) -> bool {
-        ctx.metadata
-            .get(RESPONSE_CACHE_STATUS_METADATA_KEY)
-            .is_some_and(|status| status == RESPONSE_CACHE_HIT_STATUS)
+        ctx.response_cache_hit()
     }
 
     /// Emit 406 on the reject path only for cache-HIT identity variants; on the
@@ -976,8 +969,8 @@ impl Plugin for CompressionPlugin {
     fn may_replace_rejection_response(&self) -> bool {
         // Opt in so a required 406 can replace an uncommitted `response_caching`
         // HIT of an identity variant. `after_proxy` only returns that Reject when
-        // `cache_status=HIT` and identity is explicitly unacceptable — auth/policy
-        // rejections are left unchanged.
+        // the monotonic request-global cache-HIT marker is present and identity
+        // is explicitly unacceptable — auth/policy rejections are left unchanged.
         true
     }
 
@@ -1100,9 +1093,9 @@ impl Plugin for CompressionPlugin {
         // Synthetic / rejection responses re-run `after_proxy` without body
         // transforms. Do not commit Content-Encoding there. Fail-closed 406 on
         // this path is scoped to `response_caching` HITs of identity variants
-        // (`cache_status=HIT`) — including when identity responses omit
-        // `Vary: Accept-Encoding` (#2355) — so auth/policy rejections keep their
-        // original status.
+        // (the monotonic request-global HIT marker) — including when identity
+        // responses omit `Vary: Accept-Encoding` (#2355) — so auth/policy
+        // rejections keep their original status.
         let on_rejection = ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY);
 
         // No-body statuses and already-coded upstream responses are

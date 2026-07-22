@@ -1,11 +1,14 @@
 use ferrum_edge::config::file_loader::load_config_from_file;
 use ferrum_edge::plugins::grpc_web::{GRPC_WEB_CONFIG_KEYS, GrpcWebPlugin};
+use ferrum_edge::plugins::security_headers::SecurityHeaders;
 use ferrum_edge::plugins::{
-    HTTP_GRPC_PROTOCOLS, Plugin, PluginFailurePolicy, PluginResult, create_plugin,
-    plugin_failure_policy, priority, validate_plugin_config,
+    BufferedInitialResponseHeaderPolicyState, HTTP_GRPC_PROTOCOLS, Plugin, PluginFailurePolicy,
+    PluginResult, create_plugin, plugin_failure_policy, priority, validate_plugin_config,
 };
+use ferrum_edge::proxy::grpc_proxy;
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 use super::plugin_utils::create_test_context;
@@ -32,6 +35,14 @@ fn grpc_web_trailer_payload(body: &[u8]) -> String {
     let len = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
     assert_eq!(body.len(), 5 + len);
     String::from_utf8(body[5..].to_vec()).unwrap()
+}
+
+fn trailing_grpc_web_trailer_payload(body: &[u8]) -> String {
+    let flag_pos = body
+        .iter()
+        .rposition(|byte| *byte == ferrum_edge::_test_support::GRPC_FRAME_TRAILER)
+        .expect("trailing gRPC-Web trailer frame");
+    grpc_web_trailer_payload(&body[flag_pos..])
 }
 
 // ── Plugin creation ──
@@ -1515,6 +1526,892 @@ fn test_build_trailer_frame() {
 }
 
 #[test]
+fn test_build_trailer_frame_preserves_ascii_custom_and_bin_metadata() {
+    use ferrum_edge::_test_support::build_trailer_frame;
+    let mut headers = HashMap::new();
+    headers.insert("grpc-status".to_string(), "0".to_string());
+    headers.insert("request-id".to_string(), "abc-123".to_string());
+    headers.insert("quota-remaining".to_string(), "7".to_string());
+    headers.insert("trace-proto-bin".to_string(), "AQID".to_string());
+    headers.insert("content-type".to_string(), "application/grpc".to_string());
+    headers.insert("x-grpc-web".to_string(), "1".to_string());
+    headers.insert(
+        "proxy-authenticate".to_string(),
+        "Basic realm=x".to_string(),
+    );
+    headers.insert("connection".to_string(), "close".to_string());
+    headers.insert("keep-alive".to_string(), "timeout=5".to_string());
+    // Connection-listed smuggling attempt: nominate a custom name via Connection.
+    headers.insert("Connection".to_string(), "x-connection-listed".to_string());
+    headers.insert("x-connection-listed".to_string(), "leak".to_string());
+    headers.insert(":status".to_string(), "200".to_string());
+    headers.insert("bad header".to_string(), "nope".to_string());
+    headers.insert("x-bad".to_string(), "line\r\ninject".to_string());
+
+    let frame = build_trailer_frame(&headers);
+    let trailer_str = String::from_utf8_lossy(&frame[5..]);
+    assert!(trailer_str.contains("grpc-status: 0"));
+    assert!(trailer_str.contains("request-id: abc-123"));
+    assert!(trailer_str.contains("quota-remaining: 7"));
+    assert!(trailer_str.contains("trace-proto-bin: AQID"));
+    assert!(!trailer_str.contains("content-type"));
+    assert!(!trailer_str.contains("x-grpc-web"));
+    assert!(!trailer_str.contains("proxy-authenticate"));
+    assert!(!trailer_str.contains("keep-alive"));
+    assert!(!trailer_str.contains("x-connection-listed"));
+    assert!(!trailer_str.contains(":status"));
+    assert!(!trailer_str.contains("bad header"));
+    assert!(!trailer_str.contains("inject"));
+}
+
+#[test]
+fn test_build_trailer_frame_preserves_duplicate_metadata_and_deterministic_order() {
+    use ferrum_edge::_test_support::build_trailer_frame;
+    let mut headers = HashMap::new();
+    // Newline-joined duplicates mirror collect_buffered_grpc_trailers.
+    headers.insert("request-id".to_string(), "first\nsecond".to_string());
+    headers.insert("grpc-status".to_string(), "0".to_string());
+    headers.insert("zebra-meta".to_string(), "z".to_string());
+    headers.insert("alpha-meta".to_string(), "a".to_string());
+
+    let frame = build_trailer_frame(&headers);
+    let trailer_str = String::from_utf8(frame[5..].to_vec()).unwrap();
+    assert!(trailer_str.contains("request-id: first\r\n"));
+    assert!(trailer_str.contains("request-id: second\r\n"));
+    assert_eq!(trailer_str.matches("request-id:").count(), 2);
+
+    // Sorted by lowercase name: alpha-meta, grpc-status, request-id..., zebra-meta
+    let alpha = trailer_str.find("alpha-meta:").expect("alpha-meta");
+    let grpc_status = trailer_str.find("grpc-status:").expect("grpc-status");
+    let request_id = trailer_str.find("request-id:").expect("request-id");
+    let zebra = trailer_str.find("zebra-meta:").expect("zebra-meta");
+    assert!(alpha < grpc_status && grpc_status < request_id && request_id < zebra);
+}
+
+#[tokio::test]
+async fn test_transform_response_body_binary_and_text_embed_custom_trailers() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let plugin = create_plugin_default();
+    let mut body = vec![0x00u8];
+    body.extend_from_slice(&5u32.to_be_bytes());
+    body.extend_from_slice(b"hello");
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+    response_headers.insert("request-id".to_string(), "abc-123".to_string());
+    response_headers.insert("trace-proto-bin".to_string(), "AQID".to_string());
+    response_headers.insert("request-id-dup".to_string(), "one\ntwo".to_string());
+    response_headers.insert("proxy-authenticate".to_string(), "Basic x".to_string());
+
+    let binary = plugin
+        .transform_response_body(&body, Some("application/grpc-web"), &response_headers)
+        .await
+        .expect("binary transform");
+    let binary_payload = grpc_web_trailer_payload(&binary[body.len()..]);
+    assert!(binary_payload.contains("grpc-status: 0"));
+    assert!(binary_payload.contains("request-id: abc-123"));
+    assert!(binary_payload.contains("trace-proto-bin: AQID"));
+    assert!(binary_payload.contains("request-id-dup: one\r\n"));
+    assert!(binary_payload.contains("request-id-dup: two\r\n"));
+    assert!(!binary_payload.contains("proxy-authenticate"));
+
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web-text".to_string(),
+    );
+    let text = plugin
+        .transform_response_body(&body, Some("application/grpc-web-text"), &response_headers)
+        .await
+        .expect("text transform");
+    let decoded = BASE64.decode(&text).expect("text body is base64");
+    assert_eq!(&decoded[..body.len()], &body[..]);
+    let text_payload = grpc_web_trailer_payload(&decoded[body.len()..]);
+    assert!(text_payload.contains("request-id: abc-123"));
+    assert!(text_payload.contains("trace-proto-bin: AQID"));
+    assert!(!text_payload.contains("proxy-authenticate"));
+}
+
+#[tokio::test]
+async fn test_transform_with_provenance_excludes_initial_header_only_fields() {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+
+    // Only backend trailers are allowlisted; header-only fields must not leak.
+    let mut trailers = HashMap::new();
+    trailers.insert("grpc-status".to_string(), "0".to_string());
+    trailers.insert("request-id".to_string(), "abc-123".to_string());
+    trailers.insert("trace-proto-bin".to_string(), "AQID".to_string());
+    ferrum_edge::plugins::grpc_web::record_backend_trailer_names_for_frame(
+        &mut ctx.metadata,
+        &trailers,
+    );
+
+    let mut response_headers = HashMap::new();
+    response_headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+    response_headers.insert("request-id".to_string(), "abc-123".to_string());
+    response_headers.insert("trace-proto-bin".to_string(), "AQID".to_string());
+    response_headers.insert("x-powered-by".to_string(), "backend-header".to_string());
+    response_headers.insert("quota-remaining".to_string(), "7".to_string());
+
+    let output = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"",
+            Some("application/grpc-web"),
+            &response_headers,
+        )
+        .await
+        .expect("transform");
+    let payload = grpc_web_trailer_payload(&output);
+    assert!(payload.contains("grpc-status: 0"));
+    assert!(payload.contains("request-id: abc-123"));
+    assert!(payload.contains("trace-proto-bin: AQID"));
+    assert!(
+        !payload.contains("x-powered-by"),
+        "initial-header-only field must not enter the trailer frame: {payload}"
+    );
+    assert!(
+        !payload.contains("quota-remaining"),
+        "non-trailer merged field must not enter the trailer frame: {payload}"
+    );
+}
+
+/// Apply after_proxy plugins under buffered initial-header policy state, then
+/// transform + reconcile + sync so the body trailer frame matches native H2/H3.
+async fn grpc_web_body_frame_after_policy_hooks(
+    backend_headers: HashMap<String, String>,
+    backend_trailers: HashMap<String, String>,
+    hooks: &[Arc<dyn Plugin>],
+) -> String {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+    ferrum_edge::plugins::grpc_web::record_backend_trailer_provenance_for_frame(
+        &mut ctx.metadata,
+        &backend_headers,
+        &backend_trailers,
+    );
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    plugin_view.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+
+    let policy_names = hooks
+        .iter()
+        .find(|hook| hook.is_initial_response_header_policy())
+        .map(|hook| Arc::new(hook.initial_response_header_policy_names().to_vec()))
+        .unwrap_or_else(|| Arc::new(Vec::new()));
+    let mut policy_state = BufferedInitialResponseHeaderPolicyState::new(
+        Arc::clone(&policy_names),
+        &backend_headers,
+        &plugin_view,
+    );
+    ferrum_edge::_test_support::begin_buffered_initial_response_header_policy_for_test(
+        &mut ctx,
+        Arc::clone(&policy_names),
+        &backend_headers,
+        &plugin_view,
+    );
+    for hook in hooks {
+        let _ = hook.after_proxy(&mut ctx, 200, &mut plugin_view).await;
+        if let Some(state) = policy_state.as_mut() {
+            state.record_after_proxy_plugin(hook.as_ref(), &mut plugin_view);
+        }
+        ferrum_edge::_test_support::record_buffered_initial_response_header_plugin_for_test(
+            &mut ctx,
+            hook.as_ref(),
+            &mut plugin_view,
+        );
+    }
+
+    let mut body = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"",
+            Some("application/grpc-web"),
+            &plugin_view,
+        )
+        .await
+        .expect("transform");
+    let mut wire_trailers = backend_trailers;
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        policy_state.as_ref(),
+    );
+    assert!(
+        ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut body,
+            Some("application/grpc-web"),
+            &wire_trailers,
+            Some(200),
+        )
+    );
+    grpc_web_trailer_payload(&body)
+}
+
+#[test]
+fn test_sync_trailer_frame_refuses_malformed_draft_body() {
+    // An incomplete data frame followed by a syntactically complete trailer
+    // must not gain another trailer. Production always supplies a complete
+    // transform-phase draft, so failure to prove that shape is fail-closed.
+    let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x20, 0x01];
+    body.extend(ferrum_edge::_test_support::build_trailer_frame(
+        &HashMap::from([("grpc-status".to_string(), "0".to_string())]),
+    ));
+    let original = body.clone();
+
+    assert!(
+        !ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut body,
+            Some("application/grpc-web"),
+            &HashMap::from([("grpc-status".to_string(), "13".to_string())]),
+            Some(200),
+        )
+    );
+    assert_eq!(body, original);
+}
+
+/// H1/H2/H3 buffered gRPC-Web must sync the body trailer frame from the
+/// reconciled wire trailer map *before* retiring application trailers.
+///
+/// A properly framed DATA+TRAILER draft (the H3→H2 bridge shape) makes sync
+/// succeed; discarding first would leave only `grpc-status` and rebuild a
+/// sparse frame. Unframed backend bytes accidentally mask that ordering bug
+/// because truncate-then-sync fails closed and keeps the transform draft.
+#[test]
+fn test_sync_before_discard_preserves_custom_trailers_on_framed_body() {
+    let backend_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let backend_trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "abc-123\nabc-456".to_string()),
+        ("trace-proto-bin".to_string(), "AQID".to_string()),
+    ]);
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    plugin_view.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+
+    // Proper length-prefixed DATA frame + transform-phase trailer draft.
+    let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x04];
+    body.extend_from_slice(b"pong");
+    body.extend(ferrum_edge::_test_support::build_trailer_frame(
+        &plugin_view,
+    ));
+
+    let mut wire_trailers = backend_trailers.clone();
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        None,
+    );
+    assert!(
+        ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut body,
+            Some("application/grpc-web"),
+            &wire_trailers,
+            Some(200),
+        ),
+        "framed DATA+TRAILER draft must sync from reconciled trailers"
+    );
+    ferrum_edge::_test_support::discard_grpc_application_trailers_after_body_rewrite_for_test(
+        &mut plugin_view,
+        &mut wire_trailers,
+        &[],
+    );
+    assert_eq!(
+        wire_trailers.get("grpc-status").map(String::as_str),
+        Some("0")
+    );
+    assert!(!wire_trailers.contains_key("request-id"));
+
+    let payload = trailing_grpc_web_trailer_payload(&body);
+    assert!(
+        payload.contains("request-id: abc-123\r\n"),
+        "sync-before-discard must keep ASCII custom trailers: {payload}"
+    );
+    assert!(
+        payload.contains("request-id: abc-456\r\n"),
+        "sync-before-discard must keep duplicate ASCII trailers: {payload}"
+    );
+    assert!(
+        payload.contains("trace-proto-bin: AQID\r\n"),
+        "sync-before-discard must keep binary trailers: {payload}"
+    );
+}
+
+#[test]
+fn test_truncate_trailing_trailer_frames_suffix_and_malformed() {
+    use ferrum_edge::_test_support::{
+        GRPC_FRAME_TRAILER, build_trailer_frame, truncate_trailing_trailer_frames_for_test,
+    };
+
+    let data_frame = {
+        let mut frame = vec![0x00, 0x00, 0x00, 0x00, 0x04];
+        frame.extend_from_slice(b"pong");
+        frame
+    };
+    let t1 = build_trailer_frame(&HashMap::from([(
+        "grpc-status".to_string(),
+        "0".to_string(),
+    )]));
+    let t2 = build_trailer_frame(&HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "a".to_string()),
+    ]));
+
+    // Multiple contiguous trailer frames at EOS truncate once to the data prefix.
+    let mut body = data_frame.clone();
+    body.extend_from_slice(&t1);
+    body.extend_from_slice(&t2);
+    assert!(truncate_trailing_trailer_frames_for_test(&mut body));
+    assert_eq!(body, data_frame);
+
+    // Trailer interspersed before a final data frame is not a trailer suffix.
+    let mut body = t1.clone();
+    body.extend_from_slice(&data_frame);
+    let original = body.clone();
+    assert!(!truncate_trailing_trailer_frames_for_test(&mut body));
+    assert_eq!(body, original);
+
+    // data + trailer + data: no contiguous trailer suffix at EOS.
+    let mut body = data_frame.clone();
+    body.extend_from_slice(&t1);
+    body.extend_from_slice(&data_frame);
+    let original = body.clone();
+    assert!(!truncate_trailing_trailer_frames_for_test(&mut body));
+    assert_eq!(body, original);
+
+    // Malformed: declared length overruns the buffer — leave bytes untouched.
+    let mut body = vec![GRPC_FRAME_TRAILER, 0x00, 0x00, 0x00, 0x10, 0x01];
+    let original = body.clone();
+    assert!(!truncate_trailing_trailer_frames_for_test(&mut body));
+    assert_eq!(body, original);
+
+    // Large synthetic sequence: many data frames then two trailer frames.
+    let mut body = Vec::new();
+    for i in 0..64u8 {
+        body.push(0x00);
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.push(i);
+    }
+    let prefix_len = body.len();
+    body.extend_from_slice(&t1);
+    body.extend_from_slice(&t2);
+    assert!(truncate_trailing_trailer_frames_for_test(&mut body));
+    assert_eq!(body.len(), prefix_len);
+}
+
+#[test]
+fn test_sync_trailer_frame_short_circuits_when_already_identical() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use ferrum_edge::_test_support::build_trailer_frame;
+
+    let trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "abc".to_string()),
+    ]);
+    let mut binary = vec![0x00, 0x00, 0x00, 0x00, 0x04];
+    binary.extend_from_slice(b"pong");
+    binary.extend(build_trailer_frame(&trailers));
+
+    // Text mode: unchanged trailer suffix must keep the original base64 bytes.
+    let mut text_body = BASE64.encode(&binary).into_bytes();
+    let original_text = text_body.clone();
+    assert!(
+        ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut text_body,
+            Some("application/grpc-web-text"),
+            &trailers,
+            Some(200),
+        )
+    );
+    assert_eq!(
+        text_body, original_text,
+        "identical trailer suffix must short-circuit without re-encoding"
+    );
+
+    // Changed metadata must rebuild (and re-encode in text mode).
+    let mut changed = trailers.clone();
+    changed.insert("request-id".to_string(), "mutated".to_string());
+    assert!(
+        ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut text_body,
+            Some("application/grpc-web-text"),
+            &changed,
+            Some(200),
+        )
+    );
+    assert_ne!(text_body, original_text);
+    let decoded = BASE64.decode(&text_body).expect("valid text body");
+    let payload = trailing_grpc_web_trailer_payload(&decoded);
+    assert!(payload.contains("request-id: mutated\r\n"));
+}
+
+/// Mesh-mTLS translated path must discard trailer-only names from initial
+/// headers after syncing the body trailer frame (H1/H2/H3 parity).
+#[test]
+fn test_mesh_sync_then_discard_matches_h2_parity() {
+    let mut response_headers = HashMap::from([
+        (
+            "content-type".to_string(),
+            "application/grpc-web".to_string(),
+        ),
+        ("x-initial".to_string(), "keep".to_string()),
+        ("x-shared".to_string(), "initial-value".to_string()),
+        ("request-id".to_string(), "trailer-only".to_string()),
+        ("grpc-status".to_string(), "0".to_string()),
+    ]);
+    let mut trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "trailer-only".to_string()),
+        ("x-shared".to_string(), "trailer-value".to_string()),
+    ]);
+
+    let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x04];
+    body.extend_from_slice(b"pong");
+    body.extend(ferrum_edge::_test_support::build_trailer_frame(
+        &response_headers,
+    ));
+
+    assert!(
+        ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut body,
+            Some("application/grpc-web"),
+            &trailers,
+            Some(200),
+        )
+    );
+    ferrum_edge::_test_support::discard_grpc_application_trailers_after_body_rewrite_for_test(
+        &mut response_headers,
+        &mut trailers,
+        &["x-shared"],
+    );
+
+    assert_eq!(
+        response_headers.get("x-initial").map(String::as_str),
+        Some("keep")
+    );
+    assert_eq!(
+        response_headers.get("x-shared").map(String::as_str),
+        Some("initial-value"),
+        "shadowed initial-header collision must be preserved"
+    );
+    assert!(
+        !response_headers.contains_key("request-id"),
+        "trailer-only custom metadata must leave initial headers after mesh sync"
+    );
+    assert_eq!(
+        response_headers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "reserved terminal metadata remains until finalize"
+    );
+    assert_eq!(trailers.get("grpc-status").map(String::as_str), Some("0"));
+    assert!(!trailers.contains_key("request-id"));
+    assert!(!trailers.contains_key("x-shared"));
+
+    let payload = trailing_grpc_web_trailer_payload(&body);
+    assert!(payload.contains("request-id: trailer-only\r\n"));
+    assert!(payload.contains("x-shared: trailer-value\r\n"), "{payload}");
+}
+
+/// Inverse of [`test_sync_before_discard_preserves_custom_trailers_on_framed_body`]:
+/// discard-then-sync on a framed body is the exact H3 provenance-loss shape.
+#[test]
+fn test_discard_before_sync_on_framed_body_drops_custom_trailers() {
+    let backend_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    let backend_trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "abc-123\nabc-456".to_string()),
+        ("trace-proto-bin".to_string(), "AQID".to_string()),
+    ]);
+    let (mut plugin_view, shadowed) =
+        grpc_proxy::build_grpc_plugin_header_view(&backend_headers, &backend_trailers);
+    plugin_view.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+
+    let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x04];
+    body.extend_from_slice(b"pong");
+    body.extend(ferrum_edge::_test_support::build_trailer_frame(
+        &plugin_view,
+    ));
+
+    let mut wire_trailers = backend_trailers;
+    ferrum_edge::_test_support::discard_grpc_application_trailers_after_body_rewrite_for_test(
+        &mut plugin_view,
+        &mut wire_trailers,
+        &[],
+    );
+    grpc_proxy::reconcile_grpc_trailers_from_view(
+        &mut wire_trailers,
+        &plugin_view,
+        &backend_headers,
+        &shadowed,
+        None,
+    );
+    assert!(
+        ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut body,
+            Some("application/grpc-web"),
+            &wire_trailers,
+            Some(200),
+        )
+    );
+    let payload = trailing_grpc_web_trailer_payload(&body);
+    assert!(
+        payload.contains("grpc-status: 0\r\n"),
+        "reserved status must remain: {payload}"
+    );
+    assert!(
+        !payload.contains("request-id"),
+        "discard-before-sync must demonstrate custom-trailer loss on framed bodies: {payload}"
+    );
+    assert!(
+        !payload.contains("trace-proto-bin"),
+        "discard-before-sync must demonstrate binary-trailer loss on framed bodies: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn test_transform_policy_set_preserves_backend_trailer_in_body_frame() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": true,
+            "set": { "X-Policy": "gateway-enforced" }
+        }))
+        .unwrap(),
+    );
+    let payload = grpc_web_body_frame_after_policy_hooks(
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]),
+        HashMap::from([
+            ("grpc-status".to_string(), "0".to_string()),
+            ("x-policy".to_string(), "application-value".to_string()),
+        ]),
+        &[policy],
+    )
+    .await;
+    assert!(
+        payload.contains("x-policy: application-value\r\n"),
+        "policy set/override must preserve the backend trailer in the body frame: {payload}"
+    );
+    assert!(
+        !payload.contains("gateway-enforced"),
+        "policy value must not replace the body-framed trailer: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn test_transform_policy_removal_suppresses_body_framed_trailer() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "set": {},
+            "remove": ["X-Trailer-Only"]
+        }))
+        .unwrap(),
+    );
+    let payload = grpc_web_body_frame_after_policy_hooks(
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]),
+        HashMap::from([
+            ("grpc-status".to_string(), "0".to_string()),
+            ("x-trailer-only".to_string(), "backend-trailer".to_string()),
+        ]),
+        &[policy],
+    )
+    .await;
+    assert!(
+        !payload.contains("x-trailer-only"),
+        "final policy removal must suppress the body-framed trailer: {payload}"
+    );
+    assert!(payload.contains("grpc-status: 0"));
+}
+
+#[tokio::test]
+async fn test_transform_later_rewrite_wins_over_initial_header_policy_in_body_frame() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": false,
+            "set": { "X-Policy": "gateway-policy" }
+        }))
+        .unwrap(),
+    );
+    let later_mutator: Arc<dyn Plugin> = Arc::new(
+        ferrum_edge::plugins::response_transformer::ResponseTransformer::new(&json!({
+            "rules": [{
+                "operation": "update",
+                "target": "header",
+                "key": "X-Policy",
+                "value": "later-transformer"
+            }]
+        }))
+        .unwrap(),
+    );
+    let payload = grpc_web_body_frame_after_policy_hooks(
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]),
+        HashMap::from([
+            ("grpc-status".to_string(), "0".to_string()),
+            ("x-policy".to_string(), "backend-trailer".to_string()),
+        ]),
+        &[policy, later_mutator],
+    )
+    .await;
+    assert!(
+        payload.contains("x-policy: later-transformer\r\n"),
+        "a later genuine rewrite must win in the body frame: {payload}"
+    );
+    assert!(!payload.contains("backend-trailer"));
+    assert!(!payload.contains("gateway-policy"));
+}
+
+#[tokio::test]
+async fn test_transform_policy_set_preserves_shadowed_collision_trailer_in_body_frame() {
+    let policy: Arc<dyn Plugin> = Arc::new(
+        SecurityHeaders::new(&json!({
+            "override_existing": true,
+            "set": { "X-Shared-Meta": "gateway-enforced" }
+        }))
+        .unwrap(),
+    );
+    let payload = grpc_web_body_frame_after_policy_hooks(
+        HashMap::from([
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("x-shared-meta".to_string(), "initial-value".to_string()),
+        ]),
+        HashMap::from([
+            ("grpc-status".to_string(), "0".to_string()),
+            ("x-shared-meta".to_string(), "trailer-value".to_string()),
+        ]),
+        &[policy],
+    )
+    .await;
+    assert!(
+        payload.contains("x-shared-meta: trailer-value\r\n"),
+        "same-name initial/trailer collision must keep the backend trailer: {payload}"
+    );
+    assert!(!payload.contains("initial-value"));
+    assert!(!payload.contains("gateway-enforced"));
+}
+
+/// Owner-staged context plus the compatibility header view for the shadowed
+/// `x-shared-meta` collision fixture. Fresh per scenario: response translation
+/// is exactly-once per RequestContext under multi-instance ownership.
+async fn owner_staged_shadowed_trailer_fixture(
+    plugin: &std::sync::Arc<dyn Plugin>,
+) -> (
+    ferrum_edge::plugins::RequestContext,
+    HashMap<String, String>,
+) {
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+
+    let mut initial_headers = HashMap::new();
+    initial_headers.insert("x-shared-meta".to_string(), "initial-value".to_string());
+    let mut trailers = HashMap::new();
+    trailers.insert("grpc-status".to_string(), "0".to_string());
+    trailers.insert("x-shared-meta".to_string(), "trailer-value".to_string());
+    ferrum_edge::plugins::grpc_web::record_backend_trailer_provenance_for_frame(
+        &mut ctx.metadata,
+        &initial_headers,
+        &trailers,
+    );
+
+    let mut merged_view = initial_headers;
+    merged_view.insert(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    );
+    merged_view.insert("grpc-status".to_string(), "0".to_string());
+    (ctx, merged_view)
+}
+
+#[tokio::test]
+async fn test_transform_with_provenance_uses_true_shadowed_trailer_value() {
+    let plugin = create_plugin_default();
+
+    // Untouched compatibility view recovers the true shadowed trailer value.
+    let (mut ctx, merged_view) = owner_staged_shadowed_trailer_fixture(&plugin).await;
+    let output = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"",
+            Some("application/grpc-web"),
+            &merged_view,
+        )
+        .await
+        .expect("transform");
+    let payload = grpc_web_trailer_payload(&output);
+    assert!(payload.contains("x-shared-meta: trailer-value\r\n"));
+    assert!(!payload.contains("x-shared-meta: initial-value\r\n"));
+
+    // Later genuine rewrite wins on a fresh owner-staged request context.
+    let (mut ctx, mut merged_view) = owner_staged_shadowed_trailer_fixture(&plugin).await;
+    merged_view.insert("x-shared-meta".to_string(), "sanitized".to_string());
+    let output = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"",
+            Some("application/grpc-web"),
+            &merged_view,
+        )
+        .await
+        .expect("sanitized transform");
+    let payload = grpc_web_trailer_payload(&output);
+    assert!(payload.contains("x-shared-meta: sanitized\r\n"));
+    assert!(!payload.contains("trailer-value"));
+
+    // Later removal stays removed on a fresh owner-staged request context.
+    let (mut ctx, mut merged_view) = owner_staged_shadowed_trailer_fixture(&plugin).await;
+    merged_view.remove("x-shared-meta");
+    let output = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"",
+            Some("application/grpc-web"),
+            &merged_view,
+        )
+        .await
+        .expect("removed transform");
+    let payload = grpc_web_trailer_payload(&output);
+    assert!(!payload.contains("x-shared-meta"));
+}
+
+#[tokio::test]
+async fn test_transform_missing_collision_provenance_fails_closed() {
+    let plugin = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    plugin.on_request_received(&mut ctx).await;
+
+    let initial_headers =
+        HashMap::from([("x-shared-meta".to_string(), "initial-secret".to_string())]);
+    let trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("x-shared-meta".to_string(), "trailer-value".to_string()),
+    ]);
+    ferrum_edge::plugins::grpc_web::record_backend_trailer_provenance_for_frame(
+        &mut ctx.metadata,
+        &initial_headers,
+        &trailers,
+    );
+    ctx.metadata.remove("grpc_web_shadowed_trailers");
+
+    let response_headers = HashMap::from([
+        (
+            "content-type".to_string(),
+            "application/grpc-web".to_string(),
+        ),
+        ("grpc-status".to_string(), "0".to_string()),
+        ("x-shared-meta".to_string(), "initial-secret".to_string()),
+    ]);
+    let output = plugin
+        .transform_response_body_with_context(
+            &mut ctx,
+            b"",
+            Some("application/grpc-web"),
+            &response_headers,
+        )
+        .await
+        .expect("transform");
+    let payload = grpc_web_trailer_payload(&output);
+    assert!(payload.contains("grpc-status: 0"));
+    assert!(
+        !payload.contains("x-shared-meta"),
+        "missing collision provenance must not frame an initial header: {payload}"
+    );
+}
+
+#[test]
+fn test_mesh_bridge_promotion_strips_value_bearing_internal_headers() {
+    let trailers = HashMap::from([("x-shared-meta".to_string(), "trailer-secret".to_string())]);
+    let mut response_headers =
+        HashMap::from([("x-shared-meta".to_string(), "initial-secret".to_string())]);
+    ferrum_edge::plugins::grpc_web::bridge_backend_trailer_provenance_for_frame(
+        &mut response_headers,
+        &trailers,
+    );
+
+    let mut metadata = HashMap::new();
+    ferrum_edge::plugins::grpc_web::promote_bridged_trailer_provenance(
+        &mut metadata,
+        &mut response_headers,
+    );
+
+    assert!(!response_headers.contains_key("x-ferrum-grpc-web-trailer-names"));
+    assert!(!response_headers.contains_key("x-ferrum-grpc-web-shadowed-trailers"));
+    assert!(metadata.contains_key("grpc_web_trailer_names"));
+    assert!(metadata.contains_key("grpc_web_shadowed_trailers"));
+}
+
+#[test]
+fn test_capture_bridged_trailer_split_fails_closed_on_corrupt_shadowed_payload() {
+    let mut response_headers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("x-shared-meta".to_string(), "initial-secret".to_string()),
+        ("request-id".to_string(), "trailer-only".to_string()),
+    ]);
+    let trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("x-shared-meta".to_string(), "trailer-secret".to_string()),
+        ("request-id".to_string(), "trailer-only".to_string()),
+    ]);
+    ferrum_edge::plugins::grpc_web::bridge_backend_trailer_provenance_for_frame(
+        &mut response_headers,
+        &trailers,
+    );
+    // Corrupt the collision payload while leaving trailer-name provenance intact.
+    response_headers.insert(
+        "x-ferrum-grpc-web-shadowed-trailers".to_string(),
+        "not-valid-base64!!!".to_string(),
+    );
+
+    let split =
+        ferrum_edge::plugins::grpc_web::capture_bridged_trailer_split_for_policy(&response_headers)
+            .expect("names provenance still present");
+
+    assert_eq!(
+        split.trailers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "reserved terminal metadata survives fail-closed capture"
+    );
+    assert!(
+        !split.trailers.contains_key("x-shared-meta"),
+        "corrupt collision payload must not substitute the initial-header value as a trailer"
+    );
+    assert!(
+        !split.trailers.contains_key("request-id"),
+        "application trailers are suppressed when collision provenance is corrupt"
+    );
+    assert!(split.shadowed_keys.is_empty());
+    assert!(
+        !split.initial_headers.contains_key("x-shared-meta"),
+        "listed trailer names are removed from the initial view under fail-closed"
+    );
+    assert!(!split.initial_headers.contains_key("request-id"));
+}
+
+#[test]
 fn test_build_trailer_frame_missing_status_defaults_to_unknown() {
     use ferrum_edge::_test_support::{GRPC_FRAME_TRAILER, build_trailer_frame};
     let headers = HashMap::new();
@@ -1918,4 +2815,313 @@ async fn test_spoofed_mode_header_cannot_mark_request_translated() {
     let _ = plugin.on_request_received(&mut ctx).await;
     assert!(!request_is_grpc_web_translated(&ctx));
     assert!(!ctx.headers.contains_key("x-grpc-web-mode"));
+}
+
+// ── Multi-instance ownership (issue #2503) ──
+
+fn count_grpc_web_trailer_frames(body: &[u8]) -> usize {
+    use ferrum_edge::_test_support::{GRPC_FRAME_TRAILER, parse_grpc_frames};
+    parse_grpc_frames(body)
+        .into_iter()
+        .filter(|(flag, _)| *flag == GRPC_FRAME_TRAILER || *flag == 0x81)
+        .count()
+}
+
+async fn run_two_instance_response_chain(
+    first: &std::sync::Arc<dyn Plugin>,
+    second: &std::sync::Arc<dyn Plugin>,
+    request_ct: &str,
+    backend_body: &[u8],
+) -> (HashMap<String, String>, Vec<u8>) {
+    let mut ctx = create_grpc_web_context(request_ct);
+    assert!(matches!(
+        first.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+
+    let mut outgoing = HashMap::new();
+    assert!(matches!(
+        first.before_proxy(&mut ctx, &mut outgoing).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second.before_proxy(&mut ctx, &mut outgoing).await,
+        PluginResult::Continue
+    ));
+    // Only the owner plants shared request staging.
+    assert_eq!(
+        outgoing.get("x-grpc-web-mode").map(String::as_str),
+        Some(if request_ct.contains("grpc-web-text") {
+            "text"
+        } else {
+            "binary"
+        })
+    );
+
+    let mut response_headers =
+        HashMap::from([("content-type".to_string(), "application/grpc".to_string())]);
+    response_headers.insert("grpc-status".to_string(), "0".to_string());
+    assert!(matches!(
+        first
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        second
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut body = backend_body.to_vec();
+    for plugin in [first, second] {
+        if let Some(next) = plugin
+            .transform_response_body_with_context(
+                &mut ctx,
+                &body,
+                response_headers.get("content-type").map(String::as_str),
+                &response_headers,
+            )
+            .await
+        {
+            body = next;
+        }
+    }
+    (response_headers, body)
+}
+
+#[tokio::test]
+async fn test_two_instances_binary_translate_once_and_union_expose_headers() {
+    let first = create_plugin("grpc_web", &json!({"expose_headers": ["x-request-id"]}))
+        .unwrap()
+        .unwrap();
+    let second = create_plugin("grpc_web", &json!({"expose_headers": ["x-trace-id"]}))
+        .unwrap()
+        .unwrap();
+
+    let mut data = vec![0x00u8];
+    data.extend_from_slice(&5u32.to_be_bytes());
+    data.extend_from_slice(b"hello");
+
+    let (headers, output) =
+        run_two_instance_response_chain(&first, &second, "application/grpc-web", &data).await;
+
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/grpc-web")
+    );
+    assert_eq!(count_grpc_web_trailer_frames(&output), 1);
+    assert_eq!(&output[..10], &data[..]);
+    assert_eq!(output[10], 0x80);
+
+    let expose = headers
+        .get("access-control-expose-headers")
+        .expect("expose headers");
+    assert!(expose.contains("x-request-id"), "got {expose}");
+    assert!(expose.contains("x-trace-id"), "got {expose}");
+    assert!(expose.contains("grpc-status"), "got {expose}");
+}
+
+#[tokio::test]
+async fn test_two_instances_text_decode_and_encode_exactly_once() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+
+    let first = create_plugin("grpc_web", &json!({"expose_headers": ["x-a"]}))
+        .unwrap()
+        .unwrap();
+    let second = create_plugin("grpc_web", &json!({"expose_headers": ["x-b"]}))
+        .unwrap()
+        .unwrap();
+    assert!(first.needs_final_request_body_context());
+    assert!(second.needs_final_request_body_context());
+
+    let mut ctx = create_grpc_web_context("application/grpc-web-text");
+    first.on_request_received(&mut ctx).await;
+    second.on_request_received(&mut ctx).await;
+    assert_eq!(
+        ctx.metadata.get("grpc_web_mode").map(String::as_str),
+        Some("text")
+    );
+    assert!(ctx.metadata.contains_key("grpc_web.owner"));
+
+    let mut grpc_frame = vec![0x00u8];
+    grpc_frame.extend_from_slice(&5u32.to_be_bytes());
+    grpc_frame.extend_from_slice(b"hello");
+    let encoded = BASE64.encode(&grpc_frame);
+
+    let mut outgoing = HashMap::new();
+    first.before_proxy(&mut ctx, &mut outgoing).await;
+    second.before_proxy(&mut ctx, &mut outgoing).await;
+
+    let mut body = encoded.into_bytes();
+    for plugin in [&first, &second] {
+        if let Some(next) = plugin
+            .transform_request_body_with_context(
+                &mut ctx,
+                &body,
+                Some("application/grpc"),
+                &outgoing,
+            )
+            .await
+        {
+            body = next;
+        }
+    }
+    assert_eq!(body, grpc_frame);
+    assert_eq!(
+        ctx.metadata
+            .get("grpc_web.request_decoded")
+            .map(String::as_str),
+        ctx.metadata.get("grpc_web.owner").map(String::as_str)
+    );
+
+    for plugin in [&first, &second] {
+        assert!(matches!(
+            plugin
+                .on_final_request_body_with_context(&mut ctx, &outgoing, &body)
+                .await,
+            PluginResult::Continue
+        ));
+    }
+
+    let mut data = vec![0x00u8];
+    data.extend_from_slice(&3u32.to_be_bytes());
+    data.extend_from_slice(b"abc");
+    let (headers, output) =
+        run_two_instance_response_chain(&first, &second, "application/grpc-web-text", &data).await;
+
+    // Fresh chain above re-claims; for the response-only assertion reuse the
+    // already-translated output path from this helper call.
+    let decoded = BASE64.decode(&output).expect("single base64 layer");
+    assert_eq!(count_grpc_web_trailer_frames(&decoded), 1);
+    assert_eq!(&decoded[..8], &data[..]);
+    let expose = headers
+        .get("access-control-expose-headers")
+        .expect("expose headers");
+    assert!(
+        expose.contains("x-a") && expose.contains("x-b"),
+        "got {expose}"
+    );
+}
+
+#[tokio::test]
+async fn test_two_instances_priority_order_first_owner_wins() {
+    // Simulate distinct priority_override ordering: lower effective priority
+    // runs first and must own translation; the later instance only unions
+    // expose_headers.
+    let early = create_plugin("grpc_web", &json!({"expose_headers": ["x-early"]}))
+        .unwrap()
+        .unwrap();
+    let late = create_plugin("grpc_web", &json!({"expose_headers": ["x-late"]}))
+        .unwrap()
+        .unwrap();
+
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    early.on_request_received(&mut ctx).await;
+    let owner = ctx
+        .metadata
+        .get("grpc_web.owner")
+        .cloned()
+        .expect("early instance claims ownership");
+    late.on_request_received(&mut ctx).await;
+    assert_eq!(
+        ctx.metadata.get("grpc_web.owner").map(String::as_str),
+        Some(owner.as_str()),
+        "later instance must not overwrite the owner marker"
+    );
+
+    let (headers, output) =
+        run_two_instance_response_chain(&early, &late, "application/grpc-web+proto", &[]).await;
+    assert_eq!(count_grpc_web_trailer_frames(&output), 1);
+    let expose = headers
+        .get("access-control-expose-headers")
+        .expect("expose headers");
+    assert!(expose.contains("x-early"), "got {expose}");
+    assert!(expose.contains("x-late"), "got {expose}");
+}
+
+#[tokio::test]
+async fn test_follower_fails_closed_without_owner_staging_on_response_transform() {
+    let owner = create_plugin_default();
+    let follower = create_plugin("grpc_web", &json!({"expose_headers": ["x-follower"]}))
+        .unwrap()
+        .unwrap();
+
+    let mut ctx = create_grpc_web_context("application/grpc-web");
+    owner.on_request_received(&mut ctx).await;
+    // Corrupt shared mode staging while leaving ownership intact — owner must
+    // refuse speculative translation rather than invent frames from CT alone.
+    ctx.metadata
+        .insert("grpc_web_mode".to_string(), "not-a-mode".to_string());
+    // Clear the namespaced per-instance mode key as well.
+    let owner_id = ctx.metadata.get("grpc_web.owner").cloned().unwrap();
+    ctx.metadata
+        .remove(&format!("grpc_web.instance.{owner_id}.mode"));
+
+    let response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web".to_string(),
+    )]);
+    assert!(
+        owner
+            .transform_response_body_with_context(
+                &mut ctx,
+                b"",
+                Some("application/grpc-web"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "malformed mode staging must fail closed"
+    );
+    assert!(
+        follower
+            .transform_response_body_with_context(
+                &mut ctx,
+                b"",
+                Some("application/grpc-web"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "non-owner must never translate the response body"
+    );
+}
+
+#[tokio::test]
+async fn test_owner_requires_namespaced_mode_even_when_shared_mode_is_valid() {
+    let owner = create_plugin_default();
+    let mut ctx = create_grpc_web_context("application/grpc-web-text");
+    owner.on_request_received(&mut ctx).await;
+
+    let owner_id = ctx.metadata.get("grpc_web.owner").cloned().unwrap();
+    ctx.metadata
+        .remove(&format!("grpc_web.instance.{owner_id}.mode"));
+    assert_eq!(
+        ctx.metadata.get("grpc_web_mode").map(String::as_str),
+        Some("text")
+    );
+
+    let response_headers = HashMap::from([(
+        "content-type".to_string(),
+        "application/grpc-web-text".to_string(),
+    )]);
+    assert!(
+        owner
+            .transform_response_body_with_context(
+                &mut ctx,
+                b"",
+                Some("application/grpc-web-text"),
+                &response_headers,
+            )
+            .await
+            .is_none(),
+        "owner must not fall back to shared mode after losing its namespaced staging"
+    );
 }

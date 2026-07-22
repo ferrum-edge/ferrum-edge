@@ -32,7 +32,7 @@ A comprehensive feature list for Ferrum Edge.
 - **Host-only routing** — HTTP proxies can match purely on `hosts` with no `listen_path`. A host-only proxy serves any path under the configured host. Per-host matching order: exact path → prefix path → regex path → host-only fallback.
 - Pre-sorted route table with bounded O(1) path cache, rebuilt atomically on config changes
 - Configurable path stripping and backend path prefixing
-- Per-proxy HTTP method filtering (`allowed_methods`) with 405 Method Not Allowed responses
+- Per-proxy HTTP method filtering (`allowed_methods`) with 405 Method Not Allowed responses and terminal transaction logging (`rejection_phase: allowed_methods`)
 - Per-proxy WebSocket Origin validation (`allowed_ws_origins`) for CSWSH protection (RFC 6455 §10.2)
 
 ## Load Balancing
@@ -104,7 +104,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **HMAC** — request signature verification with body integrity protection via Digest header (RFC 9421 / RFC 3230)
 - **JWKS Auth** — multi-provider JWKS JWT validation with claim-based authorization, optional mTLS certificate binding, DPoP proof checks, and claim header fan-out
 - **LDAP Auth** — LDAP directory authentication via direct bind or search-then-bind with optional AD group filtering
-- **SOAP WS-Security** — WS-Security header validation with UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certs with enveloped-signature transform, Issuer/NotBefore/NotOnOrAfter/Audience checks, Subject NameID exported as `soap_ws_saml_subject`), timestamp freshness, and nonce replay protection
+- **SOAP WS-Security** — WS-Security header validation with UsernameToken (PasswordText/PasswordDigest), X.509 signature verification, SAML 2.0 assertion validation (XMLDSIG signature verification against trusted IdP signing certs with enveloped-signature transform, Issuer/NotBefore/NotOnOrAfter/Audience checks, Subject NameID exported as `soap_ws_saml_subject`), timestamp freshness, and nonce replay protection; SOAP bodies are decoded from UTF-8 / UTF-16LE / UTF-16BE (BOM + charset) before validation while preserving original wire bytes
 
 ### Authorization & Security Plugins
 
@@ -127,7 +127,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 - **Request Deduplication** — idempotency key-based deduplication for POST/PUT/PATCH requests with local in-memory and centralized Redis storage backends
 - **Fault Injection** — probabilistic HTTP/gRPC aborts and latency injection plus stream connect rejection/delay for chaos testing, with per-instance counters so proxy/group scopes stay independent
 - **GraphQL** — query depth/complexity limiting, alias limiting, introspection control, per-operation rate limiting
-- **gRPC-Web** — bidirectional protocol translation between gRPC-Web (browser) and native gRPC (HTTP/2), supporting binary and base64 text encoding modes with trailer frame embedding; response media type is negotiated from `Accept` (with q-values/wildcards, message-format suffix preservation, and fail-closed refusal when Accept is malformed or fully unacceptable)
+- **gRPC-Web** — bidirectional protocol translation between gRPC-Web (browser) and native gRPC (HTTP/2), supporting binary and base64 text encoding modes with trailer frame embedding of `grpc-status`, binary `*-bin` metadata, and valid ASCII custom trailing metadata (hop-by-hop / forbidden / invalid fields excluded); response media type is negotiated from `Accept` (with q-values/wildcards, message-format suffix preservation, and fail-closed refusal when Accept is malformed or fully unacceptable)
 - **gRPC Method Router** — per-method access control (allow/deny lists) and per-method rate limiting with metadata enrichment
 - **gRPC Deadline** — `grpc-timeout` enforcement, default injection, max capping, and gateway processing time subtraction
 

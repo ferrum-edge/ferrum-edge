@@ -3986,6 +3986,8 @@ where
         {
             Ok(Some(b)) => b,
             Ok(None) => {
+                // Default writer emits HEADERS then STOP_SENDING; do not reverse
+                // that order with a pre-write halt (would duplicate STOP_SENDING).
                 release_cross_protocol_circuit_breaker_probe_on_admission_reject(
                     state,
                     proxy,
@@ -4033,7 +4035,12 @@ where
                     current_cb_target_key.as_deref(),
                     cb_retry_probe_slot_available,
                 );
-                return write_grpc_error_for_request(
+                // Request-aware writer with halt_recv=false: mid-recv_data cancel
+                // leaves h3-quinn's recv slot None, so STOP_SENDING would
+                // unwrap-abort under panic=abort. Quinn Drop still stops the peer
+                // when the stream is released. Keep gRPC-Web trailer-frame shaping
+                // via ctx, and bound the terminal write with the shared grace.
+                let write = write_grpc_error_for_request_with_recv_halt(
                     stream,
                     ctx,
                     grpc_proxy::grpc_status::DEADLINE_EXCEEDED,
@@ -4041,8 +4048,38 @@ where
                     backend_start,
                     0,
                     initial_response_header_policy_plugins,
+                    false,
+                );
+                return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                    write,
                 )
-                .await;
+                .await
+                {
+                    Ok(outcome) => Ok(outcome),
+                    Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                        // Client reset the response half after rejection was
+                        // selected — keep accounting rather than dropping the
+                        // already-rejected request as a bare transport Err.
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            StatusCode::OK.as_u16(),
+                            0,
+                            backend_start,
+                            0,
+                            true,
+                        ))
+                    }
+                    Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                        crate::http3::stream_util::abort_response_stream(stream);
+                        Ok(terminal_deadline_write_aborted_outcome(
+                            StatusCode::OK.as_u16(),
+                            0,
+                            backend_start,
+                            0,
+                            false,
+                        ))
+                    }
+                };
             }
             Err(super::server::H3RequestBodyReadError::DeadlineExceeded) => {
                 ctx.mark_gateway_deadline_response_selected();
@@ -4076,6 +4113,7 @@ where
                 )
                 .await;
                 outcome.rejection_logged = true;
+                // Do not STOP_SENDING here: the drain was cancelled mid-recv_data.
                 return Ok(outcome);
             }
         }
@@ -4418,6 +4456,17 @@ where
                     &resp.headers,
                     &resp.trailers,
                 );
+            // Same gRPC-Web trailer-frame provenance as the H1/H2 buffered path:
+            // record backend trailer names and collision values so the body
+            // frame neither copies initial-header-only fields nor substitutes
+            // an initial value for a same-name backend trailer.
+            if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) {
+                crate::plugins::grpc_web::record_backend_trailer_provenance_for_frame(
+                    &mut ctx.metadata,
+                    &resp.headers,
+                    &resp.trailers,
+                );
+            }
             let mut authoritative_trailers_only_terminal_metadata = (resp.body.is_empty()
                 && resp.trailers.is_empty())
             .then(|| {
@@ -4461,9 +4510,11 @@ where
             } else {
                 None
             };
-            let mut buffered_initial_response_header_policy_state =
-                ctx.take_buffered_initial_response_header_policy();
+            // Keep policy state on `ctx` through body transforms so gRPC-Web
+            // trailer framing sees BufferedInitialResponseHeaderPolicyState
+            // outcomes; take it after transform for wire reconciliation.
             if let Some(reject) = after_proxy_reject {
+                let _ = ctx.take_buffered_initial_response_header_policy();
                 let reject_status = reject.status_code;
                 let mut outcome = match write_final_body_reject(
                     stream,
@@ -4578,12 +4629,9 @@ where
                     // Same ordering contract as the transform phase below: the
                     // decode-only normalize rewrite must not let the trailer
                     // retirement masquerade as a policy-owned header removal.
-                    if let Some(policy_state) =
-                        buffered_initial_response_header_policy_state.as_mut()
-                    {
-                        Arc::make_mut(policy_state)
-                            .record_later_response_header_mutations(&mut plugin_response_headers);
-                    }
+                    ctx.record_buffered_initial_response_header_later_mutations(
+                        &mut plugin_response_headers,
+                    );
                     crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
                         &mut plugin_response_headers,
                         &mut response_trailers,
@@ -4637,12 +4685,17 @@ where
                             &mut response_trailers,
                             &mut authoritative_trailers_only_terminal_metadata,
                         );
-                        buffered_initial_response_header_policy_state = None;
+                        let _ = ctx.take_buffered_initial_response_header_policy();
                         response_body_rejected = true;
                         break;
                     }
                 }
             }
+            // Capture normalize / inspect header mutations before gRPC-Web
+            // frames trailers from the live compatibility view.
+            ctx.record_buffered_initial_response_header_later_mutations(
+                &mut plugin_response_headers,
+            );
             // A response-body transform like grpc_web reads the gRPC status from
             // the headers map it is handed. The merged view already carries the
             // gRPC trailers (grpc-status / grpc-message and any trailer-only
@@ -4682,7 +4735,7 @@ where
                     &mut response_trailers,
                     &mut authoritative_trailers_only_terminal_metadata,
                 );
-                buffered_initial_response_header_policy_state = None;
+                let _ = ctx.take_buffered_initial_response_header_policy();
                 terminal_metadata_is_body_framed |= grpc_web_response_content_type.is_some();
                 response_body_rejected = true;
             }
@@ -4727,6 +4780,7 @@ where
                                 &mut response_trailers,
                                 &mut authoritative_trailers_only_terminal_metadata,
                             );
+                            let _ = ctx.take_buffered_initial_response_header_policy();
                             terminal_metadata_is_body_framed |=
                                 client_terminal_metadata_is_body_framed;
                             response_body_rejected = true;
@@ -4750,21 +4804,20 @@ where
                     );
                 }
             }
-            // Mirror the main buffered gRPC path: record genuine transform-phase
-            // edits before retiring stale compatibility-view trailers, so a
-            // policy-owned initial header the backend also sent as a trailer is
-            // not mistaken for a later intentional removal.
+            // Mirror the main buffered gRPC path: take policy state for wire
+            // reconciliation and record genuine transform-phase edits before
+            // later trailer retirement. Discarding application trailers here
+            // (before reconcile + gRPC-Web body-frame sync) would leave only
+            // reserved terminal keys and sync would rebuild a sparse frame
+            // that drops ASCII/binary custom metadata on properly framed
+            // H3→H2 bodies.
+            let mut buffered_initial_response_header_policy_state =
+                ctx.take_buffered_initial_response_header_policy();
             if let Some(policy_state) = buffered_initial_response_header_policy_state.as_mut() {
                 Arc::make_mut(policy_state)
                     .record_later_response_header_mutations(&mut plugin_response_headers);
             }
-            if representation_rewritten {
-                crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
-                    &mut plugin_response_headers,
-                    &mut response_trailers,
-                    &header_shadowed_trailer_keys,
-                );
-            }
+            let defer_application_trailer_discard = representation_rewritten;
             if !response_body_rejected {
                 for plugin in plugins.iter() {
                     let result = match crate::plugins::await_grpc_deadline(
@@ -4836,6 +4889,38 @@ where
                 &header_shadowed_trailer_keys,
                 buffered_initial_response_header_policy_state.as_deref(),
             );
+            // Body-framed gRPC-Web trailers must match reconciled wire trailers.
+            if !terminal_metadata_is_body_framed
+                && crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
+            {
+                let http_status = ctx
+                    .metadata
+                    .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
+                    .and_then(|value| value.parse::<u16>().ok());
+                let content_type = plugin_response_headers
+                    .get("content-type")
+                    .map(String::as_str);
+                if crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
+                    &mut response_body,
+                    content_type,
+                    &response_trailers,
+                    http_status,
+                ) {
+                    plugin_response_headers.insert(
+                        "content-length".to_string(),
+                        response_body.len().to_string(),
+                    );
+                }
+            }
+            // Retire compatibility-view application trailers only after the
+            // body frame has been synced from the reconciled map.
+            if defer_application_trailer_discard {
+                crate::proxy::grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+                    &mut plugin_response_headers,
+                    &mut response_trailers,
+                    &header_shadowed_trailer_keys,
+                );
+            }
             // Admission retains the pristine backend status; transaction
             // metadata follows the post-hook status that the H3 client sees.
             crate::proxy::grpc_proxy::refresh_grpc_status_metadata_with_body_framed_terminal(
@@ -4997,7 +5082,11 @@ where
                 }
             }
             if body_completed && !response_trailers.is_empty() {
-                let trailer_map = headers_to_header_map(&response_trailers);
+                // Split LF-joined duplicate metadata before HeaderValue
+                // construction — same native buffered emit path as H2.
+                let trailer_map = crate::proxy::grpc_proxy::buffered_grpc_trailers_to_header_map(
+                    &response_trailers,
+                );
                 let trailer_write = if terminal_gateway_deadline {
                     crate::http3::stream_util::await_terminal_response_write_before_deadline(
                         grpc_deadline_at,
@@ -6435,19 +6524,6 @@ fn collect_reqwest_response_headers(response: &reqwest::Response) -> HashMap<Str
     headers
 }
 
-fn headers_to_header_map(map: &HashMap<String, String>) -> HeaderMap {
-    let mut hmap = HeaderMap::new();
-    for (k, v) in map {
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            hmap.append(name, val);
-        }
-    }
-    hmap
-}
-
 // ---------------------------------------------------------------------------
 // H3 body drain + response writers
 // ---------------------------------------------------------------------------
@@ -6459,17 +6535,9 @@ async fn drain_h3_body<S>(
     max_bytes: usize,
 ) -> Result<Option<Vec<u8>>, h3::error::StreamError>
 where
-    S: RecvStream + SendStream<Bytes>,
+    S: RecvStream,
 {
-    let mut body = Vec::new();
-    while let Some(chunk) = stream.recv_data().await? {
-        let bytes = chunk.chunk();
-        if max_bytes > 0 && body.len() + bytes.len() > max_bytes {
-            return Ok(None);
-        }
-        body.extend_from_slice(bytes);
-    }
-    Ok(Some(body))
+    super::server::drain_h3_request_body(stream, max_bytes).await
 }
 
 async fn send_response_headers<S>(
@@ -6746,6 +6814,30 @@ async fn write_reject_with_headers<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    write_reject_with_headers_and_recv_halt(
+        stream,
+        status,
+        body,
+        headers,
+        backend_start,
+        bytes_sent,
+        true,
+    )
+    .await
+}
+
+async fn write_reject_with_headers_and_recv_halt<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    status: StatusCode,
+    body: &[u8],
+    headers: &HashMap<String, String>,
+    backend_start: Instant,
+    bytes_sent: u64,
+    halt_recv: bool,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
     let mut headers = headers.clone();
     strip_client_response_hop_by_hop_headers(&mut headers);
     let mut resp_builder = Response::builder().status(status);
@@ -6773,7 +6865,9 @@ where
         let _ = stream.send_data(Bytes::copy_from_slice(body)).await;
     }
     let _ = stream.finish().await;
-    crate::http3::stream_util::halt_request_body(stream);
+    if halt_recv {
+        crate::http3::stream_util::halt_request_body(stream);
+    }
     Ok(CrossProtocolOutcome {
         response_status: status.as_u16(),
         response_streamed: false,
@@ -6895,67 +6989,108 @@ where
     .await;
     // Pending committed observers continue on owned state under a post-response
     // bound, while the downstream terminal write remains best-effort: it must
-    // not park forever on exhausted QUIC flow-control credit. Give the complete
-    // HEADERS/DATA/FIN writer one immediate poll after expiry and reset the
-    // stream if any constituent write would block.
+    // not park forever on exhausted QUIC flow-control credit. Already-selected
+    // deadline rejections use the shared post-deadline grace (not the expired
+    // absolute deadline) so HEADERS can become visible without unbounded
+    // retention; grace expiry aborts the send half without STOP_SENDING after
+    // a mid-recv_data cancel.
     let terminal_gateway_deadline = ctx.gateway_deadline_response_selected();
     if let Some(translated) = grpc_web_reject {
-        let write = write_reject_with_headers(
+        if terminal_gateway_deadline {
+            let write = write_reject_with_headers_and_recv_halt(
+                stream,
+                StatusCode::OK,
+                &translated.body,
+                &translated.headers,
+                backend_start,
+                bytes_sent,
+                false,
+            );
+            return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                write,
+            )
+            .await
+            {
+                Ok(outcome) => Ok(outcome),
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    Ok(terminal_deadline_write_aborted_outcome(
+                        StatusCode::OK.as_u16(),
+                        0,
+                        backend_start,
+                        bytes_sent,
+                        true,
+                    ))
+                }
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    Ok(terminal_deadline_write_aborted_outcome(
+                        StatusCode::OK.as_u16(),
+                        0,
+                        backend_start,
+                        bytes_sent,
+                        false,
+                    ))
+                }
+            };
+        }
+        write_reject_with_headers(
             stream,
             StatusCode::OK,
             &translated.body,
             &translated.headers,
             backend_start,
             bytes_sent,
-        );
-        if !terminal_gateway_deadline {
-            return write.await;
-        }
-        match crate::http3::stream_util::await_terminal_response_write_before_deadline(
-            ctx.grpc_deadline_at(),
-            write,
         )
         .await
-        {
-            Ok(outcome) => Ok(outcome),
-            Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
-                crate::http3::stream_util::abort_response_stream(stream);
-                crate::http3::stream_util::halt_request_body(stream);
-                Ok(terminal_deadline_write_aborted_outcome(
-                    StatusCode::OK.as_u16(),
-                    0,
-                    backend_start,
-                    bytes_sent,
-                    true,
-                ))
-            }
-            Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
-                crate::http3::stream_util::abort_response_stream(stream);
-                crate::http3::stream_util::halt_request_body(stream);
-                Ok(terminal_deadline_write_aborted_outcome(
-                    StatusCode::OK.as_u16(),
-                    0,
-                    backend_start,
-                    bytes_sent,
-                    false,
-                ))
-            }
-        }
     } else if matches!(flavor, HttpFlavor::Grpc) {
-        let write = write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent);
-        if !terminal_gateway_deadline {
-            return write.await;
+        if terminal_gateway_deadline {
+            // Send-only: skip STOP_SENDING after mid-recv_data cancel.
+            let write =
+                write_normalized_grpc_reject_send(stream, &normalized, backend_start, bytes_sent);
+            return match crate::http3::stream_util::await_post_deadline_terminal_response_write(
+                write,
+            )
+            .await
+            {
+                Ok(outcome) => Ok(outcome),
+                Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    Ok(terminal_deadline_write_aborted_outcome(
+                        normalized.http_status.as_u16(),
+                        0,
+                        backend_start,
+                        bytes_sent,
+                        true,
+                    ))
+                }
+                Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
+                    crate::http3::stream_util::abort_response_stream(stream);
+                    Ok(terminal_deadline_write_aborted_outcome(
+                        normalized.http_status.as_u16(),
+                        0,
+                        backend_start,
+                        bytes_sent,
+                        false,
+                    ))
+                }
+            };
         }
-        match crate::http3::stream_util::await_terminal_response_write_before_deadline(
-            ctx.grpc_deadline_at(),
-            write,
-        )
-        .await
-        {
+        write_normalized_grpc_reject(stream, &normalized, backend_start, bytes_sent).await
+    } else if terminal_gateway_deadline {
+        let write = write_reject_with_headers_and_recv_halt(
+            stream,
+            normalized.http_status,
+            &normalized.body,
+            &normalized.headers,
+            backend_start,
+            bytes_sent,
+            false,
+        );
+        match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
             Ok(outcome) => Ok(outcome),
             Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
                 crate::http3::stream_util::abort_response_stream(stream);
-                crate::http3::stream_util::halt_request_body(stream);
                 Ok(terminal_deadline_write_aborted_outcome(
                     normalized.http_status.as_u16(),
                     0,
@@ -6966,7 +7101,6 @@ where
             }
             Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
                 crate::http3::stream_util::abort_response_stream(stream);
-                crate::http3::stream_util::halt_request_body(stream);
                 Ok(terminal_deadline_write_aborted_outcome(
                     normalized.http_status.as_u16(),
                     0,
@@ -7162,14 +7296,21 @@ where
     if !ctx.gateway_deadline_response_selected() {
         return write.await;
     }
-    match crate::http3::stream_util::await_terminal_response_write_before_deadline(
-        ctx.grpc_deadline_at(),
-        write,
-    )
-    .await
-    {
+    // Post-deadline send-only reject: use the shared gateway grace so an
+    // immediately-ready status-4 HEADERS can complete, while a Pending
+    // flow-control wait cannot retain the task past the grace.
+    match crate::http3::stream_util::await_post_deadline_terminal_response_write(write).await {
         Ok(outcome) => Ok(outcome),
-        Err(crate::http3::stream_util::H3ResponseWriteError::Write(error)) => Err(error),
+        Err(crate::http3::stream_util::H3ResponseWriteError::Write(_)) => {
+            crate::http3::stream_util::abort_response_stream(stream);
+            Ok(terminal_deadline_write_aborted_outcome(
+                normalized.http_status.as_u16(),
+                0,
+                backend_start,
+                bytes_sent,
+                true,
+            ))
+        }
         Err(crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded) => {
             crate::http3::stream_util::abort_response_stream(stream);
             Ok(terminal_deadline_write_aborted_outcome(
@@ -7268,6 +7409,36 @@ async fn write_grpc_error_for_request<S>(
 where
     S: RecvStream + SendStream<Bytes>,
 {
+    write_grpc_error_for_request_with_recv_halt(
+        stream,
+        ctx,
+        grpc_status,
+        grpc_message,
+        backend_start,
+        bytes_sent,
+        initial_response_header_policy_plugins,
+        true,
+    )
+    .await
+}
+
+/// Request-aware gRPC error writer with explicit recv-half control.
+/// Mid-`recv_data` cancel paths pass `halt_recv=false` so STOP_SENDING cannot
+/// unwrap-abort h3-quinn's empty recv slot under `panic = "abort"`.
+#[allow(clippy::too_many_arguments)]
+async fn write_grpc_error_for_request_with_recv_halt<S>(
+    stream: &mut RequestStream<S, Bytes>,
+    ctx: &mut RequestContext,
+    grpc_status: u32,
+    grpc_message: &str,
+    backend_start: Instant,
+    bytes_sent: u64,
+    initial_response_header_policy_plugins: &[Arc<dyn Plugin>],
+    halt_recv: bool,
+) -> Result<CrossProtocolOutcome, anyhow::Error>
+where
+    S: RecvStream + SendStream<Bytes>,
+{
     if let Some(mut translated) =
         crate::plugins::grpc_web::translated_error_response(ctx, grpc_status, grpc_message)
     {
@@ -7277,26 +7448,39 @@ where
             None,
         );
         crate::proxy::insert_grpc_error_metadata(&mut ctx.metadata, grpc_status, grpc_message);
-        return write_reject_with_headers(
+        return write_reject_with_headers_and_recv_halt(
             stream,
             StatusCode::OK,
             &translated.body,
             &translated.headers,
             backend_start,
             bytes_sent,
+            halt_recv,
         )
         .await;
     }
 
-    write_grpc_error_with_policy(
-        stream,
-        grpc_status,
-        grpc_message,
-        backend_start,
-        bytes_sent,
-        initial_response_header_policy_plugins,
-    )
-    .await
+    if halt_recv {
+        write_grpc_error_with_policy(
+            stream,
+            grpc_status,
+            grpc_message,
+            backend_start,
+            bytes_sent,
+            initial_response_header_policy_plugins,
+        )
+        .await
+    } else {
+        write_grpc_error_send_with_policy(
+            stream,
+            grpc_status,
+            grpc_message,
+            backend_start,
+            bytes_sent,
+            initial_response_header_policy_plugins,
+        )
+        .await
+    }
 }
 
 /// Send-only gRPC error writer: writes the trailers-only gRPC error
