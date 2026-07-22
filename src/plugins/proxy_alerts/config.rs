@@ -586,13 +586,14 @@ fn parse_error_class(common: RuleCommon, raw: &Value) -> Result<ErrorClassRule, 
         })?;
         // Deserialize through ErrorClass's authoritative serde contract so a
         // newly added runtime class cannot drift from proxy_alerts admission.
-        let class = serde_json::from_value::<ErrorClass>(Value::String(name.to_string()))
-            .map_err(|_| {
+        let class = serde_json::from_value::<ErrorClass>(Value::String(name.to_string())).map_err(
+            |_| {
                 format!(
                     "proxy_alerts: rule '{}': unknown error class '{name}'",
                     common.name
                 )
-            })?;
+            },
+        )?;
         if !classes.contains(&class) {
             classes.push(class);
         }
