@@ -2307,6 +2307,20 @@ async fn test_identity_vary_preserves_wildcard_and_case_insensitive_dedupe() {
         Some("accept-encoding, Origin"),
         "must not duplicate Accept-Encoding case-insensitively"
     );
+
+    // A present but empty upstream field must not produce a leading comma.
+    let mut ctx = make_ctx(None);
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("vary".to_string(), "  ".to_string());
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(
+        resp_headers.get("vary").map(String::as_str),
+        Some("Accept-Encoding")
+    );
 }
 
 #[tokio::test]

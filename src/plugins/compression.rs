@@ -657,6 +657,10 @@ fn ensure_vary_accept_encoding(response_headers: &mut HashMap<String, String>) {
     match response_headers.get("vary") {
         Some(existing) => {
             let trimmed = existing.trim();
+            if trimmed.is_empty() {
+                response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+                return;
+            }
             // `*` already implies every request header, including Accept-Encoding.
             if trimmed == "*" || comma_header_contains_token(trimmed, "*") {
                 return;
