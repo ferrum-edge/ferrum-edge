@@ -1432,20 +1432,84 @@ fn cache_key_path_matches(cache_key: &str, target_path: &str) -> bool {
             && cached_path.as_bytes().get(encoded_target.len()) == Some(&b'/'))
 }
 
-fn normalize_etag(tag: &str) -> &str {
-    let tag = tag.trim();
-    let tag = tag
-        .strip_prefix("W/")
-        .or_else(|| tag.strip_prefix("w/"))
-        .unwrap_or(tag);
-    tag.trim()
+fn skip_etag_ows(bytes: &[u8], position: &mut usize) {
+    while matches!(bytes.get(*position), Some(b' ' | b'\t')) {
+        *position += 1;
+    }
+}
+
+/// Parse one entity-tag and return its opaque-tag contents.
+///
+/// RFC 9110 entity tags do not use quoted-string escaping: a backslash is an
+/// ordinary opaque byte and a quote always terminates the tag. `etagc` permits
+/// visible ASCII other than `"`, plus obs-text bytes.
+fn parse_entity_tag<'a>(value: &'a str, position: &mut usize) -> Option<&'a str> {
+    let bytes = value.as_bytes();
+    if bytes.get(*position..)?.starts_with(b"W/") {
+        *position += 2;
+    }
+    if bytes.get(*position) != Some(&b'"') {
+        return None;
+    }
+    *position += 1;
+    let opaque_start = *position;
+    while let Some(&byte) = bytes.get(*position) {
+        match byte {
+            b'"' => {
+                let opaque = &value[opaque_start..*position];
+                *position += 1;
+                return Some(opaque);
+            }
+            0x21 | 0x23..=0x7e | 0x80..=0xff => *position += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn parse_single_entity_tag(value: &str) -> Option<&str> {
+    let mut position = 0;
+    skip_etag_ows(value.as_bytes(), &mut position);
+    let opaque = parse_entity_tag(value, &mut position)?;
+    skip_etag_ows(value.as_bytes(), &mut position);
+    (position == value.len()).then_some(opaque)
 }
 
 fn if_none_match_matches(if_none_match: &str, etag: &str) -> bool {
-    if_none_match
-        .split(',')
-        .map(str::trim)
-        .any(|candidate| candidate == "*" || normalize_etag(candidate) == normalize_etag(etag))
+    let bytes = if_none_match.as_bytes();
+    let mut position = 0;
+    skip_etag_ows(bytes, &mut position);
+
+    // `*` is an alternative to the entity-tag list, not a list member.
+    if bytes.get(position) == Some(&b'*') {
+        position += 1;
+        skip_etag_ows(bytes, &mut position);
+        return position == bytes.len();
+    }
+
+    let Some(current_opaque) = parse_single_entity_tag(etag) else {
+        return false;
+    };
+    let mut matched = false;
+    loop {
+        skip_etag_ows(bytes, &mut position);
+        let Some(candidate_opaque) = parse_entity_tag(if_none_match, &mut position) else {
+            return false;
+        };
+        matched |= candidate_opaque == current_opaque;
+        skip_etag_ows(bytes, &mut position);
+        if position == bytes.len() {
+            return matched;
+        }
+        if bytes.get(position) != Some(&b',') {
+            return false;
+        }
+        position += 1;
+        skip_etag_ows(bytes, &mut position);
+        if position == bytes.len() {
+            return false;
+        }
+    }
 }
 
 /// Parse an HTTP-date for conditional-request handling.

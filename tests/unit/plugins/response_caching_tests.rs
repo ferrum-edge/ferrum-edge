@@ -1765,6 +1765,104 @@ async fn test_if_none_match_returns_304_from_cache() {
 }
 
 #[tokio::test]
+async fn test_if_none_match_parses_entity_tag_lists_without_partial_matches() {
+    let plugin = default_plugin();
+    let cases = [
+        (
+            "quoted comma",
+            r#""alpha,beta""#,
+            r#""alpha,beta""#,
+            true,
+        ),
+        (
+            "quoted comma in list",
+            r#""other", "alpha,beta", W/"last""#,
+            r#""alpha,beta""#,
+            true,
+        ),
+        ("weak comparison", r#"W/"alpha,beta""#, r#""alpha,beta""#, true),
+        ("wildcard", " \t*\t ", r#""alpha,beta""#, true),
+        (
+            "optional whitespace",
+            " \tW/\"other\"\t,\t \"alpha,beta\" \t",
+            r#"W/"alpha,beta""#,
+            true,
+        ),
+        (
+            "invalid leading fragment",
+            r#"bogus, "alpha,beta""#,
+            r#""alpha,beta""#,
+            false,
+        ),
+        (
+            "trailing comma",
+            r#""alpha,beta", "#,
+            r#""alpha,beta""#,
+            false,
+        ),
+        (
+            "junk after matching tag",
+            r#""alpha,beta"junk"#,
+            r#""alpha,beta""#,
+            false,
+        ),
+        (
+            "lowercase weak prefix",
+            r#"w/"alpha,beta""#,
+            r#""alpha,beta""#,
+            false,
+        ),
+        (
+            "space inside opaque tag",
+            r#""alpha, beta""#,
+            r#""alpha, beta""#,
+            false,
+        ),
+        (
+            "wildcard list member",
+            r#""alpha,beta", *"#,
+            r#""alpha,beta""#,
+            false,
+        ),
+    ];
+
+    for (index, (name, if_none_match, etag, should_match)) in cases.into_iter().enumerate() {
+        let path = format!("/etag-list-{index}");
+        let mut response_headers = HashMap::new();
+        response_headers.insert("etag".to_string(), etag.to_string());
+        response_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+        cache_response(
+            &plugin,
+            "GET",
+            &path,
+            200,
+            &response_headers,
+            b"cached-body",
+        )
+        .await;
+
+        let mut ctx = make_ctx("GET", &path);
+        ctx.headers
+            .insert("if-none-match".to_string(), if_none_match.to_string());
+        let mut headers = HashMap::new();
+        headers.insert("if-none-match".to_string(), if_none_match.to_string());
+        let (status_code, body, _) =
+            expect_reject(plugin.before_proxy(&mut ctx, &mut headers).await);
+
+        assert_eq!(
+            status_code,
+            if should_match { 304 } else { 200 },
+            "case {name}: If-None-Match={if_none_match:?}, ETag={etag:?}"
+        );
+        assert_eq!(
+            body.is_empty(),
+            should_match,
+            "case {name}: 304 must be empty and a non-match must replay the cached body"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_authorization_response_not_shared_cached_without_public() {
     let plugin = default_plugin();
     let mut ctx = make_ctx("GET", "/api/private");
