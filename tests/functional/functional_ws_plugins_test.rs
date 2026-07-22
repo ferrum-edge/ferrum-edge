@@ -802,18 +802,21 @@ async fn test_ws_frame_logging_connection_id_correlates_frame_and_disconnect() {
         if value.get("target").and_then(|t| t.as_str()) != Some("ws_frame_log") {
             continue;
         }
-        let Some(id) = value.get("connection_id").and_then(|v| v.as_u64()) else {
+        // tracing-subscriber JSON nests event attributes under `fields` while
+        // leaving `target` at the envelope root.
+        let fields = value.get("fields").unwrap_or(&value);
+        let Some(id) = fields.get("connection_id").and_then(|v| v.as_u64()) else {
             continue;
         };
-        let is_disconnect = value.get("event").and_then(|e| e.as_str()) == Some("disconnect")
-            || value
+        let is_disconnect = fields.get("event").and_then(|e| e.as_str()) == Some("disconnect")
+            || fields
                 .get("message")
                 .and_then(|m| m.as_str())
                 .is_some_and(|m| m.contains("session ended"));
         if is_disconnect {
             disconnect_ids.insert(id);
-        } else if value.get("frame_type").is_some()
-            || value
+        } else if fields.get("frame_type").is_some()
+            || fields
                 .get("message")
                 .and_then(|m| m.as_str())
                 .is_some_and(|m| m.contains("WebSocket frame"))
