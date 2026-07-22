@@ -913,12 +913,11 @@ impl ResponseCaching {
     /// Extension/unknown methods are treated as unsafe (fail-safe): with no
     /// explicit contract declaring them safe, invalidating is the conservative
     /// choice that prevents serving a stale cached representation after a
-    /// state-changing extension method. An operator who knows an extension
-    /// method is safe can add it to `cacheable_methods` (which bypasses
-    /// lookup/storage) — but that does not suppress invalidation, so a safe
-    /// extension method that is NOT in `cacheable_methods` still invalidates.
-    /// To fully suppress invalidation for a safe extension method, add it to
-    /// `cacheable_methods` and set `invalidate_on_unsafe_methods: false`.
+    /// state-changing extension method. An operator may explicitly add a
+    /// known-safe extension method to `cacheable_methods`, which makes it
+    /// cache-eligible and therefore keeps it out of this invalidation branch.
+    /// There is intentionally no separate allowlist for extension methods that
+    /// should bypass both caching and invalidation.
     fn is_unsafe_method(method: &str) -> bool {
         !matches!(method, "GET" | "HEAD" | "OPTIONS" | "TRACE")
     }
