@@ -6758,8 +6758,7 @@ fn admin_metrics_openapi_accepts_typed_mode_breaker_and_health_fixtures() {
         .expect("circuit breaker target property");
     assert!(breaker.get("type").is_some());
     assert!(
-        docs.contains("per-target (upstream)")
-            && docs.contains("direct-backend (per-proxy)"),
+        docs.contains("per-target (upstream)") && docs.contains("direct-backend (per-proxy)"),
         "docs must describe direct vs per-target breaker semantics"
     );
 
@@ -6790,7 +6789,9 @@ fn admin_metrics_openapi_accepts_typed_mode_breaker_and_health_fixtures() {
         &spec,
         "AdminMetricsUnhealthyTarget",
         &serde_json::to_value(AdminMetricsUnhealthyTarget::passive(
-            "proxy-a", "10.0.0.1:80", 1,
+            "proxy-a",
+            "10.0.0.1:80",
+            1,
         ))
         .expect("passive"),
         true,

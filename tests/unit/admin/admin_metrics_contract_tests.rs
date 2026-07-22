@@ -101,8 +101,7 @@ fn contract_fixtures_cover_modes_breakers_and_health_variants() {
 
     assert!(
         values.iter().any(|value| {
-            value["gateway"]["mode"] == "mesh"
-                && value["connection_pools"].get("http").is_some()
+            value["gateway"]["mode"] == "mesh" && value["connection_pools"].get("http").is_some()
         }),
         "mesh fixture must use the proxy-serving shape"
     );
@@ -114,7 +113,9 @@ fn contract_fixtures_cover_modes_breakers_and_health_variants() {
         "node_agent fixture must use the empty-skeleton shape"
     );
     assert!(
-        values.iter().any(|value| value.get("database_polling").is_some()),
+        values
+            .iter()
+            .any(|value| value.get("database_polling").is_some()),
         "database fixture must include database_polling"
     );
 

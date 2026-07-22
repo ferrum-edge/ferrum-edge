@@ -11,8 +11,7 @@ use std::collections::BTreeMap;
 
 /// Operating modes that construct an [`crate::admin::AdminState`] and serve
 /// authenticated `GET /admin/metrics`.
-pub const ADMIN_METRICS_MODES: &[&str] =
-    &["database", "file", "cp", "dp", "mesh", "node_agent"];
+pub const ADMIN_METRICS_MODES: &[&str] = &["database", "file", "cp", "dp", "mesh", "node_agent"];
 
 /// Top-level authenticated `/admin/metrics` payload.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -375,9 +374,7 @@ pub fn build_admin_metrics(
             mode: mode.to_string(),
             ferrum_version: crate::FERRUM_VERSION.to_string(),
             uptime_seconds: ps.started_at.elapsed().as_secs(),
-            total_requests: ps
-                .request_count
-                .load(std::sync::atomic::Ordering::Relaxed),
+            total_requests: ps.request_count.load(std::sync::atomic::Ordering::Relaxed),
             status_codes_total,
             requests_per_second: ps
                 .windowed_metrics
@@ -414,9 +411,7 @@ pub fn build_admin_metrics(
             unhealthy_target_count: unhealthy_targets.len(),
             unhealthy_targets,
         },
-        load_balancers: AdminMetricsLoadBalancers {
-            active_connections,
-        },
+        load_balancers: AdminMetricsLoadBalancers { active_connections },
         caches: AdminMetricsCaches {
             router: Some(AdminMetricsRouterCache {
                 prefix_cache_entries: prefix_entries,
@@ -511,8 +506,7 @@ fn proxy_serving_fixture(mode: &str) -> AdminMetrics {
     } else {
         "n/a".to_string()
     };
-    metrics.gateway.config_last_updated_at =
-        Some("2026-03-29T14:23:07.482Z".to_string());
+    metrics.gateway.config_last_updated_at = Some("2026-03-29T14:23:07.482Z".to_string());
     metrics.gateway.metrics_window_seconds = 30;
     metrics.connection_pools = AdminMetricsConnectionPools {
         http: Some(AdminMetricsHttpPool {
