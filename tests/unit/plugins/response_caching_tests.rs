@@ -1637,7 +1637,8 @@ async fn test_safe_method_bypass_status_is_set() {
             "{method} should report BYPASS"
         );
         assert!(
-            !ctx.metadata.contains_key(&staging_key(&plugin, "cache_base_key")),
+            !ctx.metadata
+                .contains_key(&staging_key(&plugin, "cache_base_key")),
             "{method} must not leave cache_base_key staging behind"
         );
     }
