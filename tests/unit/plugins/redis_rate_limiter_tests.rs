@@ -614,7 +614,7 @@ fn rate_limit_backend_from_plugin_config_honors_pool_size_for_named_consumers() 
                     "redis_health_check_interval_seconds": 60,
                 }),
                 &http,
-                algorithm.clone(),
+                algorithm,
             )
             .expect("failover backend");
         assert!(matches!(backend, RateLimitBackend::Failover(_)));
