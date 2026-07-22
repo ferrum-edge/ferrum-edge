@@ -16177,8 +16177,9 @@ components:
                 - response_headers
                 - response_body
             - type: object
-              additionalProperties: false
               required: [type]
+              not:
+                required: [path]
               properties:
                 type:
                   type: string
@@ -16193,8 +16194,9 @@ components:
                     type: string
                     minLength: 1
             - type: object
-              additionalProperties: false
               required: [type, path]
+              not:
+                required: [names]
               properties:
                 type:
                   const: body_json_path
@@ -16204,8 +16206,11 @@ components:
                   description: >-
                     Required dotted JSON path for body_json_path targets.
             - type: object
-              additionalProperties: false
               required: [type]
+              not:
+                anyOf:
+                  - required: [names]
+                  - required: [path]
               properties:
                 type:
                   type: string

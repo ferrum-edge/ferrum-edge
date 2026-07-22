@@ -1292,6 +1292,10 @@ fn waf_rule_target_openapi_runtime_parity() {
         json!({ "type": "request_query" }),
         json!({ "type": "body_json_path", "path": "messages.0.content" }),
         json!({ "type": "response_headers" }),
+        // The runtime ignores unrelated target-object extension keys. The
+        // schema must constrain only the enforcement-relevant names/path
+        // fields rather than silently becoming stricter than construction.
+        json!({ "type": "query_values", "extension": true }),
     ];
     for target in &valid_targets {
         assert!(
