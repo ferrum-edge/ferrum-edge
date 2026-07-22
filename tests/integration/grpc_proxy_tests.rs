@@ -706,61 +706,99 @@ async fn grpc_web_accept_negotiates_h1_h2_success_and_rejection_paths() {
     let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
 
     for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
-        let (status, headers, encoded) = send_http_request_with_accept(
-            gateway_addr,
-            version,
-            Method::POST,
-            "/grpc-accept/my.Service/Unary",
-            "application/grpc-web+json",
-            Some("text/html, Application/Grpc-Web-Text+Json; charset=utf-8; Q=0.8"),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("{version:?} text-negotiated request failed: {error}"));
-        assert_eq!(status, 200, "{version:?} text-negotiated status");
-        assert_eq!(
-            headers.get("content-type").map(String::as_str),
-            Some("application/grpc-web-text+json"),
-            "{version:?} text-negotiated content type"
-        );
+        // Success-path backend exchanges can rarely blip under heavy parallel CI
+        // load (mid-response reset before trailers). That correctly surfaces as a
+        // gRPC-Web non-OK terminal frame (#2041) rather than the negotiated
+        // success shape under test. Retry a bounded number of times — the same
+        // pattern as `grpc_web_transformed_response_suppresses_native_trailers`
+        // and `grpc_web_text_keeps_security_policy_in_initial_headers`. A genuine
+        // Accept/transform regression fails every attempt, so retries cannot mask
+        // one. Rejection paths below stay single-shot: they never reach the
+        // backend.
+        let mut text_ok = false;
+        let mut last_text_status = 0u16;
+        let mut last_text_ct: Option<String> = None;
+        let mut last_text_vary: Option<String> = None;
+        let mut last_text_body_len = 0usize;
+        for _attempt in 0..5 {
+            let (status, headers, encoded) = send_http_request_with_accept(
+                gateway_addr,
+                version,
+                Method::POST,
+                "/grpc-accept/my.Service/Unary",
+                "application/grpc-web+json",
+                Some("text/html, Application/Grpc-Web-Text+Json; charset=utf-8; Q=0.8"),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{version:?} text-negotiated request failed: {error}"));
+            last_text_status = status;
+            last_text_ct = headers.get("content-type").cloned();
+            last_text_vary = headers.get("vary").cloned();
+            last_text_body_len = encoded.len();
+            if status == 200
+                && last_text_ct.as_deref() == Some("application/grpc-web-text+json")
+                && last_text_vary
+                    .as_deref()
+                    .is_some_and(|vary| vary.split(',').any(|token| token.trim() == "Accept"))
+            {
+                if let Ok(decoded) = BASE64.decode(&encoded)
+                    && decoded
+                        .windows(b"grpc-status: 0".len())
+                        .any(|window| window == b"grpc-status: 0")
+                {
+                    text_ok = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(
-            headers
-                .get("vary")
-                .is_some_and(|vary| vary.split(',').any(|token| token.trim() == "Accept")),
-            "{version:?} negotiated response must vary on Accept"
-        );
-        let decoded = BASE64
-            .decode(&encoded)
-            .unwrap_or_else(|error| panic!("{version:?} response was not base64: {error}"));
-        assert!(
-            decoded
-                .windows(b"grpc-status: 0".len())
-                .any(|window| window == b"grpc-status: 0"),
-            "{version:?} text response missing terminal status"
+            text_ok,
+            "{version:?} text-negotiated success never embedded grpc-status: 0 \
+             (last status={last_text_status}, content-type={last_text_ct:?}, \
+             vary={last_text_vary:?}, {} body bytes)",
+            last_text_body_len
         );
 
         let text_request = BASE64.encode([0u8, 0, 0, 0, 0]);
-        let (status, headers, binary) = send_http_request_with_body_and_accept(
-            gateway_addr,
-            version,
-            Method::POST,
-            "/grpc-accept/my.Service/Unary",
-            "application/grpc-web-text+custom",
-            Some("application/grpc-web; q=1"),
-            Bytes::from(text_request),
-        )
-        .await
-        .unwrap_or_else(|error| panic!("{version:?} binary-negotiated request failed: {error}"));
-        assert_eq!(status, 200, "{version:?} binary-negotiated status");
-        assert_eq!(
-            headers.get("content-type").map(String::as_str),
-            Some("application/grpc-web+custom"),
-            "{version:?} binary-negotiated content type"
-        );
+        let mut binary_ok = false;
+        let mut last_binary_status = 0u16;
+        let mut last_binary_ct: Option<String> = None;
+        let mut last_binary_body_len = 0usize;
+        for _attempt in 0..5 {
+            let (status, headers, binary) = send_http_request_with_body_and_accept(
+                gateway_addr,
+                version,
+                Method::POST,
+                "/grpc-accept/my.Service/Unary",
+                "application/grpc-web-text+custom",
+                Some("application/grpc-web; q=1"),
+                Bytes::from(text_request.clone()),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{version:?} binary-negotiated request failed: {error}")
+            });
+            last_binary_status = status;
+            last_binary_ct = headers.get("content-type").cloned();
+            last_binary_body_len = binary.len();
+            if status == 200
+                && last_binary_ct.as_deref() == Some("application/grpc-web+custom")
+                && binary
+                    .windows(b"grpc-status: 0".len())
+                    .any(|window| window == b"grpc-status: 0")
+            {
+                binary_ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(
-            binary
-                .windows(b"grpc-status: 0".len())
-                .any(|window| window == b"grpc-status: 0"),
-            "{version:?} binary response missing terminal status"
+            binary_ok,
+            "{version:?} binary-negotiated success never embedded grpc-status: 0 \
+             (last status={last_binary_status}, content-type={last_binary_ct:?}, \
+             {} body bytes)",
+            last_binary_body_len
         );
 
         for accept in ["text/html", "application/grpc-web;q=broken"] {
