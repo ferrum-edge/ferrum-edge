@@ -106,7 +106,7 @@ const META_GRPC_WEB_ORIGINAL_CT: &str = "grpc_web_original_ct";
 /// `transform_response_body` cannot see response status directly, so the
 /// status is stashed here for HTTP→gRPC trailer synthesis when `grpc-status`
 /// is absent. Written only by the translation owner.
-const META_GRPC_WEB_HTTP_STATUS: &str = "grpc_web_http_status";
+pub(crate) const META_GRPC_WEB_HTTP_STATUS: &str = "grpc_web_http_status";
 /// Metadata key listing backend trailer names (newline-separated, sorted) that
 /// may be embedded in the gRPC-Web body trailer frame.
 ///
@@ -126,11 +126,18 @@ const META_GRPC_WEB_SHADOWED_TRAILERS: &str = "grpc_web_shadowed_trailers";
 /// paths that only hold `&RequestContext` (sidecar mesh-mTLS). `after_proxy`
 /// promotes this into [`META_GRPC_WEB_TRAILER_NAMES`] and strips it before the
 /// client-visible header map is finalized.
-const HEADER_GRPC_WEB_TRAILER_NAMES: &str = "x-ferrum-grpc-web-trailer-names";
+pub(crate) const HEADER_GRPC_WEB_TRAILER_NAMES: &str = "x-ferrum-grpc-web-trailer-names";
 /// Internal response-header bridge for [`META_GRPC_WEB_SHADOWED_TRAILERS`].
 /// The payload is base64 so arbitrary printable trailer metadata never becomes
 /// header syntax while it crosses the sidecar mesh-mTLS dispatch boundary.
-const HEADER_GRPC_WEB_SHADOWED_TRAILERS: &str = "x-ferrum-grpc-web-shadowed-trailers";
+pub(crate) const HEADER_GRPC_WEB_SHADOWED_TRAILERS: &str = "x-ferrum-grpc-web-shadowed-trailers";
+
+/// Ferrum-owned gRPC-Web bridge headers that must never reach a client.
+#[inline]
+pub(crate) fn is_internal_grpc_web_bridge_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case(HEADER_GRPC_WEB_TRAILER_NAMES)
+        || name.eq_ignore_ascii_case(HEADER_GRPC_WEB_SHADOWED_TRAILERS)
+}
 /// Instance id (decimal) of the `grpc_web` instance that claimed translation
 /// for this request. Present only after a successful `on_request_received`
 /// claim — never inferred from plugin-writable client input.
@@ -965,9 +972,8 @@ fn is_forbidden_grpc_web_trailer_name(name: &str) -> bool {
                 | "access-control-max-age"
                 | "access-control-request-headers"
                 | "access-control-request-method"
-                | "x-ferrum-grpc-web-trailer-names"
-                | "x-ferrum-grpc-web-shadowed-trailers"
         )
+        || is_internal_grpc_web_bridge_header(name)
 }
 
 /// gRPC Custom-Metadata header-name charset (PROTOCOL-HTTP2): `0-9` / `a-z` /
@@ -1123,10 +1129,23 @@ pub fn capture_bridged_trailer_split_for_policy(
     response_headers: &HashMap<String, String>,
 ) -> Option<BridgedTrailerSplit> {
     let encoded_names = response_headers.get(HEADER_GRPC_WEB_TRAILER_NAMES)?;
-    let shadowed = response_headers
-        .get(HEADER_GRPC_WEB_SHADOWED_TRAILERS)
-        .and_then(|encoded| decode_shadowed_trailers_payload(encoded.as_str()))
-        .unwrap_or_default();
+    // Collision provenance is always installed alongside trailer names by the
+    // bridge helpers. Missing or undecodable payloads are incomplete/corrupt
+    // internal state — fail closed like
+    // `transform_response_body_with_context` so a same-name initial header is
+    // never substituted for the true trailer value.
+    let Some(encoded_shadowed) = response_headers.get(HEADER_GRPC_WEB_SHADOWED_TRAILERS) else {
+        return Some(fail_closed_bridged_trailer_split(
+            response_headers,
+            encoded_names,
+        ));
+    };
+    let Some(shadowed) = decode_shadowed_trailers_payload(encoded_shadowed.as_str()) else {
+        return Some(fail_closed_bridged_trailer_split(
+            response_headers,
+            encoded_names,
+        ));
+    };
     let mut trailers = HashMap::new();
     let mut shadowed_keys = HashSet::new();
     for name in encoded_names.split('\n').filter(|name| !name.is_empty()) {
@@ -1157,6 +1176,42 @@ pub fn capture_bridged_trailer_split_for_policy(
         trailers,
         shadowed_keys,
     })
+}
+
+/// Reconstruct a bridged split when collision provenance is missing/corrupt.
+///
+/// Only reserved terminal metadata may be treated as trailers; application
+/// trailer names listed in the allowlist are removed from the initial-header
+/// view without being re-sourced from merged header values.
+fn fail_closed_bridged_trailer_split(
+    response_headers: &HashMap<String, String>,
+    encoded_names: &str,
+) -> BridgedTrailerSplit {
+    let mut trailers = HashMap::new();
+    for name in encoded_names.split('\n').filter(|name| !name.is_empty()) {
+        if !is_reserved_grpc_web_terminal_metadata(name) {
+            continue;
+        }
+        if let Some(value) = response_headers.get(name).cloned().or_else(|| {
+            response_headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.clone())
+        }) {
+            trailers.insert(name.to_string(), value);
+        }
+    }
+    let mut initial = response_headers.clone();
+    initial.remove(HEADER_GRPC_WEB_TRAILER_NAMES);
+    initial.remove(HEADER_GRPC_WEB_SHADOWED_TRAILERS);
+    for name in encoded_names.split('\n').filter(|name| !name.is_empty()) {
+        initial.retain(|key, _| !key.eq_ignore_ascii_case(name));
+    }
+    BridgedTrailerSplit {
+        initial_headers: initial,
+        trailers,
+        shadowed_keys: HashSet::new(),
+    }
 }
 
 /// Move mesh-mTLS trailer provenance out of the response-header map before
@@ -1328,7 +1383,7 @@ pub fn sync_translated_body_trailer_frame_from_trailers(
     } else {
         std::mem::take(body)
     };
-    if !truncate_trailing_trailer_frames(&mut binary) {
+    let Some(suffix_start) = trailing_trailer_suffix_start(&binary) else {
         // The body transform always emits a complete trailing frame. Refuse to
         // append a second frame when that invariant cannot be proven; doing so
         // would turn malformed backend bytes into an ambiguous frame stream.
@@ -1336,8 +1391,19 @@ pub fn sync_translated_body_trailer_frame_from_trailers(
             *body = binary;
         }
         return false;
+    };
+    let rebuilt = build_trailer_frame(reconciled_trailers, http_status);
+    // Cheap short-circuit: when hooks/policy left the trailer frame
+    // byte-identical, keep the existing body (and avoid a text-mode
+    // re-encode). Any metadata mutation rebuilds below.
+    if binary[suffix_start..] == rebuilt {
+        if !is_text {
+            *body = binary;
+        }
+        return true;
     }
-    binary.extend(build_trailer_frame(reconciled_trailers, http_status));
+    binary.truncate(suffix_start);
+    binary.extend(rebuilt);
     if is_text {
         *body = BASE64.encode(&binary).into_bytes();
     } else {
@@ -1346,38 +1412,52 @@ pub fn sync_translated_body_trailer_frame_from_trailers(
     true
 }
 
+/// Locate the start of the contiguous trailer-frame suffix that reaches
+/// end-of-stream on a fully valid gRPC/gRPC-Web frame sequence.
+///
+/// Returns `None` when the stream is malformed (length overrun / trailing
+/// garbage) or does not end in a trailer frame — matching the fail-closed
+/// contract of the previous quadratic truncate loop without mutating `data`.
+fn trailing_trailer_suffix_start(data: &[u8]) -> Option<usize> {
+    let mut pos = 0;
+    let mut suffix_start: Option<usize> = None;
+    while pos + 5 <= data.len() {
+        let flag = data[pos];
+        let len =
+            u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
+                as usize;
+        let frame_start = pos;
+        pos += 5;
+        if pos + len > data.len() {
+            return None;
+        }
+        if flag == GRPC_FRAME_TRAILER {
+            if suffix_start.is_none() {
+                suffix_start = Some(frame_start);
+            }
+        } else {
+            // A data (or non-trailer) frame ends any trailer suffix so far.
+            suffix_start = None;
+        }
+        pos += len;
+    }
+    if pos != data.len() {
+        return None;
+    }
+    suffix_start
+}
+
 /// Drop trailing gRPC-Web trailer frames (flag `0x80`) from a binary body so a
 /// reconciled frame can replace the transform-phase draft.
-fn truncate_trailing_trailer_frames(data: &mut Vec<u8>) -> bool {
-    let mut removed = false;
-    loop {
-        let mut pos = 0;
-        let mut last_frame_start = None;
-        let mut last_frame_is_trailer = false;
-        while pos + 5 <= data.len() {
-            let flag = data[pos];
-            let len =
-                u32::from_be_bytes([data[pos + 1], data[pos + 2], data[pos + 3], data[pos + 4]])
-                    as usize;
-            let frame_start = pos;
-            pos += 5;
-            if pos + len > data.len() {
-                return false;
-            }
-            last_frame_start = Some(frame_start);
-            last_frame_is_trailer = flag == GRPC_FRAME_TRAILER;
-            pos += len;
-        }
-        // Only truncate a trailer that ends a fully valid frame stream.
-        if pos != data.len() || !last_frame_is_trailer {
-            return removed;
-        }
-        let Some(start) = last_frame_start else {
-            return removed;
-        };
-        data.truncate(start);
-        removed = true;
-    }
+///
+/// Single O(n) scan: identify the contiguous trailer-frame suffix at EOS and
+/// truncate once. Malformed streams leave `data` untouched and return `false`.
+pub(crate) fn truncate_trailing_trailer_frames(data: &mut Vec<u8>) -> bool {
+    let Some(start) = trailing_trailer_suffix_start(data) else {
+        return false;
+    };
+    data.truncate(start);
+    true
 }
 
 fn build_trailer_frame_with_full_provenance(

@@ -4853,7 +4853,7 @@ where
             {
                 let http_status = ctx
                     .metadata
-                    .get("grpc_web_http_status")
+                    .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
                     .and_then(|value| value.parse::<u16>().ok());
                 let content_type = plugin_response_headers
                     .get("content-type")
@@ -5040,7 +5040,11 @@ where
                 }
             }
             if body_completed && !response_trailers.is_empty() {
-                let trailer_map = headers_to_header_map(&response_trailers);
+                // Split LF-joined duplicate metadata before HeaderValue
+                // construction — same native buffered emit path as H2.
+                let trailer_map = crate::proxy::grpc_proxy::buffered_grpc_trailers_to_header_map(
+                    &response_trailers,
+                );
                 let trailer_write = if terminal_gateway_deadline {
                     crate::http3::stream_util::await_terminal_response_write_before_deadline(
                         grpc_deadline_at,
@@ -6471,19 +6475,6 @@ fn collect_reqwest_response_headers(response: &reqwest::Response) -> HashMap<Str
         }
     }
     headers
-}
-
-fn headers_to_header_map(map: &HashMap<String, String>) -> HeaderMap {
-    let mut hmap = HeaderMap::new();
-    for (k, v) in map {
-        if let (Ok(name), Ok(val)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) {
-            hmap.append(name, val);
-        }
-    }
-    hmap
 }
 
 // ---------------------------------------------------------------------------

@@ -22536,7 +22536,7 @@ async fn handle_proxy_request_inner(
                     {
                         let http_status = ctx
                             .metadata
-                            .get("grpc_web_http_status")
+                            .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
                             .and_then(|value| value.parse::<u16>().ok());
                         let content_type = plugin_response_headers
                             .get("content-type")
@@ -22767,15 +22767,11 @@ async fn handle_proxy_request_inner(
 
                 let response_body = Bytes::from(response_body);
                 let body = if !response_body.is_empty() && !response_trailers.is_empty() {
-                    let mut trailers = hyper::HeaderMap::new();
-                    for (k, v) in &response_trailers {
-                        if let (Ok(name), Ok(value)) = (
-                            hyper::header::HeaderName::from_bytes(k.as_bytes()),
-                            hyper::header::HeaderValue::from_str(v),
-                        ) {
-                            trailers.append(name, value);
-                        }
-                    }
+                    // Split LF-joined duplicate metadata before HeaderValue
+                    // construction — from_str rejects embedded LF and would
+                    // otherwise drop the entire multi-value trailer.
+                    let trailers =
+                        grpc_proxy::buffered_grpc_trailers_to_header_map(&response_trailers);
                     ProxyBody::buffered_grpc_with_trailers(response_body, trailers)
                 } else {
                     ProxyBody::full(response_body)
@@ -24014,8 +24010,8 @@ async fn handle_proxy_request_inner(
             crate::plugins::grpc_web::capture_bridged_trailer_split_for_policy(&response_headers)
     {
         let mut merged_for_policy = response_headers.clone();
-        merged_for_policy.remove("x-ferrum-grpc-web-trailer-names");
-        merged_for_policy.remove("x-ferrum-grpc-web-shadowed-trailers");
+        merged_for_policy.remove(crate::plugins::grpc_web::HEADER_GRPC_WEB_TRAILER_NAMES);
+        merged_for_policy.remove(crate::plugins::grpc_web::HEADER_GRPC_WEB_SHADOWED_TRAILERS);
         ctx.begin_buffered_initial_response_header_policy(
             plugin_cache_view.initial_response_header_policy_names(),
             &split.initial_headers,
@@ -24232,7 +24228,7 @@ async fn handle_proxy_request_inner(
             );
             let http_status = ctx
                 .metadata
-                .get("grpc_web_http_status")
+                .get(crate::plugins::grpc_web::META_GRPC_WEB_HTTP_STATUS)
                 .and_then(|value| value.parse::<u16>().ok());
             let content_type = response_headers.get("content-type").map(String::as_str);
             if crate::plugins::grpc_web::sync_translated_body_trailer_frame_from_trailers(
@@ -24242,6 +24238,14 @@ async fn handle_proxy_request_inner(
                 http_status,
             ) {
                 response_headers.insert("content-length".to_string(), data.len().to_string());
+                // Mirror H1/H2/H3: after body-framing trailers, retire
+                // trailer-only application metadata from initial headers while
+                // preserving shadowed collisions and reserved terminal keys.
+                grpc_proxy::discard_grpc_application_trailers_after_body_rewrite(
+                    &mut response_headers,
+                    &mut trailers,
+                    &shadowed_keys,
+                );
             }
         } else {
             let _ = ctx.take_buffered_initial_response_header_policy();

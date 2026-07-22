@@ -1659,6 +1659,182 @@ fn test_sync_before_discard_preserves_custom_trailers_on_framed_body() {
     );
 }
 
+#[test]
+fn test_truncate_trailing_trailer_frames_suffix_and_malformed() {
+    use ferrum_edge::_test_support::{
+        GRPC_FRAME_TRAILER, build_trailer_frame, truncate_trailing_trailer_frames_for_test,
+    };
+
+    let data_frame = {
+        let mut frame = vec![0x00, 0x00, 0x00, 0x00, 0x04];
+        frame.extend_from_slice(b"pong");
+        frame
+    };
+    let t1 = build_trailer_frame(&HashMap::from([("grpc-status".to_string(), "0".to_string())]));
+    let t2 = build_trailer_frame(&HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "a".to_string()),
+    ]));
+
+    // Multiple contiguous trailer frames at EOS truncate once to the data prefix.
+    let mut body = data_frame.clone();
+    body.extend_from_slice(&t1);
+    body.extend_from_slice(&t2);
+    assert!(truncate_trailing_trailer_frames_for_test(&mut body));
+    assert_eq!(body, data_frame);
+
+    // Trailer interspersed before a final data frame is not a trailer suffix.
+    let mut body = t1.clone();
+    body.extend_from_slice(&data_frame);
+    let original = body.clone();
+    assert!(!truncate_trailing_trailer_frames_for_test(&mut body));
+    assert_eq!(body, original);
+
+    // data + trailer + data: no contiguous trailer suffix at EOS.
+    let mut body = data_frame.clone();
+    body.extend_from_slice(&t1);
+    body.extend_from_slice(&data_frame);
+    let original = body.clone();
+    assert!(!truncate_trailing_trailer_frames_for_test(&mut body));
+    assert_eq!(body, original);
+
+    // Malformed: declared length overruns the buffer — leave bytes untouched.
+    let mut body = vec![GRPC_FRAME_TRAILER, 0x00, 0x00, 0x00, 0x10, 0x01];
+    let original = body.clone();
+    assert!(!truncate_trailing_trailer_frames_for_test(&mut body));
+    assert_eq!(body, original);
+
+    // Large synthetic sequence: many data frames then two trailer frames.
+    let mut body = Vec::new();
+    for i in 0..64u8 {
+        body.push(0x00);
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.push(i);
+    }
+    let prefix_len = body.len();
+    body.extend_from_slice(&t1);
+    body.extend_from_slice(&t2);
+    assert!(truncate_trailing_trailer_frames_for_test(&mut body));
+    assert_eq!(body.len(), prefix_len);
+}
+
+#[test]
+fn test_sync_trailer_frame_short_circuits_when_already_identical() {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use ferrum_edge::_test_support::build_trailer_frame;
+
+    let trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "abc".to_string()),
+    ]);
+    let mut binary = vec![0x00, 0x00, 0x00, 0x00, 0x04];
+    binary.extend_from_slice(b"pong");
+    binary.extend(build_trailer_frame(&trailers));
+
+    // Text mode: unchanged trailer suffix must keep the original base64 bytes.
+    let mut text_body = BASE64.encode(&binary).into_bytes();
+    let original_text = text_body.clone();
+    assert!(
+        ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut text_body,
+            Some("application/grpc-web-text"),
+            &trailers,
+            Some(200),
+        )
+    );
+    assert_eq!(
+        text_body, original_text,
+        "identical trailer suffix must short-circuit without re-encoding"
+    );
+
+    // Changed metadata must rebuild (and re-encode in text mode).
+    let mut changed = trailers.clone();
+    changed.insert("request-id".to_string(), "mutated".to_string());
+    assert!(
+        ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut text_body,
+            Some("application/grpc-web-text"),
+            &changed,
+            Some(200),
+        )
+    );
+    assert_ne!(text_body, original_text);
+    let decoded = BASE64.decode(&text_body).expect("valid text body");
+    let payload = trailing_grpc_web_trailer_payload(&decoded);
+    assert!(payload.contains("request-id: mutated\r\n"));
+}
+
+/// Mesh-mTLS translated path must discard trailer-only names from initial
+/// headers after syncing the body trailer frame (H1/H2/H3 parity).
+#[test]
+fn test_mesh_sync_then_discard_matches_h2_parity() {
+    let mut response_headers = HashMap::from([
+        (
+            "content-type".to_string(),
+            "application/grpc-web".to_string(),
+        ),
+        ("x-initial".to_string(), "keep".to_string()),
+        ("x-shared".to_string(), "initial-value".to_string()),
+        ("request-id".to_string(), "trailer-only".to_string()),
+        ("grpc-status".to_string(), "0".to_string()),
+    ]);
+    let mut trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("request-id".to_string(), "trailer-only".to_string()),
+        ("x-shared".to_string(), "trailer-value".to_string()),
+    ]);
+
+    let mut body = vec![0x00, 0x00, 0x00, 0x00, 0x04];
+    body.extend_from_slice(b"pong");
+    body.extend(ferrum_edge::_test_support::build_trailer_frame(
+        &response_headers,
+    ));
+
+    assert!(
+        ferrum_edge::_test_support::sync_translated_body_trailer_frame_from_trailers(
+            &mut body,
+            Some("application/grpc-web"),
+            &trailers,
+            Some(200),
+        )
+    );
+    ferrum_edge::_test_support::discard_grpc_application_trailers_after_body_rewrite_for_test(
+        &mut response_headers,
+        &mut trailers,
+        &["x-shared"],
+    );
+
+    assert_eq!(
+        response_headers.get("x-initial").map(String::as_str),
+        Some("keep")
+    );
+    assert_eq!(
+        response_headers.get("x-shared").map(String::as_str),
+        Some("initial-value"),
+        "shadowed initial-header collision must be preserved"
+    );
+    assert!(
+        !response_headers.contains_key("request-id"),
+        "trailer-only custom metadata must leave initial headers after mesh sync"
+    );
+    assert_eq!(
+        response_headers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "reserved terminal metadata remains until finalize"
+    );
+    assert_eq!(
+        trailers.get("grpc-status").map(String::as_str),
+        Some("0")
+    );
+    assert!(!trailers.contains_key("request-id"));
+    assert!(!trailers.contains_key("x-shared"));
+
+    let payload = trailing_grpc_web_trailer_payload(&body);
+    assert!(payload.contains("request-id: trailer-only\r\n"));
+    assert!(payload.contains("x-shared: trailer-value\r\n"), "{payload}");
+}
+
 /// Inverse of [`test_sync_before_discard_preserves_custom_trailers_on_framed_body`]:
 /// discard-then-sync on a framed body is the exact H3 provenance-loss shape.
 #[test]
@@ -1985,6 +2161,54 @@ fn test_mesh_bridge_promotion_strips_value_bearing_internal_headers() {
     assert!(!response_headers.contains_key("x-ferrum-grpc-web-shadowed-trailers"));
     assert!(metadata.contains_key("grpc_web_trailer_names"));
     assert!(metadata.contains_key("grpc_web_shadowed_trailers"));
+}
+
+#[test]
+fn test_capture_bridged_trailer_split_fails_closed_on_corrupt_shadowed_payload() {
+    let mut response_headers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("x-shared-meta".to_string(), "initial-secret".to_string()),
+        ("request-id".to_string(), "trailer-only".to_string()),
+    ]);
+    let trailers = HashMap::from([
+        ("grpc-status".to_string(), "0".to_string()),
+        ("x-shared-meta".to_string(), "trailer-secret".to_string()),
+        ("request-id".to_string(), "trailer-only".to_string()),
+    ]);
+    ferrum_edge::plugins::grpc_web::bridge_backend_trailer_provenance_for_frame(
+        &mut response_headers,
+        &trailers,
+    );
+    // Corrupt the collision payload while leaving trailer-name provenance intact.
+    response_headers.insert(
+        "x-ferrum-grpc-web-shadowed-trailers".to_string(),
+        "not-valid-base64!!!".to_string(),
+    );
+
+    let split = ferrum_edge::plugins::grpc_web::capture_bridged_trailer_split_for_policy(
+        &response_headers,
+    )
+    .expect("names provenance still present");
+
+    assert_eq!(
+        split.trailers.get("grpc-status").map(String::as_str),
+        Some("0"),
+        "reserved terminal metadata survives fail-closed capture"
+    );
+    assert!(
+        !split.trailers.contains_key("x-shared-meta"),
+        "corrupt collision payload must not substitute the initial-header value as a trailer"
+    );
+    assert!(
+        !split.trailers.contains_key("request-id"),
+        "application trailers are suppressed when collision provenance is corrupt"
+    );
+    assert!(split.shadowed_keys.is_empty());
+    assert!(
+        !split.initial_headers.contains_key("x-shared-meta"),
+        "listed trailer names are removed from the initial view under fail-closed"
+    );
+    assert!(!split.initial_headers.contains_key("request-id"));
 }
 
 #[test]

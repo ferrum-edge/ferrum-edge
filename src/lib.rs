@@ -1368,6 +1368,10 @@ pub mod _test_support {
         )
     }
 
+    pub fn truncate_trailing_trailer_frames_for_test(data: &mut Vec<u8>) -> bool {
+        crate::plugins::grpc_web::truncate_trailing_trailer_frames(data)
+    }
+
     pub fn begin_buffered_initial_response_header_policy_for_test(
         ctx: &mut crate::plugins::RequestContext,
         header_names: std::sync::Arc<Vec<String>>,

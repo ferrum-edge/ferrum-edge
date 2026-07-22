@@ -499,8 +499,7 @@ pub fn is_backend_response_strip_header(name: &str) -> bool {
 /// final client-boundary sanitation pass.
 #[inline]
 fn is_internal_response_control_header(name: &str) -> bool {
-    name.eq_ignore_ascii_case("x-ferrum-grpc-web-trailer-names")
-        || name.eq_ignore_ascii_case("x-ferrum-grpc-web-shadowed-trailers")
+    crate::plugins::grpc_web::is_internal_grpc_web_bridge_header(name)
 }
 
 /// Case-insensitive final-wire counterpart for plugin-produced response maps.
@@ -730,8 +729,8 @@ mod tests {
     #[test]
     fn response_strip_rejects_backend_forged_grpc_web_bridge_fields() {
         for name in [
-            "x-ferrum-grpc-web-trailer-names",
-            "x-ferrum-grpc-web-shadowed-trailers",
+            crate::plugins::grpc_web::HEADER_GRPC_WEB_TRAILER_NAMES,
+            crate::plugins::grpc_web::HEADER_GRPC_WEB_SHADOWED_TRAILERS,
             "X-Ferrum-Grpc-Web-Trailer-Names",
             "X-Ferrum-Grpc-Web-Shadowed-Trailers",
         ] {
