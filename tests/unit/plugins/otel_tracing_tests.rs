@@ -1664,6 +1664,7 @@ async fn test_otel_tracing_ws_disconnect_uses_new_span_id() {
         error_class: None,
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata,
     };
     plugin.on_ws_disconnect(&ctx).await;
@@ -1745,6 +1746,7 @@ async fn test_otel_tracing_ws_disconnect_distinguishes_client_and_backend_failur
             error_class: Some(ferrum_edge::retry::ErrorClass::ConnectionReset),
             consumer_username: None,
             auth_method: None,
+            connection_id: 0,
             metadata: make_trace_metadata(),
         };
         plugin.on_ws_disconnect(&ctx).await;

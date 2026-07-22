@@ -351,6 +351,27 @@ impl CompressionPlugin {
         true
     }
 
+    /// Whether `Accept-Encoding` can select a different representation for this
+    /// response. Identity/default variants must nominate `Vary: Accept-Encoding`
+    /// in those cases so shared caches do not replay them for later clients
+    /// that prefer (or require) a coded representation (#2355).
+    ///
+    /// Permanently ineligible statuses/content/transforms are excluded: a later
+    /// request cannot obtain a different coding for the same response shape.
+    fn should_nominate_accept_encoding_vary(
+        &self,
+        ctx: &RequestContext,
+        response_status: u16,
+        response_headers: &HashMap<String, String>,
+        on_rejection: bool,
+    ) -> bool {
+        !on_rejection
+            && !Self::is_protocol_hard_skip(ctx, response_status, response_headers)
+            && !Self::is_non_transformable_range_or_delta(ctx, response_status, response_headers)
+            && !Self::response_forbids_transform(ctx, response_headers)
+            && self.is_compression_eligible(response_headers)
+    }
+
     fn response_forbids_transform(
         ctx: &RequestContext,
         response_headers: &HashMap<String, String>,
@@ -631,6 +652,37 @@ fn comma_header_contains_token(value: &str, token: &str) -> bool {
     value
         .split(',')
         .any(|part| part.trim().eq_ignore_ascii_case(token))
+}
+
+/// Nominate `Accept-Encoding` in `Vary` so shared caches key identity and
+/// compressed representations separately (RFC 9110 §12.5.5 / RFC 9111 §4.1).
+///
+/// Preserves an existing `Vary: *` (already varies on every request header) and
+/// case-insensitively de-duplicates an existing `Accept-Encoding` member.
+fn ensure_vary_accept_encoding(response_headers: &mut HashMap<String, String>) {
+    match response_headers.get("vary") {
+        Some(existing) => {
+            let trimmed = existing.trim();
+            if trimmed.is_empty() {
+                response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+                return;
+            }
+            // `*` already implies every request header, including Accept-Encoding.
+            if trimmed == "*" || comma_header_contains_token(trimmed, "*") {
+                return;
+            }
+            if comma_header_contains_token(existing, "accept-encoding") {
+                return;
+            }
+            let mut updated = String::with_capacity(existing.len() + 18);
+            updated.push_str(existing);
+            updated.push_str(", Accept-Encoding");
+            response_headers.insert("vary".to_string(), updated);
+        }
+        None => {
+            response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
+        }
+    }
 }
 
 /// Read from `reader` into a `Vec`, enforcing a maximum decompressed size.
@@ -1099,8 +1151,8 @@ impl Plugin for CompressionPlugin {
         // Synthetic / rejection responses re-run `after_proxy` without body
         // transforms. Do not commit Content-Encoding there. Fail-closed 406 on
         // this path is scoped to `response_caching` HITs of identity variants
-        // (the monotonic request-global HIT marker) — including when identity
-        // responses omit `Vary: Accept-Encoding` (#2355) — so auth/policy
+        // (the monotonic request-global HIT marker) — including legacy identity
+        // responses that omit `Vary: Accept-Encoding` (#2355) — so auth/policy
         // rejections keep their original status.
         let on_rejection = ctx.metadata.contains_key(REJECTION_RESPONSE_METADATA_KEY);
 
@@ -1122,7 +1174,19 @@ impl Plugin for CompressionPlugin {
         match selection {
             // No Accept-Encoding field, or identity is the most preferred /
             // only acceptable representation: forward the uncoded response.
-            Some(CodingSelection::Identity) | None => return PluginResult::Continue,
+            // Eligible identity/default variants still nominate Vary so shared
+            // caches do not reuse them for later clients that prefer gzip/br.
+            Some(CodingSelection::Identity) | None => {
+                if self.should_nominate_accept_encoding_vary(
+                    ctx,
+                    response_status,
+                    response_headers,
+                    on_rejection,
+                ) {
+                    ensure_vary_accept_encoding(response_headers);
+                }
+                PluginResult::Continue
+            }
             // Client refused identity and every configured algorithm.
             Some(CodingSelection::NotAcceptable) => {
                 if Self::should_fail_closed_not_acceptable(ctx, on_rejection) {
@@ -1154,22 +1218,9 @@ impl Plugin for CompressionPlugin {
                     );
                     response_headers.remove("content-length");
 
-                    // Add Vary: Accept-Encoding so caches distinguish compressed variants.
-                    match response_headers.get("vary") {
-                        Some(existing) => {
-                            // Don't duplicate if already present.
-                            if !comma_header_contains_token(existing, "accept-encoding") {
-                                let mut updated = String::with_capacity(existing.len() + 17);
-                                updated.push_str(existing);
-                                updated.push_str(", Accept-Encoding");
-                                response_headers.insert("vary".to_string(), updated);
-                            }
-                        }
-                        None => {
-                            response_headers
-                                .insert("vary".to_string(), "Accept-Encoding".to_string());
-                        }
-                    }
+                    // Compressed variants nominate the same Vary dimension as
+                    // eligible identity/default responses above.
+                    ensure_vary_accept_encoding(response_headers);
 
                     return PluginResult::Continue;
                 }

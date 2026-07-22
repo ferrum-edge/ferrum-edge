@@ -1245,6 +1245,7 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
             error_class: None,
             consumer_username: Some("alice".to_string()),
             auth_method: None,
+            connection_id: 0,
             metadata: Default::default(),
         })
         .await;

@@ -493,6 +493,7 @@ fn websocket_summary() -> WsDisconnectContext {
         error_class: None,
         consumer_username: Some("alice".to_string()),
         auth_method: Some("jwt_auth"),
+        connection_id: 0,
         metadata: HashMap::from([
             ("request_id".to_string(), "req-ws".to_string()),
             ("cookie".to_string(), "ws-secret".to_string()),

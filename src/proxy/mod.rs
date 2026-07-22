@@ -9911,6 +9911,10 @@ async fn handle_websocket_request_authenticated(
         // records a valid backend URL, not the synthetic `mesh-xc-hbone|...` key.
         backend_target: strip_query_params(&ws_display_backend_url).to_string(),
         listen_port,
+        // Same admission ID passed into the relay / on_ws_frame so disconnect
+        // hooks (including upgrade-handoff failure below) correlate without a
+        // per-frame lookup map.
+        connection_id: ws_conn_id,
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
         metadata: clone_log_metadata(&ctx),
@@ -11214,6 +11218,10 @@ pub struct WsSessionMeta {
     pub client_ip: String,
     pub backend_target: String,
     pub listen_port: u16,
+    /// Process-local accepted session ID allocated at upgrade admission and
+    /// preserved through every teardown path that builds `WsDisconnectContext`.
+    /// Same value as the `connection_id` argument to `on_ws_frame` / the relay.
+    pub connection_id: u64,
     pub consumer_username: Option<String>,
     pub auth_method: Option<&'static str>,
     pub metadata: HashMap<String, String>,
@@ -11262,6 +11270,7 @@ pub async fn fire_ws_tunnel_disconnect_hooks(
         client_ip: session_meta.client_ip.clone(),
         backend_target: session_meta.backend_target.clone(),
         listen_port: session_meta.listen_port,
+        connection_id: session_meta.connection_id,
         duration_ms: disconnect_duration_ms,
         frames_client_to_backend: 0,
         frames_backend_to_client: 0,
@@ -11315,6 +11324,7 @@ pub async fn fire_ws_framed_disconnect_hooks(
         client_ip: session_meta.client_ip,
         backend_target: session_meta.backend_target,
         listen_port: session_meta.listen_port,
+        connection_id: session_meta.connection_id,
         duration_ms: disconnect_duration_ms,
         frames_client_to_backend,
         frames_backend_to_client,

@@ -106,6 +106,7 @@ fn make_ws_summary(proxy_id: &str) -> WsDisconnectContext {
         error_class: None,
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata: HashMap::new(),
     }
 }

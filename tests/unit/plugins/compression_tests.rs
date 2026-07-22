@@ -414,6 +414,11 @@ async fn test_higher_identity_quality_sends_uncoded_response() {
     let result = plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     assert!(matches!(result, PluginResult::Continue));
     assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(
+        resp_headers.get("vary").map(String::as_str),
+        Some("Accept-Encoding"),
+        "eligible identity variants must nominate Vary for shared caches"
+    );
 }
 
 #[tokio::test]
@@ -791,9 +796,11 @@ async fn test_406_via_shared_after_proxy_chokepoint() {
             .await
             .expect("shared after_proxy chokepoint must produce 406");
     assert_eq!(status, 406);
-    assert_eq!(
-        headers.get("vary").map(String::as_str),
-        Some("Accept-Encoding")
+    assert!(
+        headers
+            .get("vary")
+            .is_some_and(|vary| vary.eq_ignore_ascii_case("Accept-Encoding")),
+        "cached Vary field-name tokens are case-insensitive"
     );
     assert_eq!(
         headers.get("content-type").map(String::as_str),
@@ -849,6 +856,240 @@ fn test_h1_h2_h3_paths_reach_shared_after_proxy_chokepoint() {
         h3_cross.contains("crate::proxy::run_after_proxy_hooks("),
         "H3 cross-protocol path must call run_after_proxy_hooks"
     );
+}
+
+#[tokio::test]
+async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
+    // #2355 acceptance: populate the built-in shared cache with an eligible
+    // identity/default variant first, then prove later gzip / Brotli /
+    // identity;q=0 requests miss that entry instead of replaying identity.
+    // H1/H2/H3 all reach the same after_proxy chokepoint exercised here
+    // (see test_h1_h2_h3_paths_reach_shared_after_proxy_chokepoint).
+    let cache =
+        Arc::new(ResponseCaching::new(&json!({"ttl_seconds": 60})).unwrap()) as Arc<dyn Plugin>;
+    let compression = Arc::new(make_plugin(json!({}))) as Arc<dyn Plugin>;
+    let identity_body = br#"{"cached":"identity-default"}"#;
+
+    // Miss path: no Accept-Encoding → identity representation + Vary nomination.
+    let mut store_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cache-vary-order".to_string(),
+    );
+    store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    let mut store_req = HashMap::new();
+    assert!(matches!(
+        cache.before_proxy(&mut store_ctx, &mut store_req).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        compression
+            .before_proxy(&mut store_ctx, &mut store_req)
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut store_resp = HashMap::new();
+    store_resp.insert("content-type".to_string(), "application/json".to_string());
+    store_resp.insert("content-length".to_string(), "1000".to_string());
+    store_resp.insert("cache-control".to_string(), "max-age=60".to_string());
+    cache
+        .after_proxy(&mut store_ctx, 200, &mut store_resp)
+        .await;
+    assert!(matches!(
+        compression
+            .after_proxy(&mut store_ctx, 200, &mut store_resp)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(
+        !store_resp.contains_key("content-encoding"),
+        "default/identity store must remain uncoded"
+    );
+    assert_eq!(
+        store_resp.get("vary").map(String::as_str),
+        Some("Accept-Encoding"),
+        "identity-first store must nominate Vary before response_caching inserts"
+    );
+    cache
+        .on_final_response_body(&mut store_ctx, 200, &store_resp, identity_body)
+        .await;
+
+    // Same absent Accept-Encoding → HIT of the identity variant.
+    let mut hit_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cache-vary-order".to_string(),
+    );
+    hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    let mut hit_headers = HashMap::new();
+    let (status, body, headers) = match cache.before_proxy(&mut hit_ctx, &mut hit_headers).await {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body.into_bytes(), headers),
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body.to_vec(), headers),
+        other => panic!("expected identity HIT, got {other:?}"),
+    };
+    assert_eq!(status, 200);
+    assert_eq!(body, identity_body);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("HIT")
+    );
+    assert!(
+        headers
+            .get("vary")
+            .is_some_and(|vary| vary.eq_ignore_ascii_case("Accept-Encoding")),
+        "cached Vary field-name tokens are case-insensitive"
+    );
+
+    // Later gzip / br / identity;q=0 requests must miss the identity entry.
+    for accept_encoding in ["gzip", "br", "gzip, identity;q=0", "identity;q=0, br"] {
+        let mut miss_ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/cache-vary-order".to_string(),
+        );
+        miss_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+        miss_ctx
+            .headers
+            .insert("accept-encoding".to_string(), accept_encoding.to_string());
+        let mut miss_headers = miss_ctx.headers.clone();
+        let result = cache.before_proxy(&mut miss_ctx, &mut miss_headers).await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "Accept-Encoding={accept_encoding}: must miss identity-first cache entry, got {result:?}"
+        );
+    }
+
+    // Store a gzip variant through the same plugin order, then prove it hits
+    // only for gzip and still misses for br / absent Accept-Encoding.
+    let mut gzip_store_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cache-vary-order".to_string(),
+    );
+    gzip_store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    gzip_store_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut gzip_store_req = gzip_store_ctx.headers.clone();
+    assert!(matches!(
+        cache
+            .before_proxy(&mut gzip_store_ctx, &mut gzip_store_req)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        compression
+            .before_proxy(&mut gzip_store_ctx, &mut gzip_store_req)
+            .await,
+        PluginResult::Continue
+    ));
+    let mut gzip_resp = HashMap::new();
+    gzip_resp.insert("content-type".to_string(), "application/json".to_string());
+    gzip_resp.insert("content-length".to_string(), "1000".to_string());
+    gzip_resp.insert("cache-control".to_string(), "max-age=60".to_string());
+    cache
+        .after_proxy(&mut gzip_store_ctx, 200, &mut gzip_resp)
+        .await;
+    assert!(matches!(
+        compression
+            .after_proxy(&mut gzip_store_ctx, 200, &mut gzip_resp)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        gzip_resp.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(
+        gzip_resp.get("vary").map(String::as_str),
+        Some("Accept-Encoding")
+    );
+    // Body bytes after transform_response_body would be compressed; the cache
+    // stores whatever final body the gateway supplies. Use distinct bytes so
+    // the HIT assertion cannot confuse identity and gzip variants.
+    let gzip_body = b"gzip-variant-bytes";
+    cache
+        .on_final_response_body(&mut gzip_store_ctx, 200, &gzip_resp, gzip_body)
+        .await;
+
+    let mut gzip_hit_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/cache-vary-order".to_string(),
+    );
+    gzip_hit_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+    gzip_hit_ctx
+        .headers
+        .insert("accept-encoding".to_string(), "gzip".to_string());
+    let mut gzip_hit_headers = gzip_hit_ctx.headers.clone();
+    let (status, body, headers) = match cache
+        .before_proxy(&mut gzip_hit_ctx, &mut gzip_hit_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body.into_bytes(), headers),
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body.to_vec(), headers),
+        other => panic!("expected gzip HIT, got {other:?}"),
+    };
+    assert_eq!(status, 200);
+    assert_eq!(body, gzip_body);
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("HIT")
+    );
+
+    for accept_encoding in [None, Some("br"), Some("identity;q=0, br")] {
+        let mut miss_ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "GET".to_string(),
+            "/cache-vary-order".to_string(),
+        );
+        miss_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+        if let Some(ae) = accept_encoding {
+            miss_ctx
+                .headers
+                .insert("accept-encoding".to_string(), ae.to_string());
+        }
+        let mut miss_headers = miss_ctx.headers.clone();
+        // Absent Accept-Encoding still matches the identity-first entry.
+        let result = cache.before_proxy(&mut miss_ctx, &mut miss_headers).await;
+        if accept_encoding.is_none() {
+            let body = match result {
+                PluginResult::Reject { body, .. } => body.into_bytes(),
+                PluginResult::RejectBinary { body, .. } => body.to_vec(),
+                other => panic!("expected identity HIT for absent AE, got {other:?}"),
+            };
+            assert_eq!(
+                body, identity_body,
+                "absent Accept-Encoding must keep hitting the identity variant"
+            );
+        } else {
+            assert!(
+                matches!(result, PluginResult::Continue),
+                "Accept-Encoding={accept_encoding:?}: must miss gzip variant, got {result:?}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -2013,9 +2254,139 @@ async fn test_skips_no_accept_encoding() {
 
     plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     assert!(!resp_headers.contains_key("content-encoding"));
+    assert_eq!(
+        resp_headers.get("vary").map(String::as_str),
+        Some("Accept-Encoding"),
+        "eligible default/identity responses must still nominate Vary"
+    );
 }
 
 // ────────────────────── Vary header ──────────────────────
+
+#[tokio::test]
+async fn test_identity_default_nominates_vary_accept_encoding() {
+    // #2355: eligible identity/default variants must nominate Accept-Encoding
+    // even when no supported coding wins, so shared caches can distinguish them
+    // from later gzip/Brotli selections.
+    let plugin = make_plugin(json!({}));
+
+    for accept_encoding in [None, Some("identity"), Some("identity;q=1, gzip;q=0.2")] {
+        let mut ctx = make_ctx(accept_encoding);
+        let mut headers = HashMap::new();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut resp_headers = HashMap::new();
+        resp_headers.insert("content-type".to_string(), "application/json".to_string());
+        resp_headers.insert("content-length".to_string(), "1000".to_string());
+        resp_headers.insert("vary".to_string(), "Origin".to_string());
+
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await,
+            PluginResult::Continue
+        ));
+        assert!(
+            !resp_headers.contains_key("content-encoding"),
+            "ae={accept_encoding:?}: identity/default must stay uncoded"
+        );
+        assert_eq!(
+            resp_headers.get("vary").map(String::as_str),
+            Some("Origin, Accept-Encoding"),
+            "ae={accept_encoding:?}: must append Accept-Encoding without dropping Origin"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_identity_vary_preserves_wildcard_and_case_insensitive_dedupe() {
+    let plugin = make_plugin(json!({}));
+
+    // Vary: * already varies on every request header — leave it alone.
+    let mut ctx = make_ctx(Some("identity"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("vary".to_string(), "*".to_string());
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(resp_headers.get("vary").map(String::as_str), Some("*"));
+
+    // Case-insensitive de-dupe of an existing Accept-Encoding member.
+    let mut ctx = make_ctx(None);
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("vary".to_string(), "accept-encoding, Origin".to_string());
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(
+        resp_headers.get("vary").map(String::as_str),
+        Some("accept-encoding, Origin"),
+        "must not duplicate Accept-Encoding case-insensitively"
+    );
+
+    // A present but empty upstream field must not produce a leading comma.
+    let mut ctx = make_ctx(None);
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("vary".to_string(), "  ".to_string());
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(
+        resp_headers.get("vary").map(String::as_str),
+        Some("Accept-Encoding")
+    );
+}
+
+#[tokio::test]
+async fn test_ineligible_identity_does_not_nominate_vary() {
+    // Permanently ineligible shapes must not add Accept-Encoding as a cache
+    // dimension — compression can never select a different representation.
+    let plugin = make_plugin(json!({"min_content_length": 256}));
+
+    // Non-whitelisted content type.
+    let mut ctx = make_ctx(None);
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "image/png".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(!resp_headers.contains_key("vary"));
+
+    // Below min_content_length.
+    let mut ctx = make_ctx(Some("identity"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "10".to_string());
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(!resp_headers.contains_key("vary"));
+
+    // No-body status (protocol hard skip).
+    let mut ctx = make_ctx(None);
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    plugin.after_proxy(&mut ctx, 204, &mut resp_headers).await;
+    assert!(!resp_headers.contains_key("vary"));
+
+    // Strong ETag forbids transform permanently for this representation.
+    let mut ctx = make_ctx(Some("identity"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("etag".to_string(), "\"strong-validator\"".to_string());
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert!(!resp_headers.contains_key("vary"));
+}
 
 #[tokio::test]
 async fn test_vary_header_appended_to_existing() {
@@ -2065,6 +2436,27 @@ async fn test_vary_header_token_match_does_not_false_positive() {
     assert_eq!(
         resp_headers.get("vary").unwrap(),
         "X-Accept-Encoding-Mode, Accept-Encoding"
+    );
+}
+
+#[tokio::test]
+async fn test_vary_header_wildcard_preserved_on_compressed_branch() {
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    resp_headers.insert("content-length".to_string(), "1000".to_string());
+    resp_headers.insert("vary".to_string(), "*".to_string());
+
+    plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
+    assert_eq!(resp_headers.get("content-encoding").unwrap(), "gzip");
+    assert_eq!(
+        resp_headers.get("vary").map(String::as_str),
+        Some("*"),
+        "compressed branch must preserve Vary: *"
     );
 }
 

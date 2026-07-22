@@ -1407,21 +1407,23 @@ pub(crate) async fn handle_h3_websocket(
         .cloned()
         .collect();
 
+    let proxy_id_for_relay = proxy.id.clone();
+    // Allocate before building session_meta so framed disconnect hooks receive
+    // the same process-local ID as every on_ws_frame call for this session.
+    let ws_conn_id = state.ws_connection_counter.fetch_add(1, Ordering::Relaxed);
     let session_meta = WsSessionMeta {
         namespace: proxy.namespace.clone(),
         proxy_name: proxy.name.clone(),
         client_ip: ctx.client_ip.clone(),
         backend_target: crate::proxy::strip_query_params(&current_backend_url).to_string(),
         listen_port: h3_listen_port(&state),
+        connection_id: ws_conn_id,
         consumer_username: ctx.effective_identity().map(str::to_owned),
         auth_method: ctx.auth_method,
         metadata: crate::proxy::clone_log_metadata(&ctx),
         session_start: Utc::now(),
         session_start_mono: std::time::Instant::now(),
     };
-
-    let proxy_id_for_relay = proxy.id.clone();
-    let ws_conn_id = state.ws_connection_counter.fetch_add(1, Ordering::Relaxed);
     let max_ws_frame = state.max_websocket_frame_size_bytes;
     let ws_write_buf = state.websocket_write_buffer_size;
     let adaptive_buf = state.adaptive_buffer.clone();

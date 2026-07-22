@@ -1106,6 +1106,7 @@ fn websocket_disconnect_context_feeds_stream_rules() {
         error_class: Some(ErrorClass::ConnectionReset),
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata: Default::default(),
     };
     let observation = parsed.rules[0]
@@ -1154,6 +1155,7 @@ fn websocket_disconnect_cause_distinguishes_client_write_failures() {
         error_class: Some(ErrorClass::ConnectionReset),
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata: Default::default(),
     };
 
@@ -1241,6 +1243,7 @@ fn latency_sentinel_sample_keeps_existing_breach() {
         error_class: None,
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata: Default::default(),
     };
     let first = parsed.rules[0]
@@ -1294,6 +1297,7 @@ fn latency_boundary_threshold_does_not_fire_previous_bucket() {
         error_class: None,
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata: Default::default(),
     };
     let observation = parsed.rules[0]
@@ -1344,6 +1348,7 @@ fn latency_non_boundary_threshold_fires_within_estimated_bucket() {
         error_class: None,
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata: Default::default(),
     };
     let observation = parsed.rules[0]
@@ -1394,6 +1399,7 @@ fn latency_overflow_bucket_reports_configured_max_bound() {
         error_class: None,
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata: Default::default(),
     };
     let observation = parsed.rules[0]
@@ -1644,6 +1650,7 @@ fn stream_duration_percentile_observes_monotonic_producer_duration() {
         error_class: None,
         consumer_username: None,
         auth_method: None,
+        connection_id: 0,
         metadata: Default::default(),
     };
     let ws_observation = parsed.rules[0]
