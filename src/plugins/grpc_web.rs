@@ -1451,6 +1451,7 @@ fn trailing_trailer_suffix_start(data: &[u8]) -> Option<usize> {
 ///
 /// Single O(n) scan: identify the contiguous trailer-frame suffix at EOS and
 /// truncate once. Malformed streams leave `data` untouched and return `false`.
+#[allow(dead_code)] // reached via `_test_support` from the external test crate
 pub(crate) fn truncate_trailing_trailer_frames(data: &mut Vec<u8>) -> bool {
     let Some(start) = trailing_trailer_suffix_start(data) else {
         return false;
