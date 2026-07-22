@@ -1103,16 +1103,11 @@ fn classify_cache_request_family(body: &Value) -> Option<CacheRequestFamily> {
         || object.contains_key("systemInstruction")
         || object.contains_key("system_instruction")
         || object.contains_key("generationConfig");
-    let has_chat_history = object
-        .get("chat_history")
-        .is_some_and(Value::is_array);
+    let has_chat_history = object.get("chat_history").is_some_and(Value::is_array);
     // Cohere v1 current-turn field. Do not treat it as Cohere when a `messages`
     // array is present — that body belongs to the Messages family (OpenAI /
     // Anthropic / Cohere v2).
-    let has_cohere_message = object
-        .get("message")
-        .is_some_and(Value::is_string)
-        && !has_messages;
+    let has_cohere_message = object.get("message").is_some_and(Value::is_string) && !has_messages;
     let has_prompt = object.contains_key("prompt");
     let has_inputs = object.contains_key("inputs");
     let has_titan_markers =
@@ -1350,11 +1345,7 @@ fn append_family_conversation_state(
                             Value::String(_) => key_input.push_str("string;"),
                             Value::Object(object) => {
                                 key_input.push_str("object:");
-                                append_object_state(
-                                    object,
-                                    &["content", "text"],
-                                    key_input,
-                                );
+                                append_object_state(object, &["content", "text"], key_input);
                             }
                             _ => return None,
                         }
