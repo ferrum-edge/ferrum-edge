@@ -1,5 +1,6 @@
 use ferrum_edge::_test_support::{
-    RedisConfig, redis_client_credentials, redis_config_url_with_ip, redis_rate_limit_client_for_test,
+    RedisConfig, redis_client_credentials, redis_config_url_with_ip,
+    redis_rate_limit_client_for_test,
 };
 use serde_json::json;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
