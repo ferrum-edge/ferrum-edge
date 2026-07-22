@@ -942,9 +942,11 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
         headers.get("x-cache-status").map(String::as_str),
         Some("HIT")
     );
-    assert_eq!(
-        headers.get("vary").map(String::as_str),
-        Some("Accept-Encoding")
+    assert!(
+        headers
+            .get("vary")
+            .is_some_and(|vary| vary.eq_ignore_ascii_case("Accept-Encoding")),
+        "cached Vary field-name tokens are case-insensitive"
     );
 
     // Later gzip / br / identity;q=0 requests must miss the identity entry.
