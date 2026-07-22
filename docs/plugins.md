@@ -2422,7 +2422,7 @@ At least one rate window must be configured in every rule. Do not combine the cu
 
 The resolved request client identity canonicalizes IPv4-mapped IPv6 to native IPv4 once before plugin execution. Every local or Redis fallback key therefore uses the same canonical text without reparsing it in each limiter.
 
-**Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`. The limiter key/identity is never exposed: for `limit_by: "consumer"`/`"spiffe_identity"` it would echo the gateway's internal caller identity (consumer username) or the peer workload SVID back to the client.
+**Rate limit headers** (when `expose_headers: true`): `x-ratelimit-limit`, `x-ratelimit-remaining`, `x-ratelimit-window`. Every admitted (counted) request's client-visible response carries them — including gateway-generated responses such as cache hits, response mocks, serverless short-circuits, and rejections raised by plugins that run after `rate_limiting`; requests that never reached the rate-limit check carry no metadata and get no synthesized headers. The limiter key/identity is never exposed: for `limit_by: "consumer"`/`"spiffe_identity"` it would echo the gateway's internal caller identity (consumer username) or the peer workload SVID back to the client.
 
 Returns HTTP `429 Too Many Requests` when exceeded.
 

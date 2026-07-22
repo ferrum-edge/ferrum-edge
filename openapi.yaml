@@ -15976,7 +15976,7 @@ components:
         expose_headers:
           type: boolean
           default: false
-          description: Inject x-ratelimit-* headers on requests and responses
+          description: Inject x-ratelimit-* headers on requests and responses. Every admitted (counted) request's client-visible response carries the headers, including gateway-generated responses such as cache hits, response mocks, serverless short-circuits, and rejections from plugins that run after rate limiting.
         limits:
           type: array
           minItems: 1

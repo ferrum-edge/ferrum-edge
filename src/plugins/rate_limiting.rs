@@ -310,6 +310,21 @@ impl Plugin for RateLimiting {
         PluginResult::Continue
     }
 
+    /// An admitted request records its limit/remaining/window in request
+    /// metadata before later plugins run. Gateway-generated responses that
+    /// still consumed budget — cache hits, response mocks, serverless
+    /// short-circuits, and rejections from plugins later in the lifecycle —
+    /// finalize through the shared synthetic/rejection pipeline, which only
+    /// invokes `after_proxy` for plugins that opt in here. Opt in so every
+    /// counted request's client-visible response carries the configured
+    /// `x-ratelimit-*` telemetry regardless of response origin. The hook
+    /// remains metadata-gated: requests that never reached the rate-limit
+    /// check carry no metadata and get no synthesized headers, and with
+    /// `expose_headers: false` the hook only strips `x-ratelimit-identity`.
+    fn applies_after_proxy_on_reject(&self) -> bool {
+        true
+    }
+
     /// These telemetry writes are unconditional `insert`s of a gateway-computed
     /// value, so a backend that pre-populates the identical bytes makes them
     /// invisible to net-diff mutation tracking. Without this declaration, a

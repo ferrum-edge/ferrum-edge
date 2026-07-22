@@ -1326,3 +1326,206 @@ async fn test_expose_headers_reports_tightest_window() {
     assert_eq!(ctx2.metadata.get("ratelimit_remaining").unwrap(), "1");
     assert_eq!(ctx2.metadata.get("ratelimit_window").unwrap(), "1");
 }
+
+// ─── Gateway-generated (synthetic/rejection) response headers (#2306) ───
+
+#[tokio::test]
+async fn test_applies_after_proxy_on_reject_opted_in() {
+    let plugin = make_rate_limiter(json!({
+        "window_seconds": 60,
+        "max_requests": 10,
+        "limit_by": "ip"
+    }));
+    assert!(
+        plugin.applies_after_proxy_on_reject(),
+        "rate_limiting must opt into the shared synthetic/rejection finalizer"
+    );
+}
+
+/// An admitted request short-circuited by a later plugin (response mock,
+/// cache hit, serverless) with a synthetic success must still receive the
+/// configured x-ratelimit-* headers — the request consumed budget.
+#[tokio::test]
+async fn test_expose_headers_on_later_synthetic_success_response() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    });
+    let plugin = make_rate_limiter(config);
+
+    // The limiter admits and counts the request.
+    let mut ctx = create_test_context();
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_continue(result);
+
+    // A later plugin short-circuits with a synthetic 200 before any backend
+    // call; the shared finalizer must run rate_limiting's after_proxy.
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin)];
+    let finalized = ferrum_edge::_test_support::finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        PluginResult::Reject {
+            status_code: 200,
+            body: "mock body".to_string(),
+            headers: HashMap::new(),
+        },
+    )
+    .await;
+
+    match finalized {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(headers.get("x-ratelimit-limit").unwrap(), "5");
+            assert_eq!(headers.get("x-ratelimit-remaining").unwrap(), "4");
+            assert_eq!(headers.get("x-ratelimit-window").unwrap(), "60");
+            assert!(
+                !headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("x-ratelimit-identity")),
+                "identity header must never appear on synthetic responses: {headers:?}"
+            );
+        }
+        other => panic!("Expected finalized RejectBinary, got {other:?}"),
+    }
+}
+
+/// A rejection raised by a plugin that runs after the limiter counted the
+/// request must carry the same standard headers as a backend response.
+#[tokio::test]
+async fn test_expose_headers_on_later_plugin_rejection_response() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    });
+    let plugin = make_rate_limiter(config);
+
+    let mut ctx = create_test_context();
+    let result = plugin.on_request_received(&mut ctx).await;
+    assert_continue(result);
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin)];
+    let finalized = ferrum_edge::_test_support::finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        PluginResult::Reject {
+            status_code: 403,
+            body: "{\"error\":\"forbidden\"}".to_string(),
+            headers: HashMap::new(),
+        },
+    )
+    .await;
+
+    match finalized {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            ..
+        } => {
+            assert_eq!(status_code, 403);
+            assert_eq!(headers.get("x-ratelimit-limit").unwrap(), "5");
+            assert_eq!(headers.get("x-ratelimit-remaining").unwrap(), "4");
+            assert_eq!(headers.get("x-ratelimit-window").unwrap(), "60");
+        }
+        other => panic!("Expected finalized RejectBinary, got {other:?}"),
+    }
+}
+
+/// Requests that never reached the rate-limit check carry no metadata, so the
+/// rejection finalizer must not synthesize headers for them.
+#[tokio::test]
+async fn test_no_synthesized_headers_when_request_not_counted() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 5,
+        "limit_by": "ip",
+        "expose_headers": true
+    });
+    let plugin = make_rate_limiter(config);
+
+    // This context never goes through the limiter (e.g. an earlier plugin
+    // rejected the request before rate limiting ran).
+    let mut ctx = create_test_context();
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin)];
+    let finalized = ferrum_edge::_test_support::finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        PluginResult::Reject {
+            status_code: 401,
+            body: "{\"error\":\"unauthorized\"}".to_string(),
+            headers: HashMap::new(),
+        },
+    )
+    .await;
+
+    match finalized {
+        PluginResult::RejectBinary { headers, .. } => {
+            for header in [
+                "x-ratelimit-limit",
+                "x-ratelimit-remaining",
+                "x-ratelimit-window",
+                "x-ratelimit-identity",
+            ] {
+                assert!(
+                    !headers.keys().any(|key| key.eq_ignore_ascii_case(header)),
+                    "uncounted request must not carry {header}: {headers:?}"
+                );
+            }
+        }
+        other => panic!("Expected finalized RejectBinary, got {other:?}"),
+    }
+}
+
+/// With expose_headers disabled the reject-path hook still strips a spoofed
+/// x-ratelimit-identity header from gateway-generated responses.
+#[tokio::test]
+async fn test_rejection_path_strips_identity_header_when_expose_disabled() {
+    let config = json!({
+        "window_seconds": 60,
+        "max_requests": 10,
+        "limit_by": "ip",
+        "expose_headers": false
+    });
+    let plugin = make_rate_limiter(config);
+
+    let mut ctx = create_test_context();
+    let mut rejection_headers: HashMap<String, String> = HashMap::new();
+    rejection_headers.insert("X-RateLimit-Identity".to_string(), "ip:spoofed".to_string());
+
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::new(plugin)];
+    let finalized = ferrum_edge::_test_support::finalize_plugin_rejection_for_test(
+        &plugins,
+        &mut ctx,
+        PluginResult::Reject {
+            status_code: 200,
+            body: "mock body".to_string(),
+            headers: rejection_headers,
+        },
+    )
+    .await;
+
+    match finalized {
+        PluginResult::RejectBinary { headers, .. } => {
+            assert!(
+                !headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("x-ratelimit-identity")),
+                "identity header must be stripped on the synthetic path: {headers:?}"
+            );
+            assert!(
+                !headers
+                    .keys()
+                    .any(|key| key.eq_ignore_ascii_case("x-ratelimit-limit")),
+                "expose_headers=false must not inject telemetry headers: {headers:?}"
+            );
+        }
+        other => panic!("Expected finalized RejectBinary, got {other:?}"),
+    }
+}
