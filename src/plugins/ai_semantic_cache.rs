@@ -4,6 +4,13 @@
 //! When the same (or equivalently formatted) prompt arrives again within the TTL,
 //! the cached response is returned immediately without contacting the backend.
 //!
+//! # Request families
+//!
+//! Exact and semantic paths classify each JSON body into one exclusive provider
+//! family (OpenAI Chat / Anthropic Messages, OpenAI Responses, Gemini/Vertex,
+//! Cohere v1, legacy completions, TGI, or Titan). Unknown or ambiguous shapes
+//! bypass caching rather than guessing.
+//!
 //! # v1 — Normalized Exact Match
 //!
 //! Prompts are normalized before hashing:
@@ -155,6 +162,60 @@ const RESPONSE_SHAPE_FIELDS: &[&str] = &[
     "prediction",
     "service_tier",
 ];
+
+/// Provider-native tool / response-shape fields for Gemini / Vertex requests.
+const GEMINI_SHAPE_FIELDS: &[&str] = &[
+    "tools",
+    "toolConfig",
+    "functionDeclarations",
+    "safetySettings",
+];
+
+/// Provider-native tool / response-shape fields for Cohere v1 chat requests.
+const COHERE_SHAPE_FIELDS: &[&str] = &[
+    "tools",
+    "tool_results",
+    "documents",
+    "response_format",
+    "seed",
+];
+
+/// Schema family used for exact-key / semantic-scope / semantic-input extraction.
+///
+/// Classification is exclusive: competing prompt containers make the body
+/// ambiguous and deliberately bypass caching rather than guessing a family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheRequestFamily {
+    /// OpenAI Chat Completions and Anthropic Messages (`messages` + optional
+    /// top-level `system` / `preamble`).
+    Messages,
+    /// OpenAI Responses API (`input` / `instructions` / `previous_response_id`).
+    Responses,
+    /// Google Gemini / Vertex (`contents` + optional `systemInstruction`).
+    Gemini,
+    /// Cohere v1 chat (`chat_history` / `message` + optional `preamble`).
+    Cohere,
+    /// Legacy text completions (`prompt`).
+    LegacyPrompt,
+    /// Hugging Face TGI / text-generation (`inputs`).
+    Tgi,
+    /// Amazon Titan text-generation (`inputText`).
+    Titan,
+}
+
+impl CacheRequestFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::Responses => "responses",
+            Self::Gemini => "gemini",
+            Self::Cohere => "cohere",
+            Self::LegacyPrompt => "legacy_prompt",
+            Self::Tgi => "tgi",
+            Self::Titan => "titan",
+        }
+    }
+}
 
 /// A cached LLM response.
 #[derive(Clone)]
@@ -536,84 +597,37 @@ impl AiSemanticCache {
     /// Build a normalized cache key from the request body.
     ///
     /// Normalization steps:
-    /// 1. Parse the JSON request body
+    /// 1. Classify the JSON body into an exclusive provider request family
     /// 2. Optionally scope by proxy and authenticated consumer
-    /// 3. Optionally include model name and sampling parameters
-    /// 4. Lowercase and collapse whitespace in `messages[*].content`
-    /// 5. Include hashed fingerprints for non-text multimodal content parts
-    /// 6. Include the Anthropic top-level `system` prompt (string or array form)
-    /// 7. Include `tools` / `tool_choice` / `response_format` / `seed` /
-    ///    `logit_bias` / `stream` when present — any change to these fields
-    ///    materially changes the response and must not collapse to the same key
+    /// 3. Optionally include model name and family-correct generation controls
+    /// 4. Canonicalize family-correct prompt text (lowercase + collapse whitespace)
+    /// 5. Include hashed fingerprints for non-text multimodal / native tool blocks
+    /// 6. Include family instruction state (`system`, `instructions`,
+    ///    `systemInstruction`, `preamble`, `previous_response_id`, ...)
+    /// 7. Include family tool / response-shape fields and `stream` when present
     /// 8. SHA-256 hash the normalized representation
+    ///
+    /// Unknown or ambiguous shapes return `None` so the request bypasses caching.
     fn build_cache_key(
         &self,
         ctx: &RequestContext,
         body: &Value,
         multimodal_fingerprint: Option<&str>,
     ) -> Option<String> {
+        let family = classify_cache_request_family(body)?;
         let mut key_input = String::with_capacity(512);
         let mut has_part = false;
 
-        // Proxy scope
-        if let Some(ref proxy) = ctx.matched_proxy {
-            start_key_part(&mut key_input, &mut has_part);
-            key_input.push_str(&proxy.id);
-        }
-
-        // Consumer scope
-        if self.scope_by_consumer
-            && let Some(identity) = ctx.effective_identity()
-        {
-            start_key_part(&mut key_input, &mut has_part);
-            let _ = write!(&mut key_input, "{identity}");
-        }
-
-        // Model
-        if self.include_model_in_key
-            && let Some(model) = body.get("model").and_then(|m| m.as_str())
-        {
-            start_key_part(&mut key_input, &mut has_part);
-            key_input.push_str("m:");
-            push_ascii_lowercase(&mut key_input, model);
-        }
-
-        // Sampling parameters
-        if self.include_params_in_key {
-            if let Some(temp) = body.get("temperature") {
-                start_key_part(&mut key_input, &mut has_part);
-                key_input.push_str("t:");
-                key_input.push_str(&canonical_param_value(temp));
-            }
-            if let Some(top_p) = body.get("top_p") {
-                start_key_part(&mut key_input, &mut has_part);
-                key_input.push_str("p:");
-                key_input.push_str(&canonical_param_value(top_p));
-            }
-            if let Some(max_tokens) = body.get("max_tokens").and_then(|t| t.as_u64()) {
-                start_key_part(&mut key_input, &mut has_part);
-                let _ = write!(&mut key_input, "mt:{max_tokens}");
-            }
-        }
-
-        // Messages — the core of the cache key
-        let messages = body.get("messages").and_then(|m| m.as_array())?;
-        start_key_part(&mut key_input, &mut has_part);
-        for (index, msg) in messages.iter().enumerate() {
-            if index > 0 {
-                key_input.push('|');
-            }
-            let role = msg
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("unknown");
-            let content = self.extract_message_content(msg);
-            key_input.push_str(role);
-            key_input.push(':');
-            key_input.push_str(&content);
-        }
-        // Message order matters for conversation context, so preserve it and
-        // normalize content only within each message.
+        append_identity_key_parts(
+            self,
+            ctx,
+            body,
+            family,
+            &mut key_input,
+            &mut has_part,
+        );
+        append_family_prompt_exact_key(family, body, &mut key_input, &mut has_part)?;
+        append_family_instruction_exact_key(family, body, &mut key_input, &mut has_part);
 
         if let Some(fingerprint) = multimodal_fingerprint {
             start_key_part(&mut key_input, &mut has_part);
@@ -621,72 +635,10 @@ impl AiSemanticCache {
             key_input.push_str(fingerprint);
         }
 
-        // Top-level `system` prompt (Anthropic Messages API). Included AFTER
-        // the messages section so two requests that differ only in their
-        // system prompt cannot collapse to the same cache key. Anthropic
-        // accepts either a string or an array of content blocks (e.g.
-        // `[{"type": "text", "text": "..."}]`); we normalize both forms here.
-        if let Some(system) = body.get("system") {
-            let normalized = normalize_system_value(system);
-            start_key_part(&mut key_input, &mut has_part);
-            key_input.push_str("sys:");
-            key_input.push_str(&normalized);
-        }
+        append_family_shape_fields(family, body, &mut key_input, &mut has_part);
 
-        // Other request fields that materially change the response shape or
-        // selection. Including these prevents cross-prompt poisoning where two
-        // distinct requests differing only in tool/format/seed/logit-bias/stream
-        // configuration would collapse to the same cache entry. We use the
-        // canonical JSON serialization (sort_keys not required at this level
-        // because it's the user-supplied payload) so any byte-level change
-        // breaks the key.
-        for field in RESPONSE_SHAPE_FIELDS {
-            if let Some(value) = body.get(field) {
-                start_key_part(&mut key_input, &mut has_part);
-                key_input.push_str(field);
-                key_input.push(':');
-                let _ = write!(&mut key_input, "{value}");
-            }
-        }
-
-        // `stream`: stream:true and stream:false produce different wire
-        // formats (SSE vs single JSON), so cached non-stream responses must
-        // not be replayed to a stream:true caller (or vice versa). We don't
-        // actually cache SSE responses (see `on_final_response_body`), but
-        // including this prevents a non-streaming MISS-then-store from being
-        // served to a streaming client whose stored entry would be wrongly
-        // formatted.
-        if let Some(stream) = body.get("stream").and_then(|s| s.as_bool()) {
-            start_key_part(&mut key_input, &mut has_part);
-            let _ = write!(&mut key_input, "stream:{stream}");
-        }
-
-        // Hash the key parts into a fixed-size cache key
         let hash = Sha256::digest(key_input.as_bytes());
         Some(hex::encode(hash))
-    }
-
-    /// Extract and normalize message content text.
-    fn extract_message_content(&self, msg: &Value) -> String {
-        let raw = if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
-            content.to_string()
-        } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
-            // Multimodal: extract text parts only
-            let mut texts = Vec::new();
-            for part in parts {
-                if part.get("type").and_then(|t| t.as_str()) == Some("text")
-                    && let Some(text) = part.get("text").and_then(|t| t.as_str())
-                {
-                    texts.push(text.to_string());
-                }
-            }
-            texts.join(" ")
-        } else {
-            String::new()
-        };
-
-        // Normalize: lowercase and collapse whitespace
-        normalize_text(&raw)
     }
 
     fn build_semantic_scope_key(
@@ -695,91 +647,20 @@ impl AiSemanticCache {
         body: &Value,
         multimodal_fingerprint: Option<&str>,
     ) -> Option<String> {
-        let messages = body.get("messages").and_then(|m| m.as_array())?;
+        let family = classify_cache_request_family(body)?;
         let mut key_input = String::with_capacity(512);
         let mut has_part = false;
 
-        if let Some(ref proxy) = ctx.matched_proxy {
-            start_key_part(&mut key_input, &mut has_part);
-            key_input.push_str(&proxy.id);
-        }
-
-        if self.scope_by_consumer
-            && let Some(identity) = ctx.effective_identity()
-        {
-            start_key_part(&mut key_input, &mut has_part);
-            let _ = write!(&mut key_input, "{identity}");
-        }
-
-        if self.include_model_in_key
-            && let Some(model) = body.get("model").and_then(|m| m.as_str())
-        {
-            start_key_part(&mut key_input, &mut has_part);
-            key_input.push_str("m:");
-            push_ascii_lowercase(&mut key_input, model);
-        }
-
-        if self.include_params_in_key {
-            if let Some(temp) = body.get("temperature") {
-                start_key_part(&mut key_input, &mut has_part);
-                key_input.push_str("t:");
-                key_input.push_str(&canonical_param_value(temp));
-            }
-            if let Some(top_p) = body.get("top_p") {
-                start_key_part(&mut key_input, &mut has_part);
-                key_input.push_str("p:");
-                key_input.push_str(&canonical_param_value(top_p));
-            }
-            if let Some(max_tokens) = body.get("max_tokens").and_then(|t| t.as_u64()) {
-                start_key_part(&mut key_input, &mut has_part);
-                let _ = write!(&mut key_input, "mt:{max_tokens}");
-            }
-        }
-
-        start_key_part(&mut key_input, &mut has_part);
-        key_input.push_str("roles:");
-        for (index, msg) in messages.iter().enumerate() {
-            if index > 0 {
-                key_input.push('|');
-            }
-            let role = msg
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("unknown");
-            push_ascii_lowercase(&mut key_input, role);
-        }
-
-        let mut has_instruction_message = false;
-        for msg in messages {
-            let role = msg
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("unknown");
-            if !matches!(role.to_ascii_lowercase().as_str(), "system" | "developer") {
-                continue;
-            }
-            let content = self.extract_message_content(msg);
-            if content.is_empty() {
-                continue;
-            }
-            if !has_instruction_message {
-                start_key_part(&mut key_input, &mut has_part);
-                key_input.push_str("instructions:");
-                has_instruction_message = true;
-            } else {
-                key_input.push('|');
-            }
-            push_ascii_lowercase(&mut key_input, role);
-            key_input.push(':');
-            let hash = Sha256::digest(content.as_bytes());
-            key_input.push_str(&hex::encode(hash));
-        }
-
-        if let Some(system) = body.get("system") {
-            start_key_part(&mut key_input, &mut has_part);
-            key_input.push_str("sys:");
-            key_input.push_str(&normalize_system_value(system));
-        }
+        append_identity_key_parts(
+            self,
+            ctx,
+            body,
+            family,
+            &mut key_input,
+            &mut has_part,
+        );
+        append_family_semantic_role_scope(family, body, &mut key_input, &mut has_part)?;
+        append_family_instruction_scope(family, body, &mut key_input, &mut has_part);
 
         if let Some(fingerprint) = multimodal_fingerprint {
             start_key_part(&mut key_input, &mut has_part);
@@ -787,40 +668,20 @@ impl AiSemanticCache {
             key_input.push_str(fingerprint);
         }
 
-        append_response_shape_fields(body, &mut key_input, &mut has_part);
+        append_family_shape_fields(family, body, &mut key_input, &mut has_part);
 
         let hash = Sha256::digest(key_input.as_bytes());
         Some(hex::encode(hash))
     }
 
+    /// Build the embedding input from family-correct user/prompt text only.
+    ///
+    /// Instruction, tool, model, and generation-control state stay in the
+    /// semantic scope key so similar prompts cannot cross incompatible
+    /// policy/output contexts.
     fn build_semantic_input(&self, body: &Value) -> Option<String> {
-        let messages = body.get("messages").and_then(|m| m.as_array())?;
-        let mut input = String::with_capacity(512);
-
-        if let Some(system) = body.get("system") {
-            let system = normalize_system_value(system);
-            if !system.is_empty() {
-                input.push_str("system: ");
-                input.push_str(&system);
-                input.push('\n');
-            }
-        }
-
-        for msg in messages {
-            let role = msg
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("unknown");
-            let content = self.extract_message_content(msg);
-            if content.is_empty() {
-                continue;
-            }
-            push_ascii_lowercase(&mut input, role);
-            input.push_str(": ");
-            input.push_str(&content);
-            input.push('\n');
-        }
-
+        let family = classify_cache_request_family(body)?;
+        let input = build_family_semantic_input(family, body)?;
         let normalized = input.trim();
         if normalized.is_empty() {
             None
@@ -1228,6 +1089,795 @@ fn start_key_part(buffer: &mut String, has_part: &mut bool) {
     }
 }
 
+/// Classify a request body into exactly one supported cache family.
+///
+/// Returns `None` for unknown shapes and for bodies that simultaneously claim
+/// multiple exclusive prompt containers (for example both `messages` and
+/// `contents`). Callers must bypass caching rather than guess.
+fn classify_cache_request_family(body: &Value) -> Option<CacheRequestFamily> {
+    let object = body.as_object()?;
+
+    let has_messages = object
+        .get("messages")
+        .is_some_and(|value| value.is_array());
+    let has_contents = object.contains_key("contents");
+    let has_chat_history = object.contains_key("chat_history");
+    // Cohere v1 current-turn field. Do not treat it as Cohere when a `messages`
+    // array is present — that body belongs to the Messages family (OpenAI /
+    // Anthropic / Cohere v2).
+    let has_cohere_message = object.contains_key("message") && !has_messages;
+    let has_prompt = object.contains_key("prompt");
+    let has_inputs = object.contains_key("inputs");
+    let has_input_text = object.contains_key("inputText");
+    let has_responses_markers = object.contains_key("input")
+        || object.contains_key("instructions")
+        || object.contains_key("previous_response_id");
+    // Responses markers only claim the Responses family when no chat `messages`
+    // array is present (mirroring `ai_request_guard::is_responses_shape`).
+    // A body that mixes `messages` with Responses markers is ambiguous and
+    // bypasses rather than guessing Chat vs Responses.
+    if has_messages && has_responses_markers {
+        return None;
+    }
+    let has_responses = !has_messages && has_responses_markers;
+
+    let mut family = None;
+    let mut set_family = |candidate: CacheRequestFamily| -> bool {
+        if family.is_some_and(|existing| existing != candidate) {
+            return false;
+        }
+        family = Some(candidate);
+        true
+    };
+
+    if has_messages && !set_family(CacheRequestFamily::Messages) {
+        return None;
+    }
+    if has_responses && !set_family(CacheRequestFamily::Responses) {
+        return None;
+    }
+    if has_contents && !set_family(CacheRequestFamily::Gemini) {
+        return None;
+    }
+    if (has_chat_history || has_cohere_message) && !set_family(CacheRequestFamily::Cohere) {
+        return None;
+    }
+    if has_prompt && !set_family(CacheRequestFamily::LegacyPrompt) {
+        return None;
+    }
+    if has_inputs && !set_family(CacheRequestFamily::Tgi) {
+        return None;
+    }
+    if has_input_text && !set_family(CacheRequestFamily::Titan) {
+        return None;
+    }
+
+    family
+}
+
+fn append_identity_key_parts(
+    plugin: &AiSemanticCache,
+    ctx: &RequestContext,
+    body: &Value,
+    family: CacheRequestFamily,
+    key_input: &mut String,
+    has_part: &mut bool,
+) {
+    start_key_part(key_input, has_part);
+    key_input.push_str("fam:");
+    key_input.push_str(family.as_str());
+
+    if let Some(ref proxy) = ctx.matched_proxy {
+        start_key_part(key_input, has_part);
+        key_input.push_str(&proxy.id);
+    }
+
+    if plugin.scope_by_consumer
+        && let Some(identity) = ctx.effective_identity()
+    {
+        start_key_part(key_input, has_part);
+        let _ = write!(key_input, "{identity}");
+    }
+
+    if plugin.include_model_in_key
+        && let Some(model) = body.get("model").and_then(|m| m.as_str())
+    {
+        start_key_part(key_input, has_part);
+        key_input.push_str("m:");
+        push_ascii_lowercase(key_input, model);
+    }
+
+    if plugin.include_params_in_key {
+        append_family_generation_controls(family, body, key_input, has_part);
+    }
+}
+
+fn append_json_field(
+    body: &Value,
+    field: &str,
+    key_input: &mut String,
+    has_part: &mut bool,
+) {
+    if let Some(value) = body.get(field) {
+        start_key_part(key_input, has_part);
+        key_input.push_str(field);
+        key_input.push(':');
+        let _ = write!(key_input, "{value}");
+    }
+}
+
+fn append_family_generation_controls(
+    family: CacheRequestFamily,
+    body: &Value,
+    key_input: &mut String,
+    has_part: &mut bool,
+) {
+    match family {
+        CacheRequestFamily::Messages
+        | CacheRequestFamily::Responses
+        | CacheRequestFamily::Cohere
+        | CacheRequestFamily::LegacyPrompt => {
+            if let Some(temp) = body.get("temperature") {
+                start_key_part(key_input, has_part);
+                key_input.push_str("t:");
+                key_input.push_str(&canonical_param_value(temp));
+            }
+            let top_p = if matches!(family, CacheRequestFamily::Cohere) {
+                body.get("top_p").or_else(|| body.get("p"))
+            } else {
+                body.get("top_p")
+            };
+            if let Some(top_p) = top_p {
+                start_key_part(key_input, has_part);
+                key_input.push_str("p:");
+                key_input.push_str(&canonical_param_value(top_p));
+            }
+            for (field, prefix) in [
+                ("max_tokens", "mt"),
+                ("max_completion_tokens", "mct"),
+                ("max_output_tokens", "mot"),
+                ("max_new_tokens", "mnt"),
+            ] {
+                if let Some(max_tokens) = body.get(field).and_then(|t| t.as_u64()) {
+                    start_key_part(key_input, has_part);
+                    let _ = write!(key_input, "{prefix}:{max_tokens}");
+                }
+            }
+            if matches!(family, CacheRequestFamily::Messages) {
+                append_json_field(body, "inferenceConfig", key_input, has_part);
+            }
+        }
+        CacheRequestFamily::Gemini => {
+            append_json_field(body, "generationConfig", key_input, has_part);
+        }
+        CacheRequestFamily::Tgi => {
+            append_json_field(body, "parameters", key_input, has_part);
+        }
+        CacheRequestFamily::Titan => {
+            append_json_field(body, "textGenerationConfig", key_input, has_part);
+        }
+    }
+}
+
+fn append_family_shape_fields(
+    family: CacheRequestFamily,
+    body: &Value,
+    key_input: &mut String,
+    has_part: &mut bool,
+) {
+    match family {
+        CacheRequestFamily::Messages
+        | CacheRequestFamily::Responses
+        | CacheRequestFamily::LegacyPrompt => {
+            for field in RESPONSE_SHAPE_FIELDS {
+                append_json_field(body, field, key_input, has_part);
+            }
+        }
+        CacheRequestFamily::Gemini => {
+            for field in GEMINI_SHAPE_FIELDS {
+                append_json_field(body, field, key_input, has_part);
+            }
+        }
+        CacheRequestFamily::Cohere => {
+            for field in COHERE_SHAPE_FIELDS {
+                append_json_field(body, field, key_input, has_part);
+            }
+        }
+        CacheRequestFamily::Tgi | CacheRequestFamily::Titan => {}
+    }
+
+    // `stream`: stream:true and stream:false produce different wire formats
+    // (SSE vs single JSON), so cached non-stream responses must not be
+    // replayed to a stream:true caller (or vice versa).
+    if let Some(stream) = body.get("stream").and_then(|s| s.as_bool()) {
+        start_key_part(key_input, has_part);
+        let _ = write!(key_input, "stream:{stream}");
+    }
+}
+
+fn extract_message_content(msg: &Value) -> String {
+    let raw = if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+        content.to_string()
+    } else if let Some(parts) = msg.get("content").and_then(|c| c.as_array()) {
+        let mut texts = Vec::new();
+        for part in parts {
+            if is_openai_text_content_part(part)
+                && let Some(text) = part.get("text").and_then(|t| t.as_str())
+            {
+                texts.push(text);
+            }
+        }
+        texts.join(" ")
+    } else {
+        String::new()
+    };
+    normalize_text(&raw)
+}
+
+fn extract_gemini_parts_text(parts: &[Value]) -> String {
+    let mut texts = Vec::new();
+    for part in parts {
+        if is_gemini_text_part(part)
+            && let Some(text) = part.get("text").and_then(|t| t.as_str())
+        {
+            texts.push(text);
+        }
+    }
+    normalize_text(&texts.join(" "))
+}
+
+fn extract_responses_input_text(input: &Value) -> String {
+    match input {
+        Value::String(text) => normalize_text(text),
+        Value::Array(items) => {
+            let mut texts = Vec::new();
+            for item in items {
+                push_responses_item_text(item, &mut texts);
+            }
+            normalize_text(&texts.join(" "))
+        }
+        Value::Object(_) => {
+            let mut texts = Vec::new();
+            push_responses_item_text(input, &mut texts);
+            normalize_text(&texts.join(" "))
+        }
+        _ => String::new(),
+    }
+}
+
+fn push_responses_item_text(item: &Value, texts: &mut Vec<&str>) {
+    if let Some(text) = item.as_str() {
+        texts.push(text);
+        return;
+    }
+    let Some(object) = item.as_object() else {
+        return;
+    };
+
+    if let Some(text) = object.get("content").and_then(|c| c.as_str()) {
+        texts.push(text);
+    } else if let Some(parts) = object.get("content").and_then(|c| c.as_array()) {
+        for part in parts {
+            if is_openai_text_content_part(part)
+                && let Some(text) = part.get("text").and_then(|t| t.as_str())
+            {
+                texts.push(text);
+            } else if part.get("type").and_then(|t| t.as_str()) == Some("input_text")
+                && let Some(text) = part.get("text").and_then(|t| t.as_str())
+            {
+                texts.push(text);
+            }
+        }
+    }
+
+    if let Some(text) = object.get("text").and_then(|t| t.as_str()) {
+        let item_type = object.get("type").and_then(|t| t.as_str());
+        if item_type.is_none()
+            || matches!(item_type, Some("input_text" | "text" | "output_text"))
+        {
+            texts.push(text);
+        }
+    }
+}
+
+fn append_family_prompt_exact_key(
+    family: CacheRequestFamily,
+    body: &Value,
+    key_input: &mut String,
+    has_part: &mut bool,
+) -> Option<()> {
+    match family {
+        CacheRequestFamily::Messages => {
+            let messages = body.get("messages").and_then(|m| m.as_array())?;
+            start_key_part(key_input, has_part);
+            for (index, msg) in messages.iter().enumerate() {
+                if index > 0 {
+                    key_input.push('|');
+                }
+                let role = msg
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("unknown");
+                let content = extract_message_content(msg);
+                key_input.push_str(role);
+                key_input.push(':');
+                key_input.push_str(&content);
+            }
+            Some(())
+        }
+        CacheRequestFamily::Responses => {
+            start_key_part(key_input, has_part);
+            key_input.push_str("input:");
+            if let Some(input) = body.get("input") {
+                key_input.push_str(&extract_responses_input_text(input));
+            }
+            Some(())
+        }
+        CacheRequestFamily::Gemini => {
+            let contents = body.get("contents").and_then(|c| c.as_array())?;
+            start_key_part(key_input, has_part);
+            for (index, content) in contents.iter().enumerate() {
+                if index > 0 {
+                    key_input.push('|');
+                }
+                let role = content
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("user");
+                let text = content
+                    .get("parts")
+                    .and_then(|p| p.as_array())
+                    .map(|parts| extract_gemini_parts_text(parts))
+                    .unwrap_or_default();
+                key_input.push_str(role);
+                key_input.push(':');
+                key_input.push_str(&text);
+            }
+            Some(())
+        }
+        CacheRequestFamily::Cohere => {
+            start_key_part(key_input, has_part);
+            let mut wrote = false;
+            if let Some(history) = body.get("chat_history").and_then(|h| h.as_array()) {
+                for msg in history {
+                    if wrote {
+                        key_input.push('|');
+                    }
+                    let role = msg
+                        .get("role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("unknown");
+                    let content = msg
+                        .get("message")
+                        .or_else(|| msg.get("content"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    key_input.push_str(role);
+                    key_input.push(':');
+                    key_input.push_str(&normalize_text(content));
+                    wrote = true;
+                }
+            }
+            if let Some(message) = body.get("message").and_then(|m| m.as_str()) {
+                if wrote {
+                    key_input.push('|');
+                }
+                key_input.push_str("user:");
+                key_input.push_str(&normalize_text(message));
+            }
+            Some(())
+        }
+        CacheRequestFamily::LegacyPrompt => {
+            let prompt = body.get("prompt")?;
+            start_key_part(key_input, has_part);
+            key_input.push_str("prompt:");
+            key_input.push_str(&normalize_prompt_value(prompt));
+            Some(())
+        }
+        CacheRequestFamily::Tgi => {
+            let inputs = body.get("inputs")?;
+            start_key_part(key_input, has_part);
+            key_input.push_str("inputs:");
+            key_input.push_str(&normalize_prompt_value(inputs));
+            Some(())
+        }
+        CacheRequestFamily::Titan => {
+            let input_text = body.get("inputText").and_then(|v| v.as_str())?;
+            start_key_part(key_input, has_part);
+            key_input.push_str("inputText:");
+            key_input.push_str(&normalize_text(input_text));
+            Some(())
+        }
+    }
+}
+
+fn append_family_instruction_exact_key(
+    family: CacheRequestFamily,
+    body: &Value,
+    key_input: &mut String,
+    has_part: &mut bool,
+) {
+    match family {
+        CacheRequestFamily::Messages => {
+            if let Some(system) = body.get("system") {
+                start_key_part(key_input, has_part);
+                key_input.push_str("sys:");
+                key_input.push_str(&normalize_system_value(system));
+            }
+            if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
+                start_key_part(key_input, has_part);
+                key_input.push_str("preamble:");
+                key_input.push_str(&normalize_text(preamble));
+            }
+        }
+        CacheRequestFamily::Responses => {
+            if let Some(instructions) = body.get("instructions") {
+                start_key_part(key_input, has_part);
+                key_input.push_str("instructions:");
+                key_input.push_str(&normalize_prompt_value(instructions));
+            }
+            if let Some(previous) = body.get("previous_response_id").and_then(|v| v.as_str()) {
+                start_key_part(key_input, has_part);
+                key_input.push_str("previous_response_id:");
+                key_input.push_str(previous);
+            }
+        }
+        CacheRequestFamily::Gemini => {
+            for field in ["systemInstruction", "system_instruction"] {
+                if let Some(system) = body.get(field) {
+                    start_key_part(key_input, has_part);
+                    key_input.push_str(field);
+                    key_input.push(':');
+                    key_input.push_str(&normalize_gemini_instruction(system));
+                }
+            }
+        }
+        CacheRequestFamily::Cohere => {
+            if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
+                start_key_part(key_input, has_part);
+                key_input.push_str("preamble:");
+                key_input.push_str(&normalize_text(preamble));
+            }
+        }
+        CacheRequestFamily::LegacyPrompt
+        | CacheRequestFamily::Tgi
+        | CacheRequestFamily::Titan => {}
+    }
+}
+
+fn append_family_semantic_role_scope(
+    family: CacheRequestFamily,
+    body: &Value,
+    key_input: &mut String,
+    has_part: &mut bool,
+) -> Option<()> {
+    match family {
+        CacheRequestFamily::Messages => {
+            let messages = body.get("messages").and_then(|m| m.as_array())?;
+            start_key_part(key_input, has_part);
+            key_input.push_str("roles:");
+            for (index, msg) in messages.iter().enumerate() {
+                if index > 0 {
+                    key_input.push('|');
+                }
+                let role = msg
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("unknown");
+                push_ascii_lowercase(key_input, role);
+            }
+            Some(())
+        }
+        CacheRequestFamily::Gemini => {
+            let contents = body.get("contents").and_then(|c| c.as_array())?;
+            start_key_part(key_input, has_part);
+            key_input.push_str("roles:");
+            for (index, content) in contents.iter().enumerate() {
+                if index > 0 {
+                    key_input.push('|');
+                }
+                let role = content
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("user");
+                push_ascii_lowercase(key_input, role);
+            }
+            Some(())
+        }
+        CacheRequestFamily::Cohere => {
+            start_key_part(key_input, has_part);
+            key_input.push_str("roles:");
+            let mut wrote = false;
+            if let Some(history) = body.get("chat_history").and_then(|h| h.as_array()) {
+                for msg in history {
+                    if wrote {
+                        key_input.push('|');
+                    }
+                    let role = msg
+                        .get("role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("unknown");
+                    push_ascii_lowercase(key_input, role);
+                    wrote = true;
+                }
+            }
+            if body.get("message").and_then(|m| m.as_str()).is_some() {
+                if wrote {
+                    key_input.push('|');
+                }
+                key_input.push_str("user");
+            }
+            Some(())
+        }
+        CacheRequestFamily::Responses => {
+            start_key_part(key_input, has_part);
+            key_input.push_str("roles:input");
+            Some(())
+        }
+        CacheRequestFamily::LegacyPrompt => {
+            start_key_part(key_input, has_part);
+            key_input.push_str("roles:prompt");
+            Some(())
+        }
+        CacheRequestFamily::Tgi => {
+            start_key_part(key_input, has_part);
+            key_input.push_str("roles:inputs");
+            Some(())
+        }
+        CacheRequestFamily::Titan => {
+            start_key_part(key_input, has_part);
+            key_input.push_str("roles:inputText");
+            Some(())
+        }
+    }
+}
+
+fn append_family_instruction_scope(
+    family: CacheRequestFamily,
+    body: &Value,
+    key_input: &mut String,
+    has_part: &mut bool,
+) {
+    match family {
+        CacheRequestFamily::Messages => {
+            if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+                let mut has_instruction_message = false;
+                for msg in messages {
+                    let role = msg
+                        .get("role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("unknown");
+                    if !matches!(role.to_ascii_lowercase().as_str(), "system" | "developer") {
+                        continue;
+                    }
+                    let content = extract_message_content(msg);
+                    if content.is_empty() {
+                        continue;
+                    }
+                    if !has_instruction_message {
+                        start_key_part(key_input, has_part);
+                        key_input.push_str("instructions:");
+                        has_instruction_message = true;
+                    } else {
+                        key_input.push('|');
+                    }
+                    push_ascii_lowercase(key_input, role);
+                    key_input.push(':');
+                    let hash = Sha256::digest(content.as_bytes());
+                    key_input.push_str(&hex::encode(hash));
+                }
+            }
+            if let Some(system) = body.get("system") {
+                start_key_part(key_input, has_part);
+                key_input.push_str("sys:");
+                key_input.push_str(&normalize_system_value(system));
+            }
+            if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
+                start_key_part(key_input, has_part);
+                key_input.push_str("preamble:");
+                key_input.push_str(&normalize_text(preamble));
+            }
+        }
+        CacheRequestFamily::Responses => {
+            if let Some(instructions) = body.get("instructions") {
+                let normalized = normalize_prompt_value(instructions);
+                if !normalized.is_empty() {
+                    start_key_part(key_input, has_part);
+                    key_input.push_str("instructions:");
+                    let hash = Sha256::digest(normalized.as_bytes());
+                    key_input.push_str(&hex::encode(hash));
+                }
+            }
+            if let Some(previous) = body.get("previous_response_id").and_then(|v| v.as_str()) {
+                start_key_part(key_input, has_part);
+                key_input.push_str("previous_response_id:");
+                key_input.push_str(previous);
+            }
+        }
+        CacheRequestFamily::Gemini => {
+            for field in ["systemInstruction", "system_instruction"] {
+                if let Some(system) = body.get(field) {
+                    let normalized = normalize_gemini_instruction(system);
+                    if normalized.is_empty() {
+                        continue;
+                    }
+                    start_key_part(key_input, has_part);
+                    key_input.push_str(field);
+                    key_input.push(':');
+                    let hash = Sha256::digest(normalized.as_bytes());
+                    key_input.push_str(&hex::encode(hash));
+                }
+            }
+        }
+        CacheRequestFamily::Cohere => {
+            if let Some(preamble) = body.get("preamble").and_then(|v| v.as_str()) {
+                let normalized = normalize_text(preamble);
+                if !normalized.is_empty() {
+                    start_key_part(key_input, has_part);
+                    key_input.push_str("preamble:");
+                    let hash = Sha256::digest(normalized.as_bytes());
+                    key_input.push_str(&hex::encode(hash));
+                }
+            }
+        }
+        CacheRequestFamily::LegacyPrompt
+        | CacheRequestFamily::Tgi
+        | CacheRequestFamily::Titan => {}
+    }
+}
+
+fn build_family_semantic_input(family: CacheRequestFamily, body: &Value) -> Option<String> {
+    let mut input = String::with_capacity(512);
+    match family {
+        CacheRequestFamily::Messages => {
+            let messages = body.get("messages").and_then(|m| m.as_array())?;
+            for msg in messages {
+                let role = msg
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("unknown");
+                if matches!(role.to_ascii_lowercase().as_str(), "system" | "developer") {
+                    continue;
+                }
+                let content = extract_message_content(msg);
+                if content.is_empty() {
+                    continue;
+                }
+                push_ascii_lowercase(&mut input, role);
+                input.push_str(": ");
+                input.push_str(&content);
+                input.push('\n');
+            }
+        }
+        CacheRequestFamily::Responses => {
+            if let Some(raw) = body.get("input") {
+                let text = extract_responses_input_text(raw);
+                if !text.is_empty() {
+                    input.push_str("input: ");
+                    input.push_str(&text);
+                    input.push('\n');
+                }
+            }
+        }
+        CacheRequestFamily::Gemini => {
+            let contents = body.get("contents").and_then(|c| c.as_array())?;
+            for content in contents {
+                let role = content
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .unwrap_or("user");
+                let text = content
+                    .get("parts")
+                    .and_then(|p| p.as_array())
+                    .map(|parts| extract_gemini_parts_text(parts))
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    continue;
+                }
+                push_ascii_lowercase(&mut input, role);
+                input.push_str(": ");
+                input.push_str(&text);
+                input.push('\n');
+            }
+        }
+        CacheRequestFamily::Cohere => {
+            if let Some(history) = body.get("chat_history").and_then(|h| h.as_array()) {
+                for msg in history {
+                    let role = msg
+                        .get("role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("unknown");
+                    if role.eq_ignore_ascii_case("system") {
+                        continue;
+                    }
+                    let content = msg
+                        .get("message")
+                        .or_else(|| msg.get("content"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    let normalized = normalize_text(content);
+                    if normalized.is_empty() {
+                        continue;
+                    }
+                    push_ascii_lowercase(&mut input, role);
+                    input.push_str(": ");
+                    input.push_str(&normalized);
+                    input.push('\n');
+                }
+            }
+            if let Some(message) = body.get("message").and_then(|m| m.as_str()) {
+                let normalized = normalize_text(message);
+                if !normalized.is_empty() {
+                    input.push_str("user: ");
+                    input.push_str(&normalized);
+                    input.push('\n');
+                }
+            }
+        }
+        CacheRequestFamily::LegacyPrompt => {
+            let prompt = normalize_prompt_value(body.get("prompt")?);
+            if !prompt.is_empty() {
+                input.push_str("prompt: ");
+                input.push_str(&prompt);
+                input.push('\n');
+            }
+        }
+        CacheRequestFamily::Tgi => {
+            let inputs = normalize_prompt_value(body.get("inputs")?);
+            if !inputs.is_empty() {
+                input.push_str("inputs: ");
+                input.push_str(&inputs);
+                input.push('\n');
+            }
+        }
+        CacheRequestFamily::Titan => {
+            let input_text = body.get("inputText").and_then(|v| v.as_str())?;
+            let normalized = normalize_text(input_text);
+            if !normalized.is_empty() {
+                input.push_str("inputText: ");
+                input.push_str(&normalized);
+                input.push('\n');
+            }
+        }
+    }
+
+    if input.trim().is_empty() {
+        None
+    } else {
+        Some(input)
+    }
+}
+
+fn normalize_prompt_value(value: &Value) -> String {
+    match value {
+        Value::String(text) => normalize_text(text),
+        Value::Array(items) => {
+            let mut texts = Vec::with_capacity(items.len());
+            for item in items {
+                match item {
+                    Value::String(text) => texts.push(normalize_text(text)),
+                    other => texts.push(normalize_text(&other.to_string())),
+                }
+            }
+            texts.join(" ")
+        }
+        other => normalize_text(&other.to_string()),
+    }
+}
+
+fn normalize_gemini_instruction(system: &Value) -> String {
+    if let Some(text) = system.as_str() {
+        return normalize_text(text);
+    }
+    if let Some(parts) = system.get("parts").and_then(|p| p.as_array()) {
+        return extract_gemini_parts_text(parts);
+    }
+    if let Some(parts) = system.as_array() {
+        return extract_gemini_parts_text(parts);
+    }
+    normalize_text(&system.to_string())
+}
+
 fn current_epoch_seconds() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1299,52 +1949,120 @@ fn cache_entry_approx_size(
         .saturating_add(embedding_size)
 }
 
-fn append_response_shape_fields(body: &Value, buffer: &mut String, has_part: &mut bool) {
-    for field in RESPONSE_SHAPE_FIELDS {
-        if let Some(value) = body.get(field) {
-            start_key_part(buffer, has_part);
-            buffer.push_str(field);
-            buffer.push(':');
-            let _ = write!(buffer, "{value}");
-        }
-    }
-
-    if let Some(stream) = body.get("stream").and_then(|s| s.as_bool()) {
-        start_key_part(buffer, has_part);
-        let _ = write!(buffer, "stream:{stream}");
-    }
-}
-
 /// Cheap structural check for whether `body` contains any non-text content
 /// part, mirroring the traversal in [`build_multimodal_fingerprint`] but
 /// short-circuiting on the first match and performing no hashing or
 /// canonicalization. Used by `cache_multimodal: reject` to bypass without
 /// paying the fingerprinting cost for a body that will be discarded.
 fn body_has_multimodal_parts(body: &Value) -> bool {
-    if let Some(messages) = body.get("messages").and_then(|m| m.as_array())
-        && messages
-            .iter()
-            .filter_map(|message| message.get("content"))
-            .any(content_has_multimodal_parts)
-    {
-        return true;
+    match classify_cache_request_family(body) {
+        Some(CacheRequestFamily::Messages) => {
+            if let Some(messages) = body.get("messages").and_then(|m| m.as_array())
+                && messages
+                    .iter()
+                    .filter_map(|message| message.get("content"))
+                    .any(|content| content_has_multimodal_parts(content, PartDialect::OpenAi))
+            {
+                return true;
+            }
+            body.get("system")
+                .is_some_and(|system| content_has_multimodal_parts(system, PartDialect::OpenAi))
+        }
+        Some(CacheRequestFamily::Responses) => body
+            .get("input")
+            .is_some_and(responses_input_has_multimodal_parts),
+        Some(CacheRequestFamily::Gemini) => {
+            if let Some(contents) = body.get("contents").and_then(|c| c.as_array()) {
+                for content in contents {
+                    if let Some(parts) = content.get("parts").and_then(|p| p.as_array())
+                        && parts.iter().any(|part| !is_gemini_text_part(part))
+                    {
+                        return true;
+                    }
+                }
+            }
+            for field in ["systemInstruction", "system_instruction"] {
+                if let Some(system) = body.get(field)
+                    && gemini_instruction_has_multimodal_parts(system)
+                {
+                    return true;
+                }
+            }
+            false
+        }
+        // Cohere / legacy / TGI / Titan prompt containers are scalar strings (or
+        // string arrays for legacy/TGI) and have no typed multimodal parts in
+        // the shapes Ferrum caches. Native tool blocks for Cohere are exact-keyed
+        // via shape fields rather than multimodal fingerprints.
+        Some(
+            CacheRequestFamily::Cohere
+            | CacheRequestFamily::LegacyPrompt
+            | CacheRequestFamily::Tgi
+            | CacheRequestFamily::Titan,
+        )
+        | None => false,
     }
+}
 
-    body.get("system").is_some_and(content_has_multimodal_parts)
+#[derive(Clone, Copy)]
+enum PartDialect {
+    OpenAi,
+    Gemini,
 }
 
 /// Returns `true` if a message/system `content` value carries at least one
 /// non-text part. A plain string is always text-only; an array contains a
-/// multimodal part when any element is not a `type: "text"` block; any other
-/// scalar/object form is multimodal unless it is itself a text part. This must
-/// stay aligned with the part-vs-text decisions in
-/// [`append_multimodal_content_fingerprint`].
-fn content_has_multimodal_parts(content: &Value) -> bool {
+/// multimodal part when any element is not a text block for the dialect; any
+/// other scalar/object form is multimodal unless it is itself a text part.
+fn content_has_multimodal_parts(content: &Value, dialect: PartDialect) -> bool {
     match content {
         Value::String(_) => false,
-        Value::Array(parts) => parts.iter().any(|part| !is_text_content_part(part)),
+        Value::Array(parts) => parts
+            .iter()
+            .any(|part| !is_text_part_for_dialect(part, dialect)),
         Value::Null => false,
-        other => !is_text_content_part(other),
+        other => !is_text_part_for_dialect(other, dialect),
+    }
+}
+
+fn gemini_instruction_has_multimodal_parts(system: &Value) -> bool {
+    if system.as_str().is_some() {
+        return false;
+    }
+    if let Some(parts) = system.get("parts").and_then(|p| p.as_array()) {
+        return parts.iter().any(|part| !is_gemini_text_part(part));
+    }
+    if let Some(parts) = system.as_array() {
+        return parts.iter().any(|part| !is_gemini_text_part(part));
+    }
+    !is_gemini_text_part(system)
+}
+
+fn responses_input_has_multimodal_parts(input: &Value) -> bool {
+    match input {
+        Value::String(_) => false,
+        Value::Array(items) => items.iter().any(responses_item_has_multimodal_parts),
+        other => responses_item_has_multimodal_parts(other),
+    }
+}
+
+fn responses_item_has_multimodal_parts(item: &Value) -> bool {
+    if item.as_str().is_some() {
+        return false;
+    }
+    let Some(object) = item.as_object() else {
+        return true;
+    };
+    if let Some(content) = object.get("content") {
+        return content_has_multimodal_parts(content, PartDialect::OpenAi);
+    }
+    match object.get("type").and_then(|t| t.as_str()) {
+        Some("input_text" | "text" | "output_text") => object
+            .get("text")
+            .and_then(|t| t.as_str())
+            .is_none(),
+        Some(_) => true,
+        None => object.get("text").and_then(|t| t.as_str()).is_none(),
     }
 }
 
@@ -1352,34 +2070,102 @@ fn build_multimodal_fingerprint(body: &Value) -> Option<String> {
     let mut descriptor = String::new();
     let mut has_part = false;
 
-    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-        for (message_index, message) in messages.iter().enumerate() {
-            let role = message
-                .get("role")
-                .and_then(|r| r.as_str())
-                .unwrap_or("unknown");
-            if let Some(content) = message.get("content") {
+    match classify_cache_request_family(body) {
+        Some(CacheRequestFamily::Messages) => {
+            if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+                for (message_index, message) in messages.iter().enumerate() {
+                    let role = message
+                        .get("role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("unknown");
+                    if let Some(content) = message.get("content") {
+                        append_multimodal_content_fingerprint(
+                            &mut descriptor,
+                            &mut has_part,
+                            "message",
+                            Some(message_index),
+                            Some(role),
+                            content,
+                            PartDialect::OpenAi,
+                        );
+                    }
+                }
+            }
+
+            if let Some(system) = body.get("system") {
                 append_multimodal_content_fingerprint(
                     &mut descriptor,
                     &mut has_part,
-                    "message",
-                    Some(message_index),
-                    Some(role),
-                    content,
+                    "system",
+                    None,
+                    None,
+                    system,
+                    PartDialect::OpenAi,
                 );
             }
         }
-    }
-
-    if let Some(system) = body.get("system") {
-        append_multimodal_content_fingerprint(
-            &mut descriptor,
-            &mut has_part,
-            "system",
-            None,
-            None,
-            system,
-        );
+        Some(CacheRequestFamily::Responses) => {
+            if let Some(input) = body.get("input") {
+                append_responses_multimodal_fingerprint(
+                    &mut descriptor,
+                    &mut has_part,
+                    input,
+                );
+            }
+        }
+        Some(CacheRequestFamily::Gemini) => {
+            if let Some(contents) = body.get("contents").and_then(|c| c.as_array()) {
+                for (content_index, content) in contents.iter().enumerate() {
+                    let role = content
+                        .get("role")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("user");
+                    if let Some(parts) = content.get("parts") {
+                        append_multimodal_content_fingerprint(
+                            &mut descriptor,
+                            &mut has_part,
+                            "contents",
+                            Some(content_index),
+                            Some(role),
+                            parts,
+                            PartDialect::Gemini,
+                        );
+                    }
+                }
+            }
+            for field in ["systemInstruction", "system_instruction"] {
+                if let Some(system) = body.get(field) {
+                    if let Some(parts) = system.get("parts") {
+                        append_multimodal_content_fingerprint(
+                            &mut descriptor,
+                            &mut has_part,
+                            field,
+                            None,
+                            None,
+                            parts,
+                            PartDialect::Gemini,
+                        );
+                    } else if system.as_str().is_none() {
+                        append_multimodal_content_fingerprint(
+                            &mut descriptor,
+                            &mut has_part,
+                            field,
+                            None,
+                            None,
+                            system,
+                            PartDialect::Gemini,
+                        );
+                    }
+                }
+            }
+        }
+        Some(
+            CacheRequestFamily::Cohere
+            | CacheRequestFamily::LegacyPrompt
+            | CacheRequestFamily::Tgi
+            | CacheRequestFamily::Titan,
+        )
+        | None => {}
     }
 
     if has_part {
@@ -1390,6 +2176,60 @@ fn build_multimodal_fingerprint(body: &Value) -> Option<String> {
     }
 }
 
+fn append_responses_multimodal_fingerprint(
+    buffer: &mut String,
+    has_part: &mut bool,
+    input: &Value,
+) {
+    match input {
+        Value::String(_) => {}
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                append_responses_item_multimodal_fingerprint(
+                    buffer, has_part, Some(index), item,
+                );
+            }
+        }
+        other => {
+            append_responses_item_multimodal_fingerprint(buffer, has_part, None, other);
+        }
+    }
+}
+
+fn append_responses_item_multimodal_fingerprint(
+    buffer: &mut String,
+    has_part: &mut bool,
+    index: Option<usize>,
+    item: &Value,
+) {
+    if item.as_str().is_some() {
+        return;
+    }
+    if let Some(content) = item.get("content") {
+        append_multimodal_content_fingerprint(
+            buffer,
+            has_part,
+            "input",
+            index,
+            item.get("role").and_then(|r| r.as_str()),
+            content,
+            PartDialect::OpenAi,
+        );
+        return;
+    }
+    if responses_item_has_multimodal_parts(item) {
+        append_multimodal_part_descriptor(
+            buffer,
+            has_part,
+            "input",
+            index,
+            item.get("role").and_then(|r| r.as_str()),
+            None,
+            item,
+        );
+    }
+}
+
 fn append_multimodal_content_fingerprint(
     buffer: &mut String,
     has_part: &mut bool,
@@ -1397,12 +2237,13 @@ fn append_multimodal_content_fingerprint(
     owner_index: Option<usize>,
     role: Option<&str>,
     content: &Value,
+    dialect: PartDialect,
 ) {
     match content {
         Value::String(_) => {}
         Value::Array(parts) => {
             for (part_index, part) in parts.iter().enumerate() {
-                if is_text_content_part(part) {
+                if is_text_part_for_dialect(part, dialect) {
                     continue;
                 }
                 append_multimodal_part_descriptor(
@@ -1418,7 +2259,7 @@ fn append_multimodal_content_fingerprint(
         }
         Value::Null => {}
         other => {
-            if !is_text_content_part(other) {
+            if !is_text_part_for_dialect(other, dialect) {
                 append_multimodal_part_descriptor(
                     buffer,
                     has_part,
@@ -1458,17 +2299,41 @@ fn append_multimodal_part_descriptor(
     append_canonical_multimodal_value(buffer, part);
 }
 
-fn is_text_content_part(part: &Value) -> bool {
-    // A part counts as "text" only when it has `type: "text"` AND a string
-    // `text` field — exactly the shape `extract_message_content` folds into the
-    // message text. Without the string-`text` requirement a malformed part like
-    // `{"type": "text"}` (no usable `text`) would be skipped here yet also
-    // skipped by `extract_message_content`, contributing to neither half of the
-    // cache key, so two requests differing only in such a part would collide.
-    // Requiring a string `text` makes the text/non-text partition exhaustive:
-    // such malformed parts fall through to fingerprinting instead.
-    part.get("type").and_then(|t| t.as_str()) == Some("text")
-        && part.get("text").and_then(|t| t.as_str()).is_some()
+fn is_text_part_for_dialect(part: &Value, dialect: PartDialect) -> bool {
+    match dialect {
+        PartDialect::OpenAi => is_openai_text_content_part(part),
+        PartDialect::Gemini => is_gemini_text_part(part),
+    }
+}
+
+fn is_openai_text_content_part(part: &Value) -> bool {
+    // A part counts as "text" only when it has a text-bearing `type` AND a
+    // string `text` field — exactly the shape prompt extraction folds into the
+    // message/input text. OpenAI Chat uses `type: "text"`; Responses also uses
+    // `input_text` / `output_text`. Without the string-`text` requirement a
+    // malformed part like `{"type": "text"}` would be skipped by both the
+    // fingerprint and text extractors, so two requests differing only in such a
+    // part would collide. Requiring a string `text` makes the partition
+    // exhaustive: malformed parts fall through to fingerprinting instead.
+    matches!(
+        part.get("type").and_then(|t| t.as_str()),
+        Some("text" | "input_text" | "output_text")
+    ) && part.get("text").and_then(|t| t.as_str()).is_some()
+}
+
+fn is_gemini_text_part(part: &Value) -> bool {
+    // Gemini text parts are typically `{"text": "..."}` without an OpenAI-style
+    // `type` field. Any media / function-call keys make the part non-text so it
+    // is fingerprinted instead of folded into prompt text.
+    part.get("text").and_then(|t| t.as_str()).is_some()
+        && part.get("inlineData").is_none()
+        && part.get("inline_data").is_none()
+        && part.get("fileData").is_none()
+        && part.get("file_data").is_none()
+        && part.get("functionCall").is_none()
+        && part.get("function_call").is_none()
+        && part.get("functionResponse").is_none()
+        && part.get("function_response").is_none()
 }
 
 fn append_canonical_multimodal_value(buffer: &mut String, value: &Value) {
@@ -1516,7 +2381,7 @@ fn append_canonical_multimodal_value(buffer: &mut String, value: &Value) {
                     // response stored for `"type": "image"` (and vice versa).
                     // Upstream model APIs may treat differently-cased enum
                     // values as distinct (or reject one), so they must not share
-                    // a cache entry. `is_text_content_part` is likewise
+                    // a cache entry. `is_openai_text_content_part` is likewise
                     // case-sensitive, keeping the two paths consistent.
                     buffer.push_str("type:");
                     append_len_prefixed(buffer, part_type);
@@ -1828,6 +2693,20 @@ impl Plugin for AiSemanticCache {
             Err(_) => return PluginResult::Continue,
         };
 
+        // Unknown or ambiguous provider shapes deliberately bypass caching
+        // rather than guessing a family or mixing structural metadata into
+        // prompt text. Clear any prior staged key so a later final-body store
+        // cannot retain a body that this instance refused to key.
+        if classify_cache_request_family(&json).is_none() {
+            debug!("ai_semantic_cache: skipping unknown or ambiguous request shape");
+            ctx.metadata.remove(AI_CACHE_KEY_METADATA);
+            ctx.ai_semantic_cache_embedding = None;
+            ctx.ai_semantic_cache_scope_key = None;
+            ctx.metadata
+                .insert("ai_cache_status".to_string(), "BYPASS".to_string());
+            return PluginResult::Continue;
+        }
+
         // In reject mode, detect multimodal content with a cheap structural
         // scan that short-circuits on the first non-text part. Computing the
         // full SHA-256 fingerprint here would canonicalize and hash every
@@ -1857,7 +2736,14 @@ impl Plugin for AiSemanticCache {
         // Build cache key
         let cache_key = match self.build_cache_key(ctx, &json, multimodal_fingerprint.as_deref()) {
             Some(k) => k,
-            None => return PluginResult::Continue,
+            None => {
+                ctx.metadata.remove(AI_CACHE_KEY_METADATA);
+                ctx.ai_semantic_cache_embedding = None;
+                ctx.ai_semantic_cache_scope_key = None;
+                ctx.metadata
+                    .insert("ai_cache_status".to_string(), "BYPASS".to_string());
+                return PluginResult::Continue;
+            }
         };
 
         // Periodic cleanup

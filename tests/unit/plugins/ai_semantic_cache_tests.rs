@@ -2939,3 +2939,568 @@ async fn test_same_key_replacement_dirties_vector_index_on_embedding_change() {
     assert_eq!(plugin.tracked_keys_count(), Some(1));
     assert_size_accounting_exact(&plugin);
 }
+
+// -------------------------------------------------------------------------
+// Provider-native request-family coverage (#2286).
+//
+// Exact hit/miss, semantic hit/isolation, multimodal/native tool blocks, and
+// deliberate unknown/ambiguous-shape bypass for every family Ferrum caches.
+// -------------------------------------------------------------------------
+
+async fn assert_exact_hit_roundtrip(body: serde_json::Value, response_body: &[u8]) {
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+    let body_str = serde_json::to_string(&body).unwrap();
+    store_response(&plugin, &body_str, None, response_body).await;
+    let (ctx, result) = run_before_proxy(&plugin, &body_str, None).await;
+    match result {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+            ..
+        } => {
+            assert_eq!(status_code, 200);
+            assert_eq!(headers.get("x-ai-cache-status").unwrap(), "HIT");
+            assert_eq!(&body[..], response_body);
+            assert_eq!(ctx.metadata.get("ai_cache_status").unwrap(), "HIT");
+        }
+        other => panic!("expected exact HIT, got {other:?}"),
+    }
+}
+
+async fn assert_exact_miss_for_variant(
+    body1: serde_json::Value,
+    body2: serde_json::Value,
+    response_body: &[u8],
+) {
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body1).unwrap(),
+        None,
+        response_body,
+    )
+    .await;
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body2).unwrap(), None).await;
+    assert!(!hit, "variant must miss the exact cache");
+}
+
+#[tokio::test]
+async fn openai_responses_exact_hit_and_instruction_isolation() {
+    let body = json!({
+        "model": "gpt-4.1",
+        "instructions": "Answer briefly.",
+        "input": "What is 2 + 2?"
+    });
+    assert_exact_hit_roundtrip(body.clone(), br#""4""#).await;
+
+    let different_instructions = json!({
+        "model": "gpt-4.1",
+        "instructions": "Answer in Spanish.",
+        "input": "What is 2 + 2?"
+    });
+    assert_exact_miss_for_variant(body, different_instructions, br#""4""#).await;
+}
+
+#[tokio::test]
+async fn openai_responses_tools_and_previous_response_isolation() {
+    let base = json!({
+        "model": "gpt-4.1",
+        "input": "Weather in NYC?",
+        "tools": [{"type": "function", "name": "get_weather"}]
+    });
+    let other_tools = json!({
+        "model": "gpt-4.1",
+        "input": "Weather in NYC?",
+        "tools": [{"type": "function", "name": "get_time"}]
+    });
+    assert_exact_miss_for_variant(base, other_tools, br#""sunny""#).await;
+
+    let with_previous = json!({
+        "model": "gpt-4.1",
+        "input": "Continue.",
+        "previous_response_id": "resp_1"
+    });
+    let other_previous = json!({
+        "model": "gpt-4.1",
+        "input": "Continue.",
+        "previous_response_id": "resp_2"
+    });
+    assert_exact_miss_for_variant(with_previous, other_previous, br#""ok""#).await;
+}
+
+#[tokio::test]
+async fn gemini_contents_exact_hit_and_generation_config_isolation() {
+    let body = json!({
+        "model": "gemini-2.5-flash",
+        "contents": [{"role": "user", "parts": [{"text": "What is 2 + 2?"}]}],
+        "generationConfig": {"temperature": 0}
+    });
+    assert_exact_hit_roundtrip(body.clone(), br#""4""#).await;
+
+    let other_temp = json!({
+        "model": "gemini-2.5-flash",
+        "contents": [{"role": "user", "parts": [{"text": "What is 2 + 2?"}]}],
+        "generationConfig": {"temperature": 0.9}
+    });
+    assert_exact_miss_for_variant(body, other_temp, br#""4""#).await;
+}
+
+#[tokio::test]
+async fn gemini_system_instruction_and_tool_isolation() {
+    let body = json!({
+        "model": "gemini-2.5-flash",
+        "systemInstruction": {"parts": [{"text": "Be terse."}]},
+        "contents": [{"role": "user", "parts": [{"text": "Capital of France?"}]}],
+        "tools": [{"functionDeclarations": [{"name": "lookup"}]}]
+    });
+    let other_system = json!({
+        "model": "gemini-2.5-flash",
+        "systemInstruction": {"parts": [{"text": "Be verbose."}]},
+        "contents": [{"role": "user", "parts": [{"text": "Capital of France?"}]}],
+        "tools": [{"functionDeclarations": [{"name": "lookup"}]}]
+    });
+    assert_exact_miss_for_variant(body.clone(), other_system, br#""Paris""#).await;
+
+    let other_tools = json!({
+        "model": "gemini-2.5-flash",
+        "systemInstruction": {"parts": [{"text": "Be terse."}]},
+        "contents": [{"role": "user", "parts": [{"text": "Capital of France?"}]}],
+        "tools": [{"functionDeclarations": [{"name": "search"}]}]
+    });
+    assert_exact_miss_for_variant(body, other_tools, br#""Paris""#).await;
+}
+
+#[tokio::test]
+async fn cohere_chat_history_exact_hit_and_preamble_isolation() {
+    let body = json!({
+        "model": "command-r",
+        "preamble": "You are helpful.",
+        "chat_history": [{"role": "USER", "message": "Hi"}],
+        "message": "What is 2 + 2?"
+    });
+    assert_exact_hit_roundtrip(body.clone(), br#""4""#).await;
+
+    let other_preamble = json!({
+        "model": "command-r",
+        "preamble": "You are a pirate.",
+        "chat_history": [{"role": "USER", "message": "Hi"}],
+        "message": "What is 2 + 2?"
+    });
+    assert_exact_miss_for_variant(body, other_preamble, br#""4""#).await;
+}
+
+#[tokio::test]
+async fn legacy_prompt_tgi_inputs_and_titan_input_text_exact_hits() {
+    assert_exact_hit_roundtrip(
+        json!({
+            "model": "gpt-3.5-turbo-instruct",
+            "prompt": "What is 2 + 2?",
+            "temperature": 0
+        }),
+        br#""4""#,
+    )
+    .await;
+
+    assert_exact_hit_roundtrip(
+        json!({
+            "inputs": "What is 2 + 2?",
+            "parameters": {"temperature": 0.0, "max_new_tokens": 16}
+        }),
+        br#""4""#,
+    )
+    .await;
+
+    assert_exact_hit_roundtrip(
+        json!({
+            "inputText": "What is 2 + 2?",
+            "textGenerationConfig": {"temperature": 0.0, "maxTokenCount": 32}
+        }),
+        br#""4""#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn legacy_tgi_titan_generation_control_misses() {
+    assert_exact_miss_for_variant(
+        json!({"prompt": "Hello", "temperature": 0.0}),
+        json!({"prompt": "Hello", "temperature": 1.0}),
+        br#""hi""#,
+    )
+    .await;
+    assert_exact_miss_for_variant(
+        json!({"inputs": "Hello", "parameters": {"temperature": 0.0}}),
+        json!({"inputs": "Hello", "parameters": {"temperature": 1.0}}),
+        br#""hi""#,
+    )
+    .await;
+    assert_exact_miss_for_variant(
+        json!({
+            "inputText": "Hello",
+            "textGenerationConfig": {"temperature": 0.0}
+        }),
+        json!({
+            "inputText": "Hello",
+            "textGenerationConfig": {"temperature": 1.0}
+        }),
+        br#""hi""#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn anthropic_messages_system_still_exact_hits() {
+    let body = json!({
+        "model": "claude-3-5-sonnet-20241022",
+        "system": "Be concise.",
+        "messages": [{"role": "user", "content": "Say hi."}]
+    });
+    assert_exact_hit_roundtrip(body, br#""hi""#).await;
+}
+
+#[tokio::test]
+async fn unknown_and_ambiguous_shapes_bypass_caching() {
+    let plugin = make_plugin(json!({"ttl_seconds": 300}));
+
+    for body in [
+        json!({"model": "gpt-4o", "foo": "bar"}),
+        json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}]
+        }),
+        json!({
+            "model": "gpt-4o",
+            "prompt": "hi",
+            "inputText": "hi"
+        }),
+        json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "input": "hi"
+        }),
+    ] {
+        let body_str = serde_json::to_string(&body).unwrap();
+        let (ctx, result) = run_before_proxy(&plugin, &body_str, None).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert_eq!(
+            ctx.metadata.get("ai_cache_status").map(String::as_str),
+            Some("BYPASS"),
+            "unknown/ambiguous body must bypass: {body}"
+        );
+        assert!(
+            !ctx.metadata.contains_key("_ai_cache_key"),
+            "bypass must not stage a cache key"
+        );
+    }
+}
+
+#[tokio::test]
+async fn gemini_and_responses_multimodal_fingerprints_isolate_exact_keys() {
+    let gemini_a = json!({
+        "model": "gemini-2.5-flash",
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"text": "Describe this"},
+                {"inlineData": {"mimeType": "image/png", "data": "aaa"}}
+            ]
+        }]
+    });
+    let gemini_b = json!({
+        "model": "gemini-2.5-flash",
+        "contents": [{
+            "role": "user",
+            "parts": [
+                {"text": "Describe this"},
+                {"inlineData": {"mimeType": "image/png", "data": "bbb"}}
+            ]
+        }]
+    });
+    assert_exact_miss_for_variant(gemini_a, gemini_b, br#""img""#).await;
+
+    let responses_a = json!({
+        "model": "gpt-4.1",
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Describe this"},
+                {"type": "input_image", "image_url": "https://example.com/a.png"}
+            ]
+        }]
+    });
+    let responses_b = json!({
+        "model": "gpt-4.1",
+        "input": [{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Describe this"},
+                {"type": "input_image", "image_url": "https://example.com/b.png"}
+            ]
+        }]
+    });
+    assert_exact_miss_for_variant(responses_a, responses_b, br#""img""#).await;
+}
+
+#[tokio::test]
+async fn gemini_native_function_call_blocks_are_fingerprinted() {
+    let with_call = json!({
+        "model": "gemini-2.5-flash",
+        "contents": [{
+            "role": "model",
+            "parts": [{
+                "functionCall": {"name": "lookup", "args": {"q": "paris"}}
+            }]
+        }, {
+            "role": "user",
+            "parts": [{"text": "thanks"}]
+        }]
+    });
+    let other_call = json!({
+        "model": "gemini-2.5-flash",
+        "contents": [{
+            "role": "model",
+            "parts": [{
+                "functionCall": {"name": "lookup", "args": {"q": "lyon"}}
+            }]
+        }, {
+            "role": "user",
+            "parts": [{"text": "thanks"}]
+        }]
+    });
+    assert_exact_miss_for_variant(with_call, other_call, br#""ok""#).await;
+}
+
+#[tokio::test]
+async fn provider_family_semantic_hit_and_instruction_isolation() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 6).await;
+    let plugin = make_plugin(semantic_config(&mock_server));
+
+    let gemini1 = json!({
+        "model": "gemini-2.5-flash",
+        "systemInstruction": {"parts": [{"text": "JSON only."}]},
+        "contents": [{"role": "user", "parts": [{"text": "Capital of France?"}]}],
+        "generationConfig": {"temperature": 0}
+    });
+    let gemini2_same_scope = json!({
+        "model": "gemini-2.5-flash",
+        "systemInstruction": {"parts": [{"text": "JSON only."}]},
+        "contents": [{"role": "user", "parts": [{"text": "What city is France's capital?"}]}],
+        "generationConfig": {"temperature": 0}
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&gemini1).unwrap(),
+        None,
+        br#"{"city":"Paris"}"#,
+    )
+    .await;
+    let (ctx, result) = run_before_proxy(
+        &plugin,
+        &serde_json::to_string(&gemini2_same_scope).unwrap(),
+        None,
+    )
+    .await;
+    match result {
+        PluginResult::RejectBinary { headers, body, .. } => {
+            assert_eq!(headers.get("x-ai-cache-match").map(String::as_str), Some("semantic"));
+            assert_eq!(&body[..], br#"{"city":"Paris"}"#);
+            assert_eq!(
+                ctx.metadata.get("ai_cache_match").map(String::as_str),
+                Some("semantic")
+            );
+        }
+        other => panic!("expected Gemini semantic HIT, got {other:?}"),
+    }
+
+    let gemini_other_instruction = json!({
+        "model": "gemini-2.5-flash",
+        "systemInstruction": {"parts": [{"text": "Plain text only."}]},
+        "contents": [{"role": "user", "parts": [{"text": "What city is France's capital?"}]}],
+        "generationConfig": {"temperature": 0}
+    });
+    let isolated = run_before_proxy_get_status(
+        &plugin,
+        &serde_json::to_string(&gemini_other_instruction).unwrap(),
+        None,
+    )
+    .await;
+    assert!(
+        !isolated,
+        "Gemini semantic hits must not cross systemInstruction scopes"
+    );
+
+    let responses1 = json!({
+        "model": "gpt-4.1",
+        "instructions": "JSON only.",
+        "input": "Capital of France?"
+    });
+    let responses2 = json!({
+        "model": "gpt-4.1",
+        "instructions": "JSON only.",
+        "input": "What city is France's capital?"
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&responses1).unwrap(),
+        None,
+        br#"{"city":"Paris"}"#,
+    )
+    .await;
+    let hit = run_before_proxy_get_status(
+        &plugin,
+        &serde_json::to_string(&responses2).unwrap(),
+        None,
+    )
+    .await;
+    assert!(hit, "Responses family should semantic-hit within one instruction scope");
+
+    let responses_isolated = json!({
+        "model": "gpt-4.1",
+        "instructions": "Plain text only.",
+        "input": "What city is France's capital?"
+    });
+    let isolated = run_before_proxy_get_status(
+        &plugin,
+        &serde_json::to_string(&responses_isolated).unwrap(),
+        None,
+    )
+    .await;
+    assert!(
+        !isolated,
+        "Responses semantic hits must not cross instructions scopes"
+    );
+}
+
+#[tokio::test]
+async fn cohere_titan_and_tgi_semantic_hits_respect_family_scope() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 9).await;
+    let plugin = make_plugin(semantic_config(&mock_server));
+
+    let cohere1 = json!({
+        "model": "command-r",
+        "preamble": "Be brief.",
+        "message": "Capital of France?"
+    });
+    let cohere2 = json!({
+        "model": "command-r",
+        "preamble": "Be brief.",
+        "message": "What city is France's capital?"
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&cohere1).unwrap(),
+        None,
+        br#""Paris""#,
+    )
+    .await;
+    assert!(
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&cohere2).unwrap(), None)
+            .await
+    );
+    let cohere_isolated = json!({
+        "model": "command-r",
+        "preamble": "Be poetic.",
+        "message": "What city is France's capital?"
+    });
+    assert!(
+        !run_before_proxy_get_status(
+            &plugin,
+            &serde_json::to_string(&cohere_isolated).unwrap(),
+            None
+        )
+        .await
+    );
+
+    let tgi1 = json!({
+        "inputs": "Capital of France?",
+        "parameters": {"temperature": 0.0}
+    });
+    let tgi2 = json!({
+        "inputs": "What city is France's capital?",
+        "parameters": {"temperature": 0.0}
+    });
+    store_response(&plugin, &serde_json::to_string(&tgi1).unwrap(), None, br#""Paris""#)
+        .await;
+    assert!(
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&tgi2).unwrap(), None).await
+    );
+    let tgi_isolated = json!({
+        "inputs": "What city is France's capital?",
+        "parameters": {"temperature": 1.0}
+    });
+    assert!(
+        !run_before_proxy_get_status(&plugin, &serde_json::to_string(&tgi_isolated).unwrap(), None)
+            .await
+    );
+
+    let titan1 = json!({
+        "inputText": "Capital of France?",
+        "textGenerationConfig": {"temperature": 0.0}
+    });
+    let titan2 = json!({
+        "inputText": "What city is France's capital?",
+        "textGenerationConfig": {"temperature": 0.0}
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&titan1).unwrap(),
+        None,
+        br#""Paris""#,
+    )
+    .await;
+    assert!(
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&titan2).unwrap(), None).await
+    );
+    let titan_isolated = json!({
+        "inputText": "What city is France's capital?",
+        "textGenerationConfig": {"temperature": 1.0}
+    });
+    assert!(
+        !run_before_proxy_get_status(
+            &plugin,
+            &serde_json::to_string(&titan_isolated).unwrap(),
+            None
+        )
+        .await
+    );
+}
+
+#[tokio::test]
+async fn distinct_families_do_not_exact_or_semantic_collide() {
+    let mock_server = MockServer::start().await;
+    mount_embedding_mock(&mock_server, 2).await;
+    let plugin = make_plugin(semantic_config(&mock_server));
+
+    let messages = json!({
+        "model": "shared-model",
+        "messages": [{"role": "user", "content": "What is 2 + 2?"}]
+    });
+    let gemini = json!({
+        "model": "shared-model",
+        "contents": [{"role": "user", "parts": [{"text": "What is 2 + 2?"}]}]
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&messages).unwrap(),
+        None,
+        br#""messages-family""#,
+    )
+    .await;
+
+    let (ctx, result) = run_before_proxy(&plugin, &serde_json::to_string(&gemini).unwrap(), None).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "Gemini body must not exact-hit a Messages-family entry"
+    );
+    assert_eq!(ctx.metadata.get("ai_cache_status").unwrap(), "MISS");
+    assert_ne!(
+        ctx.metadata.get("ai_cache_match").map(String::as_str),
+        Some("semantic"),
+        "Gemini body must not semantic-hit a Messages-family entry"
+    );
+}
