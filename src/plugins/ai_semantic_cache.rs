@@ -2077,7 +2077,9 @@ impl Plugin for AiSemanticCache {
             hosts.push(hostname.clone());
         }
         if let Some(ref redis) = self.redis_client
-            && let Some(hostname) = redis.warmup_hostname()
+            && let Some(hostname) = redis
+                .warmup_hostname()
+                .map(|hostname| hostname.to_ascii_lowercase())
             && !hosts.contains(&hostname)
         {
             hosts.push(hostname);
