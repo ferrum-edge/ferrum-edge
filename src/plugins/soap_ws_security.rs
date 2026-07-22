@@ -3143,7 +3143,14 @@ fn parse_quoted_parameter_value(raw: &str) -> Result<(&str, &str), SoapBodyDecod
                 if inner.is_empty() {
                     return Err(SoapBodyDecodeError::UnsupportedCharset);
                 }
-                return Ok((inner, &raw[i + 1..]));
+                let mut next = i + 1;
+                while next < bytes.len() && bytes[next].is_ascii_whitespace() {
+                    next += 1;
+                }
+                if next < bytes.len() && bytes[next] != b';' {
+                    return Err(SoapBodyDecodeError::ConflictingCharset);
+                }
+                return Ok((inner, &raw[next..]));
             }
             _ => i += 1,
         }
@@ -3235,7 +3242,12 @@ fn resolve_soap_xml_encoding(
                 Err(SoapBodyDecodeError::ConflictingCharset)
             }
         }
-        (None, Some(DeclaredCharset::Utf8)) => Ok((SoapXmlEncoding::Utf8, bytes)),
+        (None, Some(DeclaredCharset::Utf8)) => {
+            if looks_like_bomless_utf16_xml(bytes) {
+                return Err(SoapBodyDecodeError::ConflictingCharset);
+            }
+            Ok((SoapXmlEncoding::Utf8, bytes))
+        }
         (None, None) => {
             // BOM-less, charset-less UTF-16 XML (`3c 00` / `00 3c`) is
             // unmistakable and must not be treated as UTF-8 (NUL-containing
