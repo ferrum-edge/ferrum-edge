@@ -15,11 +15,12 @@
 //! authenticated diagnostics/metrics.
 //!
 //! Construction (`new`) is runtime-free: it parses and admits configuration,
-//! including a short-lived librdkafka [`BaseProducer`] probe that rejects
-//! unknown `producer_config` properties without spawning a Ferrum flush worker
-//! or registering a generation. Live `ThreadedProducer` / logger construction
-//! and local lifecycle ownership happen in [`Plugin::start_background_tasks`];
-//! the Ferrum flush worker stays dormant until [`Plugin::commit_background_tasks`].
+//! including a native-configuration-only validation pass that rejects unknown
+//! `producer_config` properties without constructing a Kafka client, spawning
+//! a worker, or registering a generation. Live `ThreadedProducer` / logger
+//! construction and local lifecycle ownership happen in
+//! [`Plugin::start_background_tasks`]; the Ferrum flush worker stays dormant
+//! until [`Plugin::commit_background_tasks`].
 //! Process-global active-generation publication is also deferred to commit
 //! after PluginCache atomically installs the generation that owns this instance.
 //!
@@ -40,7 +41,7 @@ use rdkafka::ClientContext;
 use rdkafka::config::ClientConfig;
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::message::DeliveryResult;
-use rdkafka::producer::{BaseProducer, BaseRecord, Producer, ProducerContext, ThreadedProducer};
+use rdkafka::producer::{BaseRecord, Producer, ProducerContext, ThreadedProducer};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
@@ -1119,8 +1120,9 @@ pub fn render_prometheus() -> String {
 
 /// Config + ClientConfig captured by [`KafkaLogging::new`] and consumed by
 /// [`Plugin::start_background_tasks`] to finish live `ThreadedProducer` /
-/// logger construction. `new` already probed this ClientConfig with a
-/// short-lived [`BaseProducer`] so unknown properties fail closed at validate.
+/// logger construction. `new` already built and dropped a native configuration
+/// object from this ClientConfig so unknown properties fail closed at validate
+/// without constructing a Kafka client.
 ///
 /// Generation IDs are intentionally absent here: allocating
 /// [`NEXT_GENERATION_ID`] during validation-only construction would burn live
@@ -1363,20 +1365,17 @@ impl KafkaLogging {
             }
         }
 
-        // Librdkafka rejects unknown property names only when a client is
-        // created. Probe with a BaseProducer (no Ferrum worker / generation)
-        // so validate and Admin admission still fail closed on typos, then
-        // drop the probe immediately. The live ThreadedProducer is created
-        // later from the same ClientConfig during start_background_tasks.
-        {
-            let probe: BaseProducer = kafka_config.create().map_err(|error| {
-                format!(
-                    "kafka_logging: failed to create Kafka producer ({})",
-                    safe_kafka_error_kind(&error)
-                )
-            })?;
-            drop(probe);
-        }
+        // Build only librdkafka's native configuration object. This applies
+        // every property through `rd_kafka_conf_set` (and therefore rejects
+        // unknown names/invalid values) without calling `rd_kafka_new`, so
+        // validation starts no client threads, DNS, sockets, or Ferrum worker.
+        // The live ThreadedProducer remains deferred to activation.
+        kafka_config.create_native_config().map_err(|error| {
+            format!(
+                "kafka_logging: failed to validate Kafka producer config ({})",
+                safe_kafka_error_kind(&error)
+            )
+        })?;
 
         let broker_hostnames: Vec<String> = broker_list
             .split(',')
