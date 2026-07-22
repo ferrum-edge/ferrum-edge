@@ -1006,23 +1006,19 @@ fn openapi_server_bases(
                 error: format!("{location}[{index}] must be a Server Object"),
             });
         };
-        let url = object
-            .get("url")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ExtractError::MalformedExtension {
+        let url = object.get("url").and_then(Value::as_str).ok_or_else(|| {
+            ExtractError::MalformedExtension {
                 which: "servers",
                 error: format!("{location}[{index}].url is required and must be a string"),
-            })?;
+            }
+        })?;
         let substituted = substitute_server_variables(
             url,
             object.get("variables"),
             &format!("{location}[{index}]"),
         )?;
-        let pathname = server_url_pathname(
-            &substituted,
-            &format!("{location}[{index}].url"),
-            "servers",
-        )?;
+        let pathname =
+            server_url_pathname(&substituted, &format!("{location}[{index}].url"), "servers")?;
         if seen.insert(pathname.clone()) {
             bases.push(pathname);
         }
@@ -1100,9 +1096,7 @@ fn substitute_server_variables(
         let Some(var_obj) = vars.get(name).and_then(Value::as_object) else {
             return Err(ExtractError::MalformedExtension {
                 which: "servers",
-                error: format!(
-                    "{location}.variables.{name} is required for substitution in url"
-                ),
+                error: format!("{location}.variables.{name} is required for substitution in url"),
             });
         };
         let Some(default) = var_obj.get("default").and_then(Value::as_str) else {
@@ -1124,9 +1118,7 @@ fn substitute_server_variables(
             if allowed.len() != enum_arr.len() {
                 return Err(ExtractError::MalformedExtension {
                     which: "servers",
-                    error: format!(
-                        "{location}.variables.{name}.enum entries must be strings"
-                    ),
+                    error: format!("{location}.variables.{name}.enum entries must be strings"),
                 });
             }
             if !allowed.is_empty() && !allowed.contains(&default) {
@@ -1193,8 +1185,9 @@ fn server_url_pathname(
     } else {
         match Url::parse(without_query) {
             Ok(absolute) => Ok(absolute),
-            Err(url::ParseError::RelativeUrlWithoutBase) => Url::parse("http://ferrum.invalid/")
-                .and_then(|base| base.join(without_query)),
+            Err(url::ParseError::RelativeUrlWithoutBase) => {
+                Url::parse("http://ferrum.invalid/").and_then(|base| base.join(without_query))
+            }
             Err(error) => Err(error),
         }
     }

@@ -7,7 +7,9 @@
 //! request path (not only the raw Paths key).
 
 use ferrum_edge::admin::api_specs::{ExtractError, SpecFormat, extract};
-use ferrum_edge::plugins::{Plugin, PluginResult, RequestContext, openapi_validator::OpenapiValidator};
+use ferrum_edge::plugins::{
+    Plugin, PluginResult, RequestContext, openapi_validator::OpenapiValidator,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -607,7 +609,13 @@ fn missing_server_variable_default_fails_closed() {
 
     let err = extract_err(&spec);
     assert!(
-        matches!(err, ExtractError::MalformedExtension { which: "servers", .. }),
+        matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "servers",
+                ..
+            }
+        ),
         "missing variable default must fail closed: {err}"
     );
 }
@@ -637,7 +645,13 @@ fn default_outside_enum_fails_closed() {
 
     let err = extract_err(&spec);
     assert!(
-        matches!(err, ExtractError::MalformedExtension { which: "servers", .. }),
+        matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "servers",
+                ..
+            }
+        ),
         "default outside enum must fail closed: {err}"
     );
 }
@@ -662,7 +676,13 @@ fn traversal_like_server_pathname_fails_closed() {
 
     let err = extract_err(&spec);
     assert!(
-        matches!(err, ExtractError::MalformedExtension { which: "servers", .. }),
+        matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "servers",
+                ..
+            }
+        ),
         "traversal-like pathname must fail closed: {err}"
     );
 }
@@ -687,7 +707,13 @@ fn percent_encoded_traversal_server_pathname_fails_closed() {
 
     let err = extract_err(&spec);
     assert!(
-        matches!(err, ExtractError::MalformedExtension { which: "servers", .. }),
+        matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "servers",
+                ..
+            }
+        ),
         "percent-encoded traversal pathname must fail closed: {err}"
     );
 }
@@ -741,7 +767,13 @@ fn malformed_absolute_server_authority_fails_closed() {
 
     let err = extract_err(&spec);
     assert!(
-        matches!(err, ExtractError::MalformedExtension { which: "servers", .. }),
+        matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "servers",
+                ..
+            }
+        ),
         "malformed absolute authority must fail closed: {err}"
     );
 }
@@ -766,7 +798,13 @@ fn swagger_base_path_rejects_absolute_url() {
 
     let err = extract_err(&spec);
     assert!(
-        matches!(err, ExtractError::MalformedExtension { which: "basePath", .. }),
+        matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "basePath",
+                ..
+            }
+        ),
         "Swagger basePath absolute URL must fail closed: {err}"
     );
 }
@@ -791,7 +829,13 @@ fn empty_servers_array_fails_closed() {
 
     let err = extract_err(&spec);
     assert!(
-        matches!(err, ExtractError::MalformedExtension { which: "servers", .. }),
+        matches!(
+            err,
+            ExtractError::MalformedExtension {
+                which: "servers",
+                ..
+            }
+        ),
         "empty servers array must fail closed: {err}"
     );
 }
