@@ -738,7 +738,7 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
         // storage on its first tick. Validation and pre-commit staging must
         // not create this directory.
         let mut node_dirs = Vec::new();
-        for _ in 0..50 {
+        for _ in 0..200 {
             node_dirs = fs::read_dir(temp.path())
                 .unwrap()
                 .flatten()
