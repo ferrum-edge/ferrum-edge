@@ -41,6 +41,21 @@ fn h3_reject_writer_skips_empty_data_frames() {
         proxy_src.contains("prepare_synthetic_response_wire("),
         "shared reject finalizer must centralize HEAD/204/205/304 wire preparation"
     );
+    let shared_finalizer_start = proxy_src
+        .find("pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(")
+        .expect("shared reject finalizer must remain present");
+    let shared_finalizer = &proxy_src[shared_finalizer_start..];
+    let shared_finalizer_end = shared_finalizer
+        .find("pub(crate) struct AfterProxyReject")
+        .expect("shared reject finalizer boundary must remain present");
+    assert!(
+        shared_finalizer[..shared_finalizer_end].contains("*body = Vec::new();"),
+        "shared no-body finalization must drop retained body allocation rather than Vec::clear()"
+    );
+    assert!(
+        !shared_finalizer[..shared_finalizer_end].contains("body.clear();"),
+        "shared no-body finalization must not retain large synthetic body capacity"
+    );
     let streaming_start = src
         .find("async fn run_h3_streaming_after_proxy_hooks(")
         .expect("H3 streaming after_proxy helper must remain present");
@@ -51,6 +66,14 @@ fn h3_reject_writer_skips_empty_data_frames() {
     assert!(
         streaming_tail[..streaming_end].contains("prepare_synthetic_response_wire("),
         "streaming after_proxy rejections must also apply shared HEAD/no-body wire preparation"
+    );
+    assert!(
+        streaming_tail[..streaming_end].contains("reject.body = Vec::new();"),
+        "H3 streaming no-body finalization must drop retained body allocation rather than Vec::clear()"
+    );
+    assert!(
+        !streaming_tail[..streaming_end].contains("reject.body.clear();"),
+        "H3 streaming no-body finalization must not retain large reject body capacity"
     );
 }
 

@@ -14999,7 +14999,7 @@ pub(crate) async fn apply_reject_after_proxy_and_synthetic_body_hooks(
         headers,
         body.len(),
     ) {
-        body.clear();
+        *body = Vec::new();
     }
 }
 
