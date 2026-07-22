@@ -70,8 +70,8 @@ async fn assert_rejects_unknown(plugin: &OpenapiValidator, method: &str, path: &
     let mut ctx = RequestContext::new("127.0.0.1".into(), method.into(), path.into());
     let mut headers = HashMap::new();
     match plugin.before_proxy(&mut ctx, &mut headers).await {
-        PluginResult::Reject { status, .. } => {
-            assert_eq!(status, Some(400), "unknown operation rejects with 400");
+        PluginResult::Reject { status_code, .. } => {
+            assert_eq!(status_code, 400, "unknown operation rejects with 400");
         }
         other => panic!("{method} {path} must be rejected as unknown operation: {other:?}"),
     }
