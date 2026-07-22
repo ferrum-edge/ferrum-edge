@@ -936,7 +936,10 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
     };
     assert_eq!(status, 200);
     assert_eq!(body, identity_body);
-    assert_eq!(headers.get("x-cache-status").map(String::as_str), Some("HIT"));
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("HIT")
+    );
     assert_eq!(
         headers.get("vary").map(String::as_str),
         Some("Accept-Encoding")
@@ -998,7 +1001,10 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
             .await,
         PluginResult::Continue
     ));
-    assert_eq!(gzip_resp.get("content-encoding").map(String::as_str), Some("gzip"));
+    assert_eq!(
+        gzip_resp.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
     assert_eq!(
         gzip_resp.get("vary").map(String::as_str),
         Some("Accept-Encoding")
@@ -1021,24 +1027,32 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
         .headers
         .insert("accept-encoding".to_string(), "gzip".to_string());
     let mut gzip_hit_headers = gzip_hit_ctx.headers.clone();
-    let (status, body, headers) =
-        match cache.before_proxy(&mut gzip_hit_ctx, &mut gzip_hit_headers).await {
-            PluginResult::Reject {
-                status_code,
-                body,
-                headers,
-            } => (status_code, body.into_bytes(), headers),
-            PluginResult::RejectBinary {
-                status_code,
-                body,
-                headers,
-            } => (status_code, body.to_vec(), headers),
-            other => panic!("expected gzip HIT, got {other:?}"),
-        };
+    let (status, body, headers) = match cache
+        .before_proxy(&mut gzip_hit_ctx, &mut gzip_hit_headers)
+        .await
+    {
+        PluginResult::Reject {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body.into_bytes(), headers),
+        PluginResult::RejectBinary {
+            status_code,
+            body,
+            headers,
+        } => (status_code, body.to_vec(), headers),
+        other => panic!("expected gzip HIT, got {other:?}"),
+    };
     assert_eq!(status, 200);
     assert_eq!(body, gzip_body);
-    assert_eq!(headers.get("content-encoding").map(String::as_str), Some("gzip"));
-    assert_eq!(headers.get("x-cache-status").map(String::as_str), Some("HIT"));
+    assert_eq!(
+        headers.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("HIT")
+    );
 
     for accept_encoding in [None, Some("br"), Some("identity;q=0, br")] {
         let mut miss_ctx = RequestContext::new(
