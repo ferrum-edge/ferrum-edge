@@ -3520,12 +3520,8 @@ async fn messages_semantic_scope_isolates_tool_state_and_native_controls() {
 
     for variant in variants {
         assert!(
-            !run_before_proxy_get_status(
-                &plugin,
-                &serde_json::to_string(&variant).unwrap(),
-                None
-            )
-            .await,
+            !run_before_proxy_get_status(&plugin, &serde_json::to_string(&variant).unwrap(), None)
+                .await,
             "semantic lookup must not cross message tool state or provider-native controls"
         );
     }
