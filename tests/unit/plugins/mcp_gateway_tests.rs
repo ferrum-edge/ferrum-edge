@@ -5264,3 +5264,188 @@ async fn composed_governor_and_mcp_gateway_normalize_omitted_mcp_arguments() {
         );
     }
 }
+
+/// Cross-plugin aggregate-router regression for #2259: governor policy keys stay
+/// on the public namespaced tool identity across `mcp_gateway`'s trusted
+/// public→upstream rewrite.
+///
+/// Drives real `ai_tool_governor` then `mcp_gateway` in priority order with
+/// `default_action: deny`, only `github.create_pr` allowed, upstream name
+/// `create_pr`, through before_proxy → transform → final-body recheck. Covers
+/// both metadata-observability settings and fail-closed cases (unrelated name
+/// change; argument policy still enforced on the rewritten body).
+#[tokio::test]
+async fn composed_governor_keeps_public_policy_name_across_aggregate_tool_rewrite() {
+    const {
+        assert!(
+            priority::AI_TOOL_GOVERNOR < priority::MCP_GATEWAY,
+            "composition must run ai_tool_governor before mcp_gateway"
+        );
+    }
+
+    for emit_metadata in [true, false] {
+        let server = start_mcp_catalog_server().await;
+        let mut mcp_config = aggregate_config(&format!("{}/mcp", server.uri()));
+        mcp_config["observability"] = json!({ "emit_metadata": emit_metadata });
+        let mcp = create_plugin("mcp_gateway", &mcp_config).unwrap().unwrap();
+        assert_eq!(mcp.priority(), priority::MCP_GATEWAY);
+
+        let governor = Arc::new(
+            AiToolGovernor::new(
+                &json!({
+                    "default_action": "deny",
+                    "tools": {
+                        "github.create_pr": {
+                            "action": "allow",
+                            "required_args": ["repo"]
+                        }
+                    },
+                    "inspect": { "mcp_tool_calls": true, "response_tool_calls": false },
+                    "observability": { "emit_metadata": emit_metadata }
+                }),
+                PluginHttpClient::default(),
+            )
+            .expect("governor with public-name allowlist"),
+        );
+        assert_eq!(governor.priority(), priority::AI_TOOL_GOVERNOR);
+
+        let session_id = initialize(&mcp).await;
+        let (mut list_ctx, mut list_headers) = mcp_ctx(json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }));
+        list_headers.insert("mcp-session-id".to_string(), session_id.clone());
+        let _ = mcp.before_proxy(&mut list_ctx, &mut list_headers).await;
+
+        let public_body = json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "github.create_pr",
+                "arguments": { "repo": "payments-api" }
+            }
+        });
+        let (mut ctx, mut headers) = mcp_ctx(public_body.clone());
+        headers.insert("mcp-session-id".to_string(), session_id.clone());
+
+        assert!(
+            matches!(
+                governor.before_proxy(&mut ctx, &mut headers).await,
+                PluginResult::Continue
+            ),
+            "initial governor pass must allow public name (emit_metadata={emit_metadata})"
+        );
+        assert!(
+            matches!(mcp.before_proxy(&mut ctx, &mut headers).await, PluginResult::Continue),
+            "mcp_gateway must route the allowlisted public tool (emit_metadata={emit_metadata})"
+        );
+        if emit_metadata {
+            assert_eq!(
+                ctx.metadata.get("mcp.public_tool_name").map(String::as_str),
+                Some("github.create_pr")
+            );
+            assert_eq!(
+                ctx.metadata
+                    .get("mcp.upstream_tool_name")
+                    .map(String::as_str),
+                Some("create_pr")
+            );
+        } else {
+            assert!(
+                !ctx.metadata.contains_key("mcp.public_tool_name"),
+                "observability.emit_metadata=false must not publish public tool metadata"
+            );
+            assert!(
+                !ctx.metadata.contains_key("mcp.upstream_tool_name"),
+                "observability.emit_metadata=false must not publish upstream tool metadata"
+            );
+        }
+
+        let rewritten = mcp
+            .transform_request_body_with_context(
+                &mut ctx,
+                serde_json::to_vec(&public_body).unwrap().as_slice(),
+                Some("application/json"),
+                &headers,
+            )
+            .await
+            .expect("aggregate router must rewrite the public tool name");
+        let rewritten_json: Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(
+            rewritten_json["params"]["name"], "create_pr",
+            "backend-visible name must be the upstream alias"
+        );
+        // Rewrite staging metadata is consumed by the transform; trust for the
+        // governor recheck lives on the private request-context mapping.
+        assert!(!ctx.metadata.contains_key("mcp.needs_request_rewrite"));
+        assert!(!ctx.metadata.contains_key("mcp.rewrite.public_value"));
+        assert!(!ctx.metadata.contains_key("mcp.rewrite.upstream_value"));
+
+        assert!(
+            matches!(
+                governor
+                    .on_final_request_body_with_context(&mut ctx, &headers, &rewritten)
+                    .await,
+                PluginResult::Continue
+            ),
+            "final governor recheck must allow under the public policy name after trusted rewrite (emit_metadata={emit_metadata})"
+        );
+
+        // Unrelated name change after the trusted rewrite must fail closed.
+        let mut hijacked = rewritten_json.clone();
+        hijacked["params"]["name"] = json!("create_pr_hijacked");
+        let hijacked_bytes = serde_json::to_vec(&hijacked).unwrap();
+        let (status, body, _) = reject_raw(
+            governor
+                .on_final_request_body_with_context(&mut ctx, &headers, &hijacked_bytes)
+                .await,
+        );
+        assert_eq!(
+            status, 403,
+            "unrelated final name must deny under default_action=deny (emit_metadata={emit_metadata})"
+        );
+        assert!(
+            body.contains("deny") || body.contains("ai_tool_governor"),
+            "denial body should identify the governor decision: {body}"
+        );
+
+        // Final arguments are still re-evaluated under the public policy.
+        let mut missing_repo = rewritten_json.clone();
+        missing_repo["params"]["arguments"] = json!({});
+        let missing_bytes = serde_json::to_vec(&missing_repo).unwrap();
+        // Fresh request context so the prior denial metadata does not mask the
+        // argument recheck: re-stage the same trusted mapping the gateway would
+        // leave after a successful rewrite.
+        let (mut arg_ctx, mut arg_headers) = mcp_ctx(public_body.clone());
+        arg_headers.insert("mcp-session-id".to_string(), session_id.clone());
+        assert!(matches!(
+            governor.before_proxy(&mut arg_ctx, &mut arg_headers).await,
+            PluginResult::Continue
+        ));
+        assert!(matches!(
+            mcp.before_proxy(&mut arg_ctx, &mut arg_headers).await,
+            PluginResult::Continue
+        ));
+        let _ = mcp
+            .transform_request_body_with_context(
+                &mut arg_ctx,
+                serde_json::to_vec(&public_body).unwrap().as_slice(),
+                Some("application/json"),
+                &arg_headers,
+            )
+            .await
+            .expect("rewrite for argument recheck");
+        let (arg_status, _, _) = reject_raw(
+            governor
+                .on_final_request_body_with_context(&mut arg_ctx, &arg_headers, &missing_bytes)
+                .await,
+        );
+        assert_eq!(
+            arg_status, 403,
+            "final arguments must still be governed under the public policy (emit_metadata={emit_metadata})"
+        );
+    }
+}

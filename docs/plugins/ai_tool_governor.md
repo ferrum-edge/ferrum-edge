@@ -372,7 +372,13 @@ so disabling metadata/hash observability cannot be bypassed by lifecycle state.
   `mcp_gateway`. Enable `inspect.mcp_tool_calls` on `ai_tool_governor` to add
   deterministic approval/argument policy over selected MCP `tools/call` traffic;
   the governor parses the JSON-RPC body directly and does not depend on
-  `mcp_gateway` being present.
+  `mcp_gateway` being present. When both plugins share a proxy in
+  `aggregate_router` mode, governor policy keys stay the **public** namespaced
+  names (for example `github.create_pr`): the gateway's trusted public→upstream
+  rewrite is remapped for the final-body recheck only when the final wire name
+  exactly matches that staged upstream alias. Final arguments, schemas, required
+  fields, regexes, and approvals are still re-evaluated, and any unrelated name
+  change fails closed under `default_action: deny`.
 
 ## Limitations (MVP)
 

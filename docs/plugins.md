@@ -3917,7 +3917,9 @@ Validation follows the same per-mode tolerance model as other file-dependent con
 
 Deterministic allow, deny, argument-redaction, and approval policy for AI tool
 definitions and calls across buffered JSON, streaming SSE, MCP, and A2A
-surfaces. See the dedicated
+surfaces. When composed with `mcp_gateway` `aggregate_router`, policy keys remain
+public namespaced tool names across the gateway's trusted upstream-name rewrite.
+See the dedicated
 [`ai_tool_governor` configuration guide](plugins/ai_tool_governor.md) for the
 complete schema, fail-closed behavior, examples, observability contract, and
 documented lifecycle limitations.
@@ -4938,7 +4940,7 @@ plugins:
 
 ### `mcp_gateway`
 
-HTTP-only Model Context Protocol gateway for AI agent tool traffic. `transparent_proxy` mode preserves MCP JSON-RPC and session headers while routing one Ferrum endpoint to one upstream MCP server. `aggregate_router` mode exposes one Ferrum MCP endpoint for multiple upstream MCP servers, synthesizes downstream `initialize`, lazily initializes upstream sessions, aggregates `tools/list`, `resources/list`, and `prompts/list`, namespaces public names, routes `tools/call`, `resources/read`, and `prompts/get`, rewrites public names back to upstream names, validates tool arguments against discovered `inputSchema`, and emits `mcp.*` metadata for existing Ferrum authz, logging, tracing, chargeback, and alert plugins.
+HTTP-only Model Context Protocol gateway for AI agent tool traffic. `transparent_proxy` mode preserves MCP JSON-RPC and session headers while routing one Ferrum endpoint to one upstream MCP server. `aggregate_router` mode exposes one Ferrum MCP endpoint for multiple upstream MCP servers, synthesizes downstream `initialize`, lazily initializes upstream sessions, aggregates `tools/list`, `resources/list`, and `prompts/list`, namespaces public names, routes `tools/call`, `resources/read`, and `prompts/get`, rewrites public names back to upstream names, validates tool arguments against discovered `inputSchema`, and emits `mcp.*` metadata for existing Ferrum authz, logging, tracing, chargeback, and alert plugins. A private, gateway-authenticated public→upstream tool-name mapping accompanies each aggregate `tools/call` rewrite so `ai_tool_governor` can keep policy keys on the public namespaced identity across that rewrite without trusting forgeable metadata.
 
 The plugin deliberately does not implement generic auth, rate limiting, retry, timeout, WAF, tracing, DLP, or semantic safety behavior.
 

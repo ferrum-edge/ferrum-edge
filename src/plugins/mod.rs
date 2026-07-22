@@ -1909,6 +1909,13 @@ pub struct RequestContext {
     /// details cannot enter transaction logs, while the response hook can
     /// preserve the public URI spelling the client actually requested.
     pub(crate) mcp_response_resource_binding: Option<(String, String)>,
+    /// Gateway-authenticated public→upstream tool-name rewrite staged by
+    /// `mcp_gateway` aggregate routing for a `tools/call`. Kept out of public
+    /// metadata so forgeable `mcp.*` keys cannot mint policy identity, while
+    /// `ai_tool_governor`'s final-body recheck can evaluate the routed call
+    /// under the public name only when the final wire name exactly matches
+    /// this trusted upstream alias.
+    pub(crate) mcp_trusted_tool_name_rewrite: Option<(String, String)>,
     /// Whether reserved `waf.*` metadata has been cleared for this request.
     ///
     /// `metadata` is intentionally public plugin scratch space. WAF-owned log
@@ -2268,6 +2275,7 @@ impl RequestContext {
             a2a_gateway_is_agent_card: false,
             a2a_gateway_streaming: false,
             mcp_response_resource_binding: None,
+            mcp_trusted_tool_name_rewrite: None,
             waf_metadata_initialized: false,
             waf_owned_metadata: HashMap::new(),
             waf_instance_scores: HashMap::new(),
@@ -2965,6 +2973,7 @@ impl RequestContext {
             a2a_gateway_is_agent_card: self.a2a_gateway_is_agent_card,
             a2a_gateway_streaming: self.a2a_gateway_streaming,
             mcp_response_resource_binding: self.mcp_response_resource_binding.clone(),
+            mcp_trusted_tool_name_rewrite: self.mcp_trusted_tool_name_rewrite.clone(),
             waf_metadata_initialized: self.waf_metadata_initialized,
             waf_owned_metadata: self.waf_owned_metadata.clone(),
             waf_instance_scores: self.waf_instance_scores.clone(),

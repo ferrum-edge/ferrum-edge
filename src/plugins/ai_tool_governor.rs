@@ -75,7 +75,12 @@
 //! enforce mode regardless of how its `Content-Type` was relabeled.
 //!
 //! Non-goals (MVP): it does not execute tools, manage MCP sessions, replace
-//! `mcp_gateway`/A2A routing, or implement an approval UI.
+//! `mcp_gateway`/A2A routing, or implement an approval UI. When composed with
+//! `mcp_gateway` aggregate routing, policy keys remain the public namespaced
+//! tool names: a gateway-authenticated public→upstream rewrite is remapped for
+//! the final-body recheck only when the final wire name exactly matches that
+//! trusted upstream alias; final arguments are still re-evaluated, and any
+//! unrelated name change fails closed.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -1836,7 +1841,7 @@ impl AiToolGovernor {
             let mut malformed_mcp_call = false;
             for entry in entries {
                 if self.inspect.mcp_tool_calls {
-                    match extract_mcp_tool_call(entry) {
+                    match extract_mcp_tool_call_for_policy(entry, ctx) {
                         McpToolCallExtraction::Call(call) => {
                             calls.push(call);
                             continue;
@@ -1912,7 +1917,7 @@ impl AiToolGovernor {
 
         // 2. MCP tools/call (direct JSON-RPC body parsing).
         if self.inspect.mcp_tool_calls {
-            match extract_mcp_tool_call(json) {
+            match extract_mcp_tool_call_for_policy(json, ctx) {
                 McpToolCallExtraction::Call(call) => {
                     let batch = self
                         .engine
@@ -2486,7 +2491,10 @@ impl Plugin for AiToolGovernor {
     /// or rewrite JSON fields — turning an allowed body into a denied `tools/call`
     /// or a disallowed `tools[]` definition before it reaches the backend. This
     /// hook closes that gap. Request decompression also runs in `transform_request_body`,
-    /// so a body opaque to `before_proxy` may be plaintext here.
+    /// so a body opaque to `before_proxy` may be plaintext here. A trusted
+    /// `mcp_gateway` aggregate-router name rewrite is remapped back to the public
+    /// policy identity only when the final wire name exactly matches the staged
+    /// upstream alias; arguments and unrelated name changes are still governed.
     async fn on_final_request_body_with_context(
         &self,
         ctx: &mut RequestContext,
@@ -4853,6 +4861,27 @@ fn extract_mcp_tool_call(json: &Value) -> McpToolCallExtraction {
             parsed_args: Some(json!({})),
         }),
         Some(arguments) => McpToolCallExtraction::Call(tool_call_from(name, Some(arguments))),
+    }
+}
+
+/// Like [`extract_mcp_tool_call`], but remaps a gateway-authenticated aggregate
+/// upstream alias to its public policy name when — and only when — the final
+/// wire name exactly matches the trusted rewrite staged by `mcp_gateway`.
+///
+/// Final arguments remain the backend-visible values. Unrelated name changes,
+/// missing trust, or a wire name that does not equal the staged upstream alias
+/// keep the wire identity and therefore fail closed under deny-by-default.
+fn extract_mcp_tool_call_for_policy(json: &Value, ctx: &RequestContext) -> McpToolCallExtraction {
+    match extract_mcp_tool_call(json) {
+        McpToolCallExtraction::Call(mut call) => {
+            if let Some((public_name, upstream_name)) = &ctx.mcp_trusted_tool_name_rewrite
+                && call.name == *upstream_name
+            {
+                call.name = public_name.clone();
+            }
+            McpToolCallExtraction::Call(call)
+        }
+        other => other,
     }
 }
 

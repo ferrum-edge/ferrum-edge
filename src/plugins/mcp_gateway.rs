@@ -900,6 +900,16 @@ impl McpGateway {
             METADATA_REWRITE_UPSTREAM_VALUE_KEY.to_string(),
             rewrite.upstream_value.to_string(),
         );
+        // Stage a non-serialized, gateway-authenticated public→upstream tool
+        // identity for `ai_tool_governor`'s final-body recheck. Public metadata
+        // alone is forgeable by sibling plugins; only this private field may
+        // remap policy identity after aggregate routing rewrites `params.name`.
+        if rewrite.method == "tools/call" && rewrite.param == "name" {
+            ctx.mcp_trusted_tool_name_rewrite = Some((
+                rewrite.public_value.to_string(),
+                rewrite.upstream_value.to_string(),
+            ));
+        }
         if !rewrite.response_resource_rewrite_possible {
             return;
         }
@@ -3612,25 +3622,88 @@ impl Plugin for McpGateway {
             return None;
         }
         if ctx.metadata.remove(METADATA_REWRITE_KEY).as_deref() != Some("true") {
+            // Routing stages rewrite metadata and the private tool-name mapping
+            // together. If a later before_proxy hook stripped the marker before
+            // this transform ran, drop pending trust so an incomplete rewrite
+            // cannot remap governor policy identity. This hook runs once per
+            // request, so a successful rewrite (which consumes the marker) is
+            // not cleared here.
+            ctx.mcp_trusted_tool_name_rewrite = None;
             return None;
         }
-        let method = ctx.metadata.remove(METADATA_REWRITE_METHOD_KEY)?;
-        let param = ctx.metadata.remove(METADATA_REWRITE_PARAM_KEY)?;
-        let public_value = ctx.metadata.remove(METADATA_REWRITE_PUBLIC_VALUE_KEY)?;
-        let upstream_value = ctx.metadata.remove(METADATA_REWRITE_UPSTREAM_VALUE_KEY)?;
+        let Some(method) = ctx.metadata.remove(METADATA_REWRITE_METHOD_KEY) else {
+            ctx.mcp_trusted_tool_name_rewrite = None;
+            return None;
+        };
+        let Some(param) = ctx.metadata.remove(METADATA_REWRITE_PARAM_KEY) else {
+            ctx.mcp_trusted_tool_name_rewrite = None;
+            return None;
+        };
+        let Some(public_value) = ctx.metadata.remove(METADATA_REWRITE_PUBLIC_VALUE_KEY) else {
+            ctx.mcp_trusted_tool_name_rewrite = None;
+            return None;
+        };
+        let Some(upstream_value) = ctx.metadata.remove(METADATA_REWRITE_UPSTREAM_VALUE_KEY) else {
+            ctx.mcp_trusted_tool_name_rewrite = None;
+            return None;
+        };
+        let trusted_tool_rewrite = method == "tools/call" && param == "name";
+        // Forgeable rewrite metadata cannot mint governor trust on its own: a
+        // tools/call name rewrite must match the private mapping staged by
+        // `mark_request_rewrite`. Any mismatch or failed rewrite clears it so
+        // the final governor recheck fails closed on untrusted aliases.
+        if trusted_tool_rewrite {
+            match &ctx.mcp_trusted_tool_name_rewrite {
+                Some((trusted_public, trusted_upstream))
+                    if trusted_public == &public_value && trusted_upstream == &upstream_value => {}
+                _ => {
+                    ctx.mcp_trusted_tool_name_rewrite = None;
+                    return None;
+                }
+            }
+        }
 
-        let mut value: Value = serde_json::from_slice(body).ok()?;
-        let request_method = value.get("method")?.as_str()?;
+        let mut value: Value = match serde_json::from_slice(body) {
+            Ok(value) => value,
+            Err(_) => {
+                if trusted_tool_rewrite {
+                    ctx.mcp_trusted_tool_name_rewrite = None;
+                }
+                return None;
+            }
+        };
+        let request_method = match value.get("method").and_then(Value::as_str) {
+            Some(request_method) => request_method,
+            None => {
+                if trusted_tool_rewrite {
+                    ctx.mcp_trusted_tool_name_rewrite = None;
+                }
+                return None;
+            }
+        };
         if request_method != method {
             warn!(
                 expected_method = %method,
                 actual_method = %request_method,
                 "Skipping MCP request rewrite because routed method does not match buffered body"
             );
+            if trusted_tool_rewrite {
+                ctx.mcp_trusted_tool_name_rewrite = None;
+            }
             return None;
         }
-        let params = value.get_mut("params")?.as_object_mut()?;
-        let current_value = params.get(&param)?.as_str()?;
+        let Some(params) = value.get_mut("params").and_then(Value::as_object_mut) else {
+            if trusted_tool_rewrite {
+                ctx.mcp_trusted_tool_name_rewrite = None;
+            }
+            return None;
+        };
+        let Some(current_value) = params.get(&param).and_then(Value::as_str) else {
+            if trusted_tool_rewrite {
+                ctx.mcp_trusted_tool_name_rewrite = None;
+            }
+            return None;
+        };
         if current_value != public_value {
             warn!(
                 method = %method,
@@ -3639,10 +3712,21 @@ impl Plugin for McpGateway {
                 actual_value_hash = %hash_str(current_value),
                 "Skipping MCP request rewrite because routed value does not match buffered body"
             );
+            if trusted_tool_rewrite {
+                ctx.mcp_trusted_tool_name_rewrite = None;
+            }
             return None;
         }
         params.insert(param, Value::String(upstream_value));
-        serde_json::to_vec(&value).ok()
+        match serde_json::to_vec(&value) {
+            Ok(rewritten) => Some(rewritten),
+            Err(_) => {
+                if trusted_tool_rewrite {
+                    ctx.mcp_trusted_tool_name_rewrite = None;
+                }
+                None
+            }
+        }
     }
 
     async fn transform_response_body_with_context(

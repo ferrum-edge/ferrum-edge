@@ -19282,7 +19282,7 @@ components:
             mcp_tool_calls:
               type: boolean
               default: false
-              description: "Inspect MCP JSON-RPC tools/call request bodies directly (params.name + params.arguments), including calls inside JSON-RPC batch arrays. When params.arguments is omitted, the governor normalizes it to {} before required-arg / regex / hash / approval / JSON Schema evaluation (MCP zero-argument calls). Provider response shapes that omit function.arguments are not normalized."
+              description: "Inspect MCP JSON-RPC tools/call request bodies directly (params.name + params.arguments), including calls inside JSON-RPC batch arrays. When params.arguments is omitted, the governor normalizes it to {} before required-arg / regex / hash / approval / JSON Schema evaluation (MCP zero-argument calls). Provider response shapes that omit function.arguments are not normalized. With mcp_gateway aggregate_router on the same proxy, policy identity stays the public namespaced tool name across the gateway's trusted upstream-name rewrite; final arguments are still rechecked and unrelated name changes fail closed."
             a2a_methods:
               type: boolean
               default: false
@@ -19291,7 +19291,7 @@ components:
           type: object
           propertyNames:
             minLength: 1
-          description: "Per-tool policy, keyed by a non-empty exact tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name). The tool-name map is intentionally free-form; each policy object is closed."
+          description: "Per-tool policy, keyed by a non-empty exact tool name (may be namespaced, e.g. github.create_pr, or an MCP/A2A method name). When composed with mcp_gateway aggregate_router, keys remain the public namespaced names: a trusted public-to-upstream rewrite is remapped for the final-body recheck only when the final wire name exactly matches that staged upstream alias; final arguments are still re-evaluated and unrelated name changes fail closed. The tool-name map is intentionally free-form; each policy object is closed."
           additionalProperties:
             type: object
             additionalProperties: false
@@ -19886,7 +19886,7 @@ components:
 
     McpGatewayConfig:
       type: object
-      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, tool argument JSON Schema validation, and mcp.* metadata emission. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins."
+      description: "Plugin: mcp_gateway — HTTP MCP / Agent Tool Gateway for JSON-RPC MCP traffic. Supports transparent_proxy and aggregate_router modes, MCP session mediation, catalog aggregation, namespaced tool/resource/prompt routing, tool argument JSON Schema validation, and mcp.* metadata emission. Aggregate tools/call rewrites stage a private gateway-authenticated public-to-upstream tool-name mapping so ai_tool_governor can keep policy keys on public namespaced identities. Generic auth, rate limiting, WAF, retry, timeout, tracing, DLP, and semantic safety remain separate Ferrum plugins."
       required: [mode, endpoint, servers]
       properties:
         enabled:
