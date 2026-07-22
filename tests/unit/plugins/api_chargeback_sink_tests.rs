@@ -814,7 +814,9 @@ async fn committed_unusable_spool_latches_status_and_metric_failure() {
     let config = valid_config(&blocked);
     let plugin = ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap();
 
-    plugin.start_background_tasks().expect("stage chargeback sink");
+    plugin
+        .start_background_tasks()
+        .expect("stage chargeback sink");
     plugin.commit_background_tasks();
 
     let mut status = Value::Null;
@@ -847,7 +849,10 @@ async fn committed_unusable_spool_latches_status_and_metric_failure() {
                 .and_then(|value| value.parse::<u64>().ok())
         })
         .unwrap_or(0);
-    assert!(failures > 0, "missing persistent failure counter:\n{prometheus}");
+    assert!(
+        failures > 0,
+        "missing persistent failure counter:\n{prometheus}"
+    );
 }
 
 #[cfg(unix)]
