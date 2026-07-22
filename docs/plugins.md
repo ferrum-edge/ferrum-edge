@@ -1408,15 +1408,20 @@ or an auth proxy that injects the `Authorization: Bearer <token>` header.
 ### `api_chargeback_sink`
 
 Exports durable charge events or snapshot deltas to ClickHouse using the same
-pricing blocks as `api_chargeback`. It supports per-event mode for
-transaction-level provenance, snapshot mode for lower ingest volume, an on-disk
-spool for ClickHouse outages, `GET /charges/sink/status`, and Prometheus metrics
-under `/metrics`. See [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md)
-for DDL, configuration, spool sizing, replay, and reconciliation guidance.
-Ordinary HTTP is priced by wire status. Native gRPC and translated gRPC-Web use
-the same canonical effective-status mapping documented for `api_chargeback`;
-durable events retain the billable `status_code`, raw `http_status_code`, and
-normalized final `grpc_status` as separate fields.
+pricing blocks as `api_chargeback`. Config is required: `clickhouse.url` plus
+at least one nonempty pricing dimension (`pricing_tiers`, `bandwidth_pricing`,
+or `stream_connection_pricing` with `PricingConfig::has_any_pricing`
+semantics). It supports per-event mode for transaction-level provenance,
+snapshot mode for lower ingest volume (requires `spool.enabled=true`), an
+on-disk spool for ClickHouse outages, `GET /charges/sink/status`, and
+Prometheus metrics under `/metrics`. See
+[plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
+configuration, OpenAPI/runtime admission layers, spool sizing, replay, and
+reconciliation guidance. Set `FERRUM_NODE_ID` for stable spool ownership on
+persistent storage. Ordinary HTTP is priced by wire status. Native gRPC and
+translated gRPC-Web use the same canonical effective-status mapping documented
+for `api_chargeback`; durable events retain the billable `status_code`, raw
+`http_status_code`, and normalized final `grpc_status` as separate fields.
 
 **Priority:** 9351
 

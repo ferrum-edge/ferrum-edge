@@ -20,7 +20,11 @@ ClickHouse or the in-memory queue is unavailable. Idle snapshot keys are evicted
 after `snapshot.stale_entry_ttl_secs` and checked every
 `snapshot.cleanup_interval_secs`.
 
-Both modes use the same pricing fields as `api_chargeback`:
+Both modes use the same pricing fields as `api_chargeback`. At least one
+nonempty pricing dimension is mandatory and matches
+`PricingConfig::has_any_pricing`: a nonempty `pricing_tiers` list, bandwidth
+pricing with at least one strictly positive per-byte rate, or
+`stream_connection_pricing` with a strictly positive `price_per_connection`.
 
 - `pricing_tiers` for HTTP-family per-call pricing by billable status. Ordinary
   HTTP uses its wire status. Native gRPC and translated gRPC-Web use the final
@@ -31,6 +35,18 @@ Both modes use the same pricing fields as `api_chargeback`:
   fail closed to the `500` billing bucket.
 - `bandwidth_pricing` for client-to-backend and backend-to-client bytes.
 - `stream_connection_pricing` for TCP, TCP+TLS, UDP, and DTLS sessions.
+
+## Admission Layers
+
+Admin, file-mode, and CP-DP admission share the OpenAPI
+`ApiChargebackSinkConfig` contract plus the plugin constructor
+(`ApiChargebackSink::new` / `validate_plugin_config`). OpenAPI requires
+`config`, `clickhouse.url`, at least one valid pricing dimension, snapshot
+mode with `spool.enabled=true`, and compatible `password_ref`/TLS settings.
+Constructor validation additionally enforces relationships OpenAPI 3.1 cannot
+express safely (notably `retry.max_delay_ms >= retry.initial_delay_ms`),
+spool directory privacy, ClickHouse egress screening, and that a nonempty
+`password_ref` names a set `FERRUM_*` environment variable.
 
 ## ClickHouse Setup
 
@@ -158,9 +174,13 @@ max_bytes >= peak_events_per_second * average_encoded_event_bytes * outage_secon
 ```
 
 When `spool.dir` is backed by persistent storage, set `FERRUM_NODE_ID` to a
-stable identity such as a StatefulSet ordinal. If the node ID changes across
-restarts, the sink logs a warning when it finds sibling spool directories that
-may contain events from an older identity.
+stable identity such as a StatefulSet ordinal (see
+[configuration.md](../configuration.md) and `ferrum.conf`). Accepted values
+are any non-empty trimmed string; whitespace-only is ignored and values longer
+than 512 characters are truncated. Resolution order is `FERRUM_NODE_ID`, then
+`HOSTNAME`, then `/etc/hostname`, then `unknown`. If the node ID changes
+across restarts, the sink logs a warning when it finds sibling spool
+directories that may contain events from an older identity.
 
 ## Reconciliation Queries
 

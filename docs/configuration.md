@@ -45,6 +45,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_PKCS11_MODULE_PATH` | No | — | Default PKCS#11 module path used by frontend/admin/backend mTLS `pkcs11://` key sources when the URI omits `?module=` and `?module_env=`. Requires the `pkcs11` Cargo feature |
 | `FERRUM_PKCS11_PIN` | No | — | Optional example token user PIN variable for `pkcs11://...?pin_env=FERRUM_PKCS11_PIN`. Ferrum only reads it when a PKCS#11 key source references it, and never logs the value |
 | `FERRUM_CLICKHOUSE_PASSWORD` | No | — | Optional materialized password used by the `api_chargeback_sink` plugin when its `clickhouse.password_ref` is set to `FERRUM_CLICKHOUSE_PASSWORD`. The plugin only accepts `FERRUM_*` password references. Populate this value directly or through existing secret suffixes such as `FERRUM_CLICKHOUSE_PASSWORD_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` |
+| `FERRUM_NODE_ID` | No | `$HOSTNAME`, then `/etc/hostname`, then `unknown` | Stable node identity used by `api_chargeback_sink` for spool ownership under `<spool.dir>/<node_id>/` and written onto exported charge events. Accepts any non-empty trimmed string (whitespace-only is ignored); values longer than 512 characters are truncated. When `spool.dir` is on persistent storage, set a stable identity such as a StatefulSet ordinal so restarts do not orphan sibling spool directories from a previous identity |
 
 Process-log admission always needs one maximum-record reservation while a new
 record is serialized. After serialization, diagnostics report the actual bytes

@@ -8299,6 +8299,7 @@ components:
               plugin_name:
                 const: api_chargeback_sink
           then:
+            required: [config]
             properties:
               config:
                 $ref: "#/components/schemas/ApiChargebackSinkConfig"
@@ -19809,6 +19810,7 @@ components:
     ApiChargebackSinkConfig:
       type: object
       additionalProperties: false
+      required: [clickhouse]
       description: |
         Plugin: api_chargeback_sink — Durable ClickHouse charge export. Uses the
         same `pricing_tiers`, `bandwidth_pricing`, `stream_connection_pricing`,
@@ -19819,6 +19821,123 @@ components:
         normalized grpc-status mapped to the canonical effective HTTP status.
         Durable events preserve that billable status, the raw HTTP status, and
         the normalized gRPC status separately.
+
+        At least one nonempty pricing dimension must be configured with the same
+        semantics as runtime `PricingConfig::has_any_pricing`: a nonempty
+        `pricing_tiers` array, `bandwidth_pricing` with at least one strictly
+        positive per-byte rate, or `stream_connection_pricing` with a strictly
+        positive `price_per_connection`.
+
+        OpenAPI encodes material cross-field invariants that JSON Schema can
+        represent accurately: `clickhouse` (with runtime-mandatory `url`) is
+        required; snapshot mode requires `spool.enabled=true`; nonempty
+        `clickhouse.password_ref` requires `https://` and forbids disabled TLS
+        certificate/hostname verification; `clickhouse.url` must be http(s)
+        without user-info; batch/spool/snapshot numeric bounds match the
+        constructor.
+
+        Runtime admission layer (not safely expressible as OpenAPI 3.1
+        comparisons or input-independent checks):
+        `retry.max_delay_ms >= retry.initial_delay_ms`;
+        nonempty `password_ref` must name a set `FERRUM_*` process environment
+        variable; spool directory privacy/permissions
+        (`ensure_private_dir`); ClickHouse URL egress IP screening; and
+        whitespace-only trimming for `currency` / `pricing_version` /
+        `password_ref`. File, Admin, and CP-DP admission all invoke the same
+        plugin constructor validation path.
+      allOf:
+        - anyOf:
+            - required: [pricing_tiers]
+              properties:
+                pricing_tiers:
+                  type: array
+                  minItems: 1
+            - required: [bandwidth_pricing]
+              properties:
+                bandwidth_pricing:
+                  type: object
+                  anyOf:
+                    - required: [price_per_byte_sent]
+                      properties:
+                        price_per_byte_sent:
+                          type: number
+                          exclusiveMinimum: 0
+                    - required: [price_per_byte_received]
+                      properties:
+                        price_per_byte_received:
+                          type: number
+                          exclusiveMinimum: 0
+            - required: [stream_connection_pricing]
+              properties:
+                stream_connection_pricing:
+                  type: object
+                  required: [price_per_connection]
+                  properties:
+                    price_per_connection:
+                      type: number
+                      exclusiveMinimum: 0
+        - if:
+            required: [mode]
+            properties:
+              mode:
+                const: snapshot
+          then:
+            required: [spool]
+            properties:
+              spool:
+                type: object
+                required: [enabled]
+                properties:
+                  enabled:
+                    const: true
+        - not:
+            allOf:
+              - required: [clickhouse]
+                properties:
+                  clickhouse:
+                    type: object
+                    required: [password_ref]
+                    properties:
+                      password_ref:
+                        type: string
+                        minLength: 1
+                        pattern: '\S'
+              - anyOf:
+                  - required: [clickhouse]
+                    properties:
+                      clickhouse:
+                        type: object
+                        required: [url]
+                        properties:
+                          url:
+                            type: string
+                            pattern: '^https?://'
+                            not:
+                              pattern: '^https://'
+                  - required: [clickhouse]
+                    properties:
+                      clickhouse:
+                        type: object
+                        required: [tls]
+                        properties:
+                          tls:
+                            type: object
+                            required: [insecure_skip_verify]
+                            properties:
+                              insecure_skip_verify:
+                                const: true
+                  - required: [clickhouse]
+                    properties:
+                      clickhouse:
+                        type: object
+                        required: [tls]
+                        properties:
+                          tls:
+                            type: object
+                            required: [verify_hostname]
+                            properties:
+                              verify_hostname:
+                                const: false
       properties:
         mode:
           type: string
@@ -19827,12 +19946,16 @@ components:
           description: Export one event per transaction or periodic snapshot deltas. Snapshot mode requires spool.enabled=true for durable delta delivery.
         currency:
           type: string
+          minLength: 1
+          pattern: '\S'
           default: "USD"
-          description: Currency label written to each charge event.
+          description: Currency label written to each charge event. Runtime also rejects whitespace-only values after trim.
         pricing_version:
           type: string
+          minLength: 1
+          pattern: '\S'
           default: default
-          description: Operator-controlled pricing/version label written to each event.
+          description: Operator-controlled pricing/version label written to each event. Runtime also rejects whitespace-only values after trim.
         include_request_id:
           type: boolean
           default: true
@@ -19860,7 +19983,7 @@ components:
               price_per_call:
                 type: number
                 minimum: 0
-          description: HTTP-family per-call pricing by billable status. A status code must appear in at most one tier.
+          description: HTTP-family per-call pricing by billable status. A status code must appear in at most one tier. A nonempty tiers list satisfies has_any_pricing even when prices are zero.
         bandwidth_pricing:
           type: object
           additionalProperties: false
@@ -19873,7 +19996,7 @@ components:
               type: number
               minimum: 0
               default: 0.0
-          description: Optional per-byte pricing for client->backend and backend->client bytes.
+          description: Optional per-byte pricing for client->backend and backend->client bytes. When this is the only pricing dimension, at least one rate must be strictly greater than zero (has_any_pricing).
         stream_connection_pricing:
           type: object
           additionalProperties: false
@@ -19882,7 +20005,7 @@ components:
             price_per_connection:
               type: number
               minimum: 0
-          description: Optional flat per-session charge for TCP/TCP+TLS/UDP/DTLS disconnects.
+          description: Optional flat per-session charge for TCP/TCP+TLS/UDP/DTLS disconnects. When this is the only pricing dimension, price_per_connection must be strictly greater than zero (has_any_pricing).
         clickhouse:
           type: object
           additionalProperties: false
@@ -19891,19 +20014,35 @@ components:
             url:
               type: string
               format: uri
-              description: ClickHouse HTTP endpoint. Must use http:// or https:// and must not contain user-info.
+              minLength: 1
+              pattern: '^https?://[^/@]+(?:[/:?#]|$)'
+              description: ClickHouse HTTP endpoint. Must use http:// or https://, include a host, and must not contain user-info (use username/password_ref instead).
             database:
               type: string
+              minLength: 1
+              pattern: '^[A-Za-z0-9_.]+$'
               default: ferrum
+              description: ClickHouse database identifier interpolated into INSERT. ASCII letters, digits, underscore, and dot only.
             table:
               type: string
+              minLength: 1
+              pattern: '^[A-Za-z0-9_.]+$'
               default: charges_raw
+              description: ClickHouse table identifier interpolated into INSERT. ASCII letters, digits, underscore, and dot only.
             username:
               type: string
               description: Optional ClickHouse HTTP Basic username.
             password_ref:
               type: string
-              description: FERRUM_* environment variable containing the ClickHouse password, often materialized at startup from an existing `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, or `_GCP` secret suffix. Because the password is sent via HTTP Basic auth, `clickhouse.url` must use `https://` and TLS certificate/hostname verification must stay enabled when this is set.
+              pattern: '^(|FERRUM_[A-Za-z0-9_]+)$'
+              description: |
+                FERRUM_* environment variable containing the ClickHouse password,
+                often materialized at startup from an existing `_FILE`, `_VAULT`,
+                `_AWS`, `_AZURE`, or `_GCP` secret suffix. Empty values are treated
+                as unset. Because the password is sent via HTTP Basic auth,
+                `clickhouse.url` must use `https://` and TLS certificate/hostname
+                verification must stay enabled when this is nonempty. Runtime
+                additionally requires the referenced env var to be set.
             tls:
               type: object
               additionalProperties: false
@@ -19956,6 +20095,10 @@ components:
         retry:
           type: object
           additionalProperties: false
+          description: |
+            Retry budget and bounded exponential backoff. OpenAPI cannot express
+            `max_delay_ms >= initial_delay_ms`; the plugin constructor rejects
+            inverted bounds during Admin/file/CP-DP admission.
           properties:
             max_attempts:
               type: integer
@@ -19969,6 +20112,7 @@ components:
               type: integer
               minimum: 0
               default: 10000
+              description: Cap on inter-attempt delay. Runtime requires max_delay_ms >= initial_delay_ms.
             jitter:
               type: boolean
               default: true
@@ -19981,6 +20125,7 @@ components:
               default: true
             dir:
               type: string
+              minLength: 1
               default: /var/lib/ferrum/chargeback-spool
             max_bytes:
               type: integer
