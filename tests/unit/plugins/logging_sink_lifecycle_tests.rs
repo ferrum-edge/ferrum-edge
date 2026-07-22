@@ -15,10 +15,10 @@ use ferrum_edge::plugins::api_chargeback_sink::{self, ApiChargebackSink};
 use ferrum_edge::plugins::kafka_logging::KafkaLogging;
 use ferrum_edge::plugins::utils::PluginHttpClient;
 use ferrum_edge::plugins::{
-    Plugin, PluginFailurePolicy, ai_transcript_audit::AiTranscriptAudit,
-    http_logging::HttpLogging, loki_logging::LokiLogging, plugin_failure_policy,
-    statsd_logging::StatsdLogging, tcp_logging::TcpLogging, udp_logging::UdpLogging,
-    validate_plugin_config, ws_logging::WsLogging,
+    Plugin, PluginFailurePolicy, ai_transcript_audit::AiTranscriptAudit, http_logging::HttpLogging,
+    loki_logging::LokiLogging, plugin_failure_policy, statsd_logging::StatsdLogging,
+    tcp_logging::TcpLogging, udp_logging::UdpLogging, validate_plugin_config,
+    ws_logging::WsLogging,
 };
 use serde_json::{Value, json};
 use std::sync::atomic::{AtomicUsize, Ordering};
