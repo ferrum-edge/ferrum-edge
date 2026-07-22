@@ -366,6 +366,58 @@ fn test_semantic_endpoint_allows_literal_ips_permitted_by_backend_policy() {
 }
 
 #[test]
+fn semantic_and_redis_hostnames_participate_in_dns_warmup() {
+    let embedding_only = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "https://Embeddings.Example.COM/v1/embeddings",
+    }));
+    assert_eq!(
+        embedding_only.warmup_hostnames(),
+        vec!["embeddings.example.com".to_string()]
+    );
+
+    let redis_only = make_plugin(json!({
+        "sync_mode": "redis",
+        "redis_url": "redis://Cache.Example.COM:6379/0",
+    }));
+    assert_eq!(
+        redis_only.warmup_hostnames(),
+        vec!["cache.example.com".to_string()]
+    );
+
+    let both = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "https://Embeddings.Example.COM/v1/embeddings",
+        "sync_mode": "redis",
+        "redis_url": "redis://Cache.Example.COM:6379/0",
+    }));
+    assert_eq!(
+        both.warmup_hostnames(),
+        vec![
+            "embeddings.example.com".to_string(),
+            "cache.example.com".to_string(),
+        ]
+    );
+
+    let duplicate = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "https://Shared.Example.COM/v1/embeddings",
+        "sync_mode": "redis",
+        "redis_url": "redis://shared.example.com:6379/0",
+    }));
+    assert_eq!(
+        duplicate.warmup_hostnames(),
+        vec!["shared.example.com".to_string()]
+    );
+
+    let literal_ip = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "http://127.0.0.1:12345/embeddings",
+    }));
+    assert!(literal_ip.warmup_hostnames().is_empty());
+}
+
+#[test]
 fn test_semantic_config_is_optional_and_valid_when_enabled() {
     let exact_only = make_plugin(json!({}));
     assert_eq!(exact_only.name(), "ai_semantic_cache");

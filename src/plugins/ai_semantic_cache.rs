@@ -178,6 +178,9 @@ struct CachedResponse {
 struct SemanticConfig {
     provider: EmbeddingProvider,
     endpoint: String,
+    /// Lowercased domain hostname used for DNS pre-warming, or `None` when
+    /// the endpoint uses a literal IP and requires no DNS lookup.
+    warmup_hostname: Option<String>,
     model: Option<String>,
     api_key: Option<String>,
     auth_header: String,
@@ -2065,11 +2068,22 @@ impl Plugin for AiSemanticCache {
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
-        if let Some(ref redis) = self.redis_client {
-            redis.warmup_hostname().into_iter().collect()
-        } else {
-            Vec::new()
+        let mut hosts = Vec::new();
+        if let Some(hostname) = self
+            .semantic
+            .as_ref()
+            .and_then(|semantic| semantic.warmup_hostname.as_ref())
+        {
+            hosts.push(hostname.clone());
         }
+        if let Some(ref redis) = self.redis_client {
+            if let Some(hostname) = redis.warmup_hostname()
+                && !hosts.contains(&hostname)
+            {
+                hosts.push(hostname);
+            }
+        }
+        hosts
     }
 
     fn tracked_keys_count(&self) -> Option<usize> {
@@ -2200,11 +2214,12 @@ fn parse_semantic_config(
         "ai_semantic_cache: 'semantic_embedding_endpoint' is required when semantic_similarity_enabled=true"
             .to_string()
     })?;
-    validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
+    let warmup_hostname = validate_semantic_embedding_endpoint(&endpoint, backend_allow_ips)?;
 
     Ok(Some(SemanticConfig {
         provider,
         endpoint,
+        warmup_hostname,
         model,
         api_key,
         auth_header,
@@ -2220,7 +2235,7 @@ fn parse_semantic_config(
 fn validate_semantic_embedding_endpoint(
     endpoint: &str,
     backend_allow_ips: &crate::config::BackendEgressPolicy,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let parsed_endpoint = url::Url::parse(endpoint)
         .map_err(|_| "ai_semantic_cache: 'semantic_embedding_endpoint' must be a valid URL")?;
     if !matches!(parsed_endpoint.scheme(), "http" | "https") {
@@ -2233,10 +2248,10 @@ fn validate_semantic_embedding_endpoint(
         "ai_semantic_cache: 'semantic_embedding_endpoint' must include a host".to_string()
     })?;
 
-    let literal_ip = match host {
-        Host::Ipv4(ip) => Some(std::net::IpAddr::V4(ip)),
-        Host::Ipv6(ip) => Some(std::net::IpAddr::V6(ip)),
-        Host::Domain(_) => None,
+    let (literal_ip, warmup_hostname) = match host {
+        Host::Ipv4(ip) => (Some(std::net::IpAddr::V4(ip)), None),
+        Host::Ipv6(ip) => (Some(std::net::IpAddr::V6(ip)), None),
+        Host::Domain(hostname) => (None, Some(hostname.to_ascii_lowercase())),
     };
 
     if let Some(ip) = literal_ip
@@ -2247,7 +2262,7 @@ fn validate_semantic_embedding_endpoint(
         ));
     }
 
-    Ok(())
+    Ok(warmup_hostname)
 }
 
 fn default_redis_key_prefix(namespace: &str) -> String {
