@@ -108,12 +108,19 @@ confirmed it is clean for their traffic.
 
 ## Rule targets
 
-A rule's `target` selects what it inspects:
+A rule's `target` selects what it inspects. Use a string for targets that need
+no extra fields, or an object with `type` (and target-specific fields).
 
-`header_names`, `header_values` (optionally scoped to specific header `names`),
-`query_keys`, `query_values`, `cookies`, `url_path`, `full_url`, `method`,
-`body_text`, `body_json_path` (a specific JSON field by dotted `path`),
-`response_headers`, `response_body`.
+Canonical targets: `header_names`, `header_values` (optionally scoped with a
+non-empty `names` list), `query_keys`, `query_values`, `cookies`, `url_path`,
+`full_url`, `method`, `body_text`, `body_json_path` (object form only: requires
+a non-empty dotted `path`), `response_headers`, `response_body`.
+
+Runtime aliases map onto those targets: `request_headers` → `header_values`,
+`request_query` → `query_values`, `request_path` → `url_path`,
+`request_url` → `full_url`, `request_method` → `method`, and
+`request_body` → `body_text`. `path` is valid only on `body_json_path`;
+`names` is valid only on `header_values` / `request_headers`.
 
 `match_kind` is one of `regex` (default), `literal`, `contains`, `equals`,
 `luhn` (credit-card checksum; body targets only), or `cidr` (IP membership).

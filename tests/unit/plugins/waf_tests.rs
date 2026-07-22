@@ -1241,6 +1241,93 @@ fn header_value_target_names_must_be_non_empty_when_provided() {
     assert!(err.contains("non-empty"));
 }
 
+/// OpenAPI `WafRule.target` must accept exactly the shapes WAF construction accepts
+/// (issue #2327): no string `body_json_path`, required non-empty `path` for JSON-path
+/// objects, `names` only on header-value targets with `minItems: 1`, and runtime aliases.
+#[test]
+fn waf_rule_target_openapi_runtime_parity() {
+    use serde_json::Value as JsonValue;
+
+    let spec: JsonValue =
+        serde_yaml::from_str(include_str!("../../../openapi.yaml")).expect("openapi.yaml parses");
+    let target_schema = spec
+        .pointer("/components/schemas/WafRule/properties/target")
+        .expect("WafRule.target schema");
+    let validator = jsonschema::draft202012::options()
+        .build(target_schema)
+        .expect("WafRule.target schema compiles");
+
+    let waf_with_target = |target: &JsonValue| {
+        Waf::new(&json!({
+            "include_default_rules": false,
+            "custom_rules": [{
+                "id": "CUSTOM-TARGET-PARITY",
+                "name": "parity",
+                "category": "custom",
+                "severity": "high",
+                "target": target,
+                "match_kind": "contains",
+                "pattern": "needle"
+            }]
+        }))
+    };
+
+    let valid_targets = [
+        json!("header_values"),
+        json!("request_headers"),
+        json!("query_values"),
+        json!("request_query"),
+        json!("url_path"),
+        json!("request_path"),
+        json!("full_url"),
+        json!("request_url"),
+        json!("method"),
+        json!("request_method"),
+        json!("body_text"),
+        json!("request_body"),
+        json!("response_body"),
+        json!({ "type": "header_values" }),
+        json!({ "type": "request_headers", "names": ["x-forwarded-for"] }),
+        json!({ "type": "query_values" }),
+        json!({ "type": "request_query" }),
+        json!({ "type": "body_json_path", "path": "messages.0.content" }),
+        json!({ "type": "response_headers" }),
+    ];
+    for target in &valid_targets {
+        assert!(
+            validator.validate(target).is_ok(),
+            "schema must accept valid target: {target}"
+        );
+        assert!(
+            waf_with_target(target).is_ok(),
+            "runtime must accept schema-valid target: {target}"
+        );
+    }
+
+    let invalid_targets = [
+        // Issue reproductions: OpenAPI previously accepted these; runtime rejected.
+        json!("body_json_path"),
+        json!({ "type": "body_json_path" }),
+        json!({ "type": "response_body", "path": "message" }),
+        json!({ "type": "query_values", "names": ["x-forwarded-for"] }),
+        json!({ "type": "header_values", "names": [] }),
+        // Additional shape guards encoded in the schema.
+        json!({ "type": "body_json_path", "path": "" }),
+        json!({ "type": "header_values", "path": "x" }),
+        json!({ "type": "body_json_path", "path": "a.b", "names": ["x"] }),
+    ];
+    for target in &invalid_targets {
+        assert!(
+            validator.validate(target).is_err(),
+            "schema must reject invalid target: {target}"
+        );
+        assert!(
+            waf_with_target(target).is_err(),
+            "runtime must reject schema-invalid target: {target}"
+        );
+    }
+}
+
 #[test]
 fn waf_is_security_critical() {
     assert_eq!(

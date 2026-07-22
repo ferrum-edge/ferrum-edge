@@ -16148,6 +16148,14 @@ components:
           enum: [info, low, medium, high, critical]
           default: medium
         target:
+          description: >-
+            Scan target. A string selects a target that needs no extra fields
+            (`body_json_path` is object-only). Object form uses `type` plus
+            target-specific fields: optional non-empty `names` only for
+            `header_values`/`request_headers`, and required non-empty `path`
+            only for `body_json_path`. Aliases `request_headers`,
+            `request_query`, `request_path`, `request_url`, `request_method`,
+            and `request_body` match runtime parsing.
           oneOf:
             - type: string
               enum:
@@ -16166,18 +16174,43 @@ components:
                 - request_method
                 - body_text
                 - request_body
-                - body_json_path
                 - response_headers
                 - response_body
             - type: object
+              additionalProperties: false
+              required: [type]
+              properties:
+                type:
+                  type: string
+                  enum: [header_values, request_headers]
+                names:
+                  type: array
+                  description: >-
+                    Optional header-name filter for header_values/request_headers;
+                    must be non-empty when provided.
+                  minItems: 1
+                  items:
+                    type: string
+                    minLength: 1
+            - type: object
+              additionalProperties: false
+              required: [type, path]
+              properties:
+                type:
+                  const: body_json_path
+                path:
+                  type: string
+                  minLength: 1
+                  description: >-
+                    Required dotted JSON path for body_json_path targets.
+            - type: object
+              additionalProperties: false
               required: [type]
               properties:
                 type:
                   type: string
                   enum:
                     - header_names
-                    - header_values
-                    - request_headers
                     - query_keys
                     - query_values
                     - request_query
@@ -16190,17 +16223,8 @@ components:
                     - request_method
                     - body_text
                     - request_body
-                    - body_json_path
                     - response_headers
                     - response_body
-                names:
-                  type: array
-                  description: Only valid for header_values/request_headers targets; must be non-empty when provided.
-                  items:
-                    type: string
-                path:
-                  type: string
-                  description: Required and only valid for body_json_path targets.
         match_kind:
           type: string
           enum: [regex, literal, contains, equals, luhn, cidr]

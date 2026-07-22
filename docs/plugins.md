@@ -3258,7 +3258,7 @@ representations explicitly outside the configured response-body scan scope.
 | `name` | string | `id` | Human-readable rule name. |
 | `category` | string | required | Category label, such as `sqli`, `xss`, or `custom`. |
 | `severity` | string | `medium` | `info`, `low`, `medium`, `high`, or `critical`. |
-| `target` | string/object | required | Scan target. Object targets support `type`, optional non-empty `names` only for request header values, and `path` only for JSON-path body rules. |
+| `target` | string/object | required | Scan target. Strings cover every target except `body_json_path` (object-only). Object form uses `type`; optional non-empty `names` only for `header_values`/`request_headers`; required non-empty `path` only for `body_json_path`. Aliases `request_headers`, `request_query`, `request_path`, `request_url`, `request_method`, and `request_body` are accepted. |
 | `match_kind` | string | `regex` | `regex`, `literal`, `contains`, `equals`, `luhn`, or `cidr`. |
 | `pattern` | string | `""` | Pattern text. Required except for `luhn` rules. CIDR rules accept an IP or CIDR range. |
 | `action` | string | global default | `enforce`, `monitor`, or `disabled`. |
@@ -3267,9 +3267,12 @@ representations explicitly outside the configured response-body scan scope.
 | `paranoia_min` | u8 | `1` | Minimum paranoia level required for this rule. |
 | `conditions` | object | `{}` | Optional request conditions: `paths`, `methods`, `headers`, and `consumers`. Path entries share exact-match and trailing-`*` prefix forms with `global_exemptions.paths`, but `~regex` anchoring differs: rule `conditions.paths` compile the text after `~` as an operator-authored, unanchored regex evaluated with Rust regex `is_match`, so they may match anywhere in the path unless the pattern itself is anchored (for example `~^/admin(?:/|$)`). A floating match such as `~api` therefore matches both `/api/users` and `/v1/api-keys`. Exact and prefix forms are unchanged and are not regex-anchored. |
 
-Supported targets: `header_names`, `header_values`, `query_keys`,
-`query_values`, `cookies`, `url_path`, `full_url`, `method`, `body_text`,
-`body_json_path`, `response_headers`, and `response_body`.
+Supported targets: `header_names`, `header_values` (optional non-empty
+`names`), `query_keys`, `query_values`, `cookies`, `url_path`, `full_url`,
+`method`, `body_text`, `body_json_path` (object with required non-empty
+`path`), `response_headers`, and `response_body`. Aliases:
+`request_headers`, `request_query`, `request_path`, `request_url`,
+`request_method`, `request_body`.
 
 CIDR rules on free-form body text are heuristic token scans. They are useful
 for tightly scoped private-address leakage checks, but broad response-body CIDR
