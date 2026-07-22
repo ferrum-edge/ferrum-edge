@@ -14,7 +14,7 @@
 //! # v1 — Normalized Exact Match
 //!
 //! Prompts are normalized before hashing:
-//! - Messages array is sorted by role, then by content
+//! - Message order is preserved while role/content text is normalized
 //! - Content text is lowercased and whitespace-collapsed
 //! - Model name is included in the key (different models = different cache entries)
 //! - Temperature, top_p, and other sampling parameters are optionally included
