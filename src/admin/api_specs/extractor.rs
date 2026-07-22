@@ -1093,7 +1093,7 @@ fn substitute_server_variables(
                 ),
             });
         };
-        let Some(var_obj) = vars.get(name).and_then(Value::as_object) else {
+        let Some(var_obj) = vars.get(&name).and_then(Value::as_object) else {
             return Err(ExtractError::MalformedExtension {
                 which: "servers",
                 error: format!("{location}.variables.{name} is required for substitution in url"),
