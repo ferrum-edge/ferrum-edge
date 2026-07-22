@@ -880,9 +880,7 @@ async fn ws_logging_drops_queued_entries_before_start() {
     plugin
         .on_stream_disconnect(&create_test_stream_transaction_summary())
         .await;
-    plugin
-        .on_ws_disconnect(&test_ws_disconnect_context())
-        .await;
+    plugin.on_ws_disconnect(&test_ws_disconnect_context()).await;
 }
 
 /// Staged WS workers must exit the flush loop when dropped without commit.

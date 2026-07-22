@@ -10,7 +10,7 @@ use ferrum_edge::plugins::utils::{
     wait_until_committed,
 };
 use serde_json::json;
-use tokio::sync::{watch, Notify};
+use tokio::sync::{Notify, watch};
 use tokio::time::timeout;
 use tracing_subscriber::fmt::MakeWriter;
 
