@@ -226,6 +226,94 @@ fn test_extract_sni_long_hostname() {
 }
 
 #[test]
+fn test_extract_sni_rejects_oversized_hostname() {
+    let hostname = "a".repeat(254);
+    let data = build_tls_client_hello(&hostname);
+
+    assert_eq!(extract_sni_from_client_hello(&data), None);
+}
+
+#[test]
+fn test_extract_sni_rejects_invalid_dns_hostname_characters() {
+    for hostname in [
+        "bad_name.example.com",
+        "-bad.example.com",
+        "bad-.example.com",
+        "bad..example.com",
+        "bad.example.com.",
+        "bäd.example.com",
+    ] {
+        let data = build_tls_client_hello(hostname);
+        assert_eq!(
+            extract_sni_from_client_hello(&data),
+            None,
+            "hostname {hostname:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn test_extract_sni_rejects_oversized_label() {
+    let hostname = format!("{}.example.com", "a".repeat(64));
+    let data = build_tls_client_hello(&hostname);
+
+    assert_eq!(extract_sni_from_client_hello(&data), None);
+}
+
+/// Build a presentation-form DNS hostname of exactly 253 bytes where every
+/// label is within the 63-byte DNS label limit (63+63+63+61 plus three dots).
+fn max_length_dns_hostname(label_byte: u8) -> String {
+    let label63 = String::from_utf8(vec![label_byte; 63]).expect("ASCII label byte");
+    let label61 = String::from_utf8(vec![label_byte; 61]).expect("ASCII label byte");
+    let hostname = format!("{label63}.{label63}.{label63}.{label61}");
+    assert_eq!(
+        hostname.len(),
+        253,
+        "fixture must sit on the DNS hostname length boundary"
+    );
+    assert!(
+        hostname.split('.').all(|label| label.len() <= 63),
+        "every label must stay within the DNS label limit"
+    );
+    hostname
+}
+
+#[test]
+fn test_extract_sni_accepts_max_length_dns_hostname() {
+    let hostname = max_length_dns_hostname(b'a');
+    let data = build_tls_client_hello(&hostname);
+
+    assert_eq!(
+        extract_sni_from_client_hello(&data),
+        Some(hostname),
+        "a valid 253-byte DNS hostname with labels ≤63 must be accepted"
+    );
+}
+
+#[test]
+fn test_extract_sni_normalizes_uppercase_at_max_length_boundary() {
+    let hostname = max_length_dns_hostname(b'A');
+    let data = build_tls_client_hello(&hostname);
+
+    assert_eq!(
+        extract_sni_from_client_hello(&data),
+        Some(hostname.to_ascii_lowercase()),
+        "ASCII uppercase SNI at the 253-byte boundary must normalize to lowercase"
+    );
+}
+
+#[test]
+fn test_extract_sni_from_dtls_rejects_oversized_hostname() {
+    let hostname = "a".repeat(254);
+    let data = build_dtls_client_hello(&hostname);
+
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&data),
+        DtlsSniResult::NoSni
+    );
+}
+
+#[test]
 fn test_extract_sni_no_sni_extension() {
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]);
