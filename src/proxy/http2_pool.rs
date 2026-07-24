@@ -716,12 +716,13 @@ impl Http2ConnectionPool {
                         // ready())`ed on it, which serialized ~100-
                         // concurrent bursts onto the already-busy shard and
                         // net-pessimized throughput (5 MB/100-conc HTTP/2
-                        // stuck at 81 RPS vs direct 232). Skip — we would
-                        // rather open a fresh connection than wait on this
-                        // one. `create_or_get_existing_owned` is per-key-
-                        // coalesced, so a burst of concurrent callers for
-                        // the same shard key dedupes onto ONE create future
-                        // (no thundering herd).
+                        // stuck at 81 RPS vs direct 232). Skip — phase 2's
+                        // `create_or_get_existing_owned` checks `cached()`
+                        // first; the existing sender is still healthy
+                        // (`!is_closed()`), so the create closure never runs
+                        // and the pool does NOT grow beyond the shard ring.
+                        // Callers queue on the start shard's existing sender
+                        // via H2 readiness / stream-cap backpressure.
                         None => {}
                     }
                 }

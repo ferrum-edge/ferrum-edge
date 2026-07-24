@@ -1006,15 +1006,20 @@ impl BackendResponse {
 ///
 /// Checks two independent retry paths:
 /// 1. **Connection failures** (`connection_error = true`): retried when
-///    `retry_on_connect_failure` is enabled, regardless of the synthetic
-///    status code. These are TCP-layer problems (connect refused, timeout,
-///    DNS failure, TLS error) where no HTTP response was received.
+///    `retry_on_connect_failure` is enabled, regardless of HTTP method.
+///    These are pre-wire TCP-layer problems (connect refused, timeout,
+///    DNS failure, TLS error) where no HTTP response was received and the
+///    request never reached the backend, so idempotency is not a concern.
+///    `retryable_methods` does NOT gate this path.
 /// 2. **HTTP status failures** (`connection_error = false`): retried when
 ///    the response status code is in `retryable_status_codes`. These are
 ///    real HTTP responses from the backend (e.g., 502 from an upstream
-///    load balancer, 503 during deployment).
+///    load balancer, 503 during deployment). This path is constrained by
+///    `retryable_methods` to guard against non-idempotent replays (e.g.,
+///    POST).
 ///
-/// Both paths still respect `max_retries` and `retryable_methods`.
+/// Both paths respect `max_retries`; only the HTTP status path respects
+/// `retryable_methods` and `retryable_status_codes`.
 pub fn should_retry(
     config: &RetryConfig,
     method: &str,

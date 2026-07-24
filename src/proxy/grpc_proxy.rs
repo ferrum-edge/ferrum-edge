@@ -627,14 +627,19 @@ impl GrpcConnectionPool {
                         Some(Err(_)) => {
                             self.pool.invalidate(key_buf);
                         }
-                        // Shard exists but is mid-send. Skip — we would
-                        // rather open a fresh h2 connection (per-key-
-                        // coalesced via `create_or_get_existing_owned`, so
-                        // concurrent callers dedupe onto ONE create future)
-                        // than stall on `timeout(ready())`. The previous
-                        // 1 ms wait still serialized under burst concurrency
-                        // and was the largest contributor to gRPC p99 tail
-                        // latency for 100-concurrent 500 KB / 1 MB payloads.
+                        // Shard exists but is mid-send. Skip — `now_or_never`
+                        // only wins on an immediately-ready sender, so a
+                        // busy-but-healthy shard falls through to phase 2.
+                        // There `create_or_get_existing_owned` checks
+                        // `cached()` first; the existing sender is still
+                        // healthy (`!is_closed()`), so the create closure
+                        // never runs and the pool does NOT grow beyond the
+                        // shard ring. Callers queue on H2 readiness /
+                        // stream-cap backpressure instead of spawning a fresh
+                        // connection. The previous 1 ms `timeout(ready())`
+                        // serialized under burst concurrency and was the
+                        // largest contributor to gRPC p99 tail latency for
+                        // 100-concurrent 500 KB / 1 MB payloads.
                         None => {}
                     }
                 }
