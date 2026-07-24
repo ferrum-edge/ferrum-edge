@@ -29,6 +29,9 @@ paths:
 - Multiple instances per proxy are allowed.
 - A proxy/group-scoped plugin replaces a same-named global for that proxy.
 - Multiple scoped instances of the same type may coexist.
+- Exception: `api_chargeback` admits at most one effective instance per proxy
+  after merge (shared `/charges` registry is exactly-once) and requires every
+  enabled instance to agree on the process-global render/cleanup tunables.
 - `proxy_group` is one shared instance for its associated proxies; stateful plugins share counters and are cascade-deleted when no proxies remain.
 
 ## Lifecycle Order

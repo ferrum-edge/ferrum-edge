@@ -9,14 +9,14 @@
 //! queue. Unless the operator opts into a fail-closed policy (`on_buffer_full`
 //! /`on_sink_error` = `reject`) the plugin never blocks or rejects traffic.
 //!
-//! Runs at priority `AI_TRANSCRIPT_AUDIT` (2924): before reject-capable AI
-//! guardrails so blocked prompts can still be staged for
-//! `always_capture_on_guardrail`, and before `ai_semantic_cache` (2980) /
-//! `ai_federation` (4060) so cache hits and federated requests are still
-//! observable. The audit candidate is staged in `before_proxy` over the
+//! Runs at priority `AI_TRANSCRIPT_AUDIT` (2740): after authentication and
+//! authorization, but before `request_deduplication` (2750) and reject-capable
+//! AI guardrails, so cached replays and blocked prompts can still be audited.
+//! It also remains before `ai_semantic_cache` (2980) / `ai_federation` (4060).
+//! The audit candidate is staged in `before_proxy` over the
 //! prebuffered request body (so terminate-and-respond plugins downstream cannot
 //! consume the transaction unaudited, and so the proxy's response buffering /
-//! dispatch decisions can see the candidate markers), then refreshed with the
+//! dispatch decisions can see the candidate state), then refreshed with the
 //! final backend-visible body in `on_final_request_body_with_context` after
 //! request redaction/transforms ran.
 //!
@@ -25,10 +25,12 @@
 //! `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in
 //! `ai_semantic_firewall` for enforcement.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -38,6 +40,7 @@ use http::header::{HeaderName, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
@@ -123,6 +126,7 @@ pub const AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS: &[&str] = &[
 pub const AI_TRANSCRIPT_AUDIT_SINK_KEYS: &[&str] = &[
     "type",
     "endpoint_url",
+    "allow_insecure_loopback",
     "custom_headers",
     "batch_size",
     "flush_interval_ms",
@@ -137,6 +141,13 @@ pub const AI_TRANSCRIPT_AUDIT_SINK_KEYS: &[&str] = &[
 /// request that never reached the `log` hook). The common path removes staging
 /// at emit/log time, so this only guards pathological cases.
 const STAGING_SWEEP_THRESHOLD: usize = 512;
+/// Hard bound for in-flight request excerpts and permits. At the default
+/// fail-open policy, excess candidates are omitted; fail-closed policies reject
+/// instead of forwarding a transaction that cannot be staged.
+const MAX_STAGING_ENTRIES: usize = 4096;
+/// Amortize orphan cleanup so request admission never repeats a full shared-map
+/// scan for every request while the live set remains above the threshold.
+const STAGING_SWEEP_INTERVAL_SECS: u64 = 60;
 
 // Metadata keys written into `ctx.metadata` (small strings only — never bodies).
 // These flow into the transaction log via the summary metadata.
@@ -147,7 +158,6 @@ const MD_SAMPLE_HIT: &str = "ai_transcript_audit.sample_hit";
 const MD_REQUEST_HASH: &str = "ai_transcript_audit.request_hash";
 const MD_RESPONSE_HASH: &str = "ai_transcript_audit.response_hash";
 const MD_SINK_STATUS: &str = "ai_transcript_audit.sink_status";
-const MD_STREAM_MARKER: &str = "ai_transcript_audit.stream_marker";
 /// Set when the request body carries `stream: true` (an SSE response is
 /// expected), so the response buffer decision does not stall the stream.
 const MD_STREAM_REQUEST: &str = "ai_transcript_audit.stream_request";
@@ -246,6 +256,8 @@ struct PrivacyConfig {
 /// Per-request request-side capture, keyed by `record_id`. Never holds a full
 /// body — only the redacted/capped excerpt (bounded by `max_request_bytes`).
 struct AuditStaging {
+    /// Holds one slot in the hard in-flight staging bound.
+    _staging_permit: OwnedSemaphorePermit,
     captured_at: Instant,
     sample_hit: bool,
     request_excerpt: Option<String>,
@@ -422,12 +434,15 @@ pub struct AiTranscriptAudit {
     endpoint_hostname: String,
     namespace: String,
     staging: Arc<DashMap<String, AuditStaging>>,
+    staging_permits: Arc<Semaphore>,
     pending_streams: Arc<DashMap<String, Arc<StreamSlot>>>,
     rate_limiter: Arc<RecordsPerMinute>,
     sink_healthy: Arc<AtomicBool>,
     /// `true` when at least one capture path is enabled (validated in `new`).
     active: bool,
     staging_ttl: Duration,
+    /// Monotonic process-relative second at which another staging sweep may run.
+    next_staging_sweep_at: AtomicU64,
 }
 
 impl AiTranscriptAudit {
@@ -632,6 +647,28 @@ impl AiTranscriptAudit {
             "ai_transcript_audit",
             http_client.backend_allow_ips(),
         )?;
+        let allow_insecure_loopback = cfg_bool(sink_obj, "allow_insecure_loopback", false, "sink")?;
+        if endpoint_url
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        {
+            if !allow_insecure_loopback {
+                return Err("ai_transcript_audit: sink.endpoint_url must use https://; \
+                     local cleartext collectors require sink.allow_insecure_loopback: true"
+                    .to_string());
+            }
+            let loopback = endpoint_hostname.eq_ignore_ascii_case("localhost")
+                || endpoint_hostname
+                    .parse::<IpAddr>()
+                    .is_ok_and(|address| address.is_loopback());
+            if !loopback {
+                return Err(
+                    "ai_transcript_audit: sink.allow_insecure_loopback permits http:// only \
+                     for localhost or a loopback IP address"
+                        .to_string(),
+                );
+            }
+        }
         let custom_headers = parse_sink_headers(sink_obj)?;
         let batch_defaults = BatchConfigDefaults {
             batch_size_key: "batch_size",
@@ -697,11 +734,13 @@ impl AiTranscriptAudit {
             endpoint_hostname,
             namespace,
             staging: Arc::new(DashMap::with_shard_amount(shard_amount)),
+            staging_permits: Arc::new(Semaphore::new(MAX_STAGING_ENTRIES)),
             pending_streams: Arc::new(DashMap::with_shard_amount(shard_amount)),
             rate_limiter: Arc::new(RecordsPerMinute::new(sampling.max_records_per_minute)),
             sink_healthy,
             active,
             staging_ttl: Duration::from_secs(60 * 60),
+            next_staging_sweep_at: AtomicU64::new(0),
         })
     }
 
@@ -748,9 +787,6 @@ impl AiTranscriptAudit {
     /// immutable. The permit is stored with the bounded request staging and is
     /// consumed only after validators determine the final status/body.
     fn ensure_commit_admission(&self, ctx: &mut RequestContext) -> PluginResult {
-        if !self.requires_response_committed_hook() {
-            return PluginResult::Continue;
-        }
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return PluginResult::Continue;
         };
@@ -787,7 +823,7 @@ impl AiTranscriptAudit {
     ) -> bool {
         if self.capture.streaming == StreamingCapture::Off
             || !flag(&ctx.metadata, MD_CANDIDATE)
-            || !flag(&ctx.metadata, &self.stream_marker_key())
+            || !self.has_staged_candidate(&ctx.metadata)
         {
             return false;
         }
@@ -844,12 +880,44 @@ impl AiTranscriptAudit {
         if self.staging.len() < STAGING_SWEEP_THRESHOLD {
             return;
         }
+        let now_seconds = process_monotonic_seconds();
+        let next = self.next_staging_sweep_at.load(Ordering::Relaxed);
+        if now_seconds < next
+            || self
+                .next_staging_sweep_at
+                .compare_exchange(
+                    next,
+                    now_seconds.saturating_add(STAGING_SWEEP_INTERVAL_SECS),
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_err()
+        {
+            return;
+        }
         let now = Instant::now();
         let ttl = self.staging_ttl;
         self.staging.retain(|_, staging| {
             (staging.stream_active && staging.commit_permit.is_some())
                 || now.duration_since(staging.captured_at) < ttl
         });
+    }
+
+    fn discard_staged_candidate(&self, ctx: &mut RequestContext) {
+        let removed_staging = ctx.metadata.get(MD_RECORD_ID).is_some_and(|record_id| {
+            let removed = self.staging.remove(record_id).is_some();
+            self.pending_streams.remove(record_id);
+            removed
+        });
+        // The marker is shared by co-located instances. A saturated instance
+        // that never staged this request must not erase a peer instance's live
+        // candidate and cause its record id to be stripped before logging.
+        if removed_staging || !flag(&ctx.metadata, MD_CANDIDATE) {
+            ctx.metadata
+                .insert(MD_CANDIDATE.to_string(), "false".to_string());
+            ctx.metadata.remove(MD_REQUEST_HASH);
+            ctx.metadata.remove(MD_STREAM_REQUEST);
+        }
     }
 
     fn shape_body(&self, raw: &[u8], max_bytes: usize) -> (Option<String>, bool) {
@@ -862,22 +930,16 @@ impl AiTranscriptAudit {
     /// currently known (pre-transform in `before_proxy`, final in the
     /// final-body hook fallback); callers have already checked the JSON
     /// content-type. Body hashes are keyed (see [`PiiRedactor::keyed_hash_hex`]).
-    fn stage_candidate(&self, ctx: &mut RequestContext, body: &[u8]) {
+    fn stage_candidate(&self, ctx: &mut RequestContext, body: &[u8]) -> PluginResult {
         if body.is_empty() {
-            if !flag(&ctx.metadata, MD_CANDIDATE) {
-                ctx.metadata
-                    .insert(MD_CANDIDATE.to_string(), "false".to_string());
-            }
-            return;
+            self.discard_staged_candidate(ctx);
+            return PluginResult::Continue;
         }
         let parsed: Option<Value> = serde_json::from_slice(body).ok();
         let is_ai = parsed.as_ref().is_some_and(json_looks_like_ai_request);
         if !is_ai {
-            if !flag(&ctx.metadata, MD_CANDIDATE) {
-                ctx.metadata
-                    .insert(MD_CANDIDATE.to_string(), "false".to_string());
-            }
-            return;
+            self.discard_staged_candidate(ctx);
+            return PluginResult::Continue;
         }
 
         let record_id = ctx
@@ -885,6 +947,24 @@ impl AiTranscriptAudit {
             .get(MD_RECORD_ID)
             .cloned()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        self.sweep_staging();
+        let staging_permit = match Arc::clone(&self.staging_permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.discard_staged_candidate(ctx);
+                let fail_closed = self.on_buffer_full == BufferFullPolicy::Reject
+                    || self.on_sink_error == SinkErrorPolicy::Reject;
+                ctx.metadata.insert(
+                    MD_SINK_STATUS.to_string(),
+                    if fail_closed { "rejected" } else { "dropped" }.to_string(),
+                );
+                return if fail_closed {
+                    reject_audit_unavailable()
+                } else {
+                    PluginResult::Continue
+                };
+            }
+        };
         let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
         // Exported body hashes are keyed HMAC-SHA256 (same key as the redaction
         // placeholders): a plain SHA-256 of a mostly-predictable body (a fixed
@@ -921,17 +1001,13 @@ impl AiTranscriptAudit {
                 .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
         }
 
-        // Mark every staged AI candidate for potential stream capture. The
-        // marker alone does not force anything: `forces_reqwest_dispatch` and
-        // `response_stream_inspector` apply the `sampled`-mode tee gate
+        // Every staged AI candidate is eligible for stream capture.
+        // `forces_reqwest_dispatch` and `response_stream_inspector` apply the
+        // `sampled`-mode tee gate
         // (`stream_tee_wanted`) at dispatch/response time, when the request-side
-        // guardrails (2925–2975, which run after this plugin's staging at 2924)
+        // guardrails (2925–2978, which run after this plugin's staging at 2740)
         // have already published their metadata. Non-AI JSON POSTs are never
-        // marked, so they stay on the native-H3 path.
-        if self.capture.streaming != StreamingCapture::Off {
-            self.mark_stream_capture(ctx);
-        }
-
+        // staged, so they stay on the native-H3 path.
         let request_model = parsed.as_ref().and_then(extract_model);
         let tool_names = if self.capture.tool_calls {
             parsed.as_ref().map(extract_tool_names).unwrap_or_default()
@@ -944,10 +1020,10 @@ impl AiTranscriptAudit {
             (None, false)
         };
 
-        self.sweep_staging();
         self.staging.insert(
             record_id,
             AuditStaging {
+                _staging_permit: staging_permit,
                 captured_at: Instant::now(),
                 sample_hit,
                 request_excerpt,
@@ -959,6 +1035,7 @@ impl AiTranscriptAudit {
                 stream_active: false,
             },
         );
+        PluginResult::Continue
     }
 
     /// Refresh an already-staged candidate with the FINAL backend-visible
@@ -969,15 +1046,20 @@ impl AiTranscriptAudit {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };
+        let parsed: Option<Value> = serde_json::from_slice(body).ok();
+        if !parsed.as_ref().is_some_and(json_looks_like_ai_request) {
+            self.discard_staged_candidate(ctx);
+            return;
+        }
         let request_hash = self.redactor.keyed_hash_hex(body);
-        if ctx
-            .metadata
-            .get(MD_REQUEST_HASH)
-            .is_some_and(|existing| *existing == request_hash)
+        if self
+            .staging
+            .get(&record_id)
+            .and_then(|staging| staging.request_hash.clone())
+            .is_some_and(|existing| existing == request_hash)
         {
             return;
         }
-        let parsed: Option<Value> = serde_json::from_slice(body).ok();
         if let Some(mut staged) = self.staging.get_mut(&record_id) {
             let (request_excerpt, request_truncated) = if self.capture.request {
                 self.shape_body(body, self.limits.max_request_bytes)
@@ -998,31 +1080,26 @@ impl AiTranscriptAudit {
         // the later buffer-vs-stream response decision
         // (`buffered_response_capture_wanted`), so — mirroring
         // `ai_tool_governor` — the marker must track the final body in BOTH
-        // directions. An unparseable body cannot rule out `stream: true`, so
-        // conservatively mark it streaming; only a parsed, provably
-        // non-streaming body clears the marker.
-        match parsed.as_ref() {
-            Some(json) if json.get("stream").and_then(Value::as_bool) != Some(true) => {
-                ctx.metadata.remove(MD_STREAM_REQUEST);
-            }
-            Some(_) | None => {
-                ctx.metadata
-                    .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
-            }
+        // directions.
+        if parsed
+            .as_ref()
+            .and_then(|json| json.get("stream"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            ctx.metadata
+                .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
+        } else {
+            ctx.metadata.remove(MD_STREAM_REQUEST);
         }
         ctx.metadata
             .insert(MD_REQUEST_HASH.to_string(), request_hash);
     }
 
-    fn stream_marker_key(&self) -> String {
-        format!("{MD_STREAM_MARKER}.{:p}", self)
-    }
-
-    fn mark_stream_capture(&self, ctx: &mut RequestContext) {
-        ctx.metadata
-            .insert(MD_STREAM_MARKER.to_string(), "true".to_string());
-        ctx.metadata
-            .insert(self.stream_marker_key(), "true".to_string());
+    fn has_staged_candidate(&self, metadata: &HashMap<String, String>) -> bool {
+        metadata
+            .get(MD_RECORD_ID)
+            .is_some_and(|record_id| self.staging.contains_key(record_id))
     }
 
     /// THIS instance's staged sampling roll, not the shared
@@ -1040,8 +1117,8 @@ impl AiTranscriptAudit {
     /// Whether a marked AI candidate's stream should actually be teed. `On`
     /// tees every marked candidate; `Sampled` tees only sampling-roll winners
     /// plus requests a request-side guardrail flagged (evaluated here — at
-    /// dispatch/response time — because the guardrail plugins at 2925–2975 run
-    /// AFTER staging at 2924 but BEFORE the proxy's dispatch decision, so
+    /// dispatch/response time — because the guardrail plugins at 2925–2978 run
+    /// AFTER staging at 2740 but BEFORE the proxy's dispatch decision, so
     /// `always_capture_on_guardrail` can still capture response evidence on an
     /// un-sampled stream). Error statuses and response-side guardrail hits are
     /// only known later still: on un-sampled streams those overrides emit via
@@ -1148,7 +1225,7 @@ impl AiTranscriptAudit {
                     harvest.tokens.insert(key.clone(), safe(value));
                 }
                 _ => {
-                    if key.starts_with("ai_cache") {
+                    if key.starts_with("ai_cache") || key.starts_with("request_deduplication.") {
                         harvest.cache.insert(key.clone(), safe(value));
                     } else if is_guardrail_key(key) {
                         harvest.guardrails.insert(key.clone(), safe(value));
@@ -1375,8 +1452,8 @@ impl Plugin for AiTranscriptAudit {
     /// - the proxy's post-transform response stream-vs-buffer decision runs (it
     ///   reads `ai_transcript_audit.candidate` via
     ///   `should_buffer_response_body`);
-    /// - the final `forces_reqwest_dispatch` preference is evaluated (it reads
-    ///   the stream marker written during staging).
+    /// - the final `forces_reqwest_dispatch` preference is evaluated (it checks
+    ///   this instance's bounded staging entry).
     fn requires_request_body_before_before_proxy(&self) -> bool {
         self.active
     }
@@ -1416,9 +1493,12 @@ impl Plugin for AiTranscriptAudit {
         let Some(body) = ctx.metadata.remove("request_body") else {
             return PluginResult::Continue;
         };
-        self.stage_candidate(ctx, body.as_bytes());
+        let stage_result = self.stage_candidate(ctx, body.as_bytes());
         ctx.metadata.insert("request_body".to_string(), body);
-        if flag(&ctx.metadata, MD_STREAM_REQUEST) {
+        if !matches!(stage_result, PluginResult::Continue) {
+            return stage_result;
+        }
+        if flag(&ctx.metadata, MD_STREAM_REQUEST) && self.requires_response_committed_hook() {
             PluginResult::Continue
         } else {
             self.ensure_commit_admission(ctx)
@@ -1448,7 +1528,7 @@ impl Plugin for AiTranscriptAudit {
         // Staged in `before_proxy`: request transforms may have changed the
         // body since, so refresh the captured hash/excerpt with the final
         // backend-visible bytes.
-        if let Some("true") = ctx.metadata.get(MD_CANDIDATE).map(String::as_str) {
+        if flag(&ctx.metadata, MD_CANDIDATE) && self.has_staged_candidate(&ctx.metadata) {
             self.refresh_staged_request(ctx, body);
             return PluginResult::Continue;
         }
@@ -1458,12 +1538,18 @@ impl Plugin for AiTranscriptAudit {
             .get("content-type")
             .is_some_and(|content_type| is_json_content_type(content_type));
         if !is_json {
-            ctx.metadata
-                .insert(MD_CANDIDATE.to_string(), "false".to_string());
+            self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
         }
-        self.stage_candidate(ctx, body);
-        PluginResult::Continue
+        let stage_result = self.stage_candidate(ctx, body);
+        if !matches!(stage_result, PluginResult::Continue) {
+            return stage_result;
+        }
+        if flag(&ctx.metadata, MD_STREAM_REQUEST) && self.requires_response_committed_hook() {
+            PluginResult::Continue
+        } else {
+            self.ensure_commit_admission(ctx)
+        }
     }
 
     // ---- reject-path request refresh ----
@@ -1508,7 +1594,17 @@ impl Plugin for AiTranscriptAudit {
         {
             // Proxy core cannot apply a fresh reject while replaying hooks over
             // an already-fixed response. Only the explicitly replaceable pass
-            // may perform fail-closed admission here.
+            // may perform fail-closed admission here. Do not retain a
+            // provisional "rejected" status from an earlier admission hook:
+            // that 503 was ignored and the existing response remains selected.
+            if ctx
+                .metadata
+                .get(MD_SINK_STATUS)
+                .is_some_and(|status| status == "rejected")
+            {
+                ctx.metadata
+                    .insert(MD_SINK_STATUS.to_string(), "deferred".to_string());
+            }
             return PluginResult::Continue;
         }
         if self.capture.streaming != StreamingCapture::Off {
@@ -1522,14 +1618,12 @@ impl Plugin for AiTranscriptAudit {
             // Stream admission above is selective: unsampled successful
             // streams must not consume buffered-response capacity.
             PluginResult::Continue
-        } else if self.buffered_response_capture_wanted(ctx) {
+        } else {
             // Streaming and buffered capture are independent policies. A
             // response that remains JSON still needs the buffered path's
             // admission even when streaming capture is also configured. Both
             // checks reuse the same per-record permit when they select the
             // same eventual audit record.
-            self.ensure_commit_admission(ctx)
-        } else {
             self.ensure_commit_admission(ctx)
         }
     }
@@ -1741,6 +1835,10 @@ impl Plugin for AiTranscriptAudit {
             || (self.capture.response && self.on_buffer_full == BufferFullPolicy::Reject)
     }
 
+    fn defers_response_stream_termination_until_after_peers(&self) -> bool {
+        true
+    }
+
     fn on_response_stream_selected(
         &self,
         ctx: &RequestContext,
@@ -1766,7 +1864,7 @@ impl Plugin for AiTranscriptAudit {
 
     fn forces_reqwest_dispatch(&self, ctx: &RequestContext) -> bool {
         self.capture.streaming != StreamingCapture::Off
-            && flag(&ctx.metadata, &self.stream_marker_key())
+            && self.has_staged_candidate(&ctx.metadata)
             && self.stream_tee_wanted(&ctx.metadata)
     }
 
@@ -1781,7 +1879,7 @@ impl Plugin for AiTranscriptAudit {
         }
         let record_id = ctx.metadata.get(MD_RECORD_ID)?.clone();
         if self.capture.streaming == StreamingCapture::Off
-            || !flag(&ctx.metadata, &self.stream_marker_key())
+            || !self.has_staged_candidate(&ctx.metadata)
         {
             return None;
         }
@@ -1908,9 +2006,6 @@ impl Plugin for AiTranscriptAudit {
 
     async fn log(&self, summary: &TransactionSummary) {
         if !self.active {
-            return;
-        }
-        if !flag(&summary.metadata, MD_CANDIDATE) {
             return;
         }
         let Some(record_id) = summary.metadata.get(MD_RECORD_ID).cloned() else {
@@ -2077,6 +2172,32 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<()
 
 // ---- free helpers ----
 
+pub(crate) fn redact_internal_log_metadata(metadata: &mut HashMap<String, String>) {
+    let candidate = flag(metadata, MD_CANDIDATE);
+    let saturation_outcome = metadata
+        .get(MD_SINK_STATUS)
+        .is_some_and(|status| matches!(status.as_str(), "dropped" | "rejected"));
+    metadata.remove(MD_CANDIDATE);
+    metadata.remove(MD_SAMPLE_HIT);
+    metadata.remove(MD_STREAM_REQUEST);
+    metadata.remove(MD_FINAL_REQ_SEEN);
+    metadata.retain(|key, _| !key.starts_with("ai_transcript_audit.stream_marker"));
+    if !candidate {
+        metadata.remove(MD_RECORD_ID);
+        metadata.remove(MD_SAMPLED);
+        metadata.remove(MD_REQUEST_HASH);
+        metadata.remove(MD_RESPONSE_HASH);
+        if !saturation_outcome {
+            metadata.remove(MD_SINK_STATUS);
+        }
+    }
+}
+
+fn process_monotonic_seconds() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_secs()
+}
+
 fn reject_audit_unavailable() -> PluginResult {
     let mut headers = HashMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
@@ -2142,20 +2263,29 @@ fn redact_body_decoded_json_strings(redactor: &PiiRedactor, raw: &[u8]) -> Strin
     }
 }
 
-/// Reassemble captured OpenAI `chat.completion.chunk` SSE frames into
-/// per-choice completion text (`choices[].delta.content`, keyed by choice
-/// `index`, concatenated in frame order), so redaction runs over the full
-/// completion instead of per-frame fragments a split PII value would evade.
-///
-/// Returns the annotated excerpt object
-/// `{"sse_reassembled": true, "object": "chat.completion.chunk",
-///   "completion_text": {"<choice index>": "<text>"}}`, or `None` when the
-/// frames are not uniformly parseable OpenAI chunks (or carry no
-/// `delta.content` at all) — callers then fall back to per-frame redaction of
-/// the raw frames.
+#[derive(Default)]
+struct ReassembledToolCall {
+    id: String,
+    call_type: String,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Default)]
+struct ReassembledChoice {
+    content: String,
+    tool_calls: BTreeMap<u64, ReassembledToolCall>,
+    finish_reason: Option<String>,
+}
+
+/// Reassemble captured OpenAI `chat.completion.chunk` SSE frames by choice.
+/// Text and tool-call fragments are concatenated in frame order, including
+/// fragmented arguments, before the caller applies sensitive-field and pattern
+/// redaction. Uniformly parseable tool-call-only streams use this path too.
 fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(raw).ok()?;
-    let mut per_choice: BTreeMap<u64, String> = BTreeMap::new();
+    let mut per_choice: BTreeMap<u64, ReassembledChoice> = BTreeMap::new();
+    let mut tool_call_choices_seen = BTreeSet::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("data:") else {
             continue;
@@ -2176,41 +2306,171 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
         };
         for choice in choices {
             let index = choice.get("index").and_then(Value::as_u64).unwrap_or(0);
-            if let Some(content) = choice
-                .get("delta")
-                .and_then(|delta| delta.get("content"))
-                .and_then(Value::as_str)
+            let accumulated = per_choice.entry(index).or_default();
+            if let Some(finish_reason) = choice.get("finish_reason")
+                && !finish_reason.is_null()
             {
-                per_choice.entry(index).or_default().push_str(content);
+                accumulated.finish_reason = Some(finish_reason.as_str()?.to_string());
+            }
+            let Some(delta) = choice.get("delta") else {
+                continue;
+            };
+            let delta = delta.as_object()?;
+            if let Some(content) = delta.get("content")
+                && !content.is_null()
+            {
+                accumulated.content.push_str(content.as_str()?);
+            }
+            if let Some(tool_calls) = delta.get("tool_calls") {
+                let tool_calls = tool_calls.as_array()?;
+                let has_indexless_call = tool_calls
+                    .iter()
+                    .any(|tool_call| tool_call.get("index").is_none());
+                if has_indexless_call && tool_call_choices_seen.contains(&index) {
+                    // Position is only an unambiguous fallback within one
+                    // frame. A later indexless frame could continue any prior
+                    // call, so keep the raw-frame redaction path rather than
+                    // joining potentially unrelated tool calls.
+                    return None;
+                }
+                tool_call_choices_seen.insert(index);
+                for (position, tool_call) in tool_calls.iter().enumerate() {
+                    let tool_call = tool_call.as_object()?;
+                    let tool_index = match tool_call.get("index") {
+                        Some(index) => index.as_u64()?,
+                        None => position as u64,
+                    };
+                    let call = accumulated.tool_calls.entry(tool_index).or_default();
+                    if let Some(id) = tool_call.get("id")
+                        && !id.is_null()
+                    {
+                        merge_sse_scalar_fragment(&mut call.id, id.as_str()?);
+                    }
+                    if let Some(call_type) = tool_call.get("type")
+                        && !call_type.is_null()
+                    {
+                        merge_sse_scalar_fragment(&mut call.call_type, call_type.as_str()?);
+                    }
+                    if let Some(function) = tool_call.get("function")
+                        && !function.is_null()
+                    {
+                        let function = function.as_object()?;
+                        if let Some(name) = function.get("name")
+                            && !name.is_null()
+                        {
+                            merge_sse_scalar_fragment(&mut call.name, name.as_str()?);
+                        }
+                        if let Some(arguments) = function.get("arguments")
+                            && !arguments.is_null()
+                        {
+                            call.arguments.push_str(arguments.as_str()?);
+                        }
+                    }
+                }
             }
         }
     }
-    if per_choice.is_empty() {
-        // Valid chunks but no text deltas (e.g. a tool-call-only stream):
-        // reassembly would export an empty excerpt and drop the tool-call
-        // frames, so keep the per-frame capture.
+    if !per_choice
+        .values()
+        .any(|choice| !choice.content.is_empty() || !choice.tool_calls.is_empty())
+    {
         return None;
     }
-    let mut completion_text = serde_json::Map::with_capacity(per_choice.len());
-    for (index, content) in per_choice {
-        completion_text.insert(index.to_string(), Value::String(content));
+    let mut completion_text = serde_json::Map::new();
+    let mut response_tool_calls = serde_json::Map::new();
+    let mut finish_reasons = serde_json::Map::new();
+    for (choice_index, choice) in per_choice {
+        let choice_key = choice_index.to_string();
+        if !choice.content.is_empty() {
+            completion_text.insert(choice_key.clone(), Value::String(choice.content));
+        }
+        if !choice.tool_calls.is_empty() {
+            let mut calls = Vec::with_capacity(choice.tool_calls.len());
+            for (tool_index, call) in choice.tool_calls {
+                let mut call_json = serde_json::Map::new();
+                call_json.insert("index".to_string(), Value::from(tool_index));
+                if !call.id.is_empty() {
+                    call_json.insert("id".to_string(), Value::String(call.id));
+                }
+                if !call.call_type.is_empty() {
+                    call_json.insert("type".to_string(), Value::String(call.call_type));
+                }
+                if !call.name.is_empty() || !call.arguments.is_empty() {
+                    let mut function = serde_json::Map::new();
+                    if !call.name.is_empty() {
+                        function.insert("name".to_string(), Value::String(call.name));
+                    }
+                    if !call.arguments.is_empty() {
+                        function.insert("arguments".to_string(), Value::String(call.arguments));
+                    }
+                    call_json.insert("function".to_string(), Value::Object(function));
+                }
+                calls.push(Value::Object(call_json));
+            }
+            response_tool_calls.insert(choice_key.clone(), Value::Array(calls));
+        }
+        if let Some(finish_reason) = choice.finish_reason {
+            finish_reasons.insert(choice_key, Value::String(finish_reason));
+        }
     }
-    let mut annotated = serde_json::Map::with_capacity(3);
+    let mut annotated = serde_json::Map::new();
     annotated.insert("sse_reassembled".to_string(), Value::Bool(true));
     annotated.insert(
         "object".to_string(),
         Value::String("chat.completion.chunk".to_string()),
     );
-    annotated.insert(
-        "completion_text".to_string(),
-        Value::Object(completion_text),
-    );
+    if !completion_text.is_empty() {
+        annotated.insert(
+            "completion_text".to_string(),
+            Value::Object(completion_text),
+        );
+    }
+    if !response_tool_calls.is_empty() {
+        annotated.insert("tool_calls".to_string(), Value::Object(response_tool_calls));
+    }
+    if !finish_reasons.is_empty() {
+        annotated.insert("finish_reason".to_string(), Value::Object(finish_reasons));
+    }
     Some(Value::Object(annotated))
 }
 
+fn merge_sse_scalar_fragment(target: &mut String, fragment: &str) {
+    if fragment.is_empty() || fragment == target.as_str() || target.ends_with(fragment) {
+        return;
+    }
+    if fragment.starts_with(target.as_str()) {
+        target.clear();
+        target.push_str(fragment);
+    } else {
+        target.push_str(fragment);
+    }
+}
+
+const MAX_JSON_REDACTION_DEPTH: usize = 64;
+
 fn redact_json_value_strings(redactor: &PiiRedactor, value: &mut Value) {
+    redact_json_value_strings_at_depth(redactor, value, 0);
+}
+
+fn redact_json_value_strings_at_depth(redactor: &PiiRedactor, value: &mut Value, depth: usize) {
+    if depth >= MAX_JSON_REDACTION_DEPTH {
+        *value = Value::String(REDACTED_PLACEHOLDER.to_string());
+        return;
+    }
     match value {
         Value::String(text) => {
+            // Tool arguments are commonly JSON encoded inside a string. Decode
+            // object/array strings before redaction so a sensitive parent key
+            // split away from its value cannot bypass the field-name policy.
+            if let Ok(mut embedded) = serde_json::from_str::<Value>(text)
+                && matches!(embedded, Value::Object(_) | Value::Array(_))
+            {
+                redact_json_value_strings_at_depth(redactor, &mut embedded, depth + 1);
+                if let Ok(serialized) = serde_json::to_string(&embedded) {
+                    *text = redactor.redact(&serialized);
+                    return;
+                }
+            }
             *text = redactor.redact(text);
         }
         Value::Number(number) => {
@@ -2222,18 +2482,67 @@ fn redact_json_value_strings(redactor: &PiiRedactor, value: &mut Value) {
         }
         Value::Array(values) => {
             for value in values {
-                redact_json_value_strings(redactor, value);
+                redact_json_value_strings_at_depth(redactor, value, depth + 1);
             }
         }
         Value::Object(map) => {
             let entries = std::mem::take(map);
             for (key, mut value) in entries {
-                redact_json_value_strings(redactor, &mut value);
+                if sensitive_json_field(&key) {
+                    value = Value::String(REDACTED_PLACEHOLDER.to_string());
+                } else {
+                    redact_json_value_strings_at_depth(redactor, &mut value, depth + 1);
+                }
                 map.insert(redactor.redact(&key), value);
             }
         }
         Value::Null | Value::Bool(_) => {}
     }
+}
+
+fn sensitive_json_field(key: &str) -> bool {
+    if is_sensitive_metadata_key(key) {
+        return true;
+    }
+    // Collapse case and separators, including zero-width/non-ASCII separators,
+    // so `pass_word`, `Pass-Word`, and `pass\u{200b}word` share one policy.
+    let compact: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect();
+    [
+        "password",
+        "passwd",
+        "clientsecret",
+        "privatekey",
+        "authorization",
+        "setcookie",
+        "sessionid",
+        "sessionkey",
+        "credential",
+        "apikey",
+    ]
+    .iter()
+    .any(|sensitive| compact.contains(sensitive))
+        || matches!(
+            compact.as_str(),
+            "auth"
+                | "authentication"
+                | "cookie"
+                | "session"
+                | "secret"
+                | "pwd"
+                | "token"
+                | "accesstoken"
+                | "refreshtoken"
+                | "authtoken"
+                | "idtoken"
+                | "apitoken"
+                | "bearertoken"
+                | "sessiontoken"
+                | "csrftoken"
+        )
 }
 
 fn redact_sse_json_frames(redactor: &PiiRedactor, raw: &[u8]) -> Option<String> {
@@ -2376,6 +2685,12 @@ fn guardrail_fired(metadata: &HashMap<String, String>) -> bool {
             return true;
         }
     }
+    if let Some(decision) = metadata.get("ai_tool_governor.decision")
+        && !decision.is_empty()
+        && !decision.eq_ignore_ascii_case("allow")
+    {
+        return true;
+    }
     false
 }
 
@@ -2393,6 +2708,7 @@ fn is_guardrail_key(key: &str) -> bool {
         "ai_request_guard",
         "ai_ratelimit",
         "ai_federation",
+        "ai_tool_governor",
     ];
     PREFIXES.iter().any(|prefix| key.starts_with(prefix))
 }

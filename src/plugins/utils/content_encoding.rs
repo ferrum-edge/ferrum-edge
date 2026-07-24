@@ -2,7 +2,8 @@
 //!
 //! This utility never mutates the caller's body or headers. It is intended for
 //! observability/security inspection paths that need a plaintext view while the
-//! encoded representation must remain client-visible.
+//! encoded representation must remain client-visible. The compression plugin
+//! reuses the same parser/decoder for opt-in request decompression.
 
 use std::borrow::Cow;
 use std::io::Read;
@@ -16,6 +17,10 @@ pub struct DecodeLimits {
     pub max_cumulative_bytes: usize,
     /// Maximum number of content-coding layers.
     pub max_codings: usize,
+    /// Maximum decoded/raw size ratio for each layer and for the final
+    /// plaintext versus the original coded body. `0` disables the ratio check
+    /// (absolute byte caps still apply).
+    pub max_amplification_ratio: u32,
 }
 
 /// True when `value` is an HTTP `token` (RFC 9110 §5.6.2).
@@ -43,24 +48,12 @@ fn is_http_token(value: &str) -> bool {
         })
 }
 
-/// Decode a complete `Content-Encoding` chain for inspection.
+/// Parse `Content-Encoding` as an ordered `#content-coding` list (RFC 9110 §8.4).
 ///
-/// Codings are parsed as an HTTP `#content-coding` list (RFC 9110 §8.4) and
-/// removed in reverse application order. `gzip`, `br`, and `identity`-only
-/// lists are supported case-insensitively. Empty tokens, non-token members,
-/// parameters, unsupported codings, mixed `identity`, too many layers, trailing
-/// data, concatenated streams, truncation, and limit overruns are rejected.
-/// Every decoded layer is capped by `max_decoded_bytes`, and the sum of all
-/// decoded layer sizes is capped by `max_cumulative_bytes`.
-pub fn decode_content_encoding<'a>(
-    header: Option<&str>,
-    body: &'a [u8],
-    limits: DecodeLimits,
-) -> Result<Cow<'a, [u8]>, String> {
-    let Some(header) = header else {
-        return Ok(Cow::Borrowed(body));
-    };
-
+/// Members are trimmed for optional whitespace (OWS). Empty tokens, non-token
+/// members, and parameters are rejected. Supported tokens are `gzip`, `x-gzip`
+/// (normalized to `gzip`), `br`, and `identity` (case-insensitive).
+pub fn parse_content_codings(header: &str) -> Result<Vec<String>, String> {
     let mut codings = Vec::new();
     for raw in header.split(',') {
         let coding = raw.trim();
@@ -78,16 +71,45 @@ pub fn decode_content_encoding<'a>(
             ));
         }
         let coding = coding.to_ascii_lowercase();
-        match coding.as_str() {
-            "gzip" | "br" | "identity" => codings.push(coding),
+        let canonical = match coding.as_str() {
+            "gzip" | "x-gzip" => "gzip".to_string(),
+            "br" => "br".to_string(),
+            "identity" => "identity".to_string(),
             _ => return Err(format!("unsupported content-encoding '{coding}'")),
-        }
-        if codings.len() > limits.max_codings {
-            return Err(format!(
-                "content-encoding has more than {} coding layers",
-                limits.max_codings
-            ));
-        }
+        };
+        codings.push(canonical);
+    }
+    if codings.is_empty() {
+        return Err("content-encoding contains no coding members".to_string());
+    }
+    Ok(codings)
+}
+
+/// Decode a complete `Content-Encoding` chain for inspection.
+///
+/// Codings are parsed as an HTTP `#content-coding` list (RFC 9110 §8.4) and
+/// removed in reverse application order. `gzip` / `x-gzip`, `br`, and
+/// `identity`-only lists are supported case-insensitively. Empty tokens,
+/// non-token members, parameters, unsupported codings, mixed `identity`, too
+/// many layers, trailing data, concatenated streams, truncation, absolute
+/// limit overruns, and raw-to-decoded amplification overruns are rejected.
+/// Every decoded layer is capped by `max_decoded_bytes`, and the sum of all
+/// decoded layer sizes is capped by `max_cumulative_bytes`.
+pub fn decode_content_encoding<'a>(
+    header: Option<&str>,
+    body: &'a [u8],
+    limits: DecodeLimits,
+) -> Result<Cow<'a, [u8]>, String> {
+    let Some(header) = header else {
+        return Ok(Cow::Borrowed(body));
+    };
+
+    let codings = parse_content_codings(header)?;
+    if codings.len() > limits.max_codings {
+        return Err(format!(
+            "content-encoding has more than {} coding layers",
+            limits.max_codings
+        ));
     }
 
     if codings.iter().all(|coding| coding == "identity") {
@@ -97,14 +119,29 @@ pub fn decode_content_encoding<'a>(
         return Err("identity content-encoding cannot be combined with other codings".to_string());
     }
 
+    let original_raw_len = body.len();
     let mut current = Cow::Borrowed(body);
     let mut cumulative = 0usize;
     for coding in codings.iter().rev() {
+        let layer_input_len = current.len();
         let decoded = match coding.as_str() {
-            "gzip" => decode_gzip_member(current.as_ref(), limits.max_decoded_bytes)?,
-            "br" => decode_brotli_stream(current.as_ref(), limits.max_decoded_bytes)?,
+            "gzip" => decode_gzip_member(
+                current.as_ref(),
+                limits.max_decoded_bytes,
+                limits.max_amplification_ratio,
+            )?,
+            "br" => decode_brotli_stream(
+                current.as_ref(),
+                limits.max_decoded_bytes,
+                limits.max_amplification_ratio,
+            )?,
             _ => return Err(format!("unsupported content-encoding '{coding}'")),
         };
+        enforce_amplification(
+            layer_input_len,
+            decoded.len(),
+            limits.max_amplification_ratio,
+        )?;
         cumulative = cumulative
             .checked_add(decoded.len())
             .ok_or_else(|| "decoded content-encoding work overflowed".to_string())?;
@@ -117,19 +154,59 @@ pub fn decode_content_encoding<'a>(
         current = Cow::Owned(decoded);
     }
 
+    enforce_amplification(
+        original_raw_len,
+        current.len(),
+        limits.max_amplification_ratio,
+    )?;
+
     Ok(current)
 }
 
-fn decode_gzip_member(input: &[u8], max_bytes: usize) -> Result<Vec<u8>, String> {
+fn enforce_amplification(
+    raw_len: usize,
+    decoded_len: usize,
+    max_amplification_ratio: u32,
+) -> Result<(), String> {
+    if max_amplification_ratio == 0 || raw_len == 0 {
+        return Ok(());
+    }
+    let Some(limit) = raw_len.checked_mul(max_amplification_ratio as usize) else {
+        // raw * ratio overflows usize; absolute layer/cumulative caps still apply.
+        return Ok(());
+    };
+    if decoded_len > limit {
+        return Err(format!(
+            "decoded content-encoding amplification exceeds {max_amplification_ratio}:1"
+        ));
+    }
+    Ok(())
+}
+
+fn decode_gzip_member(
+    input: &[u8],
+    max_bytes: usize,
+    max_amplification_ratio: u32,
+) -> Result<Vec<u8>, String> {
     let mut decoder = flate2::bufread::GzDecoder::new(input);
-    let decoded = read_bounded(&mut decoder, max_bytes, "gzip")?;
+    let decoded = read_bounded(
+        &mut decoder,
+        max_bytes,
+        input.len(),
+        max_amplification_ratio,
+        "gzip",
+    )?;
     if !decoder.into_inner().is_empty() {
         return Err("gzip content contains trailing or concatenated data".to_string());
     }
     Ok(decoded)
 }
 
-fn decode_brotli_stream(input: &[u8], max_bytes: usize) -> Result<Vec<u8>, String> {
+fn decode_brotli_stream(
+    input: &[u8],
+    max_bytes: usize,
+    max_amplification_ratio: u32,
+) -> Result<Vec<u8>, String> {
     use brotli::{BrotliDecompressStream, BrotliResult, BrotliState, HeapAlloc, HuffmanCode};
 
     let mut state = BrotliState::new(
@@ -165,6 +242,7 @@ fn decode_brotli_stream(input: &[u8], max_bytes: usize) -> Result<Vec<u8>, Strin
             return Err(format!("brotli decoded content exceeds {max_bytes} bytes"));
         }
         decoded.extend_from_slice(&chunk[..output_offset]);
+        enforce_amplification(input.len(), decoded.len(), max_amplification_ratio)?;
 
         match result {
             BrotliResult::ResultSuccess => {
@@ -184,7 +262,13 @@ fn decode_brotli_stream(input: &[u8], max_bytes: usize) -> Result<Vec<u8>, Strin
     }
 }
 
-fn read_bounded(reader: &mut dyn Read, max_bytes: usize, coding: &str) -> Result<Vec<u8>, String> {
+fn read_bounded(
+    reader: &mut dyn Read,
+    max_bytes: usize,
+    raw_len: usize,
+    max_amplification_ratio: u32,
+    coding: &str,
+) -> Result<Vec<u8>, String> {
     let mut decoded = Vec::with_capacity(8192.min(max_bytes));
     let mut chunk = [0u8; 8192];
     loop {
@@ -204,5 +288,6 @@ fn read_bounded(reader: &mut dyn Read, max_bytes: usize, coding: &str) -> Result
             ));
         }
         decoded.extend_from_slice(&chunk[..read]);
+        enforce_amplification(raw_len, decoded.len(), max_amplification_ratio)?;
     }
 }

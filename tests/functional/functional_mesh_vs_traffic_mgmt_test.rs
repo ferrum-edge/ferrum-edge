@@ -332,8 +332,9 @@ plugin_configs:
 async fn functional_mesh_vs_traffic_mgmt_mirror_replays_to_second_backend() {
     let primary = RecordingBackend::start().await;
     let mirror = RecordingBackend::start().await;
-    // The route's primary backend is `primary`; the request_mirror plugin
-    // shadows every request to `mirror`.
+    // The route rewrites URI + authority before primary dispatch; the
+    // request_mirror plugin must replay that same selected route to `mirror`
+    // with Envoy's shadow-host suffix.
     let config = format!(
         r#"version: "1"
 proxies:
@@ -345,9 +346,26 @@ proxies:
     strip_listen_path: false
     pool_enable_http2: false
     plugins:
+      - plugin_config_id: "mrd-mirror"
       - plugin_config_id: "mirror-plugin"
 consumers: []
 plugin_configs:
+  - id: "mrd-mirror"
+    plugin_name: "mesh_route_dispatch"
+    scope: "proxy"
+    proxy_id: "mirror-proxy"
+    enabled: true
+    config:
+      rules:
+        - match:
+            methods: ["GET"]
+          destination:
+            backend_host: "127.0.0.1"
+            backend_port: {primary_port}
+          rewrite:
+            uri: "/internal"
+            match_prefix: "/shadow"
+            authority: "internal.example.com"
   - id: "mirror-plugin"
     plugin_name: "request_mirror"
     scope: "proxy"
@@ -380,6 +398,20 @@ plugin_configs:
         .expect("send request");
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     assert!(primary.hits() >= 1, "primary backend must be hit");
+    let primary_lines = primary.request_lines().await;
+    assert!(
+        primary_lines
+            .iter()
+            .any(|line| line == "GET /internal/ping HTTP/1.1"),
+        "primary backend must observe the matched route rewrite: {primary_lines:?}"
+    );
+    let primary_hosts = primary.host_headers().await;
+    assert!(
+        primary_hosts
+            .iter()
+            .any(|host| host == "internal.example.com"),
+        "primary backend must observe the rewritten authority without a shadow suffix: {primary_hosts:?}"
+    );
 
     // The mirror is fire-and-forget; poll briefly for the shadowed request.
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -392,7 +424,14 @@ plugin_configs:
     );
     let lines = mirror.request_lines().await;
     assert!(
-        lines.iter().any(|l| l.contains("/shadow/ping")),
-        "mirror must replay the original path, got: {lines:?}"
+        lines.iter().any(|l| l == "GET /internal/ping HTTP/1.1"),
+        "mirror must replay the matched route rewrite, got: {lines:?}"
+    );
+    let hosts = mirror.host_headers().await;
+    assert!(
+        hosts
+            .iter()
+            .any(|host| host == "internal.example.com-shadow"),
+        "mirror must carry the rewritten authority with -shadow, got: {hosts:?}"
     );
 }

@@ -1,9 +1,10 @@
 //! HTTP access logging plugin — batched async log shipping.
 //!
 //! Serializes `TransactionSummary` entries and sends them to a remote HTTP
-//! endpoint in batches. Uses `BatchingLogger<LogEntry>` to decouple the proxy
-//! hot path from network I/O: the `log()` hook enqueues the entry
-//! non-blockingly, and a shared background task drains the queue in
+//! endpoint in batches. Uses `BatchingLogger<QueuedSummaryPayload>` to decouple
+//! the proxy hot path from network I/O: the `log()` hook reserves a queue slot
+//! and retained-byte lease before serialization, then enqueues the bounded
+//! payload non-blockingly. A shared background task drains the queue in
 //! configurable batch sizes with a flush interval timer.
 //!
 //! Construction is runtime-free. The flush worker is staged from
@@ -11,9 +12,8 @@
 //! [`Plugin::commit_background_tasks`] after the plugin-cache generation that
 //! owns this instance is atomically installed.
 //!
-//! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
-//! `LogEntry` union type, and uses the shared `PluginHttpClient` for
-//! connection pooling and DNS cache integration.
+//! Supports both HTTP and stream (TCP/UDP) transaction summaries, and uses the
+//! shared `PluginHttpClient` for connection pooling and DNS cache integration.
 
 use std::sync::Arc;
 
@@ -21,13 +21,12 @@ use async_trait::async_trait;
 use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 
-use super::utils::log_schema::{
-    SchemaCapabilities, SummaryLogEntryBatchView, SummarySchema, resolve_schema,
-};
+use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema};
 use super::utils::{
-    BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, PluginHttpClient, SummaryLogEntry,
-    build_batch_config, handle_http_batch_response, parse_custom_headers, parse_http_endpoint,
-    validate_batch_config,
+    BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, PluginHttpClient,
+    QueuedSummaryPayload, admit_byte_limits, admit_http_summary, admit_stream_summary,
+    assemble_json_array, build_batch_config, handle_http_batch_response, parse_custom_headers,
+    parse_http_endpoint, validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 
@@ -36,14 +35,16 @@ struct HttpFlushConfig {
     endpoint_url: String,
     custom_headers: Vec<(HeaderName, HeaderValue)>,
     http_client: PluginHttpClient,
-    schema: Option<Arc<SummarySchema>>,
 }
 
 pub struct HttpLogging {
     batch_config: BatchConfig,
     flush_config: HttpFlushConfig,
-    logger: DeferredBatchingLogger<SummaryLogEntry>,
+    logger: DeferredBatchingLogger<QueuedSummaryPayload>,
     endpoint_hostname: String,
+    schema: Option<Arc<SummarySchema>>,
+    byte_budget: Arc<ByteBudget>,
+    max_entry_bytes: usize,
 }
 
 impl HttpLogging {
@@ -68,13 +69,13 @@ impl HttpLogging {
             min_retry_delay_ms: 0,
         };
         validate_batch_config(config, "http_logging", batch_defaults)?;
+        let limits = admit_byte_limits(config, "http_logging")?;
 
         let schema = resolve_schema(config, "http_logging", SchemaCapabilities::BASE)?;
         let flush_config = HttpFlushConfig {
             endpoint_url,
             custom_headers,
             http_client,
-            schema,
         };
 
         Ok(Self {
@@ -82,6 +83,9 @@ impl HttpLogging {
             flush_config,
             logger: DeferredBatchingLogger::new(),
             endpoint_hostname,
+            schema,
+            byte_budget: Arc::new(ByteBudget::new("http_logging", limits.buffer_max_bytes)),
+            max_entry_bytes: limits.max_entry_bytes,
         })
     }
 }
@@ -116,11 +120,23 @@ impl Plugin for HttpLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        self.logger.try_send(summary.into());
+        admit_stream_summary(
+            &self.logger,
+            &self.byte_budget,
+            self.max_entry_bytes,
+            summary,
+            self.schema.as_deref(),
+        );
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        self.logger.try_send(summary.into());
+        admit_http_summary(
+            &self.logger,
+            &self.byte_budget,
+            self.max_entry_bytes,
+            summary,
+            self.schema.as_deref(),
+        );
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -128,13 +144,15 @@ impl Plugin for HttpLogging {
     }
 }
 
-async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<SummaryLogEntry>) -> Result<(), String> {
+async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<QueuedSummaryPayload>) -> Result<(), String> {
     let entry_count = batch.len();
-    let view = SummaryLogEntryBatchView {
-        entries: &batch,
-        schema: cfg.schema.as_deref(),
-    };
-    let mut req = cfg.http_client.get().post(&cfg.endpoint_url).json(&view);
+    let body = assemble_json_array(&batch);
+    let mut req = cfg
+        .http_client
+        .get()
+        .post(&cfg.endpoint_url)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(body);
     for (name, value) in &cfg.custom_headers {
         req = req.header(name.clone(), value.clone());
     }

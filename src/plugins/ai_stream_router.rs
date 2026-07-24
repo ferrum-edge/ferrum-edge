@@ -130,6 +130,7 @@ const NORMALIZE_DECODE_LIMITS: DecodeLimits = DecodeLimits {
     max_decoded_bytes: 8 * 1024 * 1024,
     max_cumulative_bytes: 16 * 1024 * 1024,
     max_codings: 4,
+    max_amplification_ratio: 0,
 };
 
 // ---------------------------------------------------------------------------

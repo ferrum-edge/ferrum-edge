@@ -955,6 +955,40 @@ fn test_env_config_custom_ports() {
 }
 
 #[test]
+fn test_compression_algorithm_gates_default_enabled() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_COMPRESSION_GZIP_ENABLED");
+            remove_var("FERRUM_COMPRESSION_BROTLI_ENABLED");
+            let config = EnvConfig::from_env().unwrap();
+            assert!(config.compression_gzip_enabled);
+            assert!(config.compression_brotli_enabled);
+        },
+    );
+}
+
+#[test]
+fn test_compression_algorithm_gates_parse_independently() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_COMPRESSION_GZIP_ENABLED", "false"),
+            ("FERRUM_COMPRESSION_BROTLI_ENABLED", "true"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert!(!config.compression_gzip_enabled);
+            assert!(config.compression_brotli_enabled);
+        },
+    );
+}
+
+#[test]
 fn test_env_config_default_log_level() {
     with_env_vars(
         &[
@@ -4489,8 +4523,8 @@ fn test_mongo_timeouts_custom_values() {
         ],
         || {
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.mongo_server_selection_timeout_seconds, 60);
-            assert_eq!(config.mongo_connect_timeout_seconds, 5);
+            assert_eq!(config.mongo_server_selection_timeout_seconds, Some(60));
+            assert_eq!(config.mongo_connect_timeout_seconds, Some(5));
         },
     );
 }
@@ -4503,9 +4537,17 @@ fn test_mongo_timeouts_default_values() {
             ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
         ],
         || {
+            remove_var("FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS");
+            remove_var("FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS");
             let config = EnvConfig::from_env().unwrap();
-            assert_eq!(config.mongo_server_selection_timeout_seconds, 30);
-            assert_eq!(config.mongo_connect_timeout_seconds, 10);
+            assert_eq!(
+                config.mongo_server_selection_timeout_seconds, None,
+                "unset timeout env must stay None so URI values are preserved"
+            );
+            assert_eq!(
+                config.mongo_connect_timeout_seconds, None,
+                "unset timeout env must stay None so URI values are preserved"
+            );
         },
     );
 }

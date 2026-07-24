@@ -70,6 +70,13 @@ use tokio::task::AbortHandle;
 use tracing::{info, warn};
 use url::{Host, Url};
 
+/// Operational upper bound for Redis ConnectionManager pool slots per plugin.
+///
+/// Each slot owns an ArcSwap, a Tokio mutex, and may lazily establish one
+/// multiplexed Redis TCP connection, so configuration must keep this value a
+/// small operational cardinality rather than an unbounded allocation size.
+pub const MAX_REDIS_POOL_SIZE: usize = 128;
+
 /// Redis sliding-window index and elapsed fraction from a single epoch timestamp.
 ///
 /// `elapsed_fraction` is always in `[0, 1)`: at an exact window boundary the
@@ -208,6 +215,11 @@ impl RedisConfig {
         }
         let pool_size = usize::try_from(pool_size)
             .map_err(|_| "redis rate limiter: 'redis_pool_size' is too large".to_string())?;
+        if pool_size > MAX_REDIS_POOL_SIZE {
+            return Err(format!(
+                "redis rate limiter: 'redis_pool_size' must be <= {MAX_REDIS_POOL_SIZE}"
+            ));
+        }
 
         let connect_timeout_seconds =
             parse_optional_u64(object, "redis_connect_timeout_seconds")?.unwrap_or(5);

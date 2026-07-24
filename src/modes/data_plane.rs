@@ -890,6 +890,11 @@ pub async fn run(
     {
         warn!("Background tasks did not drain within 5s, proceeding with shutdown");
     }
+    crate::observability_delivery::shutdown(Duration::from_millis(
+        env_config.log_shutdown_drain_timeout_ms,
+    ))
+    .await;
+    crate::plugins::api_chargeback_sink::finalize_all_snapshot_generations().await;
     crate::plugins::kafka_logging::finalize_all_generations().await;
 
     Ok(())

@@ -1,5 +1,5 @@
 use ferrum_edge::_test_support::{
-    RedisConfig, redis_client_credentials, redis_config_url_with_ip,
+    MAX_REDIS_POOL_SIZE, RedisConfig, redis_client_credentials, redis_config_url_with_ip,
     redis_rate_limit_client_for_test,
 };
 use serde_json::json;
@@ -173,6 +173,8 @@ fn test_from_plugin_config_rejects_invalid_redis_mode() {
         json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_tls": "true"}),
         json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_key_prefix": ""}),
         json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_pool_size": 0}),
+        json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_pool_size": (MAX_REDIS_POOL_SIZE as u64) + 1}),
+        json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_pool_size": u64::MAX}),
         json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_connect_timeout_seconds": 0}),
         json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_health_check_interval_seconds": 0}),
         json!({"sync_mode": "redis", "redis_url": "redis://localhost:6379/0", "redis_username": false}),
@@ -233,6 +235,24 @@ fn test_from_plugin_config_parses_valid_redis_mode() {
     assert_eq!(config.health_check_interval_seconds, 3);
     assert_eq!(config.username.as_deref(), Some("svc"));
     assert_eq!(config.password.as_deref(), Some("secret"));
+}
+
+#[test]
+fn test_from_plugin_config_accepts_exact_max_redis_pool_size() {
+    // Inclusive upper bound: redis_pool_size == MAX_REDIS_POOL_SIZE must parse
+    // and be preserved exactly (MAX+1 / u64::MAX remain covered by rejection cases).
+    let config = RedisConfig::from_plugin_config(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://localhost:6379/0",
+            "redis_pool_size": MAX_REDIS_POOL_SIZE,
+        }),
+        "ferrum:test",
+    )
+    .expect("exact MAX_REDIS_POOL_SIZE must be accepted")
+    .expect("sync_mode=redis must yield Some(RedisConfig)");
+
+    assert_eq!(config.pool_size, MAX_REDIS_POOL_SIZE);
 }
 
 // ── Connection-attempt timeout wiring (issue #2310) ───────────────────────

@@ -3,14 +3,20 @@
 use chrono::Utc;
 use ferrum_edge::config::types::{GatewayConfig, PluginConfig, PluginScope};
 use ferrum_edge::plugin_cache::PluginCache;
+use ferrum_edge::plugins::utils::ByteBudget;
+use ferrum_edge::plugins::utils::byte_budget::{
+    DEFAULT_MAX_ENTRY_BYTES, HARD_MAX_BUFFER_MAX_BYTES, HARD_MAX_ENTRY_BYTES, MIN_MAX_ENTRY_BYTES,
+    accounted_summary_bytes,
+};
 use ferrum_edge::plugins::{
     ALL_PROTOCOLS, Direction, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
     StreamTransactionSummary, WsDisconnectContext, plugin_failure_policy,
     statsd_logging::{
         MAX_UDP_PAYLOAD, STATSD_LOGGING_CONFIG_KEYS, StatsdLogging, bounded_grpc_status_tag,
-        format_http_metrics, format_ws_metrics, http_body_outcome, http_grpc_status_tag,
-        is_valid_timer_sample, pack_udp_datagrams, sanitize_namespace_tag_value,
-        sanitize_tag_value, validate_tag_key,
+        for_each_udp_datagram, format_http_metrics, format_ws_metrics, http_body_outcome,
+        http_grpc_status_tag, is_valid_timer_sample, pack_udp_datagrams,
+        render_http_under_budget_for_test, sanitize_namespace_tag_value, sanitize_tag_value,
+        validate_tag_key,
     },
     validate_plugin_config,
 };
@@ -338,6 +344,8 @@ async fn test_statsd_logging_accepts_all_config_options() {
             "max_batch_lines": 100,
             "max_retries": 2,
             "retry_delay_ms": 25,
+            "max_entry_bytes": 65536,
+            "buffer_max_bytes": 16_777_216,
             "schema": {
                 "summary_type": "both",
                 "rename": { "proxy_id": "route_id" }
@@ -431,7 +439,9 @@ async fn test_statsd_logging_rejects_one_character_misspellings_of_every_key() {
         ("global_tags", "global_tgas"),
         ("flush_interval_ms", "flush_interval_m"),
         ("buffer_capacity", "buffer_capacit"),
+        ("buffer_max_bytes", "buffer_max_byte"),
         ("max_batch_lines", "max_batch_line"),
+        ("max_entry_bytes", "max_entry_byte"),
         ("max_retries", "max_retrie"),
         ("retry_delay_ms", "retry_delay_m"),
         ("schema", "schemaa"),
@@ -510,6 +520,8 @@ async fn test_statsd_logging_valid_complete_config_and_open_global_tags_map() {
         "max_batch_lines": 10,
         "max_retries": 1,
         "retry_delay_ms": 5,
+        "max_entry_bytes": 8192,
+        "buffer_max_bytes": 65536,
         "schema": {
             "summary_type": "stream",
             "omit": ["disconnect_cause"]
@@ -1225,4 +1237,217 @@ async fn test_statsd_ws_disconnect_collector_emits_session_once() {
         let extra = std::str::from_utf8(&buf[..n2]).unwrap_or("");
         panic!("unexpected second datagram after single WS disconnect: {extra}");
     }
+}
+
+#[tokio::test]
+async fn test_statsd_logging_byte_budget_config_validation_fail_closed() {
+    let host = "127.0.0.1";
+    let below_min = StatsdLogging::new(
+        &json!({
+            "host": host,
+            "max_entry_bytes": MIN_MAX_ENTRY_BYTES - 1
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("max_entry_bytes below minimum");
+    assert!(below_min.contains("max_entry_bytes"), "got: {below_min}");
+
+    let above_hard = StatsdLogging::new(
+        &json!({
+            "host": host,
+            "max_entry_bytes": HARD_MAX_ENTRY_BYTES + 1
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("max_entry_bytes above hard max");
+    assert!(above_hard.contains("max_entry_bytes"), "got: {above_hard}");
+
+    let buffer_too_small = StatsdLogging::new(
+        &json!({
+            "host": host,
+            "max_entry_bytes": 2048,
+            "buffer_max_bytes": 1024
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("buffer_max_bytes below accounted minimum");
+    assert!(
+        buffer_too_small.contains("buffer_max_bytes"),
+        "got: {buffer_too_small}"
+    );
+
+    let buffer_above_hard = StatsdLogging::new(
+        &json!({
+            "host": host,
+            "buffer_max_bytes": HARD_MAX_BUFFER_MAX_BYTES + 1
+        }),
+        default_client(),
+    )
+    .err()
+    .expect("buffer_max_bytes above hard max");
+    assert!(
+        buffer_above_hard.contains("buffer_max_bytes"),
+        "got: {buffer_above_hard}"
+    );
+
+    let defaults = StatsdLogging::new(&json!({ "host": host }), default_client()).unwrap();
+    assert_eq!(defaults.max_entry_bytes_for_test(), DEFAULT_MAX_ENTRY_BYTES);
+}
+
+#[tokio::test]
+async fn test_statsd_logging_saturation_rejects_before_retention() {
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 1,
+            "buffer_capacity": 16,
+            "max_batch_lines": 1000,
+            "flush_interval_ms": 60_000,
+            "max_entry_bytes": 1024,
+            "buffer_max_bytes": accounted_summary_bytes(1024)
+        }),
+        default_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let held = plugin
+        .hold_byte_budget_for_test(accounted_summary_bytes(1024))
+        .expect("fill aggregate budget");
+    let drops_before = plugin.byte_budget_drops_for_test();
+    let used_before = plugin.byte_budget_used_for_test();
+
+    plugin.log(&create_test_transaction_summary()).await;
+
+    assert_eq!(
+        plugin.byte_budget_used_for_test(),
+        used_before,
+        "saturated admission must not retain additional content"
+    );
+    assert!(
+        plugin.byte_budget_drops_for_test() > drops_before,
+        "saturation must record a fail-closed drop"
+    );
+    drop(held);
+    assert_eq!(plugin.byte_budget_used_for_test(), 0);
+}
+
+#[test]
+fn test_statsd_logging_oversized_render_releases_lease() {
+    let budget = ByteBudget::new("statsd_logging_test", accounted_summary_bytes(1024));
+    let mut summary = create_test_transaction_summary();
+    summary.proxy_name = Some("proxy".to_string());
+    let prefix = "a".repeat(256);
+    let mut global = String::from("|#");
+    // Build a global_tags suffix that forces rendered lines over 1024 bytes.
+    while global.len() < 380 {
+        global.push_str("env:production,");
+    }
+    global.push_str("namespace:ferrum");
+
+    let drops_before = budget.drops_total();
+    let rejected =
+        render_http_under_budget_for_test(&budget, 1024, &summary, &prefix, &global, None);
+    assert!(
+        rejected.is_none(),
+        "oversized render must fail closed before retention"
+    );
+    assert_eq!(budget.used(), 0, "oversized render must release its lease");
+    assert!(budget.drops_total() > drops_before);
+}
+
+#[test]
+fn test_statsd_logging_admitted_payload_releases_on_drop() {
+    let budget = ByteBudget::new("statsd_logging_test", 1_048_576);
+    let summary = create_test_transaction_summary();
+    let admitted = render_http_under_budget_for_test(
+        &budget,
+        DEFAULT_MAX_ENTRY_BYTES,
+        &summary,
+        "ferrum",
+        "",
+        None,
+    )
+    .expect("normal summary must admit");
+    assert!(!admitted.as_str().is_empty());
+    assert!(!admitted.as_bytes().is_empty());
+    let expected = accounted_summary_bytes(admitted.retained_len());
+    assert_eq!(budget.used(), expected);
+    drop(admitted);
+    assert_eq!(
+        budget.used(),
+        0,
+        "drop must release the retained-byte lease"
+    );
+}
+
+#[tokio::test]
+async fn test_statsd_logging_failed_reserve_does_not_take_lease() {
+    let plugin = StatsdLogging::new(
+        &json!({
+            "host": "127.0.0.1",
+            "port": 1,
+            "buffer_capacity": 2,
+            "max_batch_lines": 1000,
+            "flush_interval_ms": 60_000
+        }),
+        default_client(),
+    )
+    .unwrap();
+    // Stage the worker without committing so it never drains; the channel
+    // fills and further admits fail on reserve before taking a byte lease.
+    plugin.start_background_tasks().expect("live start");
+
+    let summary = create_test_transaction_summary();
+    plugin.log(&summary).await;
+    plugin.log(&summary).await;
+    let used_when_full = plugin.byte_budget_used_for_test();
+    assert!(used_when_full > 0, "queued admits must hold leases");
+
+    let drops_before = plugin.byte_budget_drops_for_test();
+    plugin.log(&summary).await;
+    assert!(
+        plugin.byte_budget_drops_for_test() > drops_before,
+        "queue saturation must record a drop"
+    );
+    assert_eq!(
+        plugin.byte_budget_used_for_test(),
+        used_when_full,
+        "failed reserve must not retain additional content"
+    );
+}
+
+#[test]
+fn test_statsd_logging_for_each_udp_datagram_stays_mtu_safe() {
+    // Each line fits independently, while the pair plus delimiter exceeds the
+    // 1452-byte payload ceiling and therefore must visit two datagrams.
+    let line_a = "a".repeat(800);
+    let line_b = "b".repeat(800);
+    let payload = format!("{line_a}\n{line_b}");
+    let mut seen = Vec::new();
+    let dropped = for_each_udp_datagram(&payload, MAX_UDP_PAYLOAD, |datagram| {
+        assert!(datagram.len() <= MAX_UDP_PAYLOAD);
+        seen.push(datagram.to_string());
+    });
+    assert_eq!(dropped, 0);
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0], line_a);
+    assert_eq!(seen[1], line_b);
+
+    let over = "x".repeat(MAX_UDP_PAYLOAD + 8);
+    let mixed = format!("short:1|c\n{over}\nother:1|c");
+    let mut kept = Vec::new();
+    let dropped = for_each_udp_datagram(&mixed, MAX_UDP_PAYLOAD, |datagram| {
+        assert!(datagram.len() <= MAX_UDP_PAYLOAD);
+        kept.push(datagram.to_string());
+    });
+    assert_eq!(dropped, 1);
+    let joined = kept.join("\n");
+    assert!(joined.contains("short:1|c"));
+    assert!(joined.contains("other:1|c"));
+    assert!(!joined.contains(&over));
 }

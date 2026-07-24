@@ -1,6 +1,6 @@
 ---
 name: opus-agents
-description: Dispatch and orchestrate external Claude Code Opus 4.8 1M agents from Codex for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT or Codex to delegate to Claude or Opus agents, run multiple Claude Code workers, select high/xhigh/max effort, resume interrupted Claude runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents or ordinary single-agent edits.
+description: Dispatch and orchestrate external Claude Code Opus 5 1M agents from Codex for Ferrum Edge issue, PR, review-feedback, CI-repair, and shepherding work. Use when the user asks GPT or Codex to delegate to Claude or Opus agents, run multiple Claude Code workers, select low/medium/high/xhigh/max effort, resume interrupted Claude runs, or drive agent-owned branches and PRs. Do not use for Codex-native subagents or ordinary single-agent edits.
 ---
 
 # Opus agents
@@ -22,9 +22,9 @@ effort. This skill is only for sessions where the USER asked Codex to delegate t
 
 1. Read `AGENTS.md`, the relevant `.claude/rules/*.md`, and the issue or PR before dispatching.
 2. Run `command -v claude`, `claude --version`, `claude auth status`, and `claude --help`.
-3. Confirm that the installed CLI exposes `--effort` with `high`, `xhigh`, and `max`.
-4. Use the pinned model `claude-opus-4-8[1m]`. Use `opus[1m]` only when the user explicitly asks
-   for the rolling latest Opus rather than Opus 4.8.
+3. Confirm that the installed CLI exposes `--effort` with `low`, `medium`, `high`, `xhigh`, and `max`.
+4. Use the pinned model `claude-opus-5[1m]`. Use `opus[1m]` only when the user explicitly asks
+   for the rolling latest Opus rather than Opus 5.
 5. Stop and report the problem if authentication or 1M access is rejected. Do not silently fall
    back to a smaller context window, another model, or a lower effort.
 
@@ -45,6 +45,10 @@ sandbox Claude from the rest of the host.
 
 ## Select effort deliberately
 
+- `low`: reserve for mechanical, fully specified edits — a one-line revert, a rename, a version
+  bump, or applying a formatter diff. Do not use it for anything requiring root-cause analysis.
+- `medium`: use for small, well-understood changes with a known fix location: a single-file bug
+  fix, a doc or comment update, or adding a test for behavior that is already specified.
 - `high`: default for scoped fixes, review findings, tests, documentation, and CI repairs with a
   known failure mode.
 - `xhigh`: use for unfamiliar multi-module work, concurrency or lifecycle bugs, protocol
@@ -72,10 +76,10 @@ file to the bundled launcher from one long-lived execution session:
 <ABS_SKILL_DIR>/scripts/dispatch-agent.sh \
   --worktree <ABS_WORKTREE> \
   --prompt-file <ABS_PROMPT_FILE> \
-  --effort <high|xhigh|max>
+  --effort <low|medium|high|xhigh|max>
 ```
 
-The launcher pins `claude-opus-4-8[1m]`, clears environment variables that can override effort,
+The launcher pins `claude-opus-5[1m]`, clears environment variables that can override effort,
 context, or thinking, omits fallback models, enables verbose text output, and closes stdin at the
 prompt file's EOF. Pass `--model 'opus[1m]'` only for an explicit rolling-latest request. Delete the
 temporary prompt after the worker finishes.

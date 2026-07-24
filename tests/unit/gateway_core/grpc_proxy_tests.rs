@@ -2272,9 +2272,10 @@ fn grpc_mesh_fall_through_allows_only_pass_through_grpc_web_on_refused_transport
 fn grpc_mesh_fall_through_mesh_mtls_requires_streamable_request_body() {
     use grpc_proxy::{GrpcMeshDispatch, grpc_mesh_dispatch_falls_through};
     // Same-cluster AND cross-cluster Sidecar mesh-mTLS carry native gRPC
-    // (streaming trailer relay) AND binary translated gRPC-Web (buffered
-    // trailer re-encode) down the generic mesh path when the request body can
-    // stream — the cross-cluster variant rides the SAME pool's east-west branch.
+    // (streaming trailer relay) AND binary translated gRPC-Web (streaming
+    // body-framed trailer conversion) down the generic mesh path when the
+    // request body can stream — the cross-cluster variant rides the SAME pool's
+    // east-west branch.
     for dispatch in [
         GrpcMeshDispatch::MeshMtls,
         GrpcMeshDispatch::MeshMtlsCrossCluster,

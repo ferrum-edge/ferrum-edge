@@ -966,6 +966,51 @@ async fn response_header_cidr_rule_matches_without_regex_header_rules() {
 }
 
 #[tokio::test]
+async fn response_header_rules_request_buffered_grpc_web_trailer_policy() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "response_inspection": true,
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-HEADER-LEAK",
+            "name": "blocked response metadata",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_headers",
+            "match_kind": "contains",
+            "pattern": "leak-secret",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let ctx = ctx("POST", "/grpc.Service/Method");
+
+    assert!(plugin.requires_buffered_grpc_web_trailer_policy(&ctx));
+}
+
+#[tokio::test]
+async fn response_header_rules_do_not_request_grpc_web_trailer_policy_when_exempt() {
+    let plugin = Waf::new(&json!({
+        "include_default_rules": false,
+        "response_inspection": true,
+        "global_exemptions": { "paths": ["/grpc.Service/*"] },
+        "custom_rules": [{
+            "id": "CUSTOM-RESP-HEADER-LEAK",
+            "name": "blocked response metadata",
+            "category": "custom",
+            "severity": "high",
+            "target": "response_headers",
+            "match_kind": "contains",
+            "pattern": "leak-secret",
+            "action": "enforce"
+        }]
+    }))
+    .unwrap();
+    let ctx = ctx("POST", "/grpc.Service/Method");
+
+    assert!(!plugin.requires_buffered_grpc_web_trailer_policy(&ctx));
+}
+
+#[tokio::test]
 async fn response_body_inspection_is_off_by_default() {
     let plugin = Waf::new(&json!({})).unwrap();
     let ctx = ctx("GET", "/");

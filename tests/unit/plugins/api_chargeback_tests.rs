@@ -14,6 +14,7 @@ use ferrum_edge::plugins::{
 };
 use serde_json::json;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 /// Default per-instance scope used by registry tests (USD / "ferrum").
@@ -1035,6 +1036,28 @@ fn test_json_render_empty() {
     assert_eq!(parsed["currency"], "USD");
 }
 
+#[tokio::test]
+async fn test_cleanup_interval_reconfigures_across_reload_values() {
+    let registry = Arc::new(ChargebackRegistry::new());
+
+    registry.start_cleanup_task(60);
+    assert_eq!(registry.cleanup_interval_seconds_for_test(), 60);
+
+    registry.start_cleanup_task(0);
+    assert_eq!(
+        registry.cleanup_interval_seconds_for_test(),
+        0,
+        "reload must be able to disable an already-started cleanup task"
+    );
+
+    registry.start_cleanup_task(1);
+    assert_eq!(
+        registry.cleanup_interval_seconds_for_test(),
+        1,
+        "reload must be able to re-enable cleanup with a new interval"
+    );
+}
+
 #[test]
 fn test_json_render_with_data() {
     let registry = ChargebackRegistry::new();
@@ -1888,6 +1911,480 @@ fn test_websocket_then_bandwidth_only_stream_keeps_families_distinct() {
     assert_bandwidth_only_stream_and_websocket_reconcile(&registry, "websocket-then-stream");
 }
 
+// --- Issue #2572: proxy_name is live metadata; aggregation is deterministic ---
+
+/// Extract the `proxy_name="..."` label from a Prometheus sample line.
+fn prometheus_proxy_name(line: &str) -> Option<&str> {
+    let key = "proxy_name=\"";
+    let start = line.find(key)? + key.len();
+    let end = line[start..].find('"')? + start;
+    Some(&line[start..end])
+}
+
+fn record_payment(
+    registry: &ChargebackRegistry,
+    scope: &InstanceScope,
+    proxy_name: &str,
+    price: f64,
+) {
+    registry.record_http(
+        scope, "alice", "payments", proxy_name, 200, price, 0, 0, 0.0, 0.0,
+    );
+}
+
+/// Assert JSON and Prometheus expose the same authoritative `proxy_name` for a
+/// consumer/proxy HTTP status row, and that repeated renders stay stable.
+fn assert_json_and_prometheus_proxy_name_agree(
+    registry: &ChargebackRegistry,
+    consumer: &str,
+    proxy_id: &str,
+    status_code: u16,
+    expected_name: &str,
+    order_label: &str,
+) {
+    for pass in 0..8 {
+        let prom = registry.render_prometheus_uncached().unwrap();
+        let call_line = prom
+            .lines()
+            .find(|l| {
+                l.starts_with("ferrum_api_chargeable_calls_total{")
+                    && l.contains(&format!("consumer=\"{consumer}\""))
+                    && l.contains(&format!("proxy_id=\"{proxy_id}\""))
+                    && l.contains(&format!("status_code=\"{status_code}\""))
+            })
+            .unwrap_or_else(|| {
+                panic!("{order_label} pass {pass}: missing chargeable_calls row\n{prom}")
+            });
+        let prom_name = prometheus_proxy_name(call_line).unwrap_or_else(|| {
+            panic!("{order_label} pass {pass}: missing proxy_name label\n{call_line}")
+        });
+        assert_eq!(
+            prom_name, expected_name,
+            "{order_label} pass {pass}: prometheus name mismatch\n{call_line}"
+        );
+
+        let charge_line = prom
+            .lines()
+            .find(|l| {
+                l.starts_with("ferrum_api_charges_total{")
+                    && l.contains(&format!("consumer=\"{consumer}\""))
+                    && l.contains(&format!("proxy_id=\"{proxy_id}\""))
+                    && l.contains(&format!("status_code=\"{status_code}\""))
+            })
+            .unwrap_or_else(|| panic!("{order_label} pass {pass}: missing charges row\n{prom}"));
+        assert_eq!(
+            prometheus_proxy_name(charge_line),
+            Some(expected_name),
+            "{order_label} pass {pass}: charges label must match calls\n{charge_line}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+        let json_name = json["consumers"][consumer]["proxies"][proxy_id]["proxy_name"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("{order_label} pass {pass}: missing json proxy_name: {json}")
+            });
+        assert_eq!(
+            json_name, expected_name,
+            "{order_label} pass {pass}: json/prometheus name disagreement"
+        );
+        assert_eq!(
+            json_name, prom_name,
+            "{order_label} pass {pass}: json and prometheus must agree"
+        );
+    }
+}
+
+/// Name-only reload under continuous traffic must refresh the live display name
+/// on the existing key without splitting counter continuity.
+#[test]
+fn test_name_only_rename_under_continuous_traffic_refreshes_live_proxy_name() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v1".to_string(),
+    )]));
+    let s = scope();
+    let price = 0.001;
+
+    for _ in 0..10 {
+        record_payment(&registry, &s, "Payments v1", price);
+    }
+
+    let key = make_key_with_prices(
+        "alice",
+        "payments",
+        200,
+        ProtocolFamily::Http,
+        price,
+        0.0,
+        0.0,
+    );
+    assert_eq!(registry.entries.len(), 1);
+    {
+        let entry = registry.entries.get(&key).unwrap();
+        assert_eq!(entry.call_count.load(Ordering::Relaxed), 10);
+        assert_eq!(&*entry.proxy_name, "Payments v1");
+    }
+    let cached_v1: serde_json::Value =
+        serde_json::from_str(&registry.render_json().unwrap()).unwrap();
+    assert_eq!(
+        cached_v1["consumers"]["alice"]["proxies"]["payments"]["proxy_name"],
+        "Payments v1"
+    );
+
+    // The accepted reload publishes the new name before new-generation
+    // traffic. Continuous traffic after the reload still hits the same key.
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v2".to_string(),
+    )]));
+    let cached_v2: serde_json::Value =
+        serde_json::from_str(&registry.render_json().unwrap()).unwrap();
+    assert_eq!(
+        cached_v2["consumers"]["alice"]["proxies"]["payments"]["proxy_name"], "Payments v2",
+        "metadata publication must invalidate the cached old label immediately"
+    );
+    for _ in 0..5 {
+        record_payment(&registry, &s, "Payments v2", price);
+    }
+
+    assert_eq!(
+        registry.entries.len(),
+        1,
+        "name-only reload must not create a second pricing-generation entry"
+    );
+    let entry = registry.entries.get(&key).unwrap();
+    assert_eq!(
+        entry.call_count.load(Ordering::Relaxed),
+        15,
+        "counters must remain continuous across the rename"
+    );
+    assert_eq!(
+        &*entry.proxy_name, "Payments v1",
+        "entry fallback metadata remains immutable; exports use the published snapshot"
+    );
+    drop(entry);
+
+    let prom = registry.render_prometheus_uncached().unwrap();
+    let call_rows = prom
+        .lines()
+        .filter(|l| {
+            l.starts_with("ferrum_api_chargeable_calls_total{")
+                && l.contains("proxy_id=\"payments\"")
+        })
+        .count();
+    assert_eq!(
+        call_rows, 1,
+        "one render must emit one row under the authoritative current name\n{prom}"
+    );
+    assert!(
+        prom.lines().any(|l| {
+            l.starts_with("ferrum_api_chargeable_calls_total{")
+                && l.contains("proxy_name=\"Payments v2\"")
+                && l.ends_with(" 15")
+        }),
+        "expected continuous counter under the live name\n{prom}"
+    );
+
+    assert_json_and_prometheus_proxy_name_agree(
+        &registry,
+        "alice",
+        "payments",
+        200,
+        "Payments v2",
+        "name-only-rename",
+    );
+}
+
+/// Shared assertions for rename + price-change overlap under a fixed insertion
+/// order. The authoritative export name comes from the published configuration,
+/// never request completion order.
+fn assert_rename_plus_price_overlap(
+    registry: &ChargebackRegistry,
+    expected_name: &str,
+    expected_calls: u64,
+    order_label: &str,
+) {
+    assert_eq!(
+        registry.entries.len(),
+        2,
+        "{order_label}: expected two pricing-generation entries"
+    );
+
+    let prom = registry.render_prometheus_uncached().unwrap();
+    let call_rows: Vec<_> = prom
+        .lines()
+        .filter(|l| {
+            l.starts_with("ferrum_api_chargeable_calls_total{")
+                && l.contains("proxy_id=\"payments\"")
+        })
+        .collect();
+    assert_eq!(
+        call_rows.len(),
+        1,
+        "{order_label}: overlapping generations must collapse to one series\n{prom}"
+    );
+    assert!(
+        call_rows[0].ends_with(&format!(" {expected_calls}")),
+        "{order_label}: aggregated call count mismatch\n{}",
+        call_rows[0]
+    );
+    assert_eq!(
+        prometheus_proxy_name(call_rows[0]),
+        Some(expected_name),
+        "{order_label}: unexpected prometheus name\n{}",
+        call_rows[0]
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    let proxy = &json["consumers"]["alice"]["proxies"]["payments"];
+    assert_eq!(proxy["proxy_name"], expected_name);
+    assert_eq!(proxy["by_status"]["200"]["calls"], expected_calls);
+
+    assert_json_and_prometheus_proxy_name_agree(
+        registry,
+        "alice",
+        "payments",
+        200,
+        expected_name,
+        order_label,
+    );
+}
+
+#[test]
+fn test_rename_plus_price_change_old_then_new_selects_authoritative_name() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    let s = scope();
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v1".to_string(),
+    )]));
+
+    // Old generation under the retired display name.
+    record_payment(&registry, &s, "Payments v1", 0.001);
+    record_payment(&registry, &s, "Payments v1", 0.001);
+    // Publish the accepted rename, then record the new price generation.
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v2".to_string(),
+    )]));
+    record_payment(&registry, &s, "Payments v2", 0.002);
+    record_payment(&registry, &s, "Payments v2", 0.002);
+    record_payment(&registry, &s, "Payments v2", 0.002);
+
+    assert_rename_plus_price_overlap(&registry, "Payments v2", 5, "old-then-new");
+}
+
+#[test]
+fn test_rename_plus_price_change_new_then_old_selects_authoritative_name() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    let s = scope();
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v2".to_string(),
+    )]));
+
+    // Reverse insertion order: new pricing generation first, then overlapping
+    // old-generation traffic (in-flight after reload) recorded last.
+    record_payment(&registry, &s, "Payments v2", 0.002);
+    record_payment(&registry, &s, "Payments v2", 0.002);
+    record_payment(&registry, &s, "Payments v2", 0.002);
+    record_payment(&registry, &s, "Payments v1", 0.001);
+    record_payment(&registry, &s, "Payments v1", 0.001);
+
+    // The retired request completes last, but cannot restore its old name.
+    assert_rename_plus_price_overlap(&registry, "Payments v2", 5, "new-then-old");
+}
+
+#[tokio::test]
+async fn test_plugin_cache_reload_publishes_name_before_late_old_completion() {
+    const CONSUMER: &str = "issue-2572-cache-reload-consumer";
+    const PROXY_ID: &str = "issue-2572-cache-reload-proxy";
+    const PLUGIN_ID: &str = "issue-2572-cache-reload-chargeback";
+
+    let mut old_proxy = chargeback_chain_proxy(PROXY_ID, "/issue-2572-v1", PLUGIN_ID);
+    old_proxy.name = Some("Payments v1".to_string());
+    let plugin_config = chargeback_chain_plugin(
+        PLUGIN_ID,
+        PROXY_ID,
+        "USD",
+        json!({
+            "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.001 }]
+        }),
+    );
+    let old_config = GatewayConfig {
+        proxies: vec![old_proxy],
+        plugin_configs: vec![plugin_config.clone()],
+        ..GatewayConfig::default()
+    };
+    let cache = PluginCache::new(&old_config).expect("old chargeback cache");
+    let old_plugin = cache
+        .get_plugins(PROXY_ID)
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .cloned()
+        .expect("old chargeback plugin");
+    old_plugin
+        .log(&make_summary(PROXY_ID, "Payments v1", Some(CONSUMER), 200))
+        .await;
+
+    let mut new_proxy = chargeback_chain_proxy(PROXY_ID, "/issue-2572-v1", PLUGIN_ID);
+    new_proxy.name = Some("Payments v2".to_string());
+    let new_config = GatewayConfig {
+        proxies: vec![new_proxy],
+        plugin_configs: vec![plugin_config],
+        ..GatewayConfig::default()
+    };
+    cache
+        .rebuild(&new_config)
+        .expect("publish renamed chargeback cache");
+    let new_plugin = cache
+        .get_plugins(PROXY_ID)
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .cloned()
+        .expect("new chargeback plugin");
+    new_plugin
+        .log(&make_summary(PROXY_ID, "Payments v2", Some(CONSUMER), 200))
+        .await;
+
+    // A request admitted through the retained old chain completes after the
+    // rename. Its summary must not restore the retired display name.
+    old_plugin
+        .log(&make_summary(PROXY_ID, "Payments v1", Some(CONSUMER), 200))
+        .await;
+
+    let rendered: serde_json::Value =
+        serde_json::from_str(&global_registry().render_json_uncached().unwrap()).unwrap();
+    let proxy = &rendered["consumers"][CONSUMER]["proxies"][PROXY_ID];
+    assert_eq!(proxy["proxy_name"], "Payments v2");
+    assert_eq!(proxy["by_status"]["200"]["calls"], 3);
+}
+
+/// When a proxy is removed from published metadata, overlapping retained pricing
+/// generations fall back to admission-time names and keep the lexicographic
+/// maximum so JSON and Prometheus stay deterministic.
+#[test]
+fn test_deleted_proxy_uses_lexicographic_admission_name_fallback() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(5, 3600, 500);
+    let s = scope();
+
+    // Leave active_proxy_names empty so exporters must use admission fallbacks.
+    // Multiple proxy IDs make the lex-upgrade path order-independent across
+    // DashMap iteration.
+    for i in 0..16 {
+        let proxy_id = format!("deleted-proxy-{i}");
+        registry.record_http(
+            &s, "alice", &proxy_id, "Alpha", 200, 0.001, 10, 5, 0.01, 0.01,
+        );
+        registry.record_http(
+            &s, "alice", &proxy_id, "Zulu", 200, 0.002, 20, 10, 0.02, 0.02,
+        );
+        registry.record_stream(&s, "alice", &proxy_id, "Alpha", 0.001, 30, 15, 0.01, 0.01);
+        registry.record_stream(&s, "alice", &proxy_id, "Zulu", 0.002, 40, 20, 0.02, 0.02);
+    }
+
+    let prom = registry.render_prometheus_uncached().unwrap();
+    let json: serde_json::Value =
+        serde_json::from_str(&registry.render_json_uncached().unwrap()).unwrap();
+    for i in 0..16 {
+        let proxy_id = format!("deleted-proxy-{i}");
+        let call_line = prom
+            .lines()
+            .find(|l| {
+                l.starts_with("ferrum_api_chargeable_calls_total{")
+                    && l.contains(&format!("proxy_id=\"{proxy_id}\""))
+            })
+            .unwrap_or_else(|| panic!("missing http calls for {proxy_id}\n{prom}"));
+        assert_eq!(
+            prometheus_proxy_name(call_line),
+            Some("Zulu"),
+            "deleted proxy http export must pick lex-max admission name\n{call_line}"
+        );
+        let stream_line = prom
+            .lines()
+            .find(|l| {
+                l.starts_with("ferrum_api_stream_connections_total{")
+                    && l.contains(&format!("proxy_id=\"{proxy_id}\""))
+            })
+            .unwrap_or_else(|| panic!("missing stream connections for {proxy_id}\n{prom}"));
+        assert_eq!(
+            prometheus_proxy_name(stream_line),
+            Some("Zulu"),
+            "deleted proxy stream export must pick lex-max admission name\n{stream_line}"
+        );
+        assert_eq!(
+            json["consumers"]["alice"]["proxies"][&proxy_id]["proxy_name"], "Zulu",
+            "deleted proxy json export must match prometheus lex-max fallback"
+        );
+    }
+}
+
+/// Generation-tagged render caches must hit on unchanged metadata and refresh
+/// immediately after a live name publication.
+#[test]
+fn test_render_cache_hits_until_proxy_metadata_generation_advances() {
+    let registry = ChargebackRegistry::new();
+    registry.configure(60, 3600, 500);
+    let s = scope();
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v1".to_string(),
+    )]));
+    record_payment(&registry, &s, "Payments v1", 0.001);
+
+    let prom1 = registry.render_prometheus().unwrap();
+    let prom2 = registry.render_prometheus().unwrap();
+    assert_eq!(
+        prom1, prom2,
+        "unchanged metadata generation must reuse the prometheus render cache"
+    );
+    assert!(
+        prom1.contains("proxy_name=\"Payments v1\""),
+        "cached prometheus must carry the published name\n{prom1}"
+    );
+
+    let json1 = registry.render_json().unwrap();
+    let json2 = registry.render_json().unwrap();
+    assert_eq!(
+        json1, json2,
+        "unchanged metadata generation must reuse the json render cache"
+    );
+    let cached: serde_json::Value = serde_json::from_str(&json1).unwrap();
+    assert_eq!(
+        cached["consumers"]["alice"]["proxies"]["payments"]["proxy_name"],
+        "Payments v1"
+    );
+
+    registry.set_active_proxy_names(HashMap::from([(
+        "payments".to_string(),
+        "Payments v2".to_string(),
+    )]));
+    let prom3 = registry.render_prometheus().unwrap();
+    assert!(
+        prom3.contains("proxy_name=\"Payments v2\""),
+        "metadata publication must invalidate prometheus cache\n{prom3}"
+    );
+    let json3 = registry.render_json().unwrap();
+    let json3_value: serde_json::Value = serde_json::from_str(&json3).unwrap();
+    assert_eq!(
+        json3_value["consumers"]["alice"]["proxies"]["payments"]["proxy_name"],
+        "Payments v2"
+    );
+
+    // A second pair of renders after the rename must hit the new generation's
+    // cache rather than rebuilding again.
+    assert_eq!(prom3, registry.render_prometheus().unwrap());
+    assert_eq!(json3, registry.render_json().unwrap());
+}
+
 // --- Finding #76: monetary totals do not drift over high volume ---
 
 /// Recording a small per-call price across a large number of calls must yield
@@ -2671,4 +3168,185 @@ async fn test_reload_overlap_old_stream_disconnect_after_new_websocket_stays_par
         .expect("retained old stream generation entry");
     assert_eq!(stream.protocol_family, ProtocolFamily::Stream);
     assert_eq!(stream.call_count.load(Ordering::Relaxed), 1);
+}
+
+/// Issue #2564: one effective `api_chargeback` on a proxy records HTTP,
+/// WebSocket-disconnect, TCP, UDP, and DTLS activity exactly once through the
+/// PluginCache trait hooks (no silent multiplication).
+#[tokio::test]
+async fn test_effective_chain_records_each_protocol_path_exactly_once() {
+    const CONSUMER: &str = "issue-2564-protocol-consumer";
+    const HTTP_PROXY: &str = "issue-2564-http";
+    const WS_PROXY: &str = "issue-2564-ws";
+    const TCP_PROXY: &str = "issue-2564-tcp";
+    const UDP_PROXY: &str = "issue-2564-udp";
+    const DTLS_PROXY: &str = "issue-2564-dtls";
+
+    let call_and_stream = json!({
+        "pricing_tiers": [{ "status_codes": [200], "price_per_call": 1.0 }],
+        "bandwidth_pricing": {
+            "price_per_byte_sent": 0.01,
+            "price_per_byte_received": 0.02
+        },
+        "stream_connection_pricing": { "price_per_connection": 0.5 }
+    });
+    let stream_only = json!({
+        "bandwidth_pricing": {
+            "price_per_byte_sent": 0.01,
+            "price_per_byte_received": 0.02
+        },
+        "stream_connection_pricing": { "price_per_connection": 0.5 }
+    });
+    let ws_only = json!({
+        "bandwidth_pricing": {
+            "price_per_byte_sent": 0.01,
+            "price_per_byte_received": 0.02
+        }
+    });
+
+    fn stream_proxy(id: &str, plugin_config_id: &str, scheme: &str, listen_port: u16) -> Proxy {
+        serde_json::from_value(json!({
+            "id": id,
+            "name": id,
+            "namespace": "ferrum",
+            "backend_scheme": scheme,
+            "backend_host": "backend.invalid",
+            "backend_port": 9000,
+            "listen_port": listen_port,
+            "frontend_tls": scheme == "dtls",
+            "plugins": [{ "plugin_config_id": plugin_config_id }]
+        }))
+        .expect("test stream proxy config")
+    }
+
+    let plugin_configs = vec![
+        chargeback_chain_plugin("charge-http", HTTP_PROXY, "USD", call_and_stream),
+        chargeback_chain_plugin("charge-ws", WS_PROXY, "USD", ws_only),
+        chargeback_chain_plugin("charge-tcp", TCP_PROXY, "USD", stream_only.clone()),
+        chargeback_chain_plugin("charge-udp", UDP_PROXY, "USD", stream_only.clone()),
+        chargeback_chain_plugin("charge-dtls", DTLS_PROXY, "USD", stream_only),
+    ];
+    let config = GatewayConfig {
+        proxies: vec![
+            chargeback_chain_proxy(HTTP_PROXY, "/issue-2564-http", "charge-http"),
+            chargeback_chain_proxy(WS_PROXY, "/issue-2564-ws", "charge-ws"),
+            stream_proxy(TCP_PROXY, "charge-tcp", "tcp", 65011),
+            stream_proxy(UDP_PROXY, "charge-udp", "udp", 65012),
+            stream_proxy(DTLS_PROXY, "charge-dtls", "dtls", 65013),
+        ],
+        plugin_configs,
+        ..GatewayConfig::default()
+    };
+    let cache = PluginCache::new(&config).expect("single chargeback per proxy");
+
+    let http_plugin = cache
+        .get_plugins(HTTP_PROXY)
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .cloned()
+        .expect("HTTP chargeback");
+    http_plugin
+        .log(&make_summary(HTTP_PROXY, "HTTP API", Some(CONSUMER), 200))
+        .await;
+
+    let ws_plugin = cache
+        .get_plugins(WS_PROXY)
+        .iter()
+        .find(|plugin| plugin.name() == "api_chargeback")
+        .cloned()
+        .expect("WS chargeback");
+    ws_plugin
+        .on_ws_disconnect(&WsDisconnectContext {
+            namespace: "ferrum".to_string(),
+            proxy_id: WS_PROXY.to_string(),
+            proxy_name: Some("WS API".to_string()),
+            client_ip: "127.0.0.1".to_string(),
+            backend_target: "http://127.0.0.1:9000".to_string(),
+            listen_port: 8080,
+            connection_id: 1,
+            duration_ms: 10.0,
+            frames_client_to_backend: 1,
+            frames_backend_to_client: 1,
+            bytes_client_to_backend: 10,
+            bytes_backend_to_client: 20,
+            timestamp_connected: "2025-01-01T00:00:00Z".to_string(),
+            timestamp_disconnected: "2025-01-01T00:00:01Z".to_string(),
+            direction: None,
+            io_side: None,
+            error_class: None,
+            consumer_username: Some(CONSUMER.to_string()),
+            auth_method: None,
+            metadata: HashMap::new(),
+            proxy_lifecycle_generation: None,
+        })
+        .await;
+
+    for (proxy_id, protocol) in [(TCP_PROXY, "tcp"), (UDP_PROXY, "udp"), (DTLS_PROXY, "dtls")] {
+        let plugin = cache
+            .get_plugins(proxy_id)
+            .iter()
+            .find(|plugin| plugin.name() == "api_chargeback")
+            .cloned()
+            .unwrap_or_else(|| panic!("{protocol} chargeback"));
+        plugin
+            .on_stream_disconnect(&make_stream_summary(
+                proxy_id,
+                &format!("{protocol} API"),
+                Some(CONSUMER),
+                protocol,
+                10,
+                20,
+            ))
+            .await;
+    }
+
+    let rendered: serde_json::Value =
+        serde_json::from_str(&global_registry().render_json_uncached().unwrap()).unwrap();
+    let consumer = &rendered["consumers"][CONSUMER];
+    // HTTP call + three stream sessions (WS has no call_count).
+    assert_eq!(consumer["total_calls"], 4);
+    let proxies = consumer["proxies"].as_object().expect("proxies object");
+    assert_eq!(proxies[HTTP_PROXY]["by_status"]["200"]["calls"], 1);
+    assert_eq!(proxies[TCP_PROXY]["stream"]["connections"], 1);
+    assert_eq!(proxies[UDP_PROXY]["stream"]["connections"], 1);
+    assert_eq!(proxies[DTLS_PROXY]["stream"]["connections"], 1);
+    assert_eq!(proxies[WS_PROXY]["bandwidth"]["bytes_sent"], 10);
+    assert_eq!(proxies[WS_PROXY]["bandwidth"]["bytes_received"], 20);
+}
+
+/// Direct trait dispatch through two constructed instances still multiplies —
+/// proving why the PluginCache uniqueness rule is required. The production
+/// path rejects this composition; this documents the pre-fix failure mode.
+#[tokio::test]
+async fn test_two_direct_instances_would_double_count_one_http_transaction() {
+    const CONSUMER: &str = "issue-2564-double-consumer";
+    const PROXY: &str = "issue-2564-double-proxy";
+
+    let a = ApiChargeback::new(
+        &json!({
+            "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.01 }],
+            "cleanup_interval_seconds": 0
+        }),
+        "ferrum",
+    )
+    .expect("instance a");
+    let b = ApiChargeback::new(
+        &json!({
+            "pricing_tiers": [{ "status_codes": [200], "price_per_call": 0.01 }],
+            "cleanup_interval_seconds": 0
+        }),
+        "ferrum",
+    )
+    .expect("instance b");
+
+    let summary = make_summary(PROXY, "Double", Some(CONSUMER), 200);
+    a.log(&summary).await;
+    b.log(&summary).await;
+
+    let rendered: serde_json::Value =
+        serde_json::from_str(&global_registry().render_json_uncached().unwrap()).unwrap();
+    assert_eq!(
+        rendered["consumers"][CONSUMER]["proxies"][PROXY]["by_status"]["200"]["calls"], 2,
+        "two hooks on one shared registry key inflate calls — uniqueness must reject this"
+    );
 }

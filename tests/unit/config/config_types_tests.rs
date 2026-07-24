@@ -4938,6 +4938,123 @@ fn prometheus_metrics_rejects_duplicate_enabled_global_instances() {
 }
 
 #[test]
+fn api_chargeback_rejects_duplicate_effective_instances_on_one_proxy() {
+    let mut config = empty_config();
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.plugins = vec![
+        PluginAssociation {
+            plugin_config_id: "charge-a".into(),
+        },
+        PluginAssociation {
+            plugin_config_id: "charge-b".into(),
+        },
+    ];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![
+        PluginConfig {
+            id: "charge-a".into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "api_chargeback".into(),
+            config: serde_json::json!({
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+                "cleanup_interval_seconds": 0
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".into()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+        PluginConfig {
+            id: "charge-b".into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "api_chargeback".into(),
+            config: serde_json::json!({
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.02}],
+                "cleanup_interval_seconds": 0
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".into()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+    ];
+
+    let errors = config
+        .validate_plugin_references()
+        .expect_err("duplicate effective api_chargeback must be rejected");
+    assert!(errors.iter().any(|error| {
+        error.contains("at most one effective instance per proxy")
+            && error.contains("charge-a")
+            && error.contains("charge-b")
+    }));
+}
+
+#[test]
+fn api_chargeback_rejects_conflicting_shared_tunables_in_plugin_references() {
+    let mut config = empty_config();
+    let mut p1 = make_proxy("p1", "/api");
+    p1.plugins = vec![PluginAssociation {
+        plugin_config_id: "charge-a".into(),
+    }];
+    let mut p2 = make_proxy("p2", "/web");
+    p2.plugins = vec![PluginAssociation {
+        plugin_config_id: "charge-b".into(),
+    }];
+    config.proxies = vec![p1, p2];
+    config.plugin_configs = vec![
+        PluginConfig {
+            id: "charge-a".into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "api_chargeback".into(),
+            config: serde_json::json!({
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+                "render_cache_ttl_seconds": 5,
+                "cleanup_interval_seconds": 0
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p1".into()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+        PluginConfig {
+            id: "charge-b".into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            plugin_name: "api_chargeback".into(),
+            config: serde_json::json!({
+                "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+                "render_cache_ttl_seconds": 60,
+                "cleanup_interval_seconds": 0
+            }),
+            scope: PluginScope::Proxy,
+            proxy_id: Some("p2".into()),
+            enabled: true,
+            priority_override: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        },
+    ];
+
+    let errors = config
+        .validate_plugin_references()
+        .expect_err("disagreeing shared tunables must be rejected");
+    assert!(errors.iter().any(|error| {
+        error.contains("shared render/cleanup tunables must match")
+            && error.contains("charge-a")
+            && error.contains("charge-b")
+    }));
+}
+
+#[test]
 fn admin_admitted_plugin_scope_implies_runtime_reference_admit() {
     // Invariant guarding the whole functional CRUD matrix: for the proxy_group
     // scope the matrix assigns to every plugin, if the admin write path admits a

@@ -63,7 +63,28 @@ use super::utils::redis_rate_limiter::{
 use super::{Plugin, PluginHttpClient, PluginResult, RequestContext};
 use crate::util::unknown_keys::reject_unknown_keys;
 
-const AI_CACHE_KEY_METADATA: &str = "_ai_cache_key";
+/// Request-metadata namespace prefix. Each plugin instance appends its
+/// process-unique [`AiSemanticCache::instance_id`] so multiple
+/// `ai_semantic_cache` configs on one proxy cannot overwrite one another's
+/// staged cache key, status, match, or similarity markers.
+const METADATA_NAMESPACE_PREFIX: &str = "ai_semantic_cache.";
+const CACHE_KEY_SUFFIX: &str = "cache_key";
+const CACHE_STATUS_SUFFIX: &str = "cache_status";
+const CACHE_MATCH_SUFFIX: &str = "cache_match";
+const CACHE_SIMILARITY_SUFFIX: &str = "cache_similarity";
+
+static NEXT_AI_SEMANTIC_CACHE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn staging_metadata_key(instance_id: u64, suffix: &str) -> String {
+    let mut key = String::with_capacity(METADATA_NAMESPACE_PREFIX.len() + 20 + 1 + suffix.len());
+    key.push_str(METADATA_NAMESPACE_PREFIX);
+    {
+        let _ = write!(key, "{instance_id}");
+    }
+    key.push('.');
+    key.push_str(suffix);
+    key
+}
 
 /// Fixed-shape retention, isolation, size, and keying fields at the plugin root.
 pub const AI_SEMANTIC_CACHE_ROOT_POLICY_KEYS: &[&str] = &[
@@ -184,8 +205,12 @@ const GEMINI_SHAPE_FIELDS: &[&str] = &[
     "safety_settings",
 ];
 
-/// Provider-native tool / response-shape fields for Cohere v1 chat requests.
+/// Provider-native state, tool, and response-shape fields for Cohere v1 chat requests.
 const COHERE_SHAPE_FIELDS: &[&str] = &[
+    // Cohere v1 can bind requests to backend-side conversation state. Include
+    // the identifier in exact keys and semantic scopes so stateful responses
+    // never cross persisted conversations with the same current message.
+    "conversation_id",
     "tools",
     "tool_choice",
     "tool_results",
@@ -420,6 +445,18 @@ struct VectorSnapshot {
 }
 
 pub struct AiSemanticCache {
+    /// Process-unique ownership key for request-private staging. Fresh on every
+    /// constructor call so reload generations and sibling instances never share
+    /// `RequestContext` embedding/scope maps or namespaced metadata slots.
+    instance_id: u64,
+    /// Precomputed `ai_semantic_cache.<id>.cache_key` (hot-path insert/get).
+    meta_cache_key: String,
+    /// Precomputed `ai_semantic_cache.<id>.cache_status`.
+    meta_status: String,
+    /// Precomputed `ai_semantic_cache.<id>.cache_match`.
+    meta_match: String,
+    /// Precomputed `ai_semantic_cache.<id>.cache_similarity`.
+    meta_similarity: String,
     /// Cache TTL.
     ttl: Duration,
     /// Maximum number of cached entries.
@@ -583,7 +620,13 @@ impl AiSemanticCache {
             "ai_semantic_cache: admitted with effective retention and storage posture"
         );
 
+        let instance_id = NEXT_AI_SEMANTIC_CACHE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
+            instance_id,
+            meta_cache_key: staging_metadata_key(instance_id, CACHE_KEY_SUFFIX),
+            meta_status: staging_metadata_key(instance_id, CACHE_STATUS_SUFFIX),
+            meta_match: staging_metadata_key(instance_id, CACHE_MATCH_SUFFIX),
+            meta_similarity: staging_metadata_key(instance_id, CACHE_SIMILARITY_SUFFIX),
             ttl,
             max_entries,
             max_entry_size_bytes,
@@ -606,6 +649,61 @@ impl AiSemanticCache {
             vector_index_rebuild_running: Arc::new(AtomicBool::new(false)),
             store_post_admit_hook: Arc::new(ArcSwapOption::empty()),
         })
+    }
+
+    /// Process-local staging id for external multi-instance tests.
+    #[allow(dead_code)]
+    pub(crate) fn instance_id_for_tests(&self) -> u64 {
+        self.instance_id
+    }
+
+    /// Precomputed namespaced metadata key for external tests.
+    #[allow(dead_code)]
+    pub(crate) fn staging_metadata_key_for_tests(&self, suffix: &str) -> String {
+        staging_metadata_key(self.instance_id, suffix)
+    }
+
+    fn set_cache_status(&self, ctx: &mut RequestContext, status: &str) {
+        ctx.metadata
+            .insert(self.meta_status.clone(), status.to_string());
+    }
+
+    fn cache_status<'a>(&self, ctx: &'a RequestContext) -> Option<&'a str> {
+        ctx.metadata.get(&self.meta_status).map(String::as_str)
+    }
+
+    /// Drop this instance's lookup/store staging without touching sibling
+    /// instances' namespaced keys or embedding/scope map entries.
+    fn clear_instance_staging(&self, ctx: &mut RequestContext) {
+        ctx.metadata.remove(&self.meta_cache_key);
+        ctx.metadata.remove(&self.meta_match);
+        ctx.metadata.remove(&self.meta_similarity);
+        ctx.ai_semantic_cache_embeddings.remove(&self.instance_id);
+        ctx.ai_semantic_cache_scope_keys.remove(&self.instance_id);
+    }
+
+    fn stage_semantic_miss(
+        &self,
+        ctx: &mut RequestContext,
+        scope_key: String,
+        embedding: Vec<f32>,
+    ) {
+        ctx.ai_semantic_cache_embeddings
+            .insert(self.instance_id, embedding);
+        ctx.ai_semantic_cache_scope_keys
+            .insert(self.instance_id, scope_key);
+    }
+
+    fn take_staged_semantic(
+        &self,
+        ctx: &mut RequestContext,
+    ) -> (Option<String>, Option<EmbeddingPoint>) {
+        let scope_key = ctx.ai_semantic_cache_scope_keys.remove(&self.instance_id);
+        let embedding = ctx
+            .ai_semantic_cache_embeddings
+            .remove(&self.instance_id)
+            .and_then(|values| EmbeddingPoint::from_raw(values).ok());
+        (scope_key, embedding)
     }
 
     /// Build a normalized cache key from the request body.
@@ -2801,7 +2899,7 @@ impl Plugin for AiSemanticCache {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        ctx.metadata.contains_key(AI_CACHE_KEY_METADATA)
+        ctx.metadata.contains_key(&self.meta_cache_key)
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -2846,15 +2944,13 @@ impl Plugin for AiSemanticCache {
 
         // Unknown or ambiguous provider shapes deliberately bypass caching
         // rather than guessing a family or mixing structural metadata into
-        // prompt text. Clear any prior staged key so a later final-body store
-        // cannot retain a body that this instance refused to key.
+        // prompt text. Clear only this instance's staged key so a later
+        // final-body store cannot retain a body that this instance refused to
+        // key, without touching sibling instances' staging.
         if classify_cache_request_family(&json).is_none() {
             debug!("ai_semantic_cache: skipping unknown or ambiguous request shape");
-            ctx.metadata.remove(AI_CACHE_KEY_METADATA);
-            ctx.ai_semantic_cache_embedding = None;
-            ctx.ai_semantic_cache_scope_key = None;
-            ctx.metadata
-                .insert("ai_cache_status".to_string(), "BYPASS".to_string());
+            self.clear_instance_staging(ctx);
+            self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
         }
 
@@ -2868,17 +2964,12 @@ impl Plugin for AiSemanticCache {
             debug!(
                 "ai_semantic_cache: skipping multimodal request because cache_multimodal=reject"
             );
-            // Clear any cache key/embedding/scope a prior `ai_semantic_cache`
-            // instance staged earlier in this request's `before_proxy` chain.
-            // Without this, our `on_final_response_body` would still observe a
-            // staged key and store this multimodal response, violating
-            // `cache_multimodal: reject` whenever another cache instance ran
-            // first on the same request.
-            ctx.metadata.remove(AI_CACHE_KEY_METADATA);
-            ctx.ai_semantic_cache_embedding = None;
-            ctx.ai_semantic_cache_scope_key = None;
-            ctx.metadata
-                .insert("ai_cache_status".to_string(), "BYPASS".to_string());
+            // Clear only this instance's staging. Sibling instances keep their
+            // own namespaced keys/embeddings; this instance's
+            // `on_final_response_body` only observes `meta_cache_key`, so it
+            // cannot store under another instance's miss key.
+            self.clear_instance_staging(ctx);
+            self.set_cache_status(ctx, "BYPASS");
             return PluginResult::Continue;
         }
 
@@ -2888,11 +2979,8 @@ impl Plugin for AiSemanticCache {
         let cache_key = match self.build_cache_key(ctx, &json, multimodal_fingerprint.as_deref()) {
             Some(k) => k,
             None => {
-                ctx.metadata.remove(AI_CACHE_KEY_METADATA);
-                ctx.ai_semantic_cache_embedding = None;
-                ctx.ai_semantic_cache_scope_key = None;
-                ctx.metadata
-                    .insert("ai_cache_status".to_string(), "BYPASS".to_string());
+                self.clear_instance_staging(ctx);
+                self.set_cache_status(ctx, "BYPASS");
                 return PluginResult::Continue;
             }
         };
@@ -2914,8 +3002,8 @@ impl Plugin for AiSemanticCache {
                 );
                 let mut response_headers = entry.headers.clone();
                 response_headers.insert("x-ai-cache-status".to_string(), "HIT".to_string());
-                ctx.metadata
-                    .insert("ai_cache_status".to_string(), "HIT".to_string());
+                self.clear_instance_staging(ctx);
+                self.set_cache_status(ctx, "HIT");
                 return PluginResult::RejectBinary {
                     status_code: entry.status_code,
                     body: Bytes::from(entry.body),
@@ -2933,8 +3021,8 @@ impl Plugin for AiSemanticCache {
                 );
                 let mut response_headers = entry.headers.clone();
                 response_headers.insert("x-ai-cache-status".to_string(), "HIT".to_string());
-                ctx.metadata
-                    .insert("ai_cache_status".to_string(), "HIT".to_string());
+                self.clear_instance_staging(ctx);
+                self.set_cache_status(ctx, "HIT");
                 return PluginResult::RejectBinary {
                     status_code: entry.status_code,
                     body: entry.body.clone(),
@@ -2979,14 +3067,12 @@ impl Plugin for AiSemanticCache {
                         response_headers.insert("x-ai-cache-status".to_string(), "HIT".to_string());
                         response_headers
                             .insert("x-ai-cache-match".to_string(), "semantic".to_string());
+                        self.clear_instance_staging(ctx);
+                        self.set_cache_status(ctx, "HIT");
                         ctx.metadata
-                            .insert("ai_cache_status".to_string(), "HIT".to_string());
+                            .insert(self.meta_match.clone(), "semantic".to_string());
                         ctx.metadata
-                            .insert("ai_cache_match".to_string(), "semantic".to_string());
-                        ctx.metadata.insert(
-                            "ai_cache_similarity".to_string(),
-                            format!("{similarity:.6}"),
-                        );
+                            .insert(self.meta_similarity.clone(), format!("{similarity:.6}"));
                         return PluginResult::RejectBinary {
                             status_code: entry.status_code,
                             body: entry.body.clone(),
@@ -2994,8 +3080,7 @@ impl Plugin for AiSemanticCache {
                         };
                     }
 
-                    ctx.ai_semantic_cache_embedding = Some(embedding.to_vec());
-                    ctx.ai_semantic_cache_scope_key = Some(scope_key);
+                    self.stage_semantic_miss(ctx, scope_key, embedding.to_vec());
                 }
                 Err(err) => {
                     debug!(
@@ -3011,10 +3096,8 @@ impl Plugin for AiSemanticCache {
             cache_key = %cache_key,
             "ai_semantic_cache: cache MISS"
         );
-        ctx.metadata
-            .insert(AI_CACHE_KEY_METADATA.to_string(), cache_key);
-        ctx.metadata
-            .insert("ai_cache_status".to_string(), "MISS".to_string());
+        ctx.metadata.insert(self.meta_cache_key.clone(), cache_key);
+        self.set_cache_status(ctx, "MISS");
 
         PluginResult::Continue
     }
@@ -3025,9 +3108,9 @@ impl Plugin for AiSemanticCache {
         _response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        // Inject cache status header
-        if let Some(status) = ctx.metadata.get("ai_cache_status") {
-            response_headers.insert("x-ai-cache-status".to_string(), status.clone());
+        // Inject cache status header from this instance's namespaced status.
+        if let Some(status) = self.cache_status(ctx) {
+            response_headers.insert("x-ai-cache-status".to_string(), status.to_string());
         }
         PluginResult::Continue
     }
@@ -3038,8 +3121,7 @@ impl Plugin for AiSemanticCache {
     /// telemetry. Declared owned only when this request actually produced a
     /// status to write.
     fn owns_deadline_response_header(&self, ctx: &RequestContext, name: &str) -> bool {
-        name.eq_ignore_ascii_case("x-ai-cache-status")
-            && ctx.metadata.contains_key("ai_cache_status")
+        name.eq_ignore_ascii_case("x-ai-cache-status") && self.cache_status(ctx).is_some()
     }
 
     async fn on_final_response_body(
@@ -3055,7 +3137,7 @@ impl Plugin for AiSemanticCache {
         }
 
         // Synthetic short-circuit guard. On a semantic-cache MISS this plugin's
-        // `before_proxy` sets `AI_CACHE_KEY_METADATA` so this hook stores the
+        // `before_proxy` sets `meta_cache_key` so this hook stores the
         // (real) backend response. But this plugin (priority 2980) runs BEFORE
         // the later synthetic-2xx producers — `mesh_route_dispatch` (2995),
         // `serverless_function` (3025), `ai_federation` (4060),
@@ -3063,7 +3145,7 @@ impl Plugin for AiSemanticCache {
         // `request_deduplication` replay — so when ANY of those short-circuits
         // with a 2xx body, the generic synthetic body-hook path
         // (`apply_synthetic_response_body_hooks`) re-runs this
-        // `on_final_response_body` with `AI_CACHE_KEY_METADATA` still set from
+        // `on_final_response_body` with `meta_cache_key` still set from
         // the earlier miss. Without this guard that locally-generated synthetic
         // body — which NEVER reached the upstream model — would be written to the
         // in-memory + Redis semantic cache under the miss key and replayed to
@@ -3083,7 +3165,9 @@ impl Plugin for AiSemanticCache {
             return PluginResult::Continue;
         }
 
-        let cache_key = match ctx.metadata.get(AI_CACHE_KEY_METADATA) {
+        // Read only this instance's staged key so sibling instances keep their
+        // own miss markers for later final hooks in plugin order.
+        let cache_key = match ctx.metadata.get(&self.meta_cache_key) {
             Some(k) => k.clone(),
             None => return PluginResult::Continue,
         };
@@ -3129,11 +3213,11 @@ impl Plugin for AiSemanticCache {
         // cache-hit consumer — leaking session state and misleading
         // downstream clients about their own rate-limit/trace context.
         let safe_headers = sanitize_cached_headers(response_headers);
-        let semantic_scope_key = ctx.ai_semantic_cache_scope_key.take();
-        let embedding = ctx
-            .ai_semantic_cache_embedding
-            .take()
-            .and_then(|values| EmbeddingPoint::from_raw(values).ok());
+        // Consume this instance's staging only after admission succeeds so
+        // early skips leave siblings untouched and leave this instance's
+        // markers intact if a later retry path re-enters the hook.
+        ctx.metadata.remove(&self.meta_cache_key);
+        let (semantic_scope_key, embedding) = self.take_staged_semantic(ctx);
         let approx_size = cache_entry_approx_size(
             body.len(),
             &safe_headers,
@@ -3633,12 +3717,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reject_mode_bypass_clears_staged_cache_keys() {
+    async fn reject_mode_bypass_clears_only_this_instance_staging() {
         // A prior `ai_semantic_cache` instance in the same `before_proxy` chain
-        // may have staged a cache key/embedding/scope. When a later reject-mode
-        // instance bypasses a multimodal request, it must clear that staged
-        // state so its `on_final_response_body` does not store the multimodal
-        // response under the stale key.
+        // may have staged a cache key/embedding/scope under its own instance id.
+        // When a later reject-mode instance bypasses a multimodal request, it
+        // must clear only its own staging so its `on_final_response_body` does
+        // not store, without consuming the sibling's miss markers.
         let plugin = AiSemanticCache::new(
             &json!({"ttl_seconds": 600, "cache_multimodal": "reject"}),
             PluginHttpClient::default(),
@@ -3662,11 +3746,23 @@ mod tests {
         });
         ctx.metadata
             .insert("request_body".to_string(), body.to_string());
-        // Simulate staging done by an earlier cache instance.
+        // Simulate staging owned by a sibling instance (different id).
+        let sibling_id = plugin.instance_id.wrapping_add(1);
+        ctx.metadata.insert(
+            staging_metadata_key(sibling_id, CACHE_KEY_SUFFIX),
+            "sibling-key".to_string(),
+        );
+        ctx.ai_semantic_cache_embeddings
+            .insert(sibling_id, vec![0.1, 0.2, 0.3]);
+        ctx.ai_semantic_cache_scope_keys
+            .insert(sibling_id, "sibling-scope".to_string());
+        // And a stale entry under this instance that bypass must clear.
         ctx.metadata
-            .insert(AI_CACHE_KEY_METADATA.to_string(), "stale-key".to_string());
-        ctx.ai_semantic_cache_embedding = Some(vec![0.1, 0.2, 0.3]);
-        ctx.ai_semantic_cache_scope_key = Some("stale-scope".to_string());
+            .insert(plugin.meta_cache_key.clone(), "stale-key".to_string());
+        ctx.ai_semantic_cache_embeddings
+            .insert(plugin.instance_id, vec![9.0, 9.0, 9.0]);
+        ctx.ai_semantic_cache_scope_keys
+            .insert(plugin.instance_id, "stale-scope".to_string());
 
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
@@ -3674,25 +3770,41 @@ mod tests {
         let result = plugin.before_proxy(&mut ctx, &mut headers).await;
         assert!(matches!(result, PluginResult::Continue));
 
-        // Staged state must be cleared so a stale entry cannot be stored.
         assert!(
-            !ctx.metadata.contains_key(AI_CACHE_KEY_METADATA),
-            "reject bypass must remove the staged cache key"
+            !ctx.metadata.contains_key(&plugin.meta_cache_key),
+            "reject bypass must remove this instance's staged cache key"
         );
         assert!(
-            ctx.ai_semantic_cache_embedding.is_none(),
-            "reject bypass must clear the staged embedding"
+            !ctx.ai_semantic_cache_embeddings
+                .contains_key(&plugin.instance_id),
+            "reject bypass must clear this instance's staged embedding"
         );
         assert!(
-            ctx.ai_semantic_cache_scope_key.is_none(),
-            "reject bypass must clear the staged scope key"
+            !ctx.ai_semantic_cache_scope_keys
+                .contains_key(&plugin.instance_id),
+            "reject bypass must clear this instance's staged scope key"
+        );
+        assert_eq!(plugin.cache_status(&ctx), Some("BYPASS"));
+
+        // Sibling staging must survive so the earlier instance can still store.
+        assert_eq!(
+            ctx.metadata
+                .get(&staging_metadata_key(sibling_id, CACHE_KEY_SUFFIX))
+                .map(String::as_str),
+            Some("sibling-key")
         );
         assert_eq!(
-            ctx.metadata.get("ai_cache_status").map(String::as_str),
-            Some("BYPASS")
+            ctx.ai_semantic_cache_embeddings.get(&sibling_id),
+            Some(&vec![0.1, 0.2, 0.3])
+        );
+        assert_eq!(
+            ctx.ai_semantic_cache_scope_keys
+                .get(&sibling_id)
+                .map(String::as_str),
+            Some("sibling-scope")
         );
 
-        // And the consume path must therefore store nothing.
+        // And this instance's consume path must therefore store nothing.
         let response_headers = HashMap::new();
         plugin
             .on_final_response_body(&mut ctx, 200, &response_headers, b"{\"ok\":true}")

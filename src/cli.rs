@@ -65,6 +65,14 @@ pub struct ValidateArgs {
     /// Path to resources YAML/JSON (proxies, consumers, upstreams, plugins).
     #[arg(short = 'c', long = "spec")]
     pub spec: Option<PathBuf>,
+
+    /// Operating mode (database, file, cp, dp, mesh, injector, node_agent, migrate).
+    #[arg(short = 'm', long = "mode")]
+    pub mode: Option<String>,
+
+    /// Increase log verbosity (-v=info, -vv=debug, -vvv=trace).
+    #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
+    pub verbose: u8,
 }
 
 #[derive(clap::Args)]
@@ -254,9 +262,24 @@ pub fn apply_run_overrides(args: &RunArgs) {
     }
 }
 
-/// Apply settings/spec overrides shared between `run` and `validate`.
+/// Apply settings/spec/mode/verbose overrides shared between `run` and `validate`.
 pub fn apply_validate_overrides(args: &ValidateArgs) {
     apply_common_overrides(args.settings.as_deref(), args.spec.as_deref());
+
+    if let Some(ref mode) = args.mode {
+        // SAFETY: single-threaded context, before tokio runtime.
+        unsafe { std::env::set_var("FERRUM_MODE", mode) };
+    }
+
+    if args.verbose > 0 {
+        let level = match args.verbose {
+            1 => "info",
+            2 => "debug",
+            _ => "trace",
+        };
+        // SAFETY: single-threaded context, before tokio runtime.
+        unsafe { std::env::set_var("FERRUM_LOG_LEVEL", level) };
+    }
 }
 
 /// Infer file mode when a spec is available but no mode is configured anywhere.
@@ -308,7 +331,8 @@ pub fn infer_file_mode() {
     use crate::config::conf_file::ConfFile;
 
     // `-m/--mode` was already written to the environment by
-    // `apply_run_overrides`, so this one check covers CLI and env alike.
+    // `apply_run_overrides` / `apply_validate_overrides`, so this one check
+    // covers CLI and env alike.
     if direct_env_var_is_set("FERRUM_MODE") {
         return;
     }
@@ -872,7 +896,36 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Select a gateway PID from a list, excluding the caller's own PID.
+///
+/// Used by `find_gateway_pid` to pick the target of a `reload` SIGHUP. The
+/// caller's PID is excluded first so the reload process never signals itself,
+/// then the zero/one/many selection runs on the filtered set.
+pub fn select_gateway_pid(pids: Vec<u32>, self_pid: u32) -> Result<u32, String> {
+    let filtered: Vec<u32> = pids.into_iter().filter(|p| *p != self_pid).collect();
+    match filtered.len() {
+        0 => Err("No running ferrum-edge process found. Use --pid to specify the PID.".into()),
+        1 => Ok(filtered[0]),
+        n => Err(format!(
+            "Found {} ferrum-edge processes. Use --pid to specify which one:\n  {}",
+            n,
+            filtered
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        )),
+    }
+}
+
 /// Attempt to find a running ferrum-edge process via `pgrep`.
+///
+/// `pgrep -x ferrum-edge` matches by exact process name. Because the `reload`
+/// subcommand is itself named `ferrum-edge`, pgrep returns the reload process's
+/// PID alongside any gateway PIDs. `select_gateway_pid` filters out the caller's
+/// own PID before the zero/one/many selection, so a single-gateway host no
+/// longer reports "Found 2 ferrum-edge processes" and a no-gateway host no
+/// longer SIGHUPs itself.
 #[cfg(unix)]
 fn find_gateway_pid() -> Result<u32, String> {
     let output = std::process::Command::new("pgrep")
@@ -885,20 +938,18 @@ fn find_gateway_pid() -> Result<u32, String> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let pids: Vec<&str> = stdout.trim().lines().collect();
+    let self_pid = std::process::id();
+    let pids: Vec<u32> = stdout
+        .trim()
+        .lines()
+        .map(|line| {
+            line.trim()
+                .parse::<u32>()
+                .map_err(|_| "pgrep returned a non-numeric process ID".to_string())
+        })
+        .collect::<Result<_, _>>()?;
 
-    match pids.len() {
-        0 => Err("No running ferrum-edge process found. Use --pid to specify the PID.".into()),
-        1 => pids[0]
-            .trim()
-            .parse::<u32>()
-            .map_err(|e| format!("Failed to parse PID: {}", e)),
-        n => Err(format!(
-            "Found {} ferrum-edge processes. Use --pid to specify which one:\n  {}",
-            n,
-            pids.join("\n  ")
-        )),
-    }
+    select_gateway_pid(pids, self_pid)
 }
 
 #[cfg(test)]

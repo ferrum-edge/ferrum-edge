@@ -28,6 +28,8 @@ jobs:
     name: CI Plan
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     outputs:
       mode: ${{ steps.plan.outputs.mode }}
       run_helm: ${{ steps.plan.outputs.run_helm }}
@@ -40,6 +42,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Validate ARM64 Cross policy without executing a PR verifier
         run: |
@@ -897,6 +900,7 @@ jobs:
               functional_body_validator_response_stream_test
               functional_grpc_method_pre_hook_test
               functional_grpc_plugins_test
+              functional_request_mirror_grpc_transport_test
               functional_logging_plugins_test
               functional_logging_test
               functional_mesh_vs_traffic_mgmt_test
@@ -944,6 +948,7 @@ jobs:
               scripted_backend_h3_tests
               scripted_backend_matrix_tests
               scripted_backend_network_sim_tests
+              scripted_backend_streaming_latency_tests
               scripted_backend_tests
               scripted_backend_udp_tests
               functional_query_param_limits_test

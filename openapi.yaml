@@ -1441,6 +1441,15 @@ paths:
         still overflows, this endpoint returns HTTP 500 with an explicit error
         object instead of JSON `null` or Prometheus `inf`.
 
+        `proxy_name` is live display metadata for the stable `proxy_id` and is
+        not part of the registry key, so name-only reloads keep accumulated
+        counter values. Both formats resolve active IDs through the same
+        snapshot of the published configuration, so late retired-generation
+        traffic cannot restore an old name. As a Prometheus label, a rename
+        creates a controlled label transition whose new series carries the
+        existing cumulative value. Overlapping pricing generations collapse
+        under that authoritative current name.
+
         **Multi-node deployments**: Each gateway node accumulates charges independently.
         In CP/DP topologies, scrape every DP node and aggregate externally.
       tags: [Metrics]
@@ -1505,11 +1514,13 @@ paths:
       operationId: getChargebackSinkStatus
       summary: API chargeback sink status
       description: |
-        Returns effective batch and retry settings, queue depth, spool size,
-        replay timestamps, and export counters for the `api_chargeback_sink`
-        plugin. Requires a valid admin JWT because sink status can expose
-        billing topology and ClickHouse endpoint metadata. Credentials and URL
-        user-info are never returned.
+        Returns the current accepted generation for every stable
+        `api_chargeback_sink` plugin-config ID: aggregate queue/spool/export
+        totals plus per-instance batch, retry, queue, spool, and export counters
+        ordered by `plugin_config_id`. Validation throwaways, uncommitted staged
+        reloads, and superseded generations are excluded. Requires a valid admin
+        JWT because sink status can expose billing topology and ClickHouse
+        endpoint metadata. Credentials and URL user-info are never returned.
       tags: [Metrics]
       responses:
         "200":
@@ -8585,8 +8596,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -8659,8 +8671,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -11342,6 +11355,24 @@ components:
           minimum: 1
           maximum: 1000000
           description: Channel capacity — new entries are dropped when full
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1024
+          maximum: 1048576
+          description: >-
+            Maximum serialized bytes for one admitted log record. Oversized
+            records are dropped before enqueue.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 2050
+          maximum: 268435456
+          description: >-
+            Aggregate retained serialized-content budget across queued,
+            assembled, and retrying records. Admission reserves two copies plus
+            framing before serialization and shrinks that lease to the exact
+            retained size. Must be at least 2 * (max_entry_bytes + 1).
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -11430,6 +11461,23 @@ components:
           minimum: 1
           maximum: 1000000
           description: Channel capacity — new entries are dropped when full
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1024
+          maximum: 1048576
+          description: >-
+            Maximum serialized bytes for one admitted NDJSON record. Oversized
+            records are dropped before enqueue.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 2050
+          maximum: 268435456
+          description: >-
+            Aggregate retained serialized-content budget across queued,
+            assembled, and retrying records. Must be at least
+            2 * (max_entry_bytes + 1).
         connect_timeout_ms:
           type: integer
           default: 5000
@@ -11574,6 +11622,23 @@ components:
           minimum: 1
           maximum: 1000000
           description: Channel capacity — new entries are dropped when full
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1024
+          maximum: 1048576
+          description: >-
+            Maximum serialized bytes for one admitted JSON record. Oversized
+            records are dropped before enqueue.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 2050
+          maximum: 268435456
+          description: >-
+            Aggregate retained serialized-content budget across queued,
+            assembled, and retrying records. Must be at least
+            2 * (max_entry_bytes + 1).
         schema:
           $ref: "#/components/schemas/SummaryLogSchema"
         schema_ref:
@@ -12025,6 +12090,10 @@ components:
         bytes; encoded global_tags (+ namespace) are capped at 400 bytes.
         UDP datagrams never exceed a 1452-byte conservative IPv4/IPv6 payload
         ceiling; indivisible oversized lines are dropped rather than fragmented.
+        Hot-path admission reserves a queue slot and a provisional max_entry_bytes
+        lease before rendering StatsD line protocol, then shrinks the lease to the
+        exact retained size under buffer_max_bytes. Delivery retains admitted
+        payloads plus at most one MTU-bounded datagram buffer.
         Mirror summaries are excluded from request.* families. Timers require
         finite non-negative samples (the -1.0 no-backend TTFB sentinel is
         omitted). gRPC transactions add a bounded grpc_status tag and
@@ -12094,6 +12163,24 @@ components:
           minimum: 1
           maximum: 10000
           description: Max metric entries to batch before flushing
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1024
+          maximum: 1048576
+          description: >-
+            Maximum rendered StatsD line-protocol bytes for one admitted
+            transaction. Oversized renders are dropped before enqueue.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 2050
+          maximum: 268435456
+          description: >-
+            Aggregate retained rendered-content budget across queued entries,
+            one MTU-bounded datagram buffer, and retries. Admission reserves
+            two copies plus framing before rendering and shrinks that lease to
+            the exact retained size. Must be at least 2 * (max_entry_bytes + 1).
         max_retries:
           type: integer
           default: 0
@@ -15987,7 +16074,7 @@ components:
     CompressionConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: compression — On-the-fly response compression (gzip, brotli) and optional request decompression. Content negotiation follows RFC 9110 §12.5.3 including the identity coding: an uncoded response is acceptable by default at q=1 unless refused with `identity;q=0` or `*;q=0` without a more-specific identity entry (a nonzero wildcard does not lower identity quality), the most preferred acceptable representation wins (server preference order breaks ties toward compression), and the response is rejected with 406 when identity is unacceptable and no acceptable coded representation can be produced — including size/content-type ineligibility, identity range/delta responses (206/226, Content-Range, or the internal range marker), and `response_caching` HIT paths. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable); no-body statuses and already-encoded upstream responses remain protocol hard skips. Reject-path 406 replacement is scoped to cache HITs so auth/policy rejection statuses are not masked. Honors request/response Cache-Control: no-transform and strong ETag validators by skipping compression (still 406 when that leaves no acceptable representation). Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance. Multiple effective instances compose with first-wins ownership: the first instance that claims a supported request Content-Encoding owns strip+decode exactly once; the first instance that commits a gateway response Content-Encoding owns the single coding layer. Siblings must not delete the owner's request marker or compress again. An earlier identity/Vary-only decision does not block a later compress. H1/H2 and native H3 share the same sequential transform loops; reload snapshots remain atomic."
+      description: "Plugin: compression — On-the-fly HTTP/1.1, HTTP/2, and HTTP/3 response compression (gzip, Brotli) and optional request decompression. Process-wide FERRUM_COMPRESSION_GZIP_ENABLED and FERRUM_COMPRESSION_BROTLI_ENABLED gates intersect with every instance and default to true; an instance with no remaining usable algorithm after those gates fails admission. Gzip/Brotli codec CPU is offloaded via a bounded spawn_blocking admission pool; authenticated /metrics exports ferrum_compression_codec_{admitted,saturated,join_failures,worker_failures}_total. Encode abort after a committed Content-Encoding restores identity headers on shared buffered H1/H2/H3 paths rather than emitting mislabeled plaintext. Optional request decompression parses Content-Encoding as an ordered coding list (OWS-tolerant), decodes supported chains in reverse order under hard-capped size/amplification limits, and fails closed on malformed/unsupported members. Content negotiation follows RFC 9110 §12.5.3, treats x-gzip as the gzip compatibility token, strictly parses qvalues, and includes the identity coding: an uncoded response is acceptable by default at q=1 unless refused with `identity;q=0` or `*;q=0` without a more-specific identity entry (a nonzero wildcard does not lower identity quality), the most preferred acceptable representation wins (server preference order breaks ties toward compression), and the response is rejected with 406 when identity is unacceptable and no acceptable coded representation can be produced — including size/content-type ineligibility, identity range/delta responses (206/226, Content-Range, or the internal range marker), and `response_caching` HIT paths. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable); no-body statuses and already-encoded upstream responses remain protocol hard skips. Reject-path 406 replacement is scoped to cache HITs so auth/policy rejection statuses are not masked. Honors request/response Cache-Control: no-transform and strong ETag validators by skipping compression (still 406 when that leaves no acceptable representation). Unknown top-level keys are rejected at construction (for example `min_content_lenght` or `gzip_leveel`); the removed `disable_on_etag` key still reports an explicit migration error. Invalid generations fail file/admin/database/CP-DP admission while KeepLastKnownGood retains the prior published instance. Multiple effective instances compose with first-wins ownership: the first instance that claims a supported request Content-Encoding owns strip+decode exactly once; the first instance that commits a gateway response Content-Encoding owns the single coding layer. Siblings must not delete the owner's request marker or compress again. An earlier identity/Vary-only decision does not block a later compress. H1/H2 and native H3 share the same sequential transform loops; reload snapshots remain atomic. WebSocket, gRPC message compression, and raw stream compression are separate protocol mechanisms."
       properties:
         algorithms:
           type: array
@@ -16006,10 +16093,17 @@ components:
           items:
             type: string
           description: "Content-type whitelist. Defaults to 10 common text/application types. Matched as an exact media-type token (before the first semicolon, ASCII case-insensitive); parameters like ; charset=utf-8 are ignored. Substring matching is not used, so application/jsonp does not match application/json."
+        max_decompressed_request_size:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 33554432
+          default: 10485760
+          description: "Zip bomb protection: max decompressed request body size in bytes (default 10 MiB). Hard-capped at 32 MiB; when request decompression is enabled, it must also be ≤ FERRUM_MAX_REQUEST_BODY_SIZE_BYTES if that wire limit is set. Per-layer/cumulative decode ceilings and a 1024:1 raw-to-decoded amplification bound apply."
         remove_accept_encoding:
           type: boolean
           default: true
-          description: "Strip Accept-Encoding from backend request so backend sends uncompressed"
+          description: "Strip Accept-Encoding from backend request so backend sends uncompressed. Only applied when the instance still has at least one usable response codec after process-wide FERRUM_COMPRESSION_* gates."
         gzip_level:
           type: integer
           minimum: 0
@@ -16025,12 +16119,7 @@ components:
         decompress_request:
           type: boolean
           default: false
-          description: "Enable decompression of gzip/brotli request bodies"
-        max_decompressed_request_size:
-          type: integer
-          format: uint64
-          default: 10485760
-          description: "Zip bomb protection: max decompressed request body size in bytes (10 MB)"
+          description: "Enable decompression of gzip/brotli request Content-Encoding lists (OWS-tolerant ordered chains; malformed/unsupported members fail closed)"
 
     SseConfig:
       type: object
@@ -16191,8 +16280,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL-based authentication (Redis 6+)
@@ -16897,7 +16987,12 @@ components:
         Plugin: openapi_validator — validates request and response bodies
         against operation schemas generated from an attached OpenAPI/Swagger
         document. Supports JSON, XML, form-urlencoded, multipart, text, and
-        binary media types. Usually generated by `x-ferrum-validate` on
+        binary media types. XML conversion honors OpenAPI XML Object fields
+        `name`, `namespace`, `prefix`, `attribute`, and `wrapped` (namespace
+        matching uses the URI; `prefix` is serialization metadata only;
+        members that collide with a modeled name but not its XML construct or
+        namespace are rejected fail-closed rather than dropped or rebound).
+        Usually generated by `x-ferrum-validate` on
         `POST /api-specs` or `PUT /api-specs/{id}`; direct creation requires a
         proxy-scoped plugin attached to a proxy with `api_spec_id` set.
       properties:
@@ -17500,11 +17595,33 @@ components:
         request-only markers, and proxy-owned X-Forwarded-* identity); these
         forwarding fields are stripped rather than regenerated, so mirrors do
         not receive Ferrum-authored X-Forwarded-* identity. Host is derived from
-        the mirror URL. Native gRPC mirrors require HTTP/2 and re-synthesise te:
-        trailers. The mirror request-target preserves the raw query (after the
-        same auth credential strips as primary) including repeated pairs,
-        order, flags, empty values, +, percent escapes, and non-ASCII encoded
-        bytes.
+        the mirror URL (mesh shadow Host uses a protocol-valid DNS `-shadow`
+        suffix; IPv4/IPv6 literals are left unchanged). Cross-origin credential
+        forwarding is deny-by-default: any header whose lowercased name is a
+        built-in credential (Authorization, Cookie, Proxy-Authorization,
+        Proxy-Authenticate, WWW-Authenticate, X-Api-Key, …), contains a built-in
+        credential substring
+        (so vendor variants like x-openai-api-key / x-amz-security-token are also
+        caught), or matches a configured sensitive_header_patterns entry is
+        stripped before the distinct mirror origin. Native gRPC metadata travels
+        as HTTP/2 headers, so the same predicate covers gRPC credential metadata.
+        Forwarding any denied header requires the fail-closed pair
+        forward_sensitive_headers=true plus a non-empty exact-name
+        forward_sensitive_header_allowlist. Native gRPC mirrors re-synthesise te: trailers and dial
+        via the shared PluginHttpClient HTTP/2 companion (h2c prior knowledge for
+        cleartext http targets; ALPN h2 for https). Ordinary HTTP mirrors keep
+        the default all-version client so HTTP/1.1 destinations continue to work.
+        Mirror response bodies are always drained under max_response_body_bytes
+        so Content-Length responses do not strand keep-alive pools. Retained
+        request bodies share Bytes with the primary buffer and are admitted under
+        max_in_flight plus max_retained_request_body_bytes. The mirror request
+        always has a finite deadline (mirror_timeout_ms, else positive proxy
+        backend_read_timeout_ms, else 60000ms, capped at 300000ms). Label-safe
+        process-wide ferrum_request_mirror_*_total lifecycle counters are exported
+        on authenticated /metrics (no URLs, header names, or plugin IDs). The mirror
+        request-target preserves the raw query (after the same auth credential
+        strips as primary) including repeated pairs, order, flags, empty values,
+        +, percent escapes, and non-ASCII encoded bytes.
       required:
         - mirror_host
       properties:
@@ -17521,7 +17638,11 @@ components:
           type: string
           enum: [http, https]
           default: http
-          description: "Transport protocol used for the mirror request."
+          description: >
+            Transport scheme for the mirror URL. For native gRPC content-types,
+            http uses cleartext HTTP/2 prior knowledge (h2c) and https negotiates
+            ALPN h2 via the shared plugin HTTP/2 companion. Ordinary HTTP mirrors
+            retain the default all-version client (HTTP/1.1 capable).
         mirror_path:
           type: string
           pattern: '^$|^/[^?#]*$'
@@ -17545,22 +17666,81 @@ components:
         mirror_request_body:
           type: boolean
           default: true
-          description: "When true, the request body is forwarded to the mirror target. Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads). Forces request-body buffering for this proxy."
+          description: "When true, the request body is forwarded to the mirror target. Binary-safe (preserves gRPC protobuf and other non-UTF-8 payloads). Forces request-body buffering for this proxy. Shared Bytes are charged against max_retained_request_body_bytes for each in-flight task."
         max_in_flight:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 1048576
           default: 256
           description: >-
             Maximum mirror tasks allowed concurrently. Requests that arrive
             while every permit is in use are still served normally but are not
-            mirrored.
+            mirrored. Capped at 1048576 (2^20): a larger value is rejected at
+            construction rather than panicking Tokio's semaphore.
+        max_retained_request_body_bytes:
+          type: integer
+          format: uint64
+          minimum: 1
+          default: 67108864
+          description: >-
+            Aggregate retained request-body budget for in-flight mirrors on this
+            plugin instance. Shared Bytes bodies are charged once per task for
+            their length; exhaustion drops the new mirror attempt without
+            affecting the primary request. Default is 64 MiB.
+        mirror_timeout_ms:
+          type: integer
+          format: uint64
+          minimum: 1
+          maximum: 300000
+          description: >-
+            Finite mirror request deadline in milliseconds. When omitted, uses
+            the matched proxy backend_read_timeout_ms when positive, otherwise
+            60000. Always capped at 300000. A zero primary timeout never
+            disables this deadline.
+        forward_sensitive_headers:
+          type: boolean
+          default: false
+          description: >-
+            Dangerous opt-in. When true, selected origin-bound credential
+            headers may cross to the distinct mirror origin, but only exact
+            names listed in forward_sensitive_header_allowlist. Construction is
+            fail-closed: both fields are required together and the allowlist
+            must be non-empty.
+        forward_sensitive_header_allowlist:
+          type: array
+          maxItems: 64
+          items:
+            type: string
+            maxLength: 256
+          description: >-
+            Lowercased exact allowlist of denied sensitive header names to
+            forward when forward_sensitive_headers is true. Each entry must be a
+            valid HTTP header name (at most 256 bytes) that the deny-by-default
+            policy actually strips (a built-in credential or a
+            sensitive_header_patterns match); non-sensitive names are rejected at
+            construction. At most 64 entries. Default (with
+            forward_sensitive_headers false) strips every sensitive header.
+        sensitive_header_patterns:
+          type: array
+          maxItems: 64
+          items:
+            type: string
+            maxLength: 128
+          description: >-
+            Additional lowercased substrings matched against the header name
+            (case-insensitive; each at most 128 bytes, at most 64 entries) that
+            extend the built-in deny-by-default credential set. A header whose
+            lowercased name contains any pattern is stripped before the mirror
+            origin unless it is on the exact-name forward_sensitive_header_allowlist.
+            Covers HTTP headers and native gRPC metadata (gRPC metadata is carried
+            as HTTP/2 headers). Default empty.
         max_response_body_bytes:
           type: integer
           format: uint64
           minimum: 1
           default: 1048576
-          description: "Cap on bytes read from a mirror response when deriving its size. Only consulted when the response has no `content-length` header — streaming is aborted as soon as the limit is crossed and the mirror task records the truncated count. Bytes are discarded after measurement, so this only bounds memory pressure from misbehaving mirror sinks. Default is 1 MiB."
+          description: "Cap on bytes drained from every mirror response when deriving its size (with or without Content-Length). Streaming is aborted as soon as the limit is crossed and the mirror task records the truncated/observed count. Bytes are discarded after measurement so HTTP/1.1 keep-alive pools can reclaim the socket. Default is 1 MiB."
 
     ServerlessFunctionConfig:
       type: object
@@ -17943,8 +18123,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -18058,8 +18239,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -18198,13 +18380,13 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, and ai_response_guard for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and cache metadata, then exports them asynchronously to an HTTPS collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
           enum: [metadata_only, redacted_body, full_body, hash_only]
           default: redacted_body
-          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts — SSE captures whose frames are all parseable OpenAI chat.completion.chunk frames export a reassembled per-choice completion-text excerpt (annotated sse_reassembled) so PII split across streaming deltas cannot evade per-frame redaction; other SSE shapes keep the per-frame-redacted raw frames. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256 (a mostly-predictable payload around one secret would make an unkeyed digest an offline brute-force oracle)."
+          description: "metadata_only: keyed body hashes + model/provider/token/guardrail metadata, no body. redacted_body: capped, PII-redacted request/response excerpts. Values beneath normalized sensitive JSON keys (password/auth/cookie/session/credential/private-key/client-secret/API-key/token variants) are replaced regardless of value shape; JSON objects/arrays encoded inside strings (including tool arguments) are recursively decoded/redacted to a depth cap of 64. Uniform OpenAI chat.completion.chunk SSE is reassembled before redaction with exact shape {sse_reassembled:true,object:'chat.completion.chunk',completion_text:{'<choice>':'…'},tool_calls:{'<choice>':[{index,id,type,function:{name,arguments}}]},finish_reason:{'<choice>':'…'}}; absent categories are omitted, and text/tool fragments are concatenated by choice/tool index under max_stream_capture_bytes. Other or malformed SSE stays per-frame. full_body: capped unredacted excerpts (requires allow_full_body). hash_only: keyed body hashes + envelope only. Body hashes are keyed HMAC-SHA256 in every mode, never plain SHA-256."
         allow_full_body:
           type: boolean
           default: false
@@ -18249,6 +18431,7 @@ components:
             always_capture_on_guardrail:
               type: boolean
               default: true
+              description: "Override a losing sampling roll for a fired guardrail. A non-empty ai_tool_governor.decision other than allow (deny, dry_run, require_approval, or redact_args) fires this override on request, buffered-response, and terminal-stream paths; ordinary allow does not. Exported guardrails include bounded ai_tool_governor.enabled, mode, decision, tool_names, risk, policy_ids, approval_id, arguments_hashes, and redacted_tools fields."
             always_capture_on_error:
               type: boolean
               default: true
@@ -18260,7 +18443,7 @@ components:
         redaction:
           type: [object, "null"]
           additionalProperties: false
-          description: "PII redaction policy for captured excerpts. Omit or null to keep defaults. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt)."
+          description: "PII redaction policy for captured excerpts. Omit or null to keep defaults. In mode=redacted_body and mode=metadata_only the pattern set must not be empty: builtins=[] with no custom_patterns is rejected at construction (a pass-through redactor would export unredacted data — body excerpts in redacted_body, the request-derived model/tool_names in both — without the full_body opt-in; hash_only exports no request-derived strings and is exempt). redacted_body also replaces values beneath normalized sensitive parent keys and recursively redacts JSON-encoded object/array strings before applying regex patterns."
           properties:
             builtins:
               type: array
@@ -18312,7 +18495,7 @@ components:
           type: object
           required: [endpoint_url]
           additionalProperties: false
-          description: "Async batched HTTP sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Unknown sink keys are rejected; custom_headers remains an open string map."
+          description: "Async batched HTTPS sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Cleartext HTTP requires allow_insecure_loopback=true and is then limited to localhost or a loopback IP. Unknown sink keys are rejected; custom_headers remains an open string map."
           properties:
             type:
               type: string
@@ -18321,7 +18504,11 @@ components:
             endpoint_url:
               type: string
               format: uri
-              description: "http(s) collector URL."
+              description: "Collector URL. HTTPS is required by default. HTTP is accepted only for localhost or a loopback IP when allow_insecure_loopback is explicitly true."
+            allow_insecure_loopback:
+              type: boolean
+              default: false
+              description: "Allow an http:// collector only when endpoint_url uses localhost or a loopback IP. This never permits remote cleartext delivery."
             custom_headers:
               type: object
               additionalProperties:
@@ -18357,12 +18544,12 @@ components:
               type: string
               enum: [drop, reject]
               default: drop
-              description: "drop: silently drop when the queue is full (never block). reject: fail selected buffered or streaming audit records with 503 before response commit when a queue slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
+              description: "drop: silently drop when the queue or 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
             on_sink_error:
               type: string
               enum: [warn, reject]
               default: warn
-              description: "warn: log and drop on permanent sink failure. reject: fail selected buffered or streaming audit records with 503 before response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
+              description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
         privacy:
           type: [object, "null"]
           additionalProperties: false
@@ -18697,10 +18884,15 @@ components:
         Unknown or ambiguous JSON shapes bypass caching. Exact-match
         normalization is enabled by default; optional semantic similarity uses
         a configured embedding provider and a local HNSW vector index.
-        Supports local DashMap and Redis exact-response storage. Unknown root,
-        semantic-policy, and Redis sync keys are rejected at admission with
-        path-qualified diagnostics (registration policy KeepLastKnownGood).
-        There are no intentionally open maps.
+        Supports local DashMap and Redis exact-response storage. Multiple
+        instances on one proxy namespace request staging metadata under
+        ai_semantic_cache.<instance_id>.* and keep embedding/scope vectors in
+        per-instance RequestContext maps so differing key policies and
+        semantic/non-semantic combinations remain independent across priority
+        order and reload generations. Unknown root, semantic-policy, and Redis
+        sync keys are rejected at admission with path-qualified diagnostics
+        (registration policy KeepLastKnownGood). There are no intentionally
+        open maps.
       properties:
         ttl_seconds:
           type: integer
@@ -18821,8 +19013,9 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_connect_timeout_seconds:
           type: integer
           format: uint64
@@ -19064,8 +19257,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -20298,6 +20492,15 @@ components:
         Unknown top-level keys and unknown `pricing_tiers[]` keys are
         rejected so a misspelled pricing dimension cannot silently bill
         at zero.
+        Exactly-once accounting: after scope merging, each proxy may retain
+        at most one effective `api_chargeback` instance. Multiple proxy-scoped,
+        proxy-group-scoped, or mixed attachments on one proxy are rejected
+        because the process-global `/charges` registry has no ledger/instance
+        dimension. Distinct proxies may each attach one instance (including
+        different currencies/pricing). Shared render/cleanup tunables
+        (`render_cache_ttl_seconds`, `stale_entry_ttl_seconds`,
+        `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`) must
+        agree across every enabled instance in the process.
       properties:
         currency:
           type: string
@@ -20382,19 +20585,32 @@ components:
         render_cache_ttl_seconds:
           type: integer
           default: 5
-          description: How long the cached /charges response is served before rebuilding.
+          description: |
+            How long the cached /charges response is served before rebuilding.
+            Process-global: every enabled api_chargeback instance must use the
+            same value.
         stale_entry_ttl_seconds:
           type: integer
           default: 3600
-          description: How long idle chargeback entries live before eviction.
+          description: |
+            How long idle chargeback entries live before eviction.
+            Process-global: every enabled api_chargeback instance must use the
+            same value.
         cache_invalidation_min_age_ms:
           type: integer
           default: 500
-          description: Minimum age (ms) of the render cache before record() will invalidate it.
+          description: |
+            Minimum age (ms) of the render cache before record() will invalidate
+            it. Process-global: every enabled api_chargeback instance must use
+            the same value.
         cleanup_interval_seconds:
           type: integer
           default: 300
-          description: How often (seconds) the background task evicts entries that have been idle longer than stale_entry_ttl_seconds. Set to 0 to disable.
+          description: |
+            How often (seconds) the background task evicts entries that have
+            been idle longer than stale_entry_ttl_seconds. Set to 0 to disable.
+            Process-global: every enabled api_chargeback instance must use the
+            same value.
 
     ApiChargebackSinkConfig:
       type: object
@@ -20409,7 +20625,11 @@ components:
         status for pricing. Native gRPC and translated gRPC-Web use the final
         normalized grpc-status mapped to the canonical effective HTTP status.
         Durable events preserve that billable status, the raw HTTP status, and
-        the normalized gRPC status separately.
+        the normalized gRPC status separately. Snapshot mode aggregates by every
+        exported categorical dimension (namespace, consumer_id, consumer_name,
+        proxy_id, proxy_name, route_id, billable status, raw HTTP status, final
+        gRPC status, and protocol) so mixed route/protocol/name traffic cannot
+        be labeled with first-record metadata.
 
         At least one nonempty pricing dimension must be configured with the same
         semantics as runtime `PricingConfig::has_any_pricing`: a nonempty
@@ -20431,9 +20651,12 @@ components:
         worst-case cumulative inter-attempt delay
         (`retry.max_attempts` / `retry.initial_delay_ms` / `retry.max_delay_ms`)
         must not exceed 600000 ms;
+        `snapshot.stale_entry_ttl_secs >= snapshot.interval_secs`;
         nonempty `password_ref` must name a set `FERRUM_*` process environment
         variable; spool directory privacy/permissions
-        (`ensure_private_dir`); ClickHouse URL egress IP screening; and
+        (`ensure_private_dir`); ClickHouse URL egress IP screening;
+        `wait_for_async_insert` falsy values require
+        `clickhouse.allow_lossy_async_insert=true`; and
         whitespace-only trimming for `currency` / `pricing_version` /
         `password_ref`. File, Admin, and CP-DP admission all invoke the same
         plugin constructor validation path.
@@ -20538,7 +20761,16 @@ components:
           type: string
           enum: [per_event, snapshot]
           default: per_event
-          description: Export one event per transaction or periodic snapshot deltas. Snapshot mode requires spool.enabled=true for durable delta delivery.
+          description: |
+            Export one event per transaction or periodic snapshot deltas.
+            Snapshot mode requires spool.enabled=true for durable delta delivery.
+            Snapshot accumulator identity is every exported categorical field:
+            namespace, consumer_id, consumer_name (empty when absent), proxy_id,
+            proxy_name, route_id (empty when absent), billable status_code, raw
+            http_status_code, final grpc_status, and protocol. Delta emission,
+            last-emitted bookkeeping, and stale cleanup share that identity so
+            mixed routes, protocols, or display names cannot collapse into one
+            mislabeled aggregate.
         currency:
           type: string
           minLength: 1
@@ -20672,7 +20904,25 @@ components:
               additionalProperties:
                 type: string
               default: {}
-              description: Extra query parameters appended to the ClickHouse INSERT request, such as async_insert.
+              description: |
+                Extra query parameters appended to the ClickHouse INSERT request.
+                Durable mode rejects `wait_for_async_insert` values that disable
+                persistence waits (`0`, `false`, `no`, `off`) unless
+                `allow_lossy_async_insert` is true. Recommended durable settings
+                use `async_insert=1` with `wait_for_async_insert=1`. When
+                `async_insert` is enabled and the wait setting is omitted, the
+                sink pins `wait_for_async_insert=1` rather than inheriting the
+                ClickHouse user/profile default.
+            allow_lossy_async_insert:
+              type: boolean
+              default: false
+              description: |
+                Explicit fire-and-forget opt-in. When true, permits
+                `insert_query_params.wait_for_async_insert=0` (and equivalent
+                falsy values). ClickHouse may acknowledge buffered inserts before
+                persistence; spool deletion still follows a complete
+                exception-free HTTP acknowledgement, which is not a durability
+                proof in this mode. Default false keeps the durable contract.
             timeout_ms:
               type: integer
               minimum: 1
@@ -20696,6 +20946,14 @@ components:
               minimum: 1
               maximum: 1000000
               default: 50000
+            buffer_max_bytes:
+              type: integer
+              minimum: 9312
+              maximum: 268435456
+              default: 16777216
+              description: >-
+                Aggregate retained-byte budget for ChargeEvent records awaiting
+                ClickHouse export or async spool delivery.
         retry:
           type: object
           additionalProperties: false
@@ -20757,6 +21015,17 @@ components:
               type: integer
               minimum: 1
               default: 60
+            delivery_queue_capacity:
+              type: integer
+              minimum: 1
+              maximum: 1000000
+              default: 4096
+              description: >-
+                Bounded async handoff queue for overflow and failed-batch spool
+                writes. Request and body terminal hooks only enqueue here;
+                compression, directory work, writes, and fsync run on the owned
+                delivery worker. Saturation drops are counted without blocking
+                the proxy path.
             compression:
               type: string
               enum: [zstd, none]
@@ -20782,7 +21051,38 @@ components:
               type: integer
               minimum: 1
               default: 3600
-              description: How long a snapshot accumulator key may remain idle before entries and last-emitted state are removed.
+              description: |
+                How long a snapshot accumulator key may remain idle before
+                entries and last-emitted state are removed. Runtime requires
+                `stale_entry_ttl_secs >= interval_secs`. Cleanup also refuses to
+                evict keys whose current totals still exceed their last durable
+                baseline (pending/uncommitted deltas survive TTL).
+            max_entries:
+              type: integer
+              minimum: 1
+              maximum: 1000000
+              default: 100000
+              description: |
+                Hard ceiling on distinct snapshot accumulator identities.
+                New identities beyond this budget are spooled as per-event rows
+                through the bounded async spool delivery worker (never inline on
+                the terminal hook), or staged within the retained-byte budget for
+                the next durable emission, rather than merged into unrelated
+                keys. Exhaustion of both durable handoff and bounded staging
+                increments the explicit cardinality-rejection counter.
+            max_retained_bytes:
+              type: integer
+              minimum: 1
+              maximum: 268435456
+              default: 67108864
+              description: |
+                Hard ceiling on estimated retained bytes for snapshot
+                accumulator identities and staged overflow events, enforced as a
+                single combined reservation so concurrent identity admission and
+                overflow staging cannot exceed it. Overflow uses the same bounded
+                async delivery-worker spool strategy as max_entries. Runtime
+                additionally requires the value to be at least one bounded
+                charge-event size.
 
     ChargebackResponse:
       type: object
@@ -20803,7 +21103,8 @@ components:
             When `"mixed"`, any consumer whose proxies span more than one currency
             nulls its flat monetary totals and exposes `charges_by_currency`
             instead; never treat a mixed consumer's omitted/null totals as a
-            settlement amount.
+            settlement amount. An empty registry reports `"USD"` because no
+            recorded entry has an authoritative instance currency.
           example: "USD"
         generated_at:
           type: string
@@ -20875,6 +21176,17 @@ components:
                   properties:
                     proxy_name:
                       type: string
+                      description: |
+                        Live display name for the stable `proxy_id`. Not part of
+                        the in-memory chargeback key, so name-only reloads
+                        preserve accumulated counter values. JSON and Prometheus
+                        resolve active IDs through the same snapshot of the
+                        published configuration; late retired-generation traffic
+                        cannot restore an old name. As a Prometheus label, a
+                        rename creates a controlled label transition whose new
+                        series carries the existing cumulative value.
+                        Overlapping pricing generations collapse under that
+                        authoritative current name.
                     currency:
                       type: string
                       description: |
@@ -20939,17 +21251,127 @@ components:
 
     ChargebackSinkStatusResponse:
       type: object
-      description: Status response from `GET /charges/sink/status`.
+      description: |
+        Status response from `GET /charges/sink/status`. Reports the current
+        accepted generation for every stable `api_chargeback_sink` plugin-config
+        ID plus process-wide totals. Instances are ordered by ascending
+        `plugin_config_id`. Validation throwaways, uncommitted staged reloads,
+        and superseded generations are excluded.
+      required: [enabled, instance_count, snapshot_finalizations_pending, snapshot_finalizations_pending_bytes, snapshot_finalizations_oldest_age_secs, snapshot_finalization_recovery_policy, totals, instances]
       properties:
+        enabled:
+          type: boolean
+          description: True when at least one accepted sink instance is live.
+        instance_count:
+          type: integer
+          minimum: 0
+          description: Number of current accepted plugin-config IDs in `instances`.
+        snapshot_finalizations_pending:
+          type: integer
+          minimum: 0
+          description: Retired snapshot generations retaining an unspooled terminal delta for bounded retry.
+        snapshot_finalizations_pending_bytes:
+          type: integer
+          minimum: 0
+          description: Estimated retained bytes across pending full and compact snapshot finalization recovery state.
+        snapshot_finalizations_oldest_age_secs:
+          type: integer
+          minimum: 0
+          description: Age in seconds of the oldest pending snapshot finalization recovery entry.
+        snapshot_finalization_recovery_policy:
+          type: string
+          description: |
+            Explicit operator recovery policy for pending snapshot finalizations.
+            Restore spool writability; compact recoveries retry on reload and
+            shutdown; new snapshot generations fail closed while pending recovery
+            count or bytes exceed budget.
+        totals:
+          type: object
+          description: Aggregates across every accepted live instance.
+          required: [queue, spool, export]
+          properties:
+            queue:
+              type: object
+              properties:
+                depth:
+                  type: integer
+                  minimum: 0
+                capacity:
+                  type: integer
+                  minimum: 0
+                high_water_hits_total:
+                  type: integer
+                  minimum: 0
+            spool:
+              type: object
+              properties:
+                files:
+                  type: integer
+                  minimum: 0
+                bytes:
+                  type: integer
+                  minimum: 0
+                drops_total:
+                  type: integer
+                  minimum: 0
+                prepare_failures_total:
+                  type: integer
+                  minimum: 0
+                available:
+                  type: boolean
+                  description: |
+                    True only when every spool-enabled live instance currently
+                    reports writable storage.
+            export:
+              type: object
+              properties:
+                events_enqueued_total:
+                  type: integer
+                  minimum: 0
+                events_exported_total:
+                  type: integer
+                  minimum: 0
+                failures_total:
+                  type: integer
+                  minimum: 0
+        instances:
+          type: array
+          description: |
+            Per-instance status for the current accepted generation of each
+            stable plugin-config ID, ordered by ascending `plugin_config_id`.
+          items:
+            $ref: "#/components/schemas/ChargebackSinkInstanceStatus"
+
+    ChargebackSinkInstanceStatus:
+      type: object
+      description: Status for one accepted live `api_chargeback_sink` instance.
+      required:
+        - plugin_config_id
+        - generation
+        - mode
+        - pricing_version
+        - clickhouse
+        - batch
+        - retry
+        - queue
+        - spool
+        - export
+      properties:
+        plugin_config_id:
+          type: string
+          minLength: 1
+          description: Stable plugin-config resource id for this instance.
+        generation:
+          type: integer
+          minimum: 1
+          description: Accepted-generation identity assigned at activation.
         mode:
           type: string
           enum: [per_event, snapshot]
-        enabled:
-          type: boolean
         pricing_version:
-          type: [string, "null"]
+          type: string
         clickhouse:
-          type: [object, "null"]
+          type: object
           properties:
             endpoint:
               type: string
@@ -20960,7 +21382,7 @@ components:
               type: string
         batch:
           type: object
-          description: Effective admitted batching settings used by the live sink. Values are zero while the sink is disabled.
+          description: Effective admitted batching settings used by this instance.
           properties:
             size:
               type: integer
@@ -20971,10 +21393,7 @@ components:
               minimum: 0
         retry:
           type: object
-          description: |
-            Effective admitted retry settings used by the live sink. Disabled
-            status uses the same object shape with zeroed numeric fields and
-            `jitter: false`.
+          description: Effective admitted retry settings used by this instance.
           properties:
             max_attempts:
               type: integer
@@ -21004,6 +21423,10 @@ components:
           properties:
             enabled:
               type: boolean
+            available:
+              type: boolean
+            prepare_failures_total:
+              type: integer
             files:
               type: integer
               description: Count of owned spool files (active data, temps, and quarantined).
@@ -21123,8 +21546,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_connect_timeout_seconds:
           type: integer
           minimum: 1

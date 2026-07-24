@@ -1185,6 +1185,155 @@ async fn h3_grpc_web_preserves_ascii_custom_trailers_binary_and_text() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
+async fn h3_grpc_web_server_streaming_reaches_client_before_backend_eof() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gRPC backend");
+    let backend_port = backend_listener.local_addr().expect("backend addr").port();
+    let backend_ca = TestCa::new("h3-grpc-web-cadence").expect("backend CA");
+    let (backend_cert, backend_key) = backend_ca.valid().expect("backend leaf");
+    let backend = ScriptedGrpcBackend::builder_tls(backend_listener, &backend_cert, &backend_key)
+        .expect("backend TLS")
+        .step(GrpcStep::AcceptRpc(MatchRpc::method(
+            "/echo.Echo/ServerStream",
+        )))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::new()))
+        .step(GrpcStep::Sleep(Duration::from_secs(1)))
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"x")))
+        .step(GrpcStep::RespondStatusWithTrailers {
+            code: 0,
+            message: "ok",
+            trailers: vec![("x-stream-meta", "final".to_string())],
+        })
+        .step(GrpcStep::AcceptRpc(MatchRpc::method(
+            "/echo.Echo/ServerStream",
+        )))
+        .step(GrpcStep::SendInitialHeaders)
+        .step(GrpcStep::RespondMessage(Bytes::new()))
+        .step(GrpcStep::Sleep(Duration::from_secs(1)))
+        .step(GrpcStep::RespondMessage(Bytes::from_static(b"x")))
+        .step(GrpcStep::RespondStatusWithTrailers {
+            code: 0,
+            message: "ok",
+            trailers: vec![("x-stream-meta", "final".to_string())],
+        })
+        .spawn()
+        .expect("spawn gRPC backend");
+
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "h3-grpc-web-cadence",
+            "listen_path": "/cadence",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "auth_mode": "single",
+            "plugins": [{"plugin_config_id": "grpc-web-cadence"}],
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [{
+            "id": "grpc-web-cadence",
+            "plugin_name": "grpc_web",
+            "scope": "proxy",
+            "proxy_id": "h3-grpc-web-cadence",
+            "enabled": true,
+            "config": {},
+        }],
+    });
+    let (_gateway, https_port, _scratch) = spawn_h3_gateway(config).await;
+    let client = Http3Client::insecure().expect("H3 client");
+    let url = format!("https://127.0.0.1:{https_port}/cadence/echo.Echo/ServerStream");
+
+    for (content_type, text_mode) in [
+        ("application/grpc-web+proto", false),
+        ("application/grpc-web-text+proto", true),
+    ] {
+        let mut stream = client
+            .open_grpc_web_stream(&url, content_type)
+            .await
+            .expect("open H3 gRPC-Web stream");
+        let request = grpc_frame(b"ping");
+        if text_mode {
+            stream
+                .send_raw_data(Bytes::from(BASE64.encode(request)))
+                .await
+                .expect("send text request");
+        } else {
+            stream
+                .send_raw_data(Bytes::from(request))
+                .await
+                .expect("send binary request");
+        }
+        stream.finish().await.expect("finish request");
+        let (status, headers) = stream.recv_response().await.expect("response headers");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            headers
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some(content_type)
+        );
+        assert!(!headers.contains_key("content-length"));
+
+        let first = tokio::time::timeout(Duration::from_millis(700), stream.recv_data())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("{content_type} withheld its first H3 message until backend EOF")
+            })
+            .expect("first DATA read")
+            .expect("first DATA");
+        let first = if text_mode {
+            assert!(first.ends_with(b"="), "first text flush must be padded");
+            BASE64.decode(first).expect("first text segment")
+        } else {
+            first.to_vec()
+        };
+        assert_eq!(first, grpc_frame(b""));
+
+        let mut tail = Vec::new();
+        while let Some(data) = stream.recv_data().await.expect("remaining DATA") {
+            if text_mode {
+                tail.extend_from_slice(&BASE64.decode(data).expect("text segment"));
+            } else {
+                tail.extend_from_slice(&data);
+            }
+        }
+        assert!(
+            stream
+                .recv_trailers()
+                .await
+                .expect("downstream trailers")
+                .is_none(),
+            "translated gRPC-Web must not emit native H3 trailers"
+        );
+        let second = grpc_frame(b"x");
+        assert!(tail.starts_with(&second), "second message missing");
+        let frames = grpc_web_frames(&tail[second.len()..]);
+        assert_eq!(frames.len(), 1, "terminal frame must be unique");
+        assert_eq!(frames[0].0, 0x80);
+        let payload = String::from_utf8_lossy(frames[0].1);
+        assert!(payload.contains("grpc-status: 0\r\n"));
+        assert!(payload.contains("grpc-message: ok\r\n"));
+        assert!(payload.contains("x-stream-meta: final\r\n"));
+    }
+
+    let backend_errors = backend.step_errors().await;
+    assert!(
+        backend_errors.is_empty(),
+        "backend script errors: {backend_errors:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
 async fn h3_grpc_web_validates_complete_binary_and_text_request_envelopes() {
     let backend_listener = TcpListener::bind("127.0.0.1:0")
         .await

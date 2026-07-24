@@ -205,13 +205,22 @@ mod inner {
     }
 
     fn is_duplicate_key(err: &mongodb::error::Error) -> bool {
-        is_mongo_command_error_with_code(err, MONGO_ERR_DUPLICATE_KEY)
-            || matches!(
-                err.kind.as_ref(),
-                mongodb::error::ErrorKind::Write(
-                    mongodb::error::WriteFailure::WriteError(write_error)
-                ) if write_error.code == MONGO_ERR_DUPLICATE_KEY
-            )
+        if is_mongo_command_error_with_code(err, MONGO_ERR_DUPLICATE_KEY) {
+            return true;
+        }
+        match err.kind.as_ref() {
+            mongodb::error::ErrorKind::Write(mongodb::error::WriteFailure::WriteError(
+                write_error,
+            )) if write_error.code == MONGO_ERR_DUPLICATE_KEY => true,
+            mongodb::error::ErrorKind::InsertMany(insert_error) => {
+                insert_error.write_errors.as_deref().is_some_and(|errors| {
+                    errors
+                        .iter()
+                        .any(|write_error| write_error.code == MONGO_ERR_DUPLICATE_KEY)
+                })
+            }
+            _ => false,
+        }
     }
 
     /// Recognize an AWS DocumentDB rejection of an aggregation-pipeline-form
@@ -299,13 +308,38 @@ mod inner {
         pub app_name: Option<String>,
         pub replica_set: Option<String>,
         pub auth_mechanism: Option<String>,
-        pub server_selection_timeout_secs: u64,
-        pub connect_timeout_secs: u64,
+        /// Explicit `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` override.
+        /// `None` preserves the URI `serverSelectionTimeoutMS` value (or the
+        /// driver default when the URI omits it).
+        pub server_selection_timeout_secs: Option<u64>,
+        /// Explicit `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` override.
+        /// `None` preserves the URI `connectTimeoutMS` value (or the driver
+        /// default when the URI omits it).
+        pub connect_timeout_secs: Option<u64>,
         pub tls_enabled: bool,
         pub tls_ca_cert_path: Option<String>,
         pub tls_client_cert_path: Option<String>,
         pub tls_client_key_path: Option<String>,
         pub tls_insecure: bool,
+    }
+
+    /// Apply explicit Ferrum timeout overrides onto parsed `ClientOptions`.
+    ///
+    /// URI-parsed timeout values survive when the corresponding env override is
+    /// unset (`None`). Only an explicitly supplied `FERRUM_MONGO_*_TIMEOUT_SECONDS`
+    /// value replaces the URI/driver setting — mirroring `app_name` /
+    /// `repl_set_name` precedence.
+    pub(crate) fn apply_mongo_timeout_overrides(
+        client_options: &mut ClientOptions,
+        server_selection_timeout_secs: Option<u64>,
+        connect_timeout_secs: Option<u64>,
+    ) {
+        if let Some(secs) = server_selection_timeout_secs {
+            client_options.server_selection_timeout = Some(Duration::from_secs(secs));
+        }
+        if let Some(secs) = connect_timeout_secs {
+            client_options.connect_timeout = Some(Duration::from_secs(secs));
+        }
     }
 
     /// Decide whether multi-document transactions are available based on the
@@ -854,8 +888,8 @@ mod inner {
             app_name: Option<&str>,
             replica_set: Option<&str>,
             auth_mechanism: Option<&str>,
-            server_selection_timeout_secs: u64,
-            connect_timeout_secs: u64,
+            server_selection_timeout_secs: Option<u64>,
+            connect_timeout_secs: Option<u64>,
             tls_enabled: bool,
             tls_ca_cert_path: Option<&str>,
             tls_client_cert_path: Option<&str>,
@@ -966,10 +1000,11 @@ mod inner {
                     anyhow::anyhow!("Invalid MongoDB auth mechanism '{}': {}", mechanism, e)
                 })?);
             }
-            client_options.server_selection_timeout =
-                Some(Duration::from_secs(settings.server_selection_timeout_secs));
-            client_options.connect_timeout =
-                Some(Duration::from_secs(settings.connect_timeout_secs));
+            apply_mongo_timeout_overrides(
+                &mut client_options,
+                settings.server_selection_timeout_secs,
+                settings.connect_timeout_secs,
+            );
 
             // Configure TLS via the canonical database TLS env vars. URI TLS
             // settings were rejected above whenever the canonical mode is set.
@@ -1246,8 +1281,8 @@ mod inner {
             app_name: Option<&str>,
             replica_set: Option<&str>,
             auth_mechanism: Option<&str>,
-            server_selection_timeout_secs: u64,
-            connect_timeout_secs: u64,
+            server_selection_timeout_secs: Option<u64>,
+            connect_timeout_secs: Option<u64>,
             tls_enabled: bool,
             tls_ca_cert_path: Option<&str>,
             tls_client_cert_path: Option<&str>,
@@ -3219,10 +3254,12 @@ mod inner {
         // Consumer identity index maintenance
         // -------------------------------------------------------------------
 
-        /// Insert identity reservations for `values` inside a transaction.
-        /// A duplicate-key error (another consumer owns one of the values)
-        /// aborts the transaction; the E11000 message contains
-        /// "duplicate key", which the admin layer maps to HTTP 409.
+        /// Reserve identity docs for `values` inside a transaction using a
+        /// preflight read-then-insert protocol: every requested value is read
+        /// and validated BEFORE any potentially-aborting write, so stale
+        /// same-owner reservations are adopted without ever relying on reads or
+        /// repair writes after an E11000 in an already-failed transaction. See
+        /// [`Self::preflight_reserve_consumer_identity_docs_in_session`].
         async fn insert_consumer_identity_docs_in_session(
             &self,
             session: &mut ClientSession,
@@ -3233,8 +3270,92 @@ mod inner {
             if values.is_empty() {
                 return Ok(());
             }
+            self.preflight_reserve_consumer_identity_docs_in_session(
+                session,
+                &consumer_identity_index_docs(namespace, consumer_id, values),
+            )
+            .await
+        }
+
+        /// Preflight-reserve a set of `consumer_identity_index` candidate docs
+        /// inside a transaction. Every candidate is read first — one batched
+        /// `_id` `$in` read using the transaction's own read concern — and
+        /// classified BEFORE any write:
+        ///   - a same-owner reservation is adopted (skipped);
+        ///   - a different-owner or malformed reservation fails closed as a
+        ///     duplicate-key conflict — the "duplicate key" text maps to HTTP
+        ///     409;
+        ///   - only preflight-absent candidates are inserted.
+        ///
+        /// A duplicate key on the insert of a preflight-absent candidate means
+        /// a concurrent writer committed the same reservation in the read→write
+        /// window (or two candidates in this batch collide on one identity
+        /// value). That aborts the transaction; the error is propagated WITHOUT
+        /// any further reads or repair writes — the session is no longer usable
+        /// and must never be treated as if it were. The convenient-transaction
+        /// runner retries the whole closure on the resulting transient write
+        /// conflict, and the retry's preflight then observes the now-committed
+        /// reservation and either adopts it or fails closed. There is
+        /// intentionally no post-E11000 recovery read/write in this
+        /// already-failed transaction.
+        async fn preflight_reserve_consumer_identity_docs_in_session(
+            &self,
+            session: &mut ClientSession,
+            candidates: &[Document],
+        ) -> mongodb::error::Result<()> {
+            if candidates.is_empty() {
+                return Ok(());
+            }
+            // Batched preflight read of every candidate reservation's current
+            // owner, inside the transaction, before any write.
+            let mut ids: Vec<Bson> = Vec::with_capacity(candidates.len());
+            for candidate in candidates {
+                let doc_id = consumer_identity_field(candidate, "_id")?;
+                ids.push(Bson::String(doc_id.to_string()));
+            }
+            let mut existing_owners = std::collections::HashMap::<String, String>::new();
+            let mut cursor = self
+                .consumer_identity_index()
+                .find(doc! { "_id": { "$in": ids } })
+                .session(&mut *session)
+                .await?;
+            while cursor.advance(&mut *session).await? {
+                let existing = cursor.deserialize_current()?;
+                let doc_id = consumer_identity_field(&existing, "_id")?;
+                let owner = consumer_identity_field(&existing, "consumer_id")?;
+                existing_owners.insert(doc_id.to_string(), owner.to_string());
+            }
+            drop(cursor);
+
+            // Classify every candidate against the preflight snapshot. Only
+            // preflight-absent candidates are inserted; a different owner or a
+            // malformed reservation fails closed (409) with no write attempted.
+            let mut to_insert: Vec<Document> = Vec::new();
+            for candidate in candidates {
+                let doc_id = consumer_identity_field(candidate, "_id")?;
+                let consumer_id = consumer_identity_field(candidate, "consumer_id")?;
+                match existing_owners.get(doc_id) {
+                    Some(owner) => {
+                        if owner.as_str() != consumer_id {
+                            return Err(mongodb::error::Error::custom(format!(
+                                "E11000 duplicate key error: consumer identity reservation \
+                                 '{doc_id}' is reserved by consumer '{owner}'"
+                            )));
+                        }
+                        // Same owner ⇒ adopt the existing reservation.
+                    }
+                    None => to_insert.push(candidate.clone()),
+                }
+            }
+            if to_insert.is_empty() {
+                return Ok(());
+            }
+            // Insert ONLY preflight-absent reservations. A duplicate key here is
+            // a concurrent race in the read→write window (or an intra-batch
+            // collision): it aborts the transaction and is propagated as-is. Do
+            // not follow it with any session operation.
             self.consumer_identity_index()
-                .insert_many(consumer_identity_index_docs(namespace, consumer_id, values))
+                .insert_many(to_insert)
                 .session(&mut *session)
                 .await?;
             Ok(())
@@ -3283,27 +3404,85 @@ mod inner {
         }
 
         /// Standalone reserve-first: insert the identity reservations BEFORE
-        /// writing the consumer document. A duplicate-key error means another
-        /// consumer owns one of the values — best-effort delete exactly the
-        /// documents this call inserted (the prefix before the failed index)
-        /// and bail without touching the consumer. Deleting only the inserted
-        /// prefix matters: releasing the full value set could remove
-        /// reservations that a pre-existing consumer with the same id already
-        /// legitimately owns.
+        /// writing the consumer document. A duplicate-key error is treated as
+        /// success when every conflicting reservation is already owned by this
+        /// consumer (orphaned same-owner retry / stale release). A different
+        /// owner still bails after best-effort deleting (1) the verifiable
+        /// ordered-insert prefix and (2) vacant reservations this adoption
+        /// attempt inserted before failing — never pre-existing same-owner
+        /// adoptions.
+        ///
+        /// On success, returns only the identity values **this attempt newly
+        /// inserted**. Later write-path rollback must release that set alone —
+        /// never adopted same-owner reservations whose provenance is unknown
+        /// (they may belong to a live consumer or a prior durable orphan that
+        /// another retry still needs).
         async fn reserve_consumer_identity_docs_standalone(
             &self,
             namespace: &str,
             consumer_id: &str,
             values: &[String],
-        ) -> Result<(), anyhow::Error> {
+        ) -> Result<Vec<String>, anyhow::Error> {
             if values.is_empty() {
-                return Ok(());
+                return Ok(Vec::new());
             }
             if let Err(err) = self
                 .consumer_identity_index()
                 .insert_many(consumer_identity_index_docs(namespace, consumer_id, values))
                 .await
             {
+                if is_duplicate_key(&err) {
+                    match self
+                        .ensure_consumer_identity_docs_owned(namespace, consumer_id, values)
+                        .await
+                    {
+                        Ok(ensured_new) => {
+                            let inserted_prefix = Self::ordered_insert_inserted_prefix_len(&err);
+                            let mut newly_inserted =
+                                ordered_insert_newly_inserted_prefix(values, inserted_prefix)
+                                    .to_vec();
+                            if inserted_prefix.is_none() {
+                                warn!(
+                                    "Retaining MongoDB consumer identity reservations for '{}' in \
+                                     namespace '{}' that may have been inserted by a failed ordered \
+                                     insert without a verifiable write-error index; rollback will \
+                                     only release values newly inserted during same-owner adoption",
+                                    consumer_id, namespace
+                                );
+                            }
+                            for value in ensured_new {
+                                if !newly_inserted.contains(&value) {
+                                    newly_inserted.push(value);
+                                }
+                            }
+                            return Ok(newly_inserted);
+                        }
+                        Err(adopt_err) => {
+                            let inserted_prefix = Self::ordered_insert_inserted_prefix_len(&err);
+                            if inserted_prefix.is_none() {
+                                warn!(
+                                    "Retaining MongoDB consumer identity reservations for '{}' in \
+                                     namespace '{}' because the failed ordered insert did not report \
+                                     a verifiable write-error index; still releasing vacant \
+                                     reservations inserted during this adoption attempt",
+                                    consumer_id, namespace
+                                );
+                            }
+                            let to_release = consumer_identity_adoption_failure_release_values(
+                                values,
+                                inserted_prefix,
+                                &adopt_err.newly_inserted,
+                            );
+                            self.release_consumer_identity_values_best_effort(
+                                namespace,
+                                consumer_id,
+                                &to_release,
+                            )
+                            .await;
+                            return Err(adopt_err.into_source());
+                        }
+                    }
+                }
                 if let Some(inserted) = Self::ordered_insert_inserted_prefix_len(&err) {
                     self.release_consumer_identity_values_best_effort(
                         namespace,
@@ -3321,8 +3500,151 @@ mod inner {
                 }
                 return Err(err.into());
             }
-            Ok(())
+            Ok(values.to_vec())
         }
+
+        /// Ensure every identity value is reserved by `consumer_id`.
+        ///
+        /// Used after an E11000 on `insert_many`: same-owner docs are adopted;
+        /// vacant docs are inserted; a different owner is a conflict (message
+        /// retains "duplicate key" so the admin layer maps to HTTP 409).
+        ///
+        /// On success, returns identity values this call newly inserted (safe
+        /// to roll back). Adopted existing docs are omitted — their provenance
+        /// is unknown. On failure, [`ConsumerIdentityEnsureOwnedError`] still
+        /// carries the exact vacant inserts committed before the failure so
+        /// callers can release that provenance.
+        async fn ensure_consumer_identity_docs_owned(
+            &self,
+            namespace: &str,
+            consumer_id: &str,
+            values: &[String],
+        ) -> Result<Vec<String>, ConsumerIdentityEnsureOwnedError> {
+            let mut newly_inserted = Vec::new();
+            for value in values {
+                let doc_id = consumer_identity_doc_id(namespace, value);
+                let existing = match self
+                    .consumer_identity_index()
+                    .find_one(doc! { "_id": &doc_id })
+                    .await
+                {
+                    Ok(existing) => existing,
+                    Err(err) => {
+                        return Err(ConsumerIdentityEnsureOwnedError::new(
+                            newly_inserted,
+                            err.into(),
+                        ));
+                    }
+                };
+                match existing {
+                    Some(existing) => {
+                        let owner = match existing.get_str("consumer_id") {
+                            Ok(owner) => owner,
+                            Err(e) => {
+                                return Err(ConsumerIdentityEnsureOwnedError::new(
+                                    newly_inserted,
+                                    anyhow::anyhow!(
+                                        "consumer_identity_index doc '{}' missing consumer_id: {}",
+                                        doc_id,
+                                        e
+                                    ),
+                                ));
+                            }
+                        };
+                        // Same owner ⇒ adopt the existing reservation (orphaned
+                        // retry / stale release). A different owner is a conflict;
+                        // the "duplicate key" text maps to HTTP 409. Live
+                        // reservations are never stolen.
+                        if owner != consumer_id {
+                            return Err(ConsumerIdentityEnsureOwnedError::new(
+                                newly_inserted,
+                                anyhow::anyhow!(
+                                    "E11000 duplicate key error: identity value '{}' in \
+                                     namespace '{}' is reserved by consumer '{}'",
+                                    value,
+                                    namespace,
+                                    owner
+                                ),
+                            ));
+                        }
+                    }
+                    None => {
+                        let doc = consumer_identity_index_doc(namespace, value, consumer_id);
+                        if let Err(err) = self.consumer_identity_index().insert_one(doc).await {
+                            if !is_duplicate_key(&err) {
+                                return Err(ConsumerIdentityEnsureOwnedError::new(
+                                    newly_inserted,
+                                    err.into(),
+                                ));
+                            }
+                            let existing = match self
+                                .consumer_identity_index()
+                                .find_one(doc! { "_id": &doc_id })
+                                .await
+                            {
+                                Ok(existing) => existing,
+                                Err(find_err) => {
+                                    return Err(ConsumerIdentityEnsureOwnedError::new(
+                                        newly_inserted,
+                                        find_err.into(),
+                                    ));
+                                }
+                            };
+                            let Some(existing) = existing else {
+                                return Err(ConsumerIdentityEnsureOwnedError::new(
+                                    newly_inserted,
+                                    err.into(),
+                                ));
+                            };
+                            let owner = match existing.get_str("consumer_id") {
+                                Ok(owner) => owner,
+                                Err(e) => {
+                                    return Err(ConsumerIdentityEnsureOwnedError::new(
+                                        newly_inserted,
+                                        anyhow::anyhow!(
+                                            "consumer_identity_index doc '{}' missing \
+                                             consumer_id: {}",
+                                            doc_id,
+                                            e
+                                        ),
+                                    ));
+                                }
+                            };
+                            if owner != consumer_id {
+                                return Err(ConsumerIdentityEnsureOwnedError::new(
+                                    newly_inserted,
+                                    anyhow::anyhow!(
+                                        "E11000 duplicate key error: identity value '{}' in \
+                                         namespace '{}' is reserved by consumer '{}'",
+                                        value,
+                                        namespace,
+                                        owner
+                                    ),
+                                ));
+                            }
+                            // Lost the insert race to another same-owner writer —
+                            // provenance unknown; do not mark rollback-safe.
+                        } else {
+                            newly_inserted.push(value.clone());
+                        }
+                    }
+                }
+            }
+            Ok(newly_inserted)
+        }
+
+        // NOTE: There is intentionally NO startup/orphan reconcile that deletes
+        // `consumer_identity_index` docs whose consumer point-read is absent.
+        // The migration lease serializes migration runners only — not normal
+        // consumer CRUD across serving nodes. A standalone reserve-first create
+        // can commit the reservation and still be awaiting `consumers.insert_one`
+        // while another node observes the consumer absent and would reclaim the
+        // live reservation, leaving the delayed create unguarded. Automatic
+        // different-owner reclamation would need attempt/generation identity,
+        // bounded leases, atomic conditional takeover, and writer-side
+        // verify/rollback; without that protocol, permanent conservative lockout
+        // (healed by same-owner E11000 adoption or manual mongosh surgery) is
+        // preferred over corrupting uniqueness.
 
         /// Best-effort compensation: delete identity reservations this call
         /// inserted. Filtered by `consumer_id` so reservations owned by other
@@ -3354,27 +3676,32 @@ mod inner {
             }
         }
 
-        /// Release reservations only for consumer documents whose compensating
-        /// delete was confirmed. Reservations for documents in a failed or
-        /// unverified rollback chunk remain held so later writes cannot claim
-        /// identities that may still belong to a persisted consumer.
+        /// Release reservations only for identity docs **this attempt newly
+        /// inserted**, and only when the owning consumer document's compensating
+        /// delete was confirmed. Adopted same-owner reservations and docs for
+        /// unverified rollback chunks are retained so a live consumer (or a
+        /// durable orphan still needed by same-owner retry) cannot lose its
+        /// uniqueness guard.
         async fn release_confirmed_batch_consumer_identity_docs_best_effort(
             &self,
-            consumers: &[Consumer],
+            newly_inserted_identity_docs: &[Document],
             confirmed_absent_doc_ids: &HashSet<String>,
         ) {
-            for consumer in consumers {
-                if confirmed_absent_doc_ids
-                    .contains(&consumer_doc_id(&consumer.namespace, &consumer.id))
-                {
-                    self.release_consumer_identity_values_best_effort(
-                        &consumer.namespace,
-                        &consumer.id,
-                        &consumer_identity_values(consumer),
-                    )
-                    .await;
-                }
-            }
+            let docs_to_release: Vec<Document> = newly_inserted_identity_docs
+                .iter()
+                .filter(|doc| {
+                    let Ok(namespace) = doc.get_str("namespace") else {
+                        return false;
+                    };
+                    let Ok(consumer_id) = doc.get_str("consumer_id") else {
+                        return false;
+                    };
+                    confirmed_absent_doc_ids.contains(&consumer_doc_id(namespace, consumer_id))
+                })
+                .cloned()
+                .collect();
+            self.release_consumer_identity_docs_best_effort(&docs_to_release)
+                .await;
         }
 
         /// Best-effort deletion of specific identity-index documents
@@ -3824,6 +4151,101 @@ mod inner {
             .iter()
             .map(|value| consumer_identity_index_doc(namespace, value, consumer_id))
             .collect()
+    }
+
+    /// Extract a required string field from a `consumer_identity_index`
+    /// reservation candidate or stored document, mapping a missing or mistyped
+    /// field to a transaction error instead of panicking. Used by the
+    /// preflight replica-set reservation path.
+    fn consumer_identity_field<'a>(
+        doc: &'a Document,
+        field: &str,
+    ) -> mongodb::error::Result<&'a str> {
+        doc.get_str(field).map_err(|_| {
+            mongodb::error::Error::custom(format!(
+                "consumer_identity_index reservation doc missing field '{field}'"
+            ))
+        })
+    }
+
+    /// Failure from [`MongoStore::ensure_consumer_identity_docs_owned`] that
+    /// preserves vacant reservations this adoption attempt inserted before the
+    /// failure. Callers must best-effort release `newly_inserted` (in addition
+    /// to any verifiable ordered-insert prefix) and must never treat adopted
+    /// pre-existing same-owner reservations as rollback-safe.
+    ///
+    /// Crate-internal only: the type is not exposed through any public or
+    /// `_test_support` surface; failure provenance is exercised through the
+    /// `consumer_identity_adoption_failure_release_values` helper and the
+    /// standalone/batch reserve paths.
+    #[derive(Debug)]
+    struct ConsumerIdentityEnsureOwnedError {
+        /// Exact identity values this ensure call newly inserted before failing.
+        newly_inserted: Vec<String>,
+        source: anyhow::Error,
+    }
+
+    impl ConsumerIdentityEnsureOwnedError {
+        fn new(newly_inserted: Vec<String>, source: anyhow::Error) -> Self {
+            Self {
+                newly_inserted,
+                source,
+            }
+        }
+
+        /// Consume the error, returning the underlying source for propagation.
+        fn into_source(self) -> anyhow::Error {
+            self.source
+        }
+    }
+
+    impl std::fmt::Display for ConsumerIdentityEnsureOwnedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.source)
+        }
+    }
+
+    impl std::error::Error for ConsumerIdentityEnsureOwnedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source.source()
+        }
+    }
+
+    /// Ordered `insert_many` E11000: only the prefix before `first_error_index`
+    /// was inserted by this attempt. `None` means attribution is unknown —
+    /// retain everything (return an empty rollback-safe slice).
+    pub(crate) fn ordered_insert_newly_inserted_prefix<T>(
+        values: &[T],
+        first_error_index: Option<usize>,
+    ) -> &[T] {
+        match first_error_index {
+            Some(i) if i <= values.len() => &values[..i],
+            _ => &[],
+        }
+    }
+
+    /// Failure-path release set after a partial ordered insert entered
+    /// same-owner adoption and then failed.
+    ///
+    /// Includes (1) the verifiable ordered-insert prefix and (2) vacant
+    /// reservations this adoption attempt inserted before failing. Unknown
+    /// ordered-insert provenance (`None`) contributes nothing — those
+    /// reservations are retained. Pre-existing same-owner adoptions must not
+    /// appear in `adoption_newly_inserted`.
+    pub(crate) fn consumer_identity_adoption_failure_release_values(
+        ordered_values: &[String],
+        ordered_first_error_index: Option<usize>,
+        adoption_newly_inserted: &[String],
+    ) -> Vec<String> {
+        let mut out =
+            ordered_insert_newly_inserted_prefix(ordered_values, ordered_first_error_index)
+                .to_vec();
+        for value in adoption_newly_inserted {
+            if !out.contains(value) {
+                out.push(value.clone());
+            }
+        }
+        out
     }
 
     /// Convert a domain `Consumer` into a BSON `Document`.
@@ -5895,17 +6317,23 @@ mod inner {
                 // before the consumer makes the identity-index `_id` the
                 // atomic admission guard — a duplicate key error (E11000,
                 // "duplicate key") bails before the consumer is written.
-                self.reserve_consumer_identity_docs_standalone(
-                    &consumer.namespace,
-                    &consumer.id,
-                    &identity_values,
-                )
-                .await?;
+                // Rollback releases only values this attempt newly inserted
+                // (never adopted same-owner reservations of unknown provenance).
+                let newly_inserted_identity_values = self
+                    .reserve_consumer_identity_docs_standalone(
+                        &consumer.namespace,
+                        &consumer.id,
+                        &identity_values,
+                    )
+                    .await?;
+                // Release only values this attempt newly inserted — never adopted
+                // same-owner reservations, whose provenance is unknown.
+                let rollback_identity_values: &[String] = &newly_inserted_identity_values;
                 if let Err(err) = self.consumers().insert_one(doc).await {
                     self.release_consumer_identity_values_best_effort(
                         &consumer.namespace,
                         &consumer.id,
-                        &identity_values,
+                        rollback_identity_values,
                     )
                     .await;
                     return Err(err.into());
@@ -5927,7 +6355,7 @@ mod inner {
                         self.release_consumer_identity_values_best_effort(
                             &consumer.namespace,
                             &consumer.id,
-                            &identity_values,
+                            rollback_identity_values,
                         )
                         .await;
                     } else {
@@ -6096,12 +6524,18 @@ mod inner {
                         // replace the consumer, then release the removed values. A
                         // duplicate key on the reservation (another consumer owns one
                         // of the values) bails before the consumer is touched.
-                        self.reserve_consumer_identity_docs_standalone(
-                            &consumer.namespace,
-                            &consumer.id,
-                            &added,
-                        )
-                        .await?;
+                        // Failure rollback releases only values this attempt newly
+                        // inserted — never adopted same-owner reservations.
+                        let newly_inserted_identity_values = self
+                            .reserve_consumer_identity_docs_standalone(
+                                &consumer.namespace,
+                                &consumer.id,
+                                &added,
+                            )
+                            .await?;
+                        // Release only values this attempt newly inserted — never
+                        // adopted same-owner reservations of unknown provenance.
+                        let rollback_identity_values: &[String] = &newly_inserted_identity_values;
                         let replace_result = match self
                             .consumers()
                             .replace_one(doc! { "_id": &composite_id }, doc)
@@ -6112,7 +6546,7 @@ mod inner {
                                 self.release_consumer_identity_values_best_effort(
                                     &consumer.namespace,
                                     &consumer.id,
-                                    &added,
+                                    rollback_identity_values,
                                 )
                                 .await;
                                 return Err(err.into());
@@ -6124,7 +6558,7 @@ mod inner {
                             self.release_consumer_identity_values_best_effort(
                                 &consumer.namespace,
                                 &consumer.id,
-                                &added,
+                                rollback_identity_values,
                             )
                             .await;
                             return Ok(false);
@@ -6151,7 +6585,7 @@ mod inner {
                                 self.release_consumer_identity_values_best_effort(
                                     &consumer.namespace,
                                     &consumer.id,
-                                    &added,
+                                    rollback_identity_values,
                                 )
                                 .await;
                             }
@@ -7737,14 +8171,22 @@ mod inner {
                         (self, docs, changes, identity_docs),
                         |s, (this, docs, changes, identity_docs)| {
                             Box::pin(async move {
-                                // Reserve the merged identity keyspace first — a
-                                // duplicate key aborts the whole transaction.
-                                if !identity_docs.is_empty() {
-                                    this.consumer_identity_index()
-                                        .insert_many(identity_docs.clone())
-                                        .session(&mut *s)
-                                        .await?;
-                                }
+                                // Reserve the merged identity keyspace with a
+                                // preflight read-then-insert (see
+                                // preflight_reserve_consumer_identity_docs_in_session):
+                                // every reservation is read and classified
+                                // BEFORE any write. Same-owner reservations are
+                                // adopted, a different owner or an intra-batch
+                                // collision fails closed (409), and only
+                                // preflight-absent reservations are inserted.
+                                // No post-E11000 recovery runs in this
+                                // transaction — a duplicate on the insert aborts
+                                // it and the runner retries the closure.
+                                this.preflight_reserve_consumer_identity_docs_in_session(
+                                    &mut *s,
+                                    identity_docs.as_slice(),
+                                )
+                                .await?;
                                 let result = this
                                     .consumers()
                                     .insert_many(docs.clone())
@@ -7779,25 +8221,160 @@ mod inner {
             } else {
                 // Standalone RESERVE FIRST: insert identity reservations for
                 // the whole batch (ordered) before any consumer document. On
-                // failure, best-effort delete exactly the documents this call
-                // inserted (the prefix before the failed index) — releasing
-                // the full set could remove reservations a pre-existing
-                // consumer with the same id legitimately owns.
+                // failure, best-effort delete (1) the verifiable ordered-insert
+                // prefix and (2) vacant reservations this adoption attempt
+                // inserted before failing — never pre-existing same-owner
+                // adoptions. After a successful reserve (including same-owner
+                // adoption), later consumer-write rollback releases only that
+                // newly-inserted set — never adopted docs of unknown provenance.
+                let mut newly_inserted_identity_docs: Vec<Document> = Vec::new();
                 if let Err(err) = self
                     .consumer_identity_index()
                     .insert_many(identity_docs.clone())
                     .await
                 {
-                    if let Some(inserted) = Self::ordered_insert_inserted_prefix_len(&err) {
-                        self.release_consumer_identity_docs_best_effort(&identity_docs[..inserted])
-                            .await;
-                    } else {
-                        warn!(
-                            "Retaining MongoDB batch consumer identity reservations because the \
-                             failed ordered insert did not report a verifiable write-error index"
+                    if is_duplicate_key(&err) {
+                        // Same-owner adoption across the batch: every doc must
+                        // already be owned by its intended consumer_id (or be
+                        // insertable). Cross-owner conflict still fails after
+                        // releasing this call's ordered prefix plus vacant
+                        // adoption inserts committed before the conflict.
+                        let mut adopt_ok = true;
+                        let mut adopt_err: Option<anyhow::Error> = None;
+                        let mut ensured_new_docs: Vec<Document> = Vec::new();
+                        for doc in &identity_docs {
+                            let Ok(doc_id) = doc.get_str("_id") else {
+                                adopt_ok = false;
+                                adopt_err = Some(anyhow::anyhow!(
+                                    "batch consumer identity reservation missing _id"
+                                ));
+                                break;
+                            };
+                            let Ok(consumer_id) = doc.get_str("consumer_id") else {
+                                adopt_ok = false;
+                                adopt_err = Some(anyhow::anyhow!(
+                                    "batch consumer identity reservation '{}' missing consumer_id",
+                                    doc_id
+                                ));
+                                break;
+                            };
+                            let Ok(namespace) = doc.get_str("namespace") else {
+                                adopt_ok = false;
+                                adopt_err = Some(anyhow::anyhow!(
+                                    "batch consumer identity reservation '{}' missing namespace",
+                                    doc_id
+                                ));
+                                break;
+                            };
+                            let Ok(identity_value) = doc.get_str("identity_value") else {
+                                adopt_ok = false;
+                                adopt_err = Some(anyhow::anyhow!(
+                                    "batch consumer identity reservation '{}' missing identity_value",
+                                    doc_id
+                                ));
+                                break;
+                            };
+                            match self
+                                .ensure_consumer_identity_docs_owned(
+                                    namespace,
+                                    consumer_id,
+                                    &[identity_value.to_string()],
+                                )
+                                .await
+                            {
+                                Ok(newly) => {
+                                    if newly.iter().any(|value| value == identity_value) {
+                                        ensured_new_docs.push(doc.clone());
+                                    }
+                                }
+                                Err(e) => {
+                                    // Single-value ensure: any vacant insert
+                                    // committed inside this call before failure
+                                    // is still on e.newly_inserted.
+                                    for value in &e.newly_inserted {
+                                        if value == identity_value {
+                                            let already = ensured_new_docs.iter().any(|existing| {
+                                                existing.get_str("_id").ok()
+                                                    == doc.get_str("_id").ok()
+                                            });
+                                            if !already {
+                                                ensured_new_docs.push(doc.clone());
+                                            }
+                                        }
+                                    }
+                                    adopt_ok = false;
+                                    adopt_err = Some(e.into_source());
+                                    break;
+                                }
+                            }
+                        }
+                        if !adopt_ok {
+                            let inserted_prefix =
+                                Self::ordered_insert_inserted_prefix_len(&err);
+                            if inserted_prefix.is_none() {
+                                warn!(
+                                    "Retaining MongoDB batch consumer identity reservations because the \
+                                     failed ordered insert did not report a verifiable write-error index; \
+                                     still releasing vacant reservations inserted during this adoption \
+                                     attempt"
+                                );
+                            }
+                            let mut to_release: Vec<Document> =
+                                ordered_insert_newly_inserted_prefix(
+                                    &identity_docs,
+                                    inserted_prefix,
+                                )
+                                .to_vec();
+                            for doc in &ensured_new_docs {
+                                let already = to_release.iter().any(|existing| {
+                                    existing.get_str("_id").ok() == doc.get_str("_id").ok()
+                                });
+                                if !already {
+                                    to_release.push(doc.clone());
+                                }
+                            }
+                            self.release_consumer_identity_docs_best_effort(&to_release)
+                                .await;
+                            return Err(adopt_err.unwrap_or_else(|| err.into()));
+                        }
+                        let inserted_prefix = Self::ordered_insert_inserted_prefix_len(&err);
+                        newly_inserted_identity_docs.extend(
+                            ordered_insert_newly_inserted_prefix(&identity_docs, inserted_prefix)
+                                .iter()
+                                .cloned(),
                         );
+                        if inserted_prefix.is_none() {
+                            warn!(
+                                "Retaining MongoDB batch consumer identity reservations that may have \
+                                 been inserted by a failed ordered insert without a verifiable \
+                                 write-error index; rollback will only release values newly inserted \
+                                 during same-owner adoption"
+                            );
+                        }
+                        for doc in ensured_new_docs {
+                            let already = newly_inserted_identity_docs.iter().any(|existing| {
+                                existing.get_str("_id").ok() == doc.get_str("_id").ok()
+                            });
+                            if !already {
+                                newly_inserted_identity_docs.push(doc);
+                            }
+                        }
+                    } else {
+                        if let Some(inserted) = Self::ordered_insert_inserted_prefix_len(&err) {
+                            self.release_consumer_identity_docs_best_effort(
+                                &identity_docs[..inserted],
+                            )
+                            .await;
+                        } else {
+                            warn!(
+                                "Retaining MongoDB batch consumer identity reservations because the \
+                                 failed ordered insert did not report a verifiable write-error index"
+                            );
+                        }
+                        return Err(err.into());
                     }
-                    return Err(err.into());
+                } else {
+                    newly_inserted_identity_docs = identity_docs.clone();
                 }
                 // Composite `_id`s ("{namespace}:{id}") for document-level
                 // rollback; change-log records keep the plain resource ids.
@@ -7821,7 +8398,7 @@ mod inner {
                             )
                             .await;
                         self.release_confirmed_batch_consumer_identity_docs_best_effort(
-                            consumers,
+                            &newly_inserted_identity_docs,
                             &confirmed_absent,
                         )
                         .await;
@@ -7842,7 +8419,7 @@ mod inner {
                         .rollback_standalone_created_documents("consumers", "consumer", &ids, &err)
                         .await;
                     self.release_confirmed_batch_consumer_identity_docs_best_effort(
-                        consumers,
+                        &newly_inserted_identity_docs,
                         &confirmed_absent,
                     )
                     .await;
@@ -8670,6 +9247,15 @@ mod inner {
                 self.consumer_identity_index()
                     .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
                     .await?;
+
+                // Intentionally no automatic orphan reconcile of
+                // `consumer_identity_index` against `consumers`. Point-read
+                // consumer absence is not a uniqueness proof across serving
+                // nodes (migration lease ≠ CRUD lock); reclaiming a live
+                // reserve-first create would drop the durable uniqueness
+                // guard. Crash orphans stay locked until same-owner E11000
+                // adoption heals a retry of the same consumer id, or an
+                // operator removes the reservation manually.
 
                 // The guard collections are keyed purely by `_id`
                 // (`{namespace}:{route_key_hash}`, `{namespace}:{upstream_id}`,
@@ -9572,12 +10158,26 @@ mod inner {
             {
                 // Only update metadata fields on the spec doc.
                 Self::run_mtls_dns_mutations(&mut mtls_leases, async {
-                    self.api_specs()
+                    let replace_result = self
+                        .api_specs()
                         .replace_one(
                             doc! { "_id": &spec.id, "namespace": &spec.namespace },
                             spec_doc_check,
                         )
                         .await?;
+                    // `replace_one` (no upsert) on the unique `{_id, namespace}`
+                    // filter matches 0 or 1 doc. Zero means the spec was deleted
+                    // (or the namespace predicate missed) between the hash check
+                    // and this guarded write — never report that as a success.
+                    if replace_result.matched_count != 1 {
+                        anyhow::bail!(
+                            "API spec document not found for id '{}' in namespace '{}' during \
+                             metadata-only replace (matched_count={})",
+                            spec.id,
+                            spec.namespace,
+                            replace_result.matched_count
+                        );
+                    }
                     Ok(())
                 })
                 .await?;
@@ -11037,12 +11637,13 @@ mod inner {
         /// transactions are available. Without a replica set, MongoDB does not
         /// support transactions (server-side error on `start_transaction`).
         ///
-        /// Detection is env-var-based only (`FERRUM_MONGO_REPLICA_SET`).  A
-        /// user pointing at an actual replica set without setting the env var
-        /// silently falls into the compensating-delete path.  A startup
-        /// `hello` probe could detect the mismatch and warn, but the env var
-        /// is the documented contract and false-negative is safe (just slower
-        /// and less atomic).
+        /// Detection reads the effective `ClientOptions::repl_set_name`, which
+        /// `ClientOptions::parse` populates from a URI `?replicaSet=...` option
+        /// as well as from the `FERRUM_MONGO_REPLICA_SET` env var (applied as
+        /// an override at `build_connection_bundle`). A user pointing at an
+        /// actual replica set with `?replicaSet=rs0` in the URI is therefore
+        /// recognized even without setting the env var, so transactions are
+        /// not silently downgraded to the compensating-delete path.
         fn replica_set_configured(&self) -> bool {
             self.replica_set_configured.load(Ordering::Acquire)
         }
@@ -12177,8 +12778,8 @@ mod inner {
                 app_name: None,
                 replica_set: None,
                 auth_mechanism: None,
-                server_selection_timeout_secs: 1,
-                connect_timeout_secs: 1,
+                server_selection_timeout_secs: Some(1),
+                connect_timeout_secs: Some(1),
                 tls_enabled: false,
                 tls_ca_cert_path: None,
                 tls_client_cert_path: None,
@@ -13019,3 +13620,11 @@ mod inner {
 }
 
 pub use inner::MongoStore;
+// Narrow crate-internal test seams (exposed only through `_test_support`): the
+// timeout-precedence application and the identity reservation rollback/release
+// accounting. Everything else stays module-private in `inner`.
+#[allow(unused_imports)] // The binary target has no `_test_support` consumer.
+pub(crate) use inner::{
+    apply_mongo_timeout_overrides, consumer_identity_adoption_failure_release_values,
+    ordered_insert_newly_inserted_prefix,
+};

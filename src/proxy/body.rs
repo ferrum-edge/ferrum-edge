@@ -66,6 +66,12 @@ pub struct ProxyBody {
     /// terminal deadline frame (or abort after partial DATA). Deferred backend
     /// accounting uses this signal to keep a client-chosen expiry neutral.
     client_grpc_deadline_fired: Option<Arc<AtomicBool>>,
+    /// Set by the streaming gRPC-Web adapter immediately before it yields the
+    /// terminal body-framed trailer. The outer body uses this to finish
+    /// deferred logging and backend outcome classification with the real gRPC
+    /// status even though the downstream frame is DATA rather than native HTTP
+    /// trailers.
+    grpc_web_terminal_status: Option<Arc<AtomicU64>>,
     /// Deferred logger that fires after body completion, allowing
     /// `TransactionSummary.body_completed` / `body_error_class` /
     /// `client_disconnected` / `bytes_streamed` to reflect the
@@ -366,6 +372,130 @@ impl http_body::Body for BufferedGrpcBody {
     }
 }
 
+const GRPC_WEB_TERMINAL_STATUS_UNSET: u64 = u64::MAX;
+
+/// Incremental native-gRPC to gRPC-Web response adapter.
+///
+/// Native DATA is forwarded immediately (or independently base64-encoded in
+/// text mode). A native trailer frame is consumed and replaced by exactly one
+/// gRPC-Web trailer DATA frame. Clean EOF without trailers also emits one
+/// synthesized terminal frame, while backend errors propagate unchanged and
+/// never gain a false clean status.
+struct GrpcWebStreamingBody {
+    inner: ProxyBody,
+    text_mode: bool,
+    http_status: u16,
+    initial_terminal_metadata: Option<std::collections::HashMap<String, String>>,
+    terminal_status: Arc<AtomicU64>,
+    terminal_emitted: bool,
+    failed: bool,
+}
+
+impl GrpcWebStreamingBody {
+    fn terminal_data(
+        &mut self,
+        trailers: std::collections::HashMap<String, String>,
+    ) -> Frame<Bytes> {
+        let (data, grpc_status) = crate::plugins::grpc_web::build_streaming_trailer_data(
+            &trailers,
+            self.http_status,
+            self.text_mode,
+        );
+        self.terminal_status
+            .store(u64::from(grpc_status), Ordering::Release);
+        self.terminal_emitted = true;
+        Frame::data(data)
+    }
+}
+
+impl http_body::Body for GrpcWebStreamingBody {
+    type Data = Bytes;
+    type Error = ProxyBodyError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        if this.terminal_emitted || this.failed {
+            return Poll::Ready(None);
+        }
+
+        match Pin::new(&mut this.inner).poll_frame(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Some(Err(error))) => {
+                this.failed = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(Some(Ok(frame))) if frame.is_data() => {
+                let data = match frame.into_data() {
+                    Ok(data) => data,
+                    Err(_) => {
+                        this.failed = true;
+                        return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                            "gRPC-Web streaming adapter received an invalid DATA frame",
+                        )))));
+                    }
+                };
+                // An outer client-deadline wrapper may already have produced a
+                // body-framed gRPC-Web terminal status. Preserve it verbatim
+                // (especially text mode, which is already base64-encoded) and
+                // expose its status to the outer deferred logger.
+                let inner_deadline_fired = this
+                    .inner
+                    .client_grpc_deadline_fired
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Acquire));
+                if inner_deadline_fired {
+                    this.terminal_status.store(
+                        u64::from(crate::proxy::grpc_proxy::grpc_status::DEADLINE_EXCEEDED),
+                        Ordering::Release,
+                    );
+                    this.terminal_emitted = true;
+                    return Poll::Ready(Some(Ok(Frame::data(data))));
+                }
+                Poll::Ready(Some(Ok(Frame::data(
+                    crate::plugins::grpc_web::encode_streaming_data(data, this.text_mode),
+                ))))
+            }
+            Poll::Ready(Some(Ok(frame))) if frame.is_trailers() => {
+                let trailers = match frame.into_trailers() {
+                    Ok(trailers) => trailers,
+                    Err(_) => {
+                        this.failed = true;
+                        return Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                            "gRPC-Web streaming adapter received an invalid trailer frame",
+                        )))));
+                    }
+                };
+                let mut collected = std::collections::HashMap::new();
+                super::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
+                Poll::Ready(Some(Ok(this.terminal_data(collected))))
+            }
+            Poll::Ready(Some(Ok(_))) => {
+                this.failed = true;
+                Poll::Ready(Some(Err(Box::new(std::io::Error::other(
+                    "gRPC-Web streaming adapter received an unsupported frame",
+                )))))
+            }
+            Poll::Ready(None) => {
+                let trailers = this.initial_terminal_metadata.take().unwrap_or_default();
+                Poll::Ready(Some(Ok(this.terminal_data(trailers))))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.terminal_emitted || self.failed
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        // Text encoding and the terminal trailer frame make the final length
+        // unknown until the backend completes.
+        http_body::SizeHint::new()
+    }
+}
+
 /// Immediately-EOF body that never advertises an exact length.
 ///
 /// Used for HTTP 205 responses so Hyper does not synthesize
@@ -408,6 +538,7 @@ impl ProxyBody {
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
             client_grpc_deadline_fired: None,
+            grpc_web_terminal_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             success_on_drop_after_bytes: None,
@@ -433,6 +564,7 @@ impl ProxyBody {
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
             client_grpc_deadline_fired: None,
+            grpc_web_terminal_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             success_on_drop_after_bytes: None,
@@ -463,6 +595,45 @@ impl ProxyBody {
     /// is empty.
     pub(crate) fn buffered_grpc_with_trailers(data: impl Into<Bytes>, trailers: HeaderMap) -> Self {
         Self::streaming(Box::pin(BufferedGrpcBody::new(data.into(), trailers)))
+    }
+
+    /// Translate a live native-gRPC body into an incremental gRPC-Web body.
+    ///
+    /// Backend-connection and request-lifetime guards remain on the inner body.
+    /// Admission/dispatch outcome classifiers and client-visible logging move
+    /// to the returned outer body, where the body-framed terminal status can
+    /// classify synthesized missing-trailer errors and encoded deadlines while
+    /// text expansion and terminal DATA bytes are counted exactly once.
+    pub(crate) fn into_grpc_web_streaming(
+        self,
+        content_type: &str,
+        http_status: u16,
+        initial_terminal_metadata: Option<std::collections::HashMap<String, String>>,
+    ) -> Self {
+        let mut inner = self;
+        let client_grpc_deadline_fired = inner.client_grpc_deadline_fired.clone();
+        let logger = inner.logger.take();
+        let backend_admission_permits = inner._backend_admission_permits.take();
+        let backend_admission_outcome = inner.backend_admission_outcome.take();
+        let backend_dispatch_outcome = inner.backend_dispatch_outcome.take();
+        let terminal_status = Arc::new(AtomicU64::new(GRPC_WEB_TERMINAL_STATUS_UNSET));
+        let adapter = GrpcWebStreamingBody {
+            inner,
+            text_mode: crate::plugins::grpc_web::is_grpc_web_text(content_type),
+            http_status,
+            initial_terminal_metadata,
+            terminal_status: Arc::clone(&terminal_status),
+            terminal_emitted: false,
+            failed: false,
+        };
+        let mut body = Self::streaming(Box::pin(adapter));
+        body._backend_admission_permits = backend_admission_permits;
+        body.backend_admission_outcome = backend_admission_outcome;
+        body.backend_dispatch_outcome = backend_dispatch_outcome;
+        body.client_grpc_deadline_fired = client_grpc_deadline_fired;
+        body.grpc_web_terminal_status = Some(terminal_status);
+        body.logger = logger;
+        body
     }
 
     /// Attach a [`RequestGuard`] to this body so the `active_requests`
@@ -756,6 +927,7 @@ impl ProxyBody {
             backend_admission_outcome: None,
             backend_dispatch_outcome: None,
             client_grpc_deadline_fired: None,
+            grpc_web_terminal_status: None,
             logger: None,
             bytes_streamed: AtomicU64::new(0),
             success_on_drop_after_bytes: None,
@@ -973,6 +1145,12 @@ impl http_body::Body for ProxyBody {
             .client_grpc_deadline_fired
             .as_ref()
             .is_some_and(|flag| flag.load(Ordering::Acquire));
+        let grpc_web_terminal_status = this
+            .grpc_web_terminal_status
+            .as_ref()
+            .map(|status| status.load(Ordering::Acquire))
+            .filter(|status| *status != GRPC_WEB_TERMINAL_STATUS_UNSET)
+            .map(|status| status as u32);
 
         // Fast path: when no deferred logger is attached, the byte counter
         // has no consumer — skip the atomic fetch_add entirely. The vast
@@ -997,6 +1175,8 @@ impl http_body::Body for ProxyBody {
                 // uniquely identifies the successful terminal deadline frame.
                 let is_grpc_web_deadline_terminal =
                     client_deadline_fired && frame.data_ref().is_some();
+                let is_grpc_web_streaming_terminal =
+                    grpc_web_terminal_status.is_some() && frame.data_ref().is_some();
                 let grpc_status = frame
                     .trailers_ref()
                     .and_then(|trailers| trailers.get("grpc-status"))
@@ -1004,17 +1184,13 @@ impl http_body::Body for ProxyBody {
                         value.to_str().map_or(u32::MAX, |value| {
                             crate::proxy::grpc_proxy::parse_grpc_status_value(value)
                         })
-                    });
+                    })
+                    .or(grpc_web_terminal_status);
                 // gRPC streaming: the response can finish HTTP 200 while the real
                 // outcome rides in the grpc-status trailer. Capture a non-OK status
                 // once and feed both deferred admission and backend dispatch
                 // accounting from the same mapped value.
-                if let Some(trailers) = frame.trailers_ref()
-                    && let Some(code) = trailers.get("grpc-status").map(|value| {
-                        value.to_str().map_or(u32::MAX, |value| {
-                            crate::proxy::grpc_proxy::parse_grpc_status_value(value)
-                        })
-                    })
+                if let Some(code) = grpc_status
                     && code != 0
                 {
                     let status = crate::proxy::grpc_proxy::grpc_status_to_http_status(code);
@@ -1029,7 +1205,7 @@ impl http_body::Body for ProxyBody {
                         outcome.grpc_trailer_http_status = Some(status);
                     }
                 }
-                if is_trailers || is_grpc_web_deadline_terminal {
+                if is_trailers || is_grpc_web_deadline_terminal || is_grpc_web_streaming_terminal {
                     if let Some(logger) = this.logger.take() {
                         let bytes = this.bytes_streamed.load(Ordering::Relaxed);
                         let terminal_grpc_status = if is_grpc_web_deadline_terminal {

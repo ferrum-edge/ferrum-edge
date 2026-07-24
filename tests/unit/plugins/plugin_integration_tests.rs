@@ -345,7 +345,7 @@ async fn test_plugin_creation_all_plugins() {
             }),
             // ai_transcript_audit requires an HTTP sink endpoint.
             "ai_transcript_audit" => json!({
-                "sink": {"endpoint_url": "http://localhost:9200/audit"}
+                "sink": {"endpoint_url": "https://localhost:9200/audit"}
             }),
             "ldap_auth" => json!({
                 "ldap_url": "ldaps://ldap.example.com:636",

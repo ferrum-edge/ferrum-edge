@@ -1120,11 +1120,11 @@ fn example_audit_plugin_mysql_overrides_rebuild_exact_indexes() {
         !mysql.to_ascii_uppercase().contains("IF NOT EXISTS IDX_"),
         "MySQL index DDL must not rely on IF NOT EXISTS"
     );
-    let statements: Vec<_> = mysql
-        .split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-        .collect();
+    let statements: Vec<_> =
+        ferrum_edge::config::migrations::split_plugin_migration_statements(mysql, "mysql")
+            .expect("example MySQL override must parse")
+            .into_iter()
+            .collect();
     for (drop, create) in [
         (
             "DROP INDEX idx_example_audit_log_timestamp ON example_audit_log",
@@ -1148,11 +1148,9 @@ fn example_audit_plugin_mysql_overrides_rebuild_exact_indexes() {
 
     let v4 = example.iter().find(|m| m.version == 4).expect("v4");
     let mysql_v4 = v4.sql_mysql.expect("mysql v4 override");
-    let v4_statements: Vec<_> = mysql_v4
-        .split(';')
-        .map(str::trim)
-        .filter(|statement| !statement.is_empty())
-        .collect();
+    let v4_statements: Vec<_> =
+        ferrum_edge::config::migrations::split_plugin_migration_statements(mysql_v4, "mysql")
+            .expect("example MySQL v4 override must parse");
     assert_eq!(
         v4_statements,
         [

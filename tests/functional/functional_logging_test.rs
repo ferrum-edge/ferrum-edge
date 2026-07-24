@@ -475,7 +475,8 @@ async fn test_logging_transaction_summary_on_proxied_request() {
         backend_ttfb > 0.0,
         "latency_backend_ttfb_ms should be positive"
     );
-    // backend_total_ms is -1.0 for streamed responses (body still in-flight at log time)
+    // backend_total_ms is -1.0 for streamed responses (unknown concurrent
+    // backend-body / client-delivery lifetime; gateway fields share that sentinel)
     let backend_total = get_log["latency_backend_total_ms"].as_f64().unwrap();
     let is_streaming = get_log
         .get("response_streamed")
@@ -485,6 +486,16 @@ async fn test_logging_transaction_summary_on_proxied_request() {
         assert_eq!(
             backend_total, -1.0,
             "backend_total_ms should be -1.0 for streaming responses"
+        );
+        assert_eq!(
+            get_log["latency_gateway_overhead_ms"].as_f64().unwrap(),
+            -1.0,
+            "gateway overhead must stay unknown when backend total is unknown"
+        );
+        assert_eq!(
+            get_log["latency_gateway_processing_ms"].as_f64().unwrap(),
+            -1.0,
+            "gateway processing must stay unknown when backend total is unknown"
         );
     } else {
         assert!(

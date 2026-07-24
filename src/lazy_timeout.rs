@@ -9,6 +9,7 @@
 //! Other benchmarkes it delivered a 27x
 //! speedup over tokio timeouts by combining lazy init with timer coalescing.
 
+use pin_project_lite::pin_project;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -31,47 +32,49 @@ impl std::error::Error for LazyTimeoutError {}
 /// The timer is only created when the inner future first returns `Pending`.
 /// If the inner future completes immediately (common for buffered I/O reads),
 /// no timer is ever allocated.
+///
+/// Poll ordering matches [`tokio::time::timeout`]: the inner future is always
+/// polled before the deadline, so simultaneous readiness favors completion.
 pub fn lazy_timeout<F: Future>(duration: Duration, future: F) -> LazyTimeout<F> {
     LazyTimeout {
-        future: Box::pin(future),
+        future,
         duration,
         sleep: None,
     }
 }
 
-/// Lazy timeout future. See [`lazy_timeout`] for details.
-pub struct LazyTimeout<F: Future> {
-    future: Pin<Box<F>>,
-    duration: Duration,
-    sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+// `Sleep` is `!Unpin`. Storing it as `Option<Sleep>` would poison
+// pin-project's generated `Unpin` impl (see `tests/scaffolding/network/latency.rs`).
+// `Pin<Box<Sleep>>` stays `Unpin` and is allocated only once the timer arms.
+type BoxedSleep = Pin<Box<tokio::time::Sleep>>;
+
+pin_project! {
+    /// Lazy timeout future. See [`lazy_timeout`] for details.
+    pub struct LazyTimeout<F: Future> {
+        #[pin]
+        future: F,
+        duration: Duration,
+        sleep: Option<BoxedSleep>,
+    }
 }
 
 impl<F: Future> Future for LazyTimeout<F> {
     type Output = Result<F::Output, LazyTimeoutError>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if let Some(sleep) = self.sleep.as_mut() {
-            if sleep.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Err(LazyTimeoutError));
-            }
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
 
-            if let Poll::Ready(v) = self.future.as_mut().poll(cx) {
-                return Poll::Ready(Ok(v));
-            }
-
-            return Poll::Pending;
-        }
-
-        // Always try the inner future first (fast path -- no timer allocated)
-        if let Poll::Ready(v) = self.future.as_mut().poll(cx) {
+        // Always poll the inner future first (fast path + tokio timeout parity).
+        if let Poll::Ready(v) = this.future.poll(cx) {
             return Poll::Ready(Ok(v));
         }
 
-        // Inner future is Pending -- create timeout timer if not yet initialized
-        self.sleep = Some(Box::pin(tokio::time::sleep(self.duration)));
+        // Inner future is Pending — create the timeout timer once.
+        if this.sleep.is_none() {
+            *this.sleep = Some(Box::pin(tokio::time::sleep(*this.duration)));
+        }
 
-        // Check the timeout timer
-        if let Some(sleep) = self.sleep.as_mut()
+        if let Some(sleep) = this.sleep.as_mut()
             && sleep.as_mut().poll(cx).is_ready()
         {
             return Poll::Ready(Err(LazyTimeoutError));

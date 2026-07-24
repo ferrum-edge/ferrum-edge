@@ -50,6 +50,7 @@ fn content_decoding_borrows_when_no_transform_is_required() {
         max_decoded_bytes: 4 * 1024 * 1024,
         max_cumulative_bytes: 8 * 1024 * 1024,
         max_codings: 4,
+        max_amplification_ratio: 0,
     };
     for header in [None, Some("identity")] {
         let decoded = decode_content_encoding(header, body, limits).unwrap();

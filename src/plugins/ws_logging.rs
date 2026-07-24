@@ -42,12 +42,13 @@ use super::utils::log_schema::{
 };
 use super::utils::{
     BatchConfigDefaults, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS, MAX_BATCH_SIZE,
-    MAX_BUFFER_CAPACITY, PluginHttpClient, validate_batch_config, wait_until_committed,
+    MAX_BUFFER_CAPACITY, PluginHttpClient, validate_batch_config, wait_until_committed_or_closed,
 };
 use super::{
     ALL_PROTOCOLS, Direction, Plugin, ProxyProtocol, StreamTransactionSummary, TransactionSummary,
     WsDisconnectContext,
 };
+use crate::observability_delivery::DeliveryWorkerControl;
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
 
 /// Default / hard maxima for per-entry serialization and aggregate queued,
@@ -427,6 +428,8 @@ pub struct WsLogging {
     buffer_capacity: usize,
     pending_config: Mutex<Option<WsConfig>>,
     sender: OnceLock<mpsc::Sender<QueuedEntry>>,
+    worker: OnceLock<Arc<DeliveryWorkerControl>>,
+    outstanding_count: Arc<AtomicUsize>,
     /// Releases the staged flush/connect loop after PluginCache publication.
     commit_tx: OnceLock<watch::Sender<bool>>,
     start_lock: Mutex<()>,
@@ -610,6 +613,8 @@ impl WsLogging {
             buffer_capacity,
             pending_config: Mutex::new(Some(ws_config)),
             sender: OnceLock::new(),
+            worker: OnceLock::new(),
+            outstanding_count: Arc::new(AtomicUsize::new(0)),
             commit_tx: OnceLock::new(),
             start_lock: Mutex::new(()),
             schema,
@@ -623,6 +628,16 @@ impl WsLogging {
     where
         T: serde::Serialize,
     {
+        let Some(worker) = self.worker.get() else {
+            self.byte_budget
+                .record_drop("worker unavailable before start_background_tasks");
+            return;
+        };
+        let Some(_admission) = worker.try_admit() else {
+            self.byte_budget
+                .record_drop("worker unavailable during shutdown");
+            return;
+        };
         let Some(sender) = self.sender.get() else {
             self.byte_budget
                 .record_drop("worker unavailable before start_background_tasks");
@@ -632,9 +647,11 @@ impl WsLogging {
             self.byte_budget.record_drop("queue slot exhausted");
             return;
         };
+        self.outstanding_count.fetch_add(1, Ordering::Relaxed);
         let Some((json, lease)) =
             serialize_under_byte_budget(&self.byte_budget, self.max_entry_bytes, value, kind)
         else {
+            decrement_outstanding(&self.outstanding_count, 1);
             return;
         };
         permit.send(QueuedEntry {
@@ -664,6 +681,16 @@ impl WsLogging {
     fn queue_websocket(&self, ctx: &WsDisconnectContext) {
         // Slot first, then provisional aggregate bytes, then a borrowed
         // disconnect view (no deep clone of attacker-shaped strings/metadata).
+        let Some(worker) = self.worker.get() else {
+            self.byte_budget
+                .record_drop("worker unavailable before start_background_tasks");
+            return;
+        };
+        let Some(_admission) = worker.try_admit() else {
+            self.byte_budget
+                .record_drop("worker unavailable during shutdown");
+            return;
+        };
         let Some(sender) = self.sender.get() else {
             self.byte_budget
                 .record_drop("worker unavailable before start_background_tasks");
@@ -673,8 +700,10 @@ impl WsLogging {
             self.byte_budget.record_drop("queue slot exhausted");
             return;
         };
+        self.outstanding_count.fetch_add(1, Ordering::Relaxed);
         let provisional = retained_charge_for_serialized_len(self.max_entry_bytes);
         let Some(lease) = self.byte_budget.try_acquire(provisional) else {
+            decrement_outstanding(&self.outstanding_count, 1);
             return;
         };
         let entry = WsDisconnectLogEntry::from(ctx);
@@ -696,6 +725,7 @@ impl WsLogging {
             } else {
                 warn!("WebSocket logging: failed to serialize WebSocket disconnect entry: {error}");
             }
+            decrement_outstanding(&self.outstanding_count, 1);
             return;
         }
         let retained_bytes = retained_charge_for_serialized_len(writer.bytes.len());
@@ -706,6 +736,7 @@ impl WsLogging {
                 warn!(
                     "WebSocket logging: serialized WebSocket disconnect entry was not UTF-8: {error}"
                 );
+                decrement_outstanding(&self.outstanding_count, 1);
                 return;
             }
         };
@@ -905,6 +936,10 @@ impl Plugin for WsLogging {
 
         let (sender, receiver) = mpsc::channel(self.buffer_capacity);
         let (commit_tx, commit_rx) = watch::channel(false);
+        let pending_count = Arc::clone(&self.outstanding_count);
+        let (worker, close_rx) = DeliveryWorkerControl::new("ws_logging", move || {
+            pending_count.load(Ordering::Relaxed) as u64
+        });
         // Under start_lock both OnceLocks are empty; set the commit gate first
         // so a theoretical sender collision can still restore pending config.
         if self.commit_tx.set(commit_tx).is_err() {
@@ -924,10 +959,40 @@ impl Plugin for WsLogging {
                     .to_string(),
             );
         }
+        if self.worker.set(Arc::clone(&worker)).is_err() {
+            if let Ok(mut pending) = self.pending_config.lock() {
+                *pending = Some(ws_config);
+            }
+            worker.abort();
+            return Err(
+                "ws_logging: lifecycle worker already staged; refusing duplicate activation"
+                    .to_string(),
+            );
+        }
         // Sender is staged: Drop of WsLogging closes the channel / commit gate
         // and the flush loop exits without connect/flush side effects when
         // commit never ran. Config is intentionally consumed on success.
-        tokio::spawn(flush_loop(receiver, ws_config, commit_rx));
+        let completion = worker.completion();
+        let worker_drain_control = Arc::clone(&worker);
+        let outstanding_count = Arc::clone(&self.outstanding_count);
+        let task = tokio::spawn(async move {
+            let mut completion = completion;
+            flush_loop(
+                receiver,
+                ws_config,
+                commit_rx,
+                worker_drain_control,
+                close_rx,
+                outstanding_count,
+            )
+            .await;
+            completion.complete();
+        });
+        worker
+            .install_abort_handle(task.abort_handle())
+            .map_err(|error| format!("ws_logging: {error}"))?;
+        drop(task);
+        crate::observability_delivery::register_worker(worker);
         Ok(())
     }
 
@@ -961,6 +1026,23 @@ impl Plugin for WsLogging {
     }
 }
 
+impl Drop for WsLogging {
+    fn drop(&mut self) {
+        let committed = self
+            .commit_tx
+            .get()
+            .is_some_and(|commit_tx| *commit_tx.borrow());
+        let _ = self.sender.take();
+        if let Some(worker) = self.worker.get() {
+            if committed {
+                worker.close_admission();
+            } else {
+                worker.abort();
+            }
+        }
+    }
+}
+
 /// Background task that maintains a persistent WebSocket connection and
 /// flushes batched log entries as JSON text messages.
 ///
@@ -970,19 +1052,47 @@ async fn flush_loop(
     mut receiver: mpsc::Receiver<QueuedEntry>,
     cfg: WsConfig,
     commit_rx: watch::Receiver<bool>,
+    worker: Arc<DeliveryWorkerControl>,
+    mut close_rx: watch::Receiver<bool>,
+    outstanding_count: Arc<AtomicUsize>,
 ) {
-    if !wait_until_committed(commit_rx).await {
+    if !wait_until_committed_or_closed(commit_rx, close_rx.clone()).await {
         drop(receiver);
         return;
     }
 
     if cfg.endpoint_url.is_empty() {
-        while receiver.recv().await.is_some() {}
+        let mut closing = *close_rx.borrow();
+        if closing {
+            worker.wait_for_admissions().await;
+            receiver.close();
+        }
+        loop {
+            tokio::select! {
+                biased;
+                _ = close_rx.changed(), if !closing => {
+                    closing = true;
+                    worker.wait_for_admissions().await;
+                    receiver.close();
+                }
+                entry = receiver.recv() => {
+                    if entry.is_none() {
+                        break;
+                    }
+                    decrement_outstanding(&outstanding_count, 1);
+                }
+            }
+        }
         return;
     }
 
     let mut buffer: Vec<QueuedEntry> = Vec::with_capacity(cfg.batch_size);
     let mut timer = tokio::time::interval(cfg.flush_interval);
+    let mut closing = *close_rx.borrow();
+    if closing {
+        worker.wait_for_admissions().await;
+        receiver.close();
+    }
     timer.tick().await;
 
     // Lazily connect — the first flush attempt will establish the connection.
@@ -992,20 +1102,30 @@ async fn flush_loop(
         tokio::select! {
             biased;
 
+            _ = close_rx.changed(), if !closing => {
+                closing = true;
+                worker.wait_for_admissions().await;
+                receiver.close();
+            }
+
             msg = receiver.recv() => {
                 match msg {
                     Some(entry) => {
                         buffer.push(entry);
                         if buffer.len() >= cfg.batch_size {
                             let batch = std::mem::take(&mut buffer);
+                            let batch_len = batch.len();
                             ws_conn = send_batch(&cfg, batch, ws_conn).await;
+                            decrement_outstanding(&outstanding_count, batch_len);
                         }
                     }
                     None => {
                         // Channel closed — flush remaining entries and exit.
                         if !buffer.is_empty() {
                             let batch = std::mem::take(&mut buffer);
+                            let batch_len = batch.len();
                             let _ = send_batch(&cfg, batch, ws_conn).await;
+                            decrement_outstanding(&outstanding_count, batch_len);
                         }
                         break;
                     }
@@ -1015,7 +1135,9 @@ async fn flush_loop(
             _ = timer.tick() => {
                 if !buffer.is_empty() {
                     let batch = std::mem::take(&mut buffer);
+                    let batch_len = batch.len();
                     ws_conn = send_batch(&cfg, batch, ws_conn).await;
+                    decrement_outstanding(&outstanding_count, batch_len);
                 }
             }
 
@@ -1029,6 +1151,12 @@ async fn flush_loop(
             }
         }
     }
+}
+
+fn decrement_outstanding(outstanding_count: &AtomicUsize, count: usize) {
+    let _ = outstanding_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(count))
+    });
 }
 
 async fn wait_drain_done(conn: &Option<WsConnection>) {

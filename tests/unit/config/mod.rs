@@ -23,6 +23,7 @@ mod mesh_validation_tests;
 mod migration_runner_tests;
 mod mongo_store_tests;
 mod peer_auth_mtls_tests;
+mod plugin_migration_split_tests;
 mod plugin_migration_tests;
 mod pool_config_tests;
 mod separate_listeners_tests;

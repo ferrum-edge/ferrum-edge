@@ -33,13 +33,12 @@ use tokio::net::UdpSocket;
 use tokio::time::{Instant, timeout};
 use tracing::warn;
 
-use super::utils::log_schema::{
-    SchemaCapabilities, SummaryLogEntryBatchView, SummarySchema, resolve_schema,
-};
+use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema};
 use super::utils::{
-    BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, PluginHttpClient, SummaryLogEntry,
-    UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, parse_socket_host,
-    resolve_udp_endpoint, validate_batch_config,
+    BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, PluginHttpClient,
+    QueuedSummaryPayload, UDP_RE_RESOLVE_INTERVAL, admit_byte_limits, admit_http_summary,
+    admit_stream_summary, assemble_json_array, bind_connected_udp_socket, build_batch_config,
+    parse_socket_host, resolve_udp_endpoint, validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
@@ -53,6 +52,7 @@ use crate::util::unknown_keys::reject_unknown_keys;
 pub const UDP_LOGGING_CONFIG_KEYS: &[&str] = &[
     "batch_size",
     "buffer_capacity",
+    "buffer_max_bytes",
     "dtls",
     "dtls_ca_cert_path",
     "dtls_cert_path",
@@ -60,6 +60,7 @@ pub const UDP_LOGGING_CONFIG_KEYS: &[&str] = &[
     "dtls_no_verify",
     "flush_interval_ms",
     "host",
+    "max_entry_bytes",
     "max_retries",
     "port",
     "retry_delay_ms",
@@ -103,7 +104,6 @@ struct UdpFlushConfig {
     dtls_enabled: bool,
     dtls_material: Option<Arc<CachedDtlsMaterial>>,
     dns_cache: Option<DnsCache>,
-    schema: Option<Arc<SummarySchema>>,
     /// Test-only resolve override. Production construction leaves the slot
     /// empty; deterministic DNS-lifecycle tests may publish an address that
     /// the next resolve consumes exactly once.
@@ -126,8 +126,11 @@ struct UdpFlushState {
 pub struct UdpLogging {
     batch_config: BatchConfig,
     flush_config: UdpFlushConfig,
-    logger: DeferredBatchingLogger<SummaryLogEntry>,
+    logger: DeferredBatchingLogger<QueuedSummaryPayload>,
     endpoint_hostname: Option<String>,
+    schema: Option<Arc<SummarySchema>>,
+    byte_budget: Arc<ByteBudget>,
+    max_entry_bytes: usize,
     /// Shared with the flush worker; retained here so external unit tests can
     /// inspect/age DNS state. Binary target sees no readers.
     #[allow(dead_code)] // used only by tests/, dead code in the bin target
@@ -164,7 +167,6 @@ impl UdpLogging {
             dtls_enabled,
             dtls_material,
             dns_cache: http_client.dns_cache().cloned(),
-            schema,
             next_resolve_addr: Arc::clone(&next_resolve_addr),
             dtls_connect_timeout_ms: Arc::clone(&dtls_connect_timeout_ms),
         };
@@ -175,11 +177,15 @@ impl UdpLogging {
             sender_generation: 0,
         }));
 
+        let limits = admit_byte_limits(config, "udp_logging")?;
         Ok(Self {
             batch_config: build_batch_config(config, "udp_logging", batch_defaults)?,
             flush_config,
             logger: DeferredBatchingLogger::new(),
             endpoint_hostname: socket_host_warmup,
+            schema,
+            byte_budget: Arc::new(ByteBudget::new("udp_logging", limits.buffer_max_bytes)),
+            max_entry_bytes: limits.max_entry_bytes,
             flush_state,
             next_resolve_addr,
             dtls_connect_timeout_ms,
@@ -624,11 +630,23 @@ impl Plugin for UdpLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        self.logger.try_send(summary.into());
+        admit_stream_summary(
+            &self.logger,
+            &self.byte_budget,
+            self.max_entry_bytes,
+            summary,
+            self.schema.as_deref(),
+        );
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        self.logger.try_send(summary.into());
+        admit_http_summary(
+            &self.logger,
+            &self.byte_budget,
+            self.max_entry_bytes,
+            summary,
+            self.schema.as_deref(),
+        );
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -818,7 +836,7 @@ async fn build_sender_for_addr(
 async fn send_batch(
     cfg: &UdpFlushConfig,
     state: &Mutex<UdpFlushState>,
-    batch: Vec<SummaryLogEntry>,
+    batch: Vec<QueuedSummaryPayload>,
 ) -> Result<(), String> {
     if batch.is_empty() {
         return Ok(());
@@ -955,28 +973,16 @@ fn oversized_dtls_batch_error(max_plaintext: usize, got: usize) -> String {
     )
 }
 
-fn serialize_batch_payload(
-    batch: &[SummaryLogEntry],
-    schema: Option<&SummarySchema>,
-) -> Result<Vec<u8>, UdpDeliveryError> {
-    let view = SummaryLogEntryBatchView {
-        entries: batch,
-        schema,
-    };
-    match serde_json::to_vec(&view) {
-        Ok(payload) => Ok(payload),
-        Err(error) => Err(UdpDeliveryError::local(format!(
-            "udp_logging: failed to serialize batch: {error}"
-        ))),
-    }
+fn serialize_batch_payload(batch: &[QueuedSummaryPayload]) -> Vec<u8> {
+    assemble_json_array(batch).into_bytes()
 }
 
 #[allow(dead_code)] // used via library `_test_support`; dead in the bin target
 pub(crate) fn classify_serialized_dtls_batch_for_test(
-    batch: &[SummaryLogEntry],
+    batch: &[QueuedSummaryPayload],
     max_plaintext: usize,
 ) -> Result<(DtlsBatchSizeDecision, usize), String> {
-    let payload = serialize_batch_payload(batch, None).map_err(UdpDeliveryError::into_message)?;
+    let payload = serialize_batch_payload(batch);
     let decision = classify_dtls_batch_size(true, payload.len(), batch.len(), max_plaintext);
     Ok((decision, payload.len()))
 }
@@ -984,9 +990,9 @@ pub(crate) fn classify_serialized_dtls_batch_for_test(
 async fn deliver_batch(
     cfg: &UdpFlushConfig,
     sender: &UdpSender,
-    batch: &[SummaryLogEntry],
+    batch: &[QueuedSummaryPayload],
 ) -> Result<(), UdpDeliveryError> {
-    let payload = serialize_batch_payload(batch, cfg.schema.as_deref())?;
+    let payload = serialize_batch_payload(batch);
 
     let max_plaintext = crate::dtls::max_plaintext_bytes();
     match classify_dtls_batch_size(cfg.dtls_enabled, payload.len(), batch.len(), max_plaintext) {
@@ -999,6 +1005,9 @@ async fn deliver_batch(
             // so one oversized record cannot erase co-batched siblings. Oversized
             // singles are discarded with an explicit warning; other local delivery
             // failures still propagate into retry/final-loss.
+            // Release the superseded contiguous batch before assembling each
+            // single-entry payload so the two-copy byte accounting remains exact.
+            drop(payload);
             for entry in batch {
                 match deliver_one_entry(cfg, sender, entry).await {
                     Ok(()) => {}
@@ -1019,9 +1028,9 @@ async fn deliver_batch(
 async fn deliver_one_entry(
     cfg: &UdpFlushConfig,
     sender: &UdpSender,
-    entry: &SummaryLogEntry,
+    entry: &QueuedSummaryPayload,
 ) -> Result<(), UdpDeliveryError> {
-    let payload = serialize_batch_payload(std::slice::from_ref(entry), cfg.schema.as_deref())?;
+    let payload = serialize_batch_payload(std::slice::from_ref(entry));
 
     let max_plaintext = crate::dtls::max_plaintext_bytes();
     match classify_dtls_batch_size(cfg.dtls_enabled, payload.len(), 1, max_plaintext) {

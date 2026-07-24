@@ -712,6 +712,11 @@ impl Plugin for ResponseTransformer {
         super::HTTP_GRPC_PROTOCOLS
     }
 
+    fn requires_buffered_grpc_web_trailer_policy(&self, ctx: &RequestContext) -> bool {
+        self.rules_enabled()
+            && (!self.header_rules.is_empty() || ctx.route_override_response_transform.is_some())
+    }
+
     fn requires_response_body_buffering(&self) -> bool {
         !self.body_rules.is_empty()
     }

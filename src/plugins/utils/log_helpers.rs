@@ -4,8 +4,6 @@ use http::header::{HeaderName, HeaderValue};
 use serde_json::Value;
 use url::{Host, Url};
 
-use crate::plugins::{StreamTransactionSummary, TransactionSummary};
-
 use super::response_body::{BoundedReadError, measure_response_body_bounded};
 use super::{
     BatchConfig, MAX_BATCH_FLUSH_INTERVAL_MS, MAX_BATCH_RETRIES, MAX_BATCH_RETRY_DELAY_MS,
@@ -108,25 +106,6 @@ pub struct BatchConfigDefaults {
     /// require at least `1` so a configured delay cannot silently become a
     /// busy-loop.
     pub min_retry_delay_ms: u64,
-}
-
-#[derive(Clone, serde::Serialize)]
-#[serde(untagged)]
-pub enum SummaryLogEntry {
-    Http(TransactionSummary),
-    Stream(StreamTransactionSummary),
-}
-
-impl From<&TransactionSummary> for SummaryLogEntry {
-    fn from(summary: &TransactionSummary) -> Self {
-        Self::Http(summary.clone())
-    }
-}
-
-impl From<&StreamTransactionSummary> for SummaryLogEntry {
-    fn from(summary: &StreamTransactionSummary) -> Self {
-        Self::Stream(summary.clone())
-    }
 }
 
 /// Admit one optional unsigned integer config field.

@@ -1595,7 +1595,10 @@ fn plugin_config_fixture(plugin_name: &str, dispatch_upstream_id: &str) -> Value
             "tools": { "github.create_pr": { "action": "allow" } }
         }),
         "ai_transcript_audit" => json!({
-            "sink": {"endpoint_url": "http://localhost:9200/audit"}
+            "sink": {
+                "endpoint_url": "http://localhost:9200/audit",
+                "allow_insecure_loopback": true
+            }
         }),
         "ai_federation" => {
             json!({"providers": [{"name": "test", "provider_type": "openai", "api_key": "sk-test"}]})

@@ -3372,3 +3372,45 @@ fn deadline_bound_grpc_web_pass_through_never_selects_native_backend_h3() {
         .expect("bounded retry target capability refresh");
     assert!(retry_rotation.contains("current_dispatch_h3 = !deadline_bound_grpc_web_pass_through"));
 }
+
+#[test]
+fn streaming_grpc_web_adapters_honor_preserved_response_statuses() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+
+    let direct = source
+        .split("let grpc_web_streaming_content_type = grpc_web_response_content_type")
+        .nth(1)
+        .expect("direct streaming gRPC-Web translation gate")
+        .split("// Build the response with the live Incoming body")
+        .next()
+        .expect("bounded direct streaming response preparation");
+    let direct_gate = direct
+        .find("response_body_rewrite_allowed(grpc_streaming.status)")
+        .expect("direct streaming adapter must honor preserved statuses");
+    let direct_terminal_take = direct
+        .find("take_streaming_initial_terminal_metadata(")
+        .expect("direct streaming terminal metadata extraction");
+    assert!(
+        direct_gate < direct_terminal_take,
+        "preserved statuses must bypass metadata extraction and representation rewriting"
+    );
+    assert!(direct.contains("if grpc_web_streaming_content_type.is_some()"));
+
+    let generic = source
+        .split("let grpc_web_streaming_adapter = if body_will_stream")
+        .nth(1)
+        .expect("generic streaming gRPC-Web translation gate")
+        .split("// Build final response")
+        .next()
+        .expect("bounded generic streaming response preparation");
+    let generic_gate = generic
+        .find("response_body_rewrite_allowed(response_status)")
+        .expect("generic streaming adapter must honor preserved statuses");
+    let generic_terminal_take = generic
+        .find("take_streaming_initial_terminal_metadata(")
+        .expect("generic streaming terminal metadata extraction");
+    assert!(
+        generic_gate < generic_terminal_take,
+        "generic preserved statuses must retain native headers and body framing"
+    );
+}

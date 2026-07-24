@@ -176,7 +176,7 @@ Built-in plugins with per-request refinement:
 
 | Plugin | Skips buffering when |
 |--------|---------------------|
-| `compression` | `Accept-Encoding` header is absent (nothing to compress) |
+| `compression` | The client's `Accept-Encoding` selects no supported nonzero coding — identity, unsupported-only, or all-`q=0` requests (nothing to compress) — or the request is `HEAD` / request `no-transform`. It also skips (streams identity) when `before_proxy` negotiated a supported coding but could not reserve bounded codec admission, or when `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` is unlimited (`0`) or above the fixed 32 MiB compression safety ceiling. The buffered population therefore never exceeds the codec semaphore, and every compression-induced full-body collection has an absolute per-response bound. |
 | `ai_token_metrics` | Request is native gRPC, or the client asked for a stream (`Accept: text/event-stream` / a `stream: true` request) without `buffer_streaming_responses: true` (pre-header); additionally, after headers, when the response content type is not JSON, or is `text/event-stream` without `buffer_streaming_responses: true` |
 | `ai_rate_limiter` | Never for active HTTP/gRPC responses; response usage reconciliation needs the body. Its pre-request reservation path only buffers request bodies for JSON `POST` requests. |
 | `ai_response_guard` | Never from request-side intent. An active guard buffers conservatively until pristine backend headers are known. A genuine backend event stream is then decided before header commit: enforcing/redacting/structural policies reject with 502 because they cannot inspect an unbounded stream completely, while a warn-only guard records the uninspectable stream and permits it. |

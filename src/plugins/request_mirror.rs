@@ -15,19 +15,55 @@
 //! mirror destination. The main request proceeds immediately — mirror latency
 //! has zero impact on client response time.
 //!
+//! Multiple independent `request_mirror` instances on one proxy each dispatch
+//! and each push their own result receiver onto a per-request collection. A
+//! later instance never overwrites an earlier one. Transaction logging emits
+//! one `mirror: true` summary per dispatched instance, attributable by plugin
+//! config id and query-stripped destination URL. Sampled-out work leaves no
+//! record; concurrency-limit rejection still publishes an explicit per-instance
+//! failure (preserving prior observability).
+//!
 //! Outbound mirror headers cross the same canonical secondary-request boundary
 //! as primary backend dispatch (Connection-listed hop-by-hop, Trailer, framing,
 //! Ferrum request-only markers, and proxy-owned `X-Forwarded-*`). Forwarding
-//! identity is stripped rather than regenerated. Client `Host` is omitted so
-//! authority comes from the mirror URL; native gRPC content-types re-synthesise
-//! `te: trailers` for HTTP/2-capable mirror targets. The request-target prefers
-//! the original raw query (after the same auth credential strips the primary
-//! backend uses) so duplicate keys, order, flags, `+`, percent escapes, and
-//! encoded bytes match the primary contract.
+//! identity is stripped rather than regenerated. Off-mesh mirrors omit client
+//! `Host` so authority comes from the mirror URL. When `mesh_route_dispatch`
+//! has already matched the request, the mirror instead applies Istio/Envoy
+//! shadow Host/:authority semantics: dial and validate the configured mirror
+//! destination, but set Host to a protocol-valid shadow authority — DNS
+//! hostnames receive a `-shadow` suffix before any port, while IPv4 and
+//! bracketed IPv6 literals keep their literal form (suffixing would yield an
+//! invalid Host). Cross-origin credential forwarding is deny-by-default: any
+//! header whose lowercased name is a built-in credential (`Authorization`,
+//! `Cookie`, `Proxy-Authorization`, `Proxy-Authenticate`, `WWW-Authenticate`,
+//! `X-Api-Key`, …),
+//! contains a built-in credential substring (so vendor variants like
+//! `x-openai-api-key`, `x-amz-security-token`, `x-vendor-auth-token` are also
+//! caught), or matches an operator `sensitive_header_patterns` entry is stripped
+//! before the distinct mirror origin. Because native gRPC metadata is carried as
+//! HTTP/2 headers, the same predicate covers gRPC credential metadata. Forwarding
+//! any denied header requires the high-friction, fail-closed pair
+//! `forward_sensitive_headers=true` plus an exact-name
+//! `forward_sensitive_header_allowlist`. Native gRPC content-types
+//! re-synthesise `te: trailers` for HTTP/2-capable mirror targets. Native gRPC
+//! mirrors dial through `PluginHttpClient::get_http2` (h2c prior knowledge for
+//! cleartext `http` targets, ALPN `h2` for `https`); ordinary HTTP mirrors keep
+//! the default all-version client so HTTP/1.1 destinations continue to work.
+//! The request-target prefers the original raw query (after the same auth
+//! credential strips the primary backend uses) so duplicate keys, order, flags,
+//! `+`, percent escapes, and encoded bytes match the primary contract.
+//!
+//! Path selection precedence when building the mirror URL:
+//! 1. explicit plugin `mirror_path` (operator override; wins)
+//! 2. else mesh `route_override_path` when set (final selected/rebased URI;
+//!    read without consuming the override primary dispatch still needs)
+//! 3. else the backend-effective authorized path when backend-path policy is
+//!    active
+//! 4. else the original request path
 //!
 //! The mirror request uses the gateway's shared `PluginHttpClient`, which means
-//! it inherits the gateway's DNS cache, connection pool keepalive, and TLS
-//! settings (CA bundle, skip-verify).
+//! it inherits the gateway's DNS cache, connection pool keepalive, TLS
+//! settings (CA bundle, skip-verify), egress screening, and redacted logging.
 //!
 //! ## Mirror response logging
 //!
@@ -38,8 +74,29 @@
 //! delaying the client response. The channel is seeded with a sanitized task
 //! failure fallback; concurrency drops are published as completed failures.
 //!
-//! Mirror timeout defaults to the proxy's `backend_read_timeout_ms`, ensuring
-//! shadow requests respect the same timeout budget as the real backend call.
+//! Alongside the per-event summary, each instance keeps bounded-lifetime
+//! `AtomicU64` counters (`MirrorMetrics`) for the mirror lifecycle — dispatched,
+//! completed, request/drain timeouts, request/drain failures, drain truncations,
+//! cancellations, and concurrency/byte-budget drops. A cancellation (runtime
+//! shutdown, panic, or future cancellation before a terminal outcome) is counted
+//! via a drop guard, so a stalled/cancelled mirror is never silently invisible.
+//! Counters are pure tallies (no header names, URLs, plugin IDs, or credential
+//! material) and dual-write into Ferrum's process-wide authenticated Prometheus
+//! registry (`ferrum_request_mirror_*_total`). Per-instance values reset on
+//! config reload; the Prometheus series remain monotonic for the process.
+//! Mirror *transaction summaries* stay excluded from request/billing histograms —
+//! that exclusion does not apply to these label-safe lifecycle counters.
+//!
+//! Mirror timeout prefers an optional plugin `mirror_timeout_ms`, else the
+//! matched proxy's `backend_read_timeout_ms` when positive, else a finite
+//! 60s default, always capped by a hard maximum. A zero primary
+//! `backend_read_timeout_ms` therefore never disables the mirror deadline.
+//! Mirror response bodies are always drained under `max_response_body_bytes`
+//! and a short drain timeout so HTTP/1.1 keep-alive pools can reclaim sockets
+//! even when `Content-Length` is advertised. Retained request bodies share
+//! `bytes::Bytes` with the primary buffer and are admitted under both
+//! `max_in_flight` and a per-instance `max_retained_request_body_bytes` budget;
+//! leases release when the detached task ends.
 //!
 //! ## Configuration
 //!
@@ -60,11 +117,16 @@
 //! | `mirror_host` | string | **(required)** | Hostname or IP of the mirror target |
 //! | `mirror_port` | u16 | 80 (http) / 443 (https) | Port of the mirror target |
 //! | `mirror_protocol` | string | `"http"` | `"http"` or `"https"` |
-//! | `mirror_path` | string | (none) | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, the backend-effective authorized path is used if backend-path policy is active; otherwise the original request path is used |
+//! | `mirror_path` | string | (none) | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, prefers the mesh route rewrite path when present; otherwise the backend-effective authorized path if backend-path policy is active; otherwise the original request path |
 //! | `percentage` | f64 | `100.0` | Percentage of requests to mirror (0.0–100.0). Deterministic evenly spaced sampling at 0.1% granularity (see sampling notes below) |
 //! | `mirror_request_body` | bool | `true` | Whether to include the request body in the mirror request |
-//! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes read from a mirror response when sizing it (only consulted when the response has no `content-length`). Streaming aborts as soon as the limit is crossed; mirror task discards the bytes after sizing. |
-//! | `max_in_flight` | u64 | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1). Requests that arrive while every permit is in use are still served normally but are not mirrored — saturation drops the new mirror attempt without affecting the primary request. |
+//! | `max_response_body_bytes` | u64 | `1048576` (1 MiB) | Cap on bytes drained from every mirror response (with or without `Content-Length`). Streaming aborts as soon as the limit is crossed; bytes are discarded after sizing so keep-alive pools can reclaim the socket. |
+//! | `max_in_flight` | u64 | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1, maximum 1048576). Requests that arrive while every permit is in use are still served normally but are not mirrored — saturation drops the new mirror attempt without affecting the primary request. Values above the cap are rejected at construction rather than panicking Tokio's semaphore. |
+//! | `max_retained_request_body_bytes` | u64 | `67108864` (64 MiB) | Aggregate retained request-body budget for in-flight mirrors on this instance. Shared `Bytes` bodies are charged once per task for their length; exhaustion drops the new mirror attempt without affecting the primary request. |
+//! | `mirror_timeout_ms` | u64 | (proxy / 60000) | Finite mirror request deadline in milliseconds (minimum 1, maximum 300000). When omitted, uses the matched proxy `backend_read_timeout_ms` when positive, otherwise 60000. Zero primary timeout never disables this deadline. |
+//! | `forward_sensitive_headers` | bool | `false` | Dangerous opt-in. When `true`, selected origin-bound credential headers may cross to the mirror origin, but only exact names listed in `forward_sensitive_header_allowlist` (fail-closed: both fields required together, allowlist must be non-empty). |
+//! | `forward_sensitive_header_allowlist` | string[] | `[]` | Lowercased exact allowlist of denied sensitive header names to forward when `forward_sensitive_headers` is `true`. Each entry must be a valid HTTP header name (≤256 chars) that the deny-by-default policy actually strips (a built-in credential or a `sensitive_header_patterns` match); at most 64 entries; non-sensitive names are rejected at construction. |
+//! | `sensitive_header_patterns` | string[] | `[]` | Additional lowercased substrings (matched against the header name; each ≤128 chars, at most 64 entries) that extend the built-in deny-by-default credential set. Covers HTTP headers and native gRPC metadata. |
 //!
 //! ## Percentage sampling
 //!
@@ -96,6 +158,7 @@
 //! panic, and cannot bias a complete sampling cycle.
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde_json::Value;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -117,16 +180,98 @@ use crate::proxy::headers::{
 };
 
 /// Default cap on the size of mirror response bodies the gateway is willing
-/// to read. The body is discarded — only its length is reported in mirror
+/// to drain. The body is discarded — only its length is reported in mirror
 /// metadata — so 1 MiB is plenty for the size-derivation use case while still
 /// protecting against a misbehaving mirror endpoint streaming an unbounded
 /// response over a fire-and-forget task.
 const DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_IN_FLIGHT_MIRRORS: usize = 256;
+/// Deployment-safe hard ceiling on `max_in_flight`. This is deliberately far
+/// below `tokio::sync::Semaphore::MAX_PERMITS` (`usize::MAX >> 3`): a config
+/// value between this cap and `MAX_PERMITS` still fits `usize` and passes the
+/// nonzero check, but would panic inside `Semaphore::new`. Rejecting above this
+/// bound turns an unreasonable value into an ordinary validation error instead
+/// of a process/admission crash. 2^20 concurrent detached mirror tasks per
+/// instance is already far beyond any real deployment.
+const MAX_MAX_IN_FLIGHT_MIRRORS: usize = 1 << 20;
+/// Per-instance retained request-body budget for detached mirror tasks.
+const DEFAULT_MAX_RETAINED_REQUEST_BODY_BYTES: u64 = 64 * 1024 * 1024;
+/// Finite mirror deadline when the proxy has no positive read timeout.
+const DEFAULT_MIRROR_TIMEOUT_MS: u64 = 60_000;
+/// Hard ceiling on every mirror request deadline (plugin or proxy derived).
+const MAX_MIRROR_TIMEOUT_MS: u64 = 300_000;
+/// Bound on post-header body discard so a slow CL body cannot pin the task
+/// for the full request budget after headers arrive.
+const MIRROR_RESPONSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const MIRROR_TASK_INCOMPLETE_ERROR: &str =
     "mirror task ended before publishing a result (cancelled or failed)";
 const MIRROR_CONCURRENCY_DROP_ERROR: &str =
     "mirror request dropped because max_in_flight limit was reached";
+const MIRROR_BODY_BUDGET_DROP_ERROR: &str =
+    "mirror request dropped because max_retained_request_body_bytes budget was exhausted";
+const MIRROR_DRAIN_TIMEOUT_ERROR: &str = "mirror response body drain timed out";
+const MIRROR_DRAIN_TRANSPORT_ERROR: &str = "mirror response body stream failed";
+
+/// Hard ceiling on operator `sensitive_header_patterns` entries so an admitted
+/// config cannot create unbounded per-request substring scans or retained
+/// config memory.
+const MAX_SENSITIVE_HEADER_PATTERNS: usize = 64;
+/// Maximum UTF-8 byte length of one `sensitive_header_patterns` entry.
+const MAX_SENSITIVE_HEADER_PATTERN_LEN: usize = 128;
+/// Hard ceiling on `forward_sensitive_header_allowlist` entries.
+const MAX_FORWARD_SENSITIVE_ALLOWLIST: usize = 64;
+/// Maximum UTF-8 byte length of one allowlist header name.
+const MAX_FORWARD_SENSITIVE_ALLOWLIST_ITEM_LEN: usize = 256;
+
+/// Well-known origin-bound credential / session header names stripped from
+/// cross-origin mirror requests unless an explicit fail-closed allowlist opts
+/// in. Most are also matched by [`MIRROR_SENSITIVE_HEADER_SUBSTRINGS`]; the
+/// exact list is retained as a self-documenting inventory of standard
+/// credentials (including challenge headers such as `WWW-Authenticate` /
+/// `Proxy-Authenticate` that may appear on secondary requests).
+const MIRROR_SENSITIVE_HEADER_NAMES: &[&str] = &[
+    "authorization",
+    "cookie",
+    "cookie2",
+    "proxy-authorization",
+    "proxy-authenticate",
+    "www-authenticate",
+    "x-api-key",
+    "x-auth-token",
+    "x-csrf-token",
+];
+
+/// Built-in credential/session substrings applied to lowercased header names so
+/// vendor-prefixed variants (`x-openai-api-key`, `x-amz-security-token`,
+/// `x-vendor-auth-token`) are stripped without an exact-name allowlist. Chosen
+/// to match credential families only: bare `token`/`key`/`session`/`auth`
+/// substrings are deliberately excluded because they also match benign headers
+/// such as pagination cursors (`x-continuation-token`). `authenticate` is
+/// included so `Proxy-Authenticate` / `WWW-Authenticate` variants are covered
+/// without a bare `auth` match. Operators extend this with
+/// `sensitive_header_patterns`. gRPC metadata is carried as HTTP/2 headers,
+/// so the same predicate covers native gRPC credential metadata.
+const MIRROR_SENSITIVE_HEADER_SUBSTRINGS: &[&str] = &[
+    "authorization",
+    "cookie",
+    "authenticate",
+    "api-key",
+    "apikey",
+    "api_key",
+    "auth-token",
+    "access-token",
+    "refresh-token",
+    "id-token",
+    "session-token",
+    "security-token",
+    "csrf",
+    "xsrf",
+    "bearer",
+    "password",
+    "passwd",
+    "secret",
+    "credential",
+];
 
 /// Sampling period for percentage decisions: threshold is tenths of a percent
 /// in `0..=SAMPLE_PERIOD`, so each complete cycle of `SAMPLE_PERIOD` requests
@@ -137,14 +282,411 @@ fn strip_query_params(url: &str) -> &str {
     url.split_once('?').map_or(url, |(base, _)| base)
 }
 
-fn mirror_failure_meta(target_url: String, error: &'static str) -> MirrorResponseMeta {
+fn mirror_failure_meta(
+    plugin_id: Option<String>,
+    target_url: String,
+    error: &'static str,
+) -> MirrorResponseMeta {
     MirrorResponseMeta {
+        mirror_plugin_id: plugin_id,
         mirror_target_url: target_url,
         mirror_response_status_code: None,
         mirror_response_size_bytes: None,
+        mirror_response_advertised_size_bytes: None,
         mirror_latency_ms: 0.0,
         mirror_error: Some(error.to_string()),
     }
+}
+
+fn is_numeric_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_port_suffix(rest: &str) -> bool {
+    matches!(rest.strip_prefix(':'), Some(port) if is_numeric_port(port))
+}
+
+/// Deny-by-default sensitivity test for a lowercased header name. A header is
+/// sensitive if it is a well-known credential name, contains a built-in
+/// credential substring, or contains any operator-configured
+/// `sensitive_header_patterns` substring.
+fn is_mirror_sensitive_header(name_lower: &str, operator_patterns: &[String]) -> bool {
+    MIRROR_SENSITIVE_HEADER_NAMES.contains(&name_lower)
+        || MIRROR_SENSITIVE_HEADER_SUBSTRINGS
+            .iter()
+            .any(|substr| name_lower.contains(substr))
+        || operator_patterns
+            .iter()
+            .any(|pattern| name_lower.contains(pattern.as_str()))
+}
+
+/// Append Envoy/Istio's `-shadow` suffix to a Host/:authority value when the
+/// host portion is a DNS name.
+///
+/// Matches Envoy's documented shadowing behavior for hostnames (`cluster1` →
+/// `cluster1-shadow`, `internal.example:8080` → `internal.example-shadow:8080`).
+/// IPv4 literals and bracketed IPv6 authorities (with or without a port) are
+/// left unchanged: appending `-shadow` after a closing bracket or onto a dotted
+/// quad produces a protocol-invalid Host. Malformed authorities are returned
+/// unchanged rather than rewritten into a different invalid form.
+pub(crate) fn append_shadow_host_suffix(authority: &str) -> String {
+    let authority = authority.trim();
+    if authority.is_empty() {
+        return String::new();
+    }
+
+    if authority.starts_with('[') {
+        let Some(close) = authority.find(']') else {
+            return authority.to_string();
+        };
+        let inner = &authority[1..close];
+        let rest = &authority[close + 1..];
+        if inner.parse::<std::net::Ipv6Addr>().is_ok() && (rest.is_empty() || is_port_suffix(rest))
+        {
+            // Bracketed IPv6 (+ optional port): keep a valid authority as-is.
+            return authority.to_string();
+        }
+        return authority.to_string();
+    }
+
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && !host.contains(':')
+        && is_numeric_port(port)
+    {
+        if host.parse::<std::net::Ipv4Addr>().is_ok() {
+            return authority.to_string();
+        }
+        let mut shadow = String::with_capacity(authority.len() + "-shadow".len());
+        shadow.push_str(host);
+        shadow.push_str("-shadow");
+        shadow.push(':');
+        shadow.push_str(port);
+        return shadow;
+    }
+
+    if authority.parse::<std::net::Ipv4Addr>().is_ok() {
+        return authority.to_string();
+    }
+    // Unbracketed IPv6 (or other multi-colon forms) cannot receive a DNS suffix
+    // without becoming an invalid authority.
+    if authority.bytes().filter(|b| *b == b':').count() >= 2 {
+        return authority.to_string();
+    }
+
+    let mut shadow = String::with_capacity(authority.len() + "-shadow".len());
+    shadow.push_str(authority);
+    shadow.push_str("-shadow");
+    shadow
+}
+
+/// Resolve the finite mirror request deadline in milliseconds.
+///
+/// Preference: explicit plugin `mirror_timeout_ms` → positive proxy
+/// `backend_read_timeout_ms` → [`DEFAULT_MIRROR_TIMEOUT_MS`]. Every path is
+/// clamped to [`MAX_MIRROR_TIMEOUT_MS`].
+pub(crate) fn resolve_mirror_timeout_ms(
+    configured_mirror_timeout_ms: Option<u64>,
+    backend_read_timeout_ms: Option<u64>,
+) -> u64 {
+    let raw = configured_mirror_timeout_ms
+        .or_else(|| backend_read_timeout_ms.filter(|ms| *ms > 0))
+        .unwrap_or(DEFAULT_MIRROR_TIMEOUT_MS);
+    raw.clamp(1, MAX_MIRROR_TIMEOUT_MS)
+}
+
+/// Strip origin-bound credentials before a distinct mirror origin. Deny by
+/// default: a sensitive header survives only when `forward_sensitive_headers`
+/// is set and the exact lowercased name is in the fail-closed allowlist.
+fn apply_mirror_credential_policy(
+    headers: &mut Vec<(String, String)>,
+    forward_sensitive_headers: bool,
+    allowlist: &[String],
+    operator_patterns: &[String],
+) {
+    headers.retain(|(name, _)| {
+        let lower = name.to_ascii_lowercase();
+        if !is_mirror_sensitive_header(&lower, operator_patterns) {
+            return true;
+        }
+        forward_sensitive_headers && allowlist.iter().any(|allowed| allowed == &lower)
+    });
+}
+
+#[derive(Debug)]
+struct MirrorBodyBudget {
+    used: AtomicU64,
+    max_bytes: u64,
+}
+
+impl MirrorBodyBudget {
+    fn new(max_bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            used: AtomicU64::new(0),
+            max_bytes,
+        })
+    }
+
+    fn try_retain(self: &Arc<Self>, bytes: Option<Bytes>) -> Option<RetainedMirrorBody> {
+        let reserved = bytes.as_ref().map_or(0, |body| body.len() as u64);
+        if reserved > 0 {
+            loop {
+                let current = self.used.load(Ordering::Relaxed);
+                if current.saturating_add(reserved) > self.max_bytes {
+                    return None;
+                }
+                if self
+                    .used
+                    .compare_exchange_weak(
+                        current,
+                        current + reserved,
+                        Ordering::SeqCst,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+        }
+        Some(RetainedMirrorBody {
+            bytes,
+            reserved,
+            budget: Arc::clone(self),
+        })
+    }
+
+    fn used_for_test(&self) -> u64 {
+        self.used.load(Ordering::Relaxed)
+    }
+}
+
+struct RetainedMirrorBody {
+    bytes: Option<Bytes>,
+    reserved: u64,
+    budget: Arc<MirrorBodyBudget>,
+}
+
+impl Drop for RetainedMirrorBody {
+    fn drop(&mut self) {
+        if self.reserved > 0 {
+            self.budget.used.fetch_sub(self.reserved, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Per-instance, bounded-lifetime mirror observability counters.
+///
+/// Lifetime is bounded to the plugin instance: a config reload rebuilds the
+/// plugin and resets every *per-instance* counter to zero (no unbounded growth,
+/// no cross-generation accumulation). Counts are aggregate outcome tallies only
+/// — they never carry header names, URLs, plugin IDs, or credential material.
+/// Each bump also dual-writes into the process-wide authenticated Prometheus
+/// registry (`ferrum_request_mirror_*_total`) so operators can scrape
+/// label-safe lifecycle counters on `/metrics`. Mirror *transaction summaries*
+/// remain excluded from request/billing histograms; that exclusion does not
+/// apply to these safe counters.
+///
+/// Every dispatched task terminates in exactly one of
+/// `{completed, request_timeouts, request_failures, drain_timeouts,
+/// drain_failures, drain_truncations, cancellations}`, so those seven sum to
+/// `dispatched`. A task that is dropped before recording a terminal outcome —
+/// runtime shutdown, panic, or the executor cancelling the future — is counted
+/// as a cancellation by [`MirrorTaskGuard`].
+#[derive(Debug, Default)]
+struct MirrorMetrics {
+    /// Detached tasks spawned (admitted past both concurrency and byte budgets).
+    dispatched: AtomicU64,
+    /// Tasks that received a response and drained its body fully within bounds.
+    completed: AtomicU64,
+    /// Request-phase deadline expiries (connect/header/body request timeout).
+    request_timeouts: AtomicU64,
+    /// Other transport failures before a response (DNS, refused, reset, TLS…).
+    request_failures: AtomicU64,
+    /// Response-body drain-phase deadline expiries.
+    drain_timeouts: AtomicU64,
+    /// Response-body transport failures during the bounded drain.
+    drain_failures: AtomicU64,
+    /// Response bodies truncated at `max_response_body_bytes` (still drained).
+    drain_truncations: AtomicU64,
+    /// Tasks dropped before a terminal outcome (shutdown/panic/cancellation).
+    cancellations: AtomicU64,
+    /// Mirror attempts dropped at admission because `max_in_flight` was full.
+    concurrency_drops: AtomicU64,
+    /// Mirror attempts dropped at admission because the byte budget was full.
+    budget_drops: AtomicU64,
+}
+
+/// Plain-`u64` snapshot of [`MirrorMetrics`] for external assertion in tests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MirrorMetricsSnapshot {
+    pub dispatched: u64,
+    pub completed: u64,
+    pub request_timeouts: u64,
+    pub request_failures: u64,
+    pub drain_timeouts: u64,
+    pub drain_failures: u64,
+    pub drain_truncations: u64,
+    pub cancellations: u64,
+    pub concurrency_drops: u64,
+    pub budget_drops: u64,
+}
+
+impl MirrorMetrics {
+    fn snapshot(&self) -> MirrorMetricsSnapshot {
+        MirrorMetricsSnapshot {
+            dispatched: self.dispatched.load(Ordering::Relaxed),
+            completed: self.completed.load(Ordering::Relaxed),
+            request_timeouts: self.request_timeouts.load(Ordering::Relaxed),
+            request_failures: self.request_failures.load(Ordering::Relaxed),
+            drain_timeouts: self.drain_timeouts.load(Ordering::Relaxed),
+            drain_failures: self.drain_failures.load(Ordering::Relaxed),
+            drain_truncations: self.drain_truncations.load(Ordering::Relaxed),
+            cancellations: self.cancellations.load(Ordering::Relaxed),
+            concurrency_drops: self.concurrency_drops.load(Ordering::Relaxed),
+            budget_drops: self.budget_drops.load(Ordering::Relaxed),
+        }
+    }
+
+    fn bump_dispatched(&self) {
+        self.dispatched.fetch_add(1, Ordering::Relaxed);
+        super::prometheus_metrics::global_registry().record_request_mirror_dispatched();
+    }
+
+    fn bump_concurrency_drop(&self) {
+        self.concurrency_drops.fetch_add(1, Ordering::Relaxed);
+        super::prometheus_metrics::global_registry().record_request_mirror_concurrency_drop();
+    }
+
+    fn bump_budget_drop(&self) {
+        self.budget_drops.fetch_add(1, Ordering::Relaxed);
+        super::prometheus_metrics::global_registry().record_request_mirror_budget_drop();
+    }
+}
+
+/// Terminal outcome recorded by a settled [`MirrorTaskGuard`].
+#[derive(Debug, Clone, Copy)]
+enum MirrorTaskOutcome {
+    Completed,
+    RequestTimeout,
+    RequestFailure,
+    DrainTimeout,
+    DrainFailure,
+    DrainTruncation,
+}
+
+/// Guards a detached mirror task so a drop before recording a terminal outcome
+/// (runtime shutdown, panic, or future cancellation) is counted as a
+/// cancellation exactly once.
+struct MirrorTaskGuard {
+    metrics: Arc<MirrorMetrics>,
+    settled: bool,
+}
+
+impl MirrorTaskGuard {
+    fn new(metrics: Arc<MirrorMetrics>) -> Self {
+        Self {
+            metrics,
+            settled: false,
+        }
+    }
+
+    /// Record a terminal outcome; the guard then no longer counts a
+    /// cancellation. Only the first outcome per task is recorded (defensive).
+    fn settle(&mut self, outcome: MirrorTaskOutcome) {
+        if self.settled {
+            return;
+        }
+        self.settled = true;
+        let counter = match outcome {
+            MirrorTaskOutcome::Completed => &self.metrics.completed,
+            MirrorTaskOutcome::RequestTimeout => &self.metrics.request_timeouts,
+            MirrorTaskOutcome::RequestFailure => &self.metrics.request_failures,
+            MirrorTaskOutcome::DrainTimeout => &self.metrics.drain_timeouts,
+            MirrorTaskOutcome::DrainFailure => &self.metrics.drain_failures,
+            MirrorTaskOutcome::DrainTruncation => &self.metrics.drain_truncations,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        let registry = super::prometheus_metrics::global_registry();
+        match outcome {
+            MirrorTaskOutcome::Completed => registry.record_request_mirror_completed(),
+            MirrorTaskOutcome::RequestTimeout => registry.record_request_mirror_request_timeout(),
+            MirrorTaskOutcome::RequestFailure => registry.record_request_mirror_request_failure(),
+            MirrorTaskOutcome::DrainTimeout => registry.record_request_mirror_drain_timeout(),
+            MirrorTaskOutcome::DrainFailure => registry.record_request_mirror_drain_failure(),
+            MirrorTaskOutcome::DrainTruncation => registry.record_request_mirror_drain_truncation(),
+        }
+    }
+}
+
+impl Drop for MirrorTaskGuard {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.metrics.cancellations.fetch_add(1, Ordering::Relaxed);
+            super::prometheus_metrics::global_registry().record_request_mirror_cancellation();
+        }
+    }
+}
+
+/// Classify a redacted transport-error string as a request-phase timeout.
+///
+/// `execute_redacted` / `execute_http2_redacted` render errors as
+/// `"{error_class} calling {url}"` using the stable snake_case `ErrorClass`
+/// Display tokens, so a leading `connection_timeout` / `read_write_timeout`
+/// identifies the mirror deadline firing (the #3057 never-responding target)
+/// without re-plumbing a typed error through the redaction boundary.
+fn redacted_error_is_timeout(error: &str) -> bool {
+    error.starts_with("connection_timeout") || error.starts_with("read_write_timeout")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MirrorDrainOutcome {
+    Complete { observed: u64 },
+    Truncated { observed: u64 },
+    Timeout,
+    TransportFailure,
+}
+
+/// Discard a mirror response body under the configured byte cap and drain
+/// timeout so pooled HTTP/1.1 connections can be reclaimed.
+async fn drain_mirror_response_body(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> (Option<u64>, MirrorDrainOutcome) {
+    // Record the advertised `Content-Length` independently, then always drain.
+    // The advertised value is never used to short-circuit the drain: a body
+    // whose real length is within `max_bytes` (even when Content-Length
+    // over-advertises) must still be consumed to EOF so the pooled HTTP/1.1
+    // socket is reclaimed, and the reported observed size must reflect bytes
+    // actually read, not a fabricated `max_bytes`. Memory and time stay bounded
+    // by `max_bytes` (the measure helper discards bytes as it counts) and the
+    // drain timeout, so an oversized or slow body cannot pin the task.
+    let advertised = response.content_length();
+    match tokio::time::timeout(
+        MIRROR_RESPONSE_DRAIN_TIMEOUT,
+        measure_response_body_bounded(response, max_bytes),
+    )
+    .await
+    {
+        Err(_) => (advertised, MirrorDrainOutcome::Timeout),
+        Ok(Ok(observed)) => (advertised, MirrorDrainOutcome::Complete { observed }),
+        Ok(Err(BoundedReadError::LimitExceeded { read_so_far, .. })) => (
+            advertised,
+            MirrorDrainOutcome::Truncated {
+                observed: read_so_far as u64,
+            },
+        ),
+        Ok(Err(BoundedReadError::Stream(_))) => (advertised, MirrorDrainOutcome::TransportFailure),
+    }
+}
+
+fn request_host_header(headers: &HashMap<String, String>) -> Option<&str> {
+    headers
+        .iter()
+        .find(|(name, _)| {
+            name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case(":authority")
+        })
+        .map(|(_, value)| value.as_str())
 }
 
 fn completed_mirror_result(
@@ -170,6 +712,10 @@ fn sample_threshold_from_percentage(percentage: f64) -> u64 {
 
 pub struct RequestMirror {
     http_client: PluginHttpClient,
+    /// Stable plugin-config resource id when constructed through the plugin
+    /// cache / factory. Surfaced on mirror summaries for multi-instance
+    /// attribution; never a secret.
+    plugin_config_id: Option<String>,
     mirror_host: String,
     mirror_port: u16,
     mirror_protocol: String,
@@ -177,22 +723,45 @@ pub struct RequestMirror {
     /// `round(percentage × 10)` clamped to `0..=1000` (0.1% granularity).
     sample_threshold: u64,
     mirror_request_body: bool,
-    /// Maximum number of bytes to read from the mirror response when deriving
-    /// `mirror_response_size_bytes`. The body is discarded after measurement,
-    /// so this only bounds memory usage for fire-and-forget mirror tasks
-    /// against misbehaving sinks. Used only when the mirror response has no
-    /// `content-length` header (the CL fast path doesn't read the body).
+    /// Maximum number of bytes to drain from every mirror response when
+    /// deriving `mirror_response_size_bytes`. The body is discarded after
+    /// measurement so this bounds memory/time for fire-and-forget tasks
+    /// against misbehaving sinks, including Content-Length responses.
     max_response_body_bytes: usize,
+    /// Optional plugin-level mirror deadline. When set, overrides the proxy
+    /// `backend_read_timeout_ms` for detached mirror work.
+    mirror_timeout_ms: Option<u64>,
+    /// When true, only names in `forward_sensitive_header_allowlist` may cross
+    /// to the mirror origin. Default false strips the sensitive set.
+    forward_sensitive_headers: bool,
+    /// Lowercased allowlist consulted only when `forward_sensitive_headers`.
+    forward_sensitive_header_allowlist: Vec<String>,
+    /// Operator-configured lowercased substrings that extend the built-in
+    /// deny-by-default sensitive-header set (`sensitive_header_patterns`).
+    sensitive_header_patterns: Vec<String>,
     mirror_hostname: Option<String>,
     /// Bresenham phase accumulator in `0..SAMPLE_PERIOD` for evenly spaced
     /// deterministic percentage sampling. Reset to `0` on construction/reload.
     sample_phase: AtomicU64,
     /// Bounds concurrent mirror tasks to prevent unbounded background work.
     mirror_in_flight: Arc<tokio::sync::Semaphore>,
+    /// Aggregate retained request-body bytes across in-flight mirror tasks.
+    body_budget: Arc<MirrorBodyBudget>,
+    /// Per-instance, bounded-lifetime mirror lifecycle counters.
+    metrics: Arc<MirrorMetrics>,
 }
 
 impl RequestMirror {
+    #[allow(dead_code)] // direct/test construction; production factory supplies the config id
     pub fn new(config: &Value, http_client: PluginHttpClient) -> Result<Self, String> {
+        Self::new_with_config_id(config, http_client, None)
+    }
+
+    pub fn new_with_config_id(
+        config: &Value,
+        http_client: PluginHttpClient,
+        plugin_config_id: Option<&str>,
+    ) -> Result<Self, String> {
         if !config.is_object() {
             return Err("request_mirror: config must be an object".to_string());
         }
@@ -257,15 +826,65 @@ impl RequestMirror {
         let max_in_flight = optional_u64(config, "max_in_flight")?
             .map(|v| {
                 if v == 0 {
-                    Err("request_mirror: 'max_in_flight' must be >= 1".to_string())
-                } else {
-                    usize::try_from(v).map_err(|_| {
-                        "request_mirror: 'max_in_flight' is too large for this platform".to_string()
-                    })
+                    return Err("request_mirror: 'max_in_flight' must be >= 1".to_string());
                 }
+                // Range-check against the deployment-safe hard cap before the
+                // value ever reaches `Semaphore::new`. A value above the cap
+                // (up to and past Tokio's `MAX_PERMITS`) fits `usize` and would
+                // otherwise panic construction; reject it as a config error.
+                let v = usize::try_from(v).map_err(|_| {
+                    format!(
+                        "request_mirror: 'max_in_flight' must be 1–{MAX_MAX_IN_FLIGHT_MIRRORS}"
+                    )
+                })?;
+                if v > MAX_MAX_IN_FLIGHT_MIRRORS {
+                    return Err(format!(
+                        "request_mirror: 'max_in_flight' must be 1–{MAX_MAX_IN_FLIGHT_MIRRORS} (got {v})"
+                    ));
+                }
+                Ok(v)
             })
             .transpose()?
             .unwrap_or(DEFAULT_MAX_IN_FLIGHT_MIRRORS);
+
+        let max_retained_request_body_bytes =
+            optional_u64(config, "max_retained_request_body_bytes")?
+                .map(|v| {
+                    if v == 0 {
+                        Err(
+                            "request_mirror: 'max_retained_request_body_bytes' must be >= 1"
+                                .to_string(),
+                        )
+                    } else {
+                        Ok(v)
+                    }
+                })
+                .transpose()?
+                .unwrap_or(DEFAULT_MAX_RETAINED_REQUEST_BODY_BYTES);
+
+        let mirror_timeout_ms = optional_u64(config, "mirror_timeout_ms")?
+            .map(|v| {
+                if v == 0 || v > MAX_MIRROR_TIMEOUT_MS {
+                    Err(format!(
+                        "request_mirror: 'mirror_timeout_ms' must be 1–{MAX_MIRROR_TIMEOUT_MS} (got {v})"
+                    ))
+                } else {
+                    Ok(v)
+                }
+            })
+            .transpose()?;
+
+        // Parse operator patterns first: the allowlist may re-permit a header
+        // that only a configured pattern denies.
+        let sensitive_header_patterns = parse_sensitive_header_patterns(config)?;
+
+        let forward_sensitive_headers =
+            optional_bool(config, "forward_sensitive_headers")?.unwrap_or(false);
+        let forward_sensitive_header_allowlist = parse_forward_sensitive_header_allowlist(
+            config,
+            forward_sensitive_headers,
+            &sensitive_header_patterns,
+        )?;
 
         let max_response_body_bytes = parse_max_response_body_bytes(
             config,
@@ -274,8 +893,17 @@ impl RequestMirror {
             DEFAULT_MIRROR_MAX_RESPONSE_BODY_BYTES,
         )?;
 
+        let plugin_config_id = match plugin_config_id {
+            Some(id) if id.trim().is_empty() => {
+                return Err("request_mirror: plugin_config_id must not be blank".to_string());
+            }
+            Some(id) => Some(id.trim().to_owned()),
+            None => None,
+        };
+
         Ok(Self {
             http_client,
+            plugin_config_id,
             mirror_host,
             mirror_port,
             mirror_protocol,
@@ -283,11 +911,19 @@ impl RequestMirror {
             sample_threshold,
             mirror_request_body,
             max_response_body_bytes,
+            mirror_timeout_ms,
+            forward_sensitive_headers,
+            forward_sensitive_header_allowlist,
+            sensitive_header_patterns,
             mirror_hostname,
             // Phase 0 defers the first selection until the accumulator crosses
             // SAMPLE_PERIOD — construction/reload never opens with a mirrored prefix.
             sample_phase: AtomicU64::new(0),
+            // `max_in_flight` is range-checked above, so `Semaphore::new` cannot
+            // panic on an out-of-range permit count.
             mirror_in_flight: Arc::new(tokio::sync::Semaphore::new(max_in_flight)),
+            body_budget: MirrorBodyBudget::new(max_retained_request_body_bytes),
+            metrics: Arc::new(MirrorMetrics::default()),
         })
     }
 
@@ -305,6 +941,50 @@ impl RequestMirror {
     #[allow(dead_code)]
     pub(crate) fn sample_phase_for_test(&self) -> u64 {
         self.sample_phase.load(Ordering::Relaxed)
+    }
+
+    /// Configured mirror timeout override when present.
+    #[allow(dead_code)]
+    pub(crate) fn mirror_timeout_ms_for_test(&self) -> Option<u64> {
+        self.mirror_timeout_ms
+    }
+
+    /// Current retained request-body budget usage for external tests.
+    #[allow(dead_code)]
+    pub(crate) fn retained_request_body_bytes_for_test(&self) -> u64 {
+        self.body_budget.used_for_test()
+    }
+
+    /// Configured retained-body ceiling for external tests.
+    #[allow(dead_code)]
+    pub(crate) fn max_retained_request_body_bytes_for_test(&self) -> u64 {
+        self.body_budget.max_bytes
+    }
+
+    /// Snapshot of the per-instance mirror lifecycle counters for external
+    /// tests. Process-wide authenticated `/metrics` also exports the same
+    /// aggregate tallies as `ferrum_request_mirror_*_total` (monotonic across
+    /// reloads); this hook asserts the per-instance, reload-reset view.
+    #[allow(dead_code)]
+    pub(crate) fn mirror_metrics_snapshot_for_test(&self) -> MirrorMetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Select the path segment for the mirror URL without consuming primary
+    /// route overrides.
+    ///
+    /// Precedence: explicit `mirror_path` → mesh `route_override_path` →
+    /// authorized backend path → original `ctx.path`.
+    fn select_mirror_path<'a>(&'a self, ctx: &'a RequestContext) -> &'a str {
+        if let Some(path) = self.mirror_path.as_deref() {
+            return path;
+        }
+        if ctx.mesh_route_dispatch_matched
+            && let Some(path) = ctx.route_override_path.as_deref()
+        {
+            return path;
+        }
+        ctx.authorized_backend_path().unwrap_or(&ctx.path)
     }
 
     /// Build the full mirror URL from the configured or gateway-selected path.
@@ -446,6 +1126,126 @@ fn parse_mirror_host(raw_host: &str) -> Result<(String, Option<String>), String>
     }
 }
 
+/// Parse the operator-configured `sensitive_header_patterns` list: lowercased,
+/// trimmed, non-blank substrings that extend the built-in deny-by-default set.
+/// Item count and per-item length are hard-capped so an admitted config cannot
+/// create unbounded per-request substring scans or retained config memory.
+fn parse_sensitive_header_patterns(config: &Value) -> Result<Vec<String>, String> {
+    match config.get("sensitive_header_patterns") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_SENSITIVE_HEADER_PATTERNS {
+                return Err(format!(
+                    "request_mirror: 'sensitive_header_patterns' must contain at most {MAX_SENSITIVE_HEADER_PATTERNS} entries"
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for (idx, item) in items.iter().enumerate() {
+                let Some(pattern) = item.as_str() else {
+                    return Err(format!(
+                        "request_mirror: 'sensitive_header_patterns[{idx}]' must be a string"
+                    ));
+                };
+                let trimmed = pattern.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "request_mirror: 'sensitive_header_patterns[{idx}]' must not be blank"
+                    ));
+                }
+                if trimmed.len() > MAX_SENSITIVE_HEADER_PATTERN_LEN {
+                    return Err(format!(
+                        "request_mirror: 'sensitive_header_patterns[{idx}]' exceeds maximum length of {MAX_SENSITIVE_HEADER_PATTERN_LEN} bytes"
+                    ));
+                }
+                let lower = trimmed.to_ascii_lowercase();
+                if !out.iter().any(|existing| existing == &lower) {
+                    out.push(lower);
+                }
+            }
+            Ok(out)
+        }
+        Some(_) => Err(
+            "request_mirror: 'sensitive_header_patterns' must be an array of strings".to_string(),
+        ),
+    }
+}
+
+fn parse_forward_sensitive_header_allowlist(
+    config: &Value,
+    forward_sensitive_headers: bool,
+    operator_patterns: &[String],
+) -> Result<Vec<String>, String> {
+    let raw = match config.get("forward_sensitive_header_allowlist") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            if items.len() > MAX_FORWARD_SENSITIVE_ALLOWLIST {
+                return Err(format!(
+                    "request_mirror: 'forward_sensitive_header_allowlist' must contain at most {MAX_FORWARD_SENSITIVE_ALLOWLIST} entries"
+                ));
+            }
+            let mut out = Vec::with_capacity(items.len());
+            for (idx, item) in items.iter().enumerate() {
+                let Some(name) = item.as_str() else {
+                    return Err(format!(
+                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' must be a string"
+                    ));
+                };
+                let trimmed = name.trim();
+                if trimmed.is_empty() {
+                    return Err(format!(
+                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' must not be blank"
+                    ));
+                }
+                if trimmed.len() > MAX_FORWARD_SENSITIVE_ALLOWLIST_ITEM_LEN {
+                    return Err(format!(
+                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' exceeds maximum length of {MAX_FORWARD_SENSITIVE_ALLOWLIST_ITEM_LEN} bytes"
+                    ));
+                }
+                if http::HeaderName::from_bytes(trimmed.as_bytes()).is_err() {
+                    return Err(format!(
+                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' is not a valid HTTP header name"
+                    ));
+                }
+                let lower = trimmed.to_ascii_lowercase();
+                // The allowlist re-permits deny-by-default headers, so every
+                // entry must actually be denied by the effective policy
+                // (built-in credential name/substring or a configured
+                // sensitive_header_patterns match). Rejecting non-sensitive
+                // names catches typos and keeps the allowlist meaningful — a
+                // name that is not stripped could never be "forwarded" by it.
+                if !is_mirror_sensitive_header(&lower, operator_patterns) {
+                    return Err(format!(
+                        "request_mirror: 'forward_sensitive_header_allowlist[{idx}]' ('{lower}') is not a recognized sensitive header (built-in credential or a configured sensitive_header_patterns match)"
+                    ));
+                }
+                if !out.iter().any(|existing| existing == &lower) {
+                    out.push(lower);
+                }
+            }
+            out
+        }
+        Some(_) => {
+            return Err(
+                "request_mirror: 'forward_sensitive_header_allowlist' must be an array of strings"
+                    .to_string(),
+            );
+        }
+    };
+
+    match (forward_sensitive_headers, raw.is_empty()) {
+        (false, true) => Ok(raw),
+        (false, false) => Err(
+            "request_mirror: 'forward_sensitive_header_allowlist' requires forward_sensitive_headers=true"
+                .to_string(),
+        ),
+        (true, true) => Err(
+            "request_mirror: forward_sensitive_headers=true requires a non-empty forward_sensitive_header_allowlist (fail-closed)"
+                .to_string(),
+        ),
+        (true, false) => Ok(raw),
+    }
+}
+
 fn optional_bool(config: &Value, key: &str) -> Result<Option<bool>, String> {
     match config.get(key) {
         Some(Value::Bool(value)) => Ok(Some(*value)),
@@ -537,10 +1337,10 @@ impl Plugin for RequestMirror {
             return PluginResult::Continue;
         }
 
-        // When backend-path policy is active, mirror the exact path that passed
-        // final authorization. Falling back to the ordinary client path keeps
-        // the established behavior for proxies without that policy boundary.
-        let mirror_path = ctx.authorized_backend_path().unwrap_or(&ctx.path);
+        // Mirror the final route-selected path without consuming the override
+        // that primary dispatch still needs. An explicit operator mirror_path
+        // remains authoritative.
+        let mirror_path = self.select_mirror_path(ctx);
         // Match primary backend query construction: start from the retained raw
         // query, then apply auth credential strips marked on the context.
         // Decoded `request_transformer` query-map mutations are intentionally
@@ -566,13 +1366,38 @@ impl Plugin for RequestMirror {
         // backend. Apply the canonical secondary-request sanitizer (hop-by-hop,
         // Connection-listed, framing, proxy-owned forwarding identity, Host
         // strip) before any mirror-specific exclusions.
+        let mesh_shadow_host = if ctx.mesh_route_dispatch_matched {
+            ctx.route_override_authority
+                .as_deref()
+                .or_else(|| request_host_header(headers))
+                .filter(|authority| !authority.is_empty())
+                .map(append_shadow_host_suffix)
+        } else {
+            None
+        };
         let mut mirror_headers = filter_secondary_request_headers(
             headers,
             SecondaryRequestHostPolicy::Strip,
             &[HEADER_TRIGGER_KEY, HEADER_FANOUT],
         );
+        apply_mirror_credential_policy(
+            &mut mirror_headers,
+            self.forward_sensitive_headers,
+            &self.forward_sensitive_header_allowlist,
+            &self.sensitive_header_patterns,
+        );
+        if let Some(shadow_host) = mesh_shadow_host {
+            // Keep the configured mirror URL as the dial/TLS identity. Only
+            // the application Host/:authority follows Envoy's route-local
+            // shadow contract.
+            mirror_headers.push(("host".to_string(), shadow_host));
+        }
         // gRPC mirrors need `te: trailers` after the generic strip removes `te`.
         synthesize_grpc_te_trailers_if_needed(&mut mirror_headers);
+        let is_native_grpc = mirror_headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("content-type")
+                && crate::proxy::backend_dispatch::is_native_grpc_content_type(value.as_bytes())
+        });
 
         // Apply the operator-configured baggage strip
         // (`FERRUM_MESH_EGRESS_STRIP_BAGGAGE_KEYS`) so mesh-internal identity
@@ -591,11 +1416,13 @@ impl Plugin for RequestMirror {
         let permit = match self.mirror_in_flight.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
+                self.metrics.bump_concurrency_drop();
                 warn!(
                     "request_mirror: dropping mirror request for {} {} because max_in_flight limit was reached",
                     method, mirror_url_for_log
                 );
-                ctx.mirror_result_rx = Some(completed_mirror_result(mirror_failure_meta(
+                ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
+                    self.plugin_config_id.clone(),
                     mirror_url_for_log,
                     MIRROR_CONCURRENCY_DROP_ERROR,
                 )));
@@ -603,75 +1430,112 @@ impl Plugin for RequestMirror {
             }
         };
 
-        // Capture request body if configured and available.
-        // Uses the binary-safe `request_body_bytes` field (preserves non-UTF-8
-        // payloads like gRPC protobuf), falling back to the UTF-8 metadata key.
-        let body_bytes: Option<Vec<u8>> = if self.mirror_request_body {
-            ctx.request_body_bytes
-                .as_ref()
-                .map(|b| b.to_vec())
-                .or_else(|| {
-                    ctx.metadata
-                        .get("request_body")
-                        .map(|b| b.as_bytes().to_vec())
-                })
+        // Share immutable body bytes with the primary buffer (no detached
+        // `to_vec` duplication). Charge length against the per-instance
+        // retained-byte budget for the task lifetime (coupled to the permit).
+        let body_bytes: Option<Bytes> = if self.mirror_request_body {
+            ctx.request_body_bytes.clone().or_else(|| {
+                ctx.metadata
+                    .get("request_body")
+                    .map(|body| Bytes::copy_from_slice(body.as_bytes()))
+            })
         } else {
             None
         };
-
-        let mirror_timeout = ctx.matched_proxy.as_ref().and_then(|p| {
-            if p.backend_read_timeout_ms > 0 {
-                Some(Duration::from_millis(p.backend_read_timeout_ms))
-            } else {
-                None
+        let retained_body = match self.body_budget.try_retain(body_bytes) {
+            Some(retained) => retained,
+            None => {
+                self.metrics.bump_budget_drop();
+                warn!(
+                    "request_mirror: dropping mirror request for {} {} because max_retained_request_body_bytes budget was exhausted",
+                    method, mirror_url_for_log
+                );
+                drop(permit);
+                ctx.push_mirror_result_rx(completed_mirror_result(mirror_failure_meta(
+                    self.plugin_config_id.clone(),
+                    mirror_url_for_log,
+                    MIRROR_BODY_BUDGET_DROP_ERROR,
+                )));
+                return PluginResult::Continue;
             }
-        });
+        };
+
+        let backend_timeout_ms = ctx
+            .matched_proxy
+            .as_ref()
+            .map(|p| p.backend_read_timeout_ms);
+        let mirror_timeout = Duration::from_millis(resolve_mirror_timeout_ms(
+            self.mirror_timeout_ms,
+            backend_timeout_ms,
+        ));
 
         // Seed the channel with a sanitized failure result. The detached
         // collector waits for the task's update, but if the task is cancelled
         // or panics its sender closes and the fallback becomes the explicit
         // mirror outcome instead of disappearing from observability.
-        let task_fallback =
-            mirror_failure_meta(mirror_url_for_log.clone(), MIRROR_TASK_INCOMPLETE_ERROR);
+        let task_fallback = mirror_failure_meta(
+            self.plugin_config_id.clone(),
+            mirror_url_for_log.clone(),
+            MIRROR_TASK_INCOMPLETE_ERROR,
+        );
         let (tx, rx) = tokio::sync::watch::channel(Some(task_fallback));
-        ctx.mirror_result_rx = Some(rx);
+        ctx.push_mirror_result_rx(rx);
 
         let http_client = self.http_client.clone();
         let max_response_body_bytes = self.max_response_body_bytes;
+        let mirror_plugin_id = self.plugin_config_id.clone();
+        let body_for_request = retained_body.bytes.clone();
+        let metrics = Arc::clone(&self.metrics);
+        metrics.bump_dispatched();
 
         // Fire-and-forget: spawn an async task to send the mirror request.
         // The main request proceeds immediately — mirror latency has zero
         // impact on client response time.
         tokio::spawn(async move {
             let _permit = permit;
+            // Keep the body-budget lease alive for the task lifetime.
+            let _retained_body_lease = retained_body;
+            // Count a cancellation if this task is dropped (runtime shutdown,
+            // panic, or future cancellation) before recording a terminal
+            // outcome. Settled below once a terminal metric is recorded.
+            let mut task_guard = MirrorTaskGuard::new(metrics);
             let start = std::time::Instant::now();
 
+            // Native gRPC must speak HTTP/2 (h2c prior knowledge on cleartext,
+            // ALPN h2 on TLS). Ordinary HTTP mirrors keep the default client so
+            // HTTP/1.1 destinations continue to work.
+            let outbound = if is_native_grpc {
+                http_client.get_http2()
+            } else {
+                http_client.get()
+            };
+
             let mut req_builder = match method.as_str() {
-                "GET" => http_client.get().get(&mirror_url),
-                "POST" => http_client.get().post(&mirror_url),
-                "PUT" => http_client.get().put(&mirror_url),
-                "DELETE" => http_client.get().delete(&mirror_url),
-                "PATCH" => http_client.get().patch(&mirror_url),
-                "HEAD" => http_client.get().head(&mirror_url),
-                _ => http_client.get().request(
+                "GET" => outbound.get(&mirror_url),
+                "POST" => outbound.post(&mirror_url),
+                "PUT" => outbound.put(&mirror_url),
+                "DELETE" => outbound.delete(&mirror_url),
+                "PATCH" => outbound.patch(&mirror_url),
+                "HEAD" => outbound.head(&mirror_url),
+                _ => outbound.request(
                     reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET),
                     &mirror_url,
                 ),
             };
 
-            if let Some(t) = mirror_timeout {
-                req_builder = req_builder.timeout(t);
-            }
+            // Always apply a finite deadline — never leave detached mirror work
+            // unbounded when the primary proxy timeout is zero/absent.
+            req_builder = req_builder.timeout(mirror_timeout);
 
             // Forward sanitized headers from the original (transformed) request.
             // The canonical secondary-request filter already removed hop-by-hop,
-            // Connection-listed, framing, proxy-owned forwarding, Host, and the
-            // reserved load-testing controls.
+            // Connection-listed, framing, proxy-owned forwarding, and Host
+            // fields; credential policy then stripped origin-bound secrets.
             for (key, value) in &mirror_headers {
                 req_builder = req_builder.header(key.as_str(), value.as_str());
             }
 
-            if let Some(body) = body_bytes {
+            if let Some(body) = body_for_request {
                 req_builder = req_builder.body(body);
             }
 
@@ -684,57 +1548,80 @@ impl Plugin for RequestMirror {
             // output, so stringifying it into `mirror_error` would leak those
             // secrets to every logging sink. `execute_redacted` reduces the
             // transport error to an `ErrorClass` plus the stripped URL.
-            let (status_code, response_size, error_msg) = match http_client
-                .execute_redacted(req_builder, "request_mirror", &mirror_url_for_log)
-                .await
-            {
+            let response = if is_native_grpc {
+                http_client
+                    .execute_http2_redacted(req_builder, "request_mirror", &mirror_url_for_log)
+                    .await
+            } else {
+                http_client
+                    .execute_redacted(req_builder, "request_mirror", &mirror_url_for_log)
+                    .await
+            };
+            let (status_code, response_size, advertised_size, error_msg) = match response {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    // Derive response size from content-length when available (avoids
-                    // reading the body). When absent, the body would otherwise be
-                    // unbounded — a misbehaving mirror sink could exhaust gateway
-                    // memory in a fire-and-forget task. Stream and bound by
-                    // `max_response_body_bytes`, discarding the bytes after sizing.
-                    let (size, body_error) = match resp.content_length() {
-                        Some(cl) => (Some(cl), None),
-                        None => match measure_response_body_bounded(resp, max_response_body_bytes)
-                            .await
-                        {
-                            Ok(n) => (Some(n), None),
-                            Err(BoundedReadError::LimitExceeded { read_so_far, .. }) => {
-                                warn!(
-                                    "request_mirror: response from {} truncated at {} bytes \
-                                         (max_response_body_bytes = {})",
-                                    mirror_url_for_log, read_so_far, max_response_body_bytes
-                                );
-                                (Some(read_so_far as u64), None)
-                            }
-                            Err(BoundedReadError::Stream(_)) => {
-                                (None, Some("mirror response body stream failed".to_string()))
-                            }
-                        },
+                    // Always drain/discard under byte + time bounds so HTTP/1.1
+                    // keep-alive pools reclaim the socket even when
+                    // Content-Length is known. Report advertised and observed
+                    // sizes independently when CL was present.
+                    let (advertised, drain) =
+                        drain_mirror_response_body(resp, max_response_body_bytes).await;
+                    let (size, body_error) = match drain {
+                        MirrorDrainOutcome::Complete { observed } => {
+                            task_guard.settle(MirrorTaskOutcome::Completed);
+                            (Some(observed), None)
+                        }
+                        MirrorDrainOutcome::Truncated { observed } => {
+                            task_guard.settle(MirrorTaskOutcome::DrainTruncation);
+                            warn!(
+                                "request_mirror: response from {} truncated at {} bytes \
+                                     (max_response_body_bytes = {}; advertised = {:?})",
+                                mirror_url_for_log, observed, max_response_body_bytes, advertised
+                            );
+                            (Some(observed), None)
+                        }
+                        MirrorDrainOutcome::Timeout => {
+                            task_guard.settle(MirrorTaskOutcome::DrainTimeout);
+                            warn!(
+                                "request_mirror: response body drain timed out for {}",
+                                mirror_url_for_log
+                            );
+                            (None, Some(MIRROR_DRAIN_TIMEOUT_ERROR.to_string()))
+                        }
+                        MirrorDrainOutcome::TransportFailure => {
+                            task_guard.settle(MirrorTaskOutcome::DrainFailure);
+                            (None, Some(MIRROR_DRAIN_TRANSPORT_ERROR.to_string()))
+                        }
                     };
-                    (Some(status), size, body_error)
+                    (Some(status), size, advertised, body_error)
                 }
                 Err(err) => {
                     // `err` is already sanitized by `execute_redacted`
                     // (ErrorClass + stripped URL); it never contains the query
                     // string. Use the same string for the log line and the
-                    // structured `mirror_error` field.
+                    // structured `mirror_error` field. Classify the mirror
+                    // deadline firing (never-responding target) as a timeout.
+                    if redacted_error_is_timeout(&err) {
+                        task_guard.settle(MirrorTaskOutcome::RequestTimeout);
+                    } else {
+                        task_guard.settle(MirrorTaskOutcome::RequestFailure);
+                    }
                     warn!(
                         "request_mirror: failed to mirror {} {} → {}",
                         method, mirror_url_for_log, err
                     );
-                    (None, None, Some(err))
+                    (None, None, None, Some(err))
                 }
             };
 
             let elapsed = start.elapsed();
 
             let meta = MirrorResponseMeta {
+                mirror_plugin_id,
                 mirror_target_url: mirror_url_for_log,
                 mirror_response_status_code: status_code,
                 mirror_response_size_bytes: response_size,
+                mirror_response_advertised_size_bytes: advertised_size,
                 mirror_latency_ms: elapsed.as_secs_f64() * 1000.0,
                 mirror_error: error_msg,
             };

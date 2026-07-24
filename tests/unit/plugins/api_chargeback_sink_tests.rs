@@ -1,12 +1,14 @@
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
-    SpoolManager, SpoolSettings, classify_clickhouse_http_status_for_tests,
+    SpoolManager, SpoolSettings, classify_clickhouse_acknowledgement_for_tests,
+    classify_clickhouse_http_status_for_tests, clickhouse_insert_url_for_tests,
     decode_spool_file_for_tests, encode_spool_bytes_for_tests, new_ulid, render_prometheus,
     render_status_json, replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
     serialize_json_each_row, write_private_file_atomically_for_tests,
@@ -91,6 +93,59 @@ fn grpc_summary(proxy_id: &str, grpc_status: &str) -> TransactionSummary {
     summary
 }
 
+fn http_summary_with_dims(
+    proxy_id: &str,
+    proxy_name: &str,
+    route_id: Option<&str>,
+    consumer_name: Option<&str>,
+    protocol: &str,
+    status: u16,
+) -> TransactionSummary {
+    let mut summary = TransactionSummary {
+        namespace: "ferrum".to_string(),
+        consumer_username: Some("alice".to_string()),
+        proxy_id: Some(proxy_id.to_string()),
+        proxy_name: Some(proxy_name.to_string()),
+        response_status_code: status,
+        ..TransactionSummary::default()
+    };
+    if protocol != "http" {
+        summary
+            .metadata
+            .insert("request_protocol".to_string(), protocol.to_string());
+    }
+    if let Some(route_id) = route_id {
+        summary
+            .metadata
+            .insert("route_id".to_string(), route_id.to_string());
+    }
+    if let Some(consumer_name) = consumer_name {
+        summary
+            .metadata
+            .insert("consumer_name".to_string(), consumer_name.to_string());
+    }
+    summary
+}
+
+fn unit_call_charge(price: f64) -> ChargeComputation {
+    ChargeComputation {
+        call_count: 1,
+        charge_call: price,
+        charge_total: price,
+        ..ChargeComputation::default()
+    }
+}
+
+fn snapshot_test_config() -> ApiChargebackSinkConfig {
+    let mut config = ApiChargebackSinkConfig {
+        mode: ferrum_edge::plugins::api_chargeback_sink::SinkMode::Snapshot,
+        ..Default::default()
+    };
+    config.currency = "USD".to_string();
+    config.pricing_version = "test-v1".to_string();
+    config
+}
+
 async fn wait_for_requests(server: &MockServer, at_least: usize) -> Vec<wiremock::Request> {
     for _ in 0..40 {
         if let Some(requests) = server.received_requests().await
@@ -104,6 +159,7 @@ async fn wait_for_requests(server: &MockServer, at_least: usize) -> Vec<wiremock
 }
 
 #[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn grpc_per_event_exports_billable_and_raw_terminal_statuses() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -381,7 +437,7 @@ fn maximum_prices_remain_finite_in_per_event_and_snapshot_exports() {
     }
 
     let mut per_event = sample_event("maximum-price-per-event");
-    per_event.call_count = http_charge.call_count;
+    per_event.call_count = u64::from(http_charge.call_count);
     per_event.charge_call = http_charge.charge_call;
     per_event.bytes_sent = http_charge.bytes_sent;
     per_event.bytes_received = http_charge.bytes_received;
@@ -1026,6 +1082,7 @@ fn spool_write_round_trip_and_oldest_eviction() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1063,6 +1120,7 @@ fn spool_rejects_empty_spool_oversized_batch() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len.saturating_sub(1).max(1),
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1094,6 +1152,7 @@ fn spool_admits_exact_fit_and_rejects_one_byte_over_with_resident_file() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1132,6 +1191,7 @@ fn spool_quota_uses_compressed_encoded_size() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::Zstd,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1150,6 +1210,7 @@ fn spool_quota_uses_compressed_encoded_size() {
         dir: temp.path().join("over"),
         max_bytes: encoded_len.saturating_sub(1).max(1),
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::Zstd,
     };
     let over_spool = SpoolManager::for_tests(over, "node-a").unwrap();
@@ -1174,6 +1235,7 @@ fn spool_accounts_corrupt_files_toward_quota_and_can_evict_them() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1206,6 +1268,7 @@ fn spool_reconciles_stale_tmp_files_at_startup() {
         dir: temp.path().to_path_buf(),
         max_bytes: 1024 * 1024,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1238,6 +1301,7 @@ fn spool_counts_tmp_files_toward_quota_before_cleanup() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1273,6 +1337,7 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
         dir: temp.path().to_path_buf(),
         max_bytes: encoded_len,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = Arc::new(SpoolManager::for_tests(settings, "node-a").unwrap());
@@ -1298,6 +1363,7 @@ async fn concurrent_spool_writes_do_not_fail_during_eviction() {
 }
 
 #[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn prometheus_counts_quarantined_owned_spool_bytes() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1311,7 +1377,7 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
     let corrupt_bytes = 256u64;
     let byte_line = format!("chargeback_sink_spool_bytes {corrupt_bytes}\n");
 
-    // ACTIVE_SINK is process-global; retry briefly if a parallel sink test races
+    // ACTIVE_SINKS is process-global; retry briefly if a parallel sink test races
     // the published runtime between construction and scrape.
     let mut matched_prom = None;
     let mut held_plugin = None;
@@ -1358,7 +1424,7 @@ async fn prometheus_counts_quarantined_owned_spool_bytes() {
     }
 
     let prom = matched_prom.expect(
-        "ACTIVE_SINK never observed this sink's quarantined owned bytes in prometheus output",
+        "ACTIVE_SINKS never observed this sink's quarantined owned bytes in prometheus output",
     );
     assert!(
         prom.contains(
@@ -1409,7 +1475,7 @@ async fn committed_unusable_spool_latches_status_and_metric_failure() {
     let mut status = Value::Null;
     for _ in 0..200 {
         status = serde_json::from_str(&render_status_json()).expect("status json");
-        if status["spool"]["prepare_failures_total"]
+        if status["instances"][0]["spool"]["prepare_failures_total"]
             .as_u64()
             .is_some_and(|failures| failures > 0)
         {
@@ -1418,13 +1484,21 @@ async fn committed_unusable_spool_latches_status_and_metric_failure() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    assert_eq!(status["spool"]["enabled"], true);
-    assert_eq!(status["spool"]["available"], false);
+    assert_eq!(status["enabled"], true);
+    assert_eq!(status["instance_count"], 1);
+    assert_eq!(status["instances"][0]["spool"]["enabled"], true);
+    assert_eq!(status["instances"][0]["spool"]["available"], false);
     assert!(
-        status["spool"]["prepare_failures_total"]
+        status["instances"][0]["spool"]["prepare_failures_total"]
             .as_u64()
             .is_some_and(|failures| failures > 0),
         "committed unusable spool must retain operational failure evidence: {status}"
+    );
+    assert_eq!(status["totals"]["spool"]["available"], false);
+    assert!(
+        status["totals"]["spool"]["prepare_failures_total"]
+            .as_u64()
+            .is_some_and(|failures| failures > 0)
     );
 
     let prometheus = render_prometheus();
@@ -1464,6 +1538,7 @@ fn spool_reconcile_fails_closed_when_stale_tmp_cannot_be_removed() {
         dir: temp.path().to_path_buf(),
         max_bytes: 1024 * 1024,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let err = match SpoolManager::for_tests(settings, "node-a") {
@@ -1524,6 +1599,7 @@ async fn replay_quarantines_corrupt_spool_file_and_continues() {
         dir: temp.path().to_path_buf(),
         max_bytes: 1024 * 1024,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
@@ -1554,6 +1630,7 @@ async fn replay_quarantines_corrupt_spool_file_and_continues() {
 }
 
 #[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn websocket_disconnect_exports_bandwidth_charge() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1604,6 +1681,7 @@ async fn websocket_disconnect_exports_bandwidth_charge() {
 }
 
 #[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
 async fn connect_method_is_not_classified_as_websocket() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1685,6 +1763,376 @@ fn snapshot_cleanup_removes_idle_entries_and_last_emitted() {
 }
 
 #[test]
+fn snapshot_cleanup_preserves_unrelated_key_and_new_generation_baseline() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    accumulator.record_for_test(
+        "ferrum", "alice", "proxy-a", "Payments", 200, "http", charge,
+    );
+    accumulator.record_for_test("ferrum", "bob", "proxy-b", "Billing", 200, "http", charge);
+    assert_eq!(
+        accumulator
+            .compute_deltas(&config, "node-a", 100, "snap-1")
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Evict both idle identities, then re-record only alice. Cleanup of the
+    // old alice generation must not strip bob's already-removed baseline in a
+    // way that breaks alice's fresh generation, and alice must emit a full
+    // restart total (not a residual against an orphaned baseline).
+    assert_eq!(accumulator.cleanup_stale_for_tests(0), 2);
+
+    accumulator.record_for_test(
+        "ferrum", "alice", "proxy-a", "Payments", 200, "http", charge,
+    );
+    let restarted = accumulator
+        .compute_deltas(&config, "node-a", 200, "snap-2")
+        .unwrap();
+    assert_eq!(restarted.len(), 1);
+    assert_eq!(restarted[0].consumer_id, "alice");
+    assert_eq!(restarted[0].call_count, 1);
+}
+
+#[test]
+fn snapshot_record_emit_cleanup_stress_around_ttl_boundary() {
+    let config = Arc::new(snapshot_test_config());
+    let accumulator = Arc::new(SnapshotAccumulator::new());
+    let stop = Arc::new(AtomicBool::new(false));
+    let emitted_calls = Arc::new(AtomicU64::new(0));
+    let recorded_calls = Arc::new(AtomicU64::new(0));
+    let emitter_iterations = Arc::new(AtomicU64::new(0));
+    let cleaner_iterations = Arc::new(AtomicU64::new(0));
+    let start = Arc::new(Barrier::new(4));
+
+    let record_acc = Arc::clone(&accumulator);
+    let record_stop = Arc::clone(&stop);
+    let record_start = Arc::clone(&start);
+    let record_calls = Arc::clone(&recorded_calls);
+    let recorder = thread::spawn(move || {
+        record_start.wait();
+        let mut i = 0u64;
+        while !record_stop.load(Ordering::Relaxed) {
+            let consumer = if i.is_multiple_of(2) { "alice" } else { "bob" };
+            record_acc.record_for_test(
+                "ferrum",
+                consumer,
+                "proxy-a",
+                "Payments",
+                200,
+                "http",
+                unit_call_charge(0.01),
+            );
+            record_calls.fetch_add(1, Ordering::Relaxed);
+            i = i.wrapping_add(1);
+        }
+    });
+
+    let emit_acc = Arc::clone(&accumulator);
+    let emit_cfg = Arc::clone(&config);
+    let emit_stop = Arc::clone(&stop);
+    let emit_start = Arc::clone(&start);
+    let emit_calls = Arc::clone(&emitted_calls);
+    let emit_iterations = Arc::clone(&emitter_iterations);
+    let emitter = thread::spawn(move || {
+        emit_start.wait();
+        let mut snap = 0u64;
+        while !emit_stop.load(Ordering::Relaxed) {
+            snap += 1;
+            let events = emit_acc
+                .compute_deltas(&emit_cfg, "node-a", snap as i64, &format!("stress-{snap}"))
+                .expect("delta arithmetic must stay finite under stress");
+            let calls: u64 = events.iter().map(|event| event.call_count).sum();
+            emit_calls.fetch_add(calls, Ordering::Relaxed);
+            emit_iterations.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    let cleanup_acc = Arc::clone(&accumulator);
+    let cleanup_stop = Arc::clone(&stop);
+    let cleanup_start = Arc::clone(&start);
+    let cleanup_iterations = Arc::clone(&cleaner_iterations);
+    let cleaner = thread::spawn(move || {
+        cleanup_start.wait();
+        while !cleanup_stop.load(Ordering::Relaxed) {
+            let _ = cleanup_acc.cleanup_stale_for_tests(0);
+            cleanup_iterations.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+
+    start.wait();
+    thread::sleep(Duration::from_millis(150));
+    stop.store(true, Ordering::Relaxed);
+    recorder.join().expect("recorder");
+    emitter.join().expect("emitter");
+    cleaner.join().expect("cleaner");
+
+    // Drain whatever survived concurrent cleanup.
+    let final_events = accumulator
+        .compute_deltas(&config, "node-a", 9_999, "stress-final")
+        .expect("final delta");
+    let final_calls: u64 = final_events.iter().map(|event| event.call_count).sum();
+    emitted_calls.fetch_add(final_calls, Ordering::Relaxed);
+
+    let recorded = recorded_calls.load(Ordering::Relaxed);
+    let emitted = emitted_calls.load(Ordering::Relaxed);
+    assert!(recorded > 0, "stress recorder must make progress");
+    assert!(
+        emitter_iterations.load(Ordering::Relaxed) > 0,
+        "stress emitter must make progress"
+    );
+    assert!(
+        cleaner_iterations.load(Ordering::Relaxed) > 0,
+        "stress cleaner must make progress"
+    );
+    assert!(
+        emitted <= recorded,
+        "emitted calls ({emitted}) must not exceed recorded calls ({recorded})"
+    );
+}
+
+#[test]
+fn snapshot_keeps_distinct_routes_that_share_consumer_proxy_status() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy-a", "Payments", Some("route-a"), None, "http", 200),
+        "alice",
+        charge,
+    );
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy-a", "Payments", Some("route-b"), None, "http", 200),
+        "alice",
+        charge,
+    );
+
+    let mut events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-routes")
+        .unwrap();
+    events.sort_by(|left, right| left.route_id.cmp(&right.route_id));
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].route_id.as_deref(), Some("route-a"));
+    assert_eq!(events[0].call_count, 1);
+    assert_eq!(events[1].route_id.as_deref(), Some("route-b"));
+    assert_eq!(events[1].call_count, 1);
+    assert!(events.iter().all(|event| {
+        event.consumer_id == "alice"
+            && event.proxy_id == "proxy-a"
+            && event.proxy_name == "Payments"
+            && event.status_code == 200
+            && event.protocol == "http"
+    }));
+}
+
+#[test]
+fn snapshot_identity_is_not_ambiguous_when_dimensions_contain_delimiters() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy", "name|route", Some("tail"), None, "http", 200),
+        "alice",
+        charge,
+    );
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy", "name", Some("route|tail"), None, "http", 200),
+        "alice",
+        charge,
+    );
+
+    let mut events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-delimiters")
+        .unwrap();
+    events.sort_by(|left, right| left.proxy_name.cmp(&right.proxy_name));
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].proxy_name, "name");
+    assert_eq!(events[0].route_id.as_deref(), Some("route|tail"));
+    assert_eq!(events[1].proxy_name, "name|route");
+    assert_eq!(events[1].route_id.as_deref(), Some("tail"));
+    assert!(events.iter().all(|event| event.call_count == 1));
+}
+
+#[test]
+fn snapshot_preserves_display_name_changes_as_separate_identities() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    accumulator.record_http_for_test(
+        &http_summary_with_dims(
+            "proxy-a",
+            "Payments",
+            Some("route-a"),
+            Some("Alice"),
+            "http",
+            200,
+        ),
+        "alice",
+        charge,
+    );
+    accumulator.record_http_for_test(
+        &http_summary_with_dims(
+            "proxy-a",
+            "Payments v2",
+            Some("route-a"),
+            Some("Alice Example"),
+            "http",
+            200,
+        ),
+        "alice",
+        charge,
+    );
+
+    let mut events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-names")
+        .unwrap();
+    events.sort_by(|left, right| {
+        (
+            left.consumer_name.as_deref().unwrap_or(""),
+            left.proxy_name.as_str(),
+        )
+            .cmp(&(
+                right.consumer_name.as_deref().unwrap_or(""),
+                right.proxy_name.as_str(),
+            ))
+    });
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].consumer_name.as_deref(), Some("Alice"));
+    assert_eq!(events[0].proxy_name, "Payments");
+    assert_eq!(events[0].call_count, 1);
+    assert_eq!(events[1].consumer_name.as_deref(), Some("Alice Example"));
+    assert_eq!(events[1].proxy_name, "Payments v2");
+    assert_eq!(events[1].call_count, 1);
+    assert!(
+        events.iter().all(
+            |event| event.route_id.as_deref() == Some("route-a") && event.proxy_id == "proxy-a"
+        )
+    );
+
+    // Additional traffic under the new names must delta only that identity.
+    accumulator.record_http_for_test(
+        &http_summary_with_dims(
+            "proxy-a",
+            "Payments v2",
+            Some("route-a"),
+            Some("Alice Example"),
+            "http",
+            200,
+        ),
+        "alice",
+        charge,
+    );
+    let second = accumulator
+        .compute_deltas(&config, "node-a", 200, "snap-names-2")
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].consumer_name.as_deref(), Some("Alice Example"));
+    assert_eq!(second[0].proxy_name, "Payments v2");
+    assert_eq!(second[0].call_count, 1);
+}
+
+#[test]
+fn snapshot_keeps_supported_protocols_that_share_proxy_status_separate() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    // Same consumer/proxy/route/billable+raw status — only protocol differs.
+    // These would collapse into one mislabeled aggregate if protocol were
+    // omitted from the snapshot identity (issue #2583).
+    for protocol in ["http", "http2", "http3"] {
+        accumulator.record_http_for_test(
+            &http_summary_with_dims("proxy-a", "Payments", Some("route-a"), None, protocol, 200),
+            "alice",
+            charge,
+        );
+    }
+
+    let mut events = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-protocols")
+        .unwrap();
+    events.sort_by(|left, right| left.protocol.cmp(&right.protocol));
+    assert_eq!(events.len(), 3);
+    assert_eq!(events[0].protocol, "http");
+    assert_eq!(events[1].protocol, "http2");
+    assert_eq!(events[2].protocol, "http3");
+    assert!(events.iter().all(|event| {
+        event.call_count == 1
+            && event.status_code == 200
+            && event.http_status_code == Some(200)
+            && event.grpc_status.is_none()
+            && event.route_id.as_deref() == Some("route-a")
+            && event.proxy_id == "proxy-a"
+    }));
+}
+
+#[test]
+fn snapshot_delta_and_stale_cleanup_share_revised_route_identity() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    let charge = unit_call_charge(0.01);
+
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy-a", "Payments", Some("route-a"), None, "http", 200),
+        "alice",
+        charge,
+    );
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy-a", "Payments", Some("route-b"), None, "http", 200),
+        "alice",
+        charge,
+    );
+    assert_eq!(
+        accumulator
+            .compute_deltas(&config, "node-a", 100, "snap-1")
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Only route-a receives more traffic before cleanup.
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy-a", "Payments", Some("route-a"), None, "http", 200),
+        "alice",
+        charge,
+    );
+    let delta = accumulator
+        .compute_deltas(&config, "node-a", 200, "snap-2")
+        .unwrap();
+    assert_eq!(delta.len(), 1);
+    assert_eq!(delta[0].route_id.as_deref(), Some("route-a"));
+    assert_eq!(delta[0].call_count, 1);
+
+    assert_eq!(accumulator.cleanup_stale_for_tests(0), 2);
+    assert!(
+        accumulator
+            .compute_deltas(&config, "node-a", 300, "snap-3")
+            .unwrap()
+            .is_empty(),
+        "stale cleanup must drop entries and last-emitted for every revised identity"
+    );
+
+    // Re-recording after cleanup starts fresh (full totals, not residual deltas).
+    accumulator.record_http_for_test(
+        &http_summary_with_dims("proxy-a", "Payments", Some("route-a"), None, "http", 200),
+        "alice",
+        charge,
+    );
+    let restarted = accumulator
+        .compute_deltas(&config, "node-a", 400, "snap-4")
+        .unwrap();
+    assert_eq!(restarted.len(), 1);
+    assert_eq!(restarted[0].route_id.as_deref(), Some("route-a"));
+    assert_eq!(restarted[0].call_count, 1);
+}
+
+#[test]
 fn generated_ulids_are_lexicographically_monotonic() {
     let mut previous = new_ulid();
     for _ in 0..256 {
@@ -1712,12 +2160,130 @@ fn clickhouse_status_classification_distinguishes_permanent_and_retryable() {
     assert_eq!(classify_clickhouse_http_status_for_tests(302), "retryable");
 }
 
+#[test]
+fn clickhouse_acknowledgement_requires_complete_empty_success_body() {
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(200, Some(b""), false),
+        "delivered"
+    );
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(204, Some(b""), false),
+        "delivered"
+    );
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(
+            200,
+            Some(b"Code: 60. DB::Exception: Table ferrum.charges_raw does not exist"),
+            false
+        ),
+        "permanent"
+    );
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(200, Some(b""), true),
+        "permanent"
+    );
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(200, Some(b"progress-ok"), false),
+        "retryable"
+    );
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(200, None, false),
+        "retryable"
+    );
+    assert_eq!(
+        classify_clickhouse_acknowledgement_for_tests(400, Some(b""), false),
+        "permanent"
+    );
+}
+
+#[test]
+fn durable_config_rejects_wait_for_async_insert_zero_without_lossy_opt_in() {
+    use ferrum_edge::plugins::validate_plugin_config;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["insert_query_params"] = json!({
+        "async_insert": "1",
+        "wait_for_async_insert": "0"
+    });
+    let err = validate_plugin_config("api_chargeback_sink", &config)
+        .expect_err("wait_for_async_insert=0 must be rejected in durable mode");
+    assert!(
+        err.contains("wait_for_async_insert"),
+        "error should name the setting: {err}"
+    );
+    assert!(
+        err.contains("allow_lossy_async_insert"),
+        "error should name the lossy opt-in: {err}"
+    );
+    assert!(
+        !err.contains("password") && !err.contains("charge_total"),
+        "validation errors must stay free of secrets and charge fields: {err}"
+    );
+
+    for falsy in ["false", "FALSE", "no", "off", " 0 "] {
+        config["clickhouse"]["insert_query_params"] = json!({
+            "async_insert": "1",
+            "wait_for_async_insert": falsy
+        });
+        assert!(
+            validate_plugin_config("api_chargeback_sink", &config).is_err(),
+            "falsy wait_for_async_insert={falsy:?} must be rejected"
+        );
+    }
+
+    config["clickhouse"]["insert_query_params"] = json!({
+        "async_insert": "1",
+        "wait_for_async_insert": "1"
+    });
+    assert!(
+        validate_plugin_config("api_chargeback_sink", &config).is_ok(),
+        "wait_for_async_insert=1 must remain valid"
+    );
+
+    config["clickhouse"]["insert_query_params"] = json!({
+        "async_insert": "1",
+        "wait_for_async_insert": "0"
+    });
+    config["clickhouse"]["allow_lossy_async_insert"] = json!(true);
+    assert!(
+        validate_plugin_config("api_chargeback_sink", &config).is_ok(),
+        "explicit allow_lossy_async_insert must permit wait_for_async_insert=0"
+    );
+
+    config["clickhouse"]["allow_lossy_async_insert_typo"] = json!(true);
+    let unknown = validate_plugin_config("api_chargeback_sink", &config)
+        .expect_err("unknown clickhouse keys must stay rejected");
+    assert!(
+        unknown.contains("unknown field") || unknown.contains("allow_lossy_async_insert_typo"),
+        "unknown-key rejection must mention the field: {unknown}"
+    );
+}
+
+#[test]
+fn durable_async_insert_pins_persistence_wait_when_omitted() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["insert_query_params"] = json!({"async_insert": "1"});
+    let config: ApiChargebackSinkConfig = serde_json::from_value(config).unwrap();
+    let url = url::Url::parse(&clickhouse_insert_url_for_tests(&config).unwrap()).unwrap();
+    let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+
+    assert_eq!(params.get("async_insert").map(String::as_str), Some("1"));
+    assert_eq!(
+        params.get("wait_for_async_insert").map(String::as_str),
+        Some("1"),
+        "durable async inserts must not inherit a potentially lossy server-profile default"
+    );
+}
+
 fn test_spool(temp: &tempfile::TempDir) -> SpoolManager {
     let settings = SpoolSettings {
         enabled: true,
         dir: temp.path().to_path_buf(),
         max_bytes: 1024 * 1024,
         replay_interval_secs: 60,
+        delivery_queue_capacity: 4096,
         compression: SpoolCompression::None,
     };
     SpoolManager::for_tests(settings, "node-a").unwrap()
@@ -2015,4 +2581,944 @@ async fn replay_partial_split_dead_letters_only_poison_row() {
     let requests = wait_for_requests(&server, 3).await;
     let delivered = String::from_utf8(requests[2].body.clone()).unwrap();
     assert!(delivered.contains("evt-good-row"));
+}
+
+#[tokio::test]
+async fn replay_deletes_spool_only_after_empty_200_acknowledgement() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let path = spool.write_events(&[sample_event("evt-ack-ok")]).unwrap();
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .unwrap();
+
+    assert!(
+        !path.exists(),
+        "complete empty HTTP 200 acknowledgement must delete the spool file"
+    );
+}
+
+#[tokio::test]
+async fn replay_dead_letters_http_200_exception_body_and_redacts_failure_context() {
+    let server = MockServer::start().await;
+    let exception_body =
+        "Code: 60. DB::Exception: Table ferrum.charges_raw does not exist. password=super-secret";
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(exception_body))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let path = spool
+        .write_events(&[sample_event("evt-exception-body")])
+        .unwrap();
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .unwrap();
+
+    assert_rejected_sidecar(&path, 200, "permanent_http");
+    let meta_raw = fs::read_to_string(dead_letter_meta_path(&path)).unwrap();
+    for forbidden in [
+        "super-secret",
+        "DB::Exception",
+        "charges_raw does not exist",
+        "evt-exception-body",
+        "password",
+    ] {
+        assert!(
+            !meta_raw.contains(forbidden),
+            "dead-letter metadata must not retain response or charge contents ({forbidden}): {meta_raw}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_dead_letters_http_200_exception_header() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).insert_header("X-ClickHouse-Exception-Code", "62"))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let path = spool
+        .write_events(&[sample_event("evt-exception-header")])
+        .unwrap();
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .unwrap();
+
+    assert_rejected_sidecar(&path, 200, "permanent_http");
+}
+
+#[tokio::test]
+async fn replay_keeps_spool_on_ambiguous_non_empty_200_acknowledgement() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("not-an-exception-but-not-empty"))
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let oldest = spool
+        .write_events(&[sample_event("evt-ambiguous")])
+        .unwrap();
+    let newer = spool.write_events(&[sample_event("evt-blocked")]).unwrap();
+
+    let err = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("ambiguous acknowledgement must be retryable");
+    assert!(
+        err.contains("ambiguous") || err.contains("non-empty"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !err.contains("not-an-exception-but-not-empty"),
+        "failure context must not echo the response body: {err}"
+    );
+    assert!(
+        !err.contains("evt-ambiguous") && !err.contains("charge_total"),
+        "failure context must not include charge contents: {err}"
+    );
+    assert!(oldest.exists(), "ambiguous ACK must retain the spool file");
+    assert!(
+        newer.exists(),
+        "ambiguous ACK must not advance past the oldest file"
+    );
+}
+
+#[tokio::test]
+async fn replay_retries_after_ambiguous_acknowledgement_without_double_billing_identity_change() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_mock = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .respond_with(move |_: &Request| {
+            let idx = calls_for_mock.fetch_add(1, Ordering::SeqCst);
+            if idx == 0 {
+                ResponseTemplate::new(200).set_body_string("temporary-ambiguous")
+            } else {
+                ResponseTemplate::new(200)
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool = test_spool(&temp);
+    let path = spool
+        .write_events(&[sample_event("evt-idempotent-retry")])
+        .unwrap();
+
+    let first = replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .expect_err("first ambiguous ACK must keep the file");
+    assert!(first.contains("ambiguous") || first.contains("non-empty"));
+    assert!(path.exists());
+
+    replay_spool_once_for_tests(&spool, &server.uri())
+        .await
+        .unwrap();
+    assert!(
+        !path.exists(),
+        "second empty ACK must delete the spool file"
+    );
+
+    let requests = wait_for_requests(&server, 2).await;
+    assert_eq!(requests.len(), 2);
+    let bodies: Vec<String> = requests
+        .iter()
+        .map(|request| String::from_utf8(request.body.clone()).unwrap())
+        .collect();
+    assert!(
+        bodies
+            .iter()
+            .all(|body| body.contains("evt-idempotent-retry")),
+        "retry must resend the same event_id for ReplacingMergeTree idempotency"
+    );
+    assert_eq!(
+        bodies[0], bodies[1],
+        "retry payload bytes must stay identical"
+    );
+}
+#[tokio::test]
+async fn config_validation_rejects_buffer_max_bytes_and_spool_delivery_queue() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut too_small = valid_config(temp.path());
+    too_small["batch"]["buffer_max_bytes"] = json!(1);
+    assert!(
+        ApiChargebackSink::new(&too_small, PluginHttpClient::default(), "ferrum").is_err(),
+        "tiny buffer_max_bytes must fail"
+    );
+
+    let mut bad_queue = valid_config(temp.path());
+    bad_queue["spool"]["delivery_queue_capacity"] = json!(0);
+    assert!(
+        ApiChargebackSink::new(&bad_queue, PluginHttpClient::default(), "ferrum").is_err(),
+        "zero delivery_queue_capacity must fail"
+    );
+
+    let mut ok = valid_config(temp.path());
+    ok["batch"]["buffer_max_bytes"] = json!(16_777_216);
+    ok["spool"]["delivery_queue_capacity"] = json!(128);
+    ApiChargebackSink::new(&ok, PluginHttpClient::default(), "ferrum")
+        .expect("valid byte-budget and delivery queue knobs must admit");
+}
+
+#[test]
+fn snapshot_call_count_preserves_values_above_u32_max() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    accumulator.seed_call_count_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        u32::MAX as u64,
+    );
+    let at_max = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-u32-max")
+        .unwrap();
+    assert_eq!(at_max.len(), 1);
+    assert_eq!(at_max[0].call_count, u32::MAX as u64);
+
+    let accumulator = SnapshotAccumulator::new();
+    accumulator.seed_call_count_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        (u32::MAX as u64) + 1,
+    );
+    let above = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-u32-plus-one")
+        .unwrap();
+    assert_eq!(above.len(), 1);
+    assert_eq!(above[0].call_count, (u32::MAX as u64) + 1);
+
+    let encoded = serialize_json_each_row(&above).unwrap();
+    assert!(
+        encoded.contains(&format!("\"call_count\":{}", (u32::MAX as u64) + 1)),
+        "JSONEachRow must serialize lossless u64 call_count: {encoded}"
+    );
+}
+
+#[test]
+fn snapshot_cleanup_preserves_pending_unemitted_totals() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        unit_call_charge(0.01),
+    );
+    // First-tick / never-emitted: TTL zero must not discard pending totals.
+    assert_eq!(accumulator.cleanup_stale_for_tests(0), 0);
+    let first = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-pending")
+        .unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].call_count, 1);
+
+    // After durable baseline commit, idle cleanup may remove the entry.
+    assert_eq!(accumulator.cleanup_stale_for_tests(0), 1);
+}
+
+#[test]
+fn snapshot_cleanup_preserves_pending_during_spool_outage_baseline() {
+    let config = snapshot_test_config();
+    let accumulator = SnapshotAccumulator::new();
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        unit_call_charge(0.01),
+    );
+    let _ = accumulator
+        .compute_deltas(&config, "node-a", 100, "snap-1")
+        .unwrap();
+    // Additional charge after baseline: simulates failed spool leaving baseline
+    // unadvanced while traffic stops.
+    accumulator.record_for_test(
+        "ferrum",
+        "alice",
+        "proxy-a",
+        "Payments",
+        200,
+        "http",
+        unit_call_charge(0.01),
+    );
+    assert_eq!(
+        accumulator.cleanup_stale_for_tests(0),
+        0,
+        "pending delta above durable baseline must survive stale cleanup"
+    );
+    let second = accumulator
+        .compute_deltas(&config, "node-a", 200, "snap-2")
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].call_count, 1);
+}
+
+#[test]
+fn config_validation_rejects_stale_ttl_shorter_than_snapshot_interval() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["mode"] = json!("snapshot");
+    config["snapshot"] = json!({
+        "interval_secs": 300,
+        "cleanup_interval_secs": 1,
+        "stale_entry_ttl_secs": 2
+    });
+    let err = match ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum") {
+        Ok(_) => panic!("ttl shorter than interval must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("stale_entry_ttl_secs must be >= snapshot.interval_secs"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn snapshot_cardinality_overflow_bounds_entries_and_preserves_protocol_dimensions() {
+    let temp = tempfile::tempdir().unwrap();
+    let settings = SpoolSettings {
+        enabled: true,
+        dir: temp.path().to_path_buf(),
+        max_bytes: 10 * 1024 * 1024,
+        replay_interval_secs: 3600,
+        delivery_queue_capacity: 128,
+        compression: SpoolCompression::None,
+    };
+    let spool = SpoolManager::for_tests(settings, "node-a").unwrap();
+    let accumulator = SnapshotAccumulator::with_limits(1, 16 * 1024 * 1024);
+    let charge = unit_call_charge(0.01);
+
+    // Occupy the sole accumulator slot with an HTTP identity.
+    accumulator.record_for_test("ferrum", "alice", "proxy-http", "HTTP", 200, "http", charge);
+    assert_eq!(accumulator.entry_count(), 1);
+
+    // Additional distinct identities must not expand cardinality.
+    accumulator.record_for_test(
+        "ferrum",
+        "bob",
+        "proxy-http-2",
+        "HTTP2",
+        200,
+        "http",
+        charge,
+    );
+    assert_eq!(
+        accumulator.entry_count(),
+        1,
+        "hard max_entries must reject new identities into the map"
+    );
+
+    // Durable overflow staging preserves the billable event without merging.
+    let overflow = sample_event("overflow-http");
+    assert!(accumulator.stage_overflow_event_for_tests(overflow.clone()));
+    spool.write_events(&[overflow]).unwrap();
+    let files = spool.scan_stats().unwrap();
+    assert!(files.files >= 1, "overflow must be durably spooled");
+
+    // Stream and websocket dimensions stay distinct when under budget.
+    let config = snapshot_test_config();
+    let wide = SnapshotAccumulator::with_limits(10, 16 * 1024 * 1024);
+    wide.record_for_test("ferrum", "s1", "proxy-s", "Stream", 0, "tcp", charge);
+    wide.record_for_test("ferrum", "w1", "proxy-w", "WS", 0, "ws", charge);
+    let mut events = wide
+        .compute_deltas(&config, "node-a", 100, "snap-dims")
+        .unwrap();
+    events.sort_by(|a, b| a.protocol.cmp(&b.protocol));
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].protocol, "tcp");
+    assert_eq!(events[1].protocol, "ws");
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn repeated_reload_under_permanent_spool_failure_bounds_full_generations() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_finalize_snapshot_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    // Point spool at a path that cannot accept durable writes after commit by
+    // using a regular file where a directory is required.
+    let blocked = temp.path().join("not-a-dir");
+    fs::write(&blocked, b"blocked").unwrap();
+
+    let mut plugins = Vec::new();
+    for idx in 0..4 {
+        let mut config = valid_config(temp.path());
+        config["mode"] = json!("snapshot");
+        config["spool"]["dir"] = json!(blocked.to_string_lossy());
+        config["snapshot"] = json!({
+            "interval_secs": 30,
+            "cleanup_interval_secs": 300,
+            "stale_entry_ttl_secs": 3600,
+            "max_entries": 1000,
+            "max_retained_bytes": 1_048_576
+        });
+        config["pricing_tiers"] = json!([{"status_codes": [200], "price_per_call": 0.01}]);
+        // Unique plugin-config ids so each activation is a distinct generation.
+        let plugin = ApiChargebackSink::new_with_config_id(
+            &config,
+            PluginHttpClient::default(),
+            "ferrum",
+            Some(&format!("cfg-{idx}")),
+        );
+        // Construction is shape-only; live spool prepare happens at start.
+        match plugin {
+            Ok(plugin) => {
+                if plugin.start_background_tasks().is_err() {
+                    // Fail-closed when spool cannot be prepared is acceptable.
+                    continue;
+                }
+                plugin.commit_background_tasks();
+                if let Some(acc) = api_chargeback_sink_snapshot_accumulator_for_test(&plugin) {
+                    acc.record_for_test(
+                        "ferrum",
+                        "alice",
+                        "proxy-a",
+                        "Payments",
+                        200,
+                        "http",
+                        unit_call_charge(0.01),
+                    );
+                }
+                let _ = api_chargeback_sink_finalize_snapshot_for_test(&plugin).await;
+                plugins.push(plugin);
+            }
+            Err(_) => {
+                // Fail-closed admission when pending recovery budget is exhausted
+                // is an acceptable outcome of repeated permanent spool failure.
+            }
+        }
+    }
+
+    let status: Value = serde_json::from_str(&render_status_json()).unwrap();
+    let pending = status["snapshot_finalizations_pending"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        pending <= 64,
+        "pending finalizations must stay count-bounded: {status}"
+    );
+    assert!(
+        status["snapshot_finalization_recovery_policy"]
+            .as_str()
+            .unwrap_or("")
+            .contains("restore_spool_writability"),
+        "status must expose explicit recovery policy: {status}"
+    );
+    assert!(
+        status.get("snapshot_finalizations_pending_bytes").is_some(),
+        "status must expose pending recovery bytes: {status}"
+    );
+    drop(plugins);
+}
+
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn compact_recovery_survives_subsequent_full_finalize_after_mapping() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_finalize_snapshot_for_test,
+        api_chargeback_sink_force_compact_snapshot_finalization_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+        api_chargeback_sink_snapshot_compact_recovery_registered_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+
+    let mut config = valid_config(temp.path());
+    config["mode"] = json!("snapshot");
+    config["spool"]["dir"] = json!(spool_dir.to_string_lossy());
+    config["snapshot"] = json!({
+        "interval_secs": 30,
+        "cleanup_interval_secs": 300,
+        "stale_entry_ttl_secs": 3600,
+        "max_entries": 1000,
+        "max_retained_bytes": 1_048_576
+    });
+    config["pricing_tiers"] = json!([{"status_codes": [200], "price_per_call": 0.01}]);
+
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("compact-mapping"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+    if let Some(acc) = api_chargeback_sink_snapshot_accumulator_for_test(&plugin) {
+        acc.record_for_test(
+            "ferrum",
+            "alice",
+            "proxy-a",
+            "Payments",
+            200,
+            "http",
+            unit_call_charge(0.01),
+        );
+    }
+
+    // Permanent write failure after admission: replace the spool directory with a
+    // regular file so Compact retries cannot drain recovery state.
+    fs::remove_dir_all(&spool_dir).unwrap();
+    fs::write(&spool_dir, b"blocked").unwrap();
+
+    // Transfer pending deltas to Compact while the Full handle remains alive.
+    assert!(
+        api_chargeback_sink_force_compact_snapshot_finalization_for_test(&plugin),
+        "failed finalization must compact to durable recovery state"
+    );
+    assert_eq!(
+        api_chargeback_sink_snapshot_compact_recovery_registered_for_test(&plugin),
+        Some(true),
+        "Compact recovery must own the generation after mapping"
+    );
+
+    let status_before: Value = serde_json::from_str(&render_status_json()).unwrap();
+    let pending_before = status_before["snapshot_finalizations_pending"]
+        .as_u64()
+        .unwrap_or(0);
+    let bytes_before = status_before["snapshot_finalizations_pending_bytes"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(
+        pending_before >= 1 && bytes_before > 0,
+        "compact recovery must remain observable: {status_before}"
+    );
+
+    // A later Full finalize against the cleared accumulator must not unregister
+    // Compact or claim empty success that drops billable recovery state.
+    let _ = api_chargeback_sink_finalize_snapshot_for_test(&plugin).await;
+    assert_eq!(
+        api_chargeback_sink_snapshot_compact_recovery_registered_for_test(&plugin),
+        Some(true),
+        "Full finalize after compaction must preserve Compact ownership while spool remains unwritable"
+    );
+
+    let status_after: Value = serde_json::from_str(&render_status_json()).unwrap();
+    assert!(
+        status_after["snapshot_finalizations_pending"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "pending compact recovery must survive Full remapping attempts: {status_after}"
+    );
+    assert!(
+        status_after["snapshot_finalizations_pending_bytes"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
+        "compact retained bytes must survive Full remapping attempts: {status_after}"
+    );
+    drop(plugin);
+}
+
+fn snapshot_sink_config(spool_dir: &Path, max_entries: usize) -> Value {
+    let mut config = valid_config(spool_dir);
+    config["mode"] = json!("snapshot");
+    config["spool"]["dir"] = json!(spool_dir.to_string_lossy());
+    config["snapshot"] = json!({
+        "interval_secs": 30,
+        "cleanup_interval_secs": 300,
+        "stale_entry_ttl_secs": 3600,
+        "max_entries": max_entries,
+        "max_retained_bytes": 16_777_216
+    });
+    config["pricing_tiers"] = json!([{"status_codes": [200], "price_per_call": 0.01}]);
+    config
+}
+
+/// Issue #1: overflow delivery is bounded, owned, non-blocking, and only counts
+/// a durable success after the async worker's blocking write genuinely lands.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_overflow_delivery_is_nonblocking_and_durably_acknowledged() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_snapshot_overflow_counters_for_test,
+        api_chargeback_sink_spool_snapshot_overflow_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("overflow-async"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    // Route a cardinality overflow charge through the non-blocking delivery path.
+    assert!(api_chargeback_sink_spool_snapshot_overflow_for_test(
+        &plugin,
+        sample_event("overflow-async-1")
+    ));
+
+    // Durable-success counters advance only after the worker's blocking write.
+    let mut spooled = 0u64;
+    for _ in 0..200 {
+        let (s, pending, rejections) =
+            api_chargeback_sink_snapshot_overflow_counters_for_test(&plugin).unwrap();
+        assert_eq!(rejections, 0, "a writable spool must never record a loss");
+        assert_eq!(
+            pending, 0,
+            "a writable spool must not stage bounded overflow"
+        );
+        if s >= 1 {
+            spooled = s;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        spooled, 1,
+        "overflow charge must be durably spooled via the bounded async worker"
+    );
+    assert!(
+        disk_owned_bytes(&spool_dir) > 0,
+        "durable overflow acknowledgement must leave a spool file on disk"
+    );
+    drop(plugin);
+}
+
+/// Issue #1: when the async spool write fails, the exact overflow event is
+/// re-staged in bounded overflow (not silently lost) and no cardinality loss is
+/// recorded while bounded staging still has room.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_overflow_delivery_write_failure_stages_within_bound() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_snapshot_overflow_counters_for_test,
+        api_chargeback_sink_spool_snapshot_overflow_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("overflow-async-fallback"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    // Make every spool write fail by replacing the directory with a file.
+    fs::remove_dir_all(&spool_dir).unwrap();
+    fs::write(&spool_dir, b"blocked").unwrap();
+
+    assert!(api_chargeback_sink_spool_snapshot_overflow_for_test(
+        &plugin,
+        sample_event("overflow-async-fallback-1")
+    ));
+
+    let mut pending_seen = 0u64;
+    for _ in 0..200 {
+        let (spooled, pending, rejections) =
+            api_chargeback_sink_snapshot_overflow_counters_for_test(&plugin).unwrap();
+        assert_eq!(
+            spooled, 0,
+            "a failed write must not count a durable success"
+        );
+        assert_eq!(
+            rejections, 0,
+            "bounded staging still has room, so no cardinality loss"
+        );
+        if pending >= 1 {
+            pending_seen = pending;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        pending_seen, 1,
+        "a failed async write must re-stage the exact event in bounded overflow"
+    );
+    drop(plugin);
+}
+
+/// A queued overflow owns its recovery payload until durable success. Aborting
+/// an uncommitted delivery worker must re-stage that payload before releasing
+/// lifecycle delivery ownership.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn snapshot_overflow_queue_abort_restages_before_delivery_release() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_abort_spool_delivery_for_test,
+        api_chargeback_sink_snapshot_overflow_counters_for_test,
+        api_chargeback_sink_spool_snapshot_overflow_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("overflow-abort-recovery"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+
+    // Leave the worker behind its commit gate so the event is certainly queued
+    // when abort drops the receiver.
+    assert!(api_chargeback_sink_spool_snapshot_overflow_for_test(
+        &plugin,
+        sample_event("overflow-abort-recovery-1")
+    ));
+    assert!(api_chargeback_sink_abort_spool_delivery_for_test(&plugin));
+
+    let mut pending_seen = 0u64;
+    for _ in 0..200 {
+        let (spooled, pending, rejections) =
+            api_chargeback_sink_snapshot_overflow_counters_for_test(&plugin).unwrap();
+        assert_eq!(spooled, 0, "an uncommitted worker cannot spool the event");
+        assert_eq!(
+            rejections, 0,
+            "bounded recovery has room and must not record loss"
+        );
+        if pending >= 1 {
+            pending_seen = pending;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        pending_seen, 1,
+        "worker abort must re-stage its queued snapshot overflow payload"
+    );
+    drop(plugin);
+}
+
+/// Issue #2: compaction refuses to clear full-generation state while an
+/// admission guard is held and succeeds on retry once the admitted hook drains.
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn compaction_refuses_while_admitted_and_succeeds_after_drain() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_compact_refuses_while_admitted_then_succeeds_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1000);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("compaction-quiescence"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    // Seed a pending delta so compaction has real state to transfer.
+    if let Some(acc) = api_chargeback_sink_snapshot_accumulator_for_test(&plugin) {
+        acc.record_for_test(
+            "ferrum",
+            "alice",
+            "proxy-a",
+            "Payments",
+            200,
+            "http",
+            unit_call_charge(0.01),
+        );
+    }
+
+    let (refused_while_admitted, compacted_after_drain) =
+        api_chargeback_sink_compact_refuses_while_admitted_then_succeeds_for_test(&plugin)
+            .expect("snapshot lifecycle must exist");
+    assert!(
+        refused_while_admitted,
+        "compaction must refuse to clear full state while an admission guard is held"
+    );
+    assert!(
+        compacted_after_drain,
+        "compaction must succeed once the admitted hook has drained"
+    );
+    drop(plugin);
+}
+
+#[tokio::test]
+async fn compaction_refuses_while_overflow_delivery_can_stage_back() {
+    use ferrum_edge::_test_support::{
+        api_chargeback_sink_compact_refuses_while_overflow_delivery_for_test,
+        api_chargeback_sink_snapshot_accumulator_for_test,
+    };
+
+    let temp = tempfile::tempdir().unwrap();
+    let spool_dir = temp.path().join("spool");
+    fs::create_dir_all(&spool_dir).unwrap();
+    let config = snapshot_sink_config(&spool_dir, 1000);
+    let plugin = ApiChargebackSink::new_with_config_id(
+        &config,
+        PluginHttpClient::default(),
+        "ferrum",
+        Some("compaction-delivery-quiescence"),
+    )
+    .expect("construct snapshot sink");
+    plugin
+        .start_background_tasks()
+        .expect("start snapshot sink");
+    plugin.commit_background_tasks();
+
+    if let Some(acc) = api_chargeback_sink_snapshot_accumulator_for_test(&plugin) {
+        assert!(acc.stage_overflow_event_for_tests(sample_event("delivery-pending")));
+    }
+
+    let (refused_while_delivery, compacted_after_drain) =
+        api_chargeback_sink_compact_refuses_while_overflow_delivery_for_test(&plugin)
+            .expect("snapshot lifecycle");
+    assert!(
+        refused_while_delivery,
+        "compaction must retain Full ownership while a delivery can stage back"
+    );
+    assert!(
+        compacted_after_drain,
+        "compaction should succeed after overflow delivery ownership drains"
+    );
+    drop(plugin);
+}
+
+/// Issue #3: concurrent new-key insertion, same-key refresh, and overflow
+/// staging never push the accumulator past its hard entry/byte ceilings, and no
+/// charge is double-counted or silently dropped.
+#[test]
+fn snapshot_admission_reservation_never_exceeds_hard_limits_under_concurrency() {
+    const MAX_ENTRIES: usize = 64;
+    // Small enough that the retained-byte ceiling also binds before max_entries.
+    const MAX_BYTES: usize = 8 * 1024;
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 4_000;
+    // More distinct identities than the entry ceiling forces overflow, and
+    // reusing them across all threads forces new-key/refresh races on hot keys.
+    const DISTINCT_KEYS: usize = 200;
+
+    let accumulator = Arc::new(SnapshotAccumulator::with_limits(MAX_ENTRIES, MAX_BYTES));
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let accumulated = Arc::new(AtomicU64::new(0));
+    let overflowed = Arc::new(AtomicU64::new(0));
+
+    let mut handles = Vec::new();
+    for t in 0..THREADS {
+        let acc = Arc::clone(&accumulator);
+        let barrier = Arc::clone(&barrier);
+        let accumulated = Arc::clone(&accumulated);
+        let overflowed = Arc::clone(&overflowed);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            for i in 0..PER_THREAD {
+                let key = (i + t) % DISTINCT_KEYS;
+                let consumer = format!("consumer-{key}");
+                let accepted = acc.record_accumulated_for_test(
+                    "ferrum",
+                    &consumer,
+                    "proxy",
+                    "Proxy",
+                    200,
+                    "http",
+                    unit_call_charge(0.01),
+                );
+                if accepted {
+                    accumulated.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    overflowed.fetch_add(1, Ordering::Relaxed);
+                }
+                // Race overflow staging against entry admission on the shared
+                // combined byte ceiling from some threads.
+                if t % 2 == 0 && i % 8 == 0 {
+                    let _ =
+                        acc.stage_overflow_event_for_tests(sample_event(&format!("ov-{t}-{i}")));
+                }
+                // Hard ceilings must hold at every observation.
+                assert!(
+                    acc.entry_count() <= MAX_ENTRIES,
+                    "entry count exceeded the hard ceiling"
+                );
+                assert!(
+                    acc.retained_bytes_for_tests() <= MAX_BYTES,
+                    "combined retained bytes exceeded the hard ceiling"
+                );
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let total = (THREADS * PER_THREAD) as u64;
+    let accumulated = accumulated.load(Ordering::Relaxed);
+    let overflowed = overflowed.load(Ordering::Relaxed);
+    assert_eq!(
+        accumulated + overflowed,
+        total,
+        "every record must be accumulated or overflowed exactly once"
+    );
+    assert!(
+        overflowed > 0,
+        "the test must actually exercise the overflow path"
+    );
+    // No double-count and no silent drop: one call per accumulated record means
+    // the summed call_count across live entries must equal the accumulated count.
+    assert_eq!(
+        accumulator.total_call_count_for_tests(),
+        accumulated,
+        "accumulated call_count must equal the accumulated record count"
+    );
+    assert!(accumulator.entry_count() <= MAX_ENTRIES);
+    assert!(accumulator.retained_bytes_for_tests() <= MAX_BYTES);
 }

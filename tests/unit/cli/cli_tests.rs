@@ -3,7 +3,7 @@
 use clap::Parser;
 use ferrum_edge::cli::{
     Cli, Command, HealthArgs, ReloadArgs, RunArgs, ValidateArgs, VersionArgs, execute_health,
-    resolve_settings_path, resolve_spec_path,
+    resolve_settings_path, resolve_spec_path, select_gateway_pid,
 };
 use std::path::Path;
 use tempfile::TempDir;
@@ -167,8 +167,82 @@ fn test_parse_validate_with_spec() {
         Some(Command::Validate(args)) => {
             assert_eq!(args.spec.unwrap().to_str().unwrap(), "/path/to/config.yaml");
             assert!(args.settings.is_none());
+            assert!(args.mode.is_none());
+            assert_eq!(args.verbose, 0);
         }
         _ => panic!("Expected Validate command"),
+    }
+}
+
+#[test]
+fn test_parse_validate_with_mode_and_spec() {
+    let cli = Cli::try_parse_from([
+        "ferrum-edge",
+        "validate",
+        "-m",
+        "file",
+        "-c",
+        "/path/to/config.yaml",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Command::Validate(args)) => {
+            assert_eq!(args.mode.as_deref(), Some("file"));
+            assert_eq!(args.spec.unwrap().to_str().unwrap(), "/path/to/config.yaml");
+            assert_eq!(args.verbose, 0);
+        }
+        _ => panic!("Expected Validate command"),
+    }
+}
+
+#[test]
+fn test_parse_validate_with_mode_verbose() {
+    let cli = Cli::try_parse_from(["ferrum-edge", "validate", "-m", "file", "-vv"]).unwrap();
+    match cli.command {
+        Some(Command::Validate(args)) => {
+            assert_eq!(args.mode.as_deref(), Some("file"));
+            assert_eq!(args.verbose, 2);
+        }
+        _ => panic!("Expected Validate command"),
+    }
+}
+
+#[test]
+fn test_parse_validate_short_flags() {
+    let cli = Cli::try_parse_from([
+        "ferrum-edge",
+        "validate",
+        "-s",
+        "f.conf",
+        "-c",
+        "r.yaml",
+        "-m",
+        "cp",
+    ])
+    .unwrap();
+    match cli.command {
+        Some(Command::Validate(args)) => {
+            assert_eq!(args.settings.unwrap().to_str().unwrap(), "f.conf");
+            assert_eq!(args.spec.unwrap().to_str().unwrap(), "r.yaml");
+            assert_eq!(args.mode.as_deref(), Some("cp"));
+        }
+        _ => panic!("Expected Validate command"),
+    }
+}
+
+#[test]
+fn test_parse_validate_verbose_levels() {
+    for (flags, expected) in [
+        (vec!["ferrum-edge", "validate", "-v"], 1),
+        (vec!["ferrum-edge", "validate", "-vv"], 2),
+        (vec!["ferrum-edge", "validate", "-vvv"], 3),
+        (vec!["ferrum-edge", "validate", "--verbose", "--verbose"], 2),
+    ] {
+        let cli = Cli::try_parse_from(flags).unwrap();
+        match cli.command {
+            Some(Command::Validate(args)) => assert_eq!(args.verbose, expected),
+            _ => panic!("Expected Validate command"),
+        }
     }
 }
 
@@ -188,6 +262,87 @@ fn test_parse_reload_no_pid() {
         Some(Command::Reload(args)) => assert!(args.pid.is_none()),
         _ => panic!("Expected Reload command"),
     }
+}
+
+// ── select_gateway_pid tests ─────────────────────────────────────────────────
+
+#[test]
+fn test_select_gateway_pid_only_self_returns_not_found() {
+    let self_pid = 12345;
+    let result = select_gateway_pid(vec![self_pid], self_pid);
+    assert!(result.is_err());
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("No running ferrum-edge process"),
+        "expected 'no process' error, got: {msg}"
+    );
+}
+
+#[test]
+fn test_select_gateway_pid_one_gateway_plus_self_returns_gateway() {
+    let self_pid = 12345;
+    let gw_pid = 999;
+    let result = select_gateway_pid(vec![gw_pid, self_pid], self_pid);
+    assert_eq!(result.unwrap(), gw_pid);
+}
+
+#[test]
+fn test_select_gateway_pid_two_gateways_plus_self_returns_error() {
+    let self_pid = 12345;
+    let a = 100;
+    let b = 200;
+    let result = select_gateway_pid(vec![a, b, self_pid], self_pid);
+    assert!(result.is_err());
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("Found 2 ferrum-edge processes"),
+        "expected 'found 2' error, got: {msg}"
+    );
+    assert!(msg.contains("100"), "error should list PID 100: {msg}");
+    assert!(msg.contains("200"), "error should list PID 200: {msg}");
+    assert!(
+        !msg.contains("12345"),
+        "error must not list the self PID: {msg}"
+    );
+}
+
+#[test]
+fn test_select_gateway_pid_empty_returns_not_found() {
+    let self_pid = 12345;
+    let result = select_gateway_pid(vec![], self_pid);
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .contains("No running ferrum-edge process")
+    );
+}
+
+#[test]
+fn test_select_gateway_pid_two_gateways_without_self_returns_error() {
+    let self_pid = 12345;
+    let a = 100;
+    let b = 200;
+    let result = select_gateway_pid(vec![a, b], self_pid);
+    assert!(result.is_err());
+    let msg = result.unwrap_err();
+    assert!(msg.contains("Found 2 ferrum-edge processes"), "got: {msg}");
+}
+
+#[test]
+fn test_select_gateway_pid_self_not_in_list_returns_gateway() {
+    let self_pid = 12345;
+    let gw_pid = 999;
+    let result = select_gateway_pid(vec![gw_pid], self_pid);
+    assert_eq!(result.unwrap(), gw_pid);
+}
+
+#[test]
+fn test_select_gateway_pid_excludes_self_from_many() {
+    let self_pid = 12345;
+    let gw_pid = 999;
+    let result = select_gateway_pid(vec![gw_pid, self_pid, self_pid], self_pid);
+    assert_eq!(result.unwrap(), gw_pid);
 }
 
 #[test]
@@ -635,6 +790,8 @@ fn test_validate_explicit_spec_does_not_override_conf_file_mode() {
             let args = ValidateArgs {
                 settings: Some(conf_path),
                 spec: Some(spec_path),
+                mode: None,
+                verbose: 0,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             ferrum_edge::cli::infer_file_mode();
@@ -665,6 +822,8 @@ fn test_apply_validate_overrides_sets_spec_path() {
             let args = ValidateArgs {
                 settings: None,
                 spec: Some("/etc/ferrum/config.yaml".into()),
+                mode: None,
+                verbose: 0,
             };
             ferrum_edge::cli::apply_validate_overrides(&args);
             assert_eq!(
@@ -673,6 +832,172 @@ fn test_apply_validate_overrides_sets_spec_path() {
             );
             ferrum_edge::cli::infer_file_mode();
             assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
+        },
+    );
+}
+
+#[test]
+fn test_apply_validate_overrides_sets_mode() {
+    without_env_vars(
+        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        || {
+            let temp_dir = TempDir::new().unwrap();
+            pin_absent_conf_file(&temp_dir);
+            let args = ValidateArgs {
+                settings: None,
+                spec: None,
+                mode: Some("file".to_string()),
+                verbose: 0,
+            };
+            ferrum_edge::cli::apply_validate_overrides(&args);
+            assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
+        },
+    );
+}
+
+#[test]
+fn test_apply_validate_overrides_explicit_mode_not_overridden_by_spec() {
+    without_env_vars(
+        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        || {
+            let temp_dir = TempDir::new().unwrap();
+            pin_absent_conf_file(&temp_dir);
+            let args = ValidateArgs {
+                settings: None,
+                spec: Some("/tmp/spec.yaml".into()),
+                mode: Some("database".to_string()),
+                verbose: 0,
+            };
+            ferrum_edge::cli::apply_validate_overrides(&args);
+            ferrum_edge::cli::infer_file_mode();
+            assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "database");
+        },
+    );
+}
+
+#[test]
+fn test_apply_validate_overrides_verbose_levels() {
+    without_env_vars(
+        &[
+            "FERRUM_MODE",
+            "FERRUM_LOG_LEVEL",
+            "FERRUM_CONF_PATH",
+            "FERRUM_FILE_CONFIG_PATH",
+        ],
+        || {
+            for (level, expected) in [(1, "info"), (2, "debug"), (3, "trace"), (4, "trace")] {
+                let args = ValidateArgs {
+                    settings: None,
+                    spec: None,
+                    mode: Some("file".to_string()),
+                    verbose: level,
+                };
+                ferrum_edge::cli::apply_validate_overrides(&args);
+                assert_eq!(std::env::var("FERRUM_LOG_LEVEL").unwrap(), expected);
+                unsafe {
+                    std::env::remove_var("FERRUM_LOG_LEVEL");
+                    std::env::remove_var("FERRUM_MODE");
+                };
+            }
+        },
+    );
+}
+
+#[test]
+fn test_apply_validate_overrides_no_verbose_does_not_set_log_level() {
+    without_env_vars(
+        &[
+            "FERRUM_MODE",
+            "FERRUM_LOG_LEVEL",
+            "FERRUM_CONF_PATH",
+            "FERRUM_FILE_CONFIG_PATH",
+        ],
+        || {
+            let args = ValidateArgs {
+                settings: None,
+                spec: None,
+                mode: Some("file".to_string()),
+                verbose: 0,
+            };
+            ferrum_edge::cli::apply_validate_overrides(&args);
+            assert!(std::env::var("FERRUM_LOG_LEVEL").is_err());
+        },
+    );
+}
+
+#[test]
+fn test_validate_mode_and_spec_sets_env_before_infer() {
+    without_env_vars(
+        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        || {
+            let temp_dir = TempDir::new().unwrap();
+            pin_absent_conf_file(&temp_dir);
+            let args = ValidateArgs {
+                settings: None,
+                spec: Some("/tmp/config.yaml".into()),
+                mode: Some("file".to_string()),
+                verbose: 0,
+            };
+            ferrum_edge::cli::apply_validate_overrides(&args);
+            assert_eq!(
+                std::env::var("FERRUM_FILE_CONFIG_PATH").unwrap(),
+                "/tmp/config.yaml"
+            );
+            assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
+            ferrum_edge::cli::infer_file_mode();
+            assert_eq!(std::env::var("FERRUM_MODE").unwrap(), "file");
+        },
+    );
+}
+
+#[test]
+fn test_apply_validate_overrides_mode_wins_over_env() {
+    without_env_vars(
+        &["FERRUM_MODE", "FERRUM_CONF_PATH", "FERRUM_FILE_CONFIG_PATH"],
+        || {
+            // Seed a lower-precedence env value, then apply CLI `-m`.
+            unsafe { std::env::set_var("FERRUM_MODE", "database") };
+            let args = ValidateArgs {
+                settings: None,
+                spec: None,
+                mode: Some("file".to_string()),
+                verbose: 0,
+            };
+            ferrum_edge::cli::apply_validate_overrides(&args);
+            assert_eq!(
+                std::env::var("FERRUM_MODE").unwrap(),
+                "file",
+                "CLI -m must overwrite a pre-existing FERRUM_MODE env value"
+            );
+            unsafe { std::env::remove_var("FERRUM_MODE") };
+        },
+    );
+}
+
+#[test]
+fn test_apply_validate_overrides_verbose_wins_over_env() {
+    without_env_vars(
+        &[
+            "FERRUM_MODE",
+            "FERRUM_LOG_LEVEL",
+            "FERRUM_CONF_PATH",
+            "FERRUM_FILE_CONFIG_PATH",
+        ],
+        || {
+            unsafe { std::env::set_var("FERRUM_LOG_LEVEL", "error") };
+            let args = ValidateArgs {
+                settings: None,
+                spec: None,
+                mode: None,
+                verbose: 2,
+            };
+            ferrum_edge::cli::apply_validate_overrides(&args);
+            assert_eq!(
+                std::env::var("FERRUM_LOG_LEVEL").unwrap(),
+                "debug",
+                "CLI -vv must overwrite a pre-existing FERRUM_LOG_LEVEL env value"
+            );
+            unsafe { std::env::remove_var("FERRUM_LOG_LEVEL") };
         },
     );
 }

@@ -8,7 +8,7 @@
 use crate::config::types::CircuitBreakerConfig;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use tracing::{info, warn};
 
 const STATE_CLOSED: u8 = 0;
@@ -581,8 +581,17 @@ pub fn target_key(host: &str, port: u16) -> String {
 /// Cache of circuit breakers, keyed per proxy unless dispatch supplies an
 /// effective target (`proxy_id::host:port`) for upstream targets or direct
 /// backend overrides.
+///
+/// Admission uses an atomic entry counter coordinated with DashMap `entry`
+/// semantics so concurrent same-key creation, changed-config replacement, and
+/// distinct-key capacity checks stay correct without a process-wide lock.
+/// Matching-config hits stay on the shard read path (`DashMap::get`).
 pub struct CircuitBreakerCache {
     breakers: DashMap<String, Arc<CircuitBreaker>>,
+    /// Exact resident-entry count coordinated with insert/remove. Capacity
+    /// admission loads this atomic instead of `DashMap::len()`, which would
+    /// take a read guard on every shard.
+    entry_count: AtomicUsize,
     max_entries: usize,
 }
 
@@ -599,8 +608,16 @@ impl CircuitBreakerCache {
     }
 
     pub fn with_max_entries(max_entries: usize) -> Self {
+        Self::with_max_entries_and_shard_amount(
+            max_entries,
+            crate::util::sharding::pool_shard_amount(0),
+        )
+    }
+
+    pub fn with_max_entries_and_shard_amount(max_entries: usize, shard_amount: usize) -> Self {
         Self {
-            breakers: DashMap::new(),
+            breakers: DashMap::with_shard_amount(shard_amount),
+            entry_count: AtomicUsize::new(0),
             max_entries,
         }
     }
@@ -611,31 +628,73 @@ impl CircuitBreakerCache {
     /// a concrete upstream target or direct backend override, and `None` when a
     /// direct backend proxy should use one breaker for the proxy.
     /// If the config has changed, replaces the breaker with a fresh one.
+    ///
+    /// Concurrent callers for the same key/config generation receive the same
+    /// `Arc`. New distinct keys are admitted only while under `max_entries`;
+    /// when the cache is genuinely full, a **transient** (uncached) breaker is
+    /// returned so the request can still proceed without retaining split or
+    /// unbounded state. Existing keys remain replaceable at capacity (config
+    /// change).
     pub fn get_or_create(
         &self,
         proxy_id: &str,
         target_key: Option<&str>,
         config: &CircuitBreakerConfig,
     ) -> Arc<CircuitBreaker> {
+        use dashmap::mapref::entry::Entry;
+
         let key = circuit_breaker_key(proxy_id, target_key);
+        // Hot path: matching-config hits use a shard read lock only.
         if let Some(existing) = self.breakers.get(&key)
             && existing.config() == config
         {
             return existing.clone();
         }
-        // Enforce max entries: if at capacity and this is a genuinely new key,
-        // skip creating a breaker. Existing keys are always replaced (config change).
-        if self.breakers.len() >= self.max_entries && !self.breakers.contains_key(&key) {
-            warn!(
-                "Circuit breaker cache at capacity ({}), skipping new entry for {}",
-                self.max_entries, key
-            );
-            // Return a transient breaker that won't be cached
-            return Arc::new(CircuitBreaker::new(config.clone()));
+
+        // Miss or config change: per-key entry API holds the shard write lock
+        // for create/replace so concurrent same-key callers share one Arc, and
+        // vacant keys reserve capacity before publishing.
+        match self.breakers.entry(key) {
+            Entry::Occupied(mut occupied) => {
+                if occupied.get().config() == config {
+                    return occupied.get().clone();
+                }
+                let cb = Arc::new(CircuitBreaker::new(config.clone()));
+                occupied.insert(cb.clone());
+                cb
+            }
+            Entry::Vacant(vacant) => {
+                if !self.try_reserve_entry_slot() {
+                    warn!(
+                        "Circuit breaker cache at capacity ({}), skipping new entry for {}",
+                        self.max_entries,
+                        vacant.key()
+                    );
+                    // Transient breaker: not cached, so overflow traffic does
+                    // not retain state across requests and cannot grow the map.
+                    return Arc::new(CircuitBreaker::new(config.clone()));
+                }
+                let cb = Arc::new(CircuitBreaker::new(config.clone()));
+                vacant.insert(cb.clone());
+                cb
+            }
         }
-        let cb = Arc::new(CircuitBreaker::new(config.clone()));
-        self.breakers.insert(key, cb.clone());
-        cb
+    }
+
+    fn try_reserve_entry_slot(&self) -> bool {
+        self.entry_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < self.max_entries).then_some(count + 1)
+            })
+            .is_ok()
+    }
+
+    fn release_entry_slot(&self) {
+        let _ = self
+            .entry_count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            });
     }
 
     /// Read-only lookup of the breaker currently cached for a proxy (+target),
@@ -719,10 +778,14 @@ impl CircuitBreakerCache {
     /// (`proxy_id::host:port`) for each removed proxy.
     pub fn prune(&self, removed_proxy_ids: &[String]) {
         self.breakers.retain(|key, _| {
-            !removed_proxy_ids.iter().any(|id| {
+            let keep = !removed_proxy_ids.iter().any(|id| {
                 // Match exact proxy_id key or proxy_id:: prefix for target-scoped keys
                 key == id || key.starts_with(&format!("{id}::"))
-            })
+            });
+            if !keep {
+                self.release_entry_slot();
+            }
+            keep
         });
     }
 
@@ -735,20 +798,24 @@ impl CircuitBreakerCache {
             if !key.contains("::") {
                 return true;
             }
-            active_target_keys.contains(key)
+            let keep = active_target_keys.contains(key);
+            if !keep {
+                self.release_entry_slot();
+            }
+            keep
         });
     }
 
     /// Current number of entries in the cache.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
-        self.breakers.len()
+        self.entry_count.load(Ordering::Acquire)
     }
 
     /// Whether the cache is empty.
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.breakers.is_empty()
+        self.len() == 0
     }
 }
 

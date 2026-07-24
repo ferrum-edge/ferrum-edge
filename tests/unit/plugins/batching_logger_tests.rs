@@ -883,6 +883,41 @@ async fn batching_logger_close_and_await_aborts_when_uncommitted() {
     );
 }
 
+#[tokio::test]
+async fn committed_close_drains_with_published_handle_still_alive() {
+    let flushed = Arc::new(AtomicUsize::new(0));
+    let flushed_cb = Arc::clone(&flushed);
+    let mut logger = BatchingLogger::spawn(
+        test_logger_config("batching_logger_structured_close", 10, 8),
+        move |batch: Vec<u32>| {
+            flushed_cb.fetch_add(batch.len(), Ordering::SeqCst);
+            async move { Ok(()) }
+        },
+    );
+    logger.commit();
+    let handle = logger.handle().expect("published handle");
+    assert!(handle.try_send(9));
+
+    let closed = timeout(Duration::from_secs(1), logger.close_and_await())
+        .await
+        .expect("structured close must not wait for sender clones");
+    assert!(closed);
+    assert_eq!(flushed.load(Ordering::SeqCst), 1);
+    assert!(
+        logger.close_and_await().await,
+        "repeated structured close should remain successful"
+    );
+    assert_eq!(
+        flushed.load(Ordering::SeqCst),
+        1,
+        "idempotent close must not deliver the final batch twice"
+    );
+    assert!(
+        !handle.try_send(10),
+        "worker admission must close before the final drain"
+    );
+}
+
 /// Deferred helpers expose the staged logger for lifecycle observers.
 #[tokio::test]
 async fn deferred_batching_logger_get_returns_staged_logger() {

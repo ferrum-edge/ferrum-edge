@@ -2,11 +2,35 @@
 //!
 //! Supports gzip and brotli algorithms. Response compression is negotiated via
 //! the client's `Accept-Encoding` header (RFC 9110 §12.5.3). Request
-//! decompression is opt-in: when enabled, supported `Content-Encoding: gzip|br`
-//! request bodies are decoded in the shared pre-`before_proxy` normalization
-//! phase so earlier body consumers (for example `soap_ws_security`) inspect
-//! validated plaintext. The same plaintext is forwarded to the backend after
-//! encoding/length headers are stripped only on successful decode.
+//! decompression is opt-in: when enabled, `Content-Encoding` is parsed as an
+//! ordered coding list (OWS-tolerant), supported chains are decoded in reverse
+//! application order under per-layer/cumulative/amplification limits, and
+//! malformed or unsupported members fail closed. Decoding runs in the shared
+//! pre-`before_proxy` normalization phase so earlier body consumers (for
+//! example `soap_ws_security`) inspect validated plaintext. The same plaintext
+//! is forwarded to the backend after encoding/length headers are stripped only
+//! on successful decode. Rare buffered fallback paths that strip headers without
+//! a mutable body view stage the validated plaintext onto the request context
+//! so the later transform emits those bytes instead of re-decoding.
+//!
+//! Gzip/Brotli codec CPU runs on a bounded `spawn_blocking` pool guarded by an
+//! admission semaphore so Tokio workers are not monopolized. Queue saturation
+//! and worker-join failures are exported on the authenticated Prometheus
+//! `/metrics` surface. When a committed gateway `Content-Encoding` cannot be
+//! produced, shared H1/H2/H3 buffered transforms restore an identity response
+//! with matching headers rather than emitting a mislabeled body.
+//!
+//! Response compression reserves its codec admission in `before_proxy`, ahead of
+//! the response-buffer decision, so the same semaphore also bounds the
+//! population of response bodies collected for compression rather than only the
+//! codec workers. A request that negotiates a supported coding but cannot obtain
+//! a bounded permit streams identity instead of pinning a (possibly unbounded)
+//! body onto the compression-only buffered path; `after_proxy` consumes the
+//! reserved permit and never reacquires once a streaming/identity path is
+//! chosen, failing closed with 406 only when identity is prohibited.
+//! Response compression is also disabled when the gateway response-body limit is
+//! unlimited or exceeds the 32 MiB compression safety ceiling, so every body
+//! admitted to compression buffering has a hard per-response byte bound.
 //!
 //! Multiple effective instances compose with first-wins ownership: one instance
 //! owns request decode and one owns response encode per request so Content-
@@ -21,13 +45,20 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{Read, Write};
+use std::future::Future;
+use std::io::Write;
+use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, warn};
 
 use crate::util::http_headers::{headers_have_cache_control_directive, headers_have_strong_etag};
 use crate::util::unknown_keys::reject_unknown_keys;
 
+use super::utils::content_encoding::{
+    DecodeLimits, decode_content_encoding, parse_content_codings,
+};
 use super::{Plugin, PluginResult, RequestContext};
 
 /// Accepted top-level `compression` config keys.
@@ -44,6 +75,46 @@ pub const COMPRESSION_CONFIG_KEYS: &[&str] = &[
     "min_content_length",
     "remove_accept_encoding",
 ];
+
+/// Deployment-safe hard ceiling for `max_decompressed_request_size` (32 MiB).
+///
+/// Configuration above this value is rejected. The effective limit is further
+/// capped by `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` when that wire limit is set.
+pub const HARD_MAX_DECOMPRESSED_REQUEST_SIZE: usize = 32 * 1024 * 1024;
+
+/// Default `max_decompressed_request_size` (10 MiB).
+const DEFAULT_MAX_DECOMPRESSED_REQUEST_SIZE: usize = 10 * 1024 * 1024;
+
+/// Hard ceiling for a response that compression may force onto the buffered
+/// path. The shared response collector enforces the configured gateway limit;
+/// compression is disabled when that limit is `0` (unlimited) or above this
+/// ceiling so the plugin cannot introduce an unbounded full-body allocation.
+pub const HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE: usize = 32 * 1024 * 1024;
+
+/// Maximum stacked request content-coding layers decoded for one upload.
+const REQUEST_DECODE_MAX_CODINGS: usize = 4;
+
+/// Abort early when a decoded layer (or the final plaintext) expands more than
+/// this multiple of its coded input. Absolute size caps still apply.
+const MAX_RAW_TO_DECODED_AMPLIFICATION_RATIO: u32 = 1024;
+
+/// Maximum concurrent gzip/Brotli codec jobs across all compression instances.
+pub const MAX_CONCURRENT_CODEC_JOBS: usize = 32;
+
+static NEXT_COMPRESSION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+static CODEC_BUDGET: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_CODEC_JOBS)));
+static CODEC_ADMITTED: AtomicU64 = AtomicU64::new(0);
+static CODEC_SATURATED: AtomicU64 = AtomicU64::new(0);
+static CODEC_JOIN_FAILURES: AtomicU64 = AtomicU64::new(0);
+static CODEC_WORKER_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+tokio::task_local! {
+    /// Test-only injected codec budget. When set, admission uses this semaphore
+    /// instead of the process-global pool so saturation tests cannot starve
+    /// unrelated parallel codec work.
+    static TEST_CODEC_BUDGET: Arc<Semaphore>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Algorithm {
@@ -106,10 +177,6 @@ const REJECTION_RESPONSE_METADATA_KEY: &str = "ferrum:rejection_response";
 const REQUEST_NO_TRANSFORM_METADATA_KEY: &str = "compression:request_no_transform";
 const RESPONSE_ALGORITHM_METADATA_KEY: &str = "compression:algorithm";
 
-/// Process-unique instance ids so ownership tokens cannot collide across
-/// reload generations that temporarily overlap in flight.
-static NEXT_COMPRESSION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-
 /// The client's original `Accept-Encoding`, saved in `before_proxy` before
 /// `remove_accept_encoding` can strip it from the backend-bound request.
 ///
@@ -124,9 +191,87 @@ pub(crate) const REQUEST_ACCEPT_ENCODING_METADATA_KEY: &str = "compression:accep
 /// again; the backend already receives the normalized bytes.
 pub(crate) const REQUEST_DECODED_METADATA_KEY: &str = "compression:request_decoded";
 
+/// Process-wide compression codec admission metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionCodecMetrics {
+    pub admitted: u64,
+    pub saturated: u64,
+    pub join_failures: u64,
+    pub worker_failures: u64,
+}
+
+/// Snapshot process-wide codec admission counters (also scraped via Prometheus).
+pub fn compression_codec_metrics() -> CompressionCodecMetrics {
+    CompressionCodecMetrics {
+        admitted: CODEC_ADMITTED.load(Ordering::Relaxed),
+        saturated: CODEC_SATURATED.load(Ordering::Relaxed),
+        join_failures: CODEC_JOIN_FAILURES.load(Ordering::Relaxed),
+        worker_failures: CODEC_WORKER_FAILURES.load(Ordering::Relaxed),
+    }
+}
+
+/// Run `f` with an isolated codec admission budget of `permits` slots.
+///
+/// Saturation tests must use this seam instead of draining the process-global
+/// semaphore, which would nondeterministically force unrelated parallel codec
+/// work onto 503/identity paths.
+#[allow(dead_code)]
+pub async fn with_test_codec_budget<F, Fut, T>(permits: usize, f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    let budget = Arc::new(Semaphore::new(permits));
+    TEST_CODEC_BUDGET.scope(budget, f()).await
+}
+
+fn active_codec_budget() -> Arc<Semaphore> {
+    TEST_CODEC_BUDGET
+        .try_with(Arc::clone)
+        .unwrap_or_else(|_| Arc::clone(&CODEC_BUDGET))
+}
+
+fn try_acquire_codec_permit() -> Result<OwnedSemaphorePermit, ()> {
+    match active_codec_budget().try_acquire_owned() {
+        Ok(permit) => {
+            CODEC_ADMITTED.fetch_add(1, Ordering::Relaxed);
+            Ok(permit)
+        }
+        Err(_) => {
+            CODEC_SATURATED.fetch_add(1, Ordering::Relaxed);
+            Err(())
+        }
+    }
+}
+
+/// Restore identity response headers when a committed gateway content coding
+/// cannot be produced. Shared H1/H2/H3 buffered transform loops call this after
+/// a transform returns `None` so plaintext is never served under a coded header.
+pub(crate) fn reconcile_aborted_gateway_response_encoding(
+    ctx: &mut RequestContext,
+    response_headers: &mut HashMap<String, String>,
+    body_len: usize,
+) {
+    if !ctx.take_compression_response_encode_aborted() {
+        return;
+    }
+    response_headers.remove("content-encoding");
+    response_headers.insert("content-length".to_string(), body_len.to_string());
+    ctx.metadata.remove(RESPONSE_ALGORITHM_METADATA_KEY);
+    ctx.clear_gateway_response_compression();
+    warn!(
+        "compression: restored identity response after failed gateway content coding \
+         (body_len={body_len})"
+    );
+}
+
 struct CompressionConfig {
     /// Enabled algorithms in server-preference order (used to break q-value ties).
     algorithms: Vec<Algorithm>,
+    /// Process-wide codec gates. These apply to response compression and
+    /// opt-in request decompression.
+    gzip_enabled: bool,
+    brotli_enabled: bool,
 
     // -- Response compression --
     min_content_length: usize,
@@ -152,7 +297,35 @@ pub struct CompressionPlugin {
 }
 
 impl CompressionPlugin {
+    // Public for the library and external integration tests; the binary target
+    // compiles this module independently and does not construct it directly.
+    #[allow(dead_code)]
     pub fn new(config: &Value) -> Result<Self, String> {
+        Self::new_with_algorithm_support_and_body_limit(config, true, true, 0)
+    }
+
+    /// Construct a compression plugin under the process-wide codec policy.
+    ///
+    /// The configured `algorithms` order remains the per-instance response
+    /// preference, while disabled codecs are removed before the instance is
+    /// published. Request decompression observes the same gates.
+    #[allow(dead_code)]
+    pub fn new_with_algorithm_support(
+        config: &Value,
+        gzip_enabled: bool,
+        brotli_enabled: bool,
+    ) -> Result<Self, String> {
+        Self::new_with_algorithm_support_and_body_limit(config, gzip_enabled, brotli_enabled, 0)
+    }
+
+    /// Construct under process-wide codec gates and the gateway request-body
+    /// ceiling used to cross-check `max_decompressed_request_size`.
+    pub fn new_with_algorithm_support_and_body_limit(
+        config: &Value,
+        gzip_enabled: bool,
+        brotli_enabled: bool,
+        max_request_body_size_bytes: usize,
+    ) -> Result<Self, String> {
         let default_config = Value::Object(serde_json::Map::new());
         let config = if config.is_null() {
             &default_config
@@ -184,7 +357,7 @@ impl CompressionPlugin {
         // Parse `algorithms` strictly. Unknown values are rejected (no silent
         // skip) so configuration typos surface immediately at load time
         // instead of producing a partially-functional plugin.
-        let algorithms: Vec<Algorithm> = match config.get("algorithms") {
+        let mut algorithms: Vec<Algorithm> = match config.get("algorithms") {
             Some(Value::Array(arr)) => {
                 let mut algos = Vec::with_capacity(arr.len());
                 for (idx, v) in arr.iter().enumerate() {
@@ -208,6 +381,24 @@ impl CompressionPlugin {
                 return Err("compression: 'algorithms' must be an array of strings".to_string());
             }
         };
+        if algorithms.is_empty() {
+            return Err(
+                "compression: no valid algorithms configured — plugin will have no effect"
+                    .to_string(),
+            );
+        }
+        algorithms.retain(|algorithm| match algorithm {
+            Algorithm::Gzip => gzip_enabled,
+            Algorithm::Brotli => brotli_enabled,
+        });
+        // Revalidate after process-wide gates so an instance with no usable
+        // codec fails admission instead of remaining effectful-but-inert.
+        if algorithms.is_empty() {
+            return Err(
+                "compression: no usable algorithms after applying process-wide codec gates — plugin would have no effect"
+                    .to_string(),
+            );
+        }
 
         let content_types = parse_content_types(config)?;
 
@@ -218,9 +409,21 @@ impl CompressionPlugin {
 
         let decompress_request = optional_bool(config, "decompress_request")?.unwrap_or(false);
 
-        let max_decompressed_request_size =
+        let configured_max_decompressed_request_size =
             optional_positive_usize(config, "max_decompressed_request_size")?
-                .unwrap_or(10 * 1024 * 1024);
+                .unwrap_or(DEFAULT_MAX_DECOMPRESSED_REQUEST_SIZE);
+        // Preserve strict field/hard-cap validation even when request
+        // decompression is disabled, but do not reject a response-only plugin
+        // because an unused decompression default exceeds the wire-body limit.
+        let decompression_body_limit = if decompress_request {
+            max_request_body_size_bytes
+        } else {
+            0
+        };
+        let max_decompressed_request_size = resolve_max_decompressed_request_size(
+            configured_max_decompressed_request_size,
+            decompression_body_limit,
+        )?;
 
         let gzip_level = optional_u64(config, "gzip_level")?
             .map(|value| {
@@ -244,17 +447,12 @@ impl CompressionPlugin {
             .transpose()?
             .unwrap_or(4);
 
-        if algorithms.is_empty() {
-            return Err(
-                "compression: no valid algorithms configured — plugin will have no effect"
-                    .to_string(),
-            );
-        }
-
         let instance_id = NEXT_COMPRESSION_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         Ok(Self {
             config: CompressionConfig {
                 algorithms,
+                gzip_enabled,
+                brotli_enabled,
                 min_content_length,
                 content_types,
                 remove_accept_encoding,
@@ -267,6 +465,56 @@ impl CompressionPlugin {
         })
     }
 
+    fn has_response_codec(&self) -> bool {
+        !self.config.algorithms.is_empty()
+    }
+
+    fn request_decode_limits(&self) -> DecodeLimits {
+        DecodeLimits {
+            max_decoded_bytes: self.config.max_decompressed_request_size,
+            max_cumulative_bytes: self.config.max_decompressed_request_size,
+            max_codings: REQUEST_DECODE_MAX_CODINGS,
+            max_amplification_ratio: MAX_RAW_TO_DECODED_AMPLIFICATION_RATIO,
+        }
+    }
+
+    /// Classify a request `Content-Encoding` value under the configured codec
+    /// gates. Fail closed on malformed/unsupported lists when decompression is
+    /// enabled; identity-only lists need no body rewrite.
+    fn classify_request_content_encoding(&self, value: &str) -> Result<RequestCodingPlan, String> {
+        let codings = parse_content_codings(value)?;
+        if codings.len() > REQUEST_DECODE_MAX_CODINGS {
+            return Err(format!(
+                "content-encoding has more than {REQUEST_DECODE_MAX_CODINGS} coding layers"
+            ));
+        }
+        if codings.iter().all(|coding| coding == "identity") {
+            return Ok(RequestCodingPlan::IdentityOnly);
+        }
+        if codings.iter().any(|coding| coding == "identity") {
+            return Err(
+                "identity content-encoding cannot be combined with other codings".to_string(),
+            );
+        }
+        for coding in &codings {
+            match coding.as_str() {
+                "gzip" if self.config.gzip_enabled => {}
+                "br" if self.config.brotli_enabled => {}
+                "gzip" => return Err("unsupported content-encoding 'gzip'".to_string()),
+                "br" => return Err("unsupported content-encoding 'br'".to_string()),
+                other => return Err(format!("unsupported content-encoding '{other}'")),
+            }
+        }
+        // Preserve the original member spelling only for the single-coding case
+        // used by legacy observability markers; chains record the full list.
+        let marker = if codings.len() == 1 {
+            codings[0].clone()
+        } else {
+            codings.join(", ")
+        };
+        Ok(RequestCodingPlan::Decode(marker))
+    }
+
     fn is_request_decode_owner(&self, ctx: &RequestContext) -> bool {
         ctx.owns_compression_request_decode(self.instance_id)
     }
@@ -275,16 +523,17 @@ impl CompressionPlugin {
         ctx.owns_compression_response_encode(self.instance_id)
     }
 
-    /// Validate/decode a supported request coding, claim ownership, and strip
-    /// public encoding metadata only after success.
+    /// Validate/decode a supported request coding list, claim ownership, and
+    /// strip public encoding metadata only after success.
     ///
     /// When `body` is provided (pre-`before_proxy` normalization), successful
     /// decode replaces it with plaintext so later `before_proxy` consumers see
     /// the same bytes the backend will receive. When `body` is `None`, this
-    /// only validates `ctx.request_body_bytes` (legacy buffered `before_proxy`
-    /// path / rare unbuffered fallback) and leaves the transform stage to emit
-    /// plaintext.
-    fn try_claim_and_decode_request(
+    /// validates `ctx.request_body_bytes` (legacy buffered `before_proxy` path /
+    /// rare unbuffered fallback), stages the validated plaintext on the request
+    /// context, and strips encoding headers only after that staging so a later
+    /// transform can emit the plaintext without re-acquiring the codec budget.
+    async fn try_claim_and_decode_request(
         &self,
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
@@ -293,76 +542,147 @@ impl CompressionPlugin {
         if !self.config.decompress_request || ctx.has_compression_request_decode_owner() {
             return PluginResult::Continue;
         }
-        let Some(ce) = headers.get("content-encoding") else {
-            return PluginResult::Continue;
-        };
-        let Some(encoding) = supported_request_encoding(ce) else {
+        let Some(ce) = headers.get("content-encoding").cloned() else {
             return PluginResult::Continue;
         };
 
-        let decode_source: &[u8] = if let Some(body) = body.as_deref() {
-            body
-        } else if let Some(bytes) = ctx.request_body_bytes.as_ref() {
-            bytes.as_ref()
-        } else {
-            // Unbuffered path (e.g. HBONE CONNECT): without a rejectable body
-            // view, decompression cannot safely strip representation metadata.
-            // Preserve both bytes and headers unchanged for the backend.
-            return PluginResult::Continue;
-        };
-
-        let decode_result = if decode_source.is_empty() {
-            Err("empty compressed request body".to_string())
-        } else {
-            self.decompress(
-                encoding,
-                decode_source,
-                self.config.max_decompressed_request_size,
-            )
-        };
-        let decompressed = match decode_result {
-            Ok(plain) => plain,
+        let plan = match self.classify_request_content_encoding(&ce) {
+            Ok(plan) => plan,
             Err(e) => {
-                warn!("compression: rejecting request with undecodable {encoding} body: {e}");
+                warn!("compression: rejecting request with invalid Content-Encoding '{ce}': {e}");
                 return PluginResult::Reject {
                     status_code: 400,
-                    body: r#"{"error":"Malformed compressed request body"}"#.to_string(),
+                    body: r#"{"error":"Malformed or unsupported Content-Encoding"}"#.to_string(),
                     headers: HashMap::new(),
                 };
             }
         };
 
-        let claimed = ctx.claim_compression_request_decode(self.instance_id);
-        debug_assert!(
-            claimed,
-            "request decode owner changed within a sequential hook chain"
-        );
-        ctx.metadata.insert(
-            "compression:request_encoding".to_string(),
-            encoding.to_string(),
-        );
-        headers.remove("content-encoding");
-        headers.insert(
-            "x-ferrum-original-content-encoding".to_string(),
-            encoding.to_string(),
-        );
-        headers.remove("content-length");
+        match plan {
+            RequestCodingPlan::IdentityOnly => {
+                let claimed = ctx.claim_compression_request_decode(self.instance_id);
+                debug_assert!(
+                    claimed,
+                    "request decode owner changed within a sequential hook chain"
+                );
+                ctx.metadata.insert(
+                    "compression:request_encoding".to_string(),
+                    "identity".to_string(),
+                );
+                headers.remove("content-encoding");
+                headers.insert(
+                    "x-ferrum-original-content-encoding".to_string(),
+                    "identity".to_string(),
+                );
+                headers.remove("content-length");
+                PluginResult::Continue
+            }
+            RequestCodingPlan::Decode(marker) => {
+                let decode_source: Option<Vec<u8>> = if let Some(body) = body.as_deref() {
+                    Some(body.to_vec())
+                } else {
+                    ctx.request_body_bytes.as_ref().map(|bytes| bytes.to_vec())
+                };
+                let Some(decode_source) = decode_source else {
+                    // Unbuffered path (e.g. HBONE CONNECT): without a rejectable body
+                    // view, decompression cannot safely strip representation metadata.
+                    // Preserve both bytes and headers unchanged for the backend.
+                    return PluginResult::Continue;
+                };
 
-        if let Some(body) = body {
-            debug!(
-                "compression: normalized request body from {} to {} bytes ({})",
-                body.len(),
-                decompressed.len(),
-                encoding
-            );
-            *body = decompressed;
-            ctx.metadata.insert(
-                REQUEST_DECODED_METADATA_KEY.to_string(),
-                encoding.to_string(),
-            );
+                if decode_source.is_empty() {
+                    warn!("compression: rejecting request with empty compressed body ({marker})");
+                    return PluginResult::Reject {
+                        status_code: 400,
+                        body: r#"{"error":"Malformed compressed request body"}"#.to_string(),
+                        headers: HashMap::new(),
+                    };
+                }
+
+                let Ok(permit) = try_acquire_codec_permit() else {
+                    warn!("compression: codec admission saturated while decoding request body");
+                    return PluginResult::Reject {
+                        status_code: 503,
+                        body: r#"{"error":"Compression workers unavailable"}"#.to_string(),
+                        headers: HashMap::new(),
+                    };
+                };
+
+                let limits = self.request_decode_limits();
+                let header_for_decode = ce.clone();
+                let decode_result = tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    decode_content_encoding(
+                        Some(header_for_decode.as_str()),
+                        &decode_source,
+                        limits,
+                    )
+                    .map(|decoded| decoded.into_owned())
+                })
+                .await;
+
+                let decompressed = match decode_result {
+                    Ok(Ok(plain)) => plain,
+                    Ok(Err(e)) => {
+                        CODEC_WORKER_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "compression: rejecting request with undecodable Content-Encoding '{ce}': {e}"
+                        );
+                        return PluginResult::Reject {
+                            status_code: 400,
+                            body: r#"{"error":"Malformed compressed request body"}"#.to_string(),
+                            headers: HashMap::new(),
+                        };
+                    }
+                    Err(_) => {
+                        CODEC_JOIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        warn!("compression: request decode worker join failed");
+                        return PluginResult::Reject {
+                            status_code: 503,
+                            body: r#"{"error":"Compression workers unavailable"}"#.to_string(),
+                            headers: HashMap::new(),
+                        };
+                    }
+                };
+
+                let claimed = ctx.claim_compression_request_decode(self.instance_id);
+                debug_assert!(
+                    claimed,
+                    "request decode owner changed within a sequential hook chain"
+                );
+                ctx.metadata
+                    .insert("compression:request_encoding".to_string(), marker.clone());
+                headers.remove("content-encoding");
+                headers.insert(
+                    "x-ferrum-original-content-encoding".to_string(),
+                    marker.clone(),
+                );
+                headers.remove("content-length");
+
+                if let Some(body) = body {
+                    debug!(
+                        "compression: normalized request body from {} to {} bytes ({})",
+                        body.len(),
+                        decompressed.len(),
+                        marker
+                    );
+                    *body = decompressed;
+                } else {
+                    // Fallback path: headers are stripped only after staging the
+                    // validated plaintext for the later body transform.
+                    debug!(
+                        "compression: staged decoded request body ({} bytes, {}) for transform handoff",
+                        decompressed.len(),
+                        marker
+                    );
+                    ctx.set_compression_staged_request_plaintext(decompressed);
+                }
+                ctx.metadata
+                    .insert(REQUEST_DECODED_METADATA_KEY.to_string(), marker);
+
+                PluginResult::Continue
+            }
         }
-
-        PluginResult::Continue
     }
 
     /// Parse `Accept-Encoding` and negotiate the representation coding among
@@ -407,8 +727,13 @@ impl CompressionPlugin {
                 continue;
             }
 
-            let (encoding, quality) = parse_encoding_quality(part);
-            if encoding.eq_ignore_ascii_case("gzip") {
+            let encoding = part.split(';').next().unwrap_or("").trim();
+            let Some(quality) = rfc9110_entry_quality(part) else {
+                // Malformed qvalues do not express a usable preference or a
+                // refusal. Ignore the member and keep evaluating the field.
+                continue;
+            };
+            if encoding.eq_ignore_ascii_case("gzip") || encoding.eq_ignore_ascii_case("x-gzip") {
                 explicit_gzip = Some(quality);
             } else if encoding.eq_ignore_ascii_case("br") {
                 explicit_br = Some(quality);
@@ -452,6 +777,72 @@ impl CompressionPlugin {
             // Every representation Ferrum can produce — every configured
             // algorithm and identity — has quality zero.
             _ => CodingSelection::NotAcceptable,
+        }
+    }
+
+    /// The client's negotiated `Accept-Encoding` for response compression.
+    ///
+    /// Prefers the snapshot saved in `before_proxy` (the live header may then be
+    /// stripped by `remove_accept_encoding`, and `ctx.headers` may be empty on
+    /// the zero-clone request fast path). Falls back to the live request header
+    /// for the rare paths where no snapshot was staged. Response-buffer,
+    /// reservation, and `after_proxy` negotiation all read through here so the
+    /// three decisions stay consistent for one request.
+    fn negotiated_accept_encoding(ctx: &RequestContext) -> Option<&str> {
+        ctx.metadata
+            .get(REQUEST_ACCEPT_ENCODING_METADATA_KEY)
+            .map(String::as_str)
+            .or_else(|| ctx.headers.get("accept-encoding").map(String::as_str))
+    }
+
+    fn response_body_limit_allows_compression(ctx: &RequestContext) -> bool {
+        (1..=HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE).contains(&ctx.max_response_body_size_bytes)
+    }
+
+    /// Reserve one response-compression codec permit for this request when this
+    /// instance can select a supported nonzero coding for the client's
+    /// `Accept-Encoding`. Runs in `before_proxy`, ahead of the response-buffer
+    /// decision, so the buffered population is bounded by the same codec
+    /// semaphore that bounds codec workers.
+    ///
+    /// `HEAD` carries no re-encodable wire body, so it never reserves. First
+    /// success across sibling instances wins, keeping this to one response
+    /// permit per request. On admission pressure the request is marked
+    /// declined so the response streams identity (or fails closed with 406 when
+    /// identity is prohibited) rather than buffering for a compression it cannot
+    /// run; `after_proxy` must not reacquire on that path.
+    fn reserve_response_compression_admission(&self, ctx: &mut RequestContext) {
+        if !self.has_response_codec()
+            || ctx.method.eq_ignore_ascii_case("HEAD")
+            || ctx.has_compression_response_admission_owner()
+        {
+            return;
+        }
+        let selects_coding = Self::negotiated_accept_encoding(ctx)
+            .is_some_and(|ae| matches!(self.select_algorithm(ae), CodingSelection::Compress(_)));
+        if !selects_coding {
+            return;
+        }
+        if !Self::response_body_limit_allows_compression(ctx) {
+            ctx.mark_compression_response_admission_declined();
+            return;
+        }
+        match try_acquire_codec_permit() {
+            Ok(permit) => {
+                let claimed = ctx.claim_compression_response_admission(self.instance_id);
+                debug_assert!(
+                    claimed,
+                    "response admission owner changed within a sequential hook chain"
+                );
+                ctx.set_compression_response_codec_permit(permit);
+            }
+            Err(()) => {
+                ctx.mark_compression_response_admission_declined();
+                warn!(
+                    "compression: codec admission saturated at reservation; \
+                     response will stream identity instead of buffering for compression"
+                );
+            }
         }
     }
 
@@ -600,27 +991,41 @@ impl CompressionPlugin {
             .any(|rule| media_type.eq_ignore_ascii_case(rule))
     }
 
-    fn compress(&self, algo: Algorithm, data: &[u8]) -> Result<Vec<u8>, String> {
-        match algo {
-            Algorithm::Gzip => self.compress_gzip(data),
-            Algorithm::Brotli => self.compress_brotli(data),
-        }
-    }
-
-    fn compress_response_body(&self, body: &[u8], encoding: &str) -> Option<Vec<u8>> {
+    async fn compress_response_body(
+        &self,
+        body: &[u8],
+        encoding: &str,
+        permit: OwnedSemaphorePermit,
+    ) -> Option<Vec<u8>> {
         let algo = match encoding {
             "gzip" => Algorithm::Gzip,
             "br" => Algorithm::Brotli,
-            _ => return None,
+            _ => {
+                drop(permit);
+                return None;
+            }
         };
+        let gzip_level = self.config.gzip_level;
+        let brotli_quality = self.config.brotli_quality;
+        let data = body.to_vec();
+        let encoding_owned = encoding.to_string();
 
-        match self.compress(algo, body) {
-            Ok(compressed) => {
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            match algo {
+                Algorithm::Gzip => compress_gzip_blocking(&data, gzip_level),
+                Algorithm::Brotli => compress_brotli_blocking(&data, brotli_quality),
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(compressed)) => {
                 debug!(
                     "compression: compressed response body from {} to {} bytes ({}, {:.1}% reduction)",
                     body.len(),
                     compressed.len(),
-                    encoding,
+                    encoding_owned,
                     if body.is_empty() {
                         0.0
                     } else {
@@ -629,74 +1034,120 @@ impl CompressionPlugin {
                 );
                 Some(compressed)
             }
-            Err(e) => {
-                // `flate2`/`brotli` writing to a `Vec` is effectively
-                // infallible in practice, so this branch is unreachable in
-                // production. If it ever does fire, the response headers
-                // already commit us to a Content-Encoding that we cannot
-                // honour — the client will see a corrupt body. Log loudly
-                // so operators notice rather than silently downgrading.
+            Ok(Err(e)) => {
+                CODEC_WORKER_FAILURES.fetch_add(1, Ordering::Relaxed);
                 error!(
                     "compression: encoder failure for committed Content-Encoding '{}' — \
-                     response will be malformed: {e}",
-                    encoding
+                     restoring identity representation: {e}",
+                    encoding_owned
+                );
+                None
+            }
+            Err(_) => {
+                CODEC_JOIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+                error!(
+                    "compression: encoder worker join failed for committed Content-Encoding '{}' — \
+                     restoring identity representation",
+                    encoding_owned
                 );
                 None
             }
         }
     }
 
-    fn compress_gzip(&self, data: &[u8]) -> Result<Vec<u8>, String> {
-        use flate2::Compression;
-        use flate2::write::GzEncoder;
-
-        let mut encoder = GzEncoder::new(
-            Vec::with_capacity(data.len() / 2),
-            Compression::new(self.config.gzip_level),
-        );
-        encoder
-            .write_all(data)
-            .map_err(|e| format!("gzip compression write failed: {e}"))?;
-        encoder
-            .finish()
-            .map_err(|e| format!("gzip compression finish failed: {e}"))
-    }
-
-    fn compress_brotli(&self, data: &[u8]) -> Result<Vec<u8>, String> {
-        let mut output = Vec::with_capacity(data.len() / 2);
-        let params = brotli::enc::BrotliEncoderParams {
-            quality: self.config.brotli_quality as i32,
-            ..Default::default()
+    async fn decompress_request_body_transform(
+        &self,
+        body: &[u8],
+        encoding_header: &str,
+    ) -> Option<Vec<u8>> {
+        let Ok(permit) = try_acquire_codec_permit() else {
+            warn!("compression: codec admission saturated in request body transform");
+            return None;
         };
-        brotli::BrotliCompress(&mut &data[..], &mut output, &params)
-            .map_err(|e| format!("brotli compression failed: {e}"))?;
-        Ok(output)
-    }
-
-    fn decompress(&self, encoding: &str, data: &[u8], max_size: usize) -> Result<Vec<u8>, String> {
-        match encoding {
-            "gzip" => self.decompress_gzip(data, max_size),
-            "br" => self.decompress_brotli(data, max_size),
-            other => Err(format!("unsupported content-encoding: {other}")),
+        let limits = self.request_decode_limits();
+        let header = encoding_header.to_string();
+        let data = body.to_vec();
+        match tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            decode_content_encoding(Some(header.as_str()), &data, limits)
+                .map(|decoded| decoded.into_owned())
+        })
+        .await
+        {
+            Ok(Ok(decompressed)) => {
+                debug!(
+                    "compression: decompressed request body from {} to {} bytes ({})",
+                    body.len(),
+                    decompressed.len(),
+                    encoding_header
+                );
+                Some(decompressed)
+            }
+            Ok(Err(e)) => {
+                CODEC_WORKER_FAILURES.fetch_add(1, Ordering::Relaxed);
+                warn!("compression: request decompression failed: {e}");
+                None
+            }
+            Err(_) => {
+                CODEC_JOIN_FAILURES.fetch_add(1, Ordering::Relaxed);
+                warn!("compression: request decompression worker join failed");
+                None
+            }
         }
     }
+}
 
-    fn decompress_gzip(&self, data: &[u8], max_size: usize) -> Result<Vec<u8>, String> {
-        use flate2::read::MultiGzDecoder;
+enum RequestCodingPlan {
+    IdentityOnly,
+    Decode(String),
+}
 
-        // `MultiGzDecoder` (not `GzDecoder`) decodes every member of a
-        // concatenated multi-member gzip stream (RFC 1952 §2.2 permits
-        // concatenation). `GzDecoder` stops after the first member and would
-        // silently truncate a valid multi-member request body. The
-        // `read_with_limit` cap still bounds total expansion.
-        let mut decoder = MultiGzDecoder::new(data);
-        read_with_limit(&mut decoder, max_size, "gzip")
+fn resolve_max_decompressed_request_size(
+    configured: usize,
+    max_request_body_size_bytes: usize,
+) -> Result<usize, String> {
+    if configured > HARD_MAX_DECOMPRESSED_REQUEST_SIZE {
+        return Err(format!(
+            "compression: 'max_decompressed_request_size' exceeds hard maximum of {HARD_MAX_DECOMPRESSED_REQUEST_SIZE} bytes"
+        ));
     }
-
-    fn decompress_brotli(&self, data: &[u8], max_size: usize) -> Result<Vec<u8>, String> {
-        let mut reader = brotli::Decompressor::new(data, 4096);
-        read_with_limit(&mut reader, max_size, "brotli")
+    let mut limit = configured.min(HARD_MAX_DECOMPRESSED_REQUEST_SIZE);
+    if max_request_body_size_bytes > 0 {
+        if configured > max_request_body_size_bytes {
+            return Err(format!(
+                "compression: 'max_decompressed_request_size' ({configured}) exceeds FERRUM_MAX_REQUEST_BODY_SIZE_BYTES ({max_request_body_size_bytes})"
+            ));
+        }
+        limit = limit.min(max_request_body_size_bytes);
     }
+    Ok(limit)
+}
+
+fn compress_gzip_blocking(data: &[u8], gzip_level: u32) -> Result<Vec<u8>, String> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+
+    let mut encoder = GzEncoder::new(
+        Vec::with_capacity(data.len() / 2),
+        Compression::new(gzip_level),
+    );
+    encoder
+        .write_all(data)
+        .map_err(|e| format!("gzip compression write failed: {e}"))?;
+    encoder
+        .finish()
+        .map_err(|e| format!("gzip compression finish failed: {e}"))
+}
+
+fn compress_brotli_blocking(data: &[u8], brotli_quality: u32) -> Result<Vec<u8>, String> {
+    let mut output = Vec::with_capacity(data.len() / 2);
+    let params = brotli::enc::BrotliEncoderParams {
+        quality: brotli_quality as i32,
+        ..Default::default()
+    };
+    brotli::BrotliCompress(&mut &data[..], &mut output, &params)
+        .map_err(|e| format!("brotli compression failed: {e}"))?;
+    Ok(output)
 }
 
 fn optional_bool(config: &Value, field: &'static str) -> Result<Option<bool>, String> {
@@ -776,16 +1227,6 @@ fn parse_content_types(config: &Value) -> Result<Vec<String>, String> {
     Ok(content_types)
 }
 
-fn supported_request_encoding(value: &str) -> Option<&'static str> {
-    if value.eq_ignore_ascii_case("gzip") {
-        Some("gzip")
-    } else if value.eq_ignore_ascii_case("br") {
-        Some("br")
-    } else {
-        None
-    }
-}
-
 fn comma_header_contains_token(value: &str, token: &str) -> bool {
     value
         .split(',')
@@ -820,72 +1261,6 @@ fn ensure_vary_accept_encoding(response_headers: &mut HashMap<String, String>) {
         None => {
             response_headers.insert("vary".to_string(), "Accept-Encoding".to_string());
         }
-    }
-}
-
-/// Read from `reader` into a `Vec`, enforcing a maximum decompressed size.
-fn read_with_limit(
-    reader: &mut dyn Read,
-    max_size: usize,
-    algo_name: &str,
-) -> Result<Vec<u8>, String> {
-    let mut output = Vec::with_capacity(8192);
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .map_err(|e| format!("{algo_name} decompression failed: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        output.extend_from_slice(&buf[..n]);
-        if output.len() > max_size {
-            return Err(format!(
-                "decompressed request body exceeds max size of {max_size} bytes"
-            ));
-        }
-    }
-    Ok(output)
-}
-
-/// Parse a single `Accept-Encoding` token like `gzip;q=0.8` or `br`.
-///
-/// Returns the encoding token and its effective quality value, clamped to
-/// `0.0..=1.0` per RFC 9110 §12.4.2. A `q=`/`Q=` parameter that is present but
-/// unparseable (e.g. `gzip;q=abc`, `gzip;q=`) or non-finite (e.g. `gzip;q=NaN`,
-/// `gzip;q=inf`) is treated as **not acceptable** (`q = 0.0`) rather than
-/// silently defaulting to the maximum preference of `1.0` — a malformed weight
-/// must not let a codec win the selection or poison the tie-break math. A token
-/// with no `q=` parameter at all defaults to `q = 1.0` as the spec requires.
-fn parse_encoding_quality(token: &str) -> (&str, f32) {
-    // Split on ';' and look for q= parameter
-    if let Some(semi_idx) = token.find(';') {
-        let encoding = token[..semi_idx].trim();
-        let params = token[semi_idx + 1..].trim();
-        // Find q= (could be "q=0.8" or " q=0.8")
-        for param in params.split(';') {
-            let param = param.trim();
-            if let Some(stripped) = param
-                .strip_prefix("q=")
-                .or_else(|| param.strip_prefix("Q="))
-            {
-                // A q-parameter is present: its value is authoritative. Parse
-                // and clamp to [0.0, 1.0]; reject unparseable/non-finite values
-                // as q=0.0 (not acceptable). Do NOT fall through to the q=1.0
-                // default — that is only for tokens with no q-parameter.
-                let q = stripped
-                    .trim()
-                    .parse::<f32>()
-                    .ok()
-                    .filter(|value| value.is_finite())
-                    .map(|value| value.clamp(0.0, 1.0))
-                    .unwrap_or(0.0);
-                return (encoding, q);
-            }
-        }
-        (encoding, 1.0)
-    } else {
-        (token.trim(), 1.0)
     }
 }
 
@@ -1018,7 +1393,8 @@ impl Plugin for CompressionPlugin {
     }
 
     fn modifies_request_headers(&self) -> bool {
-        self.config.remove_accept_encoding || self.config.decompress_request
+        (self.config.remove_accept_encoding && self.has_response_codec())
+            || self.config.decompress_request
     }
 
     fn modifies_request_body(&self) -> bool {
@@ -1026,12 +1402,16 @@ impl Plugin for CompressionPlugin {
     }
 
     fn should_buffer_request_body(&self, ctx: &RequestContext) -> bool {
-        self.config.decompress_request
-            && ctx
-                .headers
-                .get("content-encoding")
-                .and_then(|value| supported_request_encoding(value))
-                .is_some()
+        if !self.config.decompress_request {
+            return false;
+        }
+        let Some(ce) = ctx.headers.get("content-encoding") else {
+            return false;
+        };
+        matches!(
+            self.classify_request_content_encoding(ce),
+            Ok(RequestCodingPlan::Decode(_))
+        )
     }
 
     /// Buffer the request body before `before_proxy` runs so the decompression
@@ -1068,6 +1448,7 @@ impl Plugin for CompressionPlugin {
             headers.remove("x-ferrum-original-content-encoding");
         }
         self.try_claim_and_decode_request(ctx, headers, Some(body))
+            .await
     }
 
     fn requires_response_body_buffering(&self) -> bool {
@@ -1075,17 +1456,33 @@ impl Plugin for CompressionPlugin {
     }
 
     fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        // Skip response buffering when the client doesn't accept any encoding
-        // we support — there's nothing to compress. HEAD never carries a wire
-        // body the gateway can re-encode, so do not pin it onto the buffered
-        // path either (preserves backend representation metadata).
-        !self.config.algorithms.is_empty()
-            && !ctx.method.eq_ignore_ascii_case("HEAD")
-            && ctx.headers.contains_key("accept-encoding")
-            && !ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
-            && !ctx
+        // HEAD never carries a wire body the gateway can re-encode, and request
+        // no-transform opts out of gateway response compression; neither pins
+        // the body onto the buffered path (preserving backend representation
+        // metadata / RFC 9111).
+        if ctx.method.eq_ignore_ascii_case("HEAD")
+            || ctx.metadata.contains_key(REQUEST_NO_TRANSFORM_METADATA_KEY)
+            || ctx
                 .metadata
                 .contains_key(crate::proxy::NO_TRANSFORM_REQUEST_METADATA_KEY)
+            || !Self::response_body_limit_allows_compression(ctx)
+        {
+            return false;
+        }
+        // `before_proxy` negotiated a compressible coding but could not obtain a
+        // bounded codec permit: stream identity instead of buffering for a
+        // compression that cannot run (and never enter the buffered path on the
+        // strength of admission it does not hold).
+        if ctx.compression_response_admission_declined() {
+            return false;
+        }
+        // Negotiate the original client Accept-Encoding: buffer only when this
+        // instance can actually select a supported nonzero coding. Identity,
+        // unsupported-only, and `gzip;q=0, br;q=0` requests have nothing to
+        // compress, so they stream instead of forcing a full-body collection.
+        self.has_response_codec()
+            && Self::negotiated_accept_encoding(ctx)
+                .is_some_and(|ae| matches!(self.select_algorithm(ae), CodingSelection::Compress(_)))
     }
 
     fn should_buffer_response_body_for_content_type(
@@ -1241,9 +1638,21 @@ impl Plugin for CompressionPlugin {
 
             // Strip Accept-Encoding from the backend request so the backend
             // sends an uncompressed response (we'll compress it ourselves).
-            if self.config.remove_accept_encoding {
+            // Only mutate when this instance still has a usable response codec.
+            if self.config.remove_accept_encoding && self.has_response_codec() {
                 headers.remove("accept-encoding");
             }
+
+            // Reserve response-compression codec admission now, before the
+            // response-buffer decision, so a request that cannot obtain a
+            // bounded permit never pins a (potentially unbounded) response body
+            // onto the compression-only buffered path. Negotiate against the
+            // just-saved client Accept-Encoding: buffering only pays off when
+            // this instance can select a supported nonzero coding. First-wins
+            // across sibling instances keeps it to one response permit per
+            // request; `after_proxy` consumes this reserved permit instead of
+            // acquiring a fresh one on the hot path.
+            self.reserve_response_compression_admission(ctx);
         }
 
         // For request decompression: when the shared pre-`before_proxy`
@@ -1253,7 +1662,7 @@ impl Plugin for CompressionPlugin {
         //
         // Stripping is gated on successful decompression so we never forward a
         // body whose headers and contents disagree (RFC 9110 §8.4).
-        self.try_claim_and_decode_request(ctx, headers, None)
+        self.try_claim_and_decode_request(ctx, headers, None).await
     }
 
     async fn after_proxy(
@@ -1272,18 +1681,20 @@ impl Plugin for CompressionPlugin {
 
         // No-body statuses (`204`/`205`/`304`), HEAD, and already-coded
         // upstream responses are protocol-correct as-is; negotiation does not
-        // invent a 406 for them or rewrite representation metadata.
+        // invent a 406 for them or rewrite representation metadata. A permit
+        // reserved in `before_proxy` for such a response produces no coding, so
+        // release it promptly rather than idling the slot until request end.
         if Self::is_protocol_hard_skip(ctx, response_status, response_headers) {
+            ctx.release_compression_response_admission_if_owner(self.instance_id);
             return PluginResult::Continue;
         }
 
         let range_or_delta =
             Self::is_non_transformable_range_or_delta(ctx, response_status, response_headers);
 
-        let accept_encoding = ctx
-            .metadata
-            .get(REQUEST_ACCEPT_ENCODING_METADATA_KEY)
-            .or_else(|| ctx.headers.get("accept-encoding"));
+        // Same source precedence as the buffer decision and the reservation:
+        // the saved snapshot wins over the (possibly stripped) live header.
+        let accept_encoding = Self::negotiated_accept_encoding(ctx);
 
         let selection = accept_encoding.map(|ae| self.select_algorithm(ae));
         match selection {
@@ -1310,12 +1721,74 @@ impl Plugin for CompressionPlugin {
                 PluginResult::Continue
             }
             Some(CodingSelection::Compress(algo)) => {
+                // Resolve identity acceptability into an owned flag before any
+                // mutable `ctx` access below so the `accept_encoding` borrow ends
+                // here (the reserved-permit take/set otherwise conflicts with it).
+                let identity_unacceptable =
+                    accept_encoding.is_some_and(|ae| identity_coding_quality(ae) == 0.0);
+
                 let can_encode = !on_rejection
                     && !range_or_delta
                     && !ctx.has_compression_response_encode_owner()
+                    && Self::response_body_limit_allows_compression(ctx)
                     && !Self::response_forbids_transform(ctx, response_headers)
                     && self.is_compression_eligible(response_headers);
                 if can_encode {
+                    // Obtain the codec permit for this coding. The reservation in
+                    // `before_proxy` is what bounded entry onto the buffered path,
+                    // so a request that chose to stream must never reacquire:
+                    //   * this instance reserved it -> consume the held permit
+                    //     (the common path; no reacquire on the hot path);
+                    //   * admission was declined under pressure -> do NOT
+                    //     reacquire; the request already chose to stream, so fall
+                    //     through to identity (or 406 when identity is barred);
+                    //   * a sibling still owns the reservation -> it owns the one
+                    //     coding layer; do not open a second permit for the same
+                    //     request;
+                    //   * otherwise acquire once. This is reachable when an
+                    //     earlier sibling reserved this request (so the body is
+                    //     already bounded/buffered) but declined to encode *this*
+                    //     representation and released its permit, leaving a later
+                    //     sibling with a broader config to compress the
+                    //     already-admitted body. The buffered population stays
+                    //     bounded because entry onto the buffered path still
+                    //     required a reservation at `before_proxy` time.
+                    let permit = if ctx.owns_compression_response_admission(self.instance_id) {
+                        ctx.take_compression_response_codec_permit()
+                    } else if ctx.compression_response_admission_declined()
+                        || ctx.has_compression_response_admission_owner()
+                    {
+                        None
+                    } else {
+                        try_acquire_codec_permit().ok()
+                    };
+
+                    let Some(permit) = permit else {
+                        // No bounded admission for the negotiated coding (declined
+                        // at reservation, or owned by a sibling). Do not commit
+                        // Content-Encoding: serve identity, or 406 when identity
+                        // is unacceptable. Saturation already warned at the
+                        // `before_proxy` reservation, so keep this at debug.
+                        debug!(
+                            "compression: no reserved codec admission for negotiated coding; \
+                             serving identity response"
+                        );
+                        if identity_unacceptable
+                            && Self::should_fail_closed_not_acceptable(ctx, on_rejection)
+                        {
+                            return not_acceptable_reject();
+                        }
+                        if self.should_nominate_accept_encoding_vary(
+                            ctx,
+                            response_status,
+                            response_headers,
+                            on_rejection,
+                        ) {
+                            ensure_vary_accept_encoding(response_headers);
+                        }
+                        return PluginResult::Continue;
+                    };
+
                     // Record authoritative ownership outside public plugin metadata so
                     // response security hooks can distinguish gateway-planned compression
                     // from an encoded origin response without trusting a spoofable key.
@@ -1328,6 +1801,7 @@ impl Plugin for CompressionPlugin {
                         claimed,
                         "response encode owner changed within a sequential hook chain"
                     );
+                    ctx.set_compression_response_codec_permit(permit);
 
                     // Retain the existing observable decision metadata.
                     ctx.metadata.insert(
@@ -1351,11 +1825,14 @@ impl Plugin for CompressionPlugin {
 
                 // Cannot produce the selected coded representation (range/delta,
                 // size / content-type eligibility, no-transform / strong ETag, or
-                // reject-path without body transforms). If identity is also
-                // unacceptable, fail closed rather than forwarding an excluded
-                // identity body — and never partially mutate compression headers.
-                // On the reject path, only `response_caching` HITs are replaced.
-                if accept_encoding.is_some_and(|ae| identity_coding_quality(ae) == 0.0)
+                // reject-path without body transforms). Release any permit this
+                // instance reserved so it does not idle while the identity body
+                // streams. If identity is also unacceptable, fail closed rather
+                // than forwarding an excluded identity body — and never partially
+                // mutate compression headers. On the reject path, only
+                // `response_caching` HITs are replaced.
+                ctx.release_compression_response_admission_if_owner(self.instance_id);
+                if identity_unacceptable
                     && Self::should_fail_closed_not_acceptable(ctx, on_rejection)
                 {
                     return not_acceptable_reject();
@@ -1378,28 +1855,15 @@ impl Plugin for CompressionPlugin {
         // Check Content-Encoding to decide how to decompress. The original
         // header was removed in before_proxy and saved under the private key
         // x-ferrum-original-content-encoding so the backend doesn't see it.
-        let encoding = request_headers
+        let encoding_header = request_headers
             .get("x-ferrum-original-content-encoding")
-            .or_else(|| request_headers.get("content-encoding"))
-            .and_then(|v| supported_request_encoding(v))?;
-
-        match self.decompress(encoding, body, self.config.max_decompressed_request_size) {
-            Ok(decompressed) => {
-                debug!(
-                    "compression: decompressed request body from {} to {} bytes ({})",
-                    body.len(),
-                    decompressed.len(),
-                    encoding
-                );
-                Some(decompressed)
+            .or_else(|| request_headers.get("content-encoding"))?;
+        match self.classify_request_content_encoding(encoding_header) {
+            Ok(RequestCodingPlan::Decode(_)) => {
+                self.decompress_request_body_transform(body, encoding_header)
+                    .await
             }
-            Err(e) => {
-                // The normal context-aware path validates buffered bytes before
-                // stripping Content-Encoding. Direct callers cannot reject from
-                // this transform hook, so preserve the encoded body on failure.
-                warn!("compression: request decompression failed: {e}");
-                None
-            }
+            Ok(RequestCodingPlan::IdentityOnly) | Err(_) => None,
         }
     }
 
@@ -1415,6 +1879,11 @@ impl Plugin for CompressionPlugin {
         // siblings return None so the bytes are decoded exactly once.
         if !self.is_request_decode_owner(ctx) {
             return None;
+        }
+        // Fallback path staged validated plaintext when headers were stripped
+        // without a mutable body view. Emit those bytes; never re-decode.
+        if let Some(plaintext) = ctx.take_compression_staged_request_plaintext() {
+            return Some(plaintext);
         }
         // Early normalization already replaced the buffered body with validated
         // plaintext; re-decoding would corrupt the backend-visible bytes.
@@ -1470,6 +1939,14 @@ impl Plugin for CompressionPlugin {
             return None;
         };
 
+        let Some(permit) = ctx.take_compression_response_codec_permit() else {
+            error!(
+                "compression: missing codec admission permit for committed Content-Encoding '{encoding}'"
+            );
+            ctx.mark_compression_response_encode_aborted();
+            return None;
+        };
+
         // Once `after_proxy` set `Content-Encoding`, the response is committed
         // to that encoding. We MUST NOT short-circuit here on body size — doing
         // so would leave the client with a body labelled `Content-Encoding:
@@ -1480,6 +1957,16 @@ impl Plugin for CompressionPlugin {
         // When CL is unknown (chunked / streamed responses), we accept that the
         // rare tiny chunked body will be compressed needlessly
         // — far cheaper than serving a malformed response.
-        self.compress_response_body(body, encoding)
+        //
+        // Encoder / join failure marks abort so shared transform loops restore
+        // an identity representation with correct headers instead of emitting
+        // mislabeled plaintext.
+        match self.compress_response_body(body, encoding, permit).await {
+            Some(compressed) => Some(compressed),
+            None => {
+                ctx.mark_compression_response_encode_aborted();
+                None
+            }
+        }
     }
 }

@@ -21,13 +21,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::runtime::Handle;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::Duration;
 use tracing::{debug, warn};
 use url::{Host, Url};
 use uuid::Uuid;
 
 use crate::modes::mesh::config::TracingProvider;
+use crate::observability_delivery::DeliveryWorkerControl;
 use crate::util::accept_backoff::LogRateLimiter;
 use crate::util::unknown_keys::reject_unknown_keys;
 
@@ -1135,8 +1136,10 @@ struct BufferedTraceExporter {
     hostname: String,
     sender: mpsc::Sender<QueuedSpan>,
     queued_bytes: Arc<AtomicUsize>,
+    queued_spans: Arc<AtomicUsize>,
     buffer_max_bytes: usize,
     started: AtomicBool,
+    worker: OnceLock<Arc<DeliveryWorkerControl>>,
     deferred_start: Mutex<Option<(mpsc::Receiver<QueuedSpan>, TraceHttpExporterConfig)>>,
 }
 
@@ -1150,24 +1153,16 @@ impl BufferedTraceExporter {
         let (sender, receiver) = mpsc::channel(buffer_capacity);
         let provider_name = cfg.provider_name;
         let queued_bytes = Arc::new(AtomicUsize::new(0));
-        let (started, deferred_start) = if let Ok(handle) = Handle::try_current() {
-            handle.spawn(trace_export_flush_loop(
-                receiver,
-                cfg,
-                Arc::clone(&queued_bytes),
-            ));
-            (true, Mutex::new(None))
-        } else {
-            (false, Mutex::new(Some((receiver, cfg))))
-        };
         Ok(Self {
             provider_name,
             hostname,
             sender,
             queued_bytes,
+            queued_spans: Arc::new(AtomicUsize::new(0)),
             buffer_max_bytes,
-            started: AtomicBool::new(started),
-            deferred_start,
+            started: AtomicBool::new(false),
+            worker: OnceLock::new(),
+            deferred_start: Mutex::new(Some((receiver, cfg))),
         })
     }
 
@@ -1188,11 +1183,36 @@ impl BufferedTraceExporter {
         };
         match Handle::try_current() {
             Ok(handle) => {
-                handle.spawn(trace_export_flush_loop(
-                    receiver,
-                    cfg,
-                    Arc::clone(&self.queued_bytes),
-                ));
+                let pending_spans = Arc::clone(&self.queued_spans);
+                let (worker, close_rx) = DeliveryWorkerControl::new("otel_tracing", move || {
+                    pending_spans.load(Ordering::Relaxed) as u64
+                });
+                if self.worker.set(Arc::clone(&worker)).is_err() {
+                    *deferred = Some((receiver, cfg));
+                    return Err("trace exporter lifecycle worker already started".to_string());
+                }
+                let completion = worker.completion();
+                let worker_drain_control = Arc::clone(&worker);
+                let queued_bytes = Arc::clone(&self.queued_bytes);
+                let queued_spans = Arc::clone(&self.queued_spans);
+                let task = handle.spawn(async move {
+                    let mut completion = completion;
+                    trace_export_flush_loop(
+                        receiver,
+                        cfg,
+                        queued_bytes,
+                        queued_spans,
+                        worker_drain_control,
+                        close_rx,
+                    )
+                    .await;
+                    completion.complete();
+                });
+                worker
+                    .install_abort_handle(task.abort_handle())
+                    .map_err(|error| error.to_string())?;
+                drop(task);
+                crate::observability_delivery::register_worker(worker);
                 self.started.store(true, Ordering::Release);
                 Ok(())
             }
@@ -1222,6 +1242,14 @@ impl BufferedTraceExporter {
     }
 }
 
+impl Drop for BufferedTraceExporter {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.get() {
+            worker.close_admission();
+        }
+    }
+}
+
 impl TraceExporter for BufferedTraceExporter {
     fn provider_name(&self) -> &'static str {
         self.provider_name
@@ -1235,12 +1263,24 @@ impl TraceExporter for BufferedTraceExporter {
         if !self.started.load(Ordering::Acquire) {
             self.ensure_started()?;
         }
+        let worker = self
+            .worker
+            .get()
+            .ok_or_else(|| "trace exporter worker is unavailable".to_string())?;
+        let Some(_admission) = worker.try_admit() else {
+            return Err("trace exporter is shutting down".to_string());
+        };
+        self.queued_spans.fetch_add(1, Ordering::Relaxed);
         let bytes = span.approx_queued_bytes();
-        self.try_reserve_queued_bytes(bytes)?;
+        if let Err(error) = self.try_reserve_queued_bytes(bytes) {
+            decrement_queued_spans(&self.queued_spans, 1);
+            return Err(error);
+        }
         match self.sender.try_send(QueuedSpan { span, bytes }) {
             Ok(()) => Ok(()),
             Err(error) => {
                 self.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                decrement_queued_spans(&self.queued_spans, 1);
                 Err(error.to_string())
             }
         }
@@ -1527,15 +1567,29 @@ async fn trace_export_flush_loop(
     mut receiver: mpsc::Receiver<QueuedSpan>,
     cfg: TraceHttpExporterConfig,
     queued_bytes: Arc<AtomicUsize>,
+    queued_spans: Arc<AtomicUsize>,
+    worker: Arc<DeliveryWorkerControl>,
+    mut close_rx: watch::Receiver<bool>,
 ) {
     let mut buffer: Vec<SpanData> = Vec::with_capacity(cfg.batch_size);
     let mut buffered_bytes = 0usize;
     let mut timer = tokio::time::interval(cfg.flush_interval);
+    let mut closing = *close_rx.borrow();
+    if closing {
+        worker.wait_for_admissions().await;
+        receiver.close();
+    }
     timer.tick().await;
 
     loop {
         tokio::select! {
             biased;
+
+            _ = close_rx.changed(), if !closing => {
+                closing = true;
+                worker.wait_for_admissions().await;
+                receiver.close();
+            }
 
             msg = receiver.recv() => {
                 match msg {
@@ -1543,16 +1597,20 @@ async fn trace_export_flush_loop(
                         buffered_bytes = buffered_bytes.saturating_add(queued.bytes);
                         buffer.push(queued.span);
                         if buffer.len() >= cfg.batch_size {
+                            let span_count = buffer.len();
                             send_trace_batch(&cfg, &buffer).await;
                             queued_bytes.fetch_sub(buffered_bytes, Ordering::AcqRel);
+                            decrement_queued_spans(&queued_spans, span_count);
                             buffer.clear();
                             buffered_bytes = 0;
                         }
                     }
                     None => {
                         if !buffer.is_empty() {
+                            let span_count = buffer.len();
                             send_trace_batch(&cfg, &buffer).await;
                             queued_bytes.fetch_sub(buffered_bytes, Ordering::AcqRel);
+                            decrement_queued_spans(&queued_spans, span_count);
                         }
                         break;
                     }
@@ -1561,14 +1619,22 @@ async fn trace_export_flush_loop(
 
             _ = timer.tick() => {
                 if !buffer.is_empty() {
+                    let span_count = buffer.len();
                     send_trace_batch(&cfg, &buffer).await;
                     queued_bytes.fetch_sub(buffered_bytes, Ordering::AcqRel);
+                    decrement_queued_spans(&queued_spans, span_count);
                     buffer.clear();
                     buffered_bytes = 0;
                 }
             }
         }
     }
+}
+
+fn decrement_queued_spans(queued_spans: &AtomicUsize, count: usize) {
+    let _ = queued_spans.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(count))
+    });
 }
 
 async fn send_trace_batch(cfg: &TraceHttpExporterConfig, batch: &[SpanData]) {
@@ -1827,9 +1893,16 @@ fn build_otlp_payload(
                 otlp_attribute("client.address", &s.client_ip),
                 otlp_attribute("service.name", &s.service_name),
                 otlp_attribute_double("gateway.latency.total_ms", s.duration_ms),
-                otlp_attribute_double("gateway.latency.processing_ms", s.gateway_processing_ms),
                 otlp_attribute_double("gateway.latency.backend_ttfb_ms", s.backend_ttfb_ms),
             ];
+            // Omit LATENCY_UNKNOWN_MS (-1) sentinel values rather than exporting
+            // them as concrete timing observations (matches backend_total_ms).
+            if s.gateway_processing_ms >= 0.0 {
+                attributes.push(otlp_attribute_double(
+                    "gateway.latency.processing_ms",
+                    s.gateway_processing_ms,
+                ));
+            }
             if !s.http_url.is_empty() {
                 attributes.push(otlp_attribute("url.path", &s.http_url));
             }
@@ -1856,10 +1929,12 @@ fn build_otlp_payload(
                 "gateway.plugin_execution_ms",
                 s.plugin_execution_ms,
             ));
-            attributes.push(otlp_attribute_double(
-                "gateway.overhead_ms",
-                s.gateway_overhead_ms,
-            ));
+            if s.gateway_overhead_ms >= 0.0 {
+                attributes.push(otlp_attribute_double(
+                    "gateway.overhead_ms",
+                    s.gateway_overhead_ms,
+                ));
+            }
             if let Some(ref consumer) = s.consumer {
                 attributes.push(otlp_attribute("enduser.id", consumer));
             }
@@ -3145,14 +3220,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffered_trace_exporter_marks_started_when_runtime_available() {
+    async fn buffered_trace_exporter_starts_deferred_worker_when_runtime_available() {
         let exporter =
             BufferedTraceExporter::new(test_trace_http_exporter_config(), 8, 1024 * 1024)
                 .expect("exporter config accepted");
 
         assert!(
+            !exporter.started.load(Ordering::Acquire),
+            "construction should remain side-effect free until the exporter is used"
+        );
+        exporter
+            .ensure_started()
+            .expect("runtime should start the deferred lifecycle worker");
+        assert!(
             exporter.started.load(Ordering::Acquire),
-            "exporter constructed inside a runtime should enter steady-state without per-span locking"
+            "successful deferred startup should enter steady state"
         );
     }
 

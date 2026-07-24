@@ -25,6 +25,8 @@ mod batching_logger_tests;
 mod body_transform_tests;
 mod body_validator_tests;
 mod bot_detection_tests;
+mod byte_budget_tests;
+mod chargeback_mirror_billing_tests;
 mod compression_tests;
 mod correlation_id_tests;
 mod cors_tests;

@@ -2512,7 +2512,13 @@ async fn h3_native_pool_partial_data_read_timeout_returns_timeout_without_downgr
             H3Step::RespondData(prefix),
             H3Step::StallFor(Duration::from_secs(30)),
         ],
-        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
+        // A bounded (non-zero, <= 32 MiB) response-body limit keeps the
+        // compression plugin on the buffered collect path. Response compression
+        // is disabled when the gateway limit is unlimited (0) or above the
+        // 32 MiB compression ceiling, and only the buffered collect converts a
+        // mid-body backend read timeout into a pre-commit 504 Backend timeout
+        // instead of a committed partial 200.
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "1048576")],
         200,
     )
     .await;
@@ -2583,7 +2589,13 @@ async fn h3_frontend_refined_buffered_rejects_truncated_content_length_fin() {
             H3Step::RespondTrailers(vec![("x-backend-finished", "true".to_string())]),
             H3Step::StallFor(Duration::from_millis(100)),
         ],
-        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "0")],
+        // A bounded (non-zero, <= 32 MiB) response-body limit keeps the
+        // compression plugin on the refined-buffered collect path. Response
+        // compression is disabled when the gateway limit is unlimited (0) or
+        // above the 32 MiB compression ceiling, and only the buffered collect
+        // (`collect_h3_open_response_body`) rejects a short Content-Length FIN
+        // as a pre-commit 502 truncation instead of forwarding a committed 200.
+        &[("FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES", "1048576")],
     )
     .await;
 

@@ -2226,8 +2226,123 @@ async fn mesh_tier3_mirror_vs_emits_working_request_mirror_plugin() {
     let res = plugin.before_proxy(&mut ctx, &mut headers).await;
     assert!(matches!(res, PluginResult::Continue));
     assert!(
-        ctx.mirror_result_rx.is_some(),
+        ctx.mirror_result_rxs.len() == 1,
         "a 100% mirror must arm the mirror result channel (request was mirrored)"
+    );
+}
+
+#[tokio::test]
+async fn mesh_tier3_mirror_and_exact_rewrite_share_one_route_scope() {
+    let result = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [{
+                    "match": [{"uri": {"exact": "/legacy"}}],
+                    "route": [{"destination": {"host": "api.default.svc.cluster.local", "port": {"number": 8080}}}],
+                    "rewrite": {
+                        "uri": "/internal/exact",
+                        "authority": "internal.example.com"
+                    },
+                    "mirror": {
+                        "host": "shadow.default.svc.cluster.local",
+                        "port": {"number": 9090}
+                    },
+                    "mirrorPercentage": {"value": 100.0}
+                }]
+            }),
+        )],
+        options(),
+    )
+    .expect("translation succeeds");
+
+    let proxy = result
+        .config
+        .proxies
+        .iter()
+        .find(|proxy| proxy.listen_path.as_deref() == Some("=/legacy"))
+        .expect("exact route proxy");
+    let dispatch_config = dispatch_plugin_for_proxy(&result.config, proxy);
+    let mirror_config = result
+        .config
+        .plugin_configs
+        .iter()
+        .find(|plugin| {
+            plugin.plugin_name == "request_mirror"
+                && plugin.proxy_id.as_deref() == Some(proxy.id.as_str())
+        })
+        .expect("route-local mirror plugin");
+    assert_eq!(
+        mirror_config.config["mirror_host"].as_str(),
+        Some("shadow.default.svc.cluster.local")
+    );
+
+    let rewrite = &dispatch_config.config["rules"][0]["rewrite"];
+    assert_eq!(rewrite["uri"].as_str(), Some("/internal/exact"));
+    assert_eq!(rewrite["authority"].as_str(), Some("internal.example.com"));
+    assert!(
+        rewrite.get("match_prefix").is_none(),
+        "an exact rewrite replaces the whole request target"
+    );
+
+    let dispatch = MeshRouteDispatch::new(&dispatch_config.config).expect("dispatch config");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/legacy".to_string(),
+    );
+    let mut headers = HashMap::from([("host".to_string(), "api.example.com".to_string())]);
+    assert!(matches!(
+        dispatch.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(ctx.route_override_path.as_deref(), Some("/internal/exact"));
+    assert_eq!(
+        ctx.route_override_authority.as_deref(),
+        Some("internal.example.com")
+    );
+}
+
+#[test]
+fn mesh_tier3_route_local_mirror_fails_closed_when_route_collapse_is_required() {
+    let error = translate_k8s_objects(
+        &[object(
+            "VirtualService",
+            serde_json::json!({
+                "hosts": ["api.example.com"],
+                "http": [
+                    {
+                        "match": [{
+                            "uri": {"prefix": "/api"},
+                            "headers": {"x-canary": {"exact": "true"}}
+                        }],
+                        "route": [{"destination": {"host": "canary.default.svc.cluster.local", "port": {"number": 9090}}}],
+                        "rewrite": {
+                            "uri": "/internal",
+                            "authority": "canary.internal.example.com"
+                        },
+                        "mirror": {
+                            "host": "shadow.default.svc.cluster.local",
+                            "port": {"number": 9191}
+                        },
+                        "mirrorPercentage": {"value": 100.0}
+                    },
+                    {
+                        "match": [{"uri": {"prefix": "/api"}}],
+                        "route": [{"destination": {"host": "stable.default.svc.cluster.local", "port": {"number": 8080}}}]
+                    }
+                ]
+            }),
+        )],
+        options(),
+    )
+    .expect_err("route-local mirror must fail closed instead of leaking to a sibling route");
+
+    assert!(
+        error.to_string().contains("traffic mirror")
+            && error.to_string().contains("merged with another route"),
+        "unexpected collapse error: {error}"
     );
 }
 

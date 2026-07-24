@@ -212,7 +212,7 @@ pub(crate) fn minimal_plugin_config(plugin_name: &str) -> serde_json::Value {
             "tools": { "github.create_pr": { "action": "allow" } }
         }),
         "ai_transcript_audit" => json!({
-            "sink": {"endpoint_url": "http://localhost:9200/audit"}
+            "sink": {"endpoint_url": "https://localhost:9200/audit"}
         }),
         "ldap_auth" => json!({
             "ldap_url": "ldaps://ldap.example.com:636",
@@ -1304,6 +1304,229 @@ fn test_prometheus_metrics_requires_global_and_unique_registry_owner() {
         .err()
         .expect("plugin cache must reject competing registry owners");
     assert!(duplicate_error.contains("at most one enabled global instance"));
+}
+
+#[test]
+fn test_api_chargeback_rejects_duplicate_proxy_scoped_instances() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["charge-a", "charge-b"])],
+        vec![
+            make_plugin_config(
+                "charge-a",
+                "api_chargeback",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "charge-b",
+                "api_chargeback",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+        ],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("two proxy-scoped chargeback instances must be rejected");
+    assert!(
+        error.contains("at most one effective instance per proxy"),
+        "unexpected error: {error}"
+    );
+    assert!(error.contains("charge-a") && error.contains("charge-b"));
+}
+
+#[test]
+fn test_api_chargeback_rejects_duplicate_global_instances_without_proxies() {
+    let config = make_config(
+        vec![],
+        vec![
+            make_plugin_config(
+                "charge-global-a",
+                "api_chargeback",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+            make_plugin_config(
+                "charge-global-b",
+                "api_chargeback",
+                PluginScope::Global,
+                None,
+                true,
+            ),
+        ],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("two process-global chargeback instances must be rejected");
+    assert!(
+        error.contains("at most one enabled global instance"),
+        "unexpected error: {error}"
+    );
+    assert!(error.contains("charge-global-a") && error.contains("charge-global-b"));
+}
+
+#[test]
+fn test_api_chargeback_rejects_duplicate_proxy_group_instances() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["group-a", "group-b"])],
+        vec![
+            make_plugin_config(
+                "group-a",
+                "api_chargeback",
+                PluginScope::ProxyGroup,
+                None,
+                true,
+            ),
+            make_plugin_config(
+                "group-b",
+                "api_chargeback",
+                PluginScope::ProxyGroup,
+                None,
+                true,
+            ),
+        ],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("two proxy-group chargeback instances must be rejected");
+    assert!(
+        error.contains("at most one effective instance per proxy"),
+        "unexpected error: {error}"
+    );
+    assert!(error.contains("group-a") && error.contains("group-b"));
+}
+
+#[test]
+fn test_api_chargeback_rejects_mixed_proxy_and_proxy_group_instances() {
+    let config = make_config(
+        vec![make_proxy(
+            "p1",
+            "/api",
+            vec!["charge-proxy", "charge-group"],
+        )],
+        vec![
+            make_plugin_config(
+                "charge-proxy",
+                "api_chargeback",
+                PluginScope::Proxy,
+                Some("p1"),
+                true,
+            ),
+            make_plugin_config(
+                "charge-group",
+                "api_chargeback",
+                PluginScope::ProxyGroup,
+                None,
+                true,
+            ),
+        ],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("mixed scoped chargeback instances must be rejected");
+    assert!(
+        error.contains("at most one effective instance per proxy"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn test_api_chargeback_rejects_conflicting_shared_tunables_across_proxies() {
+    let mut owner = make_plugin_config(
+        "charge-owner",
+        "api_chargeback",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    owner.config = json!({
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+        "render_cache_ttl_seconds": 5,
+        "cleanup_interval_seconds": 0
+    });
+    let mut sibling = make_plugin_config(
+        "charge-sibling",
+        "api_chargeback",
+        PluginScope::Proxy,
+        Some("p2"),
+        true,
+    );
+    sibling.config = json!({
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.02}],
+        "currency": "EUR",
+        "render_cache_ttl_seconds": 30,
+        "cleanup_interval_seconds": 0
+    });
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["charge-owner"]),
+            make_proxy("p2", "/web", vec!["charge-sibling"]),
+        ],
+        vec![owner, sibling],
+    );
+    let error = PluginCache::new(&config)
+        .err()
+        .expect("disagreeing shared tunables must be rejected");
+    assert!(
+        error.contains("shared render/cleanup tunables must match"),
+        "unexpected error: {error}"
+    );
+    assert!(error.contains("charge-owner") && error.contains("charge-sibling"));
+}
+
+#[test]
+fn test_api_chargeback_allows_one_instance_per_proxy_with_mixed_currency() {
+    let mut usd = make_plugin_config(
+        "charge-usd",
+        "api_chargeback",
+        PluginScope::Proxy,
+        Some("p1"),
+        true,
+    );
+    usd.config = json!({
+        "currency": "USD",
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.01}],
+        "cleanup_interval_seconds": 0
+    });
+    let mut eur = make_plugin_config(
+        "charge-eur",
+        "api_chargeback",
+        PluginScope::Proxy,
+        Some("p2"),
+        true,
+    );
+    eur.config = json!({
+        "currency": "EUR",
+        "pricing_tiers": [{"status_codes": [200], "price_per_call": 0.02}],
+        "cleanup_interval_seconds": 0
+    });
+    let config = make_config(
+        vec![
+            make_proxy("p1", "/api", vec!["charge-usd"]),
+            make_proxy("p2", "/web", vec!["charge-eur"]),
+        ],
+        vec![usd, eur],
+    );
+    let cache = PluginCache::new(&config).expect("one chargeback per proxy is valid");
+    assert_eq!(
+        cache
+            .get_plugins("p1")
+            .iter()
+            .filter(|plugin| plugin.name() == "api_chargeback")
+            .count(),
+        1
+    );
+    assert_eq!(
+        cache
+            .get_plugins("p2")
+            .iter()
+            .filter(|plugin| plugin.name() == "api_chargeback")
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -2403,6 +2626,92 @@ async fn serverless_instances_keep_independent_transaction_metadata() {
     );
 }
 
+#[tokio::test]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn chargeback_sink_cache_construction_preserves_plugin_config_id() {
+    let config = make_config(
+        vec![make_proxy("p1", "/api", vec!["chargeback-stable-id"])],
+        vec![make_plugin_config(
+            "chargeback-stable-id",
+            "api_chargeback_sink",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("chargeback sink cache");
+    let status: serde_json::Value =
+        serde_json::from_str(&ferrum_edge::plugins::api_chargeback_sink::render_status_json())
+            .expect("chargeback status");
+
+    assert_eq!(status["instance_count"], 1);
+    assert_eq!(
+        status["instances"][0]["plugin_config_id"], "chargeback-stable-id",
+        "production PluginCache must pass the stable resource id"
+    );
+
+    drop(cache);
+}
+
+#[tokio::test]
+async fn request_mirror_cache_construction_preserves_plugin_config_id() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(&server)
+        .await;
+    let server_url = url::Url::parse(&server.uri()).expect("mirror URL");
+    let proxy = make_proxy("p1", "/api", vec!["mirror-stable-id"]);
+    let config = make_config(
+        vec![proxy.clone()],
+        vec![make_plugin_config_with_json(
+            "mirror-stable-id",
+            "request_mirror",
+            json!({
+                "mirror_host": server_url.host_str().expect("mirror host"),
+                "mirror_port": server_url.port().expect("mirror port"),
+                "percentage": 100,
+                "mirror_request_body": false
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )],
+    );
+    let cache = PluginCache::new(&config).expect("request mirror cache");
+    let plugins = cache.get_plugins_for_protocol("p1", ProxyProtocol::Http);
+    let mirror = plugins
+        .iter()
+        .find(|plugin| plugin.name() == "request_mirror")
+        .expect("request mirror plugin");
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "GET".to_string(),
+        "/api/widgets".to_string(),
+    );
+    ctx.matched_proxy = Some(Arc::new(proxy));
+    let mut headers = HashMap::new();
+
+    assert!(matches!(
+        mirror.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        ctx.collect_mirror_result(),
+    )
+    .await
+    .expect("mirror completion")
+    .expect("mirror metadata");
+    assert_eq!(
+        result.mirror_plugin_id.as_deref(),
+        Some("mirror-stable-id"),
+        "production PluginCache must pass the stable resource id"
+    );
+}
+
 #[test]
 fn serverless_body_egress_rejects_request_body_transform_composition() {
     let mut transform_cases = vec![
@@ -2490,6 +2799,68 @@ fn candidate_security_validation_constructs_custom_capabilities_without_builtin_
     assert!(candidate.contains("ServerlessSecurityCompositionPlugin"));
     assert!(candidate.contains("validate_plugin_security_composition(&merged)"));
     assert!(candidate.contains("validate_plugin_security_composition(plugins)"));
+}
+
+#[tokio::test]
+async fn transcript_audit_must_precede_every_request_deduplication_instance() {
+    let audit_config = || {
+        make_plugin_config_with_json(
+            "audit",
+            "ai_transcript_audit",
+            json!({
+                "capture": {
+                    "request": true,
+                    "response": true
+                },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest"
+                }
+            }),
+            PluginScope::Proxy,
+            Some("p1"),
+        )
+    };
+    let dedup_config = || {
+        make_plugin_config(
+            "dedup",
+            "request_deduplication",
+            PluginScope::Proxy,
+            Some("p1"),
+            true,
+        )
+    };
+
+    let valid = make_config(
+        vec![make_proxy("p1", "/api", vec!["audit", "dedup"])],
+        vec![audit_config(), dedup_config()],
+    );
+    validate_plugin_composition_candidate_with_real_ip_header_for_test(&valid, None)
+        .expect("default audit priority must stage before deduplication");
+    PluginCache::new(&valid).expect("runtime cache must accept the safe order");
+
+    for invalid_priority in [2750, 2800] {
+        let mut audit = audit_config();
+        audit.priority_override = Some(invalid_priority);
+        let invalid = make_config(
+            vec![make_proxy("p1", "/api", vec!["audit", "dedup"])],
+            vec![audit, dedup_config()],
+        );
+        let candidate_error =
+            validate_plugin_composition_candidate_with_real_ip_header_for_test(&invalid, None)
+                .expect_err("candidate write must reject audit after/equal to deduplication");
+        assert!(
+            candidate_error.contains("must run before every request_deduplication"),
+            "priority={invalid_priority}, got: {candidate_error}"
+        );
+        let runtime_error = PluginCache::new(&invalid)
+            .err()
+            .expect("runtime cache must repeat the fail-closed ordering check");
+        assert!(
+            runtime_error.contains("must run before every request_deduplication"),
+            "priority={invalid_priority}, got: {runtime_error}"
+        );
+    }
 }
 
 #[test]
@@ -6223,6 +6594,10 @@ async fn test_priority_override_delegates_deadline_rejection_replacement_capabil
     assert_eq!(plugins.len(), 1);
     assert_eq!(plugins[0].priority(), 100);
     assert!(plugins[0].may_replace_rejection_response());
+    assert!(
+        plugins[0].defers_response_stream_termination_until_after_peers(),
+        "priority override wrappers must preserve audit terminal-observer ordering"
+    );
 }
 
 #[test]
@@ -6588,6 +6963,7 @@ async fn test_priority_override_delegates_context_response_body_transform() {
         "GET".to_string(),
         "/api/users".to_string(),
     );
+    ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
 
     let mut request_headers = HashMap::new();
     request_headers.insert("accept-encoding".to_string(), "gzip".to_string());

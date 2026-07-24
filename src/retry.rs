@@ -262,6 +262,18 @@ fn classify_stream_setup_kind(kind: crate::proxy::stream_error::StreamSetupKind)
 pub fn classify_grpc_proxy_error(e: &crate::proxy::grpc_proxy::GrpcProxyError) -> ErrorClass {
     use crate::proxy::grpc_proxy::{GrpcBackendUnavailableKind, GrpcProxyError, GrpcTimeoutKind};
 
+    // Coalesced-create waiters reconstruct `BackendUnavailable` with a
+    // `SharedPoolCreateError` source that already carries the creator's
+    // canonical ErrorClass. Prefer it before kind/message heuristics so
+    // DNS/TLS/timeout/egress/port-exhaustion stay aligned across the fan-out.
+    if let GrpcProxyError::BackendUnavailable {
+        source: Some(src), ..
+    } = e
+        && let Some(shared) = src.downcast_ref::<crate::pool::SharedPoolCreateError>()
+    {
+        return shared.error_class();
+    }
+
     // A DnsCacheResolver egress-policy denial (a gRPC backend hostname or
     // dns_override that resolves — or rebinds — to a blocked IP) surfaces as a
     // BackendUnavailable{DnsResolution} whose message carries "...denied by
@@ -363,6 +375,13 @@ fn classify_typed_chain(
 ) -> Option<ErrorClass> {
     let mut current = start;
     while let Some(err) = current {
+        // Coalesced GenericPool create failures broadcast a cloneable
+        // `SharedPoolCreateError` that already carries the creator's canonical
+        // ErrorClass. Prefer it before walking io/rustls sources so H3/anyhow
+        // waiters keep DNS/TLS/timeout/port-exhaustion/egress parity.
+        if let Some(shared) = err.downcast_ref::<crate::pool::SharedPoolCreateError>() {
+            return Some(shared.error_class());
+        }
         // `HbonePoolError` is the shared dial/setup error for ALL mesh-transport
         // tunnels (HBONE raw-TCP, Sidecar mesh-mTLS, and the WebSocket Extended
         // CONNECT egress). Every variant is a pre-wire DIAL/setup failure, so its
@@ -1006,15 +1025,20 @@ impl BackendResponse {
 ///
 /// Checks two independent retry paths:
 /// 1. **Connection failures** (`connection_error = true`): retried when
-///    `retry_on_connect_failure` is enabled, regardless of the synthetic
-///    status code. These are TCP-layer problems (connect refused, timeout,
-///    DNS failure, TLS error) where no HTTP response was received.
+///    `retry_on_connect_failure` is enabled, regardless of HTTP method.
+///    These are pre-wire TCP-layer problems (connect refused, timeout,
+///    DNS failure, TLS error) where no HTTP response was received and the
+///    request never reached the backend, so idempotency is not a concern.
+///    `retryable_methods` does NOT gate this path.
 /// 2. **HTTP status failures** (`connection_error = false`): retried when
 ///    the response status code is in `retryable_status_codes`. These are
 ///    real HTTP responses from the backend (e.g., 502 from an upstream
-///    load balancer, 503 during deployment).
+///    load balancer, 503 during deployment). This path is constrained by
+///    `retryable_methods` to guard against non-idempotent replays (e.g.,
+///    POST).
 ///
-/// Both paths still respect `max_retries` and `retryable_methods`.
+/// Both paths respect `max_retries`; only the HTTP status path respects
+/// `retryable_methods` and `retryable_status_codes`.
 pub fn should_retry(
     config: &RetryConfig,
     method: &str,

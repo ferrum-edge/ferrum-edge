@@ -66,6 +66,7 @@ fn make_ctx(accept_encoding: Option<&str>) -> RequestContext {
         "GET".to_string(),
         "/test".to_string(),
     );
+    ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
     if let Some(ae) = accept_encoding {
         ctx.headers
             .insert("accept-encoding".to_string(), ae.to_string());
@@ -122,6 +123,59 @@ fn test_decompress_request_config() {
     let plugin = make_plugin(json!({"decompress_request": true}));
     assert!(plugin.modifies_request_body());
     assert!(plugin.modifies_request_headers());
+}
+
+#[test]
+fn test_global_algorithm_gates_intersect_response_and_request_support() {
+    let plugin = CompressionPlugin::new_with_algorithm_support(
+        &json!({"algorithms": ["gzip", "br"], "decompress_request": true}),
+        false,
+        true,
+    )
+    .expect("Brotli remains enabled");
+    assert!(plugin.requires_response_body_buffering());
+
+    let mut gzip_ctx = make_ctx(None);
+    gzip_ctx
+        .headers
+        .insert("content-encoding".to_string(), "gzip".to_string());
+    assert!(
+        !plugin.should_buffer_request_body(&gzip_ctx),
+        "globally disabled gzip must not buffer or decode requests"
+    );
+
+    let mut br_ctx = make_ctx(None);
+    br_ctx
+        .headers
+        .insert("content-encoding".to_string(), "br".to_string());
+    assert!(
+        plugin.should_buffer_request_body(&br_ctx),
+        "globally enabled Brotli remains available for request decoding"
+    );
+
+    let disabled = CompressionPlugin::new_with_algorithm_support(
+        &json!({"algorithms": ["gzip", "br"], "decompress_request": true}),
+        false,
+        false,
+    );
+    let err = match disabled {
+        Err(err) => err,
+        Ok(_) => panic!("all-disabled global gates must fail admission"),
+    };
+    assert!(
+        err.contains("no usable algorithms after applying process-wide codec gates"),
+        "got: {err}"
+    );
+
+    let default_policy = make_plugin(json!({"decompress_request": true}));
+    let mut x_gzip_ctx = make_ctx(None);
+    x_gzip_ctx
+        .headers
+        .insert("content-encoding".to_string(), "x-gzip".to_string());
+    assert!(
+        default_policy.should_buffer_request_body(&x_gzip_ctx),
+        "legacy x-gzip requests must use the canonical gzip decoder"
+    );
 }
 
 #[test]
@@ -366,6 +420,30 @@ async fn test_selects_brotli_from_accept_encoding() {
 
     plugin.after_proxy(&mut ctx, 200, &mut resp_headers).await;
     assert_eq!(resp_headers.get("content-encoding").unwrap(), "br");
+}
+
+#[tokio::test]
+async fn test_x_gzip_compatibility_token_selects_canonical_gzip() {
+    let plugin = make_plugin(json!({"algorithms": ["gzip"]}));
+    let mut ctx = make_ctx(Some("x-gzip"));
+    let mut request_headers = HashMap::new();
+    plugin.before_proxy(&mut ctx, &mut request_headers).await;
+
+    let mut response_headers = HashMap::from([
+        ("content-type".to_string(), "application/json".to_string()),
+        ("content-length".to_string(), "1000".to_string()),
+    ]);
+    assert!(matches!(
+        plugin
+            .after_proxy(&mut ctx, 200, &mut response_headers)
+            .await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        response_headers.get("content-encoding").map(String::as_str),
+        Some("gzip"),
+        "legacy x-gzip negotiation must emit the canonical gzip coding"
+    );
 }
 
 #[tokio::test]
@@ -1022,6 +1100,7 @@ async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
         "GET".to_string(),
         "/cache-vary-order".to_string(),
     );
+    gzip_store_ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
     gzip_store_ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
     gzip_store_ctx
         .headers
@@ -3395,14 +3474,14 @@ async fn test_bare_wildcard_still_enables_codec() {
     assert_eq!(selected.as_deref(), Some("gzip"));
 }
 
-/// #87: a present-but-unparseable q-value (`gzip;q=abc`) is treated as not
-/// acceptable (q=0), so gzip must NOT be selected when it is the only codec.
+/// #87: a present-but-unparseable q-value (`gzip;q=abc`) is ignored, so gzip
+/// must NOT be selected when it is the only offered codec.
 #[tokio::test]
 async fn test_malformed_q_value_treated_as_not_acceptable() {
     let selected = negotiate_encoding(json!(["gzip"]), "gzip;q=abc").await;
     assert_eq!(
         selected, None,
-        "a garbage q-value must be treated as q=0 (not acceptable), not q=1.0"
+        "a garbage q-value must be ignored, not treated as q=1.0"
     );
 }
 
@@ -3414,17 +3493,17 @@ async fn test_empty_q_value_treated_as_not_acceptable() {
 }
 
 /// #87: a malformed q on one codec must not let it beat a well-formed,
-/// genuinely-preferred codec. `gzip;q=abc` (→ q=0) loses to `br;q=1`.
+/// genuinely-preferred codec. The invalid gzip member is ignored.
 #[tokio::test]
 async fn test_malformed_q_value_does_not_outrank_valid_codec() {
     // Server preference is gzip-first; without the fix gzip;q=abc would parse as
-    // q=1.0 and win the tie. With the fix it is q=0 and excluded, so br wins.
+    // q=1.0 and win the tie. With the fix it is ignored, so br wins.
     let selected = negotiate_encoding(json!(["gzip", "br"]), "gzip;q=abc, br;q=1").await;
     assert_eq!(selected.as_deref(), Some("br"));
 }
 
-/// #87: `q=NaN` parses to a float in Rust but must be rejected as non-finite
-/// (q=0) so it neither wins selection nor poisons the highest-q tie-break math.
+/// #87: `q=NaN` parses to a float in Rust but is not valid RFC 9110 syntax and
+/// must be ignored so it neither wins selection nor poisons tie-break math.
 #[tokio::test]
 async fn test_nan_q_value_does_not_poison_selection() {
     // gzip;q=NaN must be excluded. br;q=0.5 is the only acceptable configured
@@ -3442,30 +3521,27 @@ async fn test_nan_q_value_does_not_poison_selection() {
     assert_eq!(none, None);
 }
 
-/// #87: a q-value above 1.0 is clamped to 1.0 (still acceptable) rather than
-/// rejected — clamping must not turn a valid (if out-of-range) weight into a
-/// refusal.
+/// #87: a q-value above 1.0 is outside the RFC 9110 qvalue grammar. It is
+/// ignored rather than clamped into an accepted coding.
 #[tokio::test]
-async fn test_out_of_range_q_value_is_clamped_not_refused() {
+async fn test_out_of_range_q_value_is_ignored() {
     let selected = negotiate_encoding(json!(["gzip"]), "gzip;q=5").await;
-    assert_eq!(selected.as_deref(), Some("gzip"));
+    assert_eq!(selected, None);
 }
 
 // ──────────────── #60: multi-member gzip request decompression ────────────────
 
-/// #60: a concatenated multi-member gzip request body must be decoded in full.
-/// `GzDecoder` would stop after the first member and silently truncate the body;
-/// `MultiGzDecoder` decodes every member.
+/// Concatenated multi-member gzip is rejected by the shared content-coding
+/// decoder (trailing bytes after the first member). Fail closed rather than
+/// silently truncating to the first member.
 #[tokio::test]
-async fn test_multi_member_gzip_request_decompression() {
+async fn test_multi_member_gzip_request_decompression_fails_closed() {
     use flate2::write::GzEncoder;
     use std::io::Write;
 
     let part_a = b"first gzip member payload; ";
     let part_b = b"second gzip member payload!";
 
-    // Build two independent gzip members and concatenate them — a valid
-    // multi-member stream per RFC 1952 §2.2.
     let mut compressed = Vec::new();
     for part in [part_a.as_slice(), part_b.as_slice()] {
         let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -3477,17 +3553,12 @@ async fn test_multi_member_gzip_request_decompression() {
     let mut headers = HashMap::new();
     headers.insert("content-encoding".to_string(), "gzip".to_string());
 
-    let decompressed = plugin
+    let result = plugin
         .transform_request_body(&compressed, Some("application/octet-stream"), &headers)
-        .await
-        .expect("multi-member gzip should decompress");
-
-    let mut expected = Vec::new();
-    expected.extend_from_slice(part_a);
-    expected.extend_from_slice(part_b);
-    assert_eq!(
-        decompressed, expected,
-        "both gzip members must be decoded; the body must not be truncated to the first member"
+        .await;
+    assert!(
+        result.is_none(),
+        "concatenated multi-member gzip must fail closed instead of truncating"
     );
 }
 
@@ -4983,5 +5054,937 @@ fn test_h1_h2_h3_paths_share_multi_instance_body_transform_loops() {
     assert!(
         h3_cross.contains("apply_request_body_plugins_with_context("),
         "H3 cross-protocol must use the shared request-body transform helper"
+    );
+}
+
+// ── Compression audit follow-up (#3059, #3060, #3071, #3072) ───────────────
+
+#[test]
+fn test_max_decompressed_request_size_hard_maximum_rejected() {
+    use ferrum_edge::plugins::compression::HARD_MAX_DECOMPRESSED_REQUEST_SIZE;
+
+    let over = HARD_MAX_DECOMPRESSED_REQUEST_SIZE.saturating_add(1);
+    let result = CompressionPlugin::new(&json!({
+        "decompress_request": true,
+        "max_decompressed_request_size": over
+    }));
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("values above the hard maximum must fail admission"),
+    };
+    assert!(err.contains("hard maximum"), "got: {err}");
+}
+
+#[test]
+fn test_max_decompressed_request_size_cross_checks_request_body_limit() {
+    let result = CompressionPlugin::new_with_algorithm_support_and_body_limit(
+        &json!({
+            "decompress_request": true,
+            "max_decompressed_request_size": 2_000_000
+        }),
+        true,
+        true,
+        1_000_000,
+    );
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("decompressed ceiling must not exceed the request body limit"),
+    };
+    assert!(
+        err.contains("FERRUM_MAX_REQUEST_BODY_SIZE_BYTES"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn test_response_only_compression_ignores_unused_decompression_body_cross_check() {
+    CompressionPlugin::new_with_algorithm_support_and_body_limit(
+        &json!({
+            "decompress_request": false
+        }),
+        true,
+        true,
+        1_000_000,
+    )
+    .expect("response-only compression must not reject an unused decompression default");
+}
+
+#[test]
+fn test_max_decompressed_request_size_at_hard_maximum_accepted() {
+    use ferrum_edge::plugins::compression::HARD_MAX_DECOMPRESSED_REQUEST_SIZE;
+
+    CompressionPlugin::new(&json!({
+        "decompress_request": true,
+        "max_decompressed_request_size": HARD_MAX_DECOMPRESSED_REQUEST_SIZE
+    }))
+    .expect("exact hard maximum must be accepted when no body limit is set");
+}
+
+#[tokio::test]
+async fn test_high_ratio_amplification_aborts_early() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    // Highly compressible zeros: a tiny gzip expands far past 1024:1 under a
+    // generous absolute size cap, so the amplification ratio must trip first.
+    let plugin = make_plugin(json!({
+        "decompress_request": true,
+        "max_decompressed_request_size": 16 * 1024 * 1024
+    }));
+    // Four MiB sits on the 1024:1 boundary with some flate2/miniz versions
+    // once gzip framing is included. Eight MiB keeps the fixture decisively
+    // beyond the policy ratio without approaching the absolute cap.
+    let zeros = vec![0u8; 8 * 1024 * 1024];
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::best());
+    encoder.write_all(&zeros).unwrap();
+    let compressed = encoder.finish().unwrap();
+    assert!(
+        compressed
+            .len()
+            .checked_mul(1024)
+            .is_some_and(|limit| limit < zeros.len()),
+        "fixture must exceed the 1024:1 amplification ratio (compressed={})",
+        compressed.len()
+    );
+
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    let mut body = compressed.clone();
+    let result = plugin
+        .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
+        .await;
+    assert!(
+        matches!(
+            result,
+            PluginResult::Reject {
+                status_code: 400,
+                ..
+            }
+        ),
+        "high-ratio zip bombs must fail closed, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_global_gates_partial_disable_keeps_remaining_codec() {
+    let plugin = CompressionPlugin::new_with_algorithm_support(
+        &json!({"algorithms": ["gzip", "br"], "remove_accept_encoding": true}),
+        false,
+        true,
+    )
+    .expect("Brotli-only remains usable");
+
+    let mut ctx = make_ctx(Some("gzip, br"));
+    let mut headers = HashMap::new();
+    headers.insert("accept-encoding".to_string(), "gzip, br".to_string());
+    plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(
+        !headers.contains_key("accept-encoding"),
+        "usable response codec may still strip Accept-Encoding"
+    );
+
+    let mut resp = HashMap::new();
+    resp.insert("content-type".to_string(), "application/json".to_string());
+    resp.insert("content-length".to_string(), "1000".to_string());
+    plugin.after_proxy(&mut ctx, 200, &mut resp).await;
+    assert_eq!(resp.get("content-encoding").map(String::as_str), Some("br"));
+}
+
+#[tokio::test]
+async fn test_content_encoding_ows_is_trimmed_and_decoded() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let original = b"ows-trimmed content-encoding";
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), " gzip ".to_string());
+    let mut body = compressed.clone();
+    let result = plugin
+        .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(body.as_slice(), original.as_slice());
+}
+
+#[tokio::test]
+async fn test_content_encoding_chain_decodes_in_reverse_order() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let original = b"stacked gzip then brotli";
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(original).unwrap();
+    let gzip_buf = encoder.finish().unwrap();
+    let mut br_buf = Vec::new();
+    let params = brotli::enc::BrotliEncoderParams::default();
+    brotli::BrotliCompress(&mut &gzip_buf[..], &mut br_buf, &params).unwrap();
+
+    let mut ctx = make_request_ctx_with_body("gzip, br", &br_buf);
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip, br".to_string());
+    let mut body = br_buf.clone();
+    let result = plugin
+        .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+    assert_eq!(body.as_slice(), original.as_slice());
+    assert_eq!(
+        ctx.metadata
+            .get("compression:request_encoding")
+            .map(String::as_str),
+        Some("gzip, br")
+    );
+}
+
+#[tokio::test]
+async fn test_content_encoding_identity_only_strips_without_body_rewrite() {
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let mut ctx = make_request_ctx_with_body("identity", b"plain");
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "identity".to_string());
+    let mut body = b"plain".to_vec();
+    let result = plugin
+        .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(body, b"plain");
+    assert!(!headers.contains_key("content-encoding"));
+}
+
+#[tokio::test]
+async fn test_content_encoding_duplicate_supported_members_decode() {
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let original = b"double gzip chain";
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(original).unwrap();
+    let once = encoder.finish().unwrap();
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&once).unwrap();
+    let twice = encoder.finish().unwrap();
+
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip, gzip".to_string());
+    let mut ctx = make_request_ctx_with_body("gzip, gzip", &twice);
+    let mut body = twice.clone();
+    let result = plugin
+        .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
+        .await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+    assert_eq!(body.as_slice(), original.as_slice());
+}
+
+#[tokio::test]
+async fn test_content_encoding_malformed_and_unsupported_fail_closed() {
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    for ce in ["gzip,", ",gzip", "gzip;q=1", "zstd", "gzip, identity"] {
+        let mut ctx = make_request_ctx_with_body(ce, b"x");
+        let mut headers = HashMap::new();
+        headers.insert("content-encoding".to_string(), ce.to_string());
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 400,
+                    ..
+                }
+            ),
+            "Content-Encoding '{ce}' must fail closed, got {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_codec_admission_saturation_rejects_request_decode() {
+    use ferrum_edge::plugins::compression::{compression_codec_metrics, with_test_codec_budget};
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    with_test_codec_budget(0, || async {
+        let before = compression_codec_metrics();
+
+        let plugin = make_plugin(json!({"decompress_request": true}));
+        let original = b"saturation fixture";
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+        let mut headers = HashMap::new();
+        headers.insert("content-encoding".to_string(), "gzip".to_string());
+        let mut body = compressed;
+        let result = plugin
+            .normalize_buffered_request_body_before_before_proxy(&mut ctx, &mut headers, &mut body)
+            .await;
+        assert!(
+            matches!(
+                result,
+                PluginResult::Reject {
+                    status_code: 503,
+                    ..
+                }
+            ),
+            "saturated codec budget must reject request decode, got {result:?}"
+        );
+        let after = compression_codec_metrics();
+        assert!(after.saturated > before.saturated);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_codec_admission_saturation_skips_response_commit() {
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+
+    with_test_codec_budget(0, || async {
+        let plugin = make_plugin(json!({"min_content_length": 10}));
+        let mut ctx = make_ctx(Some("gzip"));
+        let mut headers = HashMap::new();
+        headers.insert("accept-encoding".to_string(), "gzip".to_string());
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+
+        let mut resp = HashMap::new();
+        resp.insert("content-type".to_string(), "application/json".to_string());
+        resp.insert("content-length".to_string(), "1000".to_string());
+        let result = plugin.after_proxy(&mut ctx, 200, &mut resp).await;
+        assert!(matches!(result, PluginResult::Continue));
+        assert!(
+            !resp.contains_key("content-encoding"),
+            "saturated codec budget must not commit Content-Encoding"
+        );
+    })
+    .await;
+}
+
+// ───────────── Response-buffer negotiation + early codec admission ─────────────
+
+/// Run `before_proxy` with the Accept-Encoding staged in the header param (the
+/// production shape) so the response-admission reservation observes the saved
+/// snapshot exactly as it does in the proxy.
+async fn before_proxy_with_accept_encoding(
+    plugin: &CompressionPlugin,
+    ctx: &mut RequestContext,
+    accept_encoding: Option<&str>,
+) {
+    let mut headers = HashMap::new();
+    if let Some(ae) = accept_encoding {
+        headers.insert("accept-encoding".to_string(), ae.to_string());
+    }
+    assert!(matches!(
+        plugin.before_proxy(ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+}
+
+#[test]
+fn test_should_buffer_negotiates_accept_encoding_not_mere_presence() {
+    // Response buffering must reflect real negotiation, not the presence of an
+    // Accept-Encoding header: identity, unsupported-only, and all-`q=0` requests
+    // have nothing this instance can compress, so they must stream.
+    let plugin = make_plugin(json!({}));
+    for ae in ["identity", "deflate", "zstd", "gzip;q=0, br;q=0", "*;q=0"] {
+        let ctx = make_ctx(Some(ae));
+        assert!(
+            !plugin.should_buffer_response_body(&ctx),
+            "Accept-Encoding {ae:?} selects no supported coding and must not buffer"
+        );
+    }
+    for ae in ["gzip", "br", "gzip;q=0, br", "identity;q=0, gzip;q=0.2"] {
+        let ctx = make_ctx(Some(ae));
+        assert!(
+            plugin.should_buffer_response_body(&ctx),
+            "Accept-Encoding {ae:?} selects a supported coding and must buffer"
+        );
+    }
+}
+
+#[test]
+fn test_should_buffer_respects_configured_algorithms() {
+    // A gzip-only instance must not buffer a brotli-only request (nothing it can
+    // produce), even though an Accept-Encoding header is present.
+    let plugin = make_plugin(json!({"algorithms": ["gzip"]}));
+    assert!(!plugin.should_buffer_response_body(&make_ctx(Some("br"))));
+    assert!(plugin.should_buffer_response_body(&make_ctx(Some("gzip"))));
+}
+
+#[tokio::test]
+async fn test_before_proxy_reserves_admission_for_supported_coding() {
+    use ferrum_edge::_test_support::{
+        compression_response_admission_declined_for_test,
+        compression_response_admission_reserved_for_test,
+    };
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+    assert!(
+        compression_response_admission_reserved_for_test(&ctx),
+        "a supported coding must reserve response codec admission in before_proxy"
+    );
+    assert!(!compression_response_admission_declined_for_test(&ctx));
+}
+
+#[tokio::test]
+async fn test_before_proxy_does_not_reserve_for_unnegotiable_encodings() {
+    use ferrum_edge::_test_support::{
+        compression_response_admission_declined_for_test,
+        compression_response_admission_reserved_for_test,
+    };
+    let plugin = make_plugin(json!({}));
+    for ae in [
+        Some("identity"),
+        Some("deflate"),
+        Some("gzip;q=0, br;q=0"),
+        None,
+    ] {
+        let mut ctx = make_ctx(ae);
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, ae).await;
+        assert!(
+            !compression_response_admission_reserved_for_test(&ctx),
+            "Accept-Encoding {ae:?} must not reserve response codec admission"
+        );
+        assert!(
+            !compression_response_admission_declined_for_test(&ctx),
+            "no reservation was attempted for {ae:?}, so it must not be marked declined"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_unsafe_global_response_limits_decline_compression_before_buffering() {
+    use ferrum_edge::_test_support::{
+        compression_response_admission_declined_for_test,
+        compression_response_admission_reserved_for_test,
+    };
+    use ferrum_edge::plugins::compression::HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE;
+
+    let plugin = make_plugin(json!({}));
+    for limit in [0, HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE + 1] {
+        let mut ctx = make_ctx(Some("gzip"));
+        ctx.max_response_body_size_bytes = limit;
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+        assert!(
+            compression_response_admission_declined_for_test(&ctx),
+            "unsafe response limit {limit} must decline compression admission"
+        );
+        assert!(!compression_response_admission_reserved_for_test(&ctx));
+        assert!(
+            !plugin.should_buffer_response_body(&ctx),
+            "unsafe response limit {limit} must stream identity"
+        );
+
+        let mut response_headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-length".to_string(), "1000".to_string()),
+        ]);
+        assert!(matches!(
+            plugin
+                .after_proxy(&mut ctx, 200, &mut response_headers)
+                .await,
+            PluginResult::Continue
+        ));
+        assert!(
+            !response_headers.contains_key("content-encoding"),
+            "unsafe response limit {limit} must not commit compression"
+        );
+
+        let accept_encoding = "gzip, identity;q=0";
+        let mut identity_barred_ctx = make_ctx(Some(accept_encoding));
+        identity_barred_ctx.max_response_body_size_bytes = limit;
+        before_proxy_with_accept_encoding(&plugin, &mut identity_barred_ctx, Some(accept_encoding))
+            .await;
+        assert!(
+            !plugin.should_buffer_response_body(&identity_barred_ctx),
+            "unsafe response limit {limit} must not buffer when identity is prohibited"
+        );
+        let mut identity_barred_headers = HashMap::from([
+            ("content-type".to_string(), "application/json".to_string()),
+            ("content-length".to_string(), "1000".to_string()),
+        ]);
+        match plugin
+            .after_proxy(&mut identity_barred_ctx, 200, &mut identity_barred_headers)
+            .await
+        {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 406),
+            other => panic!(
+                "expected 406 when identity is barred under unsafe response limit {limit}, got {other:?}"
+            ),
+        }
+        assert!(!identity_barred_headers.contains_key("content-encoding"));
+    }
+
+    let mut ceiling_ctx = make_ctx(Some("gzip"));
+    ceiling_ctx.max_response_body_size_bytes = HARD_MAX_COMPRESSIBLE_RESPONSE_SIZE;
+    before_proxy_with_accept_encoding(&plugin, &mut ceiling_ctx, Some("gzip")).await;
+    assert!(
+        compression_response_admission_reserved_for_test(&ceiling_ctx),
+        "the exact compression safety ceiling must remain admissible"
+    );
+    assert!(plugin.should_buffer_response_body(&ceiling_ctx));
+}
+
+#[tokio::test]
+async fn test_head_does_not_reserve_or_buffer_response() {
+    use ferrum_edge::_test_support::compression_response_admission_reserved_for_test;
+    let plugin = make_plugin(json!({}));
+    let mut ctx = make_ctx(Some("gzip"));
+    ctx.method = "HEAD".to_string();
+    before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+    assert!(
+        !compression_response_admission_reserved_for_test(&ctx),
+        "HEAD carries no re-encodable wire body and must not reserve admission"
+    );
+    assert!(!plugin.should_buffer_response_body(&ctx));
+}
+
+#[tokio::test]
+async fn test_saturation_before_buffering_streams_identity() {
+    use ferrum_edge::_test_support::{
+        compression_response_admission_declined_for_test,
+        compression_response_admission_reserved_for_test,
+    };
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+
+    with_test_codec_budget(0, || async {
+        let plugin = make_plugin(json!({"min_content_length": 10}));
+        let mut ctx = make_ctx(Some("gzip"));
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+
+        // Admission was unavailable: no reservation, marked declined, and the
+        // body must stream (never enter the compression-only buffered path).
+        assert!(!compression_response_admission_reserved_for_test(&ctx));
+        assert!(compression_response_admission_declined_for_test(&ctx));
+        assert!(
+            !plugin.should_buffer_response_body(&ctx),
+            "a request that could not reserve admission must stream, not buffer"
+        );
+
+        let mut resp = HashMap::new();
+        resp.insert("content-type".to_string(), "application/json".to_string());
+        resp.insert("content-length".to_string(), "1000".to_string());
+        // Identity is acceptable, so after_proxy serves it without reacquiring.
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+            PluginResult::Continue
+        ));
+        assert!(!resp.contains_key("content-encoding"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_saturation_before_buffering_fails_closed_when_identity_barred() {
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+
+    with_test_codec_budget(0, || async {
+        let plugin = make_plugin(json!({"min_content_length": 10}));
+        let mut ctx = make_ctx(Some("gzip, identity;q=0"));
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip, identity;q=0")).await;
+        assert!(
+            !plugin.should_buffer_response_body(&ctx),
+            "declined admission must not buffer even when identity is prohibited"
+        );
+
+        let mut resp = HashMap::new();
+        resp.insert("content-type".to_string(), "application/json".to_string());
+        resp.insert("content-length".to_string(), "1000".to_string());
+        // Identity is prohibited and no coding can be produced: fail closed.
+        match plugin.after_proxy(&mut ctx, 200, &mut resp).await {
+            PluginResult::Reject { status_code, .. } => assert_eq!(status_code, 406),
+            other => panic!("expected 406 when identity is barred under saturation, got {other:?}"),
+        }
+        assert!(!resp.contains_key("content-encoding"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_after_proxy_consumes_reserved_permit_without_reacquiring() {
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+
+    // A single-permit budget proves reuse: the reservation drains the only slot,
+    // so a commit can only succeed by consuming the reserved permit (a fresh
+    // acquire would find the budget empty and decline to Content-Encoding).
+    with_test_codec_budget(1, || async {
+        let plugin = make_plugin(json!({"min_content_length": 10}));
+        let mut ctx = make_ctx(Some("gzip"));
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+
+        let mut resp = HashMap::new();
+        resp.insert("content-type".to_string(), "application/json".to_string());
+        resp.insert("content-length".to_string(), "1000".to_string());
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+            PluginResult::Continue
+        ));
+        assert_eq!(
+            resp.get("content-encoding").map(String::as_str),
+            Some("gzip"),
+            "after_proxy must commit by consuming the reserved permit, not reacquiring"
+        );
+        // The reserved permit is still held in the context for the body transform.
+        assert!(
+            ferrum_edge::_test_support::take_compression_response_codec_permit_for_test(&mut ctx)
+                .is_some()
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_reserved_admission_released_when_response_ineligible() {
+    use ferrum_edge::_test_support::compression_response_admission_reserved_for_test;
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+
+    // budget=1: after release, the freed slot must be reservable again.
+    with_test_codec_budget(1, || async {
+        let plugin = make_plugin(json!({"min_content_length": 10}));
+        let mut ctx = make_ctx(Some("gzip"));
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+        assert!(compression_response_admission_reserved_for_test(&ctx));
+
+        // A non-compressible content type: after_proxy declines and must release
+        // the reserved permit rather than idle it while identity streams.
+        let mut resp = HashMap::new();
+        resp.insert("content-type".to_string(), "image/png".to_string());
+        resp.insert("content-length".to_string(), "5000".to_string());
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+            PluginResult::Continue
+        ));
+        assert!(!resp.contains_key("content-encoding"));
+        assert!(
+            !compression_response_admission_reserved_for_test(&ctx),
+            "an ineligible response must release the reserved codec admission"
+        );
+
+        // The freed slot is immediately reservable by another request.
+        let mut ctx2 = make_ctx(Some("gzip"));
+        before_proxy_with_accept_encoding(&plugin, &mut ctx2, Some("gzip")).await;
+        assert!(
+            compression_response_admission_reserved_for_test(&ctx2),
+            "released permit must return to the pool for the next request"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_reserved_admission_released_on_bodyless_status() {
+    use ferrum_edge::_test_support::compression_response_admission_reserved_for_test;
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+
+    with_test_codec_budget(1, || async {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_ctx(Some("gzip"));
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+        assert!(compression_response_admission_reserved_for_test(&ctx));
+
+        let mut resp = HashMap::new();
+        assert!(matches!(
+            plugin.after_proxy(&mut ctx, 204, &mut resp).await,
+            PluginResult::Continue
+        ));
+        assert!(
+            !compression_response_admission_reserved_for_test(&ctx),
+            "a 204 hard-skip must release the reserved codec admission"
+        );
+        assert!(!resp.contains_key("content-encoding"));
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_reserved_permit_stays_on_donor_across_compat_clone() {
+    use ferrum_edge::_test_support::{
+        clone_for_final_request_body_hooks_for_test,
+        compression_response_admission_reserved_for_test,
+        take_compression_response_codec_permit_for_test,
+    };
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+
+    with_test_codec_budget(2, || async {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_ctx(Some("gzip"));
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+        assert!(compression_response_admission_reserved_for_test(&ctx));
+
+        // The request-body-hook compatibility clone must NOT carry the response
+        // codec permit (it never runs the response transform), otherwise the
+        // permit would be released when the short-lived clone drops.
+        let mut clone = clone_for_final_request_body_hooks_for_test(&mut ctx);
+        assert!(
+            take_compression_response_codec_permit_for_test(&mut clone).is_none(),
+            "compat clone must not carry the reserved response codec permit"
+        );
+        assert!(
+            take_compression_response_codec_permit_for_test(&mut ctx).is_some(),
+            "the live context must retain the reserved response codec permit"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_cancellation_releases_reserved_permit() {
+    use ferrum_edge::_test_support::compression_response_admission_reserved_for_test;
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+
+    with_test_codec_budget(1, || async {
+        let plugin = make_plugin(json!({}));
+        let mut ctx = make_ctx(Some("gzip"));
+        before_proxy_with_accept_encoding(&plugin, &mut ctx, Some("gzip")).await;
+        assert!(compression_response_admission_reserved_for_test(&ctx));
+
+        // Simulate a cancelled request: the context is dropped before after_proxy.
+        drop(ctx);
+
+        // The single slot is free again, so the next request can reserve it.
+        let mut ctx2 = make_ctx(Some("gzip"));
+        before_proxy_with_accept_encoding(&plugin, &mut ctx2, Some("gzip")).await;
+        assert!(
+            compression_response_admission_reserved_for_test(&ctx2),
+            "dropping a reserved context must return its permit to the pool"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_sibling_instances_reserve_one_response_permit() {
+    use ferrum_edge::plugins::compression::with_test_codec_budget;
+
+    // Two response-compressing instances must not each reserve a permit: a
+    // single permit is enough for both to negotiate and one to commit.
+    with_test_codec_budget(1, || async {
+        let plugins: Vec<Arc<dyn Plugin>> = vec![
+            Arc::new(make_plugin(json!({
+                "algorithms": ["gzip"],
+                "min_content_length": 10
+            }))),
+            Arc::new(make_plugin(json!({
+                "algorithms": ["gzip"],
+                "min_content_length": 10
+            }))),
+        ];
+        let mut ctx = make_ctx(Some("gzip"));
+        let mut req_headers = HashMap::new();
+        req_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+        for plugin in &plugins {
+            assert!(matches!(
+                plugin.before_proxy(&mut ctx, &mut req_headers).await,
+                PluginResult::Continue
+            ));
+        }
+
+        let mut resp = HashMap::new();
+        resp.insert("content-type".to_string(), "application/json".to_string());
+        resp.insert("content-length".to_string(), "1000".to_string());
+        for plugin in &plugins {
+            assert!(matches!(
+                plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+                PluginResult::Continue
+            ));
+        }
+        assert_eq!(
+            resp.get("content-encoding").map(String::as_str),
+            Some("gzip"),
+            "one sibling commits a single coding layer from the shared reservation"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn test_request_fallback_stages_plaintext_before_header_strip() {
+    use bytes::Bytes;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+
+    let plugin = make_plugin(json!({"decompress_request": true}));
+    let original = b"fallback-staged-plaintext";
+    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(original).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    let mut ctx = make_request_ctx_with_body("gzip", &compressed);
+    // Simulate the rare path: body bytes are present on the context, but
+    // before_proxy has no mutable body view.
+    ctx.request_body_bytes = Some(Bytes::from(compressed.clone()));
+    let mut headers = HashMap::new();
+    headers.insert("content-encoding".to_string(), "gzip".to_string());
+    headers.insert("content-length".to_string(), compressed.len().to_string());
+
+    let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+    assert!(matches!(result, PluginResult::Continue), "got {result:?}");
+    assert!(
+        !headers.contains_key("content-encoding"),
+        "successful fallback decode must strip Content-Encoding"
+    );
+    assert!(
+        ctx.metadata.contains_key("compression:request_decoded"),
+        "fallback must mark the request as decoded"
+    );
+
+    // Transform must emit staged plaintext without needing a second codec slot.
+    let transformed = plugin
+        .transform_request_body_with_context(&mut ctx, &compressed, None, &headers)
+        .await
+        .expect("staged plaintext must be transferred");
+    assert_eq!(transformed.as_slice(), original);
+}
+
+#[tokio::test]
+async fn test_response_encode_abort_restores_identity_representation() {
+    use ferrum_edge::_test_support::{
+        gateway_response_compression_algorithm_for_test,
+        reconcile_aborted_gateway_response_encoding_for_test,
+        take_compression_response_codec_permit_for_test,
+    };
+
+    let plugin = make_plugin(json!({"min_content_length": 10}));
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    req_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+
+    let mut resp = HashMap::new();
+    resp.insert("content-type".to_string(), "application/json".to_string());
+    resp.insert("content-length".to_string(), "1000".to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+        PluginResult::Continue
+    ));
+    assert_eq!(
+        resp.get("content-encoding").map(String::as_str),
+        Some("gzip")
+    );
+
+    // Simulate a missing permit / encoder abort after Content-Encoding commit.
+    let _ = take_compression_response_codec_permit_for_test(&mut ctx);
+    let identity = compressible_json_body();
+    let transformed = plugin
+        .transform_response_body_with_context(&mut ctx, &identity, Some("application/json"), &resp)
+        .await;
+    assert!(
+        transformed.is_none(),
+        "encode abort must not emit compressed bytes"
+    );
+    reconcile_aborted_gateway_response_encoding_for_test(&mut ctx, &mut resp, identity.len());
+    assert!(
+        !resp.contains_key("content-encoding"),
+        "encode abort must restore identity headers"
+    );
+    let expected_len = identity.len().to_string();
+    assert_eq!(resp.get("content-length"), Some(&expected_len));
+    assert!(gateway_response_compression_algorithm_for_test(&ctx).is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_codec_offload_allows_unrelated_async_progress() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    let plugin = make_plugin(json!({"min_content_length": 10, "gzip_level": 9}));
+    let body = vec![b'a'; 64 * 1024];
+    let progressed = Arc::new(AtomicBool::new(false));
+    let progressed_flag = Arc::clone(&progressed);
+
+    let mut ctx = make_ctx(Some("gzip"));
+    let mut req_headers = HashMap::new();
+    req_headers.insert("accept-encoding".to_string(), "gzip".to_string());
+    plugin.before_proxy(&mut ctx, &mut req_headers).await;
+    let mut resp = HashMap::new();
+    resp.insert("content-type".to_string(), "application/json".to_string());
+    resp.insert("content-length".to_string(), body.len().to_string());
+    assert!(matches!(
+        plugin.after_proxy(&mut ctx, 200, &mut resp).await,
+        PluginResult::Continue
+    ));
+
+    let encode = tokio::spawn(async move {
+        plugin
+            .transform_response_body_with_context(&mut ctx, &body, Some("application/json"), &resp)
+            .await
+    });
+
+    // Deterministic liveness: an unrelated task must be able to run while the
+    // codec job occupies a blocking-pool worker. No wall-clock threshold.
+    let observer = tokio::spawn(async move {
+        progressed_flag.store(true, AtomicOrdering::SeqCst);
+    });
+
+    while !progressed.load(AtomicOrdering::SeqCst) && !encode.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        progressed.load(AtomicOrdering::SeqCst),
+        "Tokio must schedule unrelated work while bounded codec jobs run on spawn_blocking"
+    );
+    observer.await.expect("observer task");
+    let compressed = encode
+        .await
+        .expect("encode task join")
+        .expect("encode must succeed under an unsaturated budget");
+    assert!(
+        !compressed.is_empty(),
+        "compressed output should be non-empty"
+    );
+}
+
+#[test]
+fn test_validation_and_admin_paths_apply_process_compression_admission_policy() {
+    // Every plugin-construction/admission client that does not inherit a live
+    // ProxyState must apply the process body-limit + codec-gate cross-check.
+    let plugins_mod = include_str!("../../../src/plugins/mod.rs");
+    let admin = include_str!("../../../src/admin/mod.rs");
+    let pipeline = include_str!("../../../src/config/validation_pipeline.rs");
+    let http_client = include_str!("../../../src/plugins/utils/http_client.rs");
+    assert!(
+        http_client.contains("fn with_process_compression_admission_policy"),
+        "PluginHttpClient must expose the shared admission-policy seam"
+    );
+    assert!(
+        plugins_mod.contains("with_process_compression_admission_policy()"),
+        "validate_plugin_config* must apply process compression admission policy"
+    );
+    assert!(
+        admin.contains("with_process_compression_admission_policy()"),
+        "admin plugin_validation_http_client fallback must apply process policy"
+    );
+    assert!(
+        pipeline.contains("with_process_compression_admission_policy()"),
+        "config validation pipeline must apply process compression admission policy"
+    );
+}
+
+#[test]
+fn test_shared_paths_reconcile_aborted_gateway_encoding() {
+    // Pin that every shared buffered response-body transform loop restores
+    // identity when compression marks an encode abort.
+    let proxy = include_str!("../../../src/proxy/mod.rs");
+    let h3 = include_str!("../../../src/http3/cross_protocol.rs");
+    assert!(
+        proxy
+            .matches("reconcile_aborted_gateway_response_encoding")
+            .count()
+            >= 2,
+        "H1/H2 shared transform helpers must reconcile aborted gateway encodings"
+    );
+    assert!(
+        h3.matches("reconcile_aborted_gateway_response_encoding")
+            .count()
+            >= 2,
+        "H3 cross-protocol buffered transforms must reconcile aborted gateway encodings"
     );
 }

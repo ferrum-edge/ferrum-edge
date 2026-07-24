@@ -572,16 +572,62 @@ fn parse_sni_hostname(data: &[u8]) -> Option<String> {
         }
 
         if name_type == 0x00 {
-            // host_name
-            return std::str::from_utf8(&names[pos..pos + name_len])
-                .ok()
-                .map(|s| s.to_lowercase());
+            // host_name. SNI host_name is a DNS hostname; validate before
+            // allocating so oversized or malformed attacker-controlled names do
+            // not get retained by stream lifecycle logging.
+            let hostname = &names[pos..pos + name_len];
+            return is_valid_sni_dns_hostname(hostname).then(|| {
+                hostname
+                    .iter()
+                    .map(u8::to_ascii_lowercase)
+                    .map(char::from)
+                    .collect()
+            });
         }
 
         pos += name_len;
     }
 
     None
+}
+
+fn is_valid_sni_dns_hostname(hostname: &[u8]) -> bool {
+    const MAX_DNS_HOSTNAME_LEN: usize = 253;
+    const MAX_DNS_LABEL_LEN: usize = 63;
+
+    if hostname.is_empty() || hostname.len() > MAX_DNS_HOSTNAME_LEN {
+        return false;
+    }
+
+    let mut label_len = 0usize;
+    let mut previous = b'.';
+
+    for &byte in hostname {
+        if byte == b'.' {
+            if label_len == 0 || label_len > MAX_DNS_LABEL_LEN || previous == b'-' {
+                return false;
+            }
+            label_len = 0;
+            previous = byte;
+            continue;
+        }
+
+        if !byte.is_ascii_alphanumeric() && byte != b'-' {
+            return false;
+        }
+
+        if label_len == 0 && byte == b'-' {
+            return false;
+        }
+
+        label_len += 1;
+        if label_len > MAX_DNS_LABEL_LEN {
+            return false;
+        }
+        previous = byte;
+    }
+
+    label_len > 0 && previous != b'-'
 }
 
 /// Read a 3-byte big-endian unsigned integer.

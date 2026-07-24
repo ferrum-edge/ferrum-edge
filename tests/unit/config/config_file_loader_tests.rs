@@ -2191,3 +2191,183 @@ plugin_configs: []
     assert!(message.contains("file-mode Basic-auth credentials"));
     assert!(!message.contains("must-not-enter-runtime-config"));
 }
+
+// ============================================================================
+// Config version field typing (#2980)
+// ============================================================================
+
+#[test]
+fn test_load_yaml_accepts_unquoted_integer_version() {
+    let yaml = r#"
+version: 1
+proxies: []
+consumers: []
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("unquoted integer version: 1 must load");
+    assert_eq!(config.version, "1");
+}
+
+#[test]
+fn test_load_json_accepts_numeric_integer_version() {
+    let json = r#"{
+  "version": 1,
+  "proxies": [],
+  "consumers": [],
+  "plugin_configs": []
+}"#;
+    let mut file = NamedTempFile::with_suffix(".json").unwrap();
+    write!(file, "{}", json).unwrap();
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("JSON integer version must load");
+    assert_eq!(config.version, "1");
+}
+
+#[test]
+fn test_load_yaml_rejects_float_version_with_type_diagnostic() {
+    let yaml = r#"
+version: 1.5
+proxies: []
+consumers: []
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("float version must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("must be a string or non-negative integer"),
+        "expected type diagnostic, got: {msg}"
+    );
+    assert!(
+        !msg.contains("missing required"),
+        "must not misreport a present float as missing: {msg}"
+    );
+}
+
+#[test]
+fn test_load_json_rejects_bool_version_with_type_diagnostic() {
+    let json = r#"{
+  "version": true,
+  "proxies": [],
+  "consumers": [],
+  "plugin_configs": []
+}"#;
+    let mut file = NamedTempFile::with_suffix(".json").unwrap();
+    write!(file, "{}", json).unwrap();
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("bool version must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("must be a string or non-negative integer"),
+        "expected type diagnostic, got: {msg}"
+    );
+    assert!(
+        !msg.contains("missing required"),
+        "must not misreport a present bool as missing: {msg}"
+    );
+}
+
+#[test]
+fn test_load_yaml_rejects_null_version_with_type_diagnostic() {
+    let yaml = r#"
+version: null
+proxies: []
+consumers: []
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("null version must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("must be a string or non-negative integer"),
+        "expected type diagnostic, got: {msg}"
+    );
+    assert!(
+        !msg.contains("missing required"),
+        "must not misreport a present null as missing: {msg}"
+    );
+}
+
+#[test]
+fn test_invalid_version_diagnostic_reports_type_without_echoing_value() {
+    let yaml = r#"
+version:
+  credential: must-not-appear
+proxies: []
+consumers: []
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("object version must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("got object"),
+        "expected type diagnostic: {msg}"
+    );
+    assert!(
+        !msg.contains("must-not-appear") && !msg.contains("credential"),
+        "invalid version values must not be echoed: {msg}"
+    );
+}
+
+#[test]
+fn test_load_config_missing_version_still_reports_missing() {
+    let yaml = r#"
+proxies: []
+consumers: []
+plugin_configs: []
+"#;
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{}", yaml).unwrap();
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("absent version must still fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("missing required 'version' field"),
+        "expected missing-field diagnostic, got: {msg}"
+    );
+}

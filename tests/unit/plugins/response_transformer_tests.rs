@@ -1143,6 +1143,47 @@ async fn test_response_transformer_header_only_rules_never_buffer() {
     assert!(!plugin.should_buffer_response_body(&ctx_json));
 }
 
+#[tokio::test]
+async fn test_response_transformer_preserves_grpc_web_terminal_policy_buffering() {
+    use ferrum_edge::plugins::grpc_web::{GrpcWebPlugin, request_is_grpc_web_translated};
+
+    let plugin = ResponseTransformer::new(&json!({
+        "rules": [
+            {"operation": "remove", "target": "header", "key": "X-Internal-Trailer"}
+        ]
+    }))
+    .unwrap();
+    let grpc_web = GrpcWebPlugin::new(&json!({})).unwrap();
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/pkg.Service/Watch".to_string(),
+    );
+    ctx.headers.insert(
+        "content-type".to_string(),
+        "application/grpc-web+proto".to_string(),
+    );
+
+    assert!(matches!(
+        grpc_web.on_request_received(&mut ctx).await,
+        PluginResult::Continue
+    ));
+    let mut outgoing = ctx.headers.clone();
+    assert!(matches!(
+        grpc_web.before_proxy(&mut ctx, &mut outgoing).await,
+        PluginResult::Continue
+    ));
+    assert!(request_is_grpc_web_translated(&ctx));
+    assert!(
+        plugin.requires_buffered_grpc_web_trailer_policy(&ctx),
+        "header policy must keep translated terminal metadata on the compatible buffered path"
+    );
+    assert!(
+        !plugin.requires_response_body_buffering(),
+        "ordinary HTTP and native gRPC must remain streaming for header-only rules"
+    );
+}
+
 #[test]
 fn test_response_transformer_no_transform_preflight_reports_conservative_capability() {
     let ctx = make_ctx();

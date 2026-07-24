@@ -28,6 +28,8 @@ mod mesh_udp_capture_outcome_tests;
 mod metrics_tests;
 mod overload_tests;
 mod per_port_load_balancer_tests;
+mod pool_create_failure_classification_tests;
+mod pool_create_failure_fanout_tests;
 mod pool_key_tests;
 mod protocol_validation_tests;
 mod proxy_body_tests;

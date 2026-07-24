@@ -1874,6 +1874,98 @@ async fn test_otel_tracing_otlp_success_body_variants_are_bounded_and_never_retr
 }
 
 #[tokio::test]
+async fn test_otel_tracing_omits_unknown_gateway_latency_attributes() {
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(wiremock::ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = new_otel(&json!({
+        "endpoint": format!("{}/v1/traces", mock_server.uri()),
+        "batch_size": 1,
+        "flush_interval_ms": 100
+    }));
+
+    // Streamed unknown sentinels must be omitted (not exported as -1), matching
+    // gateway.latency.backend_total_ms. Positive TTFB / total stay present.
+    let mut unknown = make_rich_summary(make_trace_metadata());
+    unknown.latency_gateway_processing_ms = -1.0;
+    unknown.latency_gateway_overhead_ms = -1.0;
+    unknown.latency_backend_total_ms = -1.0;
+    unknown.latency_backend_ttfb_ms = 2.5;
+    plugin.log(&unknown).await;
+
+    let unknown_payload = received_json(&mock_server).await;
+    let unknown_span = otlp_span(&unknown_payload);
+    assert!(
+        otlp_attr_value(unknown_span, "gateway.latency.processing_ms").is_none(),
+        "unknown gateway processing must be omitted, got {}",
+        unknown_span["attributes"]
+    );
+    assert!(
+        otlp_attr_value(unknown_span, "gateway.overhead_ms").is_none(),
+        "unknown gateway overhead must be omitted, got {}",
+        unknown_span["attributes"]
+    );
+    assert!(
+        otlp_attr_value(unknown_span, "gateway.latency.backend_total_ms").is_none(),
+        "unknown backend total must remain omitted"
+    );
+    assert_eq!(
+        otlp_attr_value(unknown_span, "gateway.latency.backend_ttfb_ms")
+            .and_then(|value| value.get("doubleValue"))
+            .and_then(Value::as_f64),
+        Some(2.5)
+    );
+    assert_eq!(
+        otlp_attr_value(unknown_span, "gateway.latency.total_ms")
+            .and_then(|value| value.get("doubleValue"))
+            .and_then(Value::as_f64),
+        Some(150.0)
+    );
+
+    // Positive gateway timing attributes must still export.
+    let known = make_rich_summary(make_trace_metadata());
+    plugin.log(&known).await;
+    let mut known_payload: Option<Value> = None;
+    for _ in 0..50 {
+        if let Some(requests) = mock_server.received_requests().await
+            && requests.len() >= 2
+        {
+            known_payload =
+                Some(serde_json::from_slice(&requests[1].body).expect("otlp known payload"));
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let known_payload = known_payload.expect("second span export");
+    let known_span = otlp_span(&known_payload);
+    assert_eq!(
+        otlp_attr_value(known_span, "gateway.latency.processing_ms")
+            .and_then(|value| value.get("doubleValue"))
+            .and_then(Value::as_f64),
+        Some(5.0),
+        "positive gateway processing must still export"
+    );
+    assert_eq!(
+        otlp_attr_value(known_span, "gateway.overhead_ms")
+            .and_then(|value| value.get("doubleValue"))
+            .and_then(Value::as_f64),
+        Some(3.0),
+        "positive gateway overhead must still export"
+    );
+    assert_eq!(
+        otlp_attr_value(known_span, "gateway.latency.backend_total_ms")
+            .and_then(|value| value.get("doubleValue"))
+            .and_then(Value::as_f64),
+        Some(145.0),
+        "positive backend total must still export"
+    );
+}
+
+#[tokio::test]
 async fn test_otel_tracing_http_4xx_is_not_error() {
     let mock_server = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))

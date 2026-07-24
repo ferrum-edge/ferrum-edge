@@ -51,6 +51,17 @@ use crate::tls::backend::{
 pub fn classify_http3_error(err: &(dyn std::error::Error + 'static)) -> crate::retry::ErrorClass {
     use crate::retry::ErrorClass;
 
+    // Coalesced GenericPool create waiters receive `anyhow` wrapping
+    // `SharedPoolCreateError`. Prefer the captured ErrorClass before the
+    // quinn/io/substring walk so fan-out preserves creator classification.
+    let mut shared_walk: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(node) = shared_walk {
+        if let Some(shared) = node.downcast_ref::<crate::pool::SharedPoolCreateError>() {
+            return shared.error_class();
+        }
+        shared_walk = node.source();
+    }
+
     // A DnsCacheResolver egress-policy denial (a hostname that resolves — or
     // rebinds — to a blocked IP) surfaces here as a resolve error carrying
     // "...denied by backend egress policy...". Classify it as the non-retryable,

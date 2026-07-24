@@ -107,6 +107,22 @@ Each proxy's effective plugin list is built by merging global, proxy-scoped, and
 3. Multiple scoped instances of the same `plugin_name` all coexist — only the global is replaced
 4. Sort by effective priority (built-in priority or `priority_override`)
 
+**Chargeback exception:** `api_chargeback` follows the same merge steps above, but
+admission and reload then require the resulting effective list to contain **at
+most one** instance per proxy. The in-memory `/charges` registry is a
+process-global singleton with no ledger/instance dimension, so two retained
+hooks would double-count one client transaction. Attach one global, one
+proxy-scoped, or one proxy-group-scoped instance per proxy — not two scoped
+attachments on the same chain. At most one enabled global instance is permitted
+per process because unmatched/fallback transaction paths retain the global
+chain even where configured proxies use local overrides. Shared render/cleanup tunables
+(`render_cache_ttl_seconds`, `stale_entry_ttl_seconds`,
+`cache_invalidation_min_age_ms`, `cleanup_interval_seconds`) are likewise
+process-global: when multiple instances exist on **different** proxies they
+must resolve to identical values so construction order cannot alter registry
+behavior. Pricing and `currency` may still differ per proxy. See
+[`api_chargeback`](#api_chargeback).
+
 **Examples:**
 
 | Global plugins | Scoped plugins | Effective list for proxy |
@@ -184,8 +200,10 @@ Sends transaction summaries as JSON to an external HTTP endpoint. Entries are bu
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (0–60000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
+| `max_entry_bytes` | Integer | `65536` | Maximum serialized size of one admitted log record (1024–1048576). Oversized records are dropped before enqueue. |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)`; hard max 268435456). Admission reserves before serialization. |
 
-Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first.
+Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Hot-path admission reserves a queue slot and a provisional `max_entry_bytes` lease before serializing attacker-shaped summary fields, then shrinks that lease to the exact retained JSON size.
 
 Retries fire on transport errors and 5xx responses. A **4xx response other than 408 or 429 aborts the batch immediately** (retrying a malformed or unauthorized payload just delays the drop) — fix the endpoint URL, authorization header, or field schema rather than waiting through `max_retries × retry_delay_ms`. 408 (Request Timeout) and 429 (Too Many Requests) are transient throttling signals and are retried within the configured budget.
 
@@ -417,12 +435,14 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 | `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (50–600000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 | `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing (1–10000) |
+| `max_entry_bytes` | Integer | `65536` | Maximum rendered StatsD line-protocol size of one admitted transaction (1024–1048576). Oversized renders are dropped before enqueue. |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained rendered-content budget across queued entries, one MTU-bounded datagram buffer, and retries (must be ≥ `2 * (max_entry_bytes + 1)`; hard max 268435456). Admission reserves before rendering. |
 | `max_retries` | Integer | `0` | Retry attempts after the initial UDP send fails (0–10; shared batching logger) |
 | `retry_delay_ms` | Integer | `0` | Delay in milliseconds between retry attempts (0–60000) |
 | `schema` | Object | *(none)* | Inline summary schema; only `rename` / `omit` / `summary_type` affect StatsD tags. Rename targets must pass the same tag-key grammar and must not collide with reserved tags. |
 | `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
-Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Batches are packed into UDP datagrams that never exceed a **1452-byte** conservative IPv4/IPv6 payload ceiling. Multi-line batches split only on newline boundaries; an individual metric line larger than the ceiling is dropped and warned (it is never fragmented mid-line, and sibling valid lines in the same batch are still sent).
+Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Hot-path admission reserves a queue slot and a provisional `max_entry_bytes` lease before rendering attacker-shaped summary fields into StatsD line protocol, then shrinks that lease to the exact retained size. Batches are packed into UDP datagrams that never exceed a **1452-byte** conservative IPv4/IPv6 payload ceiling; delivery retains the admitted batch plus at most one datagram buffer (it does not materialize every datagram copy up front). Multi-line batches split only on newline boundaries; an individual metric line larger than the ceiling is dropped and warned (it is never fragmented mid-line, and sibling valid lines in the same batch are still sent).
 
 **DNS handling.** The StatsD endpoint is resolved through the gateway's shared `DnsCache` at startup (pre-warmed via `warmup_hostnames()`) and re-resolved every 60 seconds by the background flush task. If the resolved address changes (DNS flip, service discovery update), the UDP socket is rebound to the new address without a gateway restart.
 
@@ -439,7 +459,7 @@ Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms`
 | `{prefix}.request.count` | Counter | Client request count (mirrors excluded) |
 | `{prefix}.request.latency_total_ms` | Timer | Total request latency (finite, ≥ 0 only) |
 | `{prefix}.request.latency_backend_ttfb_ms` | Timer | Backend time-to-first-byte when a backend call occurred; omitted for the `-1.0` no-backend sentinel |
-| `{prefix}.request.latency_gateway_overhead_ms` | Timer | Pure gateway overhead |
+| `{prefix}.request.latency_gateway_overhead_ms` | Timer | Pure gateway overhead when attributable; omitted for the `-1.0` streaming-unknown sentinel |
 | `{prefix}.request.latency_plugin_execution_ms` | Timer | Plugin execution time |
 | `{prefix}.request.status.{N}xx` | Counter | HTTP header status-code bucket (2xx, 4xx, 5xx, etc.) — preserved even when the body later fails |
 | `{prefix}.request.grpc_status.{code}` | Counter | Terminal gRPC application status for gRPC transactions only (`0`–`16`, or `OTHER` for malformed/future codes). Absent for plain HTTP |
@@ -595,6 +615,8 @@ Sends transaction summaries as newline-delimited JSON (NDJSON) over a persistent
 | `max_retries` | Integer | `3` | Retry attempts on failed batch delivery (0–10) |
 | `retry_delay_ms` | Integer | `1000` | Delay in milliseconds between retry attempts (0–60000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
+| `max_entry_bytes` | Integer | `65536` | Maximum serialized size of one admitted NDJSON record (1024–1048576). Oversized records are dropped before enqueue. |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)`). |
 | `connect_timeout_ms` | Integer | `5000` | Connection establishment timeout in milliseconds (100–60000). Covers DNS resolution, TCP connect, and the TLS handshake when `tls: true`. |
 | `write_timeout_ms` | Integer | `5000` | Per-batch socket `write_all` + `flush` timeout in milliseconds (100–60000). On timeout the persistent writer is discarded and the shared retry/reconnect path runs. |
 | `schema` | Object | *(none)* | Inline log schema (see [docs/log_schema.md](log_schema.md)); mutually exclusive with `schema_ref` |
@@ -654,6 +676,8 @@ Unknown top-level keys are rejected at construction / Admin validation (OpenAPI 
 | `max_retries` | Integer | `1` | Retry attempts on failed batch delivery (0–10) |
 | `retry_delay_ms` | Integer | `500` | Delay in milliseconds between retry attempts (0–60000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
+| `max_entry_bytes` | Integer | `65536` | Maximum serialized size of one admitted JSON record (1024–1048576). Oversized records are dropped before enqueue. |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be ≥ `2 * (max_entry_bytes + 1)`). |
 
 Batches are flushed when `batch_size` is reached **or** `flush_interval_ms` elapses, whichever comes first. Each batch is serialized as a JSON array and sent as a single UDP datagram.
 
@@ -796,13 +820,13 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `backend_resolved_ip` | String or null | DNS-resolved backend IP; omitted from JSON when null |
 | `response_status_code` | u16 | HTTP status code |
 | `grpc_status` | u32 | Final normalized gRPC application status, separate from HTTP transport status; emitted for gRPC transactions. Missing terminal status normalizes to `2` (UNKNOWN); malformed input uses the existing `u32::MAX` invalid-status sentinel |
-| `latency_total_ms` | f64 | Total request-to-response time |
-| `latency_gateway_processing_ms` | f64 | Total time excluding backend communication |
-| `latency_backend_ttfb_ms` | f64 | Time to first byte from backend; -1.0 if no backend call |
-| `latency_backend_total_ms` | f64 | Full backend response time; -1.0 for streaming responses |
+| `latency_total_ms` | f64 | Total request-to-response time (for streamed responses: request receipt → body terminal) |
+| `latency_gateway_processing_ms` | f64 | Total time excluding attributed backend communication; `-1.0` when streaming backend total is unknown |
+| `latency_backend_ttfb_ms` | f64 | Time to first byte / response headers from backend; `-1.0` when no backend first byte or response headers were observed (including failures before response headers) |
+| `latency_backend_total_ms` | f64 | Full backend response time; `-1.0` for streaming responses (concurrent backend-body / client-delivery lifetime cannot be separated) |
 | `latency_plugin_execution_ms` | f64 | Wall-clock time in all plugin hooks |
 | `latency_plugin_external_io_ms` | f64 | Subset of plugin time spent on external HTTP calls |
-| `latency_gateway_overhead_ms` | f64 | Pure gateway overhead (routing, framing, pool checkout) |
+| `latency_gateway_overhead_ms` | f64 | Pure gateway overhead (routing, framing, pool checkout); `-1.0` when streaming backend total is unknown — never derived by treating TTFB as full backend duration |
 | `request_user_agent` | String or null | User-Agent header value |
 | `response_streamed` | bool | Present and `true` when body was streamed (not buffered) |
 | `client_disconnected` | bool | Present and `true` when client disconnected early |
@@ -811,12 +835,17 @@ All logging plugins (`stdout_logging`, `http_logging`, `tcp_logging`, `udp_loggi
 | `body_completed` | bool | `true` when the final body frame flushed to the client; `false` if streaming aborted before completion. Always `true` for buffered responses |
 | `bytes_sent` | u64 | Bytes the gateway **relayed from the client to the backend** (request body size). Same JSON key as `StreamTransactionSummary.bytes_sent`. Omitted from JSON when zero (empty / `GET` / `HEAD`) |
 | `bytes_received` | u64 | Bytes the gateway **relayed from the backend to the client** (response body size, unified buffered + streaming counter). Same JSON key as `StreamTransactionSummary.bytes_received`. May be less than the backend's advertised `Content-Length` when streaming was interrupted. Omitted from JSON when zero |
-| `mirror` | bool | Present and `true` when this entry is a mirror (shadow) request rather than the client-facing transaction |
+| `mirror` | bool | Present and `true` when this entry is a mirror (shadow) request rather than the client-facing transaction. Shadow summaries remain available to logging/observability plugins; `api_chargeback` and `api_chargeback_sink` never treat them as consumer-billable |
 | `metadata` | Object | Plugin-injected key-value pairs (correlation ID, trace ID, etc.) |
+
+Mirror entries add `metadata.mirror_plugin_id` (the stable plugin-config ID)
+and any `metadata.mirror_error`; their standard `backend_target` field contains
+the query-stripped mirror URL. Several shadow destinations therefore remain
+independently attributable without logging request credentials.
 
 **Notes on conditional fields:** `auth_method`, `grpc_status`, `response_streamed`, `client_disconnected`, `backend_resolved_ip`, `error_class`, and `body_error_class` are omitted from the JSON output when not applicable/false/null to keep log entries compact.
 
-**`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. A forthcoming `DeferredTransactionLogger` will move the `log` phase to body-completion so `body_error_class`, `body_completed`, and `bytes_received` reflect the full client-visible outcome.
+**`error_class` vs `body_error_class`:** `error_class` covers failures before or during the response header exchange (connect, TLS, DNS, pool, pre-header timeouts). `body_error_class` covers failures observed while streaming the response body after headers were sent. A transaction can have one, the other, both, or neither. For streamed responses, `DeferredTransactionLogger` moves the `log` phase to body-completion so `body_error_class`, `body_completed`, `bytes_received`, and `latency_total_ms` reflect the full client-visible outcome. Gateway processing/overhead stay at the `-1.0` unknown sentinel when `latency_backend_total_ms` is unknown.
 
 **`error_class` values** (serialized as `snake_case` strings — see [docs/error_classification.md](error_classification.md) for the canonical taxonomy and per-protocol semantics):
 
@@ -902,20 +931,21 @@ Only set when the gateway itself could not communicate with the backend (or when
   "backend_target": "10.0.2.15:8080/api/v1/events",
   "backend_resolved_ip": "10.0.2.15",
   "response_status_code": 200,
-  "latency_total_ms": 4.80,
-  "latency_gateway_processing_ms": 1.70,
+  "latency_total_ms": 10004.80,
+  "latency_gateway_processing_ms": -1.0,
   "latency_backend_ttfb_ms": 2.90,
   "latency_backend_total_ms": -1.0,
   "latency_plugin_execution_ms": 0.55,
   "latency_plugin_external_io_ms": 0.0,
-  "latency_gateway_overhead_ms": 1.15,
+  "latency_gateway_overhead_ms": -1.0,
   "request_user_agent": "curl/8.5.0",
   "response_streamed": true,
+  "body_completed": true,
   "metadata": {}
 }
 ```
 
-`latency_backend_total_ms` is `-1.0` because the body is still streaming when the log is emitted. Use `latency_backend_ttfb_ms` for alerting on streaming responses.
+Deferred logging emits this summary at body termination. `latency_total_ms` reflects the full streamed lifetime. `latency_backend_total_ms`, `latency_gateway_processing_ms`, and `latency_gateway_overhead_ms` remain `-1.0` because concurrent backend-body production and client delivery cannot be separated on the default streaming path — they are never filled by treating TTFB as full backend duration. Use `latency_backend_ttfb_ms` for streaming backend alerting.
 
 #### Example: HTTP/3 (QUIC)
 
@@ -1079,6 +1109,32 @@ Terminal transaction logging is independent of ordinary request hooks:
 | Matched native gRPC with non-`POST` method | protocol reject (typically 400 / gRPC `INVALID_ARGUMENT`) | Not emitted by the method-admission gate today | Not run |
 
 H1, H2, and H3 share this contract. The matched-proxy 405 path selects protocol-appropriate terminal logging/mirror hooks from one immutable plugin-cache generation and does not double-count with a later success path.
+
+##### Delivery lifecycle, reload, and shutdown
+
+Ferrum owns deferred observability work in a process-wide structured lifecycle.
+Serving modes first stop new proxy admission and drain in-flight bodies, allowing
+streaming terminal hooks to produce their final summaries. Ferrum then closes
+external delivery-task admission, awaits already registered terminal and mirror
+tasks, closes every shared batching, WebSocket logging, and buffered trace
+export worker, and drains their admitted queues. The stdout/stderr process-log
+appenders drain last, after the Tokio delivery work has finished.
+
+Reloaded plugin generations close their sender admission when the last
+request-held plugin reference retires. Their worker completion remains owned by
+the process lifecycle, so a receiver-close final batch is not detached from
+runtime teardown. Registered-worker retries and response drains continue only
+inside the remaining lifecycle budget once shutdown begins;
+producer-specific finalizers retain their separately documented bounds.
+Delivery remains sink-specific at-least-once or best-effort as documented; a
+timeout after transport progress can still produce a duplicate on retry.
+
+`FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS` is the shared absolute budget for the
+deferred-task and remote-worker phases. On expiry Ferrum closes admission,
+cancels remaining tasks/workers deterministically, and accounts rejected or
+cancelled tasks and outstanding records through
+`ferrum_observability_delivery_*` metrics. A failed or unavailable sink cannot
+wedge process exit.
 
 #### Example: TCP Stream
 
@@ -1265,7 +1321,13 @@ the terminal numeric `grpc_status` (`0`–`16`, or `OTHER` for malformed/future
 codes), so application failures under HTTP 200 are distinguishable. The
 `ferrum_rate_limit_exceeded_total` process counter aggregates each rejection,
 UDP drop, and WebSocket policy close produced by `rate_limiting`,
-`ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting`.
+`ai_rate_limiter`, `ws_rate_limiting`, and `udp_rate_limiting`. Process-wide
+compression codec admission is exported as
+`ferrum_compression_codec_admitted_total`,
+`ferrum_compression_codec_saturated_total`,
+`ferrum_compression_codec_join_failures_total`, and
+`ferrum_compression_codec_worker_failures_total` so operators can scrape queue
+saturation and worker failures from the same authenticated `/metrics` surface.
 
 WebSocket teardown exports `ferrum_websocket_sessions_total`,
 `ferrum_websocket_session_duration_ms`, `ferrum_websocket_bytes_total`, and
@@ -1315,6 +1377,32 @@ Charges accumulate in-memory and are exposed via the admin `/charges` endpoint
 in both Prometheus text and JSON formats for external billing system
 integration.
 
+**Exactly-once accounting (issue #2564):** the `/charges` registry is one
+process-global accumulator. After ordinary scope merging, each proxy may retain
+at most one effective `api_chargeback` instance. Two proxy-scoped configs, two
+proxy-group configs, or a mix of proxy and proxy-group attachments on the same
+proxy are rejected at admission/reload with a clear validation error — they
+would otherwise each receive the same transaction summary and inflate
+`total_calls` and charges. Distinct proxies may each attach their own instance
+(including different `currency` / pricing). Only one enabled global instance is
+allowed process-wide because unmatched/fallback paths retain the global chain.
+The four shared render/cleanup tunables must agree across every enabled instance
+in the process, making registry behavior independent of construction order.
+
+**`proxy_name` contract:** exported `proxy_name` is live display metadata for the
+stable `proxy_id`. It is omitted from the in-memory registry key, so a name-only
+reload preserves the accumulated counter values. After an accepted
+configuration is published, JSON and Prometheus resolve active proxy IDs through
+the same lock-free snapshot of that configuration's names. Request completion
+order cannot change the exported label, so late traffic admitted under a retired
+generation cannot restore an old name. Because `proxy_name` remains a Prometheus
+label, a rename creates a controlled label transition at the accepted reload
+boundary; the new label carries the existing cumulative counter rather than
+restarting its in-memory value. Pricing changes still create distinct
+pricing-generation entries; overlapping entries collapse under the current
+published name. Retained rows for a deleted proxy use a deterministic
+recorded-name fallback.
+
 **Arithmetic and export semantics:** every unit price is IEEE-754 binary64,
 finite, non-negative, and at most `1e288`. In-memory entries store exact `u64`
 call/byte counters, convert them to binary64, and derive monetary values once
@@ -1336,11 +1424,18 @@ client request metadata. The mapped status is the `status_code` label and
 `by_status` key in charge output; the wire HTTP status remains separately
 available in transaction logs.
 
+**Mirror accounting.** `request_mirror` shadow summaries (`mirror: true`) still
+flow through the chargeback log hook so operators can correlate them with other
+logging/observability plugins, but they are never consumer-billable. Per-call
+and bandwidth charges come only from the primary client-facing summary.
+WebSocket disconnect and stream disconnect accounting are unchanged (mirrors
+are HTTP/gRPC only).
+
 **Priority:** 9350
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion. Scoped per plugin instance: each `api_chargeback` instance (global/proxy/proxy_group scope) stamps its own currency onto the charges it records and emits it per row, so instances with different currencies do not overwrite one another |
+| `currency` | String | `"USD"` | Currency label included in Prometheus metrics and JSON output. Informational only — the plugin does not perform currency conversion. Scoped per plugin instance: each `api_chargeback` instance on a distinct proxy stamps its own currency onto the charges it records and emits it per row. Multiple effective instances on one proxy are rejected (exactly-once `/charges` accounting) |
 | `pricing_tiers` | Array | _(optional)_ | Per-call HTTP-family pricing. Each tier maps ordinary HTTP status codes or canonical effective gRPC status mappings to a per-call price |
 | `pricing_tiers[].status_codes` | Array\<Integer\> | _(required inside a tier)_ | Billable status codes that trigger this tier's charge. Native gRPC and gRPC-Web terminal codes use the documented effective-HTTP mapping. A status code must appear in exactly one tier |
 | `pricing_tiers[].price_per_call` | Number | _(required inside a tier)_ | Charge per HTTP call (e.g. `0.00001`). Must be finite, non-negative, and ≤ `1e288` so `u64` counter × price stays finite in IEEE-754 binary64 |
@@ -1349,10 +1444,10 @@ available in transaction logs.
 | `bandwidth_pricing.price_per_byte_received` | Number | `0.0` | Per-byte charge for bytes flowed backend→client. Finite, non-negative, ≤ `1e288` |
 | `stream_connection_pricing` | Object | _(optional)_ | Per-connection pricing for stream proxies (TCP/TCP+TLS/UDP/DTLS) |
 | `stream_connection_pricing.price_per_connection` | Number | _(required when block is set)_ | Per-session charge applied at stream disconnect. Finite, non-negative, ≤ `1e288` |
-| `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/charges` response is served before rebuilding |
-| `stale_entry_ttl_seconds` | Integer | `3600` | How long idle chargeback entries live before eviction |
-| `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it |
-| `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task |
+| `render_cache_ttl_seconds` | Integer | `5` | How long the cached `/charges` response is served before rebuilding. Process-global: every enabled instance must use the same value |
+| `stale_entry_ttl_seconds` | Integer | `3600` | How long idle chargeback entries live before eviction. Process-global: every enabled instance must use the same value |
+| `cache_invalidation_min_age_ms` | Integer | `500` | Minimum age (ms) of the render cache before `record()` will invalidate it. Process-global: every enabled instance must use the same value |
+| `cleanup_interval_seconds` | Integer | `300` | How often (seconds) a background task evicts entries idle longer than `stale_entry_ttl_seconds`. Set to `0` to disable the periodic cleanup task. Process-global: every enabled instance must use the same value. Reloading updates, disables, or re-enables the singleton task without retaining the prior interval |
 
 **Admin endpoint:** `GET /charges` requires a valid admin JWT in
 `Authorization: Bearer <token>`. Chargeback output can contain customer and
@@ -1362,7 +1457,7 @@ authentication policy.
 | Query Parameter | Description |
 |---|---|
 | _(none)_ | Prometheus text exposition format. Counter families: `ferrum_api_chargeable_calls_total` and `ferrum_api_charges_total` (HTTP-family per-call counts and charges, labelled by billable status: wire status for ordinary HTTP and canonical effective status for gRPC/gRPC-Web); `ferrum_api_stream_connections_total` and `ferrum_api_stream_connection_charges_total` (stream session counts and per-session charges); `ferrum_api_bytes_sent_total` / `ferrum_api_bytes_received_total` (bandwidth byte counters aggregated per `consumer`/`proxy_id`/`currency`/`protocol_family`); and `ferrum_api_bandwidth_charges_total` (bandwidth charges, with `direction="sent"`/`"received"` and `protocol_family="http"`/`"stream"`). All metrics include `currency` and `namespace` labels |
-| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries its `currency`, a `protocol_family` (`http`, `stream`, or `mixed` when one `proxy_id` carries both), per-billable-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and a `stream` block (session counts + per-connection charges) whenever the proxy recorded stream activity — so a `mixed` proxy shows both `by_status` and `stream` and the breakdown reconciles with the totals. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree. Single-currency consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges`. When one consumer spans multiple currencies, those flat monetary fields are `null` and `charges_by_currency` partitions the same components per currency (never sum USD+EUR into a unitless headline total); `total_calls` remains a unitless sum |
+| `?format=json` | JSON format with nested consumer → proxy breakdown. Each proxy carries its `currency`, a `protocol_family` (`http`, `stream`, or `mixed` when one `proxy_id` carries both), per-billable-status `by_status` calls/charges, a `bandwidth` block (`bytes_sent`, `bytes_received`, `charge_sent`, `charge_received`), and a `stream` block (session counts + per-connection charges) whenever the proxy recorded stream activity — so a `mixed` proxy shows both `by_status` and `stream` and the breakdown reconciles with the totals. The top-level `currency` is the single currency in use, or `"mixed"` when instances disagree; an empty registry reports the deterministic default `"USD"` because no recorded entry has an authoritative instance currency. Single-currency consumer totals split into `per_call_charges`, `stream_connection_charges`, and `bandwidth_charges`. When one consumer spans multiple currencies, those flat monetary fields are `null` and `charges_by_currency` partitions the same components per currency (never sum USD+EUR into a unitless headline total); `total_calls` remains a unitless sum |
 
 **Multi-node deployments (CP/DP):** Each gateway node (DP) accumulates charges
 independently in memory. In CP/DP topologies, the CP does not proxy traffic and
@@ -1429,10 +1524,15 @@ Exports durable charge events or snapshot deltas to ClickHouse using the same
 pricing blocks as `api_chargeback`. Config is required: `clickhouse.url` plus
 at least one nonempty pricing dimension (`pricing_tiers`, `bandwidth_pricing`,
 or `stream_connection_pricing` with `PricingConfig::has_any_pricing`
-semantics). It supports per-event mode for transaction-level provenance,
-snapshot mode for lower ingest volume (requires `spool.enabled=true`), an
-on-disk spool for ClickHouse outages, `GET /charges/sink/status`, and
-Prometheus metrics under `/metrics`. See
+semantics). Durable delivery requires a complete empty ClickHouse
+acknowledgement (HTTP 200/204 alone is insufficient); `wait_for_async_insert=0`
+needs explicit `clickhouse.allow_lossy_async_insert=true`, and enabling
+`async_insert` without a wait setting pins `wait_for_async_insert=1`. It
+supports per-event mode for transaction-level provenance, snapshot mode for
+lower ingest volume (requires `spool.enabled=true`), an on-disk spool for
+ClickHouse outages, `GET /charges/sink/status` (multi-instance accepted-generation
+status with aggregate totals), and process-wide aggregate Prometheus metrics
+under `/metrics`. See
 [plugins/api_chargeback_sink.md](plugins/api_chargeback_sink.md) for DDL,
 configuration, OpenAPI/runtime admission layers, spool sizing, replay, and
 reconciliation guidance. Set `FERRUM_NODE_ID` for stable spool ownership on
@@ -1440,6 +1540,9 @@ persistent storage. Ordinary HTTP is priced by wire status. Native gRPC and
 translated gRPC-Web use the same canonical effective-status mapping documented
 for `api_chargeback`; durable events retain the billable `status_code`, raw
 `http_status_code`, and normalized final `grpc_status` as separate fields.
+As with in-memory chargeback, `request_mirror` shadow summaries (`mirror: true`)
+remain available to logging/observability plugins but are never consumer-billable
+in per-event or snapshot export.
 
 **Priority:** 9351
 
@@ -2426,7 +2529,7 @@ At least one rate window must be configured in every rule. Do not combine the cu
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:rate_limiting` when namespace is `"ferrum"` |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be ≥ 1). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
@@ -2498,7 +2601,7 @@ Prevents duplicate API calls by tracking idempotency keys. When a request arrive
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`). Must use the `redis://` or `rediss://` scheme with a hostname. Explicitly supplied values are validated even in `local` mode |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `"{FERRUM_NAMESPACE}:dedup"` | Redis key namespace prefix. Defaults to `ferrum:dedup` when namespace is `"ferrum"`. Must be non-empty when supplied. Sibling instances stay isolated under a shared default/explicit prefix via stable `plugin_config_id` in logical keys |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be > 0). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout (must be > 0) |
 | `redis_health_check_interval_seconds` | u64 | `5` | Health check interval when Redis is unavailable (must be > 0) |
 | `redis_username` | String (optional) | — | Redis ACL username |
@@ -3105,7 +3208,7 @@ config:
 
 ### `compression`
 
-On-the-fly response compression and request decompression. Negotiates the best algorithm via the client's `Accept-Encoding` header (RFC 9110 §12.5.3), including the `identity` (uncoded) representation. Supports gzip and brotli.
+On-the-fly response compression and request decompression. Negotiates the best algorithm via the client's `Accept-Encoding` header (RFC 9110 §12.5.3), including the `identity` (uncoded) representation. Supports gzip and Brotli on HTTP/1.1, HTTP/2, and HTTP/3.
 
 **Priority:** 4050
 
@@ -3122,12 +3225,18 @@ On-the-fly response compression and request decompression. Negotiates the best a
 | `gzip_level` | u64 | `6` | Gzip compression level (0=no compression, emits gzip framing only; 1=fastest, 9=best) |
 | `brotli_quality` | u64 | `4` | Brotli quality (0=fastest, 11=best) |
 
+The process-wide `FERRUM_COMPRESSION_GZIP_ENABLED` and `FERRUM_COMPRESSION_BROTLI_ENABLED` settings default to `true` and intersect with every instance's `algorithms` list. A codec disabled globally cannot be re-enabled by file, database, Admin API, or CP/DP plugin configuration. The same gate also disables that codec for opt-in request decompression. After those gates are applied, an instance with no remaining usable algorithm fails admission (it is not left live while still stripping `Accept-Encoding`). This gives operators a node-wide emergency/performance switch while preserving per-proxy policy.
+
 **Request decompression** (opt-in):
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `decompress_request` | bool | `false` | Enable decompression of gzip/brotli request bodies |
-| `max_decompressed_request_size` | u64 | `10485760` | Zip bomb protection: max decompressed size in bytes (10 MB) |
+| `max_decompressed_request_size` | u64 | `10485760` | Zip bomb protection: max decompressed size in bytes (10 MB). Hard-capped at 32 MiB (`33554432`); when request decompression is enabled, it must also be ≤ `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` if that wire limit is set. Per-layer and cumulative decode work share this ceiling, and raw-to-decoded amplification above 1024:1 fails closed |
+
+When `decompress_request` is enabled, `Content-Encoding` is parsed as an ordered `#content-coding` list (RFC 9110 §8.4) with OWS trimming. Supported chains (`gzip` / `x-gzip`, `br`) decode in reverse application order under the shared content-coding decoder; `identity`-only lists strip the header without rewriting bytes. Malformed members, parameters, unsupported codings, mixed `identity`, trailing/concatenated members, and limit/amplification overruns fail closed with `400`. Codec worker saturation fails closed with `503`.
+
+Gzip and Brotli codec CPU (request decode and response encode) runs on a bounded `spawn_blocking` pool (32 concurrent jobs process-wide). Response compression **reserves** its admission permit in `before_proxy`, ahead of the response-buffer decision, so the same 32-permit pool bounds the population of response bodies collected for compression rather than only the codec workers: a request that negotiates a supported coding but cannot obtain a permit streams identity (or `406` when identity is unacceptable) instead of pinning a body onto the compression-only buffered path. Compression also requires `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` to be non-zero and no greater than the fixed 32 MiB compression safety ceiling; an unlimited or larger gateway response limit streams identity (or returns `406` when identity is unacceptable), ensuring every compression-induced full-body collection has an absolute per-response bound. `after_proxy` consumes the reserved permit at commit and never reacquires once a streaming/identity path is chosen; the reserved permit is released promptly when the response turns out ineligible (content-type / size / range / `no-transform` / strong `ETag`), is a no-body/already-coded hard skip, or the request is cancelled. Authenticated `/metrics` exports `ferrum_compression_codec_{admitted,saturated,join_failures,worker_failures}_total`. If encoding fails after `Content-Encoding` was committed (worker error or join failure), shared H1/H2/H3 buffered transform loops atomically restore an identity response with matching headers/length rather than emitting plaintext under a coded header. Rare buffered request-decode fallback paths that strip encoding headers without a mutable body view stage the validated plaintext onto the request context so the later transform emits those bytes without a second codec admission.
 
 **Default content types:** `application/json`, `application/javascript`, `application/xml`, `application/xhtml+xml`, `text/html`, `text/plain`, `text/css`, `text/xml`, `text/javascript`, `image/svg+xml`
 
@@ -3144,7 +3253,7 @@ On-the-fly response compression and request decompression. Negotiates the best a
 8. Response `Content-Length` is below `min_content_length`
 9. Client did not send `Accept-Encoding` with a supported algorithm, or the `identity` (uncoded) representation is the most preferred acceptable one
 
-**Content negotiation (RFC 9110 §12.5.3):** The gateway compares every representation it can produce — each configured algorithm and the uncoded (`identity`) representation — and serves the most preferred acceptable one. Identity is acceptable by default (q=1) unless the client refuses it with `identity;q=0` or with `*;q=0` without a more-specific `identity` entry; a nonzero wildcard (`*;q=0.3`) does **not** lower that default identity quality — the wildcard assigns quality only to unlisted configured algorithms. Explicit algorithm and `identity` entries take precedence over the wildcard, and the `algorithms` server preference order breaks ties (so an algorithm tied with identity still compresses). Only a well-formed `q=0` weight can forbid identity: a malformed qvalue on an `identity` or `*` entry is ignored rather than read as a refusal. When the client refuses identity and no acceptable coded representation is available — including when a configured algorithm would otherwise win but the response cannot be encoded because of content-type / `min_content_length` eligibility, `no-transform`, a strong `ETag`, or because the response is an identity range/delta (`206`/`226`, `Content-Range`, or the internal range marker) — the plugin rejects with `406 Not Acceptable` (`Vary: Accept-Encoding`) and does not commit compression headers or body transforms. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable) rather than protocol hard skips. No-body statuses (`204`/`205`/`304`), `HEAD` requests, and responses that already carry `Content-Encoding` remain protocol hard skips and are left unchanged. On the synthetic reject path, fail-closed 406 replacement is scoped to `response_caching` HITs of identity variants (including legacy identity responses that omit `Vary: Accept-Encoding` per #2355) so a cache hit cannot bypass negotiation; unrelated auth/policy rejection statuses are not replaced.
+**Content negotiation (RFC 9110 §12.5.3):** The gateway compares every representation it can produce — each configured and globally enabled algorithm and the uncoded (`identity`) representation — and serves the most preferred acceptable one. `gzip` and its legacy `x-gzip` token select the same gzip representation; the response always emits the canonical `Content-Encoding: gzip`. Identity is acceptable by default (q=1) unless the client refuses it with `identity;q=0` or with `*;q=0` without a more-specific `identity` entry; a nonzero wildcard (`*;q=0.3`) does **not** lower that default identity quality — the wildcard assigns quality only to unlisted configured algorithms. Explicit algorithm and `identity` entries take precedence over the wildcard, and the `algorithms` server preference order breaks ties (so an algorithm tied with identity still compresses). Quality weights are parsed with the RFC 9110 qvalue grammar; a malformed weighted member is ignored and cannot enable or forbid a representation. When the client refuses identity and no acceptable coded representation is available — including when a configured algorithm would otherwise win but the response cannot be encoded because of content-type / `min_content_length` eligibility, `no-transform`, a strong `ETag`, or because the response is an identity range/delta (`206`/`226`, `Content-Range`, or the internal range marker) — the plugin rejects with `406 Not Acceptable` (`Vary: Accept-Encoding`) and does not commit compression headers or body transforms. Identity range/delta responses are non-transformable (forwarded unchanged when identity is acceptable) rather than protocol hard skips. No-body statuses (`204`/`205`/`304`), `HEAD` requests, and responses that already carry `Content-Encoding` remain protocol hard skips and are left unchanged. On the synthetic reject path, fail-closed 406 replacement is scoped to `response_caching` HITs of identity variants (including legacy identity responses that omit `Vary: Accept-Encoding` per #2355) so a cache hit cannot bypass negotiation; unrelated auth/policy rejection statuses are not replaced.
 
 **Behavior:**
 - Strips `Accept-Encoding` from backend requests (configurable) so the backend sends uncompressed responses for the gateway to compress
@@ -3152,9 +3261,11 @@ On-the-fly response compression and request decompression. Negotiates the best a
 - Removes `Content-Length` after compression (the gateway recalculates it from the compressed body)
 - After an actual compression body transform, the shared body-transform lifecycle removes representation-integrity metadata that described the uncompressed origin bytes — `Content-Digest`, `Repr-Digest`, legacy `Digest`, and `Content-MD5` (case-insensitive), along with other content-bound validators such as weak `ETag` / `Last-Modified`. Those fields are preserved when compression is skipped, negotiation declines, the body is ineligible, or the transform returns `None`. Gateway `Content-Encoding` and `Vary: Accept-Encoding` remain. On buffered H1/H2/H3 paths, trailer integrity fields are handled the same way as other stale application trailers after a rewrite: native H3 drops backend trailers once the body is rewritten, and buffered gRPC retires application trailers (including digests) while preserving reserved terminal status metadata
 - Forces response body buffering on proxies where this plugin is enabled
-- When `decompress_request` is enabled, supported gzip/brotli request bodies are decoded in the shared pre-`before_proxy` normalization phase (H1/H2 and native H3) so earlier body consumers such as `soap_ws_security` inspect validated plaintext; the same plaintext is what later request-body hooks and the backend receive, and the forwarded request has `Content-Encoding` and `Content-Length` removed only after successful decode
+- When `decompress_request` is enabled, supported gzip/brotli request coding lists are decoded in the shared pre-`before_proxy` normalization phase (H1/H2 and native H3) so earlier body consumers such as `soap_ws_security` inspect validated plaintext; the same plaintext is what later request-body hooks and the backend receive, and the forwarded request has `Content-Encoding` and `Content-Length` removed only after successful decode. OWS-tolerant ordered lists decode in reverse application order; malformed/unsupported members fail closed. On the rare buffered fallback that validates without a mutable body view, validated plaintext is staged on the request context before headers are stripped so the later transform cannot forward compressed bytes without encoding metadata
+- `remove_accept_encoding` only mutates the backend request when the instance still has at least one usable response codec after process-wide gates
 - Request `Cache-Control: no-transform` skips gateway response compression but does not disable configured request decompression; client-controlled `no-transform` is not honored as an opt-out from upload normalization or body-inspection hooks
 - Strong origin `ETag` validators are preserved by skipping compression; when a weak-ETag response is compressed, the shared body-transform lifecycle removes that upstream validator because the client-visible bytes changed
+- Synchronous gzip/Brotli work is offloaded through a bounded admission semaphore and `spawn_blocking` so codec CPU does not monopolize Tokio workers; encoder failure after a committed coding restores identity headers on shared buffered paths
 
 **Multiple instances:** A proxy may carry several `compression` configs (for example two proxy-scoped instances after a same-named global is shadowed, or distinct `priority_override` values). Request decompression and response compression are not idempotent, so each one-shot coding decision is tied to exactly one effective instance in configured order:
 
@@ -3172,7 +3283,7 @@ config:
   decompress_request: false
 ```
 
-**Note:** This plugin handles HTTP-level `Content-Encoding` compression/decompression. gRPC message-level compression (the compressed flag in gRPC wire frames) is handled separately by `body_validator` for protobuf validation — these are different protocol layers and should not be confused.
+**Protocol scope:** HTTP/1.1, HTTP/2, and HTTP/3 use the same negotiation and buffered transform lifecycle. WebSocket data compression is a separate extension (`permessage-deflate`) and is not provided by this plugin. gRPC message-level compression uses `grpc-encoding` plus the compressed flag in gRPC wire frames; `body_validator` handles gzip decompression for protobuf validation. Raw TCP/UDP have no HTTP content-coding layer.
 
 ---
 
@@ -3616,7 +3727,7 @@ Request buffering is only enabled when at least one GraphQL policy is configured
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:graphql` | Redis key namespace prefix. Defaults to `ferrum:graphql` when namespace is `"ferrum"`. Must be non-empty when set. |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be ≥ 1). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be ≥ 1). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable (must be ≥ 1) |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
@@ -3671,7 +3782,18 @@ Request-side body trailer frames (`0x80`/`0x81`) are unsupported and rejected:
 Ferrum does not translate them into native HTTP/2 request trailers, so they are
 never forwarded to the backend as message bytes.
 
-On the response path, `grpc_web` embeds HTTP/2 trailers — `grpc-status`, `grpc-message`, binary `*-bin` metadata, and valid ASCII custom trailing metadata such as `request-id` — as a length-prefixed trailer frame (flag byte `0x80`) in the response body, then rewrites `content-type` to the **negotiated** gRPC-Web variant. Only backend trailer provenance is embedded: hop-by-hop, forbidden, pseudo, connection-listed, and invalid names or non-printable/CRLF values are stripped, and initial response headers are not copied into the trailer block. Duplicate metadata values are preserved as separate trailer lines; encoding order is deterministic by lowercase header name.
+On the response path, `grpc_web` streams backend DATA as it arrives and embeds HTTP/2 trailers — `grpc-status`, `grpc-message`, `grpc-status-details-bin`, and valid ASCII custom trailing metadata such as `request-id` — as exactly one final length-prefixed trailer frame (flag byte `0x80`) in the response body. Binary mode forwards each bounded DATA chunk without an additional translation copy; text mode base64-encodes each runtime flush independently, including protocol-permitted padding at flush boundaries, so neither mode waits for backend EOF before publishing server-streaming messages. Backpressure, cancellation, resets, absolute deadlines, response-size enforcement, load-balancer/admission guards, and deferred logging remain attached to the live body pipeline. The configured response-size ceiling applies to native backend DATA before text expansion; client-visible byte accounting records the encoded bytes and terminal frame.
+
+Header-only `response_transformer` rules keep translated gRPC-Web on the
+compatible buffered path. That path presents the merged initial-header and
+terminal-trailer view to policy before it builds the body trailer frame, so
+remove, update, and rename rules cannot be bypassed by moving metadata into
+backend trailers. Explicit response buffering and other whole-body policies
+likewise take precedence over response streaming.
+
+The plugin rewrites `content-type` to the **negotiated** gRPC-Web variant and removes an upstream `Content-Length`, because streaming text expansion and the terminal frame change the final representation length. Only backend trailer provenance is embedded: hop-by-hop, forbidden, pseudo, connection-listed, and invalid names or non-printable/CRLF values are stripped, and ordinary initial response headers are not copied into the terminal block. Duplicate metadata values are preserved as separate trailer lines; encoding order is deterministic by lowercase header name. A backend error propagates as a stream error and does not gain a fabricated clean terminal status; a clean EOF without valid trailers receives the documented HTTP-to-gRPC synthesized status.
+
+Browser gRPC-Web request streaming and full-duplex transport remain subject to upstream gRPC-Web limitations. Ferrum therefore still buffers and validates the complete gRPC-Web request envelope before native backend dispatch; this response-side streaming support covers unary and server-streaming responses.
 
 **Response media-type negotiation:** Response encoding and the client-visible response `Content-Type` follow the request `Accept` header ([PROTOCOL-WEB.md](https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-WEB.md); RFC 9110 content negotiation):
 
@@ -3720,7 +3842,7 @@ Enables per-method access control and rate limiting for canonical gRPC paths (`/
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:grpc_method_router` | Redis key namespace prefix. Defaults to `ferrum:grpc_method_router` when namespace is `"ferrum"` |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be ≥ 1). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Effective Redis connection-attempt timeout in seconds (must be > 0). Applied to redis-rs inner connection config for cached, dedicated, and health-check paths (TCP connect, TLS handshake when enabled, Redis protocol handshake). Gateway DNS screening/resolution of the Redis hostname runs before this timeout starts |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
@@ -3801,22 +3923,38 @@ Duplicates live proxy traffic to a secondary destination for shadow testing, val
 **Priority:** 3075
 **Protocols:** HTTP, gRPC
 
-Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, ws_logging, prometheus, transaction_debugger). Detached result observation follows the mirror task's actual lifetime and has no independent five-second cutoff: a response that completes within the proxy's `backend_read_timeout_ms` is still logged even when it takes longer than five seconds. Request timeouts, task cancellation/failure, response-body stream failure, and `max_in_flight` drops produce explicit mirror entries with `mirror_error` rather than silently disappearing. The gateway runtime cancels outstanding detached mirror/logging tasks during shutdown; they never delay the client response or extend shutdown. The mirror request uses the proxy's `backend_read_timeout_ms` and the gateway's shared DNS cache and connection pool.
+Mirror response metadata (status code, response size, latency) is logged as a separate `TransactionSummary` entry with `mirror: true`, flowing through all logging plugins (stdout, http_logging, ws_logging, prometheus, transaction_debugger, `api_chargeback`, `api_chargeback_sink`). Shadow summaries remain available for observability and correlation, but chargeback plugins never treat them as consumer-billable per-call or bandwidth charges — only the primary client-facing summary is priced. Every dispatched `request_mirror` instance owns an independent result receiver and emits its own entry, identified by `metadata.mirror_plugin_id` plus the query-stripped target URL. A later instance never replaces an earlier result, and collectors run independently so mixed completion order or one slow destination does not suppress another. An instance sampled out by `percentage` emits no entry because it sent no shadow request; a selected instance rejected by its own `max_in_flight` or `max_retained_request_body_bytes` limit emits an attributable failure entry. Detached result observation follows the mirror task's actual lifetime and has no independent five-second cutoff: a response that completes within the resolved mirror deadline is still logged even when it takes longer than five seconds. Request timeouts, task cancellation/failure, response-body stream/drain failure, and concurrency/byte-budget drops produce explicit mirror entries with `mirror_error` rather than silently disappearing. Each instance also keeps bounded-lifetime `AtomicU64` counters (dispatched, completed, request/drain timeouts, request/drain failures, drain truncations, cancellations, and concurrency/byte-budget drops) that reset on config reload; a task dropped before a terminal outcome (runtime shutdown, panic, or cancellation) is counted via a drop guard. These are aggregate tallies only — no header names, URLs, plugin IDs, or credential material — and dual-write into Ferrum's authenticated Prometheus `/metrics` output as process-wide monotonic `ferrum_request_mirror_*_total` counters. Mirror *transaction summaries* stay excluded from request/billing histograms; that exclusion does not apply to these label-safe lifecycle counters. After request/body drain, the structured delivery lifecycle awaits admitted mirror-result collection and logging inside the shared observability shutdown budget; work still outstanding at the deadline is cancelled and counted. This never delays the client response or leaves shutdown unbounded. The mirror request always has a finite deadline: optional plugin `mirror_timeout_ms`, else the proxy's positive `backend_read_timeout_ms`, else 60s, always capped at 300s. Zero primary timeout never disables mirroring's deadline. The mirror uses the gateway's shared DNS cache and connection pool.
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `mirror_host` | String | **(required)** | Hostname or IP of the mirror target |
 | `mirror_port` | Integer | 80/443 | Port of the mirror target (default based on protocol) |
 | `mirror_protocol` | String | `"http"` | `"http"` or `"https"` |
-| `mirror_path` | String | _(none)_ | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. When unset, uses the backend-effective authorized path if backend-path policy is active; otherwise uses the original request path |
+| `mirror_path` | String | _(none)_ | Override the request path for the mirror. Must start with `/` and cannot contain a query or fragment. Precedence is explicit `mirror_path`, then the matched mesh route rewrite, then the backend-effective authorized path when backend-path policy is active, then the original request path |
 | `percentage` | Float | `100.0` | Percentage of requests to mirror (0.0–100.0). Quantized to 0.1% steps via `round(percentage × 10)` |
 | `mirror_request_body` | Boolean | `true` | Whether to include the request body in the mirror request |
-| `max_response_body_bytes` | Integer | `1048576` | Cap on bytes read from a mirror response when sizing it. Only consulted when the response has no `content-length` header — streaming aborts as soon as the limit is crossed and the truncated count is recorded. The mirror task discards the bytes after sizing, so this only bounds memory pressure from a misbehaving mirror endpoint streaming an unbounded body to a fire-and-forget task. Default is 1 MiB |
-| `max_in_flight` | Integer | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1). Bounds the mirror concurrency/backpressure budget: saturation drops the new mirror attempt without affecting the primary request |
+| `max_response_body_bytes` | Integer | `1048576` | Cap on bytes drained from every mirror response (with or without `Content-Length`). Streaming aborts as soon as the limit is crossed and the truncated/observed count is recorded. The mirror task discards the bytes after sizing so HTTP/1.1 keep-alive pools can reclaim the socket. Default is 1 MiB |
+| `max_in_flight` | Integer | `256` | Maximum concurrent detached mirror tasks per plugin instance (minimum 1, maximum 1048576). Bounds the mirror concurrency/backpressure budget: saturation drops the new mirror attempt without affecting the primary request. A value above the cap is rejected at construction rather than panicking Tokio's semaphore |
+| `max_retained_request_body_bytes` | Integer | `67108864` | Aggregate retained request-body budget for in-flight mirrors on this instance (minimum 1). Shared `Bytes` bodies are charged once per task; exhaustion drops the new mirror attempt without affecting the primary request. Default is 64 MiB |
+| `mirror_timeout_ms` | Integer | _(proxy / 60000)_ | Finite mirror request deadline in milliseconds (1–300000). When omitted, uses the matched proxy `backend_read_timeout_ms` when positive, otherwise 60000. A zero primary timeout never disables this deadline |
+| `forward_sensitive_headers` | Boolean | `false` | Dangerous opt-in. When `true`, selected origin-bound credential headers may cross to the mirror origin, but only exact names listed in `forward_sensitive_header_allowlist`. Construction is fail-closed: both fields are required together and the allowlist must be non-empty |
+| `forward_sensitive_header_allowlist` | String[] | `[]` | Lowercased exact allowlist of denied sensitive header names to forward when `forward_sensitive_headers` is `true`. Each entry must be a valid HTTP header name (≤256 bytes, at most 64 entries) that the deny-by-default policy actually strips (a built-in credential or a `sensitive_header_patterns` match); non-sensitive names are rejected at construction |
+| `sensitive_header_patterns` | String[] | `[]` | Additional lowercased substrings matched against the header name that extend the built-in deny-by-default credential set (each ≤128 bytes, at most 64 entries). Covers HTTP headers and native gRPC metadata (gRPC metadata is carried as HTTP/2 headers) |
 
 **Percentage sampling:** Selection is deterministic and evenly spaced (Bresenham / dithered phase accumulator), not randomized and not a contiguous prefix of each 1,000-request window. The effective threshold is `round(percentage × 10)` clamped to `0..=1000` tenths of a percent. `0%` never mirrors; `100%` always mirrors. For other values, each request adds the threshold to a phase in `0..1000`; when the sum reaches or exceeds `1000` the request is mirrored and the phase wraps by subtracting `1000`. Every complete 1,000-request cycle therefore mirrors exactly `threshold` requests, with inter-selection gaps of `floor(1000/threshold)` or `ceil(1000/threshold)`. Construction and config reload reset the phase to `0`, which defers the first selection until the accumulator crosses `1000` — reload does not reopen with a mirrored burst. The phase is bounded on every update (no unbounded counter wrap), and updates are lock-free via a single `AtomicU64` compare-exchange on the request hot path (no per-request allocation, RNG, formatting, or mutex).
 
-When `mirror_request_body` is enabled, the plugin preserves binary payloads (including gRPC protobuf) using a binary-safe body store. Non-UTF-8 request bodies are mirrored correctly. For native gRPC, H1/H2 and H3 frontends reuse that one bounded prebuffer for both the detached shadow and primary dispatch: they do not read the client stream or run request transforms/final hooks twice. The prebuffer uses the gRPC receive ceiling and the proxy request-body read timeout; a cancelled or timed-out upload is rejected before either destination receives a partial request. Shadow connection, response, or logging failures remain detached from the primary RPC.
+**Mesh route parity:** When `mesh_route_dispatch` selected the request,
+`request_mirror` reads (without consuming) the finalized route URI. An explicit
+`mirror_path` still wins. The configured mirror URL remains the dial, DNS, TLS,
+and egress-validation identity, while the application Host/authority is a
+protocol-valid shadow of the selected rewritten authority (or selected request
+Host when no authority rewrite exists): DNS hostnames receive Envoy/Istio's
+`-shadow` suffix before any port, and IPv4 / bracketed IPv6 literals keep their
+literal form because a DNS suffix would produce an invalid Host. Standalone
+off-mesh mirrors retain the stricter boundary: client Host and proxy-owned
+`X-Forwarded-*` fields are stripped and authority derives from the mirror URL.
+
+When `mirror_request_body` is enabled, the plugin preserves binary payloads (including gRPC protobuf) using a binary-safe body store and shares those `Bytes` with each detached mirror task (no full-body `to_vec` duplication). In-flight mirrors are admitted under both `max_in_flight` and `max_retained_request_body_bytes`; body leases release when the task ends. Non-UTF-8 request bodies are mirrored correctly. For native gRPC, H1/H2 and H3 frontends reuse that one bounded prebuffer for both the detached shadow and primary dispatch: they do not read the client stream or run request transforms/final hooks twice. The prebuffer uses the gRPC receive ceiling and the proxy request-body read timeout; a cancelled or timed-out upload is rejected before either destination receives a partial request. Shadow connection, response, or logging failures remain detached from the primary RPC.
 
 When route-sensitive backend-path policy such as `grpc_method_router` is
 active, an unset `mirror_path` follows the finalized path that passed policy
@@ -3825,7 +3963,9 @@ replayed to the shadow destination. An explicit `mirror_path` remains an
 operator override, and proxies without backend-path policy retain the original
 request path default.
 
-**Outbound header boundary:** Mirror requests reuse Ferrum's canonical secondary-request sanitizer (the same backend-request strip predicates as primary dispatch — secondary builders call those predicates directly, so new strip arms are honored automatically). The filter snapshots RFC 9110 `Connection`-listed tokens before removing `Connection`, strips hop-by-hop / framing / `Trailer` / Ferrum request-only markers (`x-ferrum-original-content-encoding`, `x-grpc-web-mode`), drops client-supplied proxy-owned forwarding identity (`X-Forwarded-*`), and omits client `Host` so reqwest derives authority from the mirror URL. Forwarding identity is not regenerated for mirror traffic, so the mirror receives no Ferrum-authored `X-Forwarded-*` fields; this intentionally favors the off-mesh privacy/trust boundary over primary-vs-shadow identity-header parity. Reserved load-testing control headers are excluded defensively. On native gRPC mirrors (`application/grpc`, `application/grpc+…`, or parameters — not prefix-smuggled types such as `application/grpcfoo` / `application/grpc-web`), `te: trailers` is re-synthesised after the generic strip. Native gRPC mirror targets must support HTTP/2; HTTP/1.1 is not a supported native-gRPC mirror transport.
+**Outbound header boundary:** Mirror requests reuse Ferrum's canonical secondary-request sanitizer (the same backend-request strip predicates as primary dispatch — secondary builders call those predicates directly, so new strip arms are honored automatically). The filter snapshots RFC 9110 `Connection`-listed tokens before removing `Connection`, strips hop-by-hop / framing / `Trailer` / Ferrum request-only markers (`x-ferrum-original-content-encoding`, `x-grpc-web-mode`), drops client-supplied proxy-owned forwarding identity (`X-Forwarded-*`), and omits client `Host` so reqwest derives authority from the mirror URL. Forwarding identity is not regenerated for mirror traffic, so the mirror receives no Ferrum-authored `X-Forwarded-*` fields; this intentionally favors the off-mesh privacy/trust boundary over primary-vs-shadow identity-header parity. Reserved load-testing control headers are excluded defensively. After that boundary, cross-origin credential forwarding is **deny-by-default** so a distinct mirror origin cannot receive production credentials. A header is stripped when its lowercased name is a built-in credential (`Authorization`, `Cookie`, `Cookie2`, `Proxy-Authorization`, `Proxy-Authenticate`, `WWW-Authenticate`, `X-Api-Key`, `X-Auth-Token`, `X-Csrf-Token`), **contains a built-in credential substring** (`authorization`, `cookie`, `authenticate`, `api-key`/`apikey`/`api_key`, `auth-token`, `access-token`, `refresh-token`, `id-token`, `session-token`, `security-token`, `csrf`, `xsrf`, `bearer`, `password`/`passwd`, `secret`, `credential` — so vendor variants like `x-openai-api-key`, `x-amz-security-token`, and `x-vendor-auth-token` are caught without an exact list), or **matches an operator `sensitive_header_patterns` substring**. Bare `token`/`key`/`session`/`auth` substrings are deliberately excluded so benign headers (pagination cursors such as `x-continuation-token`) are not stripped; operators extend coverage with `sensitive_header_patterns`. Because native gRPC metadata is carried as HTTP/2 headers, the same predicate covers gRPC credential metadata. Forwarding any denied header requires the high-friction, fail-closed pair `forward_sensitive_headers: true` plus a non-empty exact-name `forward_sensitive_header_allowlist` — each allowlist entry must be a valid HTTP header name that the deny policy actually strips, and non-sensitive names and partial opt-ins are rejected at construction. On native gRPC mirrors (`application/grpc`, `application/grpc+…`, or parameters — not prefix-smuggled types such as `application/grpcfoo` / `application/grpc-web`), `te: trailers` is re-synthesised after the generic strip.
+
+**gRPC transport:** Native gRPC shadows dial through the shared `PluginHttpClient` HTTP/2 companion (`http2_prior_knowledge`): cleartext `mirror_protocol: http` uses h2c prior knowledge, and `https` negotiates ALPN `h2`. Ordinary (non-gRPC) HTTP mirrors keep the default all-version client so HTTP/1.1 destinations continue to work. Native gRPC mirror targets must support HTTP/2; HTTP/1.1 is not a supported native-gRPC mirror transport. DNS cache, TLS posture, pool keepalive, egress screening, configured mirror timeouts, and redacted logging remain on the shared plugin client.
 
 **Query fidelity:** The mirror request-target prefers the original raw query string after the same auth credential strips primary dispatch applies (`auth.strip_query_param.*`), preserving repeated pairs, pair order, flag and empty parameters, `+`, encoded delimiters, percent escapes, and non-ASCII encoded bytes. The materialised single-value `query_params` map is used only when no raw query is available. Decoded `request_transformer` query-map mutations are not re-serialized onto the mirror URL, matching primary backend URL construction.
 
@@ -3838,6 +3978,12 @@ config:
   percentage: 50.0
   mirror_request_body: true
   max_in_flight: 64
+  max_retained_request_body_bytes: 33554432
+  # Extend the built-in deny-by-default credential set with extra name substrings.
+  # sensitive_header_patterns: ["signature", "x-vault-"]
+  # Dangerous: omit unless the mirror origin is fully trusted with live credentials.
+  # forward_sensitive_headers: true
+  # forward_sensitive_header_allowlist: ["authorization"]
 ```
 
 ---
@@ -3952,9 +4098,9 @@ documented lifecycle limitations.
 
 Controlled AI payload capture for compliance review, incident response, customer-support debugging, and offline evaluation datasets. It captures the AI request and response (after redaction), keyed HMAC-SHA256 body hashes, model/provider, token metadata, guardrail decisions, tool names, and cache metadata, then exports them asynchronously to an HTTP collector in batches. It complements the transaction-logging plugins (which summarize metadata/metrics); this plugin is for controlled *payload* capture with redaction, hashing, sampling, size caps, and retention boundaries.
 
-**Not a security boundary by itself.** `ai_transcript_audit` observes and redacts — it does not enforce. Combine it with `ai_prompt_shield`, `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in `ai_semantic_firewall`. It reads the guardrail/model/token metadata those plugins publish into `ctx.metadata` and folds it into each record.
+**Not a security boundary by itself.** `ai_transcript_audit` observes and redacts — it does not enforce. Combine it with `ai_prompt_shield`, `ai_semantic_firewall`, `ai_response_guard`, and `ai_tool_governor`. It reads the guardrail/model/token metadata those plugins publish into `ctx.metadata` and folds it into each record.
 
-**Placement.** Priority `2924` (`AI_TRANSCRIPT_AUDIT`): before `ai_prompt_shield` (2925), `ai_semantic_firewall` (2968), and `ai_request_guard` (2975) so guardrail-rejected prompts can still be staged for `always_capture_on_guardrail`; final request-body refresh runs after downstream redaction/transforms for traffic that continues. It remains before `ai_semantic_cache` (2980) / `ai_stream_router` (2984) / `ai_federation` (4060) so cache hits, streamed requests, and federated requests remain observable. HTTP-family only (`HTTP_ONLY_PROTOCOLS`); gRPC payload capture is future work.
+**Placement.** Priority `2740` (`AI_TRANSCRIPT_AUDIT`): after authentication and authorization, but before `request_deduplication` (2750). This lets the audit stage an eligible request before a local or Redis deduplication replay terminates the hook chain, while keeping capture behind the identity/policy boundary. A replay emits one record with `cache.request_deduplication.replayed = "true"`. Request deduplication does not cache/replay streamed SSE bodies: a clean ordinary stream releases its key, while uncertain side-effect streams retain a non-replayable marker, so there is no SSE replay path for the audit to label. Configuration admission rejects any priority override that places an audit instance at or after a co-located deduplication instance. The audit also remains before `request_size_limiting` (2800), `graphql` (2850), rate limiting (2900), `ai_prompt_shield` (2925), `ai_semantic_firewall` (2968), `ai_request_guard` (2975), `ai_tool_governor` (2978), `ai_semantic_cache` (2980), `ai_stream_router` (2984), and `ai_federation` (4060), so their later rejected traffic can be captured when `always_capture_on_error` applies; under an audit reject policy, audit admission can also select a `503` before a later plugin selects its own rejection. Use `max_records_per_minute` to bound the capture and collector cost of that intentionally broad rejected-traffic surface. HTTP-family only (`HTTP_ONLY_PROTOCOLS`); gRPC payload capture is future work.
 
 **Capture modes** (`mode`):
 
@@ -3965,15 +4111,15 @@ Controlled AI payload capture for compliance review, incident response, customer
 
 **Body hashes are keyed.** The exported `request_hash` / `response_hash` (including the incrementally-hashed streaming tee) are **keyed HMAC-SHA256** digests in every mode, never plain SHA-256 — most AI payloads are a predictable JSON wrapper around a small secret, so an unkeyed digest would be an offline brute-force oracle. They share the redaction-placeholder key: set `redaction.hash_secret` for hashes that are stable fleet-wide, or omit it to use a process-wide random key shared by every instance and surviving config reloads (hashes correlate within one process lifetime but can never be dictionary-attacked from the exported records).
 
-**Redaction.** Built-in PII patterns are shared with `ai_prompt_shield` / `ai_response_guard` (`ssn`, `credit_card`, `email`, `phone_us`, `api_key`, `aws_key`, `ip_address`, `iban`) via `plugins/utils/ai_pii.rs`, plus `custom_patterns`. In `redacted_body` and `metadata_only` modes the pattern set must not be empty — `builtins: []` with no `custom_patterns` is rejected at construction, since a pass-through redactor would export unredacted data (body excerpts in `redacted_body`; the request-derived `model`/`tool_names` in both) without the `full_body` opt-in. `hash_only` exports no request-derived strings and is exempt. With `hash_redacted_values: true` (default), a match is replaced with `[REDACTED:<type>:<hmac-prefix>]` so identical values stay correlatable without the raw value ever being stored. The digest is a **keyed HMAC-SHA256**, never a plain hash (SSNs, phone numbers, and card numbers are small enough value spaces to brute-force offline from an unsalted digest): set `redaction.hash_secret` (min 16 chars) for placeholders that are stable fleet-wide, or omit it to use a process-wide random key shared by every redactor built without a secret — including across config reloads and multiple plugin instances (correlatable within one process lifetime, never dictionary-attackable from the exported records). Redaction runs over the **full** buffered payload before the excerpt is capped, so a sensitive value straddling a `max_request_bytes`/`max_response_bytes` boundary cannot leak as a raw prefix; cap-truncated stream captures drop a pattern-sized tail before redaction for the same reason. Request-derived record fields that bypass the body-excerpt path — the exported `model` and `tool_names` — are passed through the same redactor in every mode except `full_body`, so PII smuggled into those strings cannot leak through the metadata side door. Harvested `ctx.metadata` values are additionally passed through the transaction-log redaction predicate. This plugin never defeats upstream prompt/response redaction — it captures the already-redacted client-visible body.
+**Redaction.** Built-in PII patterns are shared with `ai_prompt_shield` / `ai_response_guard` (`ssn`, `credit_card`, `email`, `phone_us`, `api_key`, `aws_key`, `ip_address`, `iban`) via `plugins/utils/ai_pii.rs`, plus `custom_patterns`. In `redacted_body` and `metadata_only` modes the pattern set must not be empty — `builtins: []` with no `custom_patterns` is rejected at construction, since a pass-through redactor would export unredacted data (body excerpts in `redacted_body`; the request-derived `model`/`tool_names` in both) without the `full_body` opt-in. `hash_only` exports no request-derived strings and is exempt. With `hash_redacted_values: true` (default), a match is replaced with `[REDACTED:<type>:<hmac-prefix>]` so identical values stay correlatable without the raw value ever being stored. The digest is a **keyed HMAC-SHA256**, never a plain hash (SSNs, phone numbers, and card numbers are small enough value spaces to brute-force offline from an unsalted digest): set `redaction.hash_secret` (min 16 chars) for placeholders that are stable fleet-wide, or omit it to use a process-wide random key shared by every redactor built without a secret — including across config reloads and multiple plugin instances (correlatable within one process lifetime, never dictionary-attackable from the exported records). In addition to regex matching, `redacted_body` replaces values beneath normalized sensitive JSON keys such as password/passwd, authorization/auth, cookie/session, credential, private key, client secret, API key, and token variants. Case and separators (including zero-width separators) are ignored. JSON objects/arrays encoded inside strings, including streamed tool-call `function.arguments`, are parsed and recursively redacted before re-serialization; recursion is capped at 64 levels and deeper values are replaced wholesale. Redaction runs over the **full** buffered payload before the excerpt is capped, so a sensitive value straddling a `max_request_bytes`/`max_response_bytes` boundary cannot leak as a raw prefix; cap-truncated stream captures omit the excerpt for the same reason. Request-derived record fields that bypass the body-excerpt path — the exported `model` and `tool_names` — are passed through the same redactor in every mode except `full_body`, so PII smuggled into those strings cannot leak through the metadata side door. Harvested `ctx.metadata` values are additionally passed through the transaction-log redaction predicate. This plugin never defeats upstream prompt/response redaction — it captures the already-redacted client-visible body.
 
-**What is captured.** Only likely-AI JSON is narrowed in: request bodies are inspected only for `POST` + `application/json` and must look like an LLM call (OpenAI/Anthropic/Gemini/Cohere-shaped markers, mirroring `ai_rate_limiter`). The candidate is classified and staged in `before_proxy` over the prebuffered request body — before terminate-and-respond plugins (`ai_federation`, `ai_semantic_cache` hits) can consume the transaction, and before the proxy makes its response buffering and backend dispatch decisions — then refreshed with the final backend-visible body after request transforms run. Buffered JSON responses are emitted via `on_response_committed`, after all final-body validators and any rejection replacement, so the exported status and body match the client-visible response. SSE responses are captured with a streaming tee (`response_stream_inspector`) up to `max_stream_capture_bytes`, forwarding bytes unchanged and emitting the record at stream termination (so response-side guardrail metadata is included; abnormally-terminated streams emit a truncated, body-omitted record). In `redacted_body` mode, SSE captures whose frames are all parseable OpenAI `chat.completion.chunk` frames export a **reassembled** excerpt, not the raw frames: the `choices[].delta.content` fragments are concatenated per choice index in frame order and redaction runs over the full reassembled completion text, so PII split across streaming deltas cannot evade the per-frame regexes. The excerpt is annotated as `{"sse_reassembled": true, "object": "chat.completion.chunk", "completion_text": {"<choice>": "…"}}`. Non-2xx SSE responses are teed too when `always_capture_on_error` is set, so error transactions carry response evidence.
+**What is captured.** Only likely-AI JSON is narrowed in: request bodies are inspected only for `POST` + `application/json` and must look like an LLM call (OpenAI/Anthropic/Gemini/Cohere-shaped markers, mirroring `ai_rate_limiter`). The candidate is classified and staged in `before_proxy` before deduplication and other terminate-and-respond plugins can consume the transaction, then reclassified from the final backend-visible body after request transforms run. Classification is refreshed in both directions: non-AI→AI is newly staged; AI→non-AI or malformed discards staging, stream state, and any reserved sink permit rather than exporting out-of-scope replacement bytes. Buffered JSON responses are emitted via `on_response_committed`, after all final-body validators and any rejection replacement, so the exported status and body match the client-visible response. SSE responses are captured with a streaming tee (`response_stream_inspector`) up to `max_stream_capture_bytes`, forwarding bytes unchanged and emitting the record at stream termination (so response-side guardrail metadata is included; abnormally-terminated streams emit a truncated, body-omitted record). In `redacted_body` mode, SSE captures whose frames are all parseable OpenAI `chat.completion.chunk` frames export a **reassembled** excerpt, not raw frames. Text and tool-call fragments are concatenated by choice index and tool-call index before redaction. The exact shape is `{"sse_reassembled":true,"object":"chat.completion.chunk","completion_text":{"<choice>":"…"},"tool_calls":{"<choice>":[{"index":0,"id":"…","type":"…","function":{"name":"…","arguments":"<reassembled JSON string>"}}]},"finish_reason":{"<choice>":"tool_calls"}}`; absent categories are omitted. Tool-call arguments are concatenated in frame order. Repeated or cumulative ID, type, and function-name values are merged without duplication while genuine suffix fragments are appended. Because position alone cannot identify a continuation across frames, a choice with repeated indexless tool-call frames conservatively keeps the raw-frame redaction fallback. The existing stream byte cap applies before reconstruction. Non-2xx SSE responses are teed too when `always_capture_on_error` is set, so error transactions carry response evidence.
 
-**Sampling.** `sampling.rate` (0.0–1.0) is the fraction of eligible AI transactions emitted as full records; `always_capture_on_guardrail` / `always_capture_on_error` override the roll so guardrail trips and error responses are always captured. `max_records_per_minute` caps sink volume (0 = unlimited); over the cap, records are dropped and never reject traffic. With `capture.streaming_response: "sampled"`, only requests that win the sampling roll — or whose **request-side** guardrail fired (`ai_prompt_shield`, `ai_semantic_firewall`, `ai_request_guard`) when `always_capture_on_guardrail` is set — are teed onto the stream-inspection path; the tee decision is evaluated at dispatch time, after those guardrails ran, so an un-sampled request a guardrail flagged still captures response evidence. Error statuses and **response-side** guardrail hits are only known after that decision, so on un-sampled streaming requests those overrides still emit a record via the log fallback, just without a response body/hash. Buffered responses are unaffected: their overrides always capture the body.
+**Sampling.** `sampling.rate` (0.0–1.0) is the fraction of eligible AI transactions emitted as full records; `always_capture_on_guardrail` / `always_capture_on_error` override the roll so guardrail trips and error responses are always captured. `ai_tool_governor.decision` is a guardrail signal whenever its non-empty value is not `allow` (including `deny`, `dry_run`, `require_approval`, and `redact_args`); ordinary `allow` does not force capture. Exported `guardrails` include the bounded `ai_tool_governor.*` fields published by the governor: `enabled`, `mode`, `decision`, `tool_names`, `risk`, `policy_ids`, `approval_id`, `arguments_hashes`, and `redacted_tools`. `max_records_per_minute` caps sink volume (0 = unlimited); over the cap, records are dropped and never reject traffic. With `capture.streaming_response: "sampled"`, only requests that win the sampling roll — or whose **request-side** guardrail fired (`ai_prompt_shield`, `ai_semantic_firewall`, `ai_request_guard`, `ai_tool_governor`) when `always_capture_on_guardrail` is set — are teed onto the stream-inspection path; the tee decision is evaluated at dispatch time, after those guardrails ran, so an un-sampled request a guardrail flagged still captures response evidence. Error statuses and **response-side** guardrail hits are only known after that decision, so on un-sampled streaming requests those overrides still emit a record via the log fallback, just without a response body/hash. Buffered responses are unaffected: their overrides always capture the body.
 
 **Strict configuration.** Unknown keys are rejected at the root and inside every fixed nested object (`capture`, `sampling`, `redaction`, each `redaction.custom_patterns[]` entry, `limits`, `privacy`, and `sink`) with path-qualified errors and spelling suggestions when the typo is close. `sink.custom_headers` is the only intentional free-form string map. Nested objects may be omitted or set to `null` to keep defaults. Misspellings such as `privacy.include_consumer_usernme`, `capture.respose`, `sink.on_sink_eror`, or `sink.on_buffer_ful` fail admission instead of silently leaving privacy-on or fail-open sink defaults. Registration policy is `KeepLastKnownGood`: Admin create/update still returns HTTP 400 for invalid enabled configs, and file/DB/CP-DP reload rejects the candidate generation so the previous audit instance remains published.
 
-**Async HTTP sink.** Records batch through the shared `BatchingLogger` + `PluginHttpClient` framework: a bounded queue, batch-by-size/interval, and retry on transient (5xx/408/429) failures. Sink response bodies are drained and discarded through the shared HTTP batch helper (1 MiB cap, one-second drain timeout) so HTTP/1.1 keep-alive can be reused; bodies are never logged. The `endpoint_url` is SSRF-screened against the backend egress policy (literal IPs at construction, resolved hostnames at send time), matching every other logger sink. `sink.custom_headers` values support `${ENV_VAR}` expansion resolved lazily at send time, so a token is referenced by env and never stored in config:
+**Async HTTPS sink.** Records batch through the shared `BatchingLogger` + `PluginHttpClient` framework: a bounded queue, batch-by-size/interval, and retry on transient (5xx/408/429) failures. `sink.endpoint_url` requires `https://` by default. Cleartext `http://` is accepted only when `sink.allow_insecure_loopback: true` and the host is exactly `localhost` or a loopback IP; the opt-in never permits a remote cleartext collector. Sink response bodies are drained and discarded through the shared HTTP batch helper (1 MiB cap, one-second drain timeout) so HTTP/1.1 keep-alive can be reused; bodies are never logged. The endpoint is also SSRF-screened against the backend egress policy (literal IPs at construction, resolved hostnames at send time), matching every other logger sink. `sink.custom_headers` values support `${ENV_VAR}` expansion resolved lazily at send time, so a token is referenced by env and never stored in config:
 
 ```yaml
 plugin_name: ai_transcript_audit
@@ -4001,15 +4147,15 @@ config:
   privacy: { include_consumer_username: true, include_client_ip: false, include_raw_headers: false }
 ```
 
-**Never blocks by default.** Enqueue is non-blocking; a full buffer or a failing sink drops records (warned) unless the operator opts into `on_buffer_full: reject` / `on_sink_error: reject`, which fail selected audit records with `503`. Buffered candidates reserve capacity before commit through the normal final-body admission path. For streaming capture, the plugin re-evaluates the configured sampling/error/guardrail decision after response headers are known and, before any response bytes flow, atomically reserves the terminal record's queue slot and checks sink health. Client `stream: true`, provider-selected SSE, and synthetic short-circuits therefore cannot bypass a configured fail-closed policy; intentionally unsampled successful streams remain unaffected. Earlier response decorators such as CORS and request correlation headers are preserved if the audit gate replaces a synthetic response. Under `on_sink_error: reject`, **any** non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired sink token) whose batch is discarded rather than retried, so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, so a successful batch send automatically restores sink health and stops the rejects. **Safe defaults:** `redacted_body`, no raw headers, no client IP, 64 KiB body caps.
+**Never blocks by default.** Enqueue is non-blocking; a full buffer or a failing sink drops records (warned) unless the operator opts into `on_buffer_full: reject` / `on_sink_error: reject`, which fail selected audit records with `503`. Request-only, buffered-response, streaming, synthetic, and final-body fallback paths all perform pre-dispatch/pre-commit admission when they may emit. For streaming capture, the plugin re-evaluates the configured sampling/error/guardrail decision after response headers are known and, before any response bytes flow, atomically reserves the terminal record's queue slot and checks sink health. Client `stream: true`, provider-selected SSE, and synthetic short-circuits therefore cannot bypass a configured fail-closed policy; intentionally unsampled successful streams remain unaffected. Request staging is hard-bounded at 4096 in-flight entries. Above the bound, fail-open policies mark the candidate dropped and continue, while either reject policy returns `503`; both saturation outcomes remain visible as `sink_status` in transaction-log metadata even though the request was not admitted as an audit candidate. Orphan cleanup runs at most once per 60 seconds once 512 entries exist, rather than scanning the shared map on every admission. Earlier response decorators such as CORS and request correlation headers are preserved if the audit gate replaces a synthetic response. Under `on_sink_error: reject`, **any** non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired sink token) whose batch is discarded rather than retried, so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, so a successful batch send automatically restores sink health and stops the rejects. **Safe defaults:** `redacted_body`, no raw headers, no client IP, 64 KiB body caps.
 
-**Transaction-log metadata.** The plugin also emits small correlation fields onto the normal transaction logs: `ai_transcript_audit.record_id`, `ai_transcript_audit.request_hash`, `ai_transcript_audit.response_hash` (both keyed HMAC-SHA256, matching the exported record), `ai_transcript_audit.sampled` (the sampling roll, matching the record's `sampled` field — whether a record was emitted is conveyed by `sink_status`; written at staging time, so request-only configs and streamed responses carry it too), and `ai_transcript_audit.sink_status` (`queued` | `dropped` | `deferred` | `skipped` | `rejected`). `deferred` is the transient pre-commit state while later validators may still replace a buffered response; `on_response_committed` changes it to the terminal enqueue outcome or `skipped`. Buffered response hooks write response-phase fields directly; streamed responses write the finalized response hash and sink status from the mutable stream-terminal hook before `TransactionSummary` logging. Abnormally terminated or downstream-cut streams intentionally omit `response_hash` because the inspector did not capture a complete client-visible response.
+**Transaction-log metadata.** The plugin also emits small correlation fields onto the normal transaction logs: `ai_transcript_audit.record_id`, `ai_transcript_audit.request_hash`, `ai_transcript_audit.response_hash` (both keyed HMAC-SHA256, matching the exported record), `ai_transcript_audit.sampled` (the sampling roll, matching the record's `sampled` field — whether a record was emitted is conveyed by `sink_status`; written at staging time, so request-only configs and streamed responses carry it too), and `ai_transcript_audit.sink_status` (`queued` | `dropped` | `deferred` | `skipped` | `rejected`). `deferred` is the transient pre-commit state while later validators may still replace a buffered response; `on_response_committed` changes it to the terminal enqueue outcome or `skipped`. Internal candidate/sample/stream/final-body lifecycle state is removed before transaction metadata is cloned. Stream selection uses instance-local bounded staging, never pointer-derived metadata keys, so process addresses and reload-dependent field names cannot reach log sinks. Buffered response hooks write response-phase fields directly; streamed responses write the finalized response hash and sink status from the mutable stream-terminal hook before `TransactionSummary` logging. Abnormally terminated or downstream-cut streams intentionally omit `response_hash` because the inspector did not capture a complete client-visible response.
 
 **Limitations.**
 
 - *Post-transform classification.* AI-candidate detection and the `stream: true` marker are refreshed from the final transformed request body before the proxy commits its buffer-vs-stream and backend-dispatch decisions. The streaming capture tee is transport-independent across reqwest, direct HTTP/2, and native HTTP/3 response arms; `forces_reqwest_dispatch` is only a path preference.
 - *Stream-request error bodies.* A `stream: true` request answered with a non-SSE JSON `4xx`/`5xx` is deliberately not buffered — forcing a buffer to catch that body would also buffer the common SSE success case, which under retry (buffered→stream downgrade disabled) would cap and fail large streams. The record still captures the request side, the final status, and the error `capture_reason`; only the response body/hash are absent.
-- *Non-OpenAI SSE captures stay per-frame.* The reassembled-excerpt path only applies when every captured `data:` frame parses as an OpenAI `chat.completion.chunk`. Other SSE shapes (Anthropic events, providers that omit `object`, tool-call-only streams with no `delta.content`, unparseable frames) keep the raw-frame excerpt with per-frame redaction, so PII split across such frames' fragments can still evade the regexes there — a value-level residual, since the keyed hash and metadata are unaffected.
+- *Non-OpenAI or malformed SSE captures stay per-frame.* The reassembled-excerpt path applies when every captured `data:` frame parses as an OpenAI `chat.completion.chunk`, including tool-call-only streams. Other SSE shapes (Anthropic events, providers that omit `object`, or unparseable/partial frames) keep the raw-frame excerpt with per-frame redaction, so PII split across such frames' fragments can still evade regex matching there — a value-level residual, since the keyed hash and metadata are unaffected.
 - *Multiple instances share transaction-log keys.* With more than one `ai_transcript_audit` instance on the same proxy, the `ai_transcript_audit.*` transaction-log correlation fields reflect a single instance (the last writer wins); each instance's exported records remain correct and complete. Use one instance per proxy when transaction-log correlation matters.
 
 ### `ai_federation`
@@ -4178,7 +4324,7 @@ plugins:
 Use this only when the normal backend has equivalent authentication, model allow-listing, rate limits, prompt/body validation, and logging. Otherwise a request with an uninspectable body, no valid `model`, or an unsupported `model` can avoid the federated provider path entirely.
 
 **Cross-plugin synergy:** Works with all other AI plugins on the same proxy:
-- `ai_transcript_audit` (2924) stages transcript capture before guardrails; `ai_prompt_shield` (2925) scans/redacts PII before federation
+- `ai_transcript_audit` (2740) stages transcript capture before request deduplication and guardrails; `ai_prompt_shield` (2925) scans/redacts PII before federation
 - `ai_semantic_firewall` (2968) blocks semantic prompt injection, exfiltration, tool-abuse, and topic-policy violations before semantic cache or federation
 - `ai_request_guard` (2975) validates model, tokens, temperature before federation
 - `ai_prompt_compressor` (4055) boundedly shortens admitted OpenAI Chat/Text Completions plaintext, stages compatible metadata while limiting private wire-result reuse to 65,536 bytes, records authoritative wire stats after request decompression, and uses a bounded representation-preserving fallback so configured preserve markers cannot bypass sanitation; successful compression rewrites reserialize the complete JSON body
@@ -4487,7 +4633,7 @@ Caches LLM responses keyed by normalized prompts across Ferrum's recognized AI r
 | `redis_url` | String (optional) | -- | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `"{FERRUM_NAMESPACE}:ai_cache"` | Redis key namespace prefix. Defaults to `ferrum:ai_cache` when namespace is `"ferrum"` |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be ≥ 1). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | -- | Redis ACL username (Redis 6+) |
@@ -4508,6 +4654,7 @@ Caches LLM responses keyed by normalized prompts across Ferrum's recognized AI r
 - **Semantic scoping**: Semantic candidates must match the same family, proxy, consumer scope, model, generation controls, role sequence, provider-visible per-message state (`name`, tool calls, and tool-result IDs), instruction state (hashed OpenAI-style `system`/`developer` message content, Anthropic top-level `system`, Responses `instructions` / `previous_response_id`, Gemini `systemInstruction`, Cohere `preamble`), multimodal fingerprint when `cache_multimodal: "include_fingerprints"` is configured, tools / response-shape fields, and stream flag before they can hit. The embedded semantic input is family-correct user/prompt text only (instruction and tool state stay in the scope key), so long multi-turn conversations with similar context and different final user turns can still produce false semantic hits within one scope; raise `semantic_similarity_threshold` or disable semantic mode for workflows that require exact final-turn distinctions.
 - **Embedding failure behavior**: If the embedding endpoint is unavailable, returns a non-2xx status, or emits an invalid vector, the plugin logs at debug level and continues as a normal exact-cache miss. The backend request still proceeds.
 - **Cache status header**: Responses include an `X-Ai-Cache-Status` header: `HIT` when the response is served from cache, `MISS` when the response is fetched from the backend and stored, and `BYPASS` when caching is skipped for multimodal reject mode or for unknown/ambiguous request shapes. Successful cache-hit responses are passed through the normal buffered response-side hooks before reaching the client, so response-side `ai_semantic_firewall`, `ai_response_guard`, response body transforms, and final-response hooks still apply to cached LLM bodies.
+- **Multiple instances**: A proxy may carry several `ai_semantic_cache` configs (for example one exact-only instance and one semantic instance, or differing key/consumer policies with `priority_override`). Each instance receives a process-unique runtime staging id. Request metadata for cache key, status, match, and similarity is namespaced as `ai_semantic_cache.<instance_id>.*`, and embedding/scope vectors live in per-instance `RequestContext` maps, so sibling instances cannot overwrite, consume, or store under another instance's staged inputs. Bypass and HIT paths clear only the current instance's staging. Reload reconstructions mint a new id and never read or clear a retired generation's namespaced keys.
 - **Response admission**: Only body-bearing 2xx responses with a JSON-compatible `Content-Type` (`application/json` or an RFC 6838 `+json` subtype, parameters ignored) and a syntactically valid JSON body are retained. Missing or non-JSON content types, malformed or empty JSON bodies, SSE, and 204/205 responses pass through to the original client but are not stored locally or in Redis, preventing transient success-status maintenance pages from being amplified for the cache TTL.
 - **Semantic hit header**: Semantic hits also include `X-Ai-Cache-Match: semantic`; exact hits omit this header.
 - **SSE responses**: Server-Sent Events (streaming) responses are not cached because they arrive incrementally and cannot be reliably replayed from a stored buffer.
@@ -4708,7 +4855,7 @@ Supports both regular JSON and SSE streaming responses — when `ai_token_metric
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ai_rate_limiter` | Redis key namespace prefix. Defaults to `ferrum:ai_rate_limiter` when namespace is `"ferrum"` |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be ≥ 1). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
@@ -5147,7 +5294,7 @@ Rate limits WebSocket frames per-connection using a token bucket algorithm. Clos
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:ws_rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:ws_rate_limiting` when namespace is `"ferrum"` |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be ≥ 1). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |
@@ -5232,7 +5379,7 @@ Rate limits UDP datagrams per resolved client IP using a fixed-window algorithm 
 | `redis_url` | String (optional) | — | Redis connection URL (required when `sync_mode: "redis"`) |
 | `redis_tls` | bool | `false` | Enable TLS for Redis connection |
 | `redis_key_prefix` | String | `{FERRUM_NAMESPACE}:udp_rate_limiting` | Redis key namespace prefix. Defaults to `ferrum:udp_rate_limiting` when namespace is `"ferrum"` |
-| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be ≥ 1). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
+| `redis_pool_size` | u64 | `4` | Number of multiplexed Redis connections (must be between 1 and 128). Each value sizes a bounded pool of ConnectionManagers selected round-robin on the hot path |
 | `redis_connect_timeout_seconds` | u64 | `5` | Redis connection timeout in seconds |
 | `redis_health_check_interval_seconds` | u64 | `5` | Interval for background health check pings when Redis is unavailable |
 | `redis_username` | String (optional) | — | Redis ACL username (Redis 6+) |

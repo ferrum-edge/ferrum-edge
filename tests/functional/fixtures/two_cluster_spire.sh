@@ -80,7 +80,11 @@ EOF
     wait_for_socket "$root/server.sock" "SPIRE server"
     server_cli "$root" bundle show -format pem >"$root/bundle.pem"
 
-    token="$(server_cli "$root" token generate | awk '/Token:/ {print $2; exit}')"
+    # Capture the producer's full output before parsing: under `set -o pipefail`,
+    # piping into an awk that exits early (the `exit` below) can SIGPIPE the
+    # producer and surface as exit status 141, masking a valid token.
+    token_output="$(server_cli "$root" token generate)"
+    token="$(awk '/Token:/ {print $2; exit}' <<<"$token_output")"
     [[ -n "$token" ]] || {
       echo "SPIRE join token generation returned no token" >&2
       exit 1

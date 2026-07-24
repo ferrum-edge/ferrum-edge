@@ -118,7 +118,7 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     }
     if let Err(found) = crate::plugins::transaction_log_schema::validate_config_graph(
         config,
-        &crate::plugins::PluginHttpClient::default(),
+        &crate::plugins::PluginHttpClient::default().with_process_compression_admission_policy(),
         false,
     ) {
         errors.extend(found);
@@ -161,7 +161,8 @@ pub(crate) fn collect_rejecting_runtime_config_errors(config: &GatewayConfig) ->
     if let Err(found) = crate::plugin_cache::validate_plugin_security_composition_candidate(
         config,
         &crate::plugins::PluginHttpClient::default()
-            .with_real_ip_header(crate::config::env_config::resolve_real_ip_header()),
+            .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+            .with_process_compression_admission_policy(),
     ) {
         errors.push(found);
     }
@@ -469,7 +470,8 @@ impl<'a> ValidationPipeline<'a> {
                     let graph_http_client =
                         crate::plugins::PluginHttpClient::default_with_backend_allow_ips(
                             backend_allow_ips.clone(),
-                        );
+                        )
+                        .with_process_compression_admission_policy();
                     if let Err(graph_errors) =
                         crate::plugins::transaction_log_schema::validate_config_graph(
                             config,

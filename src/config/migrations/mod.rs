@@ -1,5 +1,8 @@
 pub(crate) mod sql_dialect;
+pub(crate) mod sql_statements;
 pub mod v001_initial_schema;
+
+pub use sql_statements::split_plugin_migration_statements;
 
 use chrono::Utc;
 use sqlx::any::AnyRow;
@@ -294,44 +297,6 @@ impl CustomPluginMigration {
             "postgres" => self.sql_postgres.unwrap_or(self.sql),
             "mysql" => self.sql_mysql.unwrap_or(self.sql),
             _ => self.sql,
-        }
-    }
-
-    /// Whether this migration contains PostgreSQL DDL that must execute at
-    /// top level rather than inside an explicit transaction.
-    fn requires_non_transactional_postgres_execution(&self, db_type: &str) -> bool {
-        if db_type != "postgres" {
-            return false;
-        }
-
-        self.sql_for_db(db_type).split(';').any(|statement| {
-            let normalized = strip_leading_sql_comments(statement)
-                .split_whitespace()
-                .map(str::to_ascii_uppercase)
-                .collect::<Vec<_>>()
-                .join(" ");
-            normalized.starts_with("VACUUM")
-                || normalized.starts_with("CREATE DATABASE")
-                || normalized.starts_with("DROP DATABASE")
-                || normalized.starts_with("ALTER SYSTEM")
-                || normalized.starts_with("REINDEX") && normalized.contains(" CONCURRENTLY")
-                || normalized.starts_with("CREATE INDEX") && normalized.contains(" CONCURRENTLY")
-                || normalized.starts_with("CREATE UNIQUE INDEX")
-                    && normalized.contains(" CONCURRENTLY")
-                || normalized.starts_with("DROP INDEX") && normalized.contains(" CONCURRENTLY")
-        })
-    }
-}
-
-fn strip_leading_sql_comments(mut sql: &str) -> &str {
-    loop {
-        sql = sql.trim_start();
-        if let Some(comment) = sql.strip_prefix("--") {
-            sql = comment.split_once('\n').map_or("", |(_, rest)| rest);
-        } else if let Some(comment) = sql.strip_prefix("/*") {
-            sql = comment.split_once("*/").map_or("", |(_, rest)| rest);
-        } else {
-            return sql;
         }
     }
 }
@@ -784,22 +749,35 @@ impl MigrationRunner {
                 let sql = migration.sql_for_db(&self.db_type);
                 let start = Instant::now();
 
+                // Fail-closed: parse the full migration body into statement
+                // boundaries before executing statement one. Classification and
+                // execution share this exact split.
+                let statements =
+                    split_plugin_migration_statements(sql, &self.db_type).map_err(|err| {
+                        anyhow::anyhow!(
+                            "plugin '{}' migration V{} ({}): {}",
+                            plugin_name,
+                            migration.version,
+                            migration.name,
+                            err
+                        )
+                    })?;
                 let non_transactional =
-                    migration.requires_non_transactional_postgres_execution(&self.db_type);
+                    sql_statements::statements_require_non_transactional_postgres(
+                        &self.db_type,
+                        &statements,
+                    );
                 let now;
                 if non_transactional {
                     // PostgreSQL online DDL such as CREATE INDEX CONCURRENTLY
                     // cannot run in an explicit transaction. Execute every
                     // statement successfully before writing the tracking row.
-                    for statement in sql.split(';') {
-                        let trimmed = statement.trim();
-                        if !trimmed.is_empty() {
-                            map_plugin_statement_result(
-                                &self.db_type,
-                                trimmed,
-                                sqlx::query(trimmed).execute(&mut *connection).await,
-                            )?;
-                        }
+                    for statement in &statements {
+                        map_plugin_statement_result(
+                            &self.db_type,
+                            statement,
+                            sqlx::query(statement).execute(&mut *connection).await,
+                        )?;
                     }
                     now = Utc::now().to_rfc3339();
                     let elapsed_ms = start.elapsed().as_millis() as i64;
@@ -819,15 +797,12 @@ impl MigrationRunner {
                     // directly on that connection; `finish(true)` commits the
                     // complete locked operation and `finish(false)` rolls it
                     // back on any error.
-                    for statement in sql.split(';') {
-                        let trimmed = statement.trim();
-                        if !trimmed.is_empty() {
-                            map_plugin_statement_result(
-                                &self.db_type,
-                                trimmed,
-                                sqlx::query(trimmed).execute(&mut *connection).await,
-                            )?;
-                        }
+                    for statement in &statements {
+                        map_plugin_statement_result(
+                            &self.db_type,
+                            statement,
+                            sqlx::query(statement).execute(&mut *connection).await,
+                        )?;
                     }
                     now = Utc::now().to_rfc3339();
                     let elapsed_ms = start.elapsed().as_millis() as i64;
@@ -849,15 +824,12 @@ impl MigrationRunner {
                     // tolerance for DROP INDEX, then insert the tracking row.
                     // Paired DROP/CREATE statements can therefore reconstruct
                     // an exact plugin-owned index after any partial DDL retry.
-                    for statement in sql.split(';') {
-                        let trimmed = statement.trim();
-                        if !trimmed.is_empty() {
-                            map_plugin_statement_result(
-                                "mysql",
-                                trimmed,
-                                sqlx::query(trimmed).execute(&mut *connection).await,
-                            )?;
-                        }
+                    for statement in &statements {
+                        map_plugin_statement_result(
+                            "mysql",
+                            statement,
+                            sqlx::query(statement).execute(&mut *connection).await,
+                        )?;
                     }
                     now = Utc::now().to_rfc3339();
                     let elapsed_ms = start.elapsed().as_millis() as i64;
@@ -875,15 +847,12 @@ impl MigrationRunner {
                     // PostgreSQL transactional path: statements and tracking
                     // remain atomic in one transaction on the lock session.
                     let mut tx = connection.begin().await?;
-                    for statement in sql.split(';') {
-                        let trimmed = statement.trim();
-                        if !trimmed.is_empty() {
-                            map_plugin_statement_result(
-                                &self.db_type,
-                                trimmed,
-                                sqlx::query(trimmed).execute(&mut *tx).await,
-                            )?;
-                        }
+                    for statement in &statements {
+                        map_plugin_statement_result(
+                            &self.db_type,
+                            statement,
+                            sqlx::query(statement).execute(&mut *tx).await,
+                        )?;
                     }
                     now = Utc::now().to_rfc3339();
                     let elapsed_ms = start.elapsed().as_millis() as i64;

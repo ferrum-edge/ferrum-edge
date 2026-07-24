@@ -8,6 +8,32 @@ use std::sync::Arc;
 
 use super::plugin_utils::{assert_continue, assert_reject, create_test_context};
 
+struct GrpcWebPollDropProbeBody {
+    frames: std::collections::VecDeque<http_body::Frame<bytes::Bytes>>,
+    polls: Arc<std::sync::atomic::AtomicUsize>,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl http_body::Body for GrpcWebPollDropProbeBody {
+    type Data = bytes::Bytes;
+    type Error = ferrum_edge::proxy::body::ProxyBodyError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        self.polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::Ready(self.frames.pop_front().map(Ok))
+    }
+}
+
+impl Drop for GrpcWebPollDropProbeBody {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 #[test]
 fn h3_grpc_web_requests_keep_the_http_protocol_key() {
     use ferrum_edge::_test_support::h3_plugin_protocol_for_request_for_test;
@@ -28,8 +54,8 @@ fn h3_grpc_web_requests_keep_the_http_protocol_key() {
 async fn streaming_grpc_web_deadline_emits_encoded_status_before_backend_data() {
     use bytes::Bytes;
     use ferrum_edge::_test_support::{
-        GRPC_FRAME_TRAILER, parse_grpc_frames, proxy_body_streaming_for_test,
-        proxy_body_with_client_grpc_deadline_for_test,
+        GRPC_FRAME_TRAILER, parse_grpc_frames, proxy_body_into_grpc_web_streaming_for_test,
+        proxy_body_streaming_for_test, proxy_body_with_client_grpc_deadline_for_test,
     };
     use ferrum_edge::proxy::body::ProxyBodyError;
     use futures_util::stream;
@@ -41,11 +67,13 @@ async fn streaming_grpc_web_deadline_emits_encoded_status_before_backend_data() 
     let deadline = tokio::time::Instant::now()
         .checked_sub(std::time::Duration::from_secs(1))
         .expect("one second before now is representable");
-    let mut body = proxy_body_with_client_grpc_deadline_for_test(
+    let body = proxy_body_with_client_grpc_deadline_for_test(
         body,
         deadline,
         Some("application/grpc-web+proto"),
     );
+    let mut body =
+        proxy_body_into_grpc_web_streaming_for_test(body, "application/grpc-web+proto", 200, None);
 
     let frame = body
         .frame()
@@ -65,6 +93,254 @@ async fn streaming_grpc_web_deadline_emits_encoded_status_before_backend_data() 
             .any(|window| window == b"grpc-status: 4")
     );
     assert!(Body::is_end_stream(&body));
+}
+
+#[tokio::test]
+async fn grpc_web_binary_streams_data_and_converts_exactly_one_terminal_trailer() {
+    use bytes::Bytes;
+    use ferrum_edge::_test_support::{
+        GRPC_FRAME_TRAILER, parse_grpc_frames, proxy_body_into_grpc_web_streaming_for_test,
+        proxy_body_streaming_for_test,
+    };
+    use ferrum_edge::proxy::body::ProxyBodyError;
+    use futures_util::stream;
+    use http::{HeaderMap, HeaderValue};
+    use http_body::Frame;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let first = Bytes::from_static(b"\x00\x00\x00");
+    let second = Bytes::from_static(b"\x00\x01x");
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from_static("0"));
+    trailers.insert("grpc-message", HeaderValue::from_static("ok"));
+    trailers.insert("grpc-status-details-bin", HeaderValue::from_static("AQID"));
+    trailers.append("x-result-meta", HeaderValue::from_static("one"));
+    trailers.append("x-result-meta", HeaderValue::from_static("two"));
+    let source = StreamBody::new(stream::iter(vec![
+        Ok::<_, ProxyBodyError>(Frame::data(first.clone())),
+        Ok(Frame::data(second.clone())),
+        Ok(Frame::trailers(trailers)),
+    ]));
+    let body = proxy_body_streaming_for_test(Box::pin(source));
+    let mut body =
+        proxy_body_into_grpc_web_streaming_for_test(body, "application/grpc-web+proto", 200, None);
+
+    assert_eq!(
+        body.frame()
+            .await
+            .expect("first frame")
+            .expect("first frame ok")
+            .into_data()
+            .expect("first DATA"),
+        first
+    );
+    assert_eq!(
+        body.frame()
+            .await
+            .expect("second frame")
+            .expect("second frame ok")
+            .into_data()
+            .expect("second DATA"),
+        second
+    );
+    let terminal = body
+        .frame()
+        .await
+        .expect("terminal frame")
+        .expect("terminal frame ok")
+        .into_data()
+        .expect("gRPC-Web terminal DATA");
+    let frames = parse_grpc_frames(&terminal);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].0, GRPC_FRAME_TRAILER);
+    let payload = String::from_utf8(frames[0].1.clone()).expect("ASCII trailer payload");
+    assert!(payload.contains("grpc-status: 0\r\n"));
+    assert!(payload.contains("grpc-message: ok\r\n"));
+    assert!(payload.contains("grpc-status-details-bin: AQID\r\n"));
+    assert!(payload.contains("x-result-meta: one\r\n"));
+    assert!(payload.contains("x-result-meta: two\r\n"));
+    assert!(
+        body.frame().await.is_none(),
+        "terminal frame must be unique"
+    );
+}
+
+#[tokio::test]
+async fn grpc_web_text_flushes_independently_padded_segments_across_chunk_boundaries() {
+    use base64::Engine as _;
+    use bytes::Bytes;
+    use ferrum_edge::_test_support::{
+        GRPC_FRAME_TRAILER, parse_grpc_frames, proxy_body_into_grpc_web_streaming_for_test,
+        proxy_body_streaming_for_test,
+    };
+    use ferrum_edge::proxy::body::ProxyBodyError;
+    use futures_util::stream;
+    use http::{HeaderMap, HeaderValue};
+    use http_body::Frame;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let chunks = [Bytes::from_static(b"a"), Bytes::from_static(b"bc")];
+    let mut trailers = HeaderMap::new();
+    trailers.insert("grpc-status", HeaderValue::from_static("7"));
+    trailers.insert("grpc-message", HeaderValue::from_static("denied"));
+    let source = StreamBody::new(stream::iter(vec![
+        Ok::<_, ProxyBodyError>(Frame::data(chunks[0].clone())),
+        Ok(Frame::data(chunks[1].clone())),
+        Ok(Frame::trailers(trailers)),
+    ]));
+    let body = proxy_body_streaming_for_test(Box::pin(source));
+    let mut body = proxy_body_into_grpc_web_streaming_for_test(
+        body,
+        "application/grpc-web-text+proto",
+        200,
+        None,
+    );
+
+    for expected in &chunks {
+        let encoded = body
+            .frame()
+            .await
+            .expect("text DATA frame")
+            .expect("text DATA frame ok")
+            .into_data()
+            .expect("text DATA");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .expect("independently padded segment"),
+            expected.as_ref()
+        );
+    }
+    let encoded_terminal = body
+        .frame()
+        .await
+        .expect("text terminal")
+        .expect("text terminal ok")
+        .into_data()
+        .expect("text terminal DATA");
+    let terminal = base64::engine::general_purpose::STANDARD
+        .decode(encoded_terminal)
+        .expect("terminal segment base64");
+    let frames = parse_grpc_frames(&terminal);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].0, GRPC_FRAME_TRAILER);
+    let payload = String::from_utf8(frames[0].1.clone()).expect("ASCII trailer payload");
+    assert!(payload.contains("grpc-status: 7\r\n"));
+    assert!(payload.contains("grpc-message: denied\r\n"));
+    assert!(body.frame().await.is_none());
+}
+
+#[tokio::test]
+async fn grpc_web_streaming_propagates_backend_error_without_false_terminal_status() {
+    use bytes::Bytes;
+    use ferrum_edge::_test_support::{
+        proxy_body_into_grpc_web_streaming_for_test, proxy_body_streaming_for_test,
+    };
+    use ferrum_edge::proxy::body::ProxyBodyError;
+    use futures_util::stream;
+    use http_body::Frame;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let source = StreamBody::new(stream::iter(vec![
+        Ok::<_, ProxyBodyError>(Frame::data(Bytes::from_static(b"partial"))),
+        Err(Box::new(std::io::Error::other("backend reset")) as ProxyBodyError),
+    ]));
+    let body = proxy_body_streaming_for_test(Box::pin(source));
+    let mut body =
+        proxy_body_into_grpc_web_streaming_for_test(body, "application/grpc-web+proto", 200, None);
+
+    assert!(body.frame().await.expect("partial frame").is_ok());
+    assert!(body.frame().await.expect("backend error frame").is_err());
+    assert!(
+        body.frame().await.is_none(),
+        "an errored stream must not synthesize a clean trailer frame"
+    );
+}
+
+#[tokio::test]
+async fn grpc_web_streaming_preserves_backpressure_and_cancellation_drop() {
+    use bytes::Bytes;
+    use ferrum_edge::_test_support::{
+        proxy_body_into_grpc_web_streaming_for_test, proxy_body_streaming_for_test,
+    };
+    use http_body::Frame;
+    use http_body_util::BodyExt;
+
+    let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let source = GrpcWebPollDropProbeBody {
+        frames: std::collections::VecDeque::from([
+            Frame::data(Bytes::from_static(b"first")),
+            Frame::data(Bytes::from_static(b"second")),
+        ]),
+        polls: Arc::clone(&polls),
+        dropped: Arc::clone(&dropped),
+    };
+    let body = proxy_body_streaming_for_test(Box::pin(source));
+    let mut body =
+        proxy_body_into_grpc_web_streaming_for_test(body, "application/grpc-web+proto", 200, None);
+
+    assert_eq!(
+        body.frame()
+            .await
+            .expect("first frame")
+            .expect("first frame ok")
+            .into_data()
+            .expect("first DATA"),
+        Bytes::from_static(b"first")
+    );
+    assert_eq!(
+        polls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one downstream demand must poll exactly one upstream frame"
+    );
+    drop(body);
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "dropping the downstream adapter must promptly release the upstream body"
+    );
+}
+
+#[tokio::test]
+async fn grpc_web_trailers_only_moves_terminal_metadata_into_body() {
+    use ferrum_edge::_test_support::{
+        GRPC_FRAME_TRAILER, parse_grpc_frames, proxy_body_into_grpc_web_streaming_for_test,
+        proxy_body_streaming_for_test,
+    };
+    use ferrum_edge::proxy::body::ProxyBodyError;
+    use futures_util::stream;
+    use http_body::Frame;
+    use http_body_util::{BodyExt, StreamBody};
+
+    let source = StreamBody::new(stream::empty::<Result<Frame<bytes::Bytes>, ProxyBodyError>>());
+    let body = proxy_body_streaming_for_test(Box::pin(source));
+    let initial = HashMap::from([
+        ("grpc-status".to_string(), "14".to_string()),
+        ("grpc-message".to_string(), "unavailable".to_string()),
+        ("x-terminal-meta".to_string(), "preserved".to_string()),
+    ]);
+    let mut body = proxy_body_into_grpc_web_streaming_for_test(
+        body,
+        "application/grpc-web+proto",
+        200,
+        Some(initial),
+    );
+
+    let terminal = body
+        .frame()
+        .await
+        .expect("trailers-only frame")
+        .expect("trailers-only frame ok")
+        .into_data()
+        .expect("trailers-only DATA");
+    let frames = parse_grpc_frames(&terminal);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].0, GRPC_FRAME_TRAILER);
+    let payload = String::from_utf8(frames[0].1.clone()).expect("ASCII trailer payload");
+    assert!(payload.contains("grpc-status: 14\r\n"));
+    assert!(payload.contains("grpc-message: unavailable\r\n"));
+    assert!(payload.contains("x-terminal-meta: preserved\r\n"));
+    assert!(body.frame().await.is_none());
 }
 
 #[test]

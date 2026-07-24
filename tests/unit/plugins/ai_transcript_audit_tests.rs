@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use ferrum_edge::_test_support::clone_log_metadata;
 use ferrum_edge::config::types::DEFAULT_NAMESPACE;
 use ferrum_edge::config::{BackendAllowIps, BackendEgressPolicy, PoolConfig};
 use ferrum_edge::dns::{DnsCache, DnsConfig};
@@ -15,13 +16,14 @@ use ferrum_edge::plugins::ai_transcript_audit::{
     AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS, AI_TRANSCRIPT_AUDIT_REDACTION_KEYS,
     AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS, AI_TRANSCRIPT_AUDIT_SINK_KEYS, AiTranscriptAudit,
 };
+use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
 use ferrum_edge::plugins::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginFailurePolicy, PluginHttpClient, PluginResult,
     RequestContext, ResponseStreamAction, ResponseStreamInspector,
     chain_response_stream_inspectors, plugin_failure_policy, priority, validate_plugin_config,
 };
-use ferrum_edge::proxy::deferred_log::BodyOutcome;
+use ferrum_edge::proxy::deferred_log::{BodyOutcome, run_response_stream_termination_hooks};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -93,6 +95,7 @@ fn config_with_sink(endpoint: &str, overrides: Value) -> Value {
         "sink": {
             "type": "http",
             "endpoint_url": endpoint,
+            "allow_insecure_loopback": true,
             "batch_size": 1,
             "flush_interval_ms": 100,
         }
@@ -114,6 +117,24 @@ async fn wait_for_records(server: &MockServer) -> Vec<Value> {
             && let Some(records) = body.as_array()
         {
             return records.clone();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Vec::new()
+}
+
+async fn wait_for_total_records(server: &MockServer, expected: usize) -> Vec<Value> {
+    for _ in 0..100 {
+        let mut records = Vec::new();
+        if let Some(requests) = server.received_requests().await {
+            for request in requests {
+                if let Ok(Value::Array(batch)) = serde_json::from_slice::<Value>(&request.body) {
+                    records.extend(batch);
+                }
+            }
+        }
+        if records.len() >= expected {
+            return records;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -213,7 +234,7 @@ async fn name_priority_and_protocols() {
     .unwrap();
     assert_eq!(plugin.name(), "ai_transcript_audit");
     assert_eq!(plugin.priority(), priority::AI_TRANSCRIPT_AUDIT);
-    assert_eq!(plugin.priority(), 2924);
+    assert_eq!(plugin.priority(), 2740);
     assert_eq!(plugin.supported_protocols(), HTTP_ONLY_PROTOCOLS);
     assert!(plugin.requires_response_committed_hook());
     // Privacy and fail-closed sink typos must reject the candidate generation so
@@ -366,6 +387,45 @@ async fn non_http_sink_scheme_rejected() {
         .err()
         .expect("expected config rejection");
     assert!(err.contains("http:// or https://"), "got: {err}");
+}
+
+#[tokio::test]
+async fn cleartext_sink_requires_explicit_loopback_only_opt_in() {
+    for config in [
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "http://127.0.0.1:9001/audit"
+            }
+        }),
+        json!({
+            "sink": {
+                "type": "http",
+                "endpoint_url": "http://collector.example.com/audit",
+                "allow_insecure_loopback": true
+            }
+        }),
+    ] {
+        let err = AiTranscriptAudit::new(&config, loopback_http_client())
+            .err()
+            .expect("cleartext policy must reject");
+        assert!(
+            err.contains("https://") || err.contains("loopback"),
+            "got: {err}"
+        );
+    }
+
+    let loopback = json!({
+        "sink": {
+            "type": "http",
+            "endpoint_url": "http://[::1]:9001/audit",
+            "allow_insecure_loopback": true
+        }
+    });
+    assert!(
+        AiTranscriptAudit::new(&loopback, loopback_http_client()).is_ok(),
+        "explicit IPv6 loopback cleartext should remain available for local development"
+    );
 }
 
 #[tokio::test]
@@ -605,6 +665,7 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
         &[
             "type",
             "endpoint_url",
+            "allow_insecure_loopback",
             "custom_headers",
             "batch_size",
             "flush_interval_ms",
@@ -755,6 +816,163 @@ async fn final_request_body_rechecks_after_non_candidate_pretransform_body() {
     assert!(ctx.metadata.contains_key("ai_transcript_audit.record_id"));
 }
 
+#[tokio::test]
+async fn final_request_body_drops_stale_candidate_after_ai_is_transformed_away() {
+    for final_body in [
+        br#"{"order_id":42}"#.as_slice(),
+        br#"{"messages":"#.as_slice(),
+    ] {
+        let plugin = AiTranscriptAudit::new(
+            &config_with_sink(
+                "https://audit.example.com/x",
+                json!({ "capture": { "streaming_response": true } }),
+            ),
+            loopback_http_client(),
+        )
+        .unwrap();
+        let mut ctx = make_ctx();
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            String::from_utf8(ai_request_body().to_vec()).unwrap(),
+        );
+        let mut headers = json_headers();
+        plugin.before_proxy(&mut ctx, &mut headers).await;
+        assert_eq!(
+            ctx.metadata
+                .get("ai_transcript_audit.candidate")
+                .map(String::as_str),
+            Some("true")
+        );
+
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, final_body)
+            .await;
+        assert_eq!(
+            ctx.metadata
+                .get("ai_transcript_audit.candidate")
+                .map(String::as_str),
+            Some("false")
+        );
+        assert!(!plugin.forces_reqwest_dispatch(&ctx));
+        assert!(
+            plugin
+                .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test]
+async fn staging_has_a_hard_bound_and_uses_configured_fail_closed_overload_behavior() {
+    let plugin = AiTranscriptAudit::new(
+        &json!({
+            "mode": "metadata_only",
+            "capture": {
+                "request": true,
+                "response": false,
+                "streaming_response": false
+            },
+            "sampling": {
+                "rate": 0.0,
+                "always_capture_on_guardrail": false,
+                "always_capture_on_error": false
+            },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x",
+                "on_buffer_full": "reject"
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let headers = json_headers();
+    for index in 0..4096 {
+        let mut ctx = make_ctx();
+        let result = plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "staging slot {index} should be admitted"
+        );
+    }
+
+    let mut overflow = make_ctx();
+    let result = plugin
+        .on_final_request_body_with_context(&mut overflow, &headers, ai_request_body())
+        .await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 503,
+            ..
+        }
+    ));
+    assert_eq!(
+        overflow
+            .metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("rejected")
+    );
+    assert_eq!(
+        overflow
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("false")
+    );
+    let overflow_log_metadata = clone_log_metadata(&overflow);
+    assert_eq!(
+        overflow_log_metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("rejected"),
+        "staging saturation must remain visible in transaction logs"
+    );
+    assert!(
+        !overflow_log_metadata.contains_key("ai_transcript_audit.candidate"),
+        "internal candidate state must still be removed"
+    );
+
+    let peer = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut peer_overflow = make_ctx();
+    assert!(matches!(
+        peer.on_final_request_body_with_context(&mut peer_overflow, &headers, ai_request_body(),)
+            .await,
+        PluginResult::Continue
+    ));
+    assert!(peer.forces_reqwest_dispatch(&peer_overflow));
+
+    let result = plugin
+        .on_final_request_body_with_context(&mut peer_overflow, &headers, ai_request_body())
+        .await;
+    assert!(matches!(
+        result,
+        PluginResult::Reject {
+            status_code: 503,
+            ..
+        }
+    ));
+    assert_eq!(
+        peer_overflow
+            .metadata
+            .get("ai_transcript_audit.candidate")
+            .map(String::as_str),
+        Some("true"),
+        "a saturated instance must not erase a peer instance's staged candidate"
+    );
+    assert!(peer.forces_reqwest_dispatch(&peer_overflow));
+}
+
 // ---------------------------------------------------------------------------
 // Record content (via wiremock sink)
 // ---------------------------------------------------------------------------
@@ -781,6 +999,53 @@ async fn request_capture_redacts_pii() {
     assert_eq!(records[0]["mode"], "redacted_body");
     assert_eq!(records[0]["model"], "gpt-4o");
     assert!(records[0]["request_hash"].is_string());
+}
+
+#[tokio::test]
+async fn redacted_body_redacts_sensitive_parent_keys_and_json_encoded_tool_arguments() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({ "mode": "redacted_body" })),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let request = br#"{
+        "model":"gpt-4o",
+        "messages":[{"role":"user","content":"use the tool"}],
+        "password":"correct horse battery staple",
+        "pass\u200bword":"zero width secret",
+        "auth":"short auth secret",
+        "cookie":"opaque cookie secret",
+        "authorization":"opaque credential",
+        "tool_arguments":"{\"nested\":{\"client_secret\":\"tool secret\"}}"
+    }"#;
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, request)
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    plugin
+        .on_response_committed(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    let captured = records[0]["request_body"].as_str().unwrap();
+    for secret in [
+        "correct horse battery staple",
+        "zero width secret",
+        "short auth secret",
+        "opaque cookie secret",
+        "opaque credential",
+        "tool secret",
+    ] {
+        assert!(!captured.contains(secret), "secret leaked: {captured}");
+    }
+    assert!(captured.contains("[REDACTED]"));
 }
 
 #[tokio::test]
@@ -1270,13 +1535,12 @@ async fn before_proxy_stages_candidate_from_prebuffered_body() {
         "candidate must be staged in before_proxy, before terminators and buffering decisions"
     );
     assert!(ctx.metadata.contains_key("ai_transcript_audit.record_id"));
-    // Streaming capture marker must exist before backend dispatch so
-    // forces_reqwest_dispatch can keep the response off native-H3.
-    assert_eq!(
+    // Instance-local staging, rather than pointer-derived metadata, selects
+    // the stream path.
+    assert!(
         ctx.metadata
-            .get("ai_transcript_audit.stream_marker")
-            .map(String::as_str),
-        Some("true")
+            .keys()
+            .all(|key| !key.starts_with("ai_transcript_audit.stream_marker"))
     );
     assert!(plugin.forces_reqwest_dispatch(&ctx));
     // The prebuffered body must be preserved for later before_proxy plugins
@@ -1290,7 +1554,7 @@ async fn before_proxy_stages_candidate_from_prebuffered_body() {
 }
 
 #[tokio::test]
-async fn stream_marker_only_set_for_ai_candidates() {
+async fn stream_capture_state_is_instance_local_and_candidate_scoped() {
     let plugin = AiTranscriptAudit::new(
         &config_with_sink(
             "https://audit.example.com/x",
@@ -1299,9 +1563,7 @@ async fn stream_marker_only_set_for_ai_candidates() {
         loopback_http_client(),
     )
     .unwrap();
-    // A non-AI JSON POST must NOT be marked for stream capture: the marker
-    // drives forces_reqwest_dispatch, which would push ordinary JSON traffic
-    // off the native-H3 path before the body proved AI-shaped.
+    // A non-AI JSON POST must not select stream capture.
     let mut ctx = make_ctx();
     ctx.metadata
         .insert("request_body".to_string(), r#"{"order_id":42}"#.to_string());
@@ -1316,7 +1578,7 @@ async fn stream_marker_only_set_for_ai_candidates() {
     assert!(
         !ctx.metadata
             .contains_key("ai_transcript_audit.stream_marker"),
-        "non-AI JSON must not carry the stream-capture marker"
+        "non-AI JSON must not carry internal stream metadata"
     );
     assert!(
         !plugin.forces_reqwest_dispatch(&ctx),
@@ -1327,7 +1589,8 @@ async fn stream_marker_only_set_for_ai_candidates() {
         "non-candidate JSON should still avoid buffered-response capture"
     );
 
-    // An AI-shaped body is marked at staging time.
+    // An AI-shaped body is selected through instance-local staging without
+    // publishing a process pointer or lifecycle key.
     let mut ai_ctx = make_ctx();
     ai_ctx.metadata.insert(
         "request_body".to_string(),
@@ -1335,12 +1598,11 @@ async fn stream_marker_only_set_for_ai_candidates() {
     );
     let mut ai_headers = ai_ctx.headers.clone();
     plugin.before_proxy(&mut ai_ctx, &mut ai_headers).await;
-    assert_eq!(
+    assert!(
         ai_ctx
             .metadata
-            .get("ai_transcript_audit.stream_marker")
-            .map(String::as_str),
-        Some("true")
+            .keys()
+            .all(|key| !key.starts_with("ai_transcript_audit.stream_marker"))
     );
     assert!(plugin.forces_reqwest_dispatch(&ai_ctx));
 }
@@ -1501,18 +1763,13 @@ async fn sampled_streaming_capture_honors_sampling_rate() {
     .unwrap();
     let headers = json_headers();
 
-    // rate 0, no guardrail: the AI candidate is marked (the marker is cheap
-    // bookkeeping) but the tee gate — evaluated at dispatch/response time —
+    // rate 0, no guardrail: instance-local staging exists, but the tee gate
     // must NOT fire just because the always_capture_* defaults are on.
     let mut ctx = make_ctx();
     plugin
         .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
         .await;
-    assert!(
-        ctx.metadata
-            .contains_key("ai_transcript_audit.stream_marker"),
-        "AI candidates are always marked; sampling gates the tee, not the marker"
-    );
+    assert!(ctx.metadata.contains_key("ai_transcript_audit.record_id"));
     assert!(
         !plugin.forces_reqwest_dispatch(&ctx),
         "sampled mode must honor sampling.rate for the dispatch decision"
@@ -1938,6 +2195,143 @@ async fn unsampled_stream_with_error_override_reserves_fail_closed_capacity() {
 }
 
 #[tokio::test]
+async fn request_only_capture_reserves_fail_closed_capacity_on_final_body_fallback() {
+    let plugin = AiTranscriptAudit::new(
+        &json!({
+            "capture": {
+                "request": true,
+                "response": false,
+                "streaming_response": false
+            },
+            "sampling": {
+                "rate": 1.0,
+                "always_capture_on_error": false,
+                "always_capture_on_guardrail": false
+            },
+            "sink": {
+                "type": "http",
+                "endpoint_url": "https://audit.example.com/x",
+                "batch_size": 1,
+                "flush_interval_ms": 100,
+                "buffer_capacity": 1,
+                "on_buffer_full": "reject"
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+
+    let mut first = make_ctx();
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut first, &headers, ai_request_body())
+            .await,
+        PluginResult::Continue
+    ));
+
+    let mut second = make_ctx();
+    assert!(matches!(
+        plugin
+            .on_final_request_body_with_context(&mut second, &headers, ai_request_body())
+            .await,
+        PluginResult::Reject {
+            status_code: 503,
+            ..
+        }
+    ));
+    assert_eq!(
+        second
+            .metadata
+            .get("ai_transcript_audit.sink_status")
+            .map(String::as_str),
+        Some("rejected")
+    );
+}
+
+#[tokio::test]
+async fn request_only_capture_rejects_before_dispatch_after_sink_becomes_unhealthy() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(401))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "capture": {
+                    "request": true,
+                    "response": false,
+                    "streaming_response": false
+                },
+                "sampling": {
+                    "rate": 1.0,
+                    "always_capture_on_error": false,
+                    "always_capture_on_guardrail": false
+                },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "max_retries": 0,
+                    "on_sink_error": "reject"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+
+    let mut first = make_ctx();
+    first.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8(ai_request_body().to_vec()).unwrap(),
+    );
+    let mut first_headers = headers.clone();
+    assert!(matches!(
+        plugin.before_proxy(&mut first, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    let mut first_summary = create_test_transaction_summary();
+    first_summary.metadata = first.metadata.clone();
+    plugin.log(&first_summary).await;
+
+    let mut rejected = false;
+    for _ in 0..100 {
+        let mut ctx = make_ctx();
+        ctx.metadata.insert(
+            "request_body".to_string(),
+            String::from_utf8(ai_request_body().to_vec()).unwrap(),
+        );
+        let mut request_headers = headers.clone();
+        if matches!(
+            plugin.before_proxy(&mut ctx, &mut request_headers).await,
+            PluginResult::Reject {
+                status_code: 503,
+                ..
+            }
+        ) {
+            rejected = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        rejected,
+        "request-only capture must enforce on_sink_error=reject before backend dispatch"
+    );
+}
+
+#[tokio::test]
 async fn stream_inspector_without_body_drive_does_not_emit_pending_record() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
@@ -2326,6 +2720,7 @@ async fn sink_recovers_after_transient_outage_with_reject_policy() {
         "sink": {
             "type": "http",
             "endpoint_url": endpoint,
+            "allow_insecure_loopback": true,
             "batch_size": 1,
             "flush_interval_ms": 100,
             "max_retries": 0,
@@ -2595,6 +2990,7 @@ async fn custom_sink_headers_are_sent_with_env_expansion() {
         "sink": {
             "type": "http",
             "endpoint_url": endpoint,
+            "allow_insecure_loopback": true,
             "batch_size": 1,
             "flush_interval_ms": 100,
             "custom_headers": {
@@ -3012,6 +3408,7 @@ async fn fail_closed_record_carries_503_status() {
         "sink": {
             "type": "http",
             "endpoint_url": endpoint,
+            "allow_insecure_loopback": true,
             "batch_size": 1,
             "flush_interval_ms": 100,
             "max_retries": 0,
@@ -3410,10 +3807,358 @@ async fn transaction_log_sampled_flag_carries_roll_not_emit() {
 }
 
 #[tokio::test]
+async fn tool_governor_request_decision_forces_request_only_capture_and_is_harvested() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "capture": {
+                    "request": true,
+                    "response": false,
+                    "streaming_response": false
+                },
+                "sampling": {
+                    "rate": 0.0,
+                    "always_capture_on_guardrail": true,
+                    "always_capture_on_error": false
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    ctx.metadata.insert(
+        "ai_tool_governor.decision".to_string(),
+        "require_approval".to_string(),
+    );
+    ctx.metadata.insert(
+        "ai_tool_governor.tool_names".to_string(),
+        "lookup_customer".to_string(),
+    );
+    ctx.metadata
+        .insert("ai_tool_governor.risk".to_string(), "high".to_string());
+    let mut summary = create_test_transaction_summary();
+    summary.response_status_code = 200;
+    summary.metadata = ctx.metadata.clone();
+    plugin.log(&summary).await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["sampled"], false);
+    assert_eq!(records[0]["capture_reason"], "guardrail");
+    assert_eq!(
+        records[0]["guardrails"]["ai_tool_governor.decision"],
+        "require_approval"
+    );
+    assert_eq!(
+        records[0]["guardrails"]["ai_tool_governor.tool_names"],
+        "lookup_customer"
+    );
+    assert_eq!(records[0]["guardrails"]["ai_tool_governor.risk"], "high");
+}
+
+struct TerminalToolGovernorDecision;
+
+#[async_trait]
+impl Plugin for TerminalToolGovernorDecision {
+    fn name(&self) -> &str {
+        "terminal_tool_governor_decision"
+    }
+
+    fn priority(&self) -> u16 {
+        priority::AI_TOOL_GOVERNOR
+    }
+
+    async fn on_response_stream_terminated(
+        &self,
+        ctx: &mut RequestContext,
+        _response_status: u16,
+        _outcome: &BodyOutcome,
+    ) {
+        ctx.metadata.insert(
+            "ai_tool_governor.decision".to_string(),
+            "redact_args".to_string(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_governor_buffered_and_terminal_stream_decisions_force_capture_but_allow_does_not() {
+    let overrides = json!({
+        "capture": {
+            "request": true,
+            "response": true,
+            "streaming_response": true
+        },
+        "sampling": {
+            "rate": 0.0,
+            "always_capture_on_guardrail": true,
+            "always_capture_on_error": false
+        }
+    });
+
+    let buffered_server = mock_sink().await;
+    let buffered_endpoint = format!("{}/ingest", buffered_server.uri());
+    let buffered = AiTranscriptAudit::new(
+        &config_with_sink(&buffered_endpoint, overrides.clone()),
+        loopback_http_client(),
+    )
+    .unwrap();
+    buffered.start_background_tasks().expect("live start");
+    buffered.commit_background_tasks();
+    let headers = json_headers();
+    let mut buffered_ctx = make_ctx();
+    buffered
+        .on_final_request_body_with_context(&mut buffered_ctx, &headers, ai_request_body())
+        .await;
+    buffered_ctx.metadata.insert(
+        "ai_tool_governor.decision".to_string(),
+        "dry_run".to_string(),
+    );
+    buffered_ctx.metadata.insert(
+        "ai_tool_governor.policy_ids".to_string(),
+        "sensitive-tools".to_string(),
+    );
+    buffered
+        .capture_final_response_body(&mut buffered_ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let buffered_records = wait_for_records(&buffered_server).await;
+    assert_eq!(buffered_records.len(), 1);
+    assert_eq!(buffered_records[0]["capture_reason"], "guardrail");
+    assert_eq!(
+        buffered_records[0]["guardrails"]["ai_tool_governor.decision"],
+        "dry_run"
+    );
+
+    let stream_server = mock_sink().await;
+    let stream_endpoint = format!("{}/ingest", stream_server.uri());
+    let streaming = Arc::new(
+        AiTranscriptAudit::new(
+            &config_with_sink(&stream_endpoint, overrides),
+            loopback_http_client(),
+        )
+        .unwrap(),
+    );
+    streaming.start_background_tasks().expect("live start");
+    streaming.commit_background_tasks();
+    let mut stream_ctx = make_ctx();
+    streaming
+        .on_final_request_body_with_context(&mut stream_ctx, &headers, ai_request_body())
+        .await;
+    let mut inspector = streaming
+        .response_stream_inspector(&stream_ctx, 200, Some("text/event-stream"))
+        .expect("streaming capture is enabled");
+    let stream =
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_end().await;
+    let termination_plugins: Vec<Arc<dyn Plugin>> =
+        vec![streaming.clone(), Arc::new(TerminalToolGovernorDecision)];
+    run_response_stream_termination_hooks(
+        &termination_plugins,
+        &mut stream_ctx,
+        200,
+        &BodyOutcome::success(stream.len() as u64),
+    )
+    .await;
+    let stream_records = wait_for_records(&stream_server).await;
+    assert_eq!(stream_records.len(), 1);
+    assert_eq!(stream_records[0]["capture_reason"], "guardrail");
+    assert_eq!(
+        stream_records[0]["guardrails"]["ai_tool_governor.decision"],
+        "redact_args"
+    );
+
+    let allow_server = mock_sink().await;
+    let allow_endpoint = format!("{}/ingest", allow_server.uri());
+    let allow = AiTranscriptAudit::new(
+        &config_with_sink(
+            &allow_endpoint,
+            json!({
+                "sampling": {
+                    "rate": 0.0,
+                    "always_capture_on_guardrail": true,
+                    "always_capture_on_error": false
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    allow.start_background_tasks().expect("live start");
+    allow.commit_background_tasks();
+    let mut allow_ctx = make_ctx();
+    allow
+        .on_final_request_body_with_context(&mut allow_ctx, &headers, ai_request_body())
+        .await;
+    allow_ctx
+        .metadata
+        .insert("ai_tool_governor.decision".to_string(), "allow".to_string());
+    allow
+        .capture_final_response_body(&mut allow_ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        allow_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .is_empty(),
+        "an ordinary allow decision must not override a losing sampling roll"
+    );
+}
+
+#[tokio::test]
+async fn transcript_internal_lifecycle_state_never_reaches_transaction_log_metadata() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    ctx.metadata.insert(
+        "ai_transcript_audit.stream_marker.0x7ffeeabc".to_string(),
+        "true".to_string(),
+    );
+    let logged = clone_log_metadata(&ctx);
+    for key in logged.keys() {
+        assert!(
+            !matches!(
+                key.as_str(),
+                "ai_transcript_audit.candidate"
+                    | "ai_transcript_audit.sample_hit"
+                    | "ai_transcript_audit.stream_request"
+                    | "ai_transcript_audit.final_req_seen"
+            ) && !key.starts_with("ai_transcript_audit.stream_marker"),
+            "internal or pointer-derived transcript state leaked to logs: {key}"
+        );
+    }
+    assert!(
+        logged.contains_key("ai_transcript_audit.record_id"),
+        "documented candidate correlation metadata must remain available"
+    );
+}
+
+#[tokio::test]
+async fn local_dedup_replay_is_staged_first_and_emits_exactly_one_marked_record() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let audit = AiTranscriptAudit::new(
+        &config_with_sink(&endpoint, json!({ "sampling": { "rate": 1.0 } })),
+        loopback_http_client(),
+    )
+    .unwrap();
+    audit.start_background_tasks().expect("live start");
+    audit.commit_background_tasks();
+    let dedup = RequestDeduplication::new(
+        &json!({ "scope_by_consumer": false }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    assert!(
+        audit.priority() < dedup.priority(),
+        "audit staging must run before a replay can terminate the chain"
+    );
+    let request_body = ai_request_body();
+    let response_body = br#"{"id":"chatcmpl-1","choices":[{"message":{"content":"ok"}}]}"#;
+
+    let mut first = make_ctx();
+    first.request_body_bytes = Some(Bytes::copy_from_slice(request_body));
+    first.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8(request_body.to_vec()).unwrap(),
+    );
+    let mut first_headers = json_headers();
+    first_headers.insert(
+        "idempotency-key".to_string(),
+        "audit-replay-key".to_string(),
+    );
+    assert!(matches!(
+        audit.before_proxy(&mut first, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    assert!(matches!(
+        dedup.before_proxy(&mut first, &mut first_headers).await,
+        PluginResult::Continue
+    ));
+    dedup
+        .on_final_response_body(&mut first, 200, &json_headers(), response_body)
+        .await;
+    audit
+        .capture_final_response_body(&mut first, 200, &json_headers(), response_body)
+        .await;
+
+    let mut replay = make_ctx();
+    replay.request_body_bytes = Some(Bytes::copy_from_slice(request_body));
+    replay.metadata.insert(
+        "request_body".to_string(),
+        String::from_utf8(request_body.to_vec()).unwrap(),
+    );
+    let mut replay_headers = json_headers();
+    replay_headers.insert(
+        "idempotency-key".to_string(),
+        "audit-replay-key".to_string(),
+    );
+    assert!(matches!(
+        audit.before_proxy(&mut replay, &mut replay_headers).await,
+        PluginResult::Continue
+    ));
+    let replay_result = dedup.before_proxy(&mut replay, &mut replay_headers).await;
+    let (status, headers, body) = match replay_result {
+        PluginResult::RejectBinary {
+            status_code,
+            headers,
+            body,
+        } => (status_code, headers, body),
+        other => panic!("expected cached replay, got {other:?}"),
+    };
+    assert_eq!(
+        replay
+            .metadata
+            .get("request_deduplication.replayed")
+            .map(String::as_str),
+        Some("true")
+    );
+    audit
+        .capture_final_response_body(&mut replay, status, &headers, &body)
+        .await;
+
+    let records = wait_for_total_records(&server, 2).await;
+    assert_eq!(
+        records.len(),
+        2,
+        "the original and replay must each emit exactly one record"
+    );
+    let replay_records: Vec<&Value> = records
+        .iter()
+        .filter(|record| record["cache"]["request_deduplication.replayed"].as_str() == Some("true"))
+        .collect();
+    assert_eq!(replay_records.len(), 1);
+    assert_eq!(replay_records[0]["status_code"], 200);
+    assert!(replay_records[0]["response_body"].is_string());
+    assert_ne!(records[0]["record_id"], records[1]["record_id"]);
+}
+
+#[tokio::test]
 async fn request_guardrail_after_staging_tees_unsampled_stream() {
     // capture.streaming_response = "sampled" with a losing roll: a request-side
     // guardrail (ai_prompt_shield 2925 / ai_semantic_firewall 2968 /
-    // ai_request_guard 2975) fires AFTER this plugin staged at 2924 but BEFORE
+    // ai_request_guard 2975) fires AFTER this plugin staged at 2740 but BEFORE
     // the proxy's dispatch decision. The tee gate is evaluated at dispatch
     // time, so always_capture_on_guardrail still captures response evidence.
     let server = mock_sink().await;
@@ -3609,6 +4354,7 @@ async fn non_retryable_sink_4xx_marks_sink_unhealthy_under_reject() {
         "sink": {
             "type": "http",
             "endpoint_url": endpoint,
+            "allow_insecure_loopback": true,
             "batch_size": 1,
             "flush_interval_ms": 100,
             "max_retries": 0,
@@ -3668,6 +4414,7 @@ async fn unhealthy_sink_rejects_unsampled_candidate_that_may_emit_at_commit() {
                 "sink": {
                     "type": "http",
                     "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
                     "batch_size": 1,
                     "flush_interval_ms": 100,
                     "max_retries": 0,
@@ -3737,6 +4484,7 @@ async fn sink_2xx_after_4xx_restores_health() {
         "sink": {
             "type": "http",
             "endpoint_url": endpoint,
+            "allow_insecure_loopback": true,
             "batch_size": 1,
             "flush_interval_ms": 100,
             "max_retries": 0,
@@ -3835,6 +4583,169 @@ async fn sse_pii_split_across_deltas_is_redacted_in_reassembled_excerpt() {
     assert!(
         excerpt.contains("your ssn is"),
         "non-PII completion text must survive reassembly: {excerpt}"
+    );
+}
+
+#[tokio::test]
+async fn mixed_sse_text_and_interleaved_tool_calls_are_reassembled_and_redacted() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let chunks: [&[u8]; 6] = [
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will look that up.\"}}]}\n\n",
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_\",\"type\":\"function\",\"function\":{\"name\":\"lookup_\",\"arguments\":\"{\\\"pass\"}},{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"notify\",\"arguments\":\"{\\\"token\\\":\\\"abc\"}}]}}]}\n\n",
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"123\\\"}\"}},{\"index\":0,\"id\":\"a\",\"function\":{\"name\":\"customer\",\"arguments\":\"word\\\":\\\"secret-one\\\"}\"}}]}}]}\n\n",
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"lookup_customer\",\"arguments\":\"\"}},{\"index\":1,\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"notify\",\"arguments\":\"\"}}]}}]}\n\n",
+        b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        b"data: [DONE]\n\n",
+    ];
+    let mut total = 0u64;
+    for chunk in chunks {
+        let _ = inspector.on_chunk(chunk).await;
+        total += chunk.len() as u64;
+    }
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(total))
+        .await;
+
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let excerpt: Value = serde_json::from_str(
+        records[0]["response_body"]
+            .as_str()
+            .expect("response excerpt"),
+    )
+    .expect("reassembled excerpt JSON");
+    assert_eq!(excerpt["sse_reassembled"], true);
+    assert_eq!(excerpt["completion_text"]["0"], "I will look that up.");
+    assert_eq!(excerpt["finish_reason"]["0"], "tool_calls");
+    let calls = excerpt["tool_calls"]["0"]
+        .as_array()
+        .expect("choice tool calls");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0]["index"], 0);
+    assert_eq!(calls[0]["id"], "call_a");
+    assert_eq!(calls[0]["type"], "function");
+    assert_eq!(calls[0]["function"]["name"], "lookup_customer");
+    let first_args: Value = serde_json::from_str(
+        calls[0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments"),
+    )
+    .expect("reassembled first arguments");
+    assert_eq!(first_args["password"], "[REDACTED]");
+    assert_eq!(calls[1]["index"], 1);
+    assert_eq!(calls[1]["id"], "call_b");
+    assert_eq!(calls[1]["function"]["name"], "notify");
+    let second_args: Value = serde_json::from_str(
+        calls[1]["function"]["arguments"]
+            .as_str()
+            .expect("arguments"),
+    )
+    .expect("reassembled second arguments");
+    assert_eq!(second_args["token"], "[REDACTED]");
+    let raw_excerpt = records[0]["response_body"].as_str().unwrap();
+    assert!(!raw_excerpt.contains("secret-one"), "{raw_excerpt}");
+    assert!(!raw_excerpt.contains("abc123"), "{raw_excerpt}");
+}
+
+#[tokio::test]
+async fn tool_call_only_sse_uses_reassembled_shape() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":2,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_only\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":42}\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":2,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .await;
+
+    let records = wait_for_records(&server).await;
+    let excerpt: Value = serde_json::from_str(
+        records[0]["response_body"]
+            .as_str()
+            .expect("response excerpt"),
+    )
+    .expect("reassembled excerpt JSON");
+    assert_eq!(excerpt["sse_reassembled"], true);
+    assert!(excerpt.get("completion_text").is_none());
+    assert_eq!(excerpt["tool_calls"]["2"][0]["id"], "call_only");
+    assert_eq!(excerpt["finish_reason"]["2"], "tool_calls");
+}
+
+#[tokio::test]
+async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"42}\"}}]}}]}\n\ndata: [DONE]\n\n";
+    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .await;
+
+    let records = wait_for_records(&server).await;
+    let excerpt = records[0]["response_body"]
+        .as_str()
+        .expect("response excerpt");
+    assert!(
+        !excerpt.contains("sse_reassembled"),
+        "ambiguous indexless continuations must not be guessed: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("chat.completion.chunk"),
+        "raw-frame fallback must retain the captured OpenAI frames: {excerpt}"
     );
 }
 
@@ -4000,6 +4911,7 @@ async fn fail_closed_rejected_then_unsampled_keeps_rejected_sink_status() {
                 "sink": {
                     "type": "http",
                     "endpoint_url": endpoint.clone(),
+                    "allow_insecure_loopback": true,
                     "batch_size": 1,
                     "flush_interval_ms": 100,
                     "max_retries": 0,
@@ -4198,6 +5110,7 @@ async fn ai_transcript_audit_reuses_http11_connection_across_retry() {
         "sink": {
             "type": "http",
             "endpoint_url": endpoint,
+            "allow_insecure_loopback": true,
             "batch_size": 1,
             "flush_interval_ms": 100,
             "max_retries": 1,

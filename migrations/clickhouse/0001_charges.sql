@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS ferrum.charges_raw (
     http_status_code      Nullable(UInt16),
     grpc_status           Nullable(UInt32),
     protocol              LowCardinality(String),
-    call_count            UInt32,
+    call_count            UInt64,
     charge_call           Float64,
     bytes_sent            UInt64,
     bytes_received        UInt64,

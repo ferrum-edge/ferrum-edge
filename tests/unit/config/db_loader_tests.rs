@@ -2,7 +2,8 @@ use ferrum_edge::_test_support::{
     DbPoolConfig, db_append_connect_timeout, db_code_is_transient, db_diff_removed,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
     db_wrap_mysql_isolation_read_error, is_config_validation_rejection,
-    mysql_mtls_dns_admission_lock_insert_sql, parse_auth_mode, parse_scheme, statement_timeout_sql,
+    mysql_config_change_lock_insert_sql, mysql_mtls_dns_admission_lock_insert_sql,
+    mysql_proxy_route_lock_insert_sql, parse_auth_mode, parse_scheme, statement_timeout_sql,
     validate_tcp_connection_throttle_attachments,
 };
 use ferrum_edge::config::db_backend::{
@@ -71,6 +72,66 @@ fn mysql_mtls_dns_lock_insert_takes_an_exclusive_duplicate_key_lock() {
         "{sql}"
     );
     assert!(!sql.contains("INSERT IGNORE"), "{sql}");
+}
+
+#[test]
+fn mysql_config_change_lock_insert_takes_an_exclusive_duplicate_key_lock() {
+    let sql = mysql_config_change_lock_insert_sql();
+    assert!(sql.contains("ON DUPLICATE KEY UPDATE"), "{sql}");
+    assert!(
+        sql.contains("updated_at = config_change_locks.updated_at"),
+        "{sql}"
+    );
+    assert!(!sql.contains("INSERT IGNORE"), "{sql}");
+}
+
+#[test]
+fn mysql_proxy_route_lock_insert_takes_an_exclusive_duplicate_key_lock() {
+    let sql = mysql_proxy_route_lock_insert_sql();
+    assert!(sql.contains("ON DUPLICATE KEY UPDATE"), "{sql}");
+    assert!(
+        sql.contains("created_at = proxy_route_locks.created_at"),
+        "{sql}"
+    );
+    assert!(!sql.contains("INSERT IGNORE"), "{sql}");
+}
+
+#[test]
+fn mysql_sequence_and_route_lock_helpers_skip_redundant_for_update() {
+    // The MySQL upsert already holds X. A follow-up SELECT ... FOR UPDATE on
+    // those paths is both redundant and the historical S->X deadlock shape.
+    let source = include_str!("../../../src/config/db_loader.rs");
+    let config_change = source
+        .split("async fn lock_config_change_sequence_tx(")
+        .nth(1)
+        .and_then(|rest| rest.split("async fn lock_mtls_dns_admission_tx(").next())
+        .expect("lock_config_change_sequence_tx body");
+    assert!(
+        config_change.contains("db_type != \"mysql\""),
+        "MySQL must be excluded from the config_change FOR UPDATE path:\n{config_change}"
+    );
+    assert!(
+        config_change.contains("FOR UPDATE"),
+        "PostgreSQL config_change lock path must retain SELECT ... FOR UPDATE:\n{config_change}"
+    );
+
+    let proxy_route = source
+        .split("async fn lock_proxy_route_bucket_tx(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("async fn lock_config_change_sequence_tx(")
+                .next()
+        })
+        .expect("lock_proxy_route_bucket_tx body");
+    assert!(
+        proxy_route.contains("db_type != \"mysql\""),
+        "MySQL must be excluded from the proxy_route FOR UPDATE path:\n{proxy_route}"
+    );
+    // PostgreSQL still needs FOR UPDATE after INSERT ... DO NOTHING.
+    assert!(
+        proxy_route.contains("FOR UPDATE"),
+        "PostgreSQL proxy_route lock path must retain SELECT ... FOR UPDATE:\n{proxy_route}"
+    );
 }
 
 fn make_upstream(id: &str) -> Upstream {

@@ -1,4 +1,4 @@
 interface:
-  display_name: "Opus 4.8 Agents"
-  short_description: "Orchestrate Opus 4.8 1M coding agents"
-  default_prompt: "Use $opus-agents to dispatch Claude Opus 4.8 1M agents for this repository task."
+  display_name: "Opus 5 Agents"
+  short_description: "Orchestrate Opus 5 1M coding agents"
+  default_prompt: "Use $opus-agents to dispatch Claude Opus 5 1M agents for this repository task."

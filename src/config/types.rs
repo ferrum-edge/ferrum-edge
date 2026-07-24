@@ -4310,6 +4310,10 @@ impl GatewayConfig {
             ));
         }
 
+        if let Err(chargeback_errors) = crate::plugins::api_chargeback::validate_composition(self) {
+            errors.extend(chargeback_errors);
+        }
+
         for plugin in &self.plugin_configs {
             // `transaction_log_schema` is process-global by design (it
             // registers named schemas into a single registry); reject

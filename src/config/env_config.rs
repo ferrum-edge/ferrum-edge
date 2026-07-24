@@ -942,8 +942,8 @@ pub struct EnvConfig {
     /// Maximum serialized bytes in one process log record. Default: 64 KiB.
     #[allow(dead_code)]
     pub log_max_record_bytes: usize,
-    /// Bounded per-sink shutdown drain timeout. Default: 2000 ms.
-    #[allow(dead_code)]
+    /// Shared observability lifecycle and per-process-sink drain timeout.
+    /// Default: 2000 ms.
     pub log_shutdown_drain_timeout_ms: u64,
     /// Default poll interval in seconds for external TLS material sources
     /// (`vault://`, `aws://`, `azure://`, `gcp://`, `k8s://`, `managed://`) when a source URI does not
@@ -981,6 +981,14 @@ pub struct EnvConfig {
     // Proxy traffic
     pub proxy_http_port: u16,
     pub proxy_https_port: u16,
+    /// Global gzip content-coding gate for the built-in compression plugin.
+    /// Intersects with each plugin instance's `algorithms` list and also
+    /// disables opt-in gzip request decompression when false.
+    pub compression_gzip_enabled: bool,
+    /// Global Brotli content-coding gate for the built-in compression plugin.
+    /// Intersects with each plugin instance's `algorithms` list and also
+    /// disables opt-in Brotli request decompression when false.
+    pub compression_brotli_enabled: bool,
     pub frontend_tls_cert_path: Option<String>,
     pub frontend_tls_key_path: Option<String>,
     /// DER OCSP response bytes, or a source URI resolving to DER bytes, to
@@ -1188,10 +1196,16 @@ pub struct EnvConfig {
     pub mongo_replica_set: Option<String>,
     /// MongoDB auth mechanism override (e.g. "SCRAM-SHA-256", "MONGODB-X509").
     pub mongo_auth_mechanism: Option<String>,
-    /// MongoDB server selection timeout in seconds. Default: 30.
-    pub mongo_server_selection_timeout_seconds: u64,
-    /// MongoDB connection timeout in seconds. Default: 10.
-    pub mongo_connect_timeout_seconds: u64,
+    /// Explicit MongoDB server selection timeout in seconds.
+    ///
+    /// `None` (unset) preserves `serverSelectionTimeoutMS` from `FERRUM_DB_URL`
+    /// or the driver default. When set, overrides the URI value.
+    pub mongo_server_selection_timeout_seconds: Option<u64>,
+    /// Explicit MongoDB connection timeout in seconds.
+    ///
+    /// `None` (unset) preserves `connectTimeoutMS` from `FERRUM_DB_URL` or the
+    /// driver default. When set, overrides the URI value.
+    pub mongo_connect_timeout_seconds: Option<u64>,
 
     // CP/DP
     pub cp_grpc_listen_addr: Option<String>,
@@ -2314,6 +2328,8 @@ impl Default for EnvConfig {
             enable_streaming_latency_tracking: false,
             proxy_http_port: 8000,
             proxy_https_port: 8443,
+            compression_gzip_enabled: true,
+            compression_brotli_enabled: true,
             frontend_tls_cert_path: None,
             frontend_tls_key_path: None,
             frontend_tls_ocsp_response_source: None,
@@ -2361,8 +2377,8 @@ impl Default for EnvConfig {
             mongo_app_name: None,
             mongo_replica_set: None,
             mongo_auth_mechanism: None,
-            mongo_server_selection_timeout_seconds: 30,
-            mongo_connect_timeout_seconds: 10,
+            mongo_server_selection_timeout_seconds: None,
+            mongo_connect_timeout_seconds: None,
             cp_grpc_listen_addr: None,
             cp_dp_grpc_jwt_secret: None,
             cp_dp_grpc_jwt_issuer: "ferrum-edge-cp-dp".to_string(),
@@ -2649,6 +2665,8 @@ impl EnvConfig {
             [proxy]
             proxy_http_port: u16 = "FERRUM_PROXY_HTTP_PORT" => 8000u16;
             proxy_https_port: u16 = "FERRUM_PROXY_HTTPS_PORT" => 8443u16;
+            compression_gzip_enabled: bool = "FERRUM_COMPRESSION_GZIP_ENABLED" => true;
+            compression_brotli_enabled: bool = "FERRUM_COMPRESSION_BROTLI_ENABLED" => true;
             frontend_tls_cert_path: Option<String> = "FERRUM_FRONTEND_TLS_CERT_PATH";
             frontend_tls_key_path: Option<String> = "FERRUM_FRONTEND_TLS_KEY_PATH";
             frontend_tls_live_reload_enabled: bool = "FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED" => false;
@@ -2707,8 +2725,8 @@ impl EnvConfig {
             mongo_app_name: Option<String> = "FERRUM_MONGO_APP_NAME";
             mongo_replica_set: Option<String> = "FERRUM_MONGO_REPLICA_SET";
             mongo_auth_mechanism: Option<String> = "FERRUM_MONGO_AUTH_MECHANISM";
-            mongo_server_selection_timeout_seconds: u64 = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS" => 30u64;
-            mongo_connect_timeout_seconds: u64 = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS" => 10u64;
+            mongo_server_selection_timeout_seconds: Option<u64> = "FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS";
+            mongo_connect_timeout_seconds: Option<u64> = "FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS";
         }
         if resolve_var(conf, "FERRUM_DB_POLL_INTERVAL")
             .as_deref()
@@ -3364,6 +3382,8 @@ impl EnvConfig {
             enable_streaming_latency_tracking,
             proxy_http_port,
             proxy_https_port,
+            compression_gzip_enabled,
+            compression_brotli_enabled,
             frontend_tls_cert_path,
             frontend_tls_key_path,
             frontend_tls_live_reload_enabled,

@@ -2746,7 +2746,6 @@ async fn grpc_web_transformed_response_suppresses_native_trailers() {
     let (backend_addr, _backend_handle) = start_grpc_backend_with_trailer_fixture().await;
 
     let mut proxy = create_grpc_proxy("grpc-web-no-native-trailers", "/grpc", backend_addr.port());
-    proxy.response_body_mode = ResponseBodyMode::Buffer;
     proxy.plugins = vec![
         ferrum_edge::config::types::PluginAssociation {
             plugin_config_id: "grpc-web-bridge".to_string(),
@@ -3064,6 +3063,203 @@ fn assert_grpc_web_custom_trailer_payload(payload: &str) {
         !payload.contains("x-powered-by"),
         "initial-header-only field leaked into gRPC-Web frame: {payload}"
     );
+}
+
+async fn start_grpc_web_cadence_backend() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    use http_body::Frame;
+    use http_body_util::StreamBody;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| async move {
+                    let _ = req.into_body().collect().await;
+                    let (tx, rx) = tokio::sync::mpsc::channel(4);
+                    tokio::spawn(async move {
+                        // An empty gRPC message is five wire bytes, so text mode
+                        // must flush a padded base64 segment before EOF.
+                        let first = Bytes::from_static(&[0, 0, 0, 0, 0]);
+                        let second = Bytes::from_static(&[0, 0, 0, 0, 1, b'x']);
+                        if tx
+                            .send(Ok::<_, std::convert::Infallible>(Frame::data(first)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        if tx.send(Ok(Frame::data(second))).await.is_err() {
+                            return;
+                        }
+                        let mut trailers = hyper::HeaderMap::new();
+                        trailers.insert("grpc-status", "0".parse().unwrap());
+                        trailers.insert("grpc-message", "ok".parse().unwrap());
+                        trailers.insert("x-stream-meta", "final".parse().unwrap());
+                        let _ = tx.send(Ok(Frame::trailers(trailers))).await;
+                    });
+
+                    Ok::<_, hyper::Error>(
+                        Response::builder()
+                            .status(200)
+                            .header("content-type", "application/grpc")
+                            .body(StreamBody::new(ReceiverStream::new(rx)))
+                            .unwrap(),
+                    )
+                });
+                let _ = Http2ServerBuilder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (addr, handle)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn grpc_web_server_streaming_reaches_h1_and_h2_before_backend_eof() {
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use http_body::Frame;
+
+    let (backend_addr, _backend_handle) = start_grpc_web_cadence_backend().await;
+    let mut proxy = create_grpc_proxy("grpc-web-cadence", "/grpc", backend_addr.port());
+    proxy.plugins = vec![ferrum_edge::config::types::PluginAssociation {
+        plugin_config_id: "grpc-web-cadence".to_string(),
+    }];
+    let plugin = PluginConfig {
+        id: "grpc-web-cadence".to_string(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "grpc_web".to_string(),
+        enabled: true,
+        config: serde_json::json!({}),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("grpc-web-cadence".to_string()),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let state = create_test_proxy_state_with_plugins(vec![proxy], vec![plugin]);
+    let (gateway_addr, _gateway_handle) = start_test_gateway(state).await;
+
+    for version in [TestHttpVersion::H1, TestHttpVersion::H2] {
+        for (content_type, text_mode) in [
+            ("application/grpc-web+proto", false),
+            ("application/grpc-web-text+proto", true),
+        ] {
+            let stream = tokio::net::TcpStream::connect(gateway_addr).await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let io = TokioIo::new(stream);
+            let request_body = if text_mode {
+                Bytes::from(BASE64.encode([0u8, 0, 0, 0, 0]))
+            } else {
+                Bytes::from_static(&[0u8, 0, 0, 0, 0])
+            };
+            let request = Request::builder()
+                .method("POST")
+                .uri("/grpc/echo.Echo/ServerStream")
+                .header("host", "localhost")
+                .header("content-type", content_type)
+                .body(Full::new(request_body))
+                .unwrap();
+            let response = match version {
+                TestHttpVersion::H1 => {
+                    let (mut sender, conn) =
+                        hyper::client::conn::http1::handshake(io).await.unwrap();
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    sender.send_request(request).await.expect("H1 send")
+                }
+                TestHttpVersion::H2 => {
+                    let (mut sender, conn) =
+                        hyper::client::conn::http2::handshake(TokioExecutor::new(), io)
+                            .await
+                            .unwrap();
+                    tokio::spawn(async move {
+                        let _ = conn.await;
+                    });
+                    sender.send_request(request).await.expect("H2 send")
+                }
+            };
+            assert_eq!(response.status(), 200);
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok()),
+                Some(content_type)
+            );
+            assert!(
+                !response.headers().contains_key("content-length"),
+                "streaming translation owns the final representation length"
+            );
+
+            let mut body = response.into_body();
+            let first = tokio::time::timeout(Duration::from_millis(700), body.frame())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{version:?} {content_type} withheld its first message until backend EOF"
+                    )
+                })
+                .expect("first frame")
+                .expect("first frame ok")
+                .into_data()
+                .expect("first DATA");
+            let first = if text_mode {
+                assert!(
+                    first.ends_with(b"="),
+                    "the five-byte first message must exercise a padded text flush"
+                );
+                BASE64.decode(first).expect("independent text segment")
+            } else {
+                first.to_vec()
+            };
+            assert_eq!(first, [0u8, 0, 0, 0, 0]);
+
+            let mut tail = Vec::new();
+            while let Some(frame) = tokio::time::timeout(Duration::from_secs(3), body.frame())
+                .await
+                .expect("stream must complete")
+            {
+                let frame: Frame<Bytes> = frame.expect("response frame");
+                assert!(
+                    frame.trailers_ref().is_none(),
+                    "translated gRPC-Web must suppress native downstream trailers"
+                );
+                let Some(data) = frame.data_ref() else {
+                    continue;
+                };
+                let decoded = if text_mode {
+                    BASE64.decode(data).expect("independent text segment")
+                } else {
+                    data.to_vec()
+                };
+                tail.extend_from_slice(&decoded);
+            }
+            let second = [0u8, 0, 0, 0, 1, b'x'];
+            assert!(
+                tail.starts_with(&second),
+                "{version:?} {content_type} lost the second message"
+            );
+            assert_eq!(
+                count_grpc_web_trailer_frames(&tail[second.len()..]),
+                1,
+                "{version:?} {content_type} must emit exactly one terminal body frame"
+            );
+            let terminal = &tail[second.len()..];
+            let payload = String::from_utf8_lossy(&terminal[5..]);
+            assert!(payload.contains("grpc-status: 0\r\n"));
+            assert!(payload.contains("grpc-message: ok\r\n"));
+            assert!(payload.contains("x-stream-meta: final\r\n"));
+        }
+    }
 }
 
 async fn grpc_web_custom_trailer_exchange(

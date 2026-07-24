@@ -62,7 +62,7 @@ Caches are divided into two categories: **gateway core caches** (controlled by `
 
 **Env var:** `FERRUM_DNS_CACHE_MAX_SIZE`.
 
-**Cleanup mechanism:** TTL-based expiration (each record's native TTL by default, or `FERRUM_DNS_TTL_OVERRIDE_SECONDS` when set), stale-while-revalidate (serves old IP while refreshing in background), a background refresh task that keeps entries warm, and a failed DNS retry task that re-attempts resolution of error-cached entries.
+**Cleanup mechanism:** TTL-based expiration (each record's native TTL by default, or `FERRUM_DNS_TTL_OVERRIDE_SECONDS` when set), stale-while-revalidate (serves old IP while refreshing in background), a background refresh task that keeps entries warm, and a failed DNS retry task that re-attempts resolution of error-cached entries with exponential error-TTL backoff, age eviction at `FERRUM_DNS_STALE_TTL`, per-cycle concurrency bound (`FERRUM_DNS_MAX_CONCURRENT_REFRESHES`), and over-capacity eviction that prefers error entries over live success entries.
 
 ### Status Code Counters
 

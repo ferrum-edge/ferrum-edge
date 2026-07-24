@@ -47,7 +47,7 @@ pub mod view;
 #[allow(unused_imports)]
 pub use fields::{FieldMeta, HTTP_FIELDS, STREAM_FIELDS, SchemaCapabilities, WS_DISCONNECT_FIELDS};
 #[allow(unused_imports)]
-pub use view::{SchemaSerializable, SchemaView, SummaryLogEntryBatchView, SummaryLogEntryView};
+pub use view::{SchemaSerializable, SchemaView};
 
 /// Which summary struct(s) a schema applies to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

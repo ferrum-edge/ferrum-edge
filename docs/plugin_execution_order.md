@@ -153,6 +153,14 @@ they still emit one terminal transaction summary from the protocol-filtered
 plugin-cache view (`metadata.rejection_phase = "allowed_methods"`) without
 running authentication, transformation, mirroring, or other request-policy
 hooks. Native gRPC requests must also use `POST` before this hook runs.
+
+Stream-termination hooks ordinarily retain plugin priority order. Terminal
+observers may explicitly defer only this final hook until ordinary peers have
+finished, while retaining relative priority within the deferred group.
+`ai_transcript_audit` uses that terminal-observer phase so a streaming record
+sees the final `ai_tool_governor` decision before the transaction summary is
+cloned; request, response, and stream-inspector ordering is unchanged.
+
 A matched request using a different method is rejected at its protocol
 admission gate before either kind of hook, even if `allowed_methods` permits
 that method. H1, H2, and H3 share the ordinary-hook blind spots for unmatched
@@ -196,6 +204,10 @@ mocked, deadline-rejected, or load-fanned-out before it is enforced. Proxies
 without a backend-path policy retain the ordinary single `before_proxy` pass.
 Deferred hooks generally observe the original client path, preserving their
 normal request semantics even when mesh routing rewrote the backend path.
+`request_mirror` is the route-parity exception: an unset `mirror_path` reads
+the finalized mesh `route_override_path` without taking it from primary
+dispatch, then falls back to the backend-effective authorized path and finally
+the original client path.
 Within that deferred transform band, `load_testing` (3070) runs before
 `request_mirror` (3075) so the reserved `X-Loadtesting-Key` is stripped on both
 matching and non-matching paths before mirror can copy it. As defense in depth,
@@ -205,6 +217,9 @@ and pre-`before_proxy` body availability when they opt in. `request_mirror` is
 also the security-sensitive path exception: when backend-path policy is active
 and `mirror_path` is unset, it mirrors the exact effective path that passed
 final authorization. An explicit operator-configured `mirror_path` still wins.
+Each configured mirror instance appends its own bounded result receiver; result
+logging is detached per instance, so later instances and mixed completion order
+cannot overwrite an earlier destination's outcome.
 A deferred hook that can inject routing headers runs after the selected
 target's single state-consuming enforcement, and that target is pinned across
 the external call. After each deferred pass, the gateway removes every case
@@ -511,13 +526,15 @@ Within each lifecycle phase, plugins are sorted by **priority** (lower number ru
 
 Multiple instances of the same plugin type are supported on a single proxy (e.g., two `http_logging` instances for different log destinations). When merging global, proxy-scoped, and proxy-group-scoped plugins, a scoped plugin replaces only the **global** plugin of the same name — other scoped instances of the same type are preserved. See [Plugin Scope](plugins.md#plugin-scope-merging) for the full merging rules and examples.
 
+**Exception — `api_chargeback`:** merge still preserves scoped same-name instances, but admission then rejects any proxy whose effective list retains more than one `api_chargeback`. The shared `/charges` registry has no instance/ledger dimension, so multiple hooks would double-count one client transaction. Shared render/cleanup tunables must also agree across every enabled instance in the process. See [api_chargeback](plugins.md#api_chargeback).
+
 Priority bands are spaced with gaps so future plugins can slot in without renumbering:
 
 | Band | Priority Range | Purpose | Plugins |
 |------|---------------|---------|---------|
 | **Early** | 0–949 | Matched-request tracing, IDs, preflight, and short-circuiting before auth | `otel_tracing` (25), `correlation_id` (50), `cors` (100), `request_termination` (125), `mesh_outbound_registry` (130), `ip_restriction` (150), `geo_restriction` (175), `bot_detection` (200), `spec_expose` (210), `sse` (250), `grpc_web` (260), `grpc_method_router` (275), `spiffe_identity` (940) |
 | **AuthN** | 950–1999 | Authentication / identity verification | `mtls_auth` (950), `jwks_auth` (1000), `oauth2_introspection` (1050), `oidc_relying_party` (1075), `jwt_auth` (1100), `key_auth` (1200), `ldap_auth` (1250), `basic_auth` (1300), `hmac_auth` (1400), `soap_ws_security` (1500) |
-| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `adaptive_concurrency` (2090), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_transcript_audit` (2924), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_semantic_firewall` (2968), `ai_request_guard` (2975), `ai_tool_governor` (2978), `ai_semantic_cache` (2980), `ai_stream_router` (2984), `mcp_gateway` (2992), `a2a_gateway` (2993), `mesh_route_dispatch` (2995) |
+| **Admission** | 2000–2999 | Authorization, validation, and request admission control | `access_control` (2000), `tcp_connection_throttle` (2050), `mesh_authz` (2075), `opa` (2080), `adaptive_concurrency` (2090), `ai_transcript_audit` (2740), `request_deduplication` (2750), `request_size_limiting` (2800), `ws_message_size_limiting` (2810), `graphql` (2850), `rate_limiting` (2900), `ws_rate_limiting` (2910), `udp_rate_limiting` (2915), `ai_prompt_shield` (2925), `waf` (2930), `fault_injection` (2940), `body_validator` (2950), `openapi_validator` (2960), `ai_semantic_firewall` (2968), `ai_request_guard` (2975), `ai_tool_governor` (2978), `ai_semantic_cache` (2980), `ai_stream_router` (2984), `mcp_gateway` (2992), `a2a_gateway` (2993), `mesh_route_dispatch` (2995) |
 | **Transform** | 3000–3999 | Request shaping and response buffering decisions | `request_transformer` (3000), `serverless_function` (3025), `response_mock` (3030), `grpc_deadline` (3050), `load_testing` (3070), `request_mirror` (3075), `response_size_limiting` (3490), `response_caching` (3500) |
 | **Response** | 4000–4999 | Response transformation, compression, security headers, and AI accounting | `response_transformer` (4000), `compression` (4050), `ai_prompt_compressor` (4055), `ai_federation` (4060), `ai_response_guard` (4075), `security_headers` (4080), `ai_token_metrics` (4100), `ai_rate_limiter` (4200) |
 | **Custom** | 5000 | Default for unrecognized/custom plugins | _(future plugins)_ |
@@ -579,14 +596,14 @@ Given all built-in plugins enabled, the execution order is:
 | 26 | `mesh_authz` | 2075 | authorize, on_stream_connect |
 | 27 | `opa` | 2080 | authorize |
 | 28 | `adaptive_concurrency` | 2090 | backend_admission |
-| 29 | `request_deduplication` | 2750 | before_proxy, on_final_response_body, on_response_stream_terminated |
-| 30 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
-| 31 | `ws_message_size_limiting` | 2810 | parser-level frame/message limits |
-| 32 | `graphql` | 2850 | before_proxy |
-| 33 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
-| 34 | `ws_rate_limiting` | 2910 | on_ws_frame |
-| 35 | `udp_rate_limiting` | 2915 | on_udp_datagram |
-| 36 | `ai_transcript_audit` | 2924 | before_proxy, on_final_request_body, on_final_response_body, on_response_committed, response_stream_inspector, on_response_stream_terminated, log |
+| 29 | `ai_transcript_audit` | 2740 | before_proxy, on_final_request_body, on_final_response_body, on_response_committed, response_stream_inspector, on_response_stream_terminated, log |
+| 30 | `request_deduplication` | 2750 | before_proxy, on_final_response_body, on_response_stream_terminated |
+| 31 | `request_size_limiting` | 2800 | on_request_received, before_proxy, on_final_request_body |
+| 32 | `ws_message_size_limiting` | 2810 | parser-level frame/message limits |
+| 33 | `graphql` | 2850 | before_proxy |
+| 34 | `rate_limiting` | 2900 | on_request_received (IP mode), authorize (consumer mode), before_proxy, after_proxy, on_stream_connect |
+| 35 | `ws_rate_limiting` | 2910 | on_ws_frame |
+| 36 | `udp_rate_limiting` | 2915 | on_udp_datagram |
 | 37 | `ai_prompt_shield` | 2925 | before_proxy, transform_request_body, on_final_request_body |
 | 38 | `waf` | 2930 | authorize, on_final_request_body, after_proxy, on_final_response_body, on_stream_connect, on_udp_datagram |
 | 39 | `fault_injection` | 2940 | before_proxy, on_stream_connect |
@@ -721,11 +738,11 @@ Rate limiting sits at the end of the AuthZ band (priority 2900) so it can enforc
 
 `openapi_validator` runs after the generic `body_validator` so explicit per-proxy body checks can fail first, then the generated OpenAPI contract can enforce operation-specific schemas. It runs before AI request policy and request transformation, which means contract mismatches are caught before the request body is reshaped or sent to an upstream.
 
-### AI Plugins: audit → PII shield → semantic firewall → guard → tool governor → routing → metrics → rate limiter (2924–4200)
+### AI Plugins: audit → PII shield → semantic firewall → guard → tool governor → routing → metrics → rate limiter (2740–4200)
 
 The AI plugins are ordered to compose correctly:
 
-1. **`ai_transcript_audit` (2924)** stages AI transcript candidates before reject-capable AI guardrails so blocked prompts can still be captured when `always_capture_on_guardrail` is enabled. Its final request-body hook refreshes the captured request after downstream redaction/transforms when traffic continues.
+1. **`ai_transcript_audit` (2740)** runs after authentication/authorization and before `request_deduplication` (2750), so local and Redis replays cannot terminate the chain before audit staging. It also stages before reject-capable AI guardrails so blocked prompts can still be captured when `always_capture_on_guardrail` is enabled. Its final request-body hook reclassifies and refreshes the captured request after downstream redaction/transforms when traffic continues; priority overrides that reverse audit/dedup order are rejected.
 2. **`ai_prompt_shield` (2925)** runs next in the pre-proxy body flow — PII must be detected/redacted before the request reaches the backend or later body validators. It sits right after audit staging and rate limiting so brute-force protection applies first. For encoded JSON bodies it defers inspection to `on_final_request_body`, after request decompression; enforcing actions fail closed if the body remains encoded, and compressed redaction rejects detected PII because that final hook cannot rewrite wire bytes. `waf` request metadata checks have already run in `authorize`; WAF request-body checks run on the final backend-visible body after request body transforms.
 3. **`ai_semantic_firewall` (2968)** runs after body/OpenAPI validation and before request guard, semantic cache, and federation — semantically dangerous prompts, RAG content, tool calls, and responses are evaluated before they can reach semantic cache or a federated provider. Because request/response body transformers run after the initial semantic pass, the firewall uses instance-scoped body hashes and re-evaluates changed final backend-visible requests and client-visible responses; unchanged bodies avoid duplicate embedding calls. Encoded requests are deferred until the final request hook after optional decompression, while encoded governed responses fail closed unless a final gateway-compressed body can be decoded within the inspection bound.
 4. **`ai_request_guard` (2975)** runs after semantic firewall — it validates model names, max_tokens, message counts, prompt size, and provider-native temperature fields. It revalidates the final backend-visible JSON after later request-body transforms, so a transformer cannot replace a protected field after admission; clamp/default caps that are undone after transformation fail closed.

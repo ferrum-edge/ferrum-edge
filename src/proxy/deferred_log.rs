@@ -102,10 +102,14 @@ pub async fn run_response_stream_termination_hooks(
     // Reusing the client deadline here would make timed-out traffic vanish
     // from exactly the cleanup/observability path meant to record it.
     crate::plugins::wait_for_response_stream_inspector(ctx).await;
-    for plugin in plugins {
-        plugin
-            .on_response_stream_terminated(ctx, response_status, outcome)
-            .await;
+    for deferred in [false, true] {
+        for plugin in plugins.iter().filter(|plugin| {
+            plugin.defers_response_stream_termination_until_after_peers() == deferred
+        }) {
+            plugin
+                .on_response_stream_terminated(ctx, response_status, outcome)
+                .await;
+        }
     }
     crate::plugins::clear_response_stream_inspector_state(ctx);
 }
@@ -118,6 +122,10 @@ pub async fn run_response_stream_termination_hooks(
 pub struct DeferredTransactionLogger {
     state: Mutex<Option<LogState>>,
     fired: AtomicBool,
+    // Test-only owned delivery lifecycle. Production paths leave this unset and
+    // dispatch through the process-global structured lifecycle.
+    #[cfg(test)]
+    delivery: Option<crate::observability_delivery::OwnedDeliveryLifecycle>,
 }
 
 /// Captured log state. Held inside a [`Mutex`] so [`fire`](DeferredTransactionLogger::fire)
@@ -166,6 +174,8 @@ impl DeferredTransactionLogger {
                 start_time: None,
             })),
             fired: AtomicBool::new(false),
+            #[cfg(test)]
+            delivery: None,
         })
     }
 
@@ -182,10 +192,14 @@ impl DeferredTransactionLogger {
     /// preserved as captured (they are defined by events that happen before
     /// the body streams). Backend total latency is likewise left untouched —
     /// for streaming responses the body drives that counter, not the deferred
-    /// logger, and -1.0 remains a meaningful "no second observation" signal.
+    /// logger, and [`crate::plugins::LATENCY_UNKNOWN_MS`] remains a meaningful
+    /// "no separable backend-total observation" signal.
     ///
-    /// Gateway processing and overhead are re-derived from the updated total
-    /// to keep the four latency fields internally consistent.
+    /// Gateway processing and overhead are refreshed via
+    /// [`TransactionSummary::refresh_gateway_latencies`]: when backend total
+    /// is unknown they stay at [`crate::plugins::LATENCY_UNKNOWN_MS`] instead
+    /// of treating TTFB as full backend duration (which would misattribute
+    /// streamed body lifetime as gateway work).
     pub fn new_with_start_time(
         summary: TransactionSummary,
         plugins: Arc<Vec<Arc<dyn Plugin>>>,
@@ -200,6 +214,8 @@ impl DeferredTransactionLogger {
                 start_time: Some(start_time),
             })),
             fired: AtomicBool::new(false),
+            #[cfg(test)]
+            delivery: None,
         })
     }
 
@@ -265,53 +281,47 @@ impl DeferredTransactionLogger {
                 .or_insert_with(|| crate::proxy::grpc_proxy::grpc_status::UNKNOWN.to_string());
         }
 
-        // Re-derive wall-clock latencies so streaming responses report the
-        // real body-completion time instead of the header-flush snapshot.
+        // Re-derive wall-clock total so streaming responses report the real
+        // body-completion time instead of the header-flush snapshot.
         //
         // Only applied when the caller threaded a start time in via
-        // `new_with_start_time`. The four recomputed fields use the same
-        // formulas as the main handler so consumers see values computed by
-        // identical logic — the only difference is the "now" reference is
-        // body-completion instead of header-flush.
+        // `new_with_start_time`. Gateway fields follow
+        // `TransactionSummary::refresh_gateway_latencies` so an unknown
+        // streaming backend total never inflates gateway overhead via TTFB
+        // substitution.
         if let Some(start) = start_time {
-            let total_ms = start.elapsed().as_secs_f64() * 1000.0;
-            // Backend total for streaming stays as captured — see rustdoc
-            // on `new_with_start_time` for the rationale.
-            let effective_backend_ms = if summary.latency_backend_total_ms >= 0.0 {
-                summary.latency_backend_total_ms
-            } else {
-                summary.latency_backend_ttfb_ms
-            };
-            summary.latency_total_ms = total_ms;
-            summary.latency_gateway_processing_ms = (total_ms - effective_backend_ms).max(0.0);
-            summary.latency_gateway_overhead_ms =
-                (total_ms - effective_backend_ms - summary.latency_plugin_execution_ms).max(0.0);
+            summary.latency_total_ms = start.elapsed().as_secs_f64() * 1000.0;
+            summary.refresh_gateway_latencies();
         }
 
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    let response_status = summary.response_status_code;
-                    run_response_stream_termination_hooks(
-                        plugins.as_slice(),
-                        &mut ctx,
-                        response_status,
-                        &outcome,
-                    )
-                    .await;
-                    // The summary skeleton is captured when response headers
-                    // are committed, but streamed inspectors only know their
-                    // aggregate decision at body termination. Refresh metadata
-                    // after the mutable terminal hooks so every log sink sees
-                    // the finalized per-request values.
-                    summary.metadata = crate::proxy::clone_log_metadata(&ctx);
-                    log_with_mirror(plugins.as_slice(), &summary, &ctx).await;
-                });
-            }
-            Err(_) => {
-                // Outside a tokio runtime — nothing we can do.
-            }
+        let task = async move {
+            let response_status = summary.response_status_code;
+            run_response_stream_termination_hooks(
+                plugins.as_slice(),
+                &mut ctx,
+                response_status,
+                &outcome,
+            )
+            .await;
+            // The summary skeleton is captured when response headers are
+            // committed, but streamed inspectors only know their aggregate
+            // decision at body termination. Refresh metadata after the
+            // mutable terminal hooks so every log sink sees the finalized
+            // per-request values.
+            summary.metadata = crate::proxy::clone_log_metadata(&ctx);
+            log_with_mirror(plugins.as_slice(), &summary, &ctx).await;
+        };
+        #[cfg(test)]
+        if let Some(delivery) = self.delivery.as_ref() {
+            // Owned test lifecycles stay open for the suite; a false return is
+            // a test harness bug, not production admission-closed behavior.
+            assert!(
+                delivery.spawn_terminal(task),
+                "owned delivery lifecycle must admit deferred terminal log tasks"
+            );
+            return;
         }
+        let _ = crate::observability_delivery::spawn_terminal(task);
     }
 }
 
@@ -330,40 +340,101 @@ impl Drop for DeferredTransactionLogger {
 }
 
 #[cfg(test)]
+impl DeferredTransactionLogger {
+    /// Bind terminal dispatch to an owned lifecycle for deterministic unit tests.
+    fn with_owned_delivery(
+        delivery: crate::observability_delivery::OwnedDeliveryLifecycle,
+        summary: TransactionSummary,
+        plugins: Arc<Vec<Arc<dyn Plugin>>>,
+        ctx: RequestContext,
+        start_time: Option<Instant>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(Some(LogState {
+                summary,
+                plugins,
+                ctx,
+                start_time,
+            })),
+            fired: AtomicBool::new(false),
+            delivery: Some(delivery),
+        })
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::observability_delivery::OwnedDeliveryLifecycle;
     use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    async fn drain(delivery: &OwnedDeliveryLifecycle) {
+        assert!(
+            delivery.drain_tasks(Duration::from_secs(1)).await,
+            "owned delivery lifecycle must drain deferred log tasks"
+        );
+    }
+
+    fn test_logger(
+        delivery: &OwnedDeliveryLifecycle,
+        summary: TransactionSummary,
+        plugins: Arc<Vec<Arc<dyn Plugin>>>,
+        ctx: RequestContext,
+    ) -> Arc<DeferredTransactionLogger> {
+        DeferredTransactionLogger::with_owned_delivery(
+            delivery.clone(),
+            summary,
+            plugins,
+            ctx,
+            None,
+        )
+    }
+
+    fn test_logger_with_start_time(
+        delivery: &OwnedDeliveryLifecycle,
+        summary: TransactionSummary,
+        plugins: Arc<Vec<Arc<dyn Plugin>>>,
+        ctx: RequestContext,
+        start_time: Instant,
+    ) -> Arc<DeferredTransactionLogger> {
+        DeferredTransactionLogger::with_owned_delivery(
+            delivery.clone(),
+            summary,
+            plugins,
+            ctx,
+            Some(start_time),
+        )
+    }
 
     #[tokio::test]
     async fn fire_is_single_shot() {
+        let delivery = OwnedDeliveryLifecycle::new();
         let counter = Arc::new(AtomicUsize::new(0));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> =
             Arc::new(vec![Arc::new(CountingPlugin(counter.clone()))]);
         let ctx = RequestContext::new("1.2.3.4".to_string(), "GET".to_string(), "/".to_string());
         let summary = fake_summary();
 
-        let logger = DeferredTransactionLogger::new(summary, plugins, ctx);
+        let logger = test_logger(&delivery, summary, plugins, ctx);
         logger.fire(BodyOutcome::success(42));
         logger.fire(BodyOutcome::success(1_000_000));
 
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
+        drain(&delivery).await;
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn drop_safety_net_fires_when_never_fired() {
+        let delivery = OwnedDeliveryLifecycle::new();
         let counter = Arc::new(AtomicUsize::new(0));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> =
             Arc::new(vec![Arc::new(CountingPlugin(counter.clone()))]);
         let ctx = RequestContext::new("1.2.3.4".to_string(), "GET".to_string(), "/".to_string());
-        let logger = DeferredTransactionLogger::new(fake_summary(), plugins, ctx);
+        let logger = test_logger(&delivery, fake_summary(), plugins, ctx);
         drop(logger);
 
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
+        drain(&delivery).await;
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
@@ -372,13 +443,14 @@ mod tests {
         // Regression guard for the unified bytes_received field. When
         // fire() fires with a streaming outcome carrying N bytes,
         // `bytes_received` should land at N.
+        let delivery = OwnedDeliveryLifecycle::new();
         let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
         let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
         let ctx = RequestContext::new("1.2.3.4".to_string(), "GET".to_string(), "/".to_string());
-        let logger = DeferredTransactionLogger::new(fake_summary(), plugins, ctx);
+        let logger = test_logger(&delivery, fake_summary(), plugins, ctx);
         logger.fire(BodyOutcome::success(12345));
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        drain(&delivery).await;
 
         let summary = captured.lock().unwrap().clone().expect("log fired");
         assert_eq!(summary.bytes_received, 12345);
@@ -387,6 +459,7 @@ mod tests {
 
     #[tokio::test]
     async fn fire_patches_terminal_grpc_status_from_trailers() {
+        let delivery = OwnedDeliveryLifecycle::new();
         let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
         let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
@@ -395,10 +468,10 @@ mod tests {
             "POST".to_string(),
             "/rpc".to_string(),
         );
-        let logger = DeferredTransactionLogger::new(fake_summary(), plugins, ctx);
+        let logger = test_logger(&delivery, fake_summary(), plugins, ctx);
 
         logger.fire(BodyOutcome::success(12).with_grpc_status(Some(14)));
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        drain(&delivery).await;
 
         let summary = captured.lock().unwrap().clone().expect("log fired");
         assert_eq!(
@@ -412,6 +485,7 @@ mod tests {
 
     #[tokio::test]
     async fn fire_marks_missing_grpc_terminal_status_unknown() {
+        let delivery = OwnedDeliveryLifecycle::new();
         let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
         let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
@@ -422,10 +496,10 @@ mod tests {
         );
         ctx.metadata
             .insert("request_protocol".to_string(), "grpc".to_string());
-        let logger = DeferredTransactionLogger::new(fake_summary(), plugins, ctx);
+        let logger = test_logger(&delivery, fake_summary(), plugins, ctx);
 
         logger.fire(BodyOutcome::success(0));
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        drain(&delivery).await;
 
         let summary = captured.lock().unwrap().clone().expect("log fired");
         assert_eq!(
@@ -442,6 +516,7 @@ mod tests {
         // the logger is constructed via `new_with_start_time`, fire should
         // replace `latency_total_ms` with the wall-clock elapsed from the
         // captured start (not the stale value in the summary).
+        let delivery = OwnedDeliveryLifecycle::new();
         let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
         let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
@@ -454,27 +529,32 @@ mod tests {
         summary.latency_plugin_execution_ms = 0.5;
         summary.latency_backend_ttfb_ms = 0.8;
         summary.latency_backend_total_ms = -1.0; // streaming sentinel
+        summary.response_streamed = true;
+        summary.latency_gateway_processing_ms = -1.0;
+        summary.latency_gateway_overhead_ms = -1.0;
 
         let start = Instant::now();
-        let logger = DeferredTransactionLogger::new_with_start_time(summary, plugins, ctx, start);
+        let logger = test_logger_with_start_time(&delivery, summary, plugins, ctx, start);
 
         // Simulate 50ms of body streaming before the logger fires.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
         logger.fire(BodyOutcome::success(999));
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        drain(&delivery).await;
 
         let observed = captured.lock().unwrap().clone().expect("log fired");
-        // latency_total_ms should reflect the ~50ms body-streaming window
-        // plus the ~25ms post-fire flush, well above the original 1.0ms.
+        // latency_total_ms should reflect the ~50ms body-streaming window,
+        // well above the original 1.0ms. Drain no longer adds a post-fire
+        // sleep, so keep the floor aligned to the simulated stream delay.
         assert!(
             observed.latency_total_ms >= 40.0,
             "expected re-derived total >= 40ms, got {}",
             observed.latency_total_ms
         );
-        // Gateway processing and overhead are re-derived consistently and
-        // must be non-negative.
-        assert!(observed.latency_gateway_processing_ms >= 0.0);
-        assert!(observed.latency_gateway_overhead_ms >= 0.0);
+        // Unknown streaming backend total must not inflate gateway fields via
+        // TTFB substitution — both stay at the shared unknown sentinel.
+        assert_eq!(observed.latency_gateway_processing_ms, -1.0);
+        assert_eq!(observed.latency_gateway_overhead_ms, -1.0);
+        assert_eq!(observed.latency_backend_total_ms, -1.0);
         // Fields unrelated to the re-derivation are preserved.
         assert_eq!(observed.latency_backend_ttfb_ms, 0.8);
         assert_eq!(observed.latency_plugin_execution_ms, 0.5);
@@ -486,6 +566,7 @@ mod tests {
         // constructed via `new` (no start time), fire must NOT touch the
         // latency fields — buffered responses have exact latencies baked in
         // at summary construction time.
+        let delivery = OwnedDeliveryLifecycle::new();
         let captured = Arc::new(Mutex::new(None::<TransactionSummary>));
         let capturer: Arc<dyn Plugin> = Arc::new(CapturingPlugin(captured.clone()));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> = Arc::new(vec![capturer]);
@@ -497,9 +578,9 @@ mod tests {
         summary.latency_gateway_processing_ms = 5.0;
         summary.latency_gateway_overhead_ms = 3.0;
 
-        let logger = DeferredTransactionLogger::new(summary, plugins, ctx);
+        let logger = test_logger(&delivery, summary, plugins, ctx);
         logger.fire(BodyOutcome::success(100));
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        drain(&delivery).await;
 
         let observed = captured.lock().unwrap().clone().expect("log fired");
         assert_eq!(observed.latency_total_ms, 42.0);
@@ -527,17 +608,16 @@ mod tests {
 
     #[tokio::test]
     async fn drop_after_explicit_fire_does_not_double_log() {
+        let delivery = OwnedDeliveryLifecycle::new();
         let counter = Arc::new(AtomicUsize::new(0));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> =
             Arc::new(vec![Arc::new(CountingPlugin(counter.clone()))]);
         let ctx = RequestContext::new("1.2.3.4".to_string(), "GET".to_string(), "/".to_string());
-        let logger = DeferredTransactionLogger::new(fake_summary(), plugins, ctx);
+        let logger = test_logger(&delivery, fake_summary(), plugins, ctx);
         logger.fire(BodyOutcome::success(10));
         drop(logger);
 
-        tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
+        drain(&delivery).await;
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
 
@@ -560,10 +640,15 @@ mod tests {
     /// A `tokio::sync::Barrier` gates both tasks until all `2*N` tasks are
     /// ready, maximising contention on the CAS. The test runs on the
     /// multi-thread runtime so tasks can execute on different threads.
+    ///
+    /// All `N` loggers share one owned delivery lifecycle so the concurrent
+    /// suite stays lightweight while remaining independent of the
+    /// process-global singleton.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_fire_and_drop_is_single_shot() {
         const N: usize = 500;
 
+        let delivery = OwnedDeliveryLifecycle::new();
         let counter = Arc::new(AtomicUsize::new(0));
         let plugins: Arc<Vec<Arc<dyn Plugin>>> =
             Arc::new(vec![Arc::new(CountingPlugin(counter.clone()))]);
@@ -577,7 +662,7 @@ mod tests {
         for _ in 0..N {
             let ctx =
                 RequestContext::new("1.2.3.4".to_string(), "GET".to_string(), "/".to_string());
-            let logger = DeferredTransactionLogger::new(fake_summary(), plugins.clone(), ctx);
+            let logger = test_logger(&delivery, fake_summary(), plugins.clone(), ctx);
 
             // Two Arc clones — one for each task. Dropping the last clone
             // triggers the Drop safety net.
@@ -601,16 +686,7 @@ mod tests {
             h.await.unwrap();
         }
 
-        // The spawned log tasks run on tokio, so give them a moment to
-        // complete. Yielding alone is not enough because `handle.spawn`
-        // inside fire_once defers the log() call.
-        for _ in 0..10 {
-            tokio::task::yield_now().await;
-            if counter.load(Ordering::Relaxed) >= N {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        drain(&delivery).await;
 
         let observed = counter.load(Ordering::Relaxed);
         assert_eq!(

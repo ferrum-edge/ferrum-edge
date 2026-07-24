@@ -39,6 +39,7 @@ pub mod logging;
 pub mod metrics;
 pub mod modes;
 pub mod notifications;
+pub mod observability_delivery;
 pub mod overload;
 pub mod plugin_cache;
 pub mod plugins;
@@ -97,6 +98,55 @@ pub mod _test_support {
         ctx: &crate::plugins::RequestContext,
     ) -> (Option<u64>, Option<u64>) {
         ctx.compression_ownership_for_test()
+    }
+
+    pub fn take_compression_response_codec_permit_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        ctx.take_compression_response_codec_permit()
+    }
+
+    /// Whether a compression instance reserved response codec admission for this
+    /// request in `before_proxy` (the early bound on the buffered population).
+    pub fn compression_response_admission_reserved_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.has_compression_response_admission_owner()
+    }
+
+    /// Whether `before_proxy` negotiated a compressible coding but could not
+    /// obtain bounded codec admission (so the response streams identity).
+    pub fn compression_response_admission_declined_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> bool {
+        ctx.compression_response_admission_declined()
+    }
+
+    /// Build the request-body-hook compatibility context. Used to prove the
+    /// reserved response codec permit stays on the donor (live) context rather
+    /// than being moved into this short-lived clone.
+    pub fn clone_for_final_request_body_hooks_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+    ) -> crate::plugins::RequestContext {
+        ctx.clone_for_final_request_body_hooks()
+    }
+
+    pub fn gateway_response_compression_algorithm_for_test(
+        ctx: &crate::plugins::RequestContext,
+    ) -> Option<&'static str> {
+        ctx.gateway_response_compression_algorithm()
+    }
+
+    pub fn reconcile_aborted_gateway_response_encoding_for_test(
+        ctx: &mut crate::plugins::RequestContext,
+        response_headers: &mut std::collections::HashMap<String, String>,
+        body_len: usize,
+    ) {
+        crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+            ctx,
+            response_headers,
+            body_len,
+        );
     }
 
     pub fn validate_correlation_id_composition_for_test(
@@ -615,6 +665,127 @@ pub mod _test_support {
         plugin: &crate::plugins::request_mirror::RequestMirror,
     ) -> u64 {
         plugin.sample_phase_for_test()
+    }
+
+    pub fn request_mirror_append_shadow_host_suffix_for_test(authority: &str) -> String {
+        crate::plugins::request_mirror::append_shadow_host_suffix(authority)
+    }
+
+    pub fn request_mirror_resolve_timeout_ms_for_test(
+        configured_mirror_timeout_ms: Option<u64>,
+        backend_read_timeout_ms: Option<u64>,
+    ) -> u64 {
+        crate::plugins::request_mirror::resolve_mirror_timeout_ms(
+            configured_mirror_timeout_ms,
+            backend_read_timeout_ms,
+        )
+    }
+
+    pub fn request_mirror_retained_request_body_bytes_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.retained_request_body_bytes_for_test()
+    }
+
+    pub fn request_mirror_max_retained_request_body_bytes_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> u64 {
+        plugin.max_retained_request_body_bytes_for_test()
+    }
+
+    pub fn request_mirror_mirror_timeout_ms_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> Option<u64> {
+        plugin.mirror_timeout_ms_for_test()
+    }
+
+    pub fn request_mirror_metrics_snapshot_for_test(
+        plugin: &crate::plugins::request_mirror::RequestMirror,
+    ) -> crate::plugins::request_mirror::MirrorMetricsSnapshot {
+        plugin.mirror_metrics_snapshot_for_test()
+    }
+
+    // ── plugins/api_chargeback_sink ──────────────────────────────────────────
+    pub fn api_chargeback_sink_snapshot_accumulator_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<Arc<crate::plugins::api_chargeback_sink::SnapshotAccumulator>> {
+        plugin.snapshot_accumulator_for_tests()
+    }
+
+    pub async fn api_chargeback_sink_finalize_snapshot_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<bool> {
+        plugin.finalize_snapshot_for_tests().await
+    }
+
+    pub async fn api_chargeback_sink_finalize_with_held_admission_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+        timeout: std::time::Duration,
+    ) -> Option<bool> {
+        plugin
+            .finalize_snapshot_with_held_admission_for_tests(timeout)
+            .await
+    }
+
+    pub fn api_chargeback_sink_snapshot_finalized_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<bool> {
+        plugin.snapshot_finalized_for_tests()
+    }
+
+    pub fn api_chargeback_sink_snapshot_generation_registered_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<bool> {
+        plugin.snapshot_generation_registered_for_tests()
+    }
+
+    pub fn api_chargeback_sink_force_compact_snapshot_finalization_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> bool {
+        plugin.force_compact_snapshot_finalization_for_tests()
+    }
+
+    pub fn api_chargeback_sink_snapshot_compact_recovery_registered_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<bool> {
+        plugin.snapshot_compact_recovery_registered_for_tests()
+    }
+
+    pub fn api_chargeback_sink_emit_snapshot_tick_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<Result<usize, String>> {
+        plugin.emit_snapshot_tick_for_tests()
+    }
+
+    pub fn api_chargeback_sink_spool_snapshot_overflow_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+        event: crate::plugins::api_chargeback_sink::ChargeEvent,
+    ) -> bool {
+        plugin.spool_snapshot_overflow_for_tests(event)
+    }
+
+    pub fn api_chargeback_sink_abort_spool_delivery_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> bool {
+        plugin.abort_spool_delivery_for_tests()
+    }
+
+    pub fn api_chargeback_sink_snapshot_overflow_counters_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(u64, u64, u64)> {
+        plugin.snapshot_overflow_counters_for_tests()
+    }
+
+    pub fn api_chargeback_sink_compact_refuses_while_overflow_delivery_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(bool, bool)> {
+        plugin.compact_refuses_while_overflow_delivery_then_succeeds_for_tests()
+    }
+
+    pub fn api_chargeback_sink_compact_refuses_while_admitted_then_succeeds_for_test(
+        plugin: &crate::plugins::api_chargeback_sink::ApiChargebackSink,
+    ) -> Option<(bool, bool)> {
+        plugin.compact_refuses_while_admitted_then_succeeds_for_tests()
     }
 
     // ── plugins/request_deduplication ─────────────────────────────────────────
@@ -1263,6 +1434,19 @@ pub mod _test_support {
         plugin.set_store_post_admit_hook_for_tests(hook);
     }
 
+    pub fn ai_semantic_cache_instance_id_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> u64 {
+        plugin.instance_id_for_tests()
+    }
+
+    pub fn ai_semantic_cache_staging_metadata_key_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        suffix: &str,
+    ) -> String {
+        plugin.staging_metadata_key_for_tests(suffix)
+    }
+
     // ── plugins/response_caching ─────────────────────────────────────────────
     /// Parse an HTTP-date the way `response_caching` does for conditional
     /// requests. Exposes the crate-private helper so tests can assert all
@@ -1716,6 +1900,7 @@ pub mod _test_support {
     }
 
     // ── plugins/utils/redis_rate_limiter ─────────────────────────────────────
+    pub use crate::plugins::utils::redis_rate_limiter::MAX_REDIS_POOL_SIZE;
     pub use crate::plugins::utils::redis_rate_limiter::RedisConfig;
     pub use crate::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
     pub use crate::plugins::utils::redis_rate_limiter::RedisWindowProgress;
@@ -1964,6 +2149,14 @@ pub mod _test_support {
         crate::config::db_loader::MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL
     }
 
+    pub fn mysql_config_change_lock_insert_sql() -> &'static str {
+        crate::config::db_loader::MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL
+    }
+
+    pub fn mysql_proxy_route_lock_insert_sql() -> &'static str {
+        crate::config::db_loader::MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL
+    }
+
     pub fn mtls_dns_policy_requires_consumer_load(
         config: &crate::config::types::GatewayConfig,
     ) -> bool {
@@ -1978,6 +2171,46 @@ pub mod _test_support {
 
     pub fn mongo_pipeline_update_unsupported(error: &mongodb::error::Error) -> bool {
         crate::config::mongo_store::MongoStore::pipeline_update_unsupported_for_test(error)
+    }
+
+    /// MongoDB timeout precedence (issue #2988): URI-parsed
+    /// `serverSelectionTimeoutMS`/`connectTimeoutMS` survive when the env
+    /// override is `None`, and are replaced only when explicitly set.
+    pub fn apply_mongo_timeout_overrides(
+        client_options: &mut mongodb::options::ClientOptions,
+        server_selection_timeout_secs: Option<u64>,
+        connect_timeout_secs: Option<u64>,
+    ) {
+        crate::config::mongo_store::apply_mongo_timeout_overrides(
+            client_options,
+            server_selection_timeout_secs,
+            connect_timeout_secs,
+        )
+    }
+
+    /// Consumer-identity ordered-insert prefix attribution (issue #2987): only
+    /// the prefix before the E11000 write-error index was inserted by this
+    /// attempt; `None` means attribution is unknown (retain everything).
+    pub fn ordered_insert_newly_inserted_prefix<T>(
+        values: &[T],
+        first_error_index: Option<usize>,
+    ) -> &[T] {
+        crate::config::mongo_store::ordered_insert_newly_inserted_prefix(values, first_error_index)
+    }
+
+    /// Consumer-identity adoption-failure release set (issue #2987): the
+    /// verifiable ordered-insert prefix plus vacant reservations this adoption
+    /// attempt inserted before failing — never pre-existing same-owner docs.
+    pub fn consumer_identity_adoption_failure_release_values(
+        ordered_values: &[String],
+        ordered_first_error_index: Option<usize>,
+        adoption_newly_inserted: &[String],
+    ) -> Vec<String> {
+        crate::config::mongo_store::consumer_identity_adoption_failure_release_values(
+            ordered_values,
+            ordered_first_error_index,
+            adoption_newly_inserted,
+        )
     }
 
     // ── plugins/grpc_web ─────────────────────────────────────────────────────
@@ -2845,31 +3078,55 @@ pub mod _test_support {
 
     // ── plugins/ai_semantic_cache staging fields ─────────────────────────────
     //
-    // `RequestContext::ai_semantic_cache_embedding` / `..._scope_key` are
+    // `RequestContext::ai_semantic_cache_embeddings` / `..._scope_keys` are
     // `pub(crate)` so the high-dimensional embedding vector and scope key cannot
-    // leak into transaction logs. The read-only accessors below let external
-    // unit tests assert that `exact_only` mode never stages either field for
-    // multimodal requests, without widening the fields to `pub`.
-    pub fn ai_semantic_cache_embedding(ctx: &crate::plugins::RequestContext) -> Option<&Vec<f32>> {
-        ctx.ai_semantic_cache_embedding.as_ref()
+    // leak into transaction logs. The accessors below let external unit tests
+    // assert per-instance staging (including `exact_only` multimodal skips)
+    // without widening the maps to `pub`.
+    pub fn ai_semantic_cache_embedding(
+        ctx: &crate::plugins::RequestContext,
+        instance_id: u64,
+    ) -> Option<&Vec<f32>> {
+        ctx.ai_semantic_cache_embeddings.get(&instance_id)
     }
 
-    pub fn ai_semantic_cache_scope_key(ctx: &crate::plugins::RequestContext) -> Option<&str> {
-        ctx.ai_semantic_cache_scope_key.as_deref()
+    pub fn ai_semantic_cache_scope_key(
+        ctx: &crate::plugins::RequestContext,
+        instance_id: u64,
+    ) -> Option<&str> {
+        ctx.ai_semantic_cache_scope_keys
+            .get(&instance_id)
+            .map(String::as_str)
     }
 
     pub fn set_ai_semantic_cache_embedding(
         ctx: &mut crate::plugins::RequestContext,
+        instance_id: u64,
         embedding: Option<Vec<f32>>,
     ) {
-        ctx.ai_semantic_cache_embedding = embedding;
+        match embedding {
+            Some(values) => {
+                ctx.ai_semantic_cache_embeddings.insert(instance_id, values);
+            }
+            None => {
+                ctx.ai_semantic_cache_embeddings.remove(&instance_id);
+            }
+        }
     }
 
     pub fn set_ai_semantic_cache_scope_key(
         ctx: &mut crate::plugins::RequestContext,
+        instance_id: u64,
         scope_key: Option<String>,
     ) {
-        ctx.ai_semantic_cache_scope_key = scope_key;
+        match scope_key {
+            Some(key) => {
+                ctx.ai_semantic_cache_scope_keys.insert(instance_id, key);
+            }
+            None => {
+                ctx.ai_semantic_cache_scope_keys.remove(&instance_id);
+            }
+        }
     }
 
     // ── WebSocket tunnel-mode disconnect hook ────────────────────────────────
@@ -3015,6 +3272,27 @@ pub mod _test_support {
         body.with_client_grpc_deadline(deadline, grpc_web_response_content_type)
     }
 
+    pub fn proxy_body_into_grpc_web_streaming_for_test(
+        body: crate::proxy::ProxyBody,
+        content_type: &str,
+        http_status: u16,
+        initial_terminal_metadata: Option<HashMap<String, String>>,
+    ) -> crate::proxy::ProxyBody {
+        body.into_grpc_web_streaming(content_type, http_status, initial_terminal_metadata)
+    }
+
+    pub fn take_streaming_initial_terminal_metadata_for_test(
+        response_headers: &mut HashMap<String, String>,
+        body_ended: bool,
+        pristine_terminal_names: &HashSet<String>,
+    ) -> HashMap<String, String> {
+        crate::plugins::grpc_web::take_streaming_initial_terminal_metadata(
+            response_headers,
+            body_ended,
+            Some(pristine_terminal_names),
+        )
+    }
+
     pub async fn finalized_upload_deadline_response_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -3089,8 +3367,20 @@ pub mod _test_support {
         max_plaintext: usize,
     ) -> Result<(&'static str, usize), String> {
         use crate::plugins::udp_logging::DtlsBatchSizeDecision;
-        let entries: Vec<crate::plugins::utils::SummaryLogEntry> =
-            summaries.iter().map(Into::into).collect();
+        use crate::plugins::utils::ByteBudget;
+        use crate::plugins::utils::byte_budget::accounted_summary_bytes;
+        use crate::plugins::utils::summary_log_budget::serialize_under_byte_budget;
+        const HARD_MAX: usize = 16 * 1024 * 1024;
+        let aggregate_budget =
+            accounted_summary_bytes(HARD_MAX).saturating_mul(summaries.len().max(1));
+        let budget = ByteBudget::new("udp_logging_test", aggregate_budget);
+        let mut entries = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            let Some(payload) = serialize_under_byte_budget(&budget, HARD_MAX, summary) else {
+                return Err("udp_logging test helper failed to serialize summary".to_string());
+            };
+            entries.push(payload);
+        }
         let (decision, payload_len) =
             crate::plugins::udp_logging::classify_serialized_dtls_batch_for_test(
                 &entries,

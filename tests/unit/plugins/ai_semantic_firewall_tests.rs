@@ -4323,6 +4323,7 @@ async fn gateway_encoding_rewrite_preserves_plaintext_firewall_inspection() {
     .unwrap();
     let mut headers = HashMap::from([("content-type".to_string(), "application/json".to_string())]);
     let mut ctx = create_test_context();
+    ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
     ctx.headers
         .insert("accept-encoding".to_string(), "br".to_string());
     assert_continue(compression.after_proxy(&mut ctx, 200, &mut headers).await);
@@ -4373,6 +4374,7 @@ async fn gateway_compressed_oversized_non_candidate_skips_final_decode() {
         ("content-length".to_string(), plaintext.len().to_string()),
     ]);
     let mut ctx = create_test_context();
+    ctx.max_response_body_size_bytes = 16 * 1024 * 1024;
     ctx.headers
         .insert("accept-encoding".to_string(), "gzip".to_string());
 

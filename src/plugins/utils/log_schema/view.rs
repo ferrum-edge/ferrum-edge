@@ -15,7 +15,6 @@ use super::{
     CollisionMode, DerivedKind, FieldSpec, HTTP_FIELDS, MetadataPolicy, STREAM_FIELDS,
     SummarySchema, TimestampFormat,
 };
-use crate::plugins::utils::log_helpers::SummaryLogEntry;
 use crate::plugins::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use crate::plugins::{StreamTransactionSummary, TransactionSummary};
 
@@ -628,76 +627,6 @@ where
             prefix,
             on_collision,
         } => flatten_metadata(metadata, prefix.as_deref(), *on_collision, emitted, map),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SummaryLogEntry view (for batched logging plugins)
-// ---------------------------------------------------------------------------
-
-/// Wraps a [`SummaryLogEntry`] with a schema; dispatches to the right
-/// [`SchemaView`] based on the variant. When the schema's `summary_type`
-/// doesn't cover this entry's variant, the entry is serialized in its
-/// native format (the schema only customizes types it claims to handle).
-pub struct SummaryLogEntryView<'a> {
-    pub entry: &'a SummaryLogEntry,
-    pub schema: &'a SummarySchema,
-}
-
-impl<'a> Serialize for SummaryLogEntryView<'a> {
-    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        match self.entry {
-            SummaryLogEntry::Http(summary) => {
-                if self.schema.applies_to_http() {
-                    SchemaView {
-                        summary,
-                        schema: self.schema,
-                    }
-                    .serialize(ser)
-                } else {
-                    summary.serialize(ser)
-                }
-            }
-            SummaryLogEntry::Stream(summary) => {
-                if self.schema.applies_to_stream() {
-                    SchemaView {
-                        summary,
-                        schema: self.schema,
-                    }
-                    .serialize(ser)
-                } else {
-                    summary.serialize(ser)
-                }
-            }
-        }
-    }
-}
-
-/// Wraps a slice of [`SummaryLogEntry`] values for batched logging
-/// plugins (`http_logging`, `udp_logging`, `ws_logging`). Each entry is
-/// rendered through [`SummaryLogEntryView`] when a schema is provided.
-pub struct SummaryLogEntryBatchView<'a> {
-    pub entries: &'a [SummaryLogEntry],
-    pub schema: Option<&'a SummarySchema>,
-}
-
-impl<'a> Serialize for SummaryLogEntryBatchView<'a> {
-    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq;
-        let mut seq = ser.serialize_seq(Some(self.entries.len()))?;
-        match self.schema {
-            Some(schema) => {
-                for entry in self.entries {
-                    seq.serialize_element(&SummaryLogEntryView { entry, schema })?;
-                }
-            }
-            None => {
-                for entry in self.entries {
-                    seq.serialize_element(entry)?;
-                }
-            }
-        }
-        seq.end()
     }
 }
 

@@ -267,23 +267,35 @@ fn test_gateway_overhead_computation_no_backend() {
     summary.latency_plugin_execution_ms = 4.0;
     summary.latency_backend_total_ms = -1.0;
     summary.latency_backend_ttfb_ms = 0.0;
-    // For rejected requests: overhead = total - plugin_execution = 6.0
-    summary.latency_gateway_overhead_ms =
-        summary.latency_total_ms - summary.latency_plugin_execution_ms;
+    summary.response_streamed = false;
+    let (processing, overhead) = TransactionSummary::derive_gateway_latencies(
+        summary.latency_total_ms,
+        summary.latency_backend_total_ms,
+        summary.latency_plugin_execution_ms,
+        summary.response_streamed,
+    );
+    summary.latency_gateway_processing_ms = processing;
+    summary.latency_gateway_overhead_ms = overhead;
 
+    assert!((summary.latency_gateway_processing_ms - 10.0).abs() < 0.001);
     assert!((summary.latency_gateway_overhead_ms - 6.0).abs() < 0.001);
 }
 
 #[test]
 fn test_gateway_overhead_computation_with_backend() {
-    // overhead = total - max(backend, 0) - plugin_execution
+    // overhead = total - backend - plugin_execution
     let mut summary = make_full_summary();
     summary.latency_total_ms = 100.0;
     summary.latency_backend_total_ms = 80.0;
     summary.latency_plugin_execution_ms = 5.0;
-    summary.latency_gateway_overhead_ms = summary.latency_total_ms
-        - summary.latency_backend_total_ms.max(0.0)
-        - summary.latency_plugin_execution_ms;
+    summary.response_streamed = false;
+    let (_processing, overhead) = TransactionSummary::derive_gateway_latencies(
+        summary.latency_total_ms,
+        summary.latency_backend_total_ms,
+        summary.latency_plugin_execution_ms,
+        summary.response_streamed,
+    );
+    summary.latency_gateway_overhead_ms = overhead;
 
     assert!((summary.latency_gateway_overhead_ms - 15.0).abs() < 0.001);
 }
@@ -297,12 +309,27 @@ fn test_gateway_overhead_with_external_io() {
     summary.latency_backend_total_ms = 50.0;
     summary.latency_plugin_execution_ms = 30.0;
     summary.latency_plugin_external_io_ms = 25.0; // 25ms of the 30ms was external HTTP
-    summary.latency_gateway_overhead_ms = summary.latency_total_ms
-        - summary.latency_backend_total_ms.max(0.0)
-        - summary.latency_plugin_execution_ms;
+    summary.response_streamed = false;
+    let (_processing, overhead) = TransactionSummary::derive_gateway_latencies(
+        summary.latency_total_ms,
+        summary.latency_backend_total_ms,
+        summary.latency_plugin_execution_ms,
+        summary.response_streamed,
+    );
+    summary.latency_gateway_overhead_ms = overhead;
 
     // overhead = 100 - 50 - 30 = 20ms (external_io is informational, not subtracted separately)
     assert!((summary.latency_gateway_overhead_ms - 20.0).abs() < 0.001);
+}
+
+#[test]
+fn test_streaming_unknown_backend_total_keeps_gateway_sentinel() {
+    // Issue #2532: streamed body lifetime must not become gateway overhead
+    // merely because backend total uses the unknown sentinel.
+    let (processing, overhead) =
+        TransactionSummary::derive_gateway_latencies(10_000.0, -1.0, 1.0, true);
+    assert_eq!(processing, -1.0);
+    assert_eq!(overhead, -1.0);
 }
 
 #[test]

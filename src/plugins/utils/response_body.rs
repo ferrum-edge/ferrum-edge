@@ -163,10 +163,11 @@ pub async fn read_response_body_bounded(
 /// retaining the bytes, aborting as soon as the running total exceeds
 /// `max_bytes`.
 ///
-/// Used by `request_mirror` when the upstream response has no
-/// `content-length`: the response body is otherwise discarded (only the size
-/// is reported in mirror metadata), so allocating the buffer is wasteful and
-/// counterproductive — we just need a bounded size.
+/// Used by `request_mirror` for discard-only sizing of mirror responses: the
+/// response body is otherwise discarded (only the size is reported in mirror
+/// metadata), so allocating the buffer is wasteful — we just need a bounded
+/// size. Callers with `Content-Length` still drain through this helper (or an
+/// equivalent timeout wrapper) so pooled connections can be reclaimed.
 ///
 /// Returns the total size on success, or `BoundedReadError::LimitExceeded`
 /// once the threshold is crossed (the stream is cancelled at that point).

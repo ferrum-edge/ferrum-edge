@@ -713,6 +713,10 @@ This separation means you can configure the breaker to trip on connection errors
 - **Connection errors only**: `trip_on_connection_errors: true` with `failure_status_codes: []`
 - **Status codes only**: `trip_on_connection_errors: false` with `failure_status_codes: [500, 503]`
 
+**Cache bound (`FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES`):**
+
+Breakers are cached per `proxy_id` (direct backend) or `proxy_id::host:port` (upstream/target). Concurrent callers for the same key and config share one breaker instance. When the cache is at capacity, requests for **new** keys still proceed with a transient (uncached) breaker that does not retain state across requests and does not grow the map; entries already in the cache remain replaceable when their config changes.
+
 ## Configuration Reference
 
 ### Complete YAML Example

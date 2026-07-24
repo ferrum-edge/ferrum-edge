@@ -94,7 +94,7 @@
 //! path emits — response status, bytes streamed, body completion state,
 //! client-disconnected flag, and error classifications.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -144,7 +144,14 @@ pub struct CrossProtocolOutcome {
     pub connection_error: bool,
     pub error_class: Option<ErrorClass>,
     pub body_error_class: Option<ErrorClass>,
+    /// Full backend interaction duration when known (buffered / non-streamed).
+    /// For streamed responses the H3 summary builder ignores this in favor of
+    /// [`crate::plugins::LATENCY_UNKNOWN_MS`] so concurrent body/client
+    /// lifetime is not misattributed.
     pub backend_total_ms: f64,
+    /// Backend time-to-first-byte (admission → response headers). Preserved
+    /// for streamed responses where `backend_total_ms` is unknown.
+    pub backend_ttfb_ms: f64,
     /// The bridge already emitted the finalized rejection transaction through
     /// `log_rejected_request`; the H3 frontend must not emit a duplicate generic
     /// transaction summary for the same request.
@@ -310,6 +317,7 @@ fn cross_protocol_header_write_disconnect_outcome(
         error_class: None,
         body_error_class: Some(ErrorClass::ClientDisconnect),
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     }
 }
@@ -2847,6 +2855,12 @@ where
                                 ctx,
                                 &mut response_headers,
                             );
+                        } else {
+                            crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                                ctx,
+                                &mut response_headers,
+                                response_body.len(),
+                            );
                         }
                         ctx.record_deadline_response_header_plugin(
                             plugin.as_ref(),
@@ -3031,6 +3045,7 @@ where
                         error_class: None,
                         body_error_class: Some(ErrorClass::ClientDisconnect),
                         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+                        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                         rejection_logged: false,
                     });
                 }
@@ -3086,6 +3101,7 @@ where
                 Some(ErrorClass::ClientDisconnect)
             },
             backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+            backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
             rejection_logged: false,
         });
     }
@@ -3211,6 +3227,7 @@ where
                     error_class: None,
                     body_error_class: Some(ErrorClass::ClientDisconnect),
                     backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+                    backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
                     rejection_logged: false,
                 });
             }
@@ -3256,6 +3273,7 @@ where
         error_class: None,
         body_error_class,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_admission_elapsed.as_secs_f64() * 1000.0,
         rejection_logged: false,
     })
 }
@@ -3481,6 +3499,27 @@ where
         outcome.backend_resolved_ip = final_backend_resolved_ip.clone();
         return Ok(outcome);
     }
+    let grpc_web_body_ended = http_body::Body::is_end_stream(&streaming.body);
+    // Capture TTFB at header availability — before body relay / client
+    // backpressure can inflate admission-start elapsed.
+    let backend_ttfb_ms = backend_admission_start.elapsed().as_secs_f64() * 1000.0;
+    let pristine_grpc_web_trailers_only_terminal_metadata =
+        (crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) && grpc_web_body_ended)
+            .then(|| {
+                crate::proxy::grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(
+                    &streaming.headers,
+                )
+            });
+    let pristine_grpc_web_terminal_names =
+        (crate::plugins::grpc_web::request_is_grpc_web_translated(ctx) && grpc_web_body_ended)
+            .then(|| {
+                streaming
+                    .headers
+                    .keys()
+                    .cloned()
+                    .collect::<HashSet<String>>()
+            });
+
     // Streaming variant: pool returned a live hyper Incoming. Run
     // after_proxy + sticky cookie on headers BEFORE streaming
     // begins — body-level hooks (`on_response_body`,
@@ -3575,6 +3614,24 @@ where
         sticky_cookie_needed,
         &mut streaming.headers,
     );
+    let grpc_web_content_type = crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
+        .then(|| crate::plugins::grpc_web::retained_response_content_type(ctx))
+        .flatten()
+        .map(str::to_owned);
+    let grpc_web_translation_mode = grpc_web_content_type
+        .as_deref()
+        .filter(|_| crate::plugins::response_body_rewrite_allowed(streaming.status))
+        .map(crate::plugins::grpc_web::is_grpc_web_text);
+    if grpc_web_translation_mode.is_some() {
+        // Match the shared H1/H2 boundary: policies cannot manufacture or
+        // replace terminal status in initial headers. Restore only a pristine
+        // Trailers-Only status from an initial END_STREAM block.
+        crate::proxy::grpc_proxy::apply_buffered_grpc_initial_response_policy(
+            None,
+            &mut streaming.headers,
+            pristine_grpc_web_trailers_only_terminal_metadata.as_ref(),
+        );
+    }
     // Hooks may rewrite/remove a Trailers-Only status. Record their final
     // client-visible header result now; a real terminal trailer wins below.
     let client_header_grpc_status = streaming
@@ -3586,6 +3643,16 @@ where
         &HashMap::new(),
         &streaming.headers,
     );
+    let mut grpc_web_initial_terminal_metadata = grpc_web_translation_mode.map(|_| {
+        crate::plugins::grpc_web::take_streaming_initial_terminal_metadata(
+            &mut streaming.headers,
+            grpc_web_body_ended,
+            pristine_grpc_web_terminal_names.as_ref(),
+        )
+    });
+    if grpc_web_initial_terminal_metadata.is_some() {
+        streaming.headers.remove("content-length");
+    }
 
     // The body relay may replace an empty backend stream with terminal
     // deadline trailers. Do not commit the backend's declared length across
@@ -3640,7 +3707,7 @@ where
     let coalesce = CoalesceConfig::from_state(state);
     let max_resp_bytes = state.max_response_body_size_bytes;
     let (
-        bytes_streamed,
+        mut bytes_streamed,
         body_completed,
         client_disconnected,
         body_error_class,
@@ -3653,6 +3720,7 @@ where
         max_resp_bytes,
         streaming.response_read_timeout_ms,
         streaming.grpc_deadline_at,
+        grpc_web_translation_mode,
     )
     .await;
 
@@ -3681,6 +3749,68 @@ where
         // Suppress the (possibly successful) backend status on an oversized upload.
         crate::http3::stream_util::abort_response_stream(stream);
         final_body_completed = false;
+    } else if body_completed && let Some(text_mode) = grpc_web_translation_mode {
+        let mut collected = grpc_web_initial_terminal_metadata
+            .take()
+            .unwrap_or_default();
+        if let Some(mut trailers) = trailers {
+            strip_response_hop_by_hop_trailers(&mut trailers);
+            collected.clear();
+            crate::proxy::grpc_proxy::collect_buffered_grpc_trailers(&trailers, &mut collected);
+        }
+        let (terminal_data, terminal_status) =
+            crate::plugins::grpc_web::build_streaming_trailer_data(
+                &collected,
+                streaming.status,
+                text_mode,
+            );
+        grpc_trailer_status = Some(terminal_status);
+        let terminal_len = terminal_data.len() as u64;
+        let terminal_write = if client_deadline_expired {
+            crate::http3::stream_util::await_terminal_response_write_before_deadline(
+                streaming.grpc_deadline_at,
+                stream.send_data(terminal_data),
+            )
+            .await
+        } else {
+            crate::http3::stream_util::await_response_write_before_deadline(
+                streaming.grpc_deadline_at,
+                stream.send_data(terminal_data),
+            )
+            .await
+        };
+        let terminal_and_finish = match terminal_write {
+            Ok(()) if client_deadline_expired => {
+                bytes_streamed += terminal_len;
+                crate::http3::stream_util::await_terminal_response_write_before_deadline(
+                    streaming.grpc_deadline_at,
+                    stream.finish(),
+                )
+                .await
+            }
+            Ok(()) => {
+                bytes_streamed += terminal_len;
+                crate::http3::stream_util::await_response_write_before_deadline(
+                    streaming.grpc_deadline_at,
+                    stream.finish(),
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = terminal_and_finish {
+            if matches!(
+                error,
+                crate::http3::stream_util::H3ResponseWriteError::DeadlineExceeded
+            ) {
+                client_deadline_expired = true;
+                crate::http3::stream_util::abort_response_stream(stream);
+            } else {
+                final_client_disconnected = true;
+                warn!("H3 gRPC-Web streaming terminal frame write failed");
+            }
+            final_body_completed = false;
+        }
     } else if body_completed && let Some(mut trailers) = trailers {
         grpc_trailer_status = trailers.get("grpc-status").map(|value| {
             value.to_str().map_or(u32::MAX, |value| {
@@ -3845,6 +3975,7 @@ where
         error_class: None,
         body_error_class: outcome_error_class,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms,
         rejection_logged: false,
     })
 }
@@ -4812,6 +4943,12 @@ where
                             &mut plugin_response_headers,
                         );
                         representation_rewritten = true;
+                    } else {
+                        crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                            ctx,
+                            &mut plugin_response_headers,
+                            response_body.len(),
+                        );
                     }
                     ctx.record_deadline_response_header_plugin(
                         plugin.as_ref(),
@@ -5233,6 +5370,7 @@ where
                     Some(ErrorClass::ClientDisconnect)
                 },
                 backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+                backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
                 rejection_logged: false,
             })
         }
@@ -6225,6 +6363,7 @@ async fn stream_hyper_incoming<S>(
     max_response_body_size_bytes: usize,
     response_read_timeout_ms: u64,
     grpc_deadline_at: Option<tokio::time::Instant>,
+    grpc_web_translation_mode: Option<bool>,
 ) -> (u64, bool, bool, Option<ErrorClass>, Option<HeaderMap>, bool)
 where
     // Send-only: this loop writes the response (`send_data` / `finish` /
@@ -6372,10 +6511,16 @@ where
                                 data_len,
                                 coalesce.min_bytes,
                             ) {
-                                if !await_downstream_write!(stream.send_data(data)) {
+                                let out = if let Some(text_mode) = grpc_web_translation_mode {
+                                    crate::plugins::grpc_web::encode_streaming_data(data, text_mode)
+                                } else {
+                                    data
+                                };
+                                let out_len = out.len() as u64;
+                                if !await_downstream_write!(stream.send_data(out)) {
                                     break 'outer;
                                 }
-                                bytes_streamed += data_len as u64;
+                                bytes_streamed += out_len;
                                 flush_timer
                                     .as_mut()
                                     .reset(tokio::time::Instant::now() + coalesce.flush_interval);
@@ -6385,6 +6530,11 @@ where
                             coalesce_buf.extend_from_slice(&data);
                             if coalesce_buf.len() >= coalesce.min_bytes {
                                 let out = coalesce_buf.split().freeze();
+                                let out = if let Some(text_mode) = grpc_web_translation_mode {
+                                    crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
+                                } else {
+                                    out
+                                };
                                 let out_len = out.len() as u64;
                                 if !await_downstream_write!(stream.send_data(out)) {
                                     break 'outer;
@@ -6413,6 +6563,11 @@ where
             }
             _ = &mut flush_timer, if !coalesce_buf.is_empty() && !stream_done => {
                 let out = coalesce_buf.split().freeze();
+                let out = if let Some(text_mode) = grpc_web_translation_mode {
+                    crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
+                } else {
+                    out
+                };
                 let out_len = out.len() as u64;
                 if !await_downstream_write!(stream.send_data(out)) {
                     break 'outer;
@@ -6435,6 +6590,11 @@ where
         if stream_done {
             if !coalesce_buf.is_empty() {
                 let out = coalesce_buf.split().freeze();
+                let out = if let Some(text_mode) = grpc_web_translation_mode {
+                    crate::plugins::grpc_web::encode_streaming_data(out, text_mode)
+                } else {
+                    out
+                };
                 let out_len = out.len() as u64;
                 if !await_downstream_write!(stream.send_data(out)) {
                     break 'outer;
@@ -6445,7 +6605,8 @@ where
             // HEADERS and FIN. Empty trailers are equivalent to absent here:
             // no trailers frame is needed, but the QUIC stream still must be
             // closed with FIN.
-            if should_finish_h3_stream_without_trailers(trailers.as_ref())
+            if grpc_web_translation_mode.is_none()
+                && should_finish_h3_stream_without_trailers(trailers.as_ref())
                 && let Err(error) = crate::http3::stream_util::await_response_write_before_deadline(
                     grpc_deadline_at,
                     stream.finish(),
@@ -6640,6 +6801,7 @@ where
         error_class: None,
         body_error_class: None,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     })
 }
@@ -6896,6 +7058,7 @@ where
         error_class: None,
         body_error_class: None,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     })
 }
@@ -6929,6 +7092,7 @@ fn terminal_deadline_write_aborted_outcome(
         error_class: None,
         body_error_class: client_disconnected.then_some(ErrorClass::ClientDisconnect),
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     }
 }
@@ -7232,6 +7396,7 @@ where
         error_class: None,
         body_error_class: None,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     })
 }
@@ -7561,6 +7726,7 @@ where
         error_class: None,
         body_error_class: None,
         backend_total_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
+        backend_ttfb_ms: backend_start.elapsed().as_secs_f64() * 1000.0,
         rejection_logged: false,
     })
 }

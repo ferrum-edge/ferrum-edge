@@ -17,8 +17,8 @@
 //! `allow_unknown_revocation_status() + only_check_end_entity_revocation()`
 //! policy, matching the proxy backend / DTLS / frontend mTLS surfaces.
 //!
-//! Supports both HTTP and stream (TCP/UDP) transaction summaries via the
-//! `LogEntry` union type, matching the http_logging plugin's behavior.
+//! Supports both HTTP and stream (TCP/UDP) transaction summaries, matching the
+//! http_logging plugin's behavior.
 
 use async_trait::async_trait;
 use rustls::pki_types::{CertificateRevocationListDer, ServerName};
@@ -27,14 +27,15 @@ use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::Duration;
-use tracing::warn;
 
-use super::utils::log_schema::{
-    SchemaCapabilities, SummaryLogEntryView, SummarySchema, resolve_schema,
-};
+use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema};
+#[cfg(test)]
+use super::utils::summary_log_budget::serialize_under_byte_budget;
 use super::utils::{
-    BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, PluginHttpClient, SummaryLogEntry,
-    build_batch_config, parse_socket_host, resolve_tcp_endpoint, validate_batch_config,
+    BatchConfig, BatchConfigDefaults, ByteBudget, DeferredBatchingLogger, PluginHttpClient,
+    QueuedSummaryPayload, admit_byte_limits, admit_http_summary, admit_stream_summary,
+    assemble_ndjson, build_batch_config, parse_socket_host, resolve_tcp_endpoint,
+    validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary};
 use crate::dns::DnsCache;
@@ -52,9 +53,11 @@ const MAX_TIMEOUT_MS: u64 = 60_000;
 pub const TCP_LOGGING_CONFIG_KEYS: &[&str] = &[
     "batch_size",
     "buffer_capacity",
+    "buffer_max_bytes",
     "connect_timeout_ms",
     "flush_interval_ms",
     "host",
+    "max_entry_bytes",
     "max_retries",
     "port",
     "retry_delay_ms",
@@ -90,15 +93,17 @@ struct TcpFlushConfig {
     /// when the plugin was constructed via the test/fallback `PluginHttpClient`
     /// path that has no cache attached.
     dns_cache: Option<DnsCache>,
-    schema: Option<Arc<SummarySchema>>,
 }
 
 pub struct TcpLogging {
     batch_config: BatchConfig,
     flush_config: TcpFlushConfig,
     writer: Arc<Mutex<Option<TcpWriter>>>,
-    logger: DeferredBatchingLogger<SummaryLogEntry>,
+    logger: DeferredBatchingLogger<QueuedSummaryPayload>,
     endpoint_hostname: Option<String>,
+    schema: Option<Arc<SummarySchema>>,
+    byte_budget: Arc<ByteBudget>,
+    max_entry_bytes: usize,
 }
 
 impl TcpLogging {
@@ -158,6 +163,7 @@ impl TcpLogging {
             min_retry_delay_ms: 0,
         };
         validate_batch_config(config, "tcp_logging", batch_defaults)?;
+        let limits = admit_byte_limits(config, "tcp_logging")?;
 
         let schema = resolve_schema(config, "tcp_logging", SchemaCapabilities::BASE)?;
         // Build the TLS connector and parse the effective server name once on
@@ -190,7 +196,6 @@ impl TcpLogging {
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             write_timeout: Duration::from_millis(write_timeout_ms),
             dns_cache: http_client.dns_cache().cloned(),
-            schema,
         };
 
         Ok(Self {
@@ -199,6 +204,9 @@ impl TcpLogging {
             writer: Arc::new(Mutex::new(None)),
             logger: DeferredBatchingLogger::new(),
             endpoint_hostname: socket_host.warmup_hostname,
+            schema,
+            byte_budget: Arc::new(ByteBudget::new("tcp_logging", limits.buffer_max_bytes)),
+            max_entry_bytes: limits.max_entry_bytes,
         })
     }
 }
@@ -289,11 +297,23 @@ impl Plugin for TcpLogging {
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        self.logger.try_send(summary.into());
+        admit_stream_summary(
+            &self.logger,
+            &self.byte_budget,
+            self.max_entry_bytes,
+            summary,
+            self.schema.as_deref(),
+        );
     }
 
     async fn log(&self, summary: &TransactionSummary) {
-        self.logger.try_send(summary.into());
+        admit_http_summary(
+            &self.logger,
+            &self.byte_budget,
+            self.max_entry_bytes,
+            summary,
+            self.schema.as_deref(),
+        );
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -476,40 +496,9 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
 async fn send_batch(
     cfg: &TcpFlushConfig,
     writer_state: &Mutex<Option<TcpWriter>>,
-    batch: Vec<SummaryLogEntry>,
+    batch: Vec<QueuedSummaryPayload>,
 ) -> Result<(), String> {
-    let mut payload = Vec::with_capacity(batch.len() * 256);
-    let mut dropped = 0usize;
-    let mut first_error: Option<String> = None;
-    for entry in &batch {
-        let result = match cfg.schema.as_deref() {
-            Some(schema) => serde_json::to_vec(&SummaryLogEntryView { entry, schema }),
-            None => serde_json::to_vec(entry),
-        };
-        match result {
-            Ok(json) => {
-                payload.extend_from_slice(&json);
-                payload.push(b'\n');
-            }
-            Err(error) => {
-                // Skip only the bad entry and keep shipping the rest, but
-                // surface the loss instead of swallowing it silently (the UDP
-                // sink already warns on serialize failure). Aggregate per batch
-                // so a recurring bad entry shape cannot flood the logs:
-                // `send_batch` runs at most once per flush interval.
-                dropped += 1;
-                if first_error.is_none() {
-                    first_error = Some(error.to_string());
-                }
-            }
-        }
-    }
-    if let Some(error) = first_error {
-        warn!(
-            dropped_entries = dropped,
-            "tcp_logging: dropped log entries that failed to serialize: {error}"
-        );
-    }
+    let payload = assemble_ndjson(&batch);
 
     let mut connection = writer_state
         .lock()
@@ -791,7 +780,6 @@ mod tests {
             connect_timeout: Duration::from_secs(2),
             write_timeout: Duration::from_secs(2),
             dns_cache: None,
-            schema: None,
         };
         let result = connect_tcp(&cfg).await;
         let err = match result {
@@ -838,7 +826,6 @@ mod tests {
             connect_timeout: Duration::from_secs(2),
             write_timeout: Duration::from_secs(2),
             dns_cache: None,
-            schema: None,
         };
         let result = connect_tcp(&cfg).await;
         assert!(
@@ -884,7 +871,6 @@ mod tests {
             connect_timeout: Duration::from_millis(200),
             write_timeout: Duration::from_secs(2),
             dns_cache: None,
-            schema: None,
         };
 
         let started = tokio::time::Instant::now();
@@ -970,7 +956,6 @@ mod tests {
             connect_timeout: Duration::from_secs(2),
             write_timeout: Duration::from_millis(200),
             dns_cache: None,
-            schema: None,
         };
         let mut stalled_writer = must(
             connect_tcp(&stalled_cfg).await,
@@ -982,13 +967,18 @@ mod tests {
         // Larger than the shrunk send/recv windows so write_all blocks against
         // a non-reading peer and hits write_timeout_ms.
         let huge = "x".repeat(256 * 1024);
-        let batch = vec![SummaryLogEntry::Http(TransactionSummary {
+        let budget = ByteBudget::new("tcp_logging_test", 4 * 1024 * 1024);
+        let summary = TransactionSummary {
             client_ip: "127.0.0.1".to_string(),
             http_method: "GET".to_string(),
             request_path: format!("/{huge}"),
             response_status_code: 200,
             ..TransactionSummary::default()
-        })];
+        };
+        let batch = vec![
+            serialize_under_byte_budget(&budget, 1024 * 1024, &summary)
+                .expect("test payload must serialize"),
+        ];
 
         let started = tokio::time::Instant::now();
         let stalled_err = match send_batch(&stalled_cfg, &writer, batch).await {
@@ -1016,15 +1006,18 @@ mod tests {
             connect_timeout: Duration::from_secs(2),
             write_timeout: Duration::from_secs(2),
             dns_cache: None,
-            schema: None,
         };
-        let small_batch = vec![SummaryLogEntry::Http(TransactionSummary {
+        let small_summary = TransactionSummary {
             client_ip: "127.0.0.1".to_string(),
             http_method: "GET".to_string(),
             request_path: "/ok".to_string(),
             response_status_code: 200,
             ..TransactionSummary::default()
-        })];
+        };
+        let small_batch = vec![
+            serialize_under_byte_budget(&budget, 1024 * 1024, &small_summary)
+                .expect("small test payload must serialize"),
+        ];
         must(
             send_batch(&healthy_cfg, &writer, small_batch).await,
             "healthy collector must accept the reconnecting send",

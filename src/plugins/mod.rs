@@ -1600,6 +1600,38 @@ pub(crate) struct WafInstanceScoreState {
     pub(crate) score: u32,
 }
 
+/// Exclusive compression codec admission permit held on a request context.
+///
+/// Clones are empty so `RequestContext`'s derived `Clone` stays valid: the
+/// permit is unique and must be transferred with `take()` / `mem::take` when a
+/// compatibility clone needs to own the reserved slot.
+#[derive(Default)]
+struct HeldCodecPermit(Option<tokio::sync::OwnedSemaphorePermit>);
+
+impl std::fmt::Debug for HeldCodecPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("HeldCodecPermit")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+impl Clone for HeldCodecPermit {
+    fn clone(&self) -> Self {
+        Self(None)
+    }
+}
+
+impl HeldCodecPermit {
+    fn set(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
+        self.0 = Some(permit);
+    }
+
+    fn take(&mut self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.0.take()
+    }
+}
+
 /// Context passed through the plugin pipeline for a single request.
 ///
 /// Headers and query parameters are lazily materialized to avoid per-request
@@ -1796,12 +1828,15 @@ pub struct RequestContext {
     /// the shared reject finalizer can remove transport-owned handshake fields
     /// after every ordered response hook without reclassifying or allocating.
     websocket_response_boundary: bool,
-    /// Semantic-cache embedding vector staged between `before_proxy` and
-    /// `on_final_response_body`. Kept out of `metadata` so high-dimensional
-    /// vectors cannot enter transaction logs.
-    pub(crate) ai_semantic_cache_embedding: Option<Vec<f32>>,
-    /// Semantic-cache scope key paired with `ai_semantic_cache_embedding`.
-    pub(crate) ai_semantic_cache_scope_key: Option<String>,
+    /// Per-`ai_semantic_cache`-instance embedding vectors staged between
+    /// `before_proxy` and `on_final_response_body`. Kept out of `metadata` so
+    /// high-dimensional vectors cannot enter transaction logs. The outer key is
+    /// a process-unique cache instance ID so sibling instances on one proxy
+    /// cannot overwrite or consume each other's staged vectors.
+    pub(crate) ai_semantic_cache_embeddings: HashMap<u64, Vec<f32>>,
+    /// Per-instance semantic-cache scope keys paired with
+    /// `ai_semantic_cache_embeddings`.
+    pub(crate) ai_semantic_cache_scope_keys: HashMap<u64, String>,
     /// OpenAPI validator operation matches staged between `before_proxy` and
     /// final body hooks. Kept out of public metadata so per-instance state does
     /// not leak into transaction logs.
@@ -1920,6 +1955,34 @@ pub struct RequestContext {
     /// encode. This remains private for the same ownership and allocation
     /// reasons as `compression_request_decode_owner`.
     compression_response_encode_owner: Option<u64>,
+    /// Process-local compression instance that reserved response codec admission
+    /// in `before_proxy`, before the response-buffer decision. First-wins across
+    /// sibling instances so at most one response permit is held per request. The
+    /// reservation is what bounds the population of response bodies admitted onto
+    /// the compression-only buffered path; `after_proxy` consumes this instance's
+    /// reserved permit rather than acquiring a fresh one on the hot path.
+    compression_response_admission_owner: Option<u64>,
+    /// Set when `before_proxy` negotiated a compressible coding but could not
+    /// obtain bounded codec admission. The response then streams identity (or
+    /// fails closed with 406 when identity is prohibited) instead of buffering
+    /// for a compression it cannot run; `after_proxy` must not reacquire.
+    compression_response_admission_declined: bool,
+    /// Reserved codec CPU admission permit for gateway response compression.
+    /// Reserved in `before_proxy` before the response-buffer decision and moved
+    /// into the `spawn_blocking` closure during the body transform. Drop
+    /// releases the slot if the transform never runs (cancellation). Clones
+    /// do not duplicate the exclusive permit.
+    compression_response_codec_permit: HeldCodecPermit,
+    /// Validated plaintext staged by the rare buffered request-decode fallback
+    /// (headers stripped in `before_proxy` without a mutable body view). The
+    /// owning transform must emit these bytes so the backend never sees a
+    /// compressed body without `Content-Encoding`.
+    compression_staged_request_plaintext: Option<Vec<u8>>,
+    /// Set when the response-encode owner cannot produce bytes that match a
+    /// previously committed gateway `Content-Encoding`. Shared transform loops
+    /// must restore an identity representation (or otherwise fail closed)
+    /// instead of forwarding plaintext under a coded header.
+    compression_response_encode_aborted: bool,
     /// Process-unique id for an attached response-stream inspector chain.
     /// Assigned only after at least one configured plugin opts into streaming
     /// hooks for the response, and cleared again when every factory returns
@@ -2016,10 +2079,16 @@ pub struct RequestContext {
     /// times these hooks inline. Clone-safe via Arc; stays 0 on the H3 path
     /// (which never calls the finalizer), so it never double-counts there.
     pub reject_hook_execution_ns: Arc<std::sync::atomic::AtomicU64>,
-    /// Receiver for mirror response metadata from the `request_mirror` plugin.
-    /// Set by the plugin in `before_proxy`; collected before building
-    /// `TransactionSummary` so all logging plugins receive mirror results.
-    pub mirror_result_rx: Option<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
+    /// Receivers for mirror response metadata from every dispatched
+    /// `request_mirror` instance on this request.
+    ///
+    /// Each enabled instance that actually selects work (sampling hit, including
+    /// saturated concurrency drops) pushes one watch receiver. Sampled-out
+    /// instances leave no slot. Bounded by the number of configured instances
+    /// that dispatch on this request — never a singleton last-writer slot.
+    /// Collected by detached mirror logging so each destination emits its own
+    /// `mirror: true` summary.
+    pub mirror_result_rxs: Vec<tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>>,
     /// One-shot HMAC work staged before request-body collection and consumed
     /// at authentication. This is private rather than transaction metadata so
     /// credential/signature/Consumer secret data cannot be forwarded or
@@ -2279,8 +2348,8 @@ impl RequestContext {
             request_http_flavor: HttpFlavor::Plain,
             original_accept_encoding: None,
             websocket_response_boundary: false,
-            ai_semantic_cache_embedding: None,
-            ai_semantic_cache_scope_key: None,
+            ai_semantic_cache_embeddings: HashMap::new(),
+            ai_semantic_cache_scope_keys: HashMap::new(),
             openapi_validator_matches: HashMap::new(),
             ai_tool_governor_response_hashes: HashMap::new(),
             ai_response_guard_replay_redactions: HashSet::new(),
@@ -2303,6 +2372,11 @@ impl RequestContext {
             gateway_response_compression_algorithm: None,
             compression_request_decode_owner: None,
             compression_response_encode_owner: None,
+            compression_response_admission_owner: None,
+            compression_response_admission_declined: false,
+            compression_response_codec_permit: HeldCodecPermit::default(),
+            compression_staged_request_plaintext: None,
+            compression_response_encode_aborted: false,
             response_stream_id: None,
             response_stream_completion: None,
             a2a_gateway_detected: false,
@@ -2323,7 +2397,7 @@ impl RequestContext {
             peer_spiffe_id: None,
             plugin_http_call_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             reject_hook_execution_ns: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            mirror_result_rx: None,
+            mirror_result_rxs: Vec::new(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
             request_body_sha256: None,
@@ -2565,6 +2639,81 @@ impl RequestContext {
 
     pub(crate) fn owns_compression_response_encode(&self, owner: u64) -> bool {
         self.compression_response_encode_owner == Some(owner)
+    }
+
+    pub(crate) fn has_compression_response_admission_owner(&self) -> bool {
+        self.compression_response_admission_owner.is_some()
+    }
+
+    pub(crate) fn claim_compression_response_admission(&mut self, owner: u64) -> bool {
+        if self.compression_response_admission_owner.is_some() {
+            return false;
+        }
+        self.compression_response_admission_owner = Some(owner);
+        // A held permit supersedes any earlier sibling's decline: the request now
+        // has bounded admission, so the response is no longer stream-only. (Once
+        // an owner exists, siblings skip reservation, so `declined` cannot be set
+        // again afterward, which keeps `owner.is_some()` implying `!declined`.)
+        self.compression_response_admission_declined = false;
+        true
+    }
+
+    pub(crate) fn owns_compression_response_admission(&self, owner: u64) -> bool {
+        self.compression_response_admission_owner == Some(owner)
+    }
+
+    pub(crate) fn mark_compression_response_admission_declined(&mut self) {
+        self.compression_response_admission_declined = true;
+    }
+
+    pub(crate) fn compression_response_admission_declined(&self) -> bool {
+        self.compression_response_admission_declined
+    }
+
+    /// Drop this request's reserved response codec admission (permit + owner)
+    /// when `instance_id` is the reserving instance. A no-op for siblings so a
+    /// non-owner declining to compress never releases another instance's slot.
+    pub(crate) fn release_compression_response_admission_if_owner(&mut self, instance_id: u64) {
+        if self.compression_response_admission_owner == Some(instance_id) {
+            self.compression_response_admission_owner = None;
+            let _ = self.compression_response_codec_permit.take();
+        }
+    }
+
+    pub(crate) fn set_compression_response_codec_permit(
+        &mut self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
+        self.compression_response_codec_permit.set(permit);
+    }
+
+    pub(crate) fn take_compression_response_codec_permit(
+        &mut self,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.compression_response_codec_permit.take()
+    }
+
+    pub(crate) fn set_compression_staged_request_plaintext(&mut self, plaintext: Vec<u8>) {
+        self.compression_staged_request_plaintext = Some(plaintext);
+    }
+
+    pub(crate) fn take_compression_staged_request_plaintext(&mut self) -> Option<Vec<u8>> {
+        self.compression_staged_request_plaintext.take()
+    }
+
+    pub(crate) fn mark_compression_response_encode_aborted(&mut self) {
+        self.compression_response_encode_aborted = true;
+    }
+
+    pub(crate) fn take_compression_response_encode_aborted(&mut self) -> bool {
+        std::mem::take(&mut self.compression_response_encode_aborted)
+    }
+
+    pub(crate) fn clear_gateway_response_compression(&mut self) {
+        self.gateway_response_compression_algorithm = None;
+        self.compression_response_encode_owner = None;
+        self.compression_response_admission_owner = None;
+        let _ = self.compression_response_codec_permit.take();
     }
 
     #[allow(dead_code)] // Used by external tests; dead code in the separately compiled bin target.
@@ -2964,8 +3113,8 @@ impl RequestContext {
             request_http_flavor: self.request_http_flavor,
             original_accept_encoding: self.original_accept_encoding.clone(),
             websocket_response_boundary: self.websocket_response_boundary,
-            ai_semantic_cache_embedding: self.ai_semantic_cache_embedding.clone(),
-            ai_semantic_cache_scope_key: self.ai_semantic_cache_scope_key.clone(),
+            ai_semantic_cache_embeddings: self.ai_semantic_cache_embeddings.clone(),
+            ai_semantic_cache_scope_keys: self.ai_semantic_cache_scope_keys.clone(),
             openapi_validator_matches: self.openapi_validator_matches.clone(),
             ai_tool_governor_response_hashes: self.ai_tool_governor_response_hashes.clone(),
             ai_response_guard_replay_redactions: self.ai_response_guard_replay_redactions.clone(),
@@ -3001,6 +3150,21 @@ impl RequestContext {
             gateway_response_compression_algorithm: self.gateway_response_compression_algorithm,
             compression_request_decode_owner: self.compression_request_decode_owner,
             compression_response_encode_owner: self.compression_response_encode_owner,
+            compression_response_admission_owner: self.compression_response_admission_owner,
+            compression_response_admission_declined: self.compression_response_admission_declined,
+            // The reserved response codec permit stays on the donor (live)
+            // context: this compatibility clone runs only the request-body hooks,
+            // never the response-body transform that consumes the permit. Moving
+            // it here would drop the slot when this short-lived clone is dropped
+            // (only `metadata`/WAF/AI state is copied back), releasing admission
+            // while the live context still owns the response encode.
+            compression_response_codec_permit: HeldCodecPermit::default(),
+            compression_staged_request_plaintext: std::mem::take(
+                &mut self.compression_staged_request_plaintext,
+            ),
+            compression_response_encode_aborted: std::mem::take(
+                &mut self.compression_response_encode_aborted,
+            ),
             response_stream_id: self.response_stream_id,
             response_stream_completion: self.response_stream_completion.clone(),
             a2a_gateway_detected: self.a2a_gateway_detected,
@@ -3021,7 +3185,11 @@ impl RequestContext {
             peer_spiffe_id: self.peer_spiffe_id.clone(),
             plugin_http_call_ns: Arc::clone(&self.plugin_http_call_ns),
             reject_hook_execution_ns: Arc::clone(&self.reject_hook_execution_ns),
-            mirror_result_rx: None,
+            // Watch receivers are clone-safe. Preserve them so the detached
+            // gRPC-deadline logging path (which intentionally clones the
+            // context before spawning cleanup) still emits every dispatched
+            // mirror result.
+            mirror_result_rxs: self.mirror_result_rxs.clone(),
             hmac_prebuffer_state: hmac_auth::HmacPrebufferState::default(),
             request_body_bytes: None,
             request_body_sha256: None,
@@ -3638,15 +3806,39 @@ impl RequestContext {
         self.query_params_materialized = true;
     }
 
-    /// Collect mirror response metadata from the `request_mirror` plugin.
+    /// Collect mirror response metadata from every dispatched `request_mirror`
+    /// instance on this request.
     ///
-    /// Returns `Some(meta)` when a selected mirror attempt completes or emits
-    /// an explicit bounded failure/drop outcome. Collection follows the actual
-    /// mirror task/request lifetime; it has no shorter independent cutoff.
-    /// Callers on a client-visible response path must run this in a detached
-    /// task.
+    /// Returns one entry per selected mirror attempt that completes or emits an
+    /// explicit bounded failure/drop outcome. Sampled-out instances contribute
+    /// nothing. Collection follows each mirror task/request lifetime and has no
+    /// shorter independent cutoff. Callers on a client-visible response path
+    /// must run this in a detached task.
+    pub async fn collect_mirror_results(&self) -> Vec<MirrorResponseMeta> {
+        let mut results = Vec::with_capacity(self.mirror_result_rxs.len());
+        for rx in &self.mirror_result_rxs {
+            if let Some(meta) = collect_mirror_result(rx.clone()).await {
+                results.push(meta);
+            }
+        }
+        results
+    }
+
+    /// Collect the first dispatched mirror result, if any.
+    ///
+    /// Prefer [`Self::collect_mirror_results`] when multiple instances may have
+    /// dispatched. Kept for single-instance call sites and tests.
     pub async fn collect_mirror_result(&self) -> Option<MirrorResponseMeta> {
-        collect_mirror_result(self.mirror_result_rx.clone()?).await
+        collect_mirror_result(self.mirror_result_rxs.first()?.clone()).await
+    }
+
+    /// Record a mirror result receiver for one dispatched `request_mirror`
+    /// instance. Does not replace earlier instance receivers.
+    pub fn push_mirror_result_rx(
+        &mut self,
+        rx: tokio::sync::watch::Receiver<Option<MirrorResponseMeta>>,
+    ) {
+        self.mirror_result_rxs.push(rx);
     }
 
     /// Return the stable authenticated identity for downstream policy and
@@ -4465,18 +4657,30 @@ mod chained_inspector_tests {
 ///
 /// Communicated via `tokio::sync::watch` channel from the spawned mirror task
 /// to the proxy handler, which builds a second `TransactionSummary` (with
-/// `mirror: true`) and logs it through the normal plugin pipeline.
+/// `mirror: true`) and logs it through the normal plugin pipeline. When several
+/// `request_mirror` instances dispatch on one request, each produces an
+/// independently attributable record (plugin config id + query-stripped
+/// destination URL) rather than overwriting a singleton slot.
 #[derive(Debug, Clone)]
 pub struct MirrorResponseMeta {
-    /// URL the mirror request was sent to.
+    /// Stable plugin-config resource id of the originating `request_mirror`
+    /// instance when known (never a secret). `None` for synthetic/test
+    /// construction without a config id.
+    pub mirror_plugin_id: Option<String>,
+    /// URL the mirror request was sent to (query string stripped so credentials
+    /// in the original request query cannot leak into logs).
     pub mirror_target_url: String,
     /// HTTP status code from the mirror target. `None` when the request failed
     /// before a response was received or was dropped/cancelled (DNS, connect,
     /// timeout, task, and concurrency errors).
     pub mirror_response_status_code: Option<u16>,
-    /// Response body size in bytes from the mirror target. Derived from
-    /// `content-length` header when present, otherwise from reading the body.
+    /// Response body size in bytes observed after a bounded drain of the
+    /// mirror response (or the truncated count when the drain cap fired).
     pub mirror_response_size_bytes: Option<u64>,
+    /// Advertised `Content-Length` from the mirror response when present.
+    /// Recorded independently of [`Self::mirror_response_size_bytes`] so
+    /// operators can compare advertised vs observed after bounded drain.
+    pub mirror_response_advertised_size_bytes: Option<u64>,
     /// Wall-clock latency of the mirror request in milliseconds.
     pub mirror_latency_ms: f64,
     /// Human-readable error message when the mirror request failed.
@@ -4515,6 +4719,21 @@ pub enum DisconnectCause {
     /// Clean shutdown initiated by either peer (e.g., FIN, graceful close frame).
     GracefulShutdown,
 }
+
+/// Shared latency sentinel for unknown or not-applicable observations.
+///
+/// Used for:
+/// * no-backend TTFB / backend total on reject paths
+/// * streaming `latency_backend_total_ms` when concurrent backend-body and
+///   client-delivery lifetime cannot be separated
+/// * streaming `latency_gateway_processing_ms` /
+///   `latency_gateway_overhead_ms` when those fields cannot be derived
+///   without inventing a backend duration (never substitute TTFB)
+///
+/// StatsD timers and Prometheus histograms omit samples `< 0`. JSON sinks
+/// still emit the sentinel so consumers can distinguish "unknown" from
+/// "zero".
+pub const LATENCY_UNKNOWN_MS: f64 = -1.0;
 
 /// Transaction summary for logging plugins.
 ///
@@ -4568,6 +4787,13 @@ pub struct TransactionSummary {
     pub backend_resolved_ip: Option<String>,
     pub response_status_code: u16,
     pub latency_total_ms: f64,
+    /// Total time excluding attributed backend communication.
+    ///
+    /// * **Buffered / known backend total**: `total - backend_total`.
+    /// * **Rejected (no backend)**: equals `latency_total_ms`.
+    /// * **Streaming with unknown backend total**: [`LATENCY_UNKNOWN_MS`].
+    ///   Concurrent backend-body and client-delivery lifetime must not be
+    ///   reported as gateway processing by substituting TTFB.
     pub latency_gateway_processing_ms: f64,
     pub latency_backend_ttfb_ms: f64,
     /// Total backend time from connection start to the final response frame.
@@ -4575,13 +4801,12 @@ pub struct TransactionSummary {
     /// Semantics by response type:
     /// * **Buffered responses**: exact — set synchronously when the body has
     ///   been fully received, before the summary is logged.
-    /// * **Streaming responses**: re-derived at deferred-log fire time from
-    ///   the real body-completion timestamp. Replaces the `-1.0` sentinel
-    ///   that was written at header-flush time. If the body never completes
-    ///   (client disconnect before the first frame, drop without any poll),
-    ///   the field may remain at the original `-1.0` sentinel — prefer
-    ///   `latency_backend_ttfb_ms` for alerting on streaming outcomes when
-    ///   you need a guaranteed non-sentinel value.
+    /// * **Streaming responses**: [`LATENCY_UNKNOWN_MS`]. Deferred logging
+    ///   refreshes `latency_total_ms` at body termination but does not invent
+    ///   a backend total from TTFB; concurrent backend-body production and
+    ///   client delivery cannot be separated on the default streaming path.
+    ///   Prefer `latency_backend_ttfb_ms` for streaming alerting when a
+    ///   guaranteed non-sentinel backend observation is required.
     pub latency_backend_total_ms: f64,
     /// Wall-clock time spent executing all plugin hooks (on_request_received
     /// through after_proxy/on_response_body/transform_response_body/
@@ -4594,13 +4819,17 @@ pub struct TransactionSummary {
     pub latency_plugin_external_io_ms: f64,
     /// Pure gateway overhead: routing, header parsing, URL building,
     /// connection pool checkout, response framing, etc.
-    /// Computed as: total - max(backend, 0) - plugin_execution.
-    /// For rejected requests (no backend call): total - plugin_execution.
+    ///
+    /// * **Buffered / known backend total**:
+    ///   `total - backend_total - plugin_execution`.
+    /// * **Rejected (no backend call)**: `total - plugin_execution`.
+    /// * **Streaming with unknown backend total**: [`LATENCY_UNKNOWN_MS`] —
+    ///   never derived by treating TTFB as full backend duration.
     pub latency_gateway_overhead_ms: f64,
     pub request_user_agent: Option<String>,
     /// True when the response body was streamed (not buffered).
-    /// When true, `latency_backend_total_ms` is populated at deferred-log
-    /// fire time from the real body-completion timestamp (see that field).
+    /// When true and `latency_backend_total_ms` is [`LATENCY_UNKNOWN_MS`],
+    /// gateway processing/overhead are also unknown (see those fields).
     pub response_streamed: bool,
     /// True when the client disconnected before receiving the full response.
     ///
@@ -4802,6 +5031,51 @@ impl TransactionSummary {
             || self.grpc_status().is_some_and(|status| status != 0)
     }
 
+    /// Derive gateway processing and overhead from terminal latency observations.
+    ///
+    /// Terminal streaming contract:
+    /// * `latency_total_ms` — wall-clock request receipt → body terminal
+    /// * `latency_backend_ttfb_ms` — preserved first-byte observation
+    /// * `latency_backend_total_ms` — known (`>= 0`) or [`LATENCY_UNKNOWN_MS`]
+    /// * plugin execution / external I/O — preserved pre-stream observations
+    /// * gateway fields — derived only when backend total is known; otherwise
+    ///   [`LATENCY_UNKNOWN_MS`] so streamed body lifetime is never labeled as
+    ///   pure gateway work by substituting TTFB
+    ///
+    /// Reject paths (`response_streamed == false`, backend total unknown)
+    /// keep the historical attribution: all non-plugin time is gateway work.
+    pub fn derive_gateway_latencies(
+        total_ms: f64,
+        backend_total_ms: f64,
+        plugin_execution_ms: f64,
+        response_streamed: bool,
+    ) -> (f64, f64) {
+        if response_streamed && backend_total_ms < 0.0 {
+            return (LATENCY_UNKNOWN_MS, LATENCY_UNKNOWN_MS);
+        }
+        if backend_total_ms < 0.0 {
+            let processing = total_ms.max(0.0);
+            let overhead = (total_ms - plugin_execution_ms).max(0.0);
+            return (processing, overhead);
+        }
+        let processing = (total_ms - backend_total_ms).max(0.0);
+        let overhead = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+        (processing, overhead)
+    }
+
+    /// Apply [`Self::derive_gateway_latencies`] onto this summary using its
+    /// current total / backend-total / plugin-execution / streamed flags.
+    pub fn refresh_gateway_latencies(&mut self) {
+        let (processing, overhead) = Self::derive_gateway_latencies(
+            self.latency_total_ms,
+            self.latency_backend_total_ms,
+            self.latency_plugin_execution_ms,
+            self.response_streamed,
+        );
+        self.latency_gateway_processing_ms = processing;
+        self.latency_gateway_overhead_ms = overhead;
+    }
+
     /// Build a mirror transaction summary from this summary and a mirror result.
     ///
     /// Clones the original request context fields (client_ip, method, path, proxy,
@@ -4838,7 +5112,9 @@ impl TransactionSummary {
             "grpc_message",
             "rejection_phase",
             "mirror_error",
+            "mirror_plugin_id",
             "response_size_bytes",
+            "mirror_response_advertised_size_bytes",
         ] {
             mirror.metadata.remove(key);
         }
@@ -4852,20 +5128,32 @@ impl TransactionSummary {
                 .metadata
                 .insert("response_size_bytes".to_string(), size.to_string());
         }
+        if let Some(advertised) = result.mirror_response_advertised_size_bytes {
+            mirror.metadata.insert(
+                "mirror_response_advertised_size_bytes".to_string(),
+                advertised.to_string(),
+            );
+        }
         if let Some(err) = result.mirror_error {
             mirror.metadata.insert("mirror_error".to_string(), err);
+        }
+        if let Some(plugin_id) = result.mirror_plugin_id {
+            mirror
+                .metadata
+                .insert("mirror_plugin_id".to_string(), plugin_id);
         }
         mirror
     }
 }
 
-/// Log a transaction summary through all logging plugins, then log a mirror
-/// summary if a mirror request was dispatched.
+/// Log a transaction summary through all logging plugins, then log one mirror
+/// summary per dispatched `request_mirror` instance.
 ///
-/// Mirror results are collected after the main summary is logged, giving the
-/// spawned mirror task maximum time to complete. The mirror entry uses the
+/// Mirror results are collected after the main summary is logged, giving each
+/// spawned mirror task maximum time to complete. Each mirror entry uses the
 /// same `TransactionSummary` schema with `mirror: true` so existing log
-/// pipelines work without changes.
+/// pipelines work without changes. Mixed completion order and mixed
+/// success/failure across instances do not drop earlier results.
 ///
 /// Some proxy paths call this with an empty plugin slice so runtime transaction
 /// metrics still see no-plugin error and streaming-disconnect outcomes.
@@ -4891,32 +5179,38 @@ pub async fn log_with_mirror(
     }
     crate::runtime_metrics::global_ref().record_transaction(summary);
 
-    // Mirror completion and mirror-summary logging are fully detached from the
-    // primary transaction. Buffered response paths call `log_with_mirror`
-    // before handing the response to hyper, so awaiting the mirror receiver
-    // here would make a stalled shadow target client-visible. Do not clone the
-    // summary or plugin list when this request was not mirrored.
-    let Some(mirror_result_rx) = ctx.mirror_result_rx.clone() else {
+    // Mirror completion and mirror-summary logging stay detached from the
+    // primary transaction, but the structured delivery lifecycle owns each
+    // collector through shutdown. Buffered response paths call
+    // `log_with_mirror` before handing the response to hyper, so awaiting
+    // mirror receivers here would make a stalled shadow target client-visible.
+    // Do not clone the summary or plugin list when this request was not mirrored.
+    if ctx.mirror_result_rxs.is_empty() {
         return;
-    };
-    let summary = summary.clone();
-    let plugins = plugins.to_vec();
-    tokio::spawn(async move {
-        let Some(mirror_result) = collect_mirror_result(mirror_result_rx).await else {
-            return;
-        };
-        let mirror_summary = summary.as_mirror_entry(mirror_result);
-        let mirror_mesh_key = if precompute_mesh_key {
-            crate::plugins::mesh::prometheus_helpers::mesh_request_key(&mirror_summary)
-        } else {
-            None
-        };
-        for plugin in plugins {
-            plugin
-                .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
-                .await;
-        }
-    });
+    }
+    let plugins: Arc<[Arc<dyn Plugin>]> = Arc::from(plugins.to_vec());
+    // Register one detached collector per instance before returning so mixed
+    // completion order cannot drop an earlier destination's summary.
+    for mirror_result_rx in ctx.mirror_result_rxs.iter().cloned() {
+        let summary = summary.clone();
+        let plugins = Arc::clone(&plugins);
+        let _ = crate::observability_delivery::spawn_mirror(async move {
+            let Some(mirror_result) = collect_mirror_result(mirror_result_rx).await else {
+                return;
+            };
+            let mirror_summary = summary.as_mirror_entry(mirror_result);
+            let mirror_mesh_key = if precompute_mesh_key {
+                crate::plugins::mesh::prometheus_helpers::mesh_request_key(&mirror_summary)
+            } else {
+                None
+            };
+            for plugin in plugins.iter() {
+                plugin
+                    .log_with_mesh_key(&mirror_summary, mirror_mesh_key.as_ref())
+                    .await;
+            }
+        });
+    }
 }
 
 /// Run terminal transaction logging before a buffered H1/H2 response is handed
@@ -4939,7 +5233,7 @@ pub async fn log_with_mirror_before_buffered_response(
 
     let plugins = plugins.to_vec();
     let ctx = ctx.clone();
-    tokio::spawn(async move {
+    let _ = crate::observability_delivery::spawn_deadline_cleanup(async move {
         if tokio::time::timeout(
             std::time::Duration::from_secs(5),
             log_with_mirror(&plugins, &summary, &ctx),
@@ -5296,7 +5590,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Matched-request tracing and preflight     | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_transcript_audit (2924), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
@@ -5339,11 +5633,10 @@ pub mod priority {
     pub const REQUEST_SIZE_LIMITING: u16 = 2800;
     pub const GRAPHQL: u16 = 2850;
     pub const RATE_LIMITING: u16 = 2900;
-    /// Runs before reject-capable AI guardrails so blocked prompts can still be
-    /// staged for `always_capture_on_guardrail`, while final request-body hooks
-    /// refresh the capture after downstream redaction/transforms when traffic
-    /// continues.
-    pub const AI_TRANSCRIPT_AUDIT: u16 = 2924;
+    /// Runs before request deduplication and reject-capable AI guardrails so
+    /// cached replays and blocked prompts are staged for audit, while final
+    /// request-body hooks refresh the capture after downstream transforms.
+    pub const AI_TRANSCRIPT_AUDIT: u16 = 2740;
     pub const AI_PROMPT_SHIELD: u16 = 2925;
     pub const WAF: u16 = 2930;
     pub const FAULT_INJECTION: u16 = 2940;
@@ -6130,6 +6423,21 @@ pub trait Plugin: Send + Sync {
         true
     }
 
+    /// Returns `true` when a translated gRPC-Web response must retain the
+    /// buffered compatibility view so this plugin can enforce policy against
+    /// terminal backend metadata.
+    ///
+    /// Native gRPC trailers arrive after `after_proxy`. The gRPC-Web buffered
+    /// path merges those trailers into the hook-visible response map and then
+    /// reconciles policy changes back into the body-framed terminal block.
+    /// Plugins that enforce header policy over that compatibility view should
+    /// opt in here. The shared response decision consults this only for a
+    /// request already claimed by `grpc_web`, so ordinary HTTP and native gRPC
+    /// streaming are unaffected.
+    fn requires_buffered_grpc_web_trailer_policy(&self, _ctx: &RequestContext) -> bool {
+        false
+    }
+
     /// Returns `true` if this plugin needs the entire response body buffered
     /// in memory before forwarding to the client. When any active plugin
     /// returns `true`, the gateway forces buffered mode for that proxy
@@ -6814,6 +7122,17 @@ pub trait Plugin: Send + Sync {
         false
     }
 
+    /// Run this plugin's stream-termination hook after ordinary termination
+    /// hooks, while preserving relative priority order within each group.
+    ///
+    /// Terminal observers that aggregate metadata from peer plugins use this
+    /// to see the final request context before the transaction summary is
+    /// cloned. This affects only the post-body terminal path, never request,
+    /// response, or inspector ordering.
+    fn defers_response_stream_termination_until_after_peers(&self) -> bool {
+        false
+    }
+
     /// Called once after the final response headers select a streaming body,
     /// before those headers are committed. Unlike
     /// [`Self::response_stream_inspector`], this notification also runs for
@@ -6967,14 +7286,19 @@ pub trait Plugin: Send + Sync {
 /// Prefer [`create_plugin_with_http_client`] in production to share the gateway's
 /// pooled client across all plugins for connection reuse and keepalive.
 ///
-/// Plugins that partition state by configured identity (notably
-/// `request_deduplication` and `waf` anomaly scoring) should be constructed
-/// through [`create_plugin_with_http_client_and_config_id`] with the stable
-/// plugin-config resource id. Direct construction here uses a validation-only
-/// default identity.
+/// Plugins that partition or attribute work by configured identity (notably
+/// `request_deduplication`, `waf` anomaly scoring, and `request_mirror`
+/// transaction records) should be constructed through
+/// [`create_plugin_with_http_client_and_config_id`] with the stable plugin-config
+/// resource id. Direct construction here uses a validation-only default
+/// identity.
 #[allow(dead_code)]
 pub fn create_plugin(name: &str, config: &Value) -> Result<Option<Arc<dyn Plugin>>, String> {
-    create_plugin_with_http_client(name, config, PluginHttpClient::default())
+    create_plugin_with_http_client(
+        name,
+        config,
+        PluginHttpClient::default().with_process_compression_admission_policy(),
+    )
 }
 
 /// Create a plugin instance with a shared HTTP client for outbound calls.
@@ -7007,10 +7331,13 @@ pub fn create_plugin_with_http_client(
 /// `plugin_config_id` is the configured plugin-config resource id (global /
 /// proxy / proxy_group). Production `PluginCache` passes `Some(&pc.id)` so
 /// Redis-backed `request_deduplication` instances partition logical keys by that
-/// identity and `waf` instances isolate anomaly-score accumulators / ownership
-/// metadata. Pass `None` for config-validation and direct/test construction that
-/// does not need sibling isolation (uses the plugin's standalone default id).
-/// Blank ids fail closed when supplied.
+/// identity, `waf` instances isolate anomaly-score accumulators / ownership
+/// metadata, and `api_chargeback_sink` instances publish accepted-generation
+/// status/metrics under that stable identity, while `request_mirror` records
+/// attribute each shadow destination. Pass `None` for config-validation and
+/// direct/test construction that does not need sibling isolation or attribution
+/// (uses the plugin's standalone default id). Blank ids fail closed when
+/// supplied.
 pub fn create_plugin_with_http_client_and_config_id(
     name: &str,
     config: &Value,
@@ -7088,7 +7415,18 @@ pub fn create_plugin_with_http_client_and_config_id(
         "spiffe_identity" => Ok(Some(Arc::new(mesh::spiffe_identity::SpiffeIdentity::new(
             config,
         )?))),
-        "compression" => Ok(Some(Arc::new(compression::CompressionPlugin::new(config)?))),
+        "compression" => {
+            let gzip_enabled = http_client.compression_gzip_enabled();
+            let brotli_enabled = http_client.compression_brotli_enabled();
+            let max_request_body_size_bytes = http_client.max_request_body_size_bytes();
+            let plugin = compression::CompressionPlugin::new_with_algorithm_support_and_body_limit(
+                config,
+                gzip_enabled,
+                brotli_enabled,
+                max_request_body_size_bytes,
+            )?;
+            Ok(Some(Arc::new(plugin)))
+        }
         "cors" => Ok(Some(Arc::new(cors::CorsPlugin::new(config)?))),
         "security_headers" => Ok(Some(Arc::new(security_headers::SecurityHeaders::new(
             config,
@@ -7147,10 +7485,13 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client.clone(),
         )?))),
-        "request_mirror" => Ok(Some(Arc::new(request_mirror::RequestMirror::new(
-            config,
-            http_client.clone(),
-        )?))),
+        "request_mirror" => Ok(Some(Arc::new(
+            request_mirror::RequestMirror::new_with_config_id(
+                config,
+                http_client.clone(),
+                plugin_config_id,
+            )?,
+        ))),
         "load_testing" => Ok(Some(Arc::new(load_testing::LoadTesting::new(
             config,
             http_client.clone(),
@@ -7215,11 +7556,14 @@ pub fn create_plugin_with_http_client_and_config_id(
             config,
             http_client.namespace(),
         )?))),
-        "api_chargeback_sink" => Ok(Some(Arc::new(api_chargeback_sink::ApiChargebackSink::new(
-            config,
-            http_client.clone(),
-            http_client.namespace(),
-        )?))),
+        "api_chargeback_sink" => Ok(Some(Arc::new(
+            api_chargeback_sink::ApiChargebackSink::new_with_config_id(
+                config,
+                http_client.clone(),
+                http_client.namespace(),
+                plugin_config_id,
+            )?,
+        ))),
         "otel_tracing" => Ok(Some(Arc::new(
             otel_tracing::OtelTracing::new_with_http_client(config, http_client)?,
         ))),
@@ -7345,7 +7689,11 @@ pub fn create_plugin_with_http_client_and_config_id(
 /// Returns `Ok(())` if the config is valid, `Err(msg)` if validation fails.
 #[allow(dead_code)]
 pub fn validate_plugin_config(name: &str, config: &Value) -> Result<(), String> {
-    validate_plugin_config_with_http_client(name, config, PluginHttpClient::default())
+    validate_plugin_config_with_http_client(
+        name,
+        config,
+        PluginHttpClient::default().with_process_compression_admission_policy(),
+    )
 }
 
 /// Validate a plugin configuration with a caller-supplied HTTP policy without
@@ -7393,7 +7741,8 @@ pub fn validate_plugin_config_with_policy(
     backend_allow_ips: &crate::config::BackendEgressPolicy,
 ) -> Result<(), String> {
     let http_client = PluginHttpClient::default_with_backend_allow_ips(backend_allow_ips.clone())
-        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header());
+        .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+        .with_process_compression_admission_policy();
     validate_plugin_config_with_http_client(name, config, http_client)?;
     validate_plugin_config_policy_only(name, config, backend_allow_ips)
 }

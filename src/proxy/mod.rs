@@ -1345,6 +1345,19 @@ pub(crate) fn should_stream_response_body(
     ctx: &RequestContext,
     maybe_requires_response_body_buffering: bool,
 ) -> bool {
+    // Before #2505, translated gRPC-Web responses were always buffered, so
+    // response_transformer header rules saw the merged initial-header +
+    // trailer compatibility view. Streaming ordinary gRPC-Web must not turn
+    // that existing terminal-metadata policy into a bypass. Keep only those
+    // explicitly policy-bearing configurations on the compatible buffered
+    // path; a plain grpc_web instance remains fully streaming.
+    if crate::plugins::grpc_web::request_is_grpc_web_translated(ctx)
+        && plugins
+            .iter()
+            .any(|plugin| plugin.requires_buffered_grpc_web_trailer_policy(ctx))
+    {
+        return false;
+    }
     match proxy.response_body_mode {
         ResponseBodyMode::Buffer => false,
         ResponseBodyMode::Stream => {
@@ -2966,6 +2979,7 @@ pub(crate) fn redact_request_body_from_log_metadata(metadata: &mut HashMap<Strin
     // `observability.emit_metadata: false` ineffective.
     metadata.remove(crate::plugins::ai_tool_governor::STREAM_REQUESTED_KEY);
     metadata.remove(crate::plugins::ai_tool_governor::STREAM_MODEL_KEY);
+    crate::plugins::ai_transcript_audit::redact_internal_log_metadata(metadata);
     // SSE Last-Event-ID is origin-defined resume state: omit the raw value from
     // transaction logs and retain only safe present/length correlation hints.
     crate::plugins::sse::redact_sse_log_metadata(metadata);
@@ -5616,6 +5630,11 @@ impl ProxyState {
             env_config_arc.pool_shard_amount,
         )
         .with_real_ip_header(env_config_arc.real_ip_header.clone())
+        .with_compression_algorithms(
+            env_config_arc.compression_gzip_enabled,
+            env_config_arc.compression_brotli_enabled,
+        )
+        .with_max_request_body_size_bytes(env_config_arc.max_request_body_size_bytes)
         .with_tls_crl_source(env_config_arc.tls_crl_file_path.clone());
         // Attach the shared SOCK_OPS metrics state when present (mesh
         // node-waypoint only). Plugin construction further down will
@@ -5671,9 +5690,11 @@ impl ProxyState {
         let mut health_check_handles = health_checker.take_active_check_handles();
         let health_checker = Arc::new(health_checker);
         // Circuit breaker cache
-        let circuit_breaker_cache = Arc::new(CircuitBreakerCache::with_max_entries(
-            env_config_arc.circuit_breaker_cache_max_entries,
-        ));
+        let circuit_breaker_cache =
+            Arc::new(CircuitBreakerCache::with_max_entries_and_shard_amount(
+                env_config_arc.circuit_breaker_cache_max_entries,
+                crate::util::sharding::pool_shard_amount(env_config_arc.pool_shard_amount),
+            ));
         // Service discovery manager (tasks started later via start_service_discovery)
         let service_discovery_manager = Arc::new(ServiceDiscoveryManager::new(
             load_balancer_cache.clone(),
@@ -15241,6 +15262,12 @@ pub(crate) async fn apply_synthetic_response_body_hooks(
             } else if mandatory_replay_transform {
                 mandatory_replay_transform_failed = Some(plugin.name());
                 break;
+            } else {
+                crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                    ctx,
+                    response_headers,
+                    response_body.len(),
+                );
             }
         }
         if let Some(plugin_name) = mandatory_replay_transform_failed {
@@ -16563,6 +16590,12 @@ pub(crate) async fn transform_buffered_response_body_with_deadline(
                 response_headers,
             );
             body_transformed = true;
+        } else {
+            crate::plugins::compression::reconcile_aborted_gateway_response_encoding(
+                ctx,
+                response_headers,
+                response_body.len(),
+            );
         }
         ctx.record_deadline_response_header_plugin(plugin.as_ref(), response_headers);
     }
@@ -22234,6 +22267,13 @@ async fn handle_proxy_request_inner(
                     grpc_body_ended.then(|| {
                         grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers)
                     });
+                let pristine_streaming_grpc_web_terminal_names =
+                    (grpc_web_response_content_type.is_some() && grpc_body_ended).then(|| {
+                        response_headers
+                            .keys()
+                            .cloned()
+                            .collect::<HashSet<String>>()
+                    });
                 let mut grpc_recorder_owns_ended_response = false;
                 let grpc_cb_recorded_eagerly = if grpc_skip_final_cb_record {
                     // A rotated retry already recorded (and released) the prior
@@ -22426,16 +22466,25 @@ async fn handle_proxy_request_inner(
                 let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
                 let plugin_external_io_ms =
                     ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-                let gateway_processing_ms = total_ms - backend_total_ms;
-                let gateway_overhead_ms =
-                    (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
                 // `backend_total_ms` for the gRPC streaming path is actually the time
                 // through response headers (TTFB) — the body is forwarded frame-by-frame
                 // by hyper after this point. When body_exceeded aborts streaming, backend
                 // work is complete at the abort so total == TTFB. Otherwise the body is
-                // still flowing at log time, so total_ms is unknown (-1.0 per schema).
+                // still flowing at log time, so backend total is unknown
+                // (`LATENCY_UNKNOWN_MS` per schema).
                 let streamed = !body_exceeded;
-                let grpc_backend_total_ms = if streamed { -1.0 } else { backend_total_ms };
+                let grpc_backend_total_ms = if streamed {
+                    crate::plugins::LATENCY_UNKNOWN_MS
+                } else {
+                    backend_total_ms
+                };
+                let (gateway_processing_ms, gateway_overhead_ms) =
+                    TransactionSummary::derive_gateway_latencies(
+                        total_ms,
+                        grpc_backend_total_ms,
+                        plugin_execution_ms,
+                        streamed,
+                    );
 
                 // Build the summary up front so we can either log synchronously
                 // (body_exceeded early-return path) or defer via the streaming
@@ -22553,6 +22602,22 @@ async fn handle_proxy_request_inner(
                     &mut response_headers,
                     grpc_total_deadline,
                 );
+                let grpc_web_streaming_content_type = grpc_web_response_content_type.filter(|_| {
+                    crate::plugins::response_body_rewrite_allowed(grpc_streaming.status)
+                });
+                let grpc_web_streaming_initial_metadata =
+                    grpc_web_streaming_content_type.map(|_| {
+                        crate::plugins::grpc_web::take_streaming_initial_terminal_metadata(
+                            &mut response_headers,
+                            grpc_body_ended,
+                            pristine_streaming_grpc_web_terminal_names.as_ref(),
+                        )
+                    });
+                if grpc_web_streaming_content_type.is_some() {
+                    // Incremental translation changes the representation size
+                    // and carries terminal metadata in a final DATA frame.
+                    response_headers.remove("content-length");
+                }
                 let cl = response_headers
                     .get("content-length")
                     .and_then(|v| v.parse::<u64>().ok());
@@ -22622,11 +22687,7 @@ async fn handle_proxy_request_inner(
                         grpc_total_deadline,
                     )
                 };
-                let mut body = if let Some(logger) = deferred_grpc_logger {
-                    body.with_logger(logger)
-                } else {
-                    body
-                };
+                let mut body = body;
 
                 // Keep the per-IP concurrent-request guard alive for the full
                 // streaming-body lifetime, matching the HTTP streaming path
@@ -22718,6 +22779,16 @@ async fn handle_proxy_request_inner(
                         .with_deferred_admission_request_body_exceeded_flag(
                             grpc_streaming.request_body_exceeded.clone(),
                         );
+                }
+                if let Some(content_type) = grpc_web_streaming_content_type {
+                    body = body.into_grpc_web_streaming(
+                        content_type,
+                        grpc_streaming.status,
+                        grpc_web_streaming_initial_metadata,
+                    );
+                }
+                if let Some(logger) = deferred_grpc_logger {
+                    body = body.with_logger(logger);
                 }
 
                 // Detach the deferred logger before handing the body to
@@ -24500,6 +24571,9 @@ async fn handle_proxy_request_inner(
         ResponseBody::StreamingH2(resp) => http_body::Body::is_end_stream(resp.body()),
         _ => false,
     };
+    let pristine_streaming_grpc_web_trailers_only_terminal_metadata =
+        (grpc_request_is_web_translated && streaming_h2_body_ended)
+            .then(|| grpc_proxy::GrpcTerminalMetadataSnapshot::from_headers(&response_headers));
     let streaming_h3_header_content_length = match &response_body {
         ResponseBody::StreamingH3(_) => response_headers
             .get("content-length")
@@ -24511,6 +24585,14 @@ async fn handle_proxy_request_inner(
     // HEAD/204/304 are still covered by `streaming_dispatch_should_defer`.
     let streaming_h3_body_ended = matches!(&response_body, ResponseBody::StreamingH3(_))
         && streaming_h3_header_content_length == Some(0);
+    let pristine_streaming_grpc_web_terminal_names = (grpc_request_is_web_translated
+        && (streaming_h2_body_ended || streaming_h3_body_ended))
+        .then(|| {
+            response_headers
+                .keys()
+                .cloned()
+                .collect::<HashSet<String>>()
+        });
     let defer_streaming_h2_dispatch = matches!(&response_body, ResponseBody::StreamingH2(_))
         && streaming_dispatch_should_defer(
             &proxy,
@@ -24647,10 +24729,12 @@ async fn handle_proxy_request_inner(
     let backend_elapsed = backend_start.elapsed().as_secs_f64() * 1000.0;
     let backend_ttfb_ms = backend_elapsed;
     // For buffered responses, backend_elapsed includes full body download (accurate total).
-    // For streaming responses, the body is still being sent to the client at log time,
-    // so we mark total as unknown (-1.0) to avoid silently reporting TTFB as total.
+    // For streaming responses, concurrent backend-body and client-delivery lifetime
+    // cannot be separated at header flush (or at deferred fire without optional
+    // tracking), so mark total as unknown (`LATENCY_UNKNOWN_MS`) rather than
+    // silently reporting TTFB as total or inflating gateway fields from it.
     let backend_total_ms = if is_streaming_response {
-        -1.0
+        crate::plugins::LATENCY_UNKNOWN_MS
     } else {
         backend_elapsed
     };
@@ -25019,13 +25103,12 @@ async fn handle_proxy_request_inner(
     let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
     let plugin_external_io_ms =
         ctx.plugin_http_call_ns.load(Ordering::Relaxed) as f64 / 1_000_000.0;
-    let effective_backend_ms = if backend_total_ms >= 0.0 {
-        backend_total_ms
-    } else {
-        backend_ttfb_ms
-    };
-    let gateway_processing_ms = total_ms - effective_backend_ms;
-    let gateway_overhead_ms = (total_ms - effective_backend_ms - plugin_execution_ms).max(0.0);
+    let (gateway_processing_ms, gateway_overhead_ms) = TransactionSummary::derive_gateway_latencies(
+        total_ms,
+        backend_total_ms,
+        plugin_execution_ms,
+        is_streaming_response,
+    );
 
     // Log/runtime-metrics phase. Keep the no-plugin, non-streaming success
     // path lightweight, but still construct a summary when runtime metrics need
@@ -25179,6 +25262,31 @@ async fn handle_proxy_request_inner(
         &mut response_headers,
         streaming_grpc_deadline,
     );
+    let grpc_web_streaming_adapter = if body_will_stream
+        && grpc_request_is_web_translated
+        && crate::plugins::response_body_rewrite_allowed(response_status)
+        && let Some(content_type) = grpc_web_response_content_type
+    {
+        // Terminal fields belong to a real trailer block unless the pristine
+        // backend response was genuinely Trailers-Only. Discard response-policy
+        // attempts to add/rewrite them and restore only that authoritative
+        // initial-END_STREAM snapshot.
+        grpc_proxy::apply_buffered_grpc_initial_response_policy(
+            None,
+            &mut response_headers,
+            pristine_streaming_grpc_web_trailers_only_terminal_metadata.as_ref(),
+        );
+        let already_ended = streaming_h2_body_ended || streaming_h3_body_ended;
+        let terminal = crate::plugins::grpc_web::take_streaming_initial_terminal_metadata(
+            &mut response_headers,
+            already_ended,
+            pristine_streaming_grpc_web_terminal_names.as_ref(),
+        );
+        response_headers.remove("content-length");
+        Some((content_type.to_string(), terminal))
+    } else {
+        None
+    };
 
     // Build final response
     let mut resp_builder = Response::builder()
@@ -25683,6 +25791,15 @@ async fn handle_proxy_request_inner(
             drop(lb_connection_guard);
             ProxyBody::full(Bytes::from(data))
         }
+    };
+    let body = if let Some((content_type, initial_terminal_metadata)) = grpc_web_streaming_adapter {
+        body.into_grpc_web_streaming(
+            &content_type,
+            response_status,
+            Some(initial_terminal_metadata),
+        )
+    } else {
+        body
     };
 
     // Attach deferred logger to the body so `log_with_mirror` fires when the
@@ -30592,9 +30709,11 @@ async fn proxy_to_backend_mesh_mtls(
     // after the plugin verified the ORIGINAL `application/grpc-web*`
     // content-type; the spoofable inbound header is stripped there. By
     // dispatch time its outbound content-type and body are wire-native gRPC,
-    // so it shares the gRPC receive limit and `te: trailers`, but its
-    // response MUST buffer: the plugin re-encodes the backend's terminal
-    // trailers INTO the gRPC-Web response body (see the buffered arm below).
+    // so it shares the gRPC receive limit and `te: trailers`. Its response
+    // normally stays streaming: the shared client-visible adapter converts the
+    // backend's terminal trailers into one gRPC-Web DATA frame. If another
+    // response policy explicitly requires buffering, the buffered arm below
+    // retains the compatible whole-body transform.
     let is_grpc_flavored = headers
         .get("content-type")
         .is_some_and(|ct| backend_dispatch::is_native_grpc_content_type(ct.as_bytes()));
@@ -30612,10 +30731,11 @@ async fn proxy_to_backend_mesh_mtls(
     //    large uploads), falling back to `backend_read_timeout_ms` when the
     //    client set none. The response-BODY absolute deadline is applied by
     //    the caller's `StreamingH2` arm via `grpc_streaming_response_deadline`.
-    //  * TRANSLATED gRPC-Web (buffers) — the buffered-path regime (F11): the
-    //    client deadline CAPPED by `backend_read_timeout_ms`, as ONE absolute
-    //    deadline shared by `send_request` and body collection below (the
-    //    deadline is end-to-end, so the phases share a single budget).
+    //  * TRANSLATED gRPC-Web selected for buffering by another response policy
+    //    — the buffered-path regime (F11): the client deadline is CAPPED by
+    //    `backend_read_timeout_ms`, as ONE absolute deadline shared by
+    //    `send_request` and body collection below (the deadline is end-to-end,
+    //    so the phases share a single budget).
     //  * Plain HTTP — the per-phase `backend_read_timeout_ms`, unchanged.
     // Timing out a gRPC-flavored request returns the direct pool's
     // Trailers-Only DEADLINE_EXCEEDED instead of a JSON 504.
@@ -30854,18 +30974,19 @@ async fn proxy_to_backend_mesh_mtls(
     } else {
         None
     };
+    let translated_grpc_web_may_buffer = is_grpc_web_translated && !stream_response;
     let grpc_send_deadline = match (client_grpc_deadline_at, backend_read_deadline) {
-        (Some(client), Some(read)) if is_grpc_web_translated => Some(client.min(read)),
+        (Some(client), Some(read)) if translated_grpc_web_may_buffer => Some(client.min(read)),
         (Some(client), _) => Some(client),
         (None, read) => read,
     };
     let grpc_send_deadline_is_client = client_grpc_deadline_at
         .is_some_and(|client| grpc_send_deadline.is_some_and(|effective| client <= effective));
-    // Translated gRPC-Web buffers the response, so request dispatch and body
-    // collection share the same post-read-start operator window. Native gRPC
-    // streams carry the receipt-anchored client deadline into the caller's H2
-    // body wrapper.
-    let buffered_grpc_shared_deadline = if is_grpc_web_translated {
+    // A translated gRPC-Web response that another policy selected for
+    // buffering shares one post-read-start operator window across request
+    // dispatch and body collection. The normal streaming path carries the
+    // receipt-anchored client deadline into the caller's H2 body wrapper.
+    let buffered_grpc_shared_deadline = if translated_grpc_web_may_buffer {
         client_grpc_deadline_at
             .map(|client| backend_read_deadline.map_or(client, |read| client.min(read)))
     } else {
@@ -31272,11 +31393,12 @@ async fn proxy_to_backend_mesh_mtls(
     // health accurate: the BACKEND responded fine — this is a gateway-side
     // policy conflict, not a backend fault.
     //
-    // gRPC-Web translated by the `grpc_web` plugin is deliberately EXEMPT
-    // (codex r1-4): its trailers are body-encoded, not wire-relayed — the
-    // plugin embeds them into the gRPC-Web response body — so buffering is
-    // required and correct. The buffered arm below captures the backend's
-    // terminal H2 trailers into the response-header view for that encoding.
+    // gRPC-Web translated by the `grpc_web` plugin is deliberately EXEMPT:
+    // when another response policy requires buffering, its trailers can be
+    // captured and body-framed by the compatible buffered transform below.
+    // In the ordinary case `grpc_web` no longer requests buffering, so this
+    // branch returns `StreamingH2` and the shared adapter body-frames trailers
+    // incrementally at the client-visible boundary.
     if is_native_grpc && !stream_response {
         warn!(
             proxy_id = %proxy.id,
@@ -31436,11 +31558,12 @@ async fn proxy_to_backend_mesh_mtls(
                 );
             }
         };
-        // codex r1-4: a gRPC-Web-translated response buffers here BY DESIGN —
-        // the `grpc_web` plugin re-encodes the backend's terminal trailers
-        // (`grpc-status` / `grpc-message` / custom trailing metadata) into
-        // the gRPC-Web response body, reading them from the response-header
-        // map. Fold the captured H2 trailers into the same merged
+        // A gRPC-Web-translated response reaches this arm only when another
+        // response policy selected buffering. The compatible whole-body
+        // transform re-encodes the backend's terminal trailers (`grpc-status` /
+        // `grpc-message` / custom trailing metadata) into the gRPC-Web response
+        // body, reading them from the response-header map. Fold the captured H2
+        // trailers into the same merged
         // header+trailer view the direct gRPC pool's buffered path presents
         // to response hooks (hop-by-hop trailer names filtered; reserved gRPC
         // terminal keys trailer-authoritative, header-wins otherwise).
@@ -38702,6 +38825,7 @@ mod tests {
         ));
 
         let mut compression_ctx = ctx.clone();
+        compression_ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
         compression_ctx
             .headers
             .insert("accept-encoding".to_string(), "gzip".to_string());

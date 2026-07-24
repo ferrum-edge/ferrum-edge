@@ -22,10 +22,13 @@
 //!
 //! **Hot-path optimization**: The recording methods use a thread-local `String`
 //! buffer for the DashMap lookup key, achieving **zero heap allocation on cache
-//! hits** (99%+ of requests). Only the first record per unique
-//! (consumer, proxy, status_code, currency, namespace, pricing) combination
+//! hits** (99%+ of requests). Only the first
+//! record per unique (consumer, proxy, status_code, scope, pricing) combination
 //! allocates — subsequent records reuse the existing DashMap entry via a
-//! read-lock `get()` on a borrowed `&str`. Stream entries use a `status_code`
+//! read-lock `get()` on a borrowed `&str`. Published proxy names live in a
+//! separate lock-free snapshot used only while rendering, so a name-only reload
+//! preserves counter continuity without letting a late retired-generation
+//! request restore stale display metadata. Stream entries use a `status_code`
 //! sentinel of `0` to share the same key format and code path.
 
 use arc_swap::ArcSwap;
@@ -70,6 +73,25 @@ pub fn global_registry() -> Arc<ChargebackRegistry> {
         .clone()
 }
 
+/// Publish authoritative proxy display names without instantiating the global
+/// registry when `api_chargeback` has never been configured.
+pub(crate) fn publish_active_proxy_names(config: &crate::config::types::GatewayConfig) {
+    let Some(registry) = CHARGEBACK_REGISTRY.get() else {
+        return;
+    };
+    let names = config
+        .proxies
+        .iter()
+        .map(|proxy| {
+            (
+                proxy.id.clone(),
+                proxy.name.clone().unwrap_or_else(|| "unknown".to_string()),
+            )
+        })
+        .collect();
+    registry.set_active_proxy_names(names);
+}
+
 fn escape_label_value(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -81,6 +103,16 @@ fn escape_label_value(value: &str) -> String {
         }
     }
     escaped
+}
+
+/// Keep a deterministic fallback for retained rows whose proxy is no longer in
+/// the published configuration. Active proxies always supply one identical
+/// candidate from the authoritative metadata snapshot.
+fn apply_export_proxy_name(agg_name: &mut String, candidate_name: &str) {
+    if candidate_name > agg_name.as_str() {
+        agg_name.clear();
+        agg_name.push_str(candidate_name);
+    }
 }
 
 /// Protocol family of a recorded entry. Stored on `ChargebackEntry` so the
@@ -124,6 +156,7 @@ type BandwidthAggregateKey = (String, String, ProtocolFamily, Arc<str>, Arc<str>
 /// (first record per unique key) stamps these `Arc<str>` onto the new
 /// [`ChargebackEntry`] with a cheap `Arc` clone; the hot path (cache hit)
 /// touches none of them, preserving the zero-allocation recording path.
+/// Multiple effective instances on one proxy are rejected (issue #2564).
 #[derive(Clone)]
 pub struct InstanceScope {
     /// Instance currency label (e.g. "USD"). Emitted per-row at render time.
@@ -200,19 +233,27 @@ fn write_chargeback_key(
 /// **Per-instance scoping (finding #24)**: `currency` and `namespace_label` are
 /// stored per entry (set from the constructing plugin instance) rather than in
 /// a single process-global, last-writer-wins registry field. A single process
-/// legitimately hosts multiple `api_chargeback` instances with different
-/// currencies/namespaces (global / proxy / proxy_group scopes), so each
-/// exported row carries the currency and namespace of the instance that
-/// recorded it.
+/// may host multiple `api_chargeback` instances on **different** proxies with
+/// different currencies/namespaces, so each exported row carries the currency
+/// and namespace of the instance that recorded it. Multiple effective instances
+/// on one proxy are rejected (issue #2564) because this registry has no
+/// ledger/instance dimension and would double-count the same client transaction.
 ///
-/// The `consumer`, `proxy_id`, `proxy_name`, `status_code`,
-/// `protocol_family`, prices, `currency`, and `namespace_label` fields are set
-/// once on creation and read during render. They are included in the DashMap key
-/// string so config reloads that change pricing create fresh entries instead of
-/// adding new traffic to stale prices, and so HTTP-family status-0 WebSocket
-/// bandwidth cannot share an entry with a stream session. The key is still a
-/// plain `String`, which lets the hot-path `get()` use a borrowed `&str` from a
-/// thread-local buffer with zero allocation.
+/// The `consumer`, `proxy_id`, `status_code`, `protocol_family`, prices,
+/// `currency`, and `namespace_label` fields are set once on creation and read
+/// during render. They are included in the DashMap key string so config reloads
+/// that change pricing create fresh entries instead of adding new traffic to
+/// stale prices, and so HTTP-family status-0 WebSocket bandwidth cannot share an
+/// entry with a stream session. The key is still a plain `String`, which lets
+/// the hot-path `get()` use a borrowed `&str` from a thread-local buffer with
+/// zero allocation.
+///
+/// **`proxy_name` is live display metadata (issue #2572)**: it is deliberately
+/// omitted from the registry key so a name-only reload keeps counter continuity
+/// under the stable `proxy_id`. Entries retain their admission-time name for a
+/// deterministic fallback after deletion, while renderers use the separately
+/// published current-proxy metadata snapshot. Late completions from a retired
+/// cache generation therefore cannot restore an old exported name.
 ///
 /// For stream entries the `status_code` is `0` and there is exactly one entry
 /// per `(consumer, proxy_id, protocol_family=stream)` (streams have no HTTP
@@ -237,6 +278,8 @@ pub struct ChargebackEntry {
     // --- Render metadata (immutable after creation) ---
     pub consumer: Arc<str>,
     pub proxy_id: Arc<str>,
+    /// Admission-time fallback name for `proxy_id`. Active exports use the
+    /// authoritative published metadata snapshot instead (issue #2572).
     pub proxy_name: Arc<str>,
     pub status_code: u16,
     pub protocol_family: ProtocolFamily,
@@ -334,10 +377,219 @@ impl ChargebackEntry {
 const DEFAULT_STALE_TTL_NANOS: u64 = 3_600_000_000_000;
 
 /// Default render cache TTL: 5 seconds.
-const DEFAULT_RENDER_CACHE_TTL_SECS: u64 = 5;
+pub const DEFAULT_RENDER_CACHE_TTL_SECS: u64 = 5;
+
+/// Default stale-entry TTL in seconds (matches [`DEFAULT_STALE_TTL_NANOS`]).
+pub const DEFAULT_STALE_ENTRY_TTL_SECS: u64 = DEFAULT_STALE_TTL_NANOS / 1_000_000_000;
 
 /// Default minimum cache age (in nanoseconds) before record() will invalidate.
 const DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS: u64 = 500_000_000; // 500ms
+
+/// Default minimum cache age in milliseconds.
+pub const DEFAULT_CACHE_INVALIDATION_MIN_AGE_MS: u64 =
+    DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000;
+
+/// Default background cleanup interval in seconds.
+pub const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 300;
+
+/// Process-global render/cleanup knobs shared by every `api_chargeback` instance
+/// through the singleton `/charges` registry.
+///
+/// Pricing and currency remain per-instance and may differ across proxies.
+/// These four values must agree across every enabled instance because one
+/// cleanup task and one render cache serve the whole process (issue #2564).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedRegistryTunables {
+    pub render_cache_ttl_secs: u64,
+    pub stale_entry_ttl_secs: u64,
+    pub cache_invalidation_min_age_ms: u64,
+    pub cleanup_interval_seconds: u64,
+}
+
+impl SharedRegistryTunables {
+    /// Resolve shared tunables from one plugin config object, applying defaults.
+    pub fn from_config(config: &Value) -> Result<Self, String> {
+        Ok(Self {
+            render_cache_ttl_secs: optional_u64(
+                config,
+                "render_cache_ttl_seconds",
+                DEFAULT_RENDER_CACHE_TTL_SECS,
+            )?,
+            stale_entry_ttl_secs: optional_u64(
+                config,
+                "stale_entry_ttl_seconds",
+                DEFAULT_STALE_ENTRY_TTL_SECS,
+            )?,
+            cache_invalidation_min_age_ms: optional_u64(
+                config,
+                "cache_invalidation_min_age_ms",
+                DEFAULT_CACHE_INVALIDATION_MIN_AGE_MS,
+            )?,
+            cleanup_interval_seconds: optional_u64(
+                config,
+                "cleanup_interval_seconds",
+                DEFAULT_CLEANUP_INTERVAL_SECS,
+            )?,
+        })
+    }
+}
+
+/// Resolve the enabled `api_chargeback` configs that the plugin cache would
+/// install for each proxy. Any local proxy/proxy-group instance shadows all
+/// global instances of the same plugin type on that proxy — matching the
+/// general merge contract — but chargeback additionally requires the resulting
+/// effective list to contain at most one instance (issue #2564).
+fn effective_api_chargeback_plugins_by_proxy(
+    config: &crate::config::types::GatewayConfig,
+) -> Vec<(
+    &crate::config::types::Proxy,
+    Vec<&crate::config::types::PluginConfig>,
+)> {
+    use crate::config::types::PluginScope;
+
+    let plugin_by_id: HashMap<&str, &crate::config::types::PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .map(|plugin| (plugin.id.as_str(), plugin))
+        .collect();
+    let global_chargeback: Vec<&crate::config::types::PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.scope == PluginScope::Global
+                && plugin.plugin_name == "api_chargeback"
+        })
+        .collect();
+
+    config
+        .proxies
+        .iter()
+        .map(|proxy| {
+            let local_chargeback: Vec<&crate::config::types::PluginConfig> = proxy
+                .plugins
+                .iter()
+                .filter_map(|association| {
+                    let plugin = *plugin_by_id.get(association.plugin_config_id.as_str())?;
+                    let scope_applies = match plugin.scope {
+                        PluginScope::Proxy => plugin.proxy_id.as_deref() == Some(proxy.id.as_str()),
+                        // Config validation already requires proxy-group
+                        // instances to omit proxy_id. Applicability here mirrors
+                        // the runtime merge, which is driven by scope plus the
+                        // proxy's explicit plugin association.
+                        PluginScope::ProxyGroup => true,
+                        PluginScope::Global => false,
+                    };
+                    (plugin.enabled && plugin.plugin_name == "api_chargeback" && scope_applies)
+                        .then_some(plugin)
+                })
+                .collect();
+            let effective = if local_chargeback.is_empty() {
+                global_chargeback.clone()
+            } else {
+                local_chargeback
+            };
+            (proxy, effective)
+        })
+        .collect()
+}
+
+/// Enforce exactly-once `/charges` accounting and deterministic ownership of the
+/// shared render/cleanup tunables (issue #2564).
+///
+/// Rules:
+/// 1. The process may have at most one enabled global `api_chargeback`
+///    instance. Although a local instance shadows globals on a configured
+///    proxy, unmatched/fallback transaction paths retain the global chain, so
+///    multiple globals would still double-count.
+/// 2. After scope merging, each proxy may have at most one effective
+///    `api_chargeback` instance. Multiple proxy-scoped, proxy-group-scoped, or
+///    mixed attachments on one proxy are rejected — the process-global registry
+///    has no ledger/instance dimension, so every retained hook would double-count
+///    the same client transaction.
+/// 3. Across the whole process, every enabled `api_chargeback` instance must
+///    resolve to identical shared tunables
+///    (`render_cache_ttl_seconds`, `stale_entry_ttl_seconds`,
+///    `cache_invalidation_min_age_ms`, `cleanup_interval_seconds`). Since every
+///    constructor applies the same values, construction order cannot change
+///    registry behavior. Pricing and currency may still differ per proxy.
+pub fn validate_composition(
+    config: &crate::config::types::GatewayConfig,
+) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+
+    let global_ids: Vec<&str> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| {
+            plugin.enabled
+                && plugin.plugin_name == "api_chargeback"
+                && plugin.scope == crate::config::types::PluginScope::Global
+        })
+        .map(|plugin| plugin.id.as_str())
+        .collect();
+    if global_ids.len() > 1 {
+        errors.push(format!(
+            "api_chargeback permits at most one enabled global instance \
+             (shared /charges registry is exactly-once); found: {}",
+            global_ids.join(", ")
+        ));
+    }
+
+    for (proxy, effective) in effective_api_chargeback_plugins_by_proxy(config) {
+        if effective.len() > 1 {
+            let ids: Vec<&str> = effective.iter().map(|plugin| plugin.id.as_str()).collect();
+            errors.push(format!(
+                "api_chargeback permits at most one effective instance per proxy \
+                 (shared /charges registry is exactly-once); proxy '{}' has: {}",
+                proxy.id,
+                ids.join(", ")
+            ));
+        }
+    }
+
+    let mut enabled: Vec<&crate::config::types::PluginConfig> = config
+        .plugin_configs
+        .iter()
+        .filter(|plugin| plugin.enabled && plugin.plugin_name == "api_chargeback")
+        .collect();
+    enabled.sort_by(|a, b| a.id.cmp(&b.id));
+
+    if let Some(reference) = enabled.first() {
+        let reference_tunables = match SharedRegistryTunables::from_config(&reference.config) {
+            Ok(tunables) => tunables,
+            Err(error) => {
+                errors.push(format!(
+                    "api_chargeback shared tunables in '{}': {error}",
+                    reference.id
+                ));
+                return Err(errors);
+            }
+        };
+        for sibling in enabled.iter().skip(1) {
+            match SharedRegistryTunables::from_config(&sibling.config) {
+                Ok(tunables) if tunables == reference_tunables => {}
+                Ok(_) => errors.push(format!(
+                    "api_chargeback shared render/cleanup tunables must match across all enabled \
+                     instances; '{}' disagrees with '{}'. \
+                     Align render_cache_ttl_seconds, stale_entry_ttl_seconds, \
+                     cache_invalidation_min_age_ms, and cleanup_interval_seconds",
+                    reference.id, sibling.id
+                )),
+                Err(error) => errors.push(format!(
+                    "api_chargeback shared tunables in '{}': {error}",
+                    sibling.id
+                )),
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
 
 /// Sentinel `status_code` for stream sessions and WebSocket-disconnect
 /// bandwidth rows. Ordinary HTTP wire statuses are in `100..=599`; the
@@ -350,25 +602,33 @@ const STREAM_STATUS_SENTINEL: u16 = 0;
 ///
 /// **Key design**: The DashMap uses plain `String` keys formatted as
 /// `"consumer|proxy_id|status_code|protocol_family|currency|namespace_label|price_bits..."`.
-/// Render metadata (consumer, proxy_id, proxy_name, status_code,
-/// protocol_family) is stored in the `ChargebackEntry` value and
-/// `protocol_family` is also part of the key so immutable family attribution
-/// cannot be fixed by insertion order. This allows the hot-path recording
-/// methods to use `DashMap::get(&str)` with a thread-local buffer — zero
-/// allocation on cache hits. Only the cold path (first record per unique
-/// billing/pricing combination) allocates a `String` key and `Arc<str>`
-/// metadata. This matches the connection pool key pattern in
-/// `connection_pool.rs`.
+/// Render metadata (consumer, proxy_id, status_code, protocol_family) is stored
+/// in the `ChargebackEntry` value and `protocol_family` is also part of the key
+/// so immutable family attribution cannot be fixed by insertion order.
+/// `proxy_name` is live display metadata only — omitted from the key so a
+/// name-only reload preserves counter continuity under the stable `proxy_id`
+/// (issue #2572). The render path substitutes the authoritative name snapshot
+/// from the published configuration. This allows the hot-path recording methods
+/// to use `DashMap::get(&str)` with a thread-local buffer — zero allocation on
+/// cache hits. Only the cold path (first record per unique billing/pricing
+/// combination) allocates a `String` key and `Arc<str>` metadata. This matches
+/// the connection pool key pattern in `connection_pool.rs`.
 pub struct ChargebackRegistry {
     epoch: Instant,
     pub entries: DashMap<String, ChargebackEntry>,
-    /// Cached render output with generation timestamp.
-    prometheus_cache: ArcSwap<Option<(Instant, String)>>,
-    json_cache: ArcSwap<Option<(Instant, String)>>,
+    /// Current display names from the published gateway configuration.
+    active_proxy_names: ArcSwap<HashMap<String, String>>,
+    /// Advances whenever `active_proxy_names` is replaced. Render caches carry
+    /// this generation so an overlapping reload cannot publish stale labels.
+    proxy_metadata_generation: AtomicU64,
+    /// Cached render output with timestamp and proxy-metadata generation.
+    prometheus_cache: ArcSwap<Option<(Instant, u64, String)>>,
+    json_cache: ArcSwap<Option<(Instant, u64, String)>>,
     render_cache_ttl_secs: AtomicU64,
     stale_entry_ttl_nanos: AtomicU64,
     cache_invalidation_min_age_nanos: AtomicU64,
-    configured_currency: ArcSwap<String>,
+    cleanup_interval_seconds: AtomicU64,
+    cleanup_interval_changed: tokio::sync::Notify,
     /// Guards against spawning duplicate background cleanup tasks.
     cleanup_task_started: AtomicBool,
 }
@@ -384,6 +644,8 @@ impl ChargebackRegistry {
         Self {
             epoch: Instant::now(),
             entries: DashMap::new(),
+            active_proxy_names: ArcSwap::from_pointee(HashMap::new()),
+            proxy_metadata_generation: AtomicU64::new(0),
             prometheus_cache: ArcSwap::from_pointee(None),
             json_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
@@ -391,24 +653,40 @@ impl ChargebackRegistry {
             cache_invalidation_min_age_nanos: AtomicU64::new(
                 DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS,
             ),
-            configured_currency: ArcSwap::from_pointee("USD".to_string()),
+            cleanup_interval_seconds: AtomicU64::new(0),
+            cleanup_interval_changed: tokio::sync::Notify::new(),
             cleanup_task_started: AtomicBool::new(false),
         }
     }
 
-    pub fn set_configured_currency(&self, currency: &str) {
-        self.configured_currency
-            .store(Arc::new(currency.to_string()));
+    /// Replace live display metadata after a gateway configuration is
+    /// published. This is a reload cold-path operation.
+    #[doc(hidden)]
+    pub fn set_active_proxy_names(&self, names: HashMap<String, String>) {
+        let unchanged = {
+            let current = self.active_proxy_names.load();
+            current.as_ref() == &names
+        };
+        if unchanged {
+            return;
+        }
+        self.active_proxy_names.store(Arc::new(names));
+        self.proxy_metadata_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.prometheus_cache.store(Arc::new(None));
+        self.json_cache.store(Arc::new(None));
     }
 
     /// Configure the process-global render/cleanup knobs that govern the SHARED
     /// registry infrastructure (render cache TTL, stale-entry eviction TTL,
     /// cache-invalidation min age). These intentionally remain registry-global
     /// because a single cleanup task and a single render cache serve all plugin
-    /// instances. Currency and namespace are NOT configured here — they are
-    /// scoped per [`ChargebackEntry`] so multiple instances with different
-    /// currencies/namespaces never misattribute one another's charges
-    /// (finding #24).
+    /// instances. Admission requires every enabled `api_chargeback` instance to
+    /// resolve to the same tunables so construction order cannot change
+    /// ownership (issue #2564). Currency and namespace are NOT configured here —
+    /// they are scoped per [`ChargebackEntry`] so instances on different proxies
+    /// with different currencies/namespaces never misattribute one another's
+    /// charges (finding #24).
     pub fn configure(
         &self,
         render_cache_ttl_secs: u64,
@@ -427,11 +705,19 @@ impl ChargebackRegistry {
         );
     }
 
-    /// Start a background task that periodically evicts stale entries.
+    /// Start or reconfigure the background task that periodically evicts stale
+    /// entries. The desired interval is reloadable, including transitions to
+    /// and from `0`; `Notify` wakes an existing task so a shorter interval or
+    /// disable takes effect without waiting for the previous timer.
+    ///
     /// Uses `compare_exchange` to ensure only one cleanup task runs per registry.
     /// Guard with `Handle::try_current()` so `new()` works in non-tokio test contexts.
     pub fn start_cleanup_task(self: &Arc<Self>, interval_seconds: u64) {
-        if interval_seconds == 0 {
+        self.cleanup_interval_seconds
+            .store(interval_seconds, Ordering::Release);
+        self.cleanup_interval_changed.notify_waiters();
+
+        if interval_seconds == 0 && !self.cleanup_task_started.load(Ordering::Acquire) {
             return;
         }
         if tokio::runtime::Handle::try_current().is_err() {
@@ -446,13 +732,39 @@ impl ChargebackRegistry {
         }
         let registry = Arc::clone(self);
         tokio::spawn(async move {
-            let mut timer = tokio::time::interval(std::time::Duration::from_secs(interval_seconds));
             loop {
-                timer.tick().await;
-                let ttl_nanos = registry.stale_entry_ttl_nanos.load(Ordering::Relaxed);
-                registry.evict_stale(ttl_nanos);
+                // Register before loading so an interval update cannot be lost
+                // between observing the value and beginning the wait.
+                let interval_changed = registry.cleanup_interval_changed.notified();
+                let interval_seconds = registry.cleanup_interval_seconds.load(Ordering::Acquire);
+                if interval_seconds == 0 {
+                    interval_changed.await;
+                    continue;
+                }
+
+                tokio::select! {
+                    () = tokio::time::sleep(std::time::Duration::from_secs(interval_seconds)) => {
+                        // If a simultaneous reload changed the interval, let
+                        // the next loop honor it instead of evicting on the old
+                        // schedule.
+                        if registry.cleanup_interval_seconds.load(Ordering::Acquire)
+                            == interval_seconds
+                        {
+                            let ttl_nanos =
+                                registry.stale_entry_ttl_nanos.load(Ordering::Relaxed);
+                            registry.evict_stale(ttl_nanos);
+                        }
+                    }
+                    () = interval_changed => {}
+                }
             }
         });
+    }
+
+    #[doc(hidden)]
+    #[allow(dead_code)] // Used by external tests; dead in the separately compiled bin target.
+    pub fn cleanup_interval_seconds_for_test(&self) -> u64 {
+        self.cleanup_interval_seconds.load(Ordering::Acquire)
     }
 
     /// Record a chargeable HTTP-family transaction (HTTP/1.1, H2, H3, gRPC,
@@ -552,7 +864,7 @@ impl ChargebackRegistry {
     ///
     /// **Hot-path (cache hit)**: Uses `DashMap::get(&str)` with a thread-local
     /// buffer — one `write!` into a pre-allocated `String`, one DashMap read-lock,
-    /// a handful of atomic operations. Zero heap allocation.
+    /// and atomic counter updates. Zero heap allocation.
     ///
     /// **Cold-path (first record per unique combination)**: Clones the per-instance
     /// `Arc<str>` render metadata (consumer/proxy/currency/namespace) and allocates
@@ -563,7 +875,8 @@ impl ChargebackRegistry {
     /// instances never reuse an entry stamped with another instance's render
     /// scope. `protocol_family` is part of the key so HTTP-family WebSocket
     /// bandwidth and stream sessions stay distinct even when both use status
-    /// `0` and identical prices.
+    /// `0` and identical prices. `proxy_name` is intentionally omitted from the
+    /// key (issue #2572).
     #[allow(clippy::too_many_arguments)]
     fn record_inner(
         &self,
@@ -637,24 +950,22 @@ impl ChargebackRegistry {
                     bandwidth_received: bw_price_received,
                 },
             );
-            self.entries
-                .entry(owned_key)
-                .or_insert_with(|| {
-                    ChargebackEntry::new(
-                        self.epoch,
-                        Arc::from(consumer),
-                        Arc::from(proxy_id),
-                        Arc::from(proxy_name),
-                        status_code,
-                        protocol_family,
-                        if count_call { call_price } else { 0.0 },
-                        bw_price_sent,
-                        bw_price_received,
-                        Arc::clone(&scope.currency),
-                        Arc::clone(&scope.namespace_label),
-                    )
-                })
-                .record(bytes_sent, bytes_received, count_call, self.epoch);
+            let entry = self.entries.entry(owned_key).or_insert_with(|| {
+                ChargebackEntry::new(
+                    self.epoch,
+                    Arc::from(consumer),
+                    Arc::from(proxy_id),
+                    Arc::from(proxy_name),
+                    status_code,
+                    protocol_family,
+                    if count_call { call_price } else { 0.0 },
+                    bw_price_sent,
+                    bw_price_received,
+                    Arc::clone(&scope.currency),
+                    Arc::clone(&scope.namespace_label),
+                )
+            });
+            entry.record(bytes_sent, bytes_received, count_call, self.epoch);
         }
 
         self.maybe_invalidate_caches();
@@ -666,7 +977,7 @@ impl ChargebackRegistry {
             .load(Ordering::Relaxed);
 
         let cached = self.prometheus_cache.load();
-        if let Some((generated_at, _)) = **cached {
+        if let Some((generated_at, _, _)) = **cached {
             let age_nanos = generated_at.elapsed().as_nanos() as u64;
             if age_nanos < min_age_nanos {
                 return;
@@ -698,8 +1009,10 @@ impl ChargebackRegistry {
     /// surface that as an explicit export failure rather than emitting `inf`.
     pub fn render_prometheus(&self) -> Result<String, String> {
         let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
+        let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
         let cached = self.prometheus_cache.load();
-        if let Some((generated_at, ref output)) = **cached
+        if let Some((generated_at, cached_generation, ref output)) = **cached
+            && cached_generation == metadata_generation
             && generated_at.elapsed().as_secs() < ttl_secs
         {
             return Ok(output.clone());
@@ -708,16 +1021,29 @@ impl ChargebackRegistry {
         let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
         self.evict_stale(stale_ttl);
 
-        let output = self.render_prometheus_uncached()?;
-        self.prometheus_cache
-            .store(Arc::new(Some((Instant::now(), output.clone()))));
-        Ok(output)
+        loop {
+            let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
+            let output = self.render_prometheus_uncached()?;
+            if self.proxy_metadata_generation.load(Ordering::Acquire) != metadata_generation {
+                continue;
+            }
+            self.prometheus_cache.store(Arc::new(Some((
+                Instant::now(),
+                metadata_generation,
+                output.clone(),
+            ))));
+            if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation {
+                return Ok(output);
+            }
+            self.prometheus_cache.store(Arc::new(None));
+        }
     }
 
     pub fn render_prometheus_uncached(&self) -> Result<String, String> {
         // Multiple counter families × ~200 bytes per entry
         let estimated_cap = 1024 + self.entries.len() * 600;
         let mut output = String::with_capacity(estimated_cap);
+        let active_proxy_names = self.active_proxy_names.load();
 
         // --- Per-call metrics (HTTP entries only — streams have no status code) ---
         struct ChargeAggregate {
@@ -730,14 +1056,20 @@ impl ChargebackRegistry {
 
         // Entries are keyed by pricing bits so config reloads do not reuse
         // stale prices, but Prometheus label sets intentionally omit those
-        // bits. Aggregate by the exposed labels before rendering so a scrape
-        // never contains duplicate series after pricing changes.
+        // bits (and omit `proxy_name` from the aggregation key) so a name-only
+        // reload preserves registry counter continuity. Aggregate by the billing
+        // identity before rendering and take live display metadata from the
+        // published configuration snapshot (issue #2572).
         let mut http_aggregates: HashMap<HttpChargeAggregateKey, ChargeAggregate> = HashMap::new();
         let mut stream_aggregates: HashMap<StreamChargeAggregateKey, ChargeAggregate> =
             HashMap::new();
 
         for entry in self.entries.iter() {
             let v = entry.value();
+            let proxy_name = active_proxy_names
+                .get(v.proxy_id.as_ref())
+                .map(String::as_str)
+                .unwrap_or(v.proxy_name.as_ref());
             match v.protocol_family {
                 ProtocolFamily::Http => {
                     let agg = http_aggregates
@@ -749,12 +1081,13 @@ impl ChargebackRegistry {
                             Arc::clone(&v.namespace_label),
                         ))
                         .or_insert_with(|| ChargeAggregate {
-                            proxy_name: v.proxy_name.to_string(),
+                            proxy_name: proxy_name.to_string(),
                             currency: Arc::clone(&v.currency),
                             namespace_label: Arc::clone(&v.namespace_label),
                             count: 0,
                             charges: 0.0,
                         });
+                    apply_export_proxy_name(&mut agg.proxy_name, proxy_name);
                     agg.count += v.call_count.load(Ordering::Relaxed);
                     agg.charges = checked_add_charge(agg.charges, v.call_charge()?)?;
                 }
@@ -767,12 +1100,13 @@ impl ChargebackRegistry {
                             Arc::clone(&v.namespace_label),
                         ))
                         .or_insert_with(|| ChargeAggregate {
-                            proxy_name: v.proxy_name.to_string(),
+                            proxy_name: proxy_name.to_string(),
                             currency: Arc::clone(&v.currency),
                             namespace_label: Arc::clone(&v.namespace_label),
                             count: 0,
                             charges: 0.0,
                         });
+                    apply_export_proxy_name(&mut agg.proxy_name, proxy_name);
                     agg.count += v.call_count.load(Ordering::Relaxed);
                     agg.charges = checked_add_charge(agg.charges, v.call_charge()?)?;
                 }
@@ -868,6 +1202,10 @@ impl ChargebackRegistry {
         let mut bw_aggregates: HashMap<BandwidthAggregateKey, BandwidthAggregate> = HashMap::new();
         for entry in self.entries.iter() {
             let v = entry.value();
+            let proxy_name = active_proxy_names
+                .get(v.proxy_id.as_ref())
+                .map(String::as_str)
+                .unwrap_or(v.proxy_name.as_ref());
             let agg = bw_aggregates
                 .entry((
                     v.consumer.to_string(),
@@ -877,7 +1215,7 @@ impl ChargebackRegistry {
                     Arc::clone(&v.namespace_label),
                 ))
                 .or_insert_with(|| BandwidthAggregate {
-                    proxy_name: v.proxy_name.to_string(),
+                    proxy_name: proxy_name.to_string(),
                     currency: Arc::clone(&v.currency),
                     namespace_label: Arc::clone(&v.namespace_label),
                     bytes_sent: 0,
@@ -885,6 +1223,7 @@ impl ChargebackRegistry {
                     charge_sent: 0.0,
                     charge_received: 0.0,
                 });
+            apply_export_proxy_name(&mut agg.proxy_name, proxy_name);
             agg.bytes_sent += v.bytes_sent_total.load(Ordering::Relaxed);
             agg.bytes_received += v.bytes_received_total.load(Ordering::Relaxed);
             agg.charge_sent = checked_add_charge(agg.charge_sent, v.bandwidth_charge_sent()?)?;
@@ -966,8 +1305,10 @@ impl ChargebackRegistry {
     /// return an explicit error response rather than serializing JSON `null`.
     pub fn render_json(&self) -> Result<String, String> {
         let ttl_secs = self.render_cache_ttl_secs.load(Ordering::Relaxed);
+        let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
         let cached = self.json_cache.load();
-        if let Some((generated_at, ref output)) = **cached
+        if let Some((generated_at, cached_generation, ref output)) = **cached
+            && cached_generation == metadata_generation
             && generated_at.elapsed().as_secs() < ttl_secs
         {
             return Ok(output.clone());
@@ -976,13 +1317,26 @@ impl ChargebackRegistry {
         let stale_ttl = self.stale_entry_ttl_nanos.load(Ordering::Relaxed);
         self.evict_stale(stale_ttl);
 
-        let output = self.render_json_uncached()?;
-        self.json_cache
-            .store(Arc::new(Some((Instant::now(), output.clone()))));
-        Ok(output)
+        loop {
+            let metadata_generation = self.proxy_metadata_generation.load(Ordering::Acquire);
+            let output = self.render_json_uncached()?;
+            if self.proxy_metadata_generation.load(Ordering::Acquire) != metadata_generation {
+                continue;
+            }
+            self.json_cache.store(Arc::new(Some((
+                Instant::now(),
+                metadata_generation,
+                output.clone(),
+            ))));
+            if self.proxy_metadata_generation.load(Ordering::Acquire) == metadata_generation {
+                return Ok(output);
+            }
+            self.json_cache.store(Arc::new(None));
+        }
     }
 
     pub fn render_json_uncached(&self) -> Result<String, String> {
+        let active_proxy_names = self.active_proxy_names.load();
         // Nested structure: consumer -> proxy -> {protocol, by_status, stream, bandwidth}.
         //
         // Currency is carried per proxy (it is a property of the recording
@@ -1022,6 +1376,10 @@ impl ChargebackRegistry {
             let bytes_received = v.bytes_received_total.load(Ordering::Relaxed);
             let bw_sent = v.bandwidth_charge_sent()?;
             let bw_received = v.bandwidth_charge_received()?;
+            let proxy_name = active_proxy_names
+                .get(v.proxy_id.as_ref())
+                .map(String::as_str)
+                .unwrap_or(v.proxy_name.as_ref());
 
             if !currency_mixed {
                 match overall_currency.as_ref() {
@@ -1041,7 +1399,7 @@ impl ChargebackRegistry {
                     Arc::clone(&v.namespace_label),
                 ))
                 .or_insert_with(|| ProxyAggregate {
-                    proxy_name: v.proxy_name.to_string(),
+                    proxy_name: proxy_name.to_string(),
                     currency: Arc::clone(&v.currency),
                     has_http: false,
                     has_stream: false,
@@ -1053,6 +1411,7 @@ impl ChargebackRegistry {
                     bandwidth_charge_sent: 0.0,
                     bandwidth_charge_received: 0.0,
                 });
+            apply_export_proxy_name(&mut proxy_entry.proxy_name, proxy_name);
             proxy_entry.bytes_sent += bytes_sent;
             proxy_entry.bytes_received += bytes_received;
             proxy_entry.bandwidth_charge_sent =
@@ -1272,11 +1631,13 @@ impl ChargebackRegistry {
         let currency = if currency_mixed {
             "mixed".to_string()
         } else {
-            let configured_currency = self.configured_currency.load();
             overall_currency
                 .as_deref()
                 .map(str::to_string)
-                .unwrap_or_else(|| configured_currency.as_str().to_string())
+                // With no recorded entries there is no authoritative instance
+                // currency. Keep the response deterministic instead of using
+                // constructor order from the process-global registry.
+                .unwrap_or_else(|| "USD".to_string())
         };
 
         let result = serde_json::json!({
@@ -1342,23 +1703,11 @@ impl ApiChargeback {
             None => "USD",
         };
 
-        let render_cache_ttl_secs = optional_u64(
-            config,
-            "render_cache_ttl_seconds",
-            DEFAULT_RENDER_CACHE_TTL_SECS,
-        )?;
-
-        let stale_entry_ttl_secs = optional_u64(
-            config,
-            "stale_entry_ttl_seconds",
-            DEFAULT_STALE_TTL_NANOS / 1_000_000_000,
-        )?;
-
-        let cache_invalidation_min_age_ms = optional_u64(
-            config,
-            "cache_invalidation_min_age_ms",
-            DEFAULT_CACHE_INVALIDATION_MIN_AGE_NANOS / 1_000_000,
-        )?;
+        // Resolve shared tunables before mutating the registry so a bad value
+        // never leaves process-global state half-applied. When multiple
+        // instances exist on different proxies they must already agree on these
+        // values (see [`validate_composition`]).
+        let tunables = SharedRegistryTunables::from_config(config)?;
 
         // Validate ALL pricing dimensions before touching the global registry,
         // so a config error never leaves shared state half-mutated.
@@ -1376,16 +1725,14 @@ impl ApiChargeback {
         // Validation passed — now safe to configure the shared registry. Only
         // the process-global render/cleanup knobs are set here; currency and
         // namespace are scoped per entry via this instance's `InstanceScope`
-        // (finding #24).
+        // (finding #24). Admission requires every enabled instance to resolve
+        // to the same tunables so construction order cannot change ownership.
         registry.configure(
-            render_cache_ttl_secs,
-            stale_entry_ttl_secs,
-            cache_invalidation_min_age_ms,
+            tunables.render_cache_ttl_secs,
+            tunables.stale_entry_ttl_secs,
+            tunables.cache_invalidation_min_age_ms,
         );
-        registry.set_configured_currency(currency);
-
-        let cleanup_interval_seconds = optional_u64(config, "cleanup_interval_seconds", 300)?;
-        registry.start_cleanup_task(cleanup_interval_seconds);
+        registry.start_cleanup_task(tunables.cleanup_interval_seconds);
 
         let scope = InstanceScope::new(currency, namespace);
 
@@ -1413,6 +1760,13 @@ impl Plugin for ApiChargeback {
     }
 
     async fn log(&self, summary: &TransactionSummary) {
+        // Shadow/mirror summaries retain the primary consumer identity for
+        // logging correlation, but they are internal backend probes — never
+        // consumer-billable per-call or bandwidth charges (issue #2437).
+        if summary.mirror {
+            return;
+        }
+
         let consumer = match summary.consumer_username.as_deref() {
             Some(c) if !c.is_empty() => c,
             _ => return,

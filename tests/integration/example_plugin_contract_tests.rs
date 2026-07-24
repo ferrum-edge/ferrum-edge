@@ -173,6 +173,6 @@ fn deadline_bearing_buffered_logging_uses_owned_bounded_cleanup() {
     assert!(helper.contains("log_with_mirror(plugins, &summary, ctx).await;"));
     assert!(helper.contains("let plugins = plugins.to_vec();"));
     assert!(helper.contains("let ctx = ctx.clone();"));
-    assert!(helper.contains("tokio::spawn(async move"));
+    assert!(helper.contains("crate::observability_delivery::spawn_deadline_cleanup(async move"));
     assert!(helper.contains("std::time::Duration::from_secs(5)"));
 }

@@ -4319,6 +4319,7 @@ async fn run_compressing_backend_rejection(
 ) -> (bool, u16, Option<String>, HashMap<String, String>, Vec<u8>) {
     let plugins = redacting_plugins_with_compression();
     let mut ctx = make_ctx();
+    ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
     ctx.headers
         .insert("accept-encoding".to_string(), "gzip, br".to_string());
 
@@ -4347,6 +4348,7 @@ async fn run_compressing_backend_rejection(
 async fn compression_does_commit_an_encoding_on_a_non_rejected_response() {
     let plugins = redacting_plugins_with_compression();
     let mut ctx = make_ctx();
+    ctx.max_response_body_size_bytes = 10 * 1024 * 1024;
     ctx.headers
         .insert("accept-encoding".to_string(), "gzip, br".to_string());
     let mut headers = json_headers();

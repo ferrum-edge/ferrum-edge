@@ -89,6 +89,7 @@ struct ConversionPlan {
     object_schemas: AHashMap<usize, Arc<Value>>,
     array_item_schemas: AHashMap<usize, Arc<Value>>,
     composed_scalar_validators: AHashMap<usize, jsonschema::Validator>,
+    pattern_property_schemas: AHashMap<usize, Vec<(Regex, Arc<Value>)>>,
 }
 
 impl ConversionPlan {
@@ -146,6 +147,18 @@ impl ConversionPlan {
                 self.register_schema(child, schema_draft, visited, depth + 1)?;
             }
         }
+        if let Some(patterns) = schema.get("patternProperties").and_then(Value::as_object) {
+            let mut compiled = Vec::with_capacity(patterns.len());
+            for (pattern, child) in patterns {
+                let regex = Regex::new(pattern).map_err(|error| {
+                    format!("invalid patternProperties regex '{pattern}': {error}")
+                })?;
+                let child = Arc::new(child.clone());
+                self.register_schema(child.as_ref(), schema_draft, visited, depth + 1)?;
+                compiled.push((regex, child));
+            }
+            self.pattern_property_schemas.insert(key, compiled);
+        }
         for keyword in ["items", "additionalProperties"] {
             if let Some(child) = schema.get(keyword).filter(|child| child.is_object()) {
                 self.register_schema(child, schema_draft, visited, depth + 1)?;
@@ -179,6 +192,33 @@ impl ConversionPlan {
     fn composed_scalar_validator(&self, schema: &Value) -> Option<&jsonschema::Validator> {
         self.composed_scalar_validators
             .get(&(schema as *const Value as usize))
+    }
+
+    fn pattern_property_schema<'a>(
+        &'a self,
+        schema: &Value,
+        property_name: &str,
+    ) -> Option<&'a Value> {
+        let mut first_match = None;
+        for (pattern, child) in self
+            .pattern_property_schemas
+            .get(&(schema as *const Value as usize))?
+        {
+            if !pattern.is_match(property_name) {
+                continue;
+            }
+            let child = child.as_ref();
+            if first_match.is_none() {
+                first_match = Some(child);
+            }
+            if !collect_scalar_types(child).is_empty()
+                || schema_accepts_object(child)
+                || schema_accepts_array(child)
+            {
+                return Some(child);
+            }
+        }
+        first_match
     }
 }
 
@@ -1227,7 +1267,105 @@ fn parse_encoding_map(
             free_form_exploded_objects.join(", ")
         ));
     }
+    reject_exploded_object_key_collisions(schema, &out)?;
     Ok(out)
+}
+
+/// Fail closed when explode=true form objects would emit the same wire key into
+/// more than one logical JSON property (root sibling, sibling exploded object,
+/// or a free-form object whose unbounded child key space overlaps another).
+fn reject_exploded_object_key_collisions(
+    schema: &Value,
+    encoding: &AHashMap<String, PropertyEncoding>,
+) -> Result<(), String> {
+    let root_names = declared_object_property_names(schema);
+    let mut exploded_children: Vec<(&str, HashSet<String>)> = Vec::new();
+    let mut free_form: Vec<&str> = Vec::new();
+    for (property, property_encoding) in encoding {
+        if property_encoding.style != EncodingStyle::Form || !property_encoding.explode {
+            continue;
+        }
+        let Some(property_schema) = property_schema_from_object(schema, property) else {
+            continue;
+        };
+        if !schema_accepts_object(property_schema) {
+            continue;
+        }
+        // A free-form object (additionalProperties not false) absorbs any wire
+        // key that is not a root sibling, so its emitted-key space is unbounded.
+        if additional_property_schema_for_conversion(property_schema).is_some() {
+            free_form.push(property.as_str());
+        }
+        let child_names = declared_object_property_names(property_schema);
+        for child in &child_names {
+            if child != property && root_names.contains(child) {
+                return Err(format!(
+                    "encoding['{property}'] explode=true object child '{child}' collides with a root request-body property"
+                ));
+            }
+        }
+        exploded_children.push((property.as_str(), child_names));
+    }
+    for (index, (left_property, left_children)) in exploded_children.iter().enumerate() {
+        for (right_property, right_children) in exploded_children.iter().skip(index + 1) {
+            let mut overlap: Vec<&str> = left_children
+                .intersection(right_children)
+                .map(String::as_str)
+                .collect();
+            if overlap.is_empty() {
+                continue;
+            }
+            overlap.sort_unstable();
+            return Err(format!(
+                "encoding explode=true object properties '{left_property}' and '{right_property}' emit colliding child keys ({})",
+                overlap.join(", ")
+            ));
+        }
+    }
+    // An unbounded free-form key space intersects the declared child keys of
+    // every other exploded object (those keys are, by the root check above,
+    // non-root wire keys the free-form object would also absorb). One wire
+    // occurrence could then populate two logical properties depending on schema
+    // declaration order, so reject the coexistence fail-closed. (Two free-form
+    // objects are already rejected earlier as mutually ambiguous.)
+    if let Some(free) = free_form.first().copied()
+        && exploded_children.len() > 1
+    {
+        let mut others: Vec<&str> = exploded_children
+            .iter()
+            .map(|(name, _)| *name)
+            .filter(|name| *name != free)
+            .collect();
+        others.sort_unstable();
+        return Err(format!(
+            "encoding explode=true free-form object '{free}' cannot coexist with other explode=true object properties ({}); its unbounded child key space would populate more than one logical property",
+            others.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn declared_object_property_names(schema: &Value) -> HashSet<String> {
+    let mut names = HashSet::new();
+    collect_declared_object_property_names(schema, &mut names, 0);
+    names
+}
+
+fn collect_declared_object_property_names(schema: &Value, out: &mut HashSet<String>, depth: usize) {
+    if depth > 32 {
+        return;
+    }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        out.extend(properties.keys().cloned());
+    }
+    for keyword in ["allOf", "oneOf", "anyOf"] {
+        let Some(branches) = schema.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        for branch in branches {
+            collect_declared_object_property_names(branch, out, depth + 1);
+        }
+    }
 }
 
 fn parse_property_encoding(
@@ -1381,8 +1519,9 @@ fn parse_property_encoding(
             }
             // Header Object may wrap `schema`; accept either that public OAS
             // shape or the internal bare-schema representation. Header Object
-            // `required` defaults to false (OAS 3.1 §4.8.21), so an optional
-            // part header must not reject an otherwise valid multipart body.
+            // `required` defaults to false (OAS 3.1 §4.8.21), while the
+            // internal bare-schema representation preserves its historical
+            // fail-closed presence requirement.
             let header_object = header_schema.as_object();
             // `required`, `description`, and `examples` are also valid JSON
             // Schema keywords, so they cannot distinguish the supported bare
@@ -1402,7 +1541,7 @@ fn parse_property_encoding(
                     }
                 }
             } else {
-                false
+                true
             };
             if is_header_object
                 && header_object.is_some_and(|object| object.contains_key("content"))
@@ -1505,6 +1644,7 @@ fn decode_body<'a>(
             max_decoded_bytes: max_body_bytes,
             max_cumulative_bytes,
             max_codings: MAX_CONTENT_CODINGS,
+            max_amplification_ratio: 0,
         },
     )
 }
@@ -1582,14 +1722,32 @@ fn xml_body_to_value(
     let doc =
         roxmltree::Document::parse(body).map_err(|error| format!("Invalid XML body: {error}"))?;
     let root = doc.root_element();
-    if let Some(expected_root) = xml_name(schema, None)
-        && root.tag_name().name() != expected_root
-    {
-        return Err(format!(
-            "XML root element '{}' does not match schema xml.name '{}'",
-            root.tag_name().name(),
-            expected_root
-        ));
+    let expected_root = xml_name(schema, None);
+    let expected_namespace = xml_namespace(schema);
+    let root_local_matches = expected_root.is_none_or(|local| root.tag_name().name() == local);
+    let root_namespace_matches =
+        expected_namespace.is_none_or(|namespace| root.tag_name().namespace() == Some(namespace));
+    if !root_local_matches || !root_namespace_matches {
+        return Err(match (expected_root, expected_namespace) {
+            (Some(local), Some(namespace)) => format!(
+                "XML root element '{}{}' does not match schema xml.name '{}' in namespace '{}'",
+                xml_namespace_display(root.tag_name().namespace()),
+                root.tag_name().name(),
+                local,
+                namespace
+            ),
+            (Some(local), None) => format!(
+                "XML root element '{}' does not match schema xml.name '{}'",
+                root.tag_name().name(),
+                local
+            ),
+            (None, Some(namespace)) => format!(
+                "XML root namespace '{}' does not match schema xml.namespace '{}'",
+                root.tag_name().namespace().unwrap_or(""),
+                namespace
+            ),
+            (None, None) => "XML root metadata did not match the schema".to_string(),
+        });
     }
     xml_node_to_value(root, schema, conversion)
 }
@@ -1613,18 +1771,15 @@ fn xml_node_to_value(
         let empty_properties = serde_json::Map::new();
         let properties =
             merged_object_properties(object_schema, conversion).unwrap_or(&empty_properties);
-        if properties.is_empty() {
-            return Ok(generic_xml_node_to_value(node));
-        }
         let mut out = serde_json::Map::new();
-        let mut modeled_children = HashSet::new();
-        let mut modeled_attributes = HashSet::new();
+        let mut modeled_names = ModeledXmlNames::default();
         for (property_name, property_schema) in properties {
             if xml_attribute(property_schema) {
-                let attr_name = xml_name(property_schema, Some(property_name.as_str()))
+                let attr_local = xml_name(property_schema, Some(property_name.as_str()))
                     .unwrap_or(property_name.as_str());
-                modeled_attributes.insert(attr_name.to_string());
-                if let Some(value) = node.attribute(attr_name) {
+                let attr_namespace = xml_namespace(property_schema);
+                modeled_names.insert_attribute(attr_namespace, attr_local, property_name);
+                if let Some(value) = xml_attribute_value(node, attr_namespace, attr_local) {
                     out.insert(
                         property_name.clone(),
                         scalar_to_schema_value(value, property_schema, conversion)?,
@@ -1633,39 +1788,121 @@ fn xml_node_to_value(
                 continue;
             }
             if schema_accepts_array(property_schema) {
+                mark_xml_array_modeled_names(
+                    property_name,
+                    property_schema,
+                    conversion,
+                    &mut modeled_names,
+                );
                 let values = xml_array_values(node, property_name, property_schema, conversion)?;
                 if !values.is_empty() {
                     out.insert(property_name.clone(), Value::Array(values));
                 }
                 continue;
             }
-            let child_name = xml_name(property_schema, Some(property_name.as_str()))
+            let child_local = xml_name(property_schema, Some(property_name.as_str()))
                 .unwrap_or(property_name.as_str());
-            modeled_children.insert(child_name.to_string());
-            if let Some(child) = first_child_element(node, child_name) {
-                out.insert(
-                    property_name.clone(),
-                    xml_node_to_value(child, property_schema, conversion)?,
-                );
+            let child_namespace = xml_namespace(property_schema);
+            modeled_names.insert_element(child_namespace, child_local, property_name);
+            let matches = child_elements_matching(node, child_namespace, child_local);
+            match matches.as_slice() {
+                [] => {}
+                [child] => {
+                    out.insert(
+                        property_name.clone(),
+                        xml_node_to_value(*child, property_schema, conversion)?,
+                    );
+                }
+                _ => {
+                    return Err(format!(
+                        "XML property '{property_name}' must not repeat for a non-array schema"
+                    ));
+                }
             }
         }
-        if object_schema
-            .get("additionalProperties")
-            .and_then(Value::as_bool)
-            == Some(false)
-        {
-            for attr in node.attributes() {
-                let name = attr.name();
-                if !modeled_attributes.contains(name) && !out.contains_key(name) {
-                    out.insert(name.to_string(), Value::String(attr.value().to_string()));
+        // Always materialize undeclared members so JSON Schema keywords such as
+        // additionalProperties, maxProperties, patternProperties, and propertyNames
+        // observe the full XML payload instead of a filtered projection.
+        // Fail closed: a member that collides with a modeled JSON key / XML local
+        // but not the property's modeled XML construct or namespace (a
+        // wrong-namespace peer, or an attribute where an element is modeled and
+        // vice versa) must not rebind that property or be silently dropped;
+        // return a conversion error.
+        let additional_schema = additional_property_schema_for_conversion(object_schema);
+        let mut additional_attribute_locals = HashSet::new();
+        let mut additional_element_names: HashMap<String, Option<String>> = HashMap::new();
+        for attr in node.attributes() {
+            if modeled_names.contains_attribute(attr) {
+                continue;
+            }
+            if modeled_names.reserves_json_key(attr.name()) {
+                return Err(format!(
+                    "XML attribute '{}' collides with a modeled property name but does not match its modeled XML construct or namespace",
+                    attr.name()
+                ));
+            }
+            let member_schema = conversion
+                .pattern_property_schema(object_schema, attr.name())
+                .or_else(|| additional_schema.flatten());
+            let value = match member_schema {
+                Some(schema) => scalar_to_schema_value(attr.value(), schema, conversion)?,
+                _ => Value::String(attr.value().to_string()),
+            };
+            additional_attribute_locals.insert(attr.name().to_string());
+            if out.insert(attr.name().to_string(), value).is_some() {
+                return Err(format!(
+                    "XML attributes sharing local name '{}' cannot be represented unambiguously",
+                    attr.name()
+                ));
+            }
+        }
+        for child in node.children().filter(roxmltree::Node::is_element) {
+            if modeled_names.contains_element(child) {
+                continue;
+            }
+            let name = child.tag_name().name();
+            if modeled_names.reserves_json_key(name) {
+                return Err(format!(
+                    "XML element '{name}' collides with a modeled property name but does not match its modeled XML construct or namespace"
+                ));
+            }
+            if additional_attribute_locals.contains(name) {
+                return Err(format!(
+                    "XML attribute and element sharing local name '{name}' cannot be represented unambiguously"
+                ));
+            }
+            let namespace = child.tag_name().namespace();
+            if let Some(previous_namespace) = additional_element_names.get(name) {
+                if previous_namespace.as_deref() != namespace {
+                    return Err(format!(
+                        "XML elements sharing local name '{name}' across namespaces cannot be represented unambiguously"
+                    ));
+                }
+            } else {
+                additional_element_names.insert(name.to_string(), namespace.map(str::to_string));
+            }
+            let member_schema = conversion
+                .pattern_property_schema(object_schema, name)
+                .or_else(|| additional_schema.flatten());
+            let value = match member_schema {
+                Some(schema) => xml_node_to_value(child, schema, conversion)?,
+                _ => generic_xml_node_to_value(child)?,
+            };
+            match out.get_mut(name) {
+                Some(Value::Array(values)) => values.push(value),
+                Some(existing) => {
+                    let first = std::mem::take(existing);
+                    *existing = Value::Array(vec![first, value]);
+                }
+                None => {
+                    out.insert(name.to_string(), value);
                 }
             }
-            for child in node.children().filter(roxmltree::Node::is_element) {
-                let name = child.tag_name().name();
-                if !modeled_children.contains(name) && !out.contains_key(name) {
-                    out.insert(name.to_string(), generic_xml_node_to_value(child));
-                }
-            }
+        }
+        if node.children().any(|child| {
+            child.is_text() && child.text().is_some_and(|text| !text.trim().is_empty())
+        }) {
+            return Err("XML object contains unmodeled text content".to_string());
         }
         return Ok(Value::Object(out));
     }
@@ -1680,51 +1917,149 @@ fn xml_array_values(
     conversion: &ConversionPlan,
 ) -> Result<Vec<Value>, String> {
     let item_schema = array_item_schema_for_conversion(property_schema, conversion);
-    let item_name = xml_name(item_schema, None)
-        .or_else(|| xml_name(property_schema, Some(property_name)))
-        .unwrap_or(property_name);
+    let (item_namespace, item_local) =
+        xml_array_item_name(property_name, property_schema, item_schema);
     let mut values = Vec::new();
     if xml_wrapped(property_schema) {
-        let wrapper_name = xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
-        for wrapper in child_elements(node, wrapper_name) {
-            for child in child_elements(wrapper, item_name) {
+        let wrapper_local = xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
+        let wrapper_namespace = xml_namespace(property_schema);
+        let wrappers = child_elements_matching(node, wrapper_namespace, wrapper_local);
+        if wrappers.len() > 1 {
+            return Err(format!(
+                "XML wrapped array '{property_name}' must not repeat its wrapper element"
+            ));
+        }
+        for wrapper in wrappers {
+            // Fail closed inside the wrapper: same-local wrong-namespace children
+            // must not be filtered away (an optional wrapped array would otherwise
+            // silently become empty and pass).
+            for child in child_elements_matching_fail_closed(
+                wrapper,
+                item_namespace,
+                item_local,
+                "array item",
+            )? {
                 values.push(xml_node_to_value(child, item_schema, conversion)?);
             }
         }
     } else {
-        for child in child_elements(node, item_name) {
+        for child in
+            child_elements_matching_fail_closed(node, item_namespace, item_local, "array item")?
+        {
             values.push(xml_node_to_value(child, item_schema, conversion)?);
         }
     }
     Ok(values)
 }
 
-fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Value {
+fn mark_xml_array_modeled_names(
+    property_name: &str,
+    property_schema: &Value,
+    conversion: &ConversionPlan,
+    modeled_names: &mut ModeledXmlNames,
+) {
+    let item_schema = array_item_schema_for_conversion(property_schema, conversion);
+    let (item_namespace, item_local) =
+        xml_array_item_name(property_name, property_schema, item_schema);
+    if xml_wrapped(property_schema) {
+        let wrapper_local = xml_name(property_schema, Some(property_name)).unwrap_or(property_name);
+        let wrapper_namespace = xml_namespace(property_schema);
+        modeled_names.insert_element(wrapper_namespace, wrapper_local, property_name);
+        // Reserve namespace-qualified item locals (and the array JSON key when the
+        // wrapper itself omits xml.namespace) so a wrong-namespace peer cannot
+        // rebind them via additional-member insertion or silent drop.
+        if item_namespace.is_some() {
+            if wrapper_namespace.is_none() {
+                modeled_names.reserve_json_key(property_name);
+            }
+            if item_local != property_name && item_local != wrapper_local {
+                modeled_names.reserve_json_key(item_local);
+            }
+        }
+    } else {
+        modeled_names.insert_element(item_namespace, item_local, property_name);
+    }
+}
+
+fn xml_array_item_name<'a>(
+    property_name: &'a str,
+    property_schema: &'a Value,
+    item_schema: &'a Value,
+) -> (Option<&'a str>, &'a str) {
+    if let Some(local) = xml_name(item_schema, None) {
+        return (xml_namespace(item_schema), local);
+    }
+    if let Some(local) = xml_name(property_schema, Some(property_name)) {
+        // Prefer item-level namespace when present; otherwise inherit the
+        // property XML Object namespace used for unwrapped array items.
+        let namespace = xml_namespace(item_schema).or_else(|| xml_namespace(property_schema));
+        return (namespace, local);
+    }
+    (
+        xml_namespace(item_schema).or_else(|| xml_namespace(property_schema)),
+        property_name,
+    )
+}
+
+fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Result<Value, String> {
     let mut out = serde_json::Map::new();
+    let mut attribute_locals = HashSet::new();
     for attr in node.attributes() {
-        out.insert(
-            attr.name().to_string(),
-            Value::String(attr.value().to_string()),
-        );
+        attribute_locals.insert(attr.name().to_string());
+        if out
+            .insert(
+                attr.name().to_string(),
+                Value::String(attr.value().to_string()),
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "XML attributes sharing local name '{}' cannot be represented unambiguously",
+                attr.name()
+            ));
+        }
     }
     let children: Vec<_> = node
         .children()
         .filter(roxmltree::Node::is_element)
         .collect();
     if children.is_empty() {
-        return Value::String(node.text().unwrap_or("").trim().to_string());
+        let text = node.text().unwrap_or("").trim().to_string();
+        if out.is_empty() {
+            return Ok(Value::String(text));
+        }
+        if !text.is_empty() {
+            out.insert("#text".to_string(), Value::String(text));
+        }
+        return Ok(Value::Object(out));
     }
+    let mut element_names: HashMap<String, Option<String>> = HashMap::new();
     for child in children {
-        let value = generic_xml_node_to_value(child);
-        let name = child.tag_name().name().to_string();
-        match out.get_mut(&name) {
+        let local = child.tag_name().name();
+        if attribute_locals.contains(local) {
+            return Err(format!(
+                "XML attribute and element sharing local name '{local}' cannot be represented unambiguously"
+            ));
+        }
+        let namespace = child.tag_name().namespace();
+        if let Some(previous_namespace) = element_names.get(local) {
+            if previous_namespace.as_deref() != namespace {
+                return Err(format!(
+                    "XML elements sharing local name '{local}' across namespaces cannot be represented unambiguously"
+                ));
+            }
+        } else {
+            element_names.insert(local.to_string(), namespace.map(str::to_string));
+        }
+        let value = generic_xml_node_to_value(child)?;
+        match out.get_mut(local) {
             Some(Value::Array(values)) => values.push(value),
             Some(existing) => {
                 let first = std::mem::take(existing);
                 *existing = Value::Array(vec![first, value]);
             }
             None => {
-                out.insert(name, value);
+                out.insert(local.to_string(), value);
             }
         }
     }
@@ -1733,7 +2068,7 @@ fn generic_xml_node_to_value(node: roxmltree::Node<'_, '_>) -> Value {
     {
         out.insert("#text".to_string(), Value::String(text.to_string()));
     }
-    Value::Object(out)
+    Ok(Value::Object(out))
 }
 
 fn form_urlencoded_to_value(
@@ -1941,21 +2276,40 @@ fn parse_multipart_parts(body: &[u8], boundary: &str) -> Result<Vec<MultipartPar
         let Some(disposition) = headers.get("content-disposition") else {
             return Err("Malformed multipart part: missing Content-Disposition".to_string());
         };
-        let params = parse_header_params(disposition)?;
-        let Some(name) = params.get("name").filter(|value| !value.is_empty()) else {
+        let (disposition_type, params) = parse_header_type_and_params(disposition)?;
+        if !disposition_type.eq_ignore_ascii_case("form-data") {
+            return Err(format!(
+                "Malformed multipart part: Content-Disposition type must be form-data (got '{disposition_type}')"
+            ));
+        }
+        let Some(name) = params
+            .get("name")
+            .map(|value| value.value.as_str())
+            .filter(|value| !value.is_empty())
+        else {
             return Err("Malformed multipart part: missing form-data name".to_string());
         };
+        // RFC 7578 form-data uses `filename`; silently treating RFC 2231/5987
+        // extended filename parameters as an ordinary non-file field would
+        // re-enable structured JSON/XML body spoofing. Reject unsupported
+        // extended/continued forms instead of dropping their file semantics.
+        if params.keys().any(|key| key.starts_with("filename*")) {
+            return Err(
+                "Malformed multipart part: extended filename parameters are unsupported"
+                    .to_string(),
+            );
+        }
         if name.len() > MAX_MULTIPART_PARAM_BYTES {
             return Err("Multipart form-data name exceeds size limit".to_string());
         }
         if let Some(filename) = params.get("filename")
-            && filename.len() > MAX_MULTIPART_PARAM_BYTES
+            && filename.value.len() > MAX_MULTIPART_PARAM_BYTES
         {
             return Err("Multipart filename exceeds size limit".to_string());
         }
         parts.push(MultipartPart {
-            name: name.clone(),
-            filename: params.get("filename").cloned(),
+            name: name.to_string(),
+            filename: params.get("filename").map(|value| value.value.clone()),
             content_type: headers.get("content-type").cloned(),
             headers,
             body: part_body.to_vec(),
@@ -2474,10 +2828,7 @@ fn multipart_parts_to_schema_object(
         let Some(values) = parts.values().next() else {
             return Ok(Value::Null);
         };
-        let Some(first) = values.first() else {
-            return Ok(Value::Null);
-        };
-        return multipart_part_to_schema_value(first, schema, None, conversion);
+        return multipart_values_to_schema_value(values, schema, None, conversion);
     }
     let mut out = serde_json::Map::new();
     let empty_properties = serde_json::Map::new();
@@ -2489,6 +2840,7 @@ fn multipart_parts_to_schema_object(
         if schema_accepts_object(property_schema)
             && let Some(values) = parts.get(property)
             && values.len() == 1
+            && values[0].filename.is_none()
             && is_structured_multipart_object_part(&values[0])
         {
             consumed_keys.insert(property.clone());
@@ -2591,6 +2943,12 @@ fn multipart_parts_to_schema_object(
                 values_to_schema_value(&[joined], property_schema, property_encoding, conversion)?,
             );
             continue;
+        }
+        if values.len() != 1 {
+            return Err(format!(
+                "Multipart field '{property}' occurs {} times but the schema expects a scalar",
+                values.len()
+            ));
         }
         if let Some(first) = values.first() {
             out.insert(
@@ -2764,6 +3122,16 @@ fn multipart_values_to_schema_value(
             });
         return values_to_schema_value(&[joined], schema, encoding, conversion);
     }
+    if values.len() != 1 {
+        let field = values
+            .first()
+            .map(|part| part.name.as_str())
+            .unwrap_or("field");
+        return Err(format!(
+            "Multipart field '{field}' occurs {} times but the schema expects a scalar",
+            values.len()
+        ));
+    }
     let Some(first) = values.first() else {
         return Ok(Value::Null);
     };
@@ -2819,10 +3187,11 @@ fn multipart_part_to_schema_value(
     }
 
     if schema_accepts_object(schema) || schema.get("properties").is_some() {
-        if let Some(media_type) = part
-            .content_type
-            .as_deref()
-            .and_then(|value| content_type_base(Some(value)).map(str::to_ascii_lowercase))
+        if part.filename.is_none()
+            && let Some(media_type) = part
+                .content_type
+                .as_deref()
+                .and_then(|value| content_type_base(Some(value)).map(str::to_ascii_lowercase))
         {
             if is_json_media_type(&media_type) {
                 return serde_json::from_slice(&part.body).map_err(|error| {
@@ -2942,12 +3311,7 @@ fn values_to_schema_value(
             .map(Value::Array);
     }
     if values.len() > 1 {
-        return Ok(Value::Array(
-            values
-                .iter()
-                .map(|value| scalar_to_schema_value(value, &Value::Null, conversion))
-                .collect::<Result<Vec<_>, _>>()?,
-        ));
+        return Err("Repeated form field values are not allowed for non-array schemas".to_string());
     }
     let value = values.first().map(String::as_str).unwrap_or("");
     scalar_to_schema_value(value, schema, conversion)
@@ -3484,25 +3848,45 @@ fn is_binary_media_type(media_type: &str) -> bool {
 }
 
 fn multipart_boundary(content_type: &str) -> Result<Option<String>, String> {
-    let mut params = parse_header_params(content_type)?;
-    Ok(params.remove("boundary"))
+    let (_, mut params) = parse_header_type_and_params(content_type)?;
+    let Some(param) = params.remove("boundary") else {
+        return Ok(None);
+    };
+    // RFC 2045/2046: characters outside the MIME token grammar (spaces, `:`,
+    // `/`, etc.) are only legal inside a quoted-string. Retain quote state so
+    // unquoted `boundary=abc:def` cannot silently become a valid delimiter.
+    if !param.was_quoted && !is_mime_token(&param.value) {
+        return Err(
+            "Unquoted multipart boundary must be a MIME token (quote values that require quoting)"
+                .to_string(),
+        );
+    }
+    Ok(Some(param.value))
 }
 
-/// Parse MIME/HTTP header parameters with quoted-string and escape awareness.
+#[derive(Debug, Clone)]
+struct HeaderParamValue {
+    value: String,
+    was_quoted: bool,
+}
+
+/// Parse a MIME/HTTP header into its type token and parameters with
+/// quoted-string / escape awareness.
 ///
 /// Semicolons and escapes inside quoted values are preserved. The first
-/// semicolon-delimited segment (media type / disposition type) is skipped.
-fn parse_header_params(value: &str) -> Result<HashMap<String, String>, String> {
+/// semicolon-delimited segment is the media type or disposition type.
+fn parse_header_type_and_params(
+    value: &str,
+) -> Result<(String, HashMap<String, HeaderParamValue>), String> {
     if value.len() > MAX_MULTIPART_PARAM_BYTES * 4 {
         return Err("Header parameter list exceeds size limit".to_string());
     }
     let mut params = HashMap::new();
     let mut parts = split_header_param_segments(value)?;
     if parts.is_empty() {
-        return Ok(params);
+        return Ok((String::new(), params));
     }
-    // Drop the type token (`multipart/form-data` or `form-data`).
-    parts.remove(0);
+    let type_token = parts.remove(0).trim().to_string();
     for piece in parts {
         let piece = piece.trim();
         if piece.is_empty() {
@@ -3516,14 +3900,14 @@ fn parse_header_params(value: &str) -> Result<HashMap<String, String>, String> {
             return Err("Invalid header parameter name".to_string());
         }
         let decoded = decode_header_param_value(raw_value.trim())?;
-        if decoded.len() > MAX_MULTIPART_PARAM_BYTES {
+        if decoded.value.len() > MAX_MULTIPART_PARAM_BYTES {
             return Err(format!("Header parameter '{key}' exceeds size limit"));
         }
         if params.insert(key.clone(), decoded).is_some() {
             return Err(format!("Duplicate header parameter '{key}'"));
         }
     }
-    Ok(params)
+    Ok((type_token, params))
 }
 
 fn split_header_param_segments(value: &str) -> Result<Vec<String>, String> {
@@ -3565,7 +3949,7 @@ fn split_header_param_segments(value: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn decode_header_param_value(value: &str) -> Result<String, String> {
+fn decode_header_param_value(value: &str) -> Result<HeaderParamValue, String> {
     let value = value.trim();
     if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
         let inner = &value[1..value.len() - 1];
@@ -3581,12 +3965,50 @@ fn decode_header_param_value(value: &str) -> Result<String, String> {
                 out.push(ch);
             }
         }
-        return Ok(out);
+        return Ok(HeaderParamValue {
+            value: out,
+            was_quoted: true,
+        });
     }
     if value.contains(['"', '\\']) {
         return Err("Unquoted header parameter contains illegal characters".to_string());
     }
-    Ok(value.to_string())
+    Ok(HeaderParamValue {
+        value: value.to_string(),
+        was_quoted: false,
+    })
+}
+
+/// RFC 2045 `token`: 1* any CHAR except SPACE, CTLs, or tspecials.
+fn is_mime_token(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(is_mime_token_char)
+}
+
+fn is_mime_token_char(byte: u8) -> bool {
+    // RFC 2045 token = 1*<any CHAR except SPACE, CTLs, or tspecials>
+    matches!(
+        byte,
+        b'0'..=b'9'
+            | b'a'..=b'z'
+            | b'A'..=b'Z'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'{'
+            | b'|'
+            | b'}'
+            | b'~'
+    )
 }
 
 fn parse_part_headers(header_bytes: &[u8]) -> Result<HashMap<String, String>, String> {
@@ -3627,11 +4049,42 @@ fn parse_part_headers(header_bytes: &[u8]) -> Result<HashMap<String, String>, St
     Ok(out)
 }
 
+/// Choose the earliest header/body separator: the first blank line, i.e. the
+/// first CRLF/LF line terminator immediately followed by another CRLF/LF
+/// terminator.
+///
+/// Matching only `\r\n\r\n` and `\n\n` (and taking the lower index) still misses
+/// mixed `\n\r\n` / `\r\n\n` blank lines. A part whose header block ends with an
+/// LF line but whose blank line is CRLF (`...name"\n\r\n...`) then has no early
+/// match, so a later separator wins and the intervening body prefix is
+/// reclassified as part headers. Scanning every terminator keeps the earliest
+/// blank line winning regardless of CRLF/LF mixing, so body bytes before a later
+/// separator can never be promoted into headers.
 fn split_header_body(segment: &[u8]) -> Option<(&[u8], &[u8])> {
-    if let Some(index) = memchr::memmem::find(segment, b"\r\n\r\n") {
-        return Some((&segment[..index], &segment[index + 4..]));
+    let mut search = 0;
+    while let Some(rel) = memchr::memchr(b'\n', &segment[search..]) {
+        let lf = search + rel;
+        // The line terminator ending at `lf` starts at a preceding CR when present.
+        let term_start = if lf > 0 && segment[lf - 1] == b'\r' {
+            lf - 1
+        } else {
+            lf
+        };
+        // A blank line requires a second terminator immediately after the first.
+        let after = lf + 1;
+        let second_len = if segment[after..].starts_with(b"\r\n") {
+            Some(2)
+        } else if segment[after..].starts_with(b"\n") {
+            Some(1)
+        } else {
+            None
+        };
+        if let Some(second_len) = second_len {
+            return Some((&segment[..term_start], &segment[after + second_len..]));
+        }
+        search = lf + 1;
     }
-    memchr::memmem::find(segment, b"\n\n").map(|index| (&segment[..index], &segment[index + 2..]))
+    None
 }
 
 fn trim_trailing_line_break(mut value: &[u8]) -> &[u8] {
@@ -3656,6 +4109,14 @@ fn xml_name<'a>(schema: &'a Value, default: Option<&'a str>) -> Option<&'a str> 
         .or(default)
 }
 
+fn xml_namespace(schema: &Value) -> Option<&str> {
+    schema
+        .get("xml")
+        .and_then(|value| value.get("namespace"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
 fn xml_attribute(schema: &Value) -> bool {
     schema
         .get("xml")
@@ -3672,21 +4133,178 @@ fn xml_wrapped(schema: &Value) -> bool {
         .unwrap_or(false)
 }
 
-fn first_child_element<'a>(
-    node: roxmltree::Node<'a, 'a>,
-    local_name: &str,
-) -> Option<roxmltree::Node<'a, 'a>> {
-    node.children()
-        .find(|child| child.is_element() && child.tag_name().name() == local_name)
+#[derive(Debug, Default)]
+struct ModeledXmlNames {
+    /// Exact expanded names when the schema declares `xml.namespace`.
+    exact_elements: HashSet<(String, String)>,
+    /// Local names that match any namespace when the schema omits `xml.namespace`.
+    any_namespace_elements: HashSet<String>,
+    exact_attributes: HashSet<(String, String)>,
+    /// Unqualified attribute locals when the schema omits `xml.namespace`.
+    unqualified_attributes: HashSet<String>,
+    /// JSON property keys and modeled XML locals claimed by modeled properties.
+    /// A member that shares one of these names but does not match the property's
+    /// modeled XML construct or namespace is rejected fail-closed rather than
+    /// dropped or rematerialized as an additional member.
+    reserved_json_keys: HashSet<String>,
 }
 
-fn child_elements<'a>(
+impl ModeledXmlNames {
+    fn reserve_json_key(&mut self, json_key: &str) {
+        self.reserved_json_keys.insert(json_key.to_string());
+    }
+
+    fn reserves_json_key(&self, json_key: &str) -> bool {
+        self.reserved_json_keys.contains(json_key)
+    }
+
+    fn insert_element(&mut self, namespace: Option<&str>, local: &str, json_key: &str) {
+        // Reserve the modeled JSON key unconditionally. Attributes and elements
+        // share the intermediate object's keyspace, so an additional member of the
+        // opposite XML construct (an attribute where this property is modeled as an
+        // element, or vice versa) could otherwise fill an unfilled modeled slot and
+        // pass validation the backend would reject: a validator/backend
+        // differential. Correct-construct members are consumed before the
+        // reserved-key check, so this only rejects cross-construct collisions.
+        //
+        // Also reserve a differing xml.name local unconditionally (with or without
+        // xml.namespace). Otherwise a namespace-less rename such as JSON key `role`
+        // / xml.name `wireRole` would leave `wireRole` free for an opposite-
+        // construct additional member under additionalProperties omitted/true/
+        // permissive.
+        self.reserve_json_key(json_key);
+        if local != json_key {
+            self.reserve_json_key(local);
+        }
+        match namespace {
+            Some(namespace) => {
+                self.exact_elements
+                    .insert((namespace.to_string(), local.to_string()));
+            }
+            None => {
+                self.any_namespace_elements.insert(local.to_string());
+            }
+        }
+    }
+
+    fn insert_attribute(&mut self, namespace: Option<&str>, local: &str, json_key: &str) {
+        // Reserve the modeled JSON key and a differing xml.name local
+        // unconditionally (see insert_element).
+        self.reserve_json_key(json_key);
+        if local != json_key {
+            self.reserve_json_key(local);
+        }
+        match namespace {
+            Some(namespace) => {
+                self.exact_attributes
+                    .insert((namespace.to_string(), local.to_string()));
+            }
+            None => {
+                self.unqualified_attributes.insert(local.to_string());
+            }
+        }
+    }
+
+    fn contains_element(&self, node: roxmltree::Node<'_, '_>) -> bool {
+        let local = node.tag_name().name();
+        if self.any_namespace_elements.contains(local) {
+            return true;
+        }
+        let Some(namespace) = node.tag_name().namespace() else {
+            return false;
+        };
+        self.exact_elements
+            .iter()
+            .any(|(ns, name)| ns == namespace && name == local)
+    }
+
+    fn contains_attribute(&self, attr: roxmltree::Attribute<'_, '_>) -> bool {
+        let local = attr.name();
+        match attr.namespace() {
+            Some(namespace) => self
+                .exact_attributes
+                .iter()
+                .any(|(ns, name)| ns == namespace && name == local),
+            None => self.unqualified_attributes.contains(local),
+        }
+    }
+}
+
+fn xml_expanded_name_matches(
+    actual: roxmltree::ExpandedName<'_, '_>,
+    expected_namespace: Option<&str>,
+    expected_local: &str,
+) -> bool {
+    if actual.name() != expected_local {
+        return false;
+    }
+    match expected_namespace {
+        // Fail closed: a declared namespace URI must match exactly. Prefix text is
+        // ignored; only the expanded name (URI + local) participates.
+        Some(namespace) => actual.namespace() == Some(namespace),
+        // When the schema omits `xml.namespace`, preserve local-name matching.
+        None => true,
+    }
+}
+
+fn xml_attribute_value<'a>(
     node: roxmltree::Node<'a, 'a>,
+    namespace: Option<&str>,
+    local: &str,
+) -> Option<&'a str> {
+    match namespace {
+        Some(namespace) => node.attribute((namespace, local)),
+        // Attributes do not inherit default namespaces; omit => unqualified only.
+        None => node.attribute(local),
+    }
+}
+
+fn child_elements_matching<'a>(
+    node: roxmltree::Node<'a, 'a>,
+    namespace: Option<&str>,
     local_name: &str,
 ) -> Vec<roxmltree::Node<'a, 'a>> {
     node.children()
-        .filter(move |child| child.is_element() && child.tag_name().name() == local_name)
+        .filter(roxmltree::Node::is_element)
+        .filter(|child| xml_expanded_name_matches(child.tag_name(), namespace, local_name))
         .collect()
+}
+
+/// Like [`child_elements_matching`], but when the schema declares a namespace URI
+/// and a child shares the modeled local name under a different URI, return a
+/// conversion error instead of silently dropping the child.
+fn child_elements_matching_fail_closed<'a>(
+    node: roxmltree::Node<'a, 'a>,
+    namespace: Option<&str>,
+    local_name: &str,
+    role: &str,
+) -> Result<Vec<roxmltree::Node<'a, 'a>>, String> {
+    let mut matched = Vec::new();
+    for child in node.children().filter(roxmltree::Node::is_element) {
+        let local = child.tag_name().name();
+        if local != local_name {
+            // Unrelated locals stay non-colliding (ignored here; object-level
+            // additional-member materialization may still observe them).
+            continue;
+        }
+        if xml_expanded_name_matches(child.tag_name(), namespace, local_name) {
+            matched.push(child);
+            continue;
+        }
+        // Reachable only when `namespace` is Some and the URI differs (or is
+        // absent): local-name-only schemas accept any URI via the match above.
+        return Err(format!(
+            "XML element '{local}' uses a local name reserved for a namespace-qualified modeled {role} but does not match the required expanded name"
+        ));
+    }
+    Ok(matched)
+}
+
+fn xml_namespace_display(namespace: Option<&str>) -> String {
+    match namespace {
+        Some(namespace) => format!("{{{namespace}}}"),
+        None => String::new(),
+    }
 }
 
 fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {

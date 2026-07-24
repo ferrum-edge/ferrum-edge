@@ -32,16 +32,44 @@ impl Http3Client {
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth();
-        Self::from_rustls(client_tls)
+        Self::from_rustls(client_tls, None)
+    }
+
+    /// Build an insecure client with an explicit per-stream receive window.
+    ///
+    /// Slow-client tests use this to create deterministic QUIC backpressure
+    /// without relying on Quinn's substantially larger default window.
+    pub fn insecure_with_stream_receive_window(
+        stream_receive_window: u32,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let provider = rustls::crypto::ring::default_provider();
+        let verifier = Arc::new(DangerousAcceptAnyServer);
+        let client_tls = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        Self::from_rustls(client_tls, Some(stream_receive_window))
     }
 
     fn from_rustls(
         mut client_tls: rustls::ClientConfig,
+        stream_receive_window: Option<u32>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         client_tls.alpn_protocols = vec![b"h3".to_vec()];
         let quic_config = quinn::crypto::rustls::QuicClientConfig::try_from(client_tls)
             .map_err(|e| format!("QuicClientConfig build failed: {e}"))?;
-        let client_config = ClientConfig::new(Arc::new(quic_config));
+        let mut client_config = ClientConfig::new(Arc::new(quic_config));
+        if let Some(window) = stream_receive_window {
+            let mut transport = quinn::TransportConfig::default();
+            transport.stream_receive_window(quinn::VarInt::from_u32(window));
+            // Leave enough connection-level credit for the response stream
+            // plus H3 control/QPACK streams while the response itself stalls.
+            transport.receive_window(quinn::VarInt::from_u32(
+                window.saturating_mul(64).max(1_048_576),
+            ));
+            client_config.transport_config(Arc::new(transport));
+        }
 
         // Bind ephemeral local UDP. quinn picks an IPv4 endpoint by default
         // which matches the gateway's IPv4 bind in test mode.
@@ -306,6 +334,27 @@ impl Http3Client {
         &self,
         url: &str,
     ) -> Result<Http3GrpcStream, Box<dyn std::error::Error + Send + Sync>> {
+        self.open_grpc_stream_with_content_type(url, "application/grpc")
+            .await
+    }
+
+    /// Open an H3 gRPC-Web request stream whose response can be consumed one
+    /// DATA chunk at a time. Functional cadence/cancellation tests use this
+    /// instead of the ordinary buffered [`Self::get_with_options`] helper.
+    pub async fn open_grpc_web_stream(
+        &self,
+        url: &str,
+        content_type: &str,
+    ) -> Result<Http3GrpcStream, Box<dyn std::error::Error + Send + Sync>> {
+        self.open_grpc_stream_with_content_type(url, content_type)
+            .await
+    }
+
+    async fn open_grpc_stream_with_content_type(
+        &self,
+        url: &str,
+        content_type: &str,
+    ) -> Result<Http3GrpcStream, Box<dyn std::error::Error + Send + Sync>> {
         let parsed: http::Uri = url.parse()?;
         let host = parsed.host().ok_or("missing host in url")?.to_string();
         let port = parsed.port_u16().unwrap_or(443);
@@ -324,13 +373,12 @@ impl Http3Client {
         let driver_task = tokio::spawn(async move {
             let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
         });
-        // Only `content-type: application/grpc` is needed for the gateway's
-        // flavor detection; the gateway synthesizes `te: trailers` toward the
-        // backend itself, so we don't send it from the client.
+        // The gateway synthesizes `te: trailers` toward the backend itself, so
+        // the client only needs the selected native/gRPC-Web content type.
         let req = Request::builder()
             .method(http::Method::POST)
             .uri(url)
-            .header(http::header::CONTENT_TYPE, "application/grpc")
+            .header(http::header::CONTENT_TYPE, content_type)
             .body(())
             .map_err(|e| format!("build request: {e}"))?;
         let stream = tokio::time::timeout(Duration::from_secs(15), send_request.send_request(req))
@@ -338,6 +386,72 @@ impl Http3Client {
             .map_err(|_| "send_request timed out")?
             .map_err(|e| format!("send_request: {e}"))?;
         Ok(Http3GrpcStream {
+            stream,
+            _send_request: send_request,
+            driver_task,
+        })
+    }
+
+    /// Open a plain HTTP/3 request stream and return it before response body
+    /// drain. Used by slow-client / disconnect latency tests that must hold
+    /// QUIC flow-control credit instead of buffering the full body eagerly.
+    pub async fn open_response_stream(
+        &self,
+        url: &str,
+        options: GetOptions,
+    ) -> Result<Http3ResponseStream, Box<dyn std::error::Error + Send + Sync>> {
+        let parsed: http::Uri = url.parse()?;
+        let host = parsed.host().ok_or("missing host in url")?.to_string();
+        let port = parsed.port_u16().unwrap_or(443);
+        let addr = resolve_loopback(&host, port)?;
+        let server_name = parsed.host().unwrap_or("localhost").to_string();
+        let conn = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.endpoint.connect(addr, &server_name)?,
+        )
+        .await
+        .map_err(|_| "QUIC handshake timed out")??;
+        let h3_conn = h3_quinn::Connection::new(conn);
+        let (mut driver, mut send_request) = h3::client::new(h3_conn)
+            .await
+            .map_err(|e| format!("h3 new: {e}"))?;
+        let driver_task = tokio::spawn(async move {
+            let _ = std::future::poll_fn(|cx| driver.poll_close(cx)).await;
+        });
+
+        let mut req_builder = Request::builder().method(options.method.clone()).uri(url);
+        match &options.host_header {
+            HostHeader::Auto => {}
+            HostHeader::Explicit(value) => {
+                req_builder = req_builder.header(http::header::HOST, value.as_str());
+            }
+            HostHeader::SameAsAuthority => {
+                let host_header = format!("{host}:{port}");
+                req_builder = req_builder.header(http::header::HOST, host_header);
+            }
+        }
+        for (name, value) in &options.headers {
+            req_builder = req_builder.header(name.as_str(), value.as_str());
+        }
+        let req = req_builder
+            .body(())
+            .map_err(|e| format!("build request: {e}"))?;
+        let mut stream =
+            tokio::time::timeout(Duration::from_secs(15), send_request.send_request(req))
+                .await
+                .map_err(|_| "send_request timed out")?
+                .map_err(|e| format!("send_request: {e}"))?;
+        if !options.body.is_empty() {
+            stream
+                .send_data(options.body.clone())
+                .await
+                .map_err(|e| format!("send request body: {e}"))?;
+        }
+        stream
+            .finish()
+            .await
+            .map_err(|e| format!("finish request body: {e}"))?;
+        Ok(Http3ResponseStream {
             stream,
             _send_request: send_request,
             driver_task,
@@ -499,6 +613,18 @@ pub struct Http3GrpcStream {
 }
 
 impl Http3GrpcStream {
+    /// Send caller-supplied request DATA without closing the request stream.
+    pub async fn send_raw_data(
+        &mut self,
+        data: impl Into<Bytes>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        tokio::time::timeout(Duration::from_secs(15), self.stream.send_data(data.into()))
+            .await
+            .map_err(|_| "send_data timed out")?
+            .map_err(|e| format!("send_data: {e}"))?;
+        Ok(())
+    }
+
     /// Send one length-prefixed gRPC message as a DATA frame WITHOUT closing the
     /// request stream (no END_STREAM), so a backend can be observed reacting to
     /// it before the client half-closes.
@@ -541,6 +667,38 @@ impl Http3GrpcStream {
         Ok((resp.status(), resp.headers().clone()))
     }
 
+    /// Receive the next response DATA chunk without draining to EOF.
+    pub async fn recv_data(
+        &mut self,
+    ) -> Result<Option<Bytes>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(mut chunk) =
+            tokio::time::timeout(Duration::from_secs(15), self.stream.recv_data())
+                .await
+                .map_err(|_| "recv_data timed out")?
+                .map_err(|e| format!("recv_data: {e}"))?
+        else {
+            return Ok(None);
+        };
+        let mut data = Vec::new();
+        while chunk.has_remaining() {
+            let take = chunk.chunk().to_vec();
+            data.extend_from_slice(&take);
+            chunk.advance(take.len());
+        }
+        Ok(Some(Bytes::from(data)))
+    }
+
+    /// Receive terminal HTTP/3 trailers after response DATA reaches EOF.
+    pub async fn recv_trailers(
+        &mut self,
+    ) -> Result<Option<HeaderMap>, Box<dyn std::error::Error + Send + Sync>> {
+        let trailers = tokio::time::timeout(Duration::from_secs(15), self.stream.recv_trailers())
+            .await
+            .map_err(|_| "recv_trailers timed out")?
+            .map_err(|e| format!("recv_trailers: {e}"))?;
+        Ok(trailers)
+    }
+
     /// Drain the response body (concatenated DATA) and the gRPC trailers.
     pub async fn recv_body_and_trailers(
         &mut self,
@@ -570,6 +728,65 @@ impl Http3GrpcStream {
 }
 
 impl Drop for Http3GrpcStream {
+    fn drop(&mut self) {
+        self.driver_task.abort();
+    }
+}
+
+/// A client-driven plain HTTP/3 response stream for slow-client and disconnect
+/// tests. Returned by [`Http3Client::open_response_stream`].
+pub struct Http3ResponseStream {
+    stream: h3::client::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>,
+    _send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+    driver_task: JoinHandle<()>,
+}
+
+impl Http3ResponseStream {
+    /// Await response headers.
+    pub async fn recv_response(
+        &mut self,
+    ) -> Result<(StatusCode, HeaderMap), Box<dyn std::error::Error + Send + Sync>> {
+        let resp = tokio::time::timeout(Duration::from_secs(15), self.stream.recv_response())
+            .await
+            .map_err(|_| "recv_response timed out")?
+            .map_err(|e| format!("recv_response: {e}"))?;
+        Ok((resp.status(), resp.headers().clone()))
+    }
+
+    /// Receive the next response DATA chunk without draining to EOF.
+    pub async fn recv_data(
+        &mut self,
+    ) -> Result<Option<Bytes>, Box<dyn std::error::Error + Send + Sync>> {
+        let Some(mut chunk) =
+            tokio::time::timeout(Duration::from_secs(15), self.stream.recv_data())
+                .await
+                .map_err(|_| "recv_data timed out")?
+                .map_err(|e| format!("recv_data: {e}"))?
+        else {
+            return Ok(None);
+        };
+        let mut data = Vec::new();
+        while chunk.has_remaining() {
+            let take = chunk.chunk().to_vec();
+            data.extend_from_slice(&take);
+            chunk.advance(take.len());
+        }
+        Ok(Some(Bytes::from(data)))
+    }
+
+    /// Drain remaining DATA frames to EOF.
+    pub async fn drain_body(&mut self) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let mut total = 0usize;
+        loop {
+            match self.recv_data().await? {
+                Some(chunk) => total = total.saturating_add(chunk.len()),
+                None => return Ok(total),
+            }
+        }
+    }
+}
+
+impl Drop for Http3ResponseStream {
     fn drop(&mut self) {
         self.driver_task.abort();
     }

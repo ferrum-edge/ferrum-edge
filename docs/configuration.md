@@ -29,7 +29,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_LOG_BUFFER_CAPACITY` | No | `4096` | Per-sink hard record-slot limit (stdout/access logs share one sink; stderr is separate). Actual admission is also constrained by `FERRUM_LOG_BUFFER_BYTES`. Clamped to 1–65,536; admission is lossy and non-blocking when either limit is full |
 | `FERRUM_LOG_BUFFER_BYTES` | No | `33554432` | Per-sink aggregate serialized-payload byte budget. Admission provisionally reserves `FERRUM_LOG_MAX_RECORD_BYTES` before serialization, then queues an exact-sized allocation and shrinks that reservation to the serialized length until write completion. Clamped between `FERRUM_LOG_MAX_RECORD_BYTES` and 1 GiB |
 | `FERRUM_LOG_MAX_RECORD_BYTES` | No | `65536` | Maximum serialized bytes for one runtime/access-log record, including its newline. Clamped to 1 KiB–1 MiB; larger records are dropped and counted |
-| `FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS` | No | `2000` | Maximum time spent draining each process log sink during shutdown. Clamped to 100–30,000 ms; records still outstanding at the deadline are counted as incomplete drain |
+| `FERRUM_LOG_SHUTDOWN_DRAIN_TIMEOUT_MS` | No | `2000` | Shared absolute budget for deferred terminal/mirror tasks and queued observability workers, followed by the per-process-log-sink drain. Clamped to 100–30,000 ms; tasks or records still outstanding at a lifecycle deadline are cancelled and counted |
 | `FERRUM_LOG_REDACT_METADATA_KEYS` | No | — | Comma-separated additional metadata-key substrings to redact from `TransactionSummary.metadata` and `StreamTransactionSummary.metadata` before log serialization. Built-in sensitive substrings such as `authorization`, `cookie`, `password`, `secret`, and `token` are always redacted. Operators can further reshape per-plugin log output (rename keys, drop fields, reorder, add static / derived fields, flatten metadata, change timestamp format) via per-logging-plugin `schema:` blocks or a shared `transaction_log_schema` plugin — see [docs/log_schema.md](log_schema.md) |
 | `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` | No | `30` | Timeout for each external secret fetch from file sources (`_FILE`, including FIFO/stalled-mount reads on a detached thread) and cloud backends (`_VAULT`/`_AWS`/`_AZURE`/`_GCP`), and for async cloud client/credential construction during startup batch resolution. **Startup env-secret resolution reads this from the environment only, not from `ferrum.conf`** — it runs before the settings file is parsed, and consulting the conf-file cache there would freeze it before a `FERRUM_CONF_PATH_FILE` source could install the intended settings path. A `ferrum.conf` value still applies to later runtime fetches (typed TLS provider URIs) |
 | `FERRUM_GCP_SECRET_MANAGER_ENDPOINT` | No | — | Override the GCP Secret Manager service endpoint (base URL) used by `_GCP` / `gcp://` secret resolution. When set, the client targets this endpoint with anonymous credentials instead of `secretmanager.googleapis.com` with Application Default Credentials. Intended for pointing the real client at a local fake/emulator or an in-cluster proxy in tests and air-gapped setups; leave unset for normal production use. Requires the `secrets-gcp` Cargo feature. **Startup env-secret resolution reads this from the environment only, not from `ferrum.conf`**, for the same reason as `FERRUM_SECRET_FETCH_TIMEOUT_SECONDS` above: the GCP client is built while startup resolution is still running, so a conf-file lookup there would freeze the settings-file cache before a `FERRUM_CONF_PATH_FILE` source could install the intended path. A `ferrum.conf` value still applies to later runtime `gcp://` TLS-material fetches |
@@ -63,6 +63,8 @@ value.
 |---|---|---|---|
 | `FERRUM_PROXY_HTTP_PORT` | No | `8000` | HTTP proxy listener port. Set to `0` to disable the plaintext HTTP listener (TLS-only operation) |
 | `FERRUM_PROXY_HTTPS_PORT` | No | `8443` | HTTPS proxy listener port |
+| `FERRUM_COMPRESSION_GZIP_ENABLED` | No | `true` | Process-wide gzip content-coding gate for the built-in `compression` plugin. When `false`, gzip (including the `x-gzip` compatibility token) is removed from every instance's response `algorithms` and opt-in gzip request decompression is disabled. Per-plugin configuration can narrow this global policy but cannot re-enable gzip |
+| `FERRUM_COMPRESSION_BROTLI_ENABLED` | No | `true` | Process-wide Brotli content-coding gate for the built-in `compression` plugin. When `false`, `br` is removed from every instance's response `algorithms` and opt-in Brotli request decompression is disabled. Per-plugin configuration can narrow this global policy but cannot re-enable Brotli |
 | `FERRUM_PROXY_BIND_ADDRESS` | No | `0.0.0.0` | Bind address for proxy listeners (HTTP, HTTPS, HTTP/3). Set to `::` for dual-stack IPv4+IPv6 |
 | `FERRUM_FRONTEND_TLS_CERT_PATH` | If HTTPS | — | PEM certificate the gateway presents to incoming clients (HTTPS, WebSocket, gRPC, TCP/TLS) |
 | `FERRUM_FRONTEND_TLS_CERT_SOURCE` | If HTTPS and set | — | Source override for `FERRUM_FRONTEND_TLS_CERT_PATH`; accepts path, `file://`, inline PEM, or provider URI |
@@ -287,8 +289,8 @@ These settings only apply when `FERRUM_DB_TYPE=mongodb`. `FERRUM_DB_POOL_*` sett
 | `FERRUM_MONGO_APP_NAME` | No | — | App name for server-side connection tracking |
 | `FERRUM_MONGO_REPLICA_SET` | No | — | Replica set name. Required for transactions and change streams |
 | `FERRUM_MONGO_AUTH_MECHANISM` | No | (auto) | Auth mechanism override: `SCRAM-SHA-256`, `MONGODB-X509`, etc. |
-| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | No | `30` | Server selection timeout |
-| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | No | `10` | TCP connection timeout |
+| `FERRUM_MONGO_SERVER_SELECTION_TIMEOUT_SECONDS` | No | — | Explicit server selection timeout. When unset, preserves `serverSelectionTimeoutMS` from `FERRUM_DB_URL` (or the driver default). When set, overrides the URI value |
+| `FERRUM_MONGO_CONNECT_TIMEOUT_SECONDS` | No | — | Explicit TCP connect timeout. When unset, preserves `connectTimeoutMS` from `FERRUM_DB_URL` (or the driver default). When set, overrides the URI value |
 
 See [mongodb.md](mongodb.md) for the full deployment guide including read preference, replica sets, Atlas, and Kubernetes examples.
 
@@ -596,9 +598,9 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_RESOLVER_ADDRESS` | No | resolv.conf | Comma-separated nameservers (ip[:port]) |
 | `FERRUM_DNS_RESOLVER_HOSTS_FILE` | No | `/etc/hosts` | Path to custom hosts file |
 | `FERRUM_DNS_ORDER` | No | `CACHE,SRV,A,CNAME` | Record type query order (comma-separated) |
-| `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh. Capped at 86400s (1 day) |
-| `FERRUM_DNS_ERROR_TTL` | No | `5` | TTL (seconds) for errors/empty responses. Capped at 86400s (1 day) |
-| `FERRUM_DNS_CACHE_MAX_SIZE` | No | `10000` | Maximum DNS cache entries |
+| `FERRUM_DNS_STALE_TTL` | No | `3600` | Stale data usage time (seconds) during refresh. Also caps failed-entry lifetime and error-TTL backoff. Capped at 86400s (1 day) |
+| `FERRUM_DNS_ERROR_TTL` | No | `5` | Base TTL (seconds) for errors/empty responses; doubles on consecutive failures up to `FERRUM_DNS_STALE_TTL`. Capped at 86400s (1 day) |
+| `FERRUM_DNS_CACHE_MAX_SIZE` | No | `10000` | Maximum DNS cache entries. Over-capacity eviction prefers error entries over live success entries |
 | `FERRUM_DNS_WARMUP_CONCURRENCY` | No | `500` | Maximum concurrent DNS warmup resolutions during startup/config reload |
 | `FERRUM_DNS_SLOW_THRESHOLD_MS` | No | Disabled | Log slow DNS resolutions above this threshold (ms) |
 | `FERRUM_DNS_REFRESH_THRESHOLD_PERCENT` | No | `90` | Percentage of TTL elapsed before background refresh (1-99) |
@@ -606,7 +608,7 @@ See [size_limits.md](size_limits.md) for detailed sizing guidance.
 | `FERRUM_DNS_TRY_TCP_ON_ERROR` | No | `true` | Retry over TCP when UDP DNS responses are truncated or fail |
 | `FERRUM_DNS_NUM_CONCURRENT_REQS` | No | `3` | Nameservers to query concurrently per lookup; clamped 1..10 |
 | `FERRUM_DNS_MAX_ACTIVE_REQUESTS` | No | `512` | Max in-flight queries per multiplexed DNS connection; clamped 1..4096 |
-| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Maximum concurrent stale-while-revalidate background refresh tasks system-wide. Prevents unbounded task spawning when many stale hostnames are hit simultaneously. Range: 1-1000 |
+| `FERRUM_DNS_MAX_CONCURRENT_REFRESHES` | No | `64` | Max concurrent stale-while-revalidate refreshes and per-cycle failed-DNS retry work (selection + resolve concurrency). Range: 1-1000 |
 
 See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 
@@ -739,12 +741,12 @@ See [client_ip_resolution.md](client_ip_resolution.md) for the security model an
 |---|---|---|---|
 | `FERRUM_WORKER_THREADS` | No | CPU cores | Tokio async worker threads |
 | `FERRUM_BLOCKING_THREADS` | No | `512` | Max tokio blocking threads for file/DNS I/O |
-| `FERRUM_POOL_SHARD_AMOUNT` | No | `0` (auto) | Shard count for hot-path `DashMap`s (connection pools, pending creations, RR counters, DNS cache, per-IP request counts, TCP connection-throttle counters, router prefix/regex caches, `response_caching` cache/Vary-index/predictor maps, and shared local/Redis-fallback rate-limiter token-state maps used by `rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, GraphQL type/operation limits, and `grpc_method_router`). `0` auto-derives `next_power_of_two(max(64, num_cpus * 16))` (64 on small dev hosts, 256 on a 16-core box, 1024 on a 64-core box). Any positive value is rounded up to the next power of two. Tune up for hosts running 1M+ concurrent flows; tune down only under memory pressure |
+| `FERRUM_POOL_SHARD_AMOUNT` | No | `0` (auto) | Shard count for hot-path `DashMap`s (connection pools, pending creations, RR counters, DNS cache, circuit-breaker cache, per-IP request counts, TCP connection-throttle counters, router prefix/regex caches, `response_caching` cache/Vary-index/predictor maps, and shared local/Redis-fallback rate-limiter token-state maps used by `rate_limiting`, `ai_rate_limiter`, `ws_rate_limiting`, `udp_rate_limiting`, GraphQL type/operation limits, and `grpc_method_router`). `0` auto-derives `next_power_of_two(max(64, num_cpus * 16))` (64 on small dev hosts, 256 on a 16-core box, 1024 on a 64-core box). Any positive value is rounded up to the next power of two. Tune up for hosts running 1M+ concurrent flows; tune down only under memory pressure |
 | `FERRUM_MAX_CONNECTIONS` | No | `100000` | Max concurrent proxy connections; queues when full, `0` = unlimited |
 | `FERRUM_MAX_REQUESTS` | No | `0` | Max concurrent in-flight requests/streams; `0` = unlimited |
 | `FERRUM_MAX_CONCURRENT_REQUESTS_PER_IP` | No | `0` | Per-client-IP concurrent request cap; `0` disables |
 | `FERRUM_PER_IP_CLEANUP_INTERVAL_SECONDS` | No | `60` | Cleanup interval for per-IP request counters |
-| `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` | No | `10000` | Max circuit breaker cache entries |
+| `FERRUM_CIRCUIT_BREAKER_CACHE_MAX_ENTRIES` | No | `10000` | Max circuit breaker cache entries (`proxy_id` or `proxy_id::host:port`). Concurrent same-key creates share one breaker; new distinct keys are refused admission once full and receive a transient (uncached) breaker so overflow traffic still proceeds without growing or splitting cached state. Existing keys remain replaceable at capacity when config changes |
 | `FERRUM_STATUS_COUNTS_MAX_ENTRIES` | No | `200` | Max distinct HTTP status code counter entries |
 | `FERRUM_TCP_LISTEN_BACKLOG` | No | `2048` | TCP listen backlog size (min 128); raise `net.core.somaxconn` to match |
 | `FERRUM_ACCEPT_THREADS` | No | `0` (auto-detect) | Parallel accept() loops per proxy listener port via SO_REUSEPORT. `0` = CPU cores, `1` = single listener. Parallelizes kernel-level connection intake independently of worker threads. Unix only (Linux 3.9+, macOS, BSDs); non-Unix platforms warn and run one accept loop |

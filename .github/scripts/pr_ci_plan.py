@@ -53,7 +53,8 @@ ACTION_MUTABLE_HELM_INSTALL = re.compile(
     r"raw\.githubusercontent\.com/helm/helm/"
     r"(?:refs/heads/)?[^/\s]+/[^\s]*(?:get-helm-3|install[^\s]*)|"
     r"https://raw\.githubusercontent\.com/[^/\s]+/[^/\s]+/"
-    r"(?:refs/heads/)?(?:main|master)/[^\s]*install",
+    r"(?:refs/heads/)?(?:main|master)/[^\s]*install|"
+    r"get\.helm\.sh/helm-install",
     re.IGNORECASE,
 )
 ACTION_DIRECT_K8S_TOOL_DOWNLOAD = re.compile(
@@ -455,6 +456,7 @@ def action_pinning_self_test() -> list[str]:
         "  curl https://cdn.dl.k8s.io/release/v1.32.3/bin/linux/amd64/kubectl\n"
         "  go install sigs.k8s.io/kind@v0.27.0\n"
         "  curl https://raw.githubusercontent.com/helm/helm/refs/heads/devel/scripts/get-helm-3\n"
+        "  curl -fsSL https://get.helm.sh/helm-install -o /tmp/helm-install\n"
     )
     alternate_failures = scan_action_policy_text(
         alternate_downloads,
@@ -465,6 +467,16 @@ def action_pinning_self_test() -> list[str]:
         failures.append(
             "alternate Kubernetes/Helm download self-test was not fully rejected: "
             f"{alternate_failures!r}"
+        )
+    helm_install_failures = scan_action_policy_text(
+        "run: curl -fsSL https://get.helm.sh/helm-install -o /tmp/helm-install\n",
+        ".github/actions/setup-kubernetes-tools/action.yml",
+        allow_direct_downloads=True,
+    )
+    if not any("mutable-branch Helm installer" in failure for failure in helm_install_failures):
+        failures.append(
+            "get.helm.sh/helm-install self-test was not rejected in setup action: "
+            f"{helm_install_failures!r}"
         )
     dockerfile_failures = scan_action_dockerfile(
         f"FROM alpine@sha256:{digest} AS pinned\nFROM scratch\nFROM ubuntu:latest\n",

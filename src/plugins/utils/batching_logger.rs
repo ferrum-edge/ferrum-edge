@@ -7,8 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
 use tracing::{debug, warn};
+
+use crate::observability_delivery::DeliveryWorkerControl;
 
 const DROP_WARN_EVERY: u64 = 100;
 /// Hard ceiling for an admitted batch size across shared logging sinks.
@@ -127,10 +128,11 @@ pub struct BatchingLogger<T: Send + 'static> {
     commit_tx: watch::Sender<bool>,
     committed: AtomicBool,
     sender: Option<mpsc::Sender<T>>,
-    worker: Option<JoinHandle<()>>,
+    worker: Arc<DeliveryWorkerControl>,
     plugin_name: &'static str,
     dropped_count: Arc<AtomicU64>,
     queue_depth: Arc<AtomicUsize>,
+    outstanding_count: Arc<AtomicUsize>,
     buffer_capacity: usize,
     hooks: LoggerHooks<T>,
 }
@@ -144,9 +146,11 @@ pub struct BatchingLogger<T: Send + 'static> {
 #[derive(Clone)]
 pub struct BatchingLoggerHandle<T: Send + 'static> {
     sender: mpsc::Sender<T>,
+    worker: Arc<DeliveryWorkerControl>,
     plugin_name: &'static str,
     dropped_count: Arc<AtomicU64>,
     queue_depth: Arc<AtomicUsize>,
+    outstanding_count: Arc<AtomicUsize>,
     buffer_capacity: usize,
     hooks: LoggerHooks<T>,
 }
@@ -157,6 +161,7 @@ pub struct BatchingLoggerHandle<T: Send + 'static> {
 pub struct BatchingLoggerPermit<T: Send + 'static> {
     permit: Option<mpsc::OwnedPermit<T>>,
     queue_depth: Arc<AtomicUsize>,
+    outstanding_count: Arc<AtomicUsize>,
 }
 
 impl<T: Send + 'static> BatchingLoggerPermit<T> {
@@ -171,6 +176,7 @@ impl<T: Send + 'static> Drop for BatchingLoggerPermit<T> {
     fn drop(&mut self) {
         if self.permit.is_some() {
             decrement_queue_depth(&self.queue_depth);
+            decrement_queue_depth(&self.outstanding_count);
         }
     }
 }
@@ -281,27 +287,56 @@ impl<T: Send + 'static> BatchingLogger<T> {
         let (sender, receiver) = mpsc::channel(cfg.buffer_capacity);
         let queue_depth = Arc::new(AtomicUsize::new(0));
         let worker_queue_depth = Arc::clone(&queue_depth);
+        let outstanding_count = Arc::new(AtomicUsize::new(0));
+        let worker_outstanding_count = Arc::clone(&outstanding_count);
+        let pending_count = Arc::clone(&outstanding_count);
         let on_failed_batch = hooks.on_failed_batch.clone();
+        let (worker_control, close_rx) = DeliveryWorkerControl::new(plugin_name, move || {
+            pending_count.load(Ordering::Relaxed) as u64
+        });
+        let completion = worker_control.completion();
+        let worker_drain_control = Arc::clone(&worker_control);
         let worker = tokio::spawn(async move {
-            if !wait_until_committed(commit_rx).await {
+            let mut completion = completion;
+            if !wait_until_committed_or_closed(commit_rx, close_rx.clone()).await {
                 // Staged generation was dropped/rejected before publication.
                 // Discard the receiver without entering the flush loop so no
                 // network or fallback side effects can run.
                 drop(receiver);
+                completion.complete();
                 return;
             }
-            run_flush_loop_with_hooks(cfg, receiver, worker_queue_depth, flush, on_failed_batch)
-                .await;
+            run_flush_loop_with_hooks(
+                cfg,
+                receiver,
+                FlushAccounting {
+                    queue_depth: worker_queue_depth,
+                    outstanding_count: worker_outstanding_count,
+                },
+                worker_drain_control,
+                close_rx,
+                flush,
+                on_failed_batch,
+            )
+            .await;
+            completion.complete();
         });
+        if let Err(error) = worker_control.install_abort_handle(worker.abort_handle()) {
+            warn!(plugin = plugin_name, "{plugin_name}: {error}");
+            worker.abort();
+        }
+        drop(worker);
+        crate::observability_delivery::register_worker(Arc::clone(&worker_control));
 
         Self {
             commit_tx,
             committed: AtomicBool::new(false),
             sender: Some(sender),
-            worker: Some(worker),
+            worker: worker_control,
             plugin_name,
             dropped_count: Arc::new(AtomicU64::new(0)),
             queue_depth,
+            outstanding_count,
             buffer_capacity,
             hooks,
         }
@@ -332,9 +367,11 @@ impl<T: Send + 'static> BatchingLogger<T> {
     pub fn handle(&self) -> Option<BatchingLoggerHandle<T>> {
         self.sender.as_ref().map(|sender| BatchingLoggerHandle {
             sender: sender.clone(),
+            worker: Arc::clone(&self.worker),
             plugin_name: self.plugin_name,
             dropped_count: Arc::clone(&self.dropped_count),
             queue_depth: Arc::clone(&self.queue_depth),
+            outstanding_count: Arc::clone(&self.outstanding_count),
             buffer_capacity: self.buffer_capacity,
             hooks: self.hooks.clone(),
         })
@@ -347,19 +384,17 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// Uncommitted loggers abort instead of draining so a rejected staged
     /// generation cannot flush as a side effect of teardown.
     ///
-    /// Callers that published [`BatchingLoggerHandle`] clones must drop those
-    /// handles first; otherwise the channel stays open until every clone is
-    /// released.
+    /// Published [`BatchingLoggerHandle`] clones may remain alive: worker
+    /// admission closes first, then the receiver closes after in-progress
+    /// enqueue attempts release their admission guards.
     pub async fn close_and_await(&mut self) -> bool {
         if !self.committed.load(Ordering::Acquire) {
             self.close_and_abort();
             return true;
         }
         drop(self.sender.take());
-        if let Some(worker) = self.worker.take() {
-            return worker.await.is_ok();
-        }
-        true
+        self.worker.close_admission();
+        self.worker.wait_finished().await
     }
 
     /// Close admission and cancel the flush worker when no asynchronous drain
@@ -367,15 +402,23 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// account the abandoned work before calling it.
     pub fn close_and_abort(&mut self) {
         drop(self.sender.take());
-        if let Some(worker) = self.worker.take() {
-            worker.abort();
-        }
+        self.worker.abort();
     }
 
     /// Non-blocking send. On full buffer, logs a warning once per N drops and
     /// silently drops intermediate entries so the hot path never blocks.
     pub fn try_send(&self, item: T) -> bool {
+        let Some(_admission) = self.worker.try_admit() else {
+            record_drop(
+                &self.dropped_count,
+                self.plugin_name,
+                "worker unavailable during shutdown",
+            );
+            return false;
+        };
+        self.outstanding_count.fetch_add(1, Ordering::Relaxed);
         let Some(sender) = self.sender.as_ref() else {
+            decrement_queue_depth(&self.outstanding_count);
             record_drop(
                 &self.dropped_count,
                 self.plugin_name,
@@ -393,6 +436,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
                 on_high_water(depth, self.buffer_capacity);
             }
             if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
+                decrement_queue_depth(&self.outstanding_count);
                 on_overflow(item, "queue high water");
                 return false;
             }
@@ -403,6 +447,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(item)) => {
                 decrement_queue_depth(&self.queue_depth);
+                decrement_queue_depth(&self.outstanding_count);
                 record_drop(&self.dropped_count, self.plugin_name, "buffer full");
                 if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
                     on_overflow(item, "buffer full");
@@ -411,6 +456,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 decrement_queue_depth(&self.queue_depth);
+                decrement_queue_depth(&self.outstanding_count);
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,
@@ -426,6 +472,14 @@ impl<T: Send + 'static> BatchingLogger<T> {
     /// capacity before a response becomes immutable, while filling the record
     /// only after later validators determine the final status and body.
     pub fn try_reserve(&self) -> Option<BatchingLoggerPermit<T>> {
+        let Some(_admission) = self.worker.try_admit() else {
+            record_drop(
+                &self.dropped_count,
+                self.plugin_name,
+                "worker unavailable while reserving a commit slot",
+            );
+            return None;
+        };
         let Some(sender) = self.sender.as_ref() else {
             record_drop(
                 &self.dropped_count,
@@ -435,13 +489,16 @@ impl<T: Send + 'static> BatchingLogger<T> {
             return None;
         };
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
+        self.outstanding_count.fetch_add(1, Ordering::Relaxed);
         match sender.clone().try_reserve_owned() {
             Ok(permit) => Some(BatchingLoggerPermit {
                 permit: Some(permit),
                 queue_depth: Arc::clone(&self.queue_depth),
+                outstanding_count: Arc::clone(&self.outstanding_count),
             }),
             Err(mpsc::error::TrySendError::Full(_sender)) => {
                 decrement_queue_depth(&self.queue_depth);
+                decrement_queue_depth(&self.outstanding_count);
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,
@@ -451,6 +508,7 @@ impl<T: Send + 'static> BatchingLogger<T> {
             }
             Err(mpsc::error::TrySendError::Closed(_sender)) => {
                 decrement_queue_depth(&self.queue_depth);
+                decrement_queue_depth(&self.outstanding_count);
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,
@@ -467,6 +525,20 @@ impl<T: Send + 'static> BatchingLogger<T> {
 
     pub fn buffer_capacity(&self) -> usize {
         self.buffer_capacity
+    }
+}
+
+impl<T: Send + 'static> Drop for BatchingLogger<T> {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if self.committed.load(Ordering::Acquire) {
+            // Reload retirement cannot await from Drop, so close the worker
+            // and leave its completion ownership with the process registry.
+            self.worker.close_admission();
+        } else {
+            // A rejected staged generation must never flush externally.
+            self.worker.abort();
+        }
     }
 }
 
@@ -599,6 +671,15 @@ impl<T: Send + 'static> BatchingLoggerHandle<T> {
     /// Non-blocking send. On full buffer, logs a warning once per N drops and
     /// silently drops intermediate entries so the hot path never blocks.
     pub fn try_send(&self, item: T) -> bool {
+        let Some(_admission) = self.worker.try_admit() else {
+            record_drop(
+                &self.dropped_count,
+                self.plugin_name,
+                "worker unavailable during shutdown",
+            );
+            return false;
+        };
+        self.outstanding_count.fetch_add(1, Ordering::Relaxed);
         let depth = self.queue_depth.load(Ordering::Relaxed);
         if is_high_water(
             depth,
@@ -609,6 +690,7 @@ impl<T: Send + 'static> BatchingLoggerHandle<T> {
                 on_high_water(depth, self.buffer_capacity);
             }
             if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
+                decrement_queue_depth(&self.outstanding_count);
                 on_overflow(item, "queue high water");
                 return false;
             }
@@ -619,6 +701,7 @@ impl<T: Send + 'static> BatchingLoggerHandle<T> {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(item)) => {
                 decrement_queue_depth(&self.queue_depth);
+                decrement_queue_depth(&self.outstanding_count);
                 record_drop(&self.dropped_count, self.plugin_name, "buffer full");
                 if let Some(on_overflow) = self.hooks.on_overflow.as_ref() {
                     on_overflow(item, "buffer full");
@@ -627,6 +710,7 @@ impl<T: Send + 'static> BatchingLoggerHandle<T> {
             }
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 decrement_queue_depth(&self.queue_depth);
+                decrement_queue_depth(&self.outstanding_count);
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,
@@ -640,14 +724,25 @@ impl<T: Send + 'static> BatchingLoggerHandle<T> {
     /// Atomically reserve one bounded-channel slot without constructing the
     /// item yet.
     pub fn try_reserve(&self) -> Option<BatchingLoggerPermit<T>> {
+        let Some(_admission) = self.worker.try_admit() else {
+            record_drop(
+                &self.dropped_count,
+                self.plugin_name,
+                "worker unavailable while reserving a commit slot",
+            );
+            return None;
+        };
         self.queue_depth.fetch_add(1, Ordering::Relaxed);
+        self.outstanding_count.fetch_add(1, Ordering::Relaxed);
         match self.sender.clone().try_reserve_owned() {
             Ok(permit) => Some(BatchingLoggerPermit {
                 permit: Some(permit),
                 queue_depth: Arc::clone(&self.queue_depth),
+                outstanding_count: Arc::clone(&self.outstanding_count),
             }),
             Err(mpsc::error::TrySendError::Full(_sender)) => {
                 decrement_queue_depth(&self.queue_depth);
+                decrement_queue_depth(&self.outstanding_count);
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,
@@ -657,6 +752,7 @@ impl<T: Send + 'static> BatchingLoggerHandle<T> {
             }
             Err(mpsc::error::TrySendError::Closed(_sender)) => {
                 decrement_queue_depth(&self.queue_depth);
+                decrement_queue_depth(&self.outstanding_count);
                 record_drop(
                     &self.dropped_count,
                     self.plugin_name,
@@ -705,10 +801,44 @@ pub async fn wait_until_committed(mut commit_rx: watch::Receiver<bool>) -> bool 
     false
 }
 
+pub async fn wait_until_committed_or_closed(
+    mut commit_rx: watch::Receiver<bool>,
+    mut close_rx: watch::Receiver<bool>,
+) -> bool {
+    loop {
+        if *commit_rx.borrow() {
+            return true;
+        }
+        if *close_rx.borrow() {
+            return false;
+        }
+        tokio::select! {
+            biased;
+            changed = commit_rx.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+            changed = close_rx.changed() => {
+                if changed.is_err() {
+                    return false;
+                }
+            }
+        }
+    }
+}
+
+struct FlushAccounting {
+    queue_depth: Arc<AtomicUsize>,
+    outstanding_count: Arc<AtomicUsize>,
+}
+
 async fn run_flush_loop_with_hooks<T, F, Fut>(
     cfg: BatchConfig,
     mut receiver: mpsc::Receiver<T>,
-    queue_depth: Arc<AtomicUsize>,
+    accounting: FlushAccounting,
+    worker: Arc<DeliveryWorkerControl>,
+    mut close_rx: watch::Receiver<bool>,
     flush: F,
     on_failed_batch: Option<FailedBatchHook<T>>,
 ) where
@@ -718,26 +848,41 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
 {
     let mut buffer = Vec::with_capacity(cfg.batch_size);
     let mut timer = tokio::time::interval(cfg.flush_interval);
+    let mut closing = *close_rx.borrow();
+    if closing {
+        worker.wait_for_admissions().await;
+        receiver.close();
+    }
     timer.tick().await;
 
     loop {
         tokio::select! {
             biased;
 
+            _ = close_rx.changed(), if !closing => {
+                closing = true;
+                worker.wait_for_admissions().await;
+                receiver.close();
+            }
+
             item = receiver.recv() => {
                 match item {
                     Some(item) => {
-                        decrement_queue_depth(&queue_depth);
+                        decrement_queue_depth(&accounting.queue_depth);
                         buffer.push(item);
                         if buffer.len() >= cfg.batch_size {
                             let batch = std::mem::take(&mut buffer);
+                            let batch_len = batch.len();
                             flush_with_retry(&cfg, &flush, batch, on_failed_batch.as_ref()).await;
+                            decrement_outstanding_by(&accounting.outstanding_count, batch_len);
                         }
                     }
                     None => {
                         if !buffer.is_empty() {
                             let batch = std::mem::take(&mut buffer);
+                            let batch_len = batch.len();
                             flush_with_retry(&cfg, &flush, batch, on_failed_batch.as_ref()).await;
+                            decrement_outstanding_by(&accounting.outstanding_count, batch_len);
                         }
                         break;
                     }
@@ -747,9 +892,12 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
             _ = timer.tick() => {
                 if !buffer.is_empty() {
                     let batch = std::mem::take(&mut buffer);
+                    let batch_len = batch.len();
                     flush_with_retry(&cfg, &flush, batch, on_failed_batch.as_ref()).await;
+                    decrement_outstanding_by(&accounting.outstanding_count, batch_len);
                 }
             }
+
         }
     }
 }
@@ -757,6 +905,12 @@ async fn run_flush_loop_with_hooks<T, F, Fut>(
 fn decrement_queue_depth(queue_depth: &AtomicUsize) {
     let _ = queue_depth.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         Some(value.saturating_sub(1))
+    });
+}
+
+fn decrement_outstanding_by(outstanding_count: &AtomicUsize, count: usize) {
+    let _ = outstanding_count.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(count))
     });
 }
 

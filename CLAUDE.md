@@ -32,7 +32,7 @@ ferrum-edge version [--json]
 ferrum-edge health [-p PORT] [--host H] [--tls] [--tls-no-verify] [--live]
 ```
 
-`run`/`validate` flags: `-s/--settings <PATH>`, `-c/--spec <PATH>`, `-m/--mode <MODE>`, `-v/--verbose`. Precedence is CLI > env > conf file > smart defaults > hardcoded. CLI flags become env vars through `apply_run_overrides()` before `CONF_FILE_CACHE` reads in `main.rs`.
+`run`/`validate` flags: `-s/--settings <PATH>`, `-c/--spec <PATH>`, `-m/--mode <MODE>`, `-v/--verbose`. Precedence is CLI > env > conf file > smart defaults > hardcoded. CLI flags become env vars through `apply_run_overrides()` / `apply_validate_overrides()` before `CONF_FILE_CACHE` reads in `main.rs`.
 
 ```bash
 cargo build

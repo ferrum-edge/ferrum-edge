@@ -556,6 +556,26 @@ pub struct MetricsRegistry {
     pub mesh_request_duration_buckets: DashMap<MeshRequestKey, HistogramBuckets>,
     /// Rate limit exceeded counter
     pub rate_limit_exceeded: AtomicU64,
+    /// `request_mirror` detached tasks admitted past concurrency + byte budgets.
+    request_mirror_dispatched: AtomicU64,
+    /// `request_mirror` tasks that fully drained a response within bounds.
+    request_mirror_completed: AtomicU64,
+    /// `request_mirror` request-phase deadline expiries.
+    request_mirror_request_timeouts: AtomicU64,
+    /// `request_mirror` pre-response transport failures.
+    request_mirror_request_failures: AtomicU64,
+    /// `request_mirror` response-body drain deadline expiries.
+    request_mirror_drain_timeouts: AtomicU64,
+    /// `request_mirror` response-body drain transport failures.
+    request_mirror_drain_failures: AtomicU64,
+    /// `request_mirror` responses truncated at `max_response_body_bytes`.
+    request_mirror_drain_truncations: AtomicU64,
+    /// `request_mirror` tasks dropped before a terminal outcome.
+    request_mirror_cancellations: AtomicU64,
+    /// `request_mirror` attempts dropped because `max_in_flight` was full.
+    request_mirror_concurrency_drops: AtomicU64,
+    /// `request_mirror` attempts dropped because the retained-body budget was full.
+    request_mirror_budget_drops: AtomicU64,
     /// Current ai_federation circuits in an open/half-open recovery state.
     ai_federation_circuits_open: AtomicI64,
     /// ai_federation closed-to-open transitions.
@@ -677,6 +697,16 @@ impl MetricsRegistry {
             mesh_request_counter: DashMap::new(),
             mesh_request_duration_buckets: DashMap::new(),
             rate_limit_exceeded: AtomicU64::new(0),
+            request_mirror_dispatched: AtomicU64::new(0),
+            request_mirror_completed: AtomicU64::new(0),
+            request_mirror_request_timeouts: AtomicU64::new(0),
+            request_mirror_request_failures: AtomicU64::new(0),
+            request_mirror_drain_timeouts: AtomicU64::new(0),
+            request_mirror_drain_failures: AtomicU64::new(0),
+            request_mirror_drain_truncations: AtomicU64::new(0),
+            request_mirror_cancellations: AtomicU64::new(0),
+            request_mirror_concurrency_drops: AtomicU64::new(0),
+            request_mirror_budget_drops: AtomicU64::new(0),
             ai_federation_circuits_open: AtomicI64::new(0),
             ai_federation_circuits_opened: AtomicU64::new(0),
             ai_federation_circuits_closed: AtomicU64::new(0),
@@ -833,6 +863,69 @@ impl MetricsRegistry {
     /// rate-limiter plugin.
     pub fn record_rate_limit_exceeded(&self) {
         self.rate_limit_exceeded.fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    /// Process-wide `request_mirror` lifecycle counters. Labels are never used:
+    /// outcomes are fixed aggregate tallies with no URLs, header names, plugin
+    /// IDs, or attacker-controlled dimensions.
+    pub fn record_request_mirror_dispatched(&self) {
+        self.request_mirror_dispatched
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_request_mirror_completed(&self) {
+        self.request_mirror_completed
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_request_mirror_request_timeout(&self) {
+        self.request_mirror_request_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_request_mirror_request_failure(&self) {
+        self.request_mirror_request_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_request_mirror_drain_timeout(&self) {
+        self.request_mirror_drain_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_request_mirror_drain_failure(&self) {
+        self.request_mirror_drain_failures
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_request_mirror_drain_truncation(&self) {
+        self.request_mirror_drain_truncations
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_request_mirror_cancellation(&self) {
+        self.request_mirror_cancellations
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_request_mirror_concurrency_drop(&self) {
+        self.request_mirror_concurrency_drops
+            .fetch_add(1, Ordering::Relaxed);
+        self.maybe_invalidate_cache();
+    }
+
+    pub fn record_request_mirror_budget_drop(&self) {
+        self.request_mirror_budget_drops
+            .fetch_add(1, Ordering::Relaxed);
         self.maybe_invalidate_cache();
     }
 
@@ -1172,10 +1265,15 @@ impl MetricsRegistry {
                 .observe(summary.latency_backend_total_ms, self.epoch);
         }
 
-        self.gateway_overhead_buckets
-            .entry(Arc::clone(&proxy_id))
-            .or_insert_with(|| HistogramBuckets::new(self.epoch))
-            .observe(summary.latency_gateway_overhead_ms, self.epoch);
+        // Same sentinel guard for gateway overhead: streamed responses with an
+        // unknown backend total emit LATENCY_UNKNOWN_MS rather than inventing
+        // overhead from TTFB (issue #2532).
+        if summary.latency_gateway_overhead_ms >= 0.0 {
+            self.gateway_overhead_buckets
+                .entry(Arc::clone(&proxy_id))
+                .or_insert_with(|| HistogramBuckets::new(self.epoch))
+                .observe(summary.latency_gateway_overhead_ms, self.epoch);
+        }
 
         if let Some(usage) = summary.ai_usage_export.as_ref()
             && let Some(provider) = ai_provider_label(usage.provider)
@@ -1751,6 +1849,99 @@ impl MetricsRegistry {
                 namespace_label_body(&ns_label),
                 self.rate_limit_exceeded.load(Ordering::Relaxed)
             ));
+        }
+
+        // request_mirror lifecycle (aggregate, label-safe; no URLs/plugin IDs).
+        // Terminal outcomes for dispatched tasks sum to dispatched:
+        // completed + request_timeouts + request_failures + drain_timeouts +
+        // drain_failures + drain_truncations + cancellations == dispatched.
+        // Admission drops are separate (never dispatched).
+        for (name, help, value) in [
+            (
+                "ferrum_request_mirror_dispatched_total",
+                "request_mirror detached tasks admitted past concurrency and retained-body budgets.",
+                self.request_mirror_dispatched.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_request_mirror_completed_total",
+                "request_mirror tasks that fully drained a response within byte and time bounds.",
+                self.request_mirror_completed.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_request_mirror_request_timeouts_total",
+                "request_mirror request-phase deadline expiries (connect/headers/body).",
+                self.request_mirror_request_timeouts.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_request_mirror_request_failures_total",
+                "request_mirror pre-response transport failures (DNS, refused, reset, TLS, …).",
+                self.request_mirror_request_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_request_mirror_drain_timeouts_total",
+                "request_mirror response-body drain deadline expiries.",
+                self.request_mirror_drain_timeouts.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_request_mirror_drain_failures_total",
+                "request_mirror response-body drain transport failures.",
+                self.request_mirror_drain_failures.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_request_mirror_drain_truncations_total",
+                "request_mirror responses truncated at max_response_body_bytes during bounded drain.",
+                self.request_mirror_drain_truncations
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_request_mirror_cancellations_total",
+                "request_mirror tasks dropped before a terminal outcome (shutdown/panic/cancellation).",
+                self.request_mirror_cancellations.load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_request_mirror_concurrency_drops_total",
+                "request_mirror attempts dropped because max_in_flight was saturated.",
+                self.request_mirror_concurrency_drops
+                    .load(Ordering::Relaxed),
+            ),
+            (
+                "ferrum_request_mirror_budget_drops_total",
+                "request_mirror attempts dropped because max_retained_request_body_bytes was exhausted.",
+                self.request_mirror_budget_drops.load(Ordering::Relaxed),
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            render_process_counter(&mut output, name, value, &ns_label);
+        }
+
+        // Compression codec admission / worker outcomes (process-wide).
+        let compression_codec = crate::plugins::compression::compression_codec_metrics();
+        for (name, help, value) in [
+            (
+                "ferrum_compression_codec_admitted_total",
+                "Compression codec jobs admitted to the bounded spawn_blocking pool.",
+                compression_codec.admitted,
+            ),
+            (
+                "ferrum_compression_codec_saturated_total",
+                "Compression codec admission refusals when the bounded pool is saturated.",
+                compression_codec.saturated,
+            ),
+            (
+                "ferrum_compression_codec_join_failures_total",
+                "Compression codec spawn_blocking tasks that failed to join.",
+                compression_codec.join_failures,
+            ),
+            (
+                "ferrum_compression_codec_worker_failures_total",
+                "Compression codec worker errors (encode/decode failures inside spawn_blocking).",
+                compression_codec.worker_failures,
+            ),
+        ] {
+            output.push_str(&format!("# HELP {name} {help}\n"));
+            output.push_str(&format!("# TYPE {name} counter\n"));
+            render_process_counter(&mut output, name, value, &ns_label);
         }
 
         output.push_str(

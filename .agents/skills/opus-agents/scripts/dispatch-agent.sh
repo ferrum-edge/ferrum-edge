@@ -5,14 +5,14 @@ set -euo pipefail
 usage() {
   printf '%s\n' \
     'Usage: dispatch-agent.sh --worktree ABS_PATH --prompt-file ABS_PATH' \
-    '                         --effort high|xhigh|max' \
-    "                         [--model 'claude-opus-4-8[1m]'|'opus[1m]']" >&2
+    '                         --effort low|medium|high|xhigh|max' \
+    "                         [--model 'claude-opus-5[1m]'|'opus[1m]']" >&2
 }
 
 worktree=''
 prompt_file=''
 effort=''
-model='claude-opus-4-8[1m]'
+model='claude-opus-5[1m]'
 
 while (($#)); do
   case "$1" in
@@ -65,7 +65,7 @@ while (($#)); do
 done
 
 case "$effort" in
-  high|xhigh|max) ;;
+  low|medium|high|xhigh|max) ;;
   *)
     printf 'Invalid effort: %s\n' "${effort:-<empty>}" >&2
     usage
@@ -74,7 +74,7 @@ case "$effort" in
 esac
 
 case "$model" in
-  'claude-opus-4-8[1m]'|'opus[1m]') ;;
+  'claude-opus-5[1m]'|'opus[1m]') ;;
   *)
     printf 'Invalid model: %s\n' "$model" >&2
     usage

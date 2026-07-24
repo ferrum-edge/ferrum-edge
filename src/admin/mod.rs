@@ -1495,6 +1495,7 @@ pub async fn handle_admin_request(
         registry.refresh_tls_certificate_inventory(&inventory);
         let mut metrics_output = registry.render();
         metrics_output.push_str(&crate::logging::render_prometheus());
+        metrics_output.push_str(&crate::observability_delivery::render_prometheus());
         metrics_output.push_str(&crate::plugins::kafka_logging::render_prometheus());
         metrics_output.push_str(&crate::plugins::api_chargeback_sink::render_prometheus());
         // Append the active `__mesh_bpf_metrics` surface exactly once from the
@@ -5139,10 +5140,15 @@ pub(crate) fn plugin_validation_http_client(state: &AdminState) -> plugins::Plug
             // The real-IP header is also safe to resolve from this CP: ConfigSync
             // rejects every DP that does not advertise the same effective value
             // before any snapshot can be distributed.
+            //
+            // Compression codec gates and the request-body ceiling must also
+            // match serving PluginCache admission so CP cannot accept a
+            // max_decompressed_request_size that DPs later reject.
             plugins::PluginHttpClient::default_with_backend_allow_ips(
                 state.backend_allow_ips.clone(),
             )
             .with_real_ip_header(crate::config::env_config::resolve_real_ip_header())
+            .with_process_compression_admission_policy()
         })
 }
 

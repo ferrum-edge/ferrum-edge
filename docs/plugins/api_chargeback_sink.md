@@ -4,27 +4,179 @@
 to `api_chargeback`: use either plugin independently, or run both when you want
 the existing in-memory `/charges` view plus a durable event stream.
 
+## Durability Contract
+
+Durable (default) export treats a charge event as delivered only after ClickHouse
+returns HTTP 200 or 204 **and** a complete, empty acknowledgement body with no
+`X-ClickHouse-Exception-Code` header and no exception markers in the body.
+HTTP status alone is never treated as proof of success: ClickHouse can return
+200 with an exception in the body, and incomplete drains are ambiguous.
+
+Recommended async-insert settings wait for persistence:
+
+```json
+"insert_query_params": { "async_insert": "1", "wait_for_async_insert": "1" }
+```
+
+When `async_insert` is enabled and `wait_for_async_insert` is omitted, the sink
+pins `wait_for_async_insert=1` on the request instead of inheriting a potentially
+lossy ClickHouse user/profile default.
+
+`wait_for_async_insert=0` (and equivalent falsy values `false` / `no` / `off`)
+is rejected unless `clickhouse.allow_lossy_async_insert` is explicitly `true`.
+That named opt-in is intentionally separate from durable mode: ClickHouse may
+acknowledge a buffered async insert before it is persisted, so a later flush
+failure or crash can lose rows that the sink already counted as exported and
+removed from the spool. Use it only when that loss is acceptable.
+
+Spool replay deletes a file only after an unambiguous persistence-aware success
+result under the durable contract (or after the same complete empty ACK when the
+lossy opt-in is enabled). Timeouts, incomplete acknowledgement drains, and other
+ambiguous outcomes keep the spool file and retry with unchanged `event_id`
+values so `ReplacingMergeTree` deduplicates duplicate-safe retries.
+
 ## Modes
 
 `mode: per_event` emits one `ChargeEvent` for each chargeable HTTP-family
 transaction, stream disconnect, or WebSocket disconnect. This preserves
 transaction-level provenance and is the default.
 
-`mode: snapshot` keeps a local accumulator keyed by namespace, consumer, proxy,
-billable status, raw HTTP status, final gRPC status, and protocol. Every
-`snapshot.interval_secs`, it emits deltas since the last snapshot. Use this when
-event volume dominates ingest cost and aggregate reconciliation is sufficient.
-Snapshot mode requires `spool.enabled: true` because the accumulator advances
-after a delta is handed to the sink queue; the spool is the durable path when
-ClickHouse or the in-memory queue is unavailable. Idle snapshot keys are evicted
-after `snapshot.stale_entry_ttl_secs` and checked every
-`snapshot.cleanup_interval_secs`.
+`mode: snapshot` keeps a local accumulator whose **identity** is every
+exported categorical field on the resulting `ChargeEvent`:
+
+- `namespace`
+- `consumer_id`
+- `consumer_name` (empty segment when absent)
+- `proxy_id`
+- `proxy_name`
+- `route_id` (empty segment when absent)
+- billable `status_code`
+- raw `http_status_code` (empty when absent, e.g. stream/WebSocket)
+- final `grpc_status` (empty when absent; non-standard codes collapse to a
+  bounded sentinel)
+- `protocol` (`http`, `grpc`, `ws`, stream protocol labels, etc.)
+
+Delta emission, last-emitted bookkeeping, and stale-entry cleanup all use this
+same key. Display-name changes (consumer or proxy rename on reload) and
+distinct routes or protocols therefore produce separate snapshot rows instead of
+silently labeling a mixed aggregate with the first record's metadata.
+`request_id` and `trace_id` are omitted from snapshot events (they are
+per-transaction only). Every `snapshot.interval_secs`, the sink emits deltas
+since the last snapshot. Use this when event volume dominates ingest cost and
+aggregate reconciliation is sufficient. Snapshot mode requires
+`spool.enabled: true` because the accumulator advances only after a delta is
+written to the spool; the queue is an additional low-latency delivery attempt,
+not the durability boundary. Idle snapshot keys are eligible for eviction after
+`snapshot.stale_entry_ttl_secs` (which must be `>= snapshot.interval_secs`) and
+are checked every `snapshot.cleanup_interval_secs`, but cleanup never removes a
+key whose current totals still exceed its last durable baseline. Pending or
+never-emitted charges therefore survive first-tick races and prolonged spool
+outages. Hard `snapshot.max_entries` and `snapshot.max_retained_bytes` budgets
+bound accumulator memory; new identities beyond those budgets are spooled as
+per-event rows through the bounded async spool delivery worker (never inline on
+the terminal hook), or staged within the same retained-byte budget for the next
+durable emission, rather than merged into unrelated keys. The overflow-spooled
+counter advances only after the delivery worker's blocking write genuinely
+lands; a full/closed delivery queue or a failed write re-stages the exact event
+within the retained-byte budget. If both durable handoff and bounded staging are
+exhausted, the sink records an explicit cardinality rejection counter instead of
+growing memory without bound.
+
+### Snapshot concurrency contract
+
+Request-path `record`, periodic delta emission, and stale cleanup share the
+accumulator without a global request-path lock (per-key DashMap shard locking
+only):
+
+- A new identity reserves one entry slot and its estimated retained bytes
+  against the hard `max_entries`/`max_retained_bytes` ceilings (atomic CAS, no
+  global lock) **before** the key is published. Retained bytes are a single
+  combined counter shared with staged overflow, so concurrent identity admission
+  and overflow staging can never exceed the byte ceiling. A losing same-key
+  inserter releases its reservation and refreshes the winner exactly once, so a
+  new-key/refresh race can never pin state above the configured ceilings or
+  double-charge a slot.
+- Each accumulator slot has a stable **generation** (assigned at insert) and a
+  **revision** that bumps on every refresh. Stale cleanup may scan candidates
+  first, but eviction is a single conditional `remove_if`: the entry is removed
+  only when generation, revision, `last_seen_at`, and a zero pending delta
+  (current totals equal the last durable baseline for that generation) still
+  match the stale observation. A same-key refresh that races after the stale
+  check wins and remains available for the next snapshot. Unemitted or
+  uncommitted totals are never TTL-evicted.
+- `last_emitted` baselines are tagged with the entry generation. Cleanup drops a
+  baseline only for the generation that was actually evicted, so a concurrent
+  reinsert cannot lose a newer baseline. Delta emission ignores a baseline whose
+  generation does not match the live entry (treats the live entry as starting
+  from zero) and publishes a new baseline only while that generation is still
+  present, so emission and cleanup cannot orphan or double-subtract totals
+  across a remove/reinsert.
+- Each accumulator has exactly one periodic snapshot task and therefore one
+  delta emitter. Before that emitter advances a baseline, it writes the exact
+  snapshot events to the required spool. It then enqueues the same event IDs as
+  a low-latency ClickHouse attempt; spool replay remains the durable path and
+  `ReplacingMergeTree` makes the duplicate-safe attempts idempotent. This
+  single-emitter ownership prevents same-generation baseline publication from
+  being reordered; request-path recorders remain concurrent with that emitter
+  and cleanup.
+- Unrelated keys never block each other on the request path.
+
+### Snapshot generation shutdown
+
+Every committed snapshot generation owns an explicit shutdown lifecycle. A
+successful config replacement and graceful shutdown in database, file,
+data-plane, and mesh modes stop admission to the old generation, wait for
+already-entered record hooks, and then await its snapshot task. The task
+computes the final delta and writes it directly to the required spool before
+the accumulator baseline advances or the generation is released. This direct
+handoff bypasses both the ClickHouse request path and the bounded in-memory
+logger queue, so an unavailable endpoint or queue pressure cannot wedge reload
+or shutdown.
+
+Shutdown wins a simultaneous timer selection. If a periodic tick has already
+durably spooled its events and advanced the baseline, the final handoff
+observes a zero delta; if shutdown wins first, the final spool write advances
+that same baseline. Thus one path, but never both, owns each pending delta.
+The periodic queue attempt may still be in flight during reload, but it uses
+the same event IDs as the durable spool rows, so aborting it cannot lose the
+delta and successful duplicate delivery cannot double-charge it. Repeated
+finalization is idempotent, and record hooks arriving after admission closes
+are ignored.
+
+Spool write failure leaves the generation unfinalized. After the bounded
+finalization deadline the sink reduces failed generations to a compact recovery
+payload (pending terminal deltas plus a spool handle) instead of retaining the
+full accumulator/runtime indefinitely. Compaction never clears, replaces, or
+unregisters a full generation until admission is closed and every already
+admitted terminal hook has released its guard (`in_flight == 0`); until that
+drain is observed the Full generation is retained untouched and a later
+compaction pass retries, so an in-flight record can never race the accumulator
+clear. Once mapped, Compact owns that
+generation's recovery: later Full finalize/Drop paths must follow the registry
+mapping and must not treat a cleared accumulator as an empty successful
+finalization that unregisters Compact. Every later multi-threaded reload retries
+all older retained full and compact recoveries concurrently with the generation
+being retired, and graceful shutdown retries the complete registry. Pending
+recovery count/bytes and oldest age are exposed on
+`GET /charges/sink/status` and Prometheus, together with an explicit recovery
+policy: restore spool writability; compact recoveries retry on reload/shutdown;
+new snapshot generations fail closed while the pending recovery budget is
+exhausted. The failure is also reported through the sink
+failure/spool-availability metrics and status. Because snapshot mode requires
+the spool, operators should treat an unwritable or exhausted spool as a
+billing-durability incident and restore it before terminating the process.
 
 Both modes use the same pricing fields as `api_chargeback`. At least one
 nonempty pricing dimension is mandatory and matches
 `PricingConfig::has_any_pricing`: a nonempty `pricing_tiers` list, bandwidth
 pricing with at least one strictly positive per-byte rate, or
 `stream_connection_pricing` with a strictly positive `price_per_connection`.
+
+`request_mirror` shadow summaries (`mirror: true`) still reach the sink log
+hook for observability/correlation with other logging plugins, but they are
+never consumer-billable. Per-event and snapshot exports charge only the
+primary client-facing HTTP summary; WebSocket and stream accounting are
+unchanged.
 
 Every unit price is an IEEE-754 binary64 value that must be finite,
 non-negative, and at most `1e288`. Per-event mode multiplies each transaction's
@@ -57,8 +209,10 @@ mode with `spool.enabled=true`, and compatible `password_ref`/TLS settings.
 Constructor validation additionally enforces relationships OpenAPI 3.1 cannot
 express safely (notably `retry.max_delay_ms >= retry.initial_delay_ms` and the
 600000 ms worst-case cumulative inter-attempt delay budget),
-spool directory privacy, ClickHouse egress screening, and that a nonempty
-`password_ref` names a set `FERRUM_*` environment variable.
+spool directory privacy, ClickHouse egress screening, that a nonempty
+`password_ref` names a set `FERRUM_*` environment variable, and that
+`wait_for_async_insert` falsy values require
+`clickhouse.allow_lossy_async_insert=true`.
 
 ## ClickHouse Setup
 
@@ -70,11 +224,12 @@ clickhouse-client < migrations/clickhouse/0001_charges.sql
 
 The DDL creates `ferrum.charges_raw` with `ReplacingMergeTree` idempotency on
 `event_id`, plus hourly, daily, and monthly views that read from
-`charges_raw FINAL`. The views trade query cost for correctness: duplicate raw
-events are deduplicated before rollup aggregation. Monetary `charge` columns in
-those views are grouped by `currency` and `pricing_version` (in addition to
-namespace/consumer/proxy/time) so mixed-currency or multi-generation sinks never
-produce unitless rollups.
+`charges_raw FINAL`. `call_count` is `UInt64` so snapshot deltas that exceed
+`UInt32` capacity remain lossless. The views trade query cost for correctness:
+duplicate raw events are deduplicated before rollup aggregation. Monetary
+`charge` columns in those views are grouped by `currency` and `pricing_version`
+(in addition to namespace/consumer/proxy/time) so mixed-currency or
+multi-generation sinks never produce unitless rollups.
 
 For HTTP-family events, `status_code` is the billable status used for pricing
 and rollups. `http_status_code` preserves the transport status, and
@@ -105,27 +260,41 @@ bucket.
       "table": "charges_raw",
       "username": "ferrum_ingest",
       "password_ref": "FERRUM_CLICKHOUSE_PASSWORD",
-      "insert_query_params": { "async_insert": "1", "wait_for_async_insert": "0" },
+      "insert_query_params": { "async_insert": "1", "wait_for_async_insert": "1" },
       "timeout_ms": 5000
     },
-    "batch": { "size": 500, "flush_interval_ms": 2000, "buffer_capacity": 50000 },
+    "batch": { "size": 500, "flush_interval_ms": 2000, "buffer_capacity": 50000, "buffer_max_bytes": 16777216 },
     "retry": { "max_attempts": 5, "initial_delay_ms": 250, "max_delay_ms": 10000, "jitter": true },
     "spool": {
       "enabled": true,
       "dir": "/var/lib/ferrum/chargeback-spool",
       "max_bytes": 10737418240,
       "replay_interval_secs": 60,
+      "delivery_queue_capacity": 4096,
       "compression": "zstd"
     },
     "snapshot": {
       "interval_secs": 30,
       "cleanup_interval_secs": 300,
       "stale_entry_ttl_secs": 3600,
+      "max_entries": 100000,
+      "max_retained_bytes": 67108864,
       "emit_zero_deltas": false
     },
     "pricing_version": "2026-01-rev3",
     "currency": "USD"
   }
+}
+```
+
+Fire-and-forget (lossy) async inserts require an explicit opt-in that cannot be
+confused with durable mode:
+
+```json
+"clickhouse": {
+  "url": "https://clickhouse.internal:8443",
+  "insert_query_params": { "async_insert": "1", "wait_for_async_insert": "0" },
+  "allow_lossy_async_insert": true
 }
 ```
 
@@ -161,10 +330,20 @@ Spool files are written under:
 <spool.dir>/<node_id>/<YYYYMMDD>/<ULID>.ndjson.zst
 ```
 
-The sink writes failed batches and queue high-water overflow to disk. Files are
+The sink writes failed batches and queue high-water overflow to an async spool
+delivery worker (bounded by `spool.delivery_queue_capacity`). Request and body
+terminal hooks only enqueue to that worker; compression, directory scans, writes,
+and fsync never run inline on those hooks. Saturation of the delivery queue is
+counted (`chargeback_sink_spool_jobs_lost_total` /
+`chargeback_sink_spool_events_lost_total`) with rate-limited warnings. Files are
 created with private permissions, written as `*.tmp`, fsynced, and renamed into
 place. The background replayer scans durable data files (`*.ndjson` /
 `*.ndjson.zst`) in lexicographic order.
+
+Queued export and spool-delivery events retain the same byte leases under
+`batch.buffer_max_bytes`; transferring an event to the spool worker does not
+escape or double-count that budget. The minimum admitted budget is 9312 bytes,
+the conservative maximum retained size of one field-bounded charge event.
 
 ### Delivery outcomes
 
@@ -173,14 +352,15 @@ split, or skip a file:
 
 | Outcome | Status / cause | Replay behavior |
 | --- | --- | --- |
-| Delivered | HTTP 200 / 204 | Remove the spool file after the accepted insert |
-| Retryable | network / timeout / TLS transport errors, HTTP 408, 429, 5xx, and other non-4xx failures | Keep the file, stop the current replay tick (newer files wait so order is preserved across transient outages) |
+| Delivered | HTTP 200 / 204 with a complete empty acknowledgement body and no exception header/markers | Remove the spool file after the accepted insert |
+| Retryable | network / timeout / TLS transport errors, incomplete acknowledgement drains, ambiguous non-empty 2xx bodies, HTTP 408, 429, 5xx, and other non-4xx failures | Keep the file, stop the current replay tick (newer files wait so order is preserved across transient outages) |
 | Payload too large | HTTP 413 | Deterministically split the JSONEachRow body (preferring `batch.size`, otherwise halving) and retry each part without rewriting row bytes, so each event keeps its stable `event_id` idempotency identity. A single row that still returns 413 is dead-lettered |
-| Permanent | other HTTP 4xx (for example 400, 401, 403) | Replace the rejected payload with safe dead-letter metadata and continue with newer spool files so one poison batch cannot head-of-line block the spool |
+| Permanent | other HTTP 4xx (for example 400, 401, 403), or HTTP 200/204 whose body/`X-ClickHouse-Exception-Code` carries a ClickHouse exception | Replace the rejected payload with safe dead-letter metadata and continue with newer spool files so one poison batch cannot head-of-line block the spool |
 
 Logs and error strings for these outcomes carry only safe metadata (plugin name,
-HTTP status code, reason class, row count, and file path). Response bodies,
-ClickHouse credentials, and charge-record fields are never logged.
+HTTP status code, reason class, row count, acknowledgement byte length class,
+and file path). Response bodies, ClickHouse credentials, and charge-record
+fields are never logged.
 
 ### Quarantine and dead-letter
 
@@ -279,24 +459,53 @@ node and time window.
 
 ## Status And Metrics
 
-`GET /charges/sink/status` is JWT-authenticated and returns the effective batch
-size, flush interval, and retry settings (`max_attempts`, `initial_delay_ms`,
-`max_delay_ms`, `jitter`), queue depth, spool size, replay timestamps, and
-export counters. While the sink is disabled the response keeps the same object
-shape with zeroed batch/retry numerics and `retry.jitter: false`. `/metrics`
-includes:
+`GET /charges/sink/status` is JWT-authenticated and returns the current
+accepted-generation observability for every stable `api_chargeback_sink`
+plugin-config ID. Validation-only construction and uncommitted staged reloads
+never publish into this view.
+
+Response contract:
+
+- `enabled` is `true` when at least one accepted instance is live.
+- `instance_count` is the number of published instances.
+- `snapshot_finalizations_pending` is the number of retired snapshot
+  generations retaining an unspooled terminal delta for bounded retry.
+- `totals` aggregates queue depth/capacity/high-water hits, spool files/bytes/
+  drops/prepare failures, and export counters across every current accepted
+  instance.
+  `totals.spool.available` is `true` only when every spool-enabled live instance
+  is currently writable.
+- `instances` lists the current accepted generation for each sink in ascending
+  `plugin_config_id` order. Each entry includes its generation plus
+  mode, pricing version, sanitized ClickHouse endpoint metadata, batch/retry
+  settings, per-instance queue/spool/export counters, and timestamps.
+
+Cardinality is bounded by the number of accepted plugin-config IDs. A newly
+accepted generation replaces the prior status entry for the same stable ID;
+dropping an older in-flight runtime removes nothing unless it is still the
+published generation.
+
+`/metrics` preserves the existing metric names as process-wide aggregates
+across the current accepted sink generation for every stable plugin-config ID:
 
 - `chargeback_sink_events_enqueued_total`
 - `chargeback_sink_events_exported_total`
 - `chargeback_sink_export_failures_total{reason}`
 - `chargeback_sink_queue_depth`
+- `chargeback_sink_snapshot_finalizations_pending`
 - `chargeback_sink_spool_bytes` (owned encoded bytes: active, temp, corrupt, and dead-lettered)
 - `chargeback_sink_spool_files` (owned file count across those same classes)
 - `chargeback_sink_spool_drops_total`
-- `chargeback_sink_spool_available` (1 only while committed storage is writable)
+- `chargeback_sink_spool_available` (aggregate is `1` only while every spool-enabled live instance is writable)
 - `chargeback_sink_spool_prepare_failures_total`
 - `chargeback_sink_export_latency_seconds`
 - `chargeback_sink_snapshot_emits_total` in snapshot mode
+
+Per-instance identity, generation, configuration, and counters are available
+from the authenticated status endpoint. Prometheus deliberately does not add a
+generation label: repeated reloads therefore cannot create an unbounded stream
+of historical time series, and ordinary sums cannot double-count aggregate plus
+component samples.
 
 ## Security Notes
 

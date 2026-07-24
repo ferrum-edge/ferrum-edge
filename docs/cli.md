@@ -74,11 +74,11 @@ ferrum-edge run --settings ferrum.conf --mode database -v
 
 File mode is inferred as a smart default — the lowest-precedence mode source — only when a spec path is available (explicit `--spec`, process-environment `FERRUM_FILE_CONFIG_PATH`, or smart path discovery) **and** no mode is configured by any higher-precedence source:
 
-1. CLI `--mode` (`run` only)
+1. CLI `--mode` (`run` / `validate`)
 2. Process environment `FERRUM_MODE` (including values materialized from `FERRUM_MODE_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP`)
 3. `FERRUM_MODE` in the selected `ferrum.conf`
 
-So `ferrum-edge run --settings ferrum.conf --spec resources.yaml` with `FERRUM_MODE=database` (or `cp`, etc.) in that settings file stays in that mode: the spec path is installed at CLI precedence, but mode inference never promotes the smart default over the conf file. The same rule applies to `validate` (which has no `--mode` flag). When no mode is configured anywhere, `ferrum-edge run --spec resources.yaml` still infers file mode so a zero-config file-mode start works.
+So `ferrum-edge run --settings ferrum.conf --spec resources.yaml` with `FERRUM_MODE=database` (or `cp`, etc.) in that settings file stays in that mode: the spec path is installed at CLI precedence, but mode inference never promotes the smart default over the conf file. The same rule applies to `validate`. When no mode is configured anywhere, `ferrum-edge run --spec resources.yaml` still infers file mode so a zero-config file-mode start works.
 
 ## validate
 
@@ -94,10 +94,12 @@ ferrum-edge validate [OPTIONS]
 |------|-------|-------------|
 | `--settings <PATH>` | `-s` | Path to `ferrum.conf` (operational settings) |
 | `--spec <PATH>` | `-c` | Path to resources YAML/JSON |
+| `--mode <MODE>` | `-m` | Operating mode: `database`, `file`, `cp`, `dp`, `mesh`, `injector`, `node_agent`, `migrate` |
+| `--verbose` | `-v` | Increase log verbosity (repeatable: `-v`=info, `-vv`=debug, `-vvv`=trace) |
 
 ### What is validated
 
-0. **External secrets** — before settings are parsed, `validate` resolves the `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` suffixes into their base `FERRUM_*` variables exactly as `run` does. Empty suffixed variables are treated as unset in every build. Validation therefore sees the same configuration the gateway would start with, and the same failures apply: an unreadable or unreachable non-empty source fails the command, and a base variable combined with a non-empty suffixed source for the same key is a conflict. Which suffixes a binary can resolve is a **build-time** property: `_FILE` works in every build, while `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` require the matching secret-backend Cargo feature (`secrets-vault`, `secrets-aws`, `secrets-azure`, `secrets-gcp`, or the `cloud-secrets` umbrella). The default feature set compiles none of them, so on a default binary a non-empty cloud suffix is not silently ignored — it fails the command with an unsupported-suffix error. No environment variable or settings value can enable a provider that was not compiled in; use a binary or image built with the required feature (the published Docker images build with `cloud-secrets`). Conflict detection is environment-only: the resolver runs before `ferrum.conf` is parsed and inspects only the process environment, so *both* the base variable and the suffixed source must be environment-provided and non-empty for the conflict to be reported. A base variable supplied by the settings file is not a competing source — the suffixed source is materialized into the environment and then wins under the normal env-over-`ferrum.conf` precedence, silently overriding the settings-file value. Keep secret base variables and their suffixed sources in the same layer. When at least one source resolves, `validate` prints an `External secrets: OK` block on stdout **unconditionally** — it is part of the validate report, like `Settings (ferrum.conf): OK`, and is not gated on `FERRUM_LOG_LEVEL`/`RUST_LOG` (`validate` has no `-v/--verbose` flag, so a log-level-gated report would be unreachable). The block lists only the resolved base variable and provider names, never source references — file paths, Vault paths, cloud resource IDs — and never secret values:
+0. **External secrets** — before settings are parsed, `validate` resolves the `_FILE`, `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` suffixes into their base `FERRUM_*` variables exactly as `run` does. Empty suffixed variables are treated as unset in every build. Validation therefore sees the same configuration the gateway would start with, and the same failures apply: an unreadable or unreachable non-empty source fails the command, and a base variable combined with a non-empty suffixed source for the same key is a conflict. Which suffixes a binary can resolve is a **build-time** property: `_FILE` works in every build, while `_VAULT`, `_AWS`, `_AZURE`, and `_GCP` require the matching secret-backend Cargo feature (`secrets-vault`, `secrets-aws`, `secrets-azure`, `secrets-gcp`, or the `cloud-secrets` umbrella). The default feature set compiles none of them, so on a default binary a non-empty cloud suffix is not silently ignored — it fails the command with an unsupported-suffix error. No environment variable or settings value can enable a provider that was not compiled in; use a binary or image built with the required feature (the published Docker images build with `cloud-secrets`). Conflict detection is environment-only: the resolver runs before `ferrum.conf` is parsed and inspects only the process environment, so *both* the base variable and the suffixed source must be environment-provided and non-empty for the conflict to be reported. A base variable supplied by the settings file is not a competing source — the suffixed source is materialized into the environment and then wins under the normal env-over-`ferrum.conf` precedence, silently overriding the settings-file value. Keep secret base variables and their suffixed sources in the same layer. When at least one source resolves, `validate` prints an `External secrets: OK` block on stdout **unconditionally** — it is part of the validate report, like `Settings (ferrum.conf): OK`, and is not gated on `FERRUM_LOG_LEVEL`/`RUST_LOG` or on `-v/--verbose` (the report is a `println!`, not a tracing record, so it stays visible at the default warn log level). The block lists only the resolved base variable and provider names, never source references — file paths, Vault paths, cloud resource IDs — and never secret values:
 
 ```text
 External secrets: OK
@@ -127,7 +129,7 @@ A resolved value that cannot be placed in the process environment is reported ra
 
 Smart path discovery yields to a suffixed source. When `FERRUM_CONF_PATH_FILE` (or the `_VAULT`/`_AWS`/`_AZURE`/`_GCP` equivalent) is set, `validate` and `run` do **not** auto-discover `./ferrum.conf`, `./config/ferrum.conf`, or `/etc/ferrum/ferrum.conf`, and the same holds for `FERRUM_FILE_CONFIG_PATH_FILE` and the `./resources.yaml` family. A discovered default is the lowest-precedence source there is, so treating it as a competing one would fail the command with a multiple-sources error in any working directory that merely happened to contain a settings or resources file. An **explicit** `-s/--settings` or `-c/--spec` path is different — that is a genuine two-sources-for-one-key mistake and is still reported as a conflict.
 
-File-mode inference is likewise the *lowest*-precedence mode source, and it runs after secrets are resolved so that every source above it is visible first. `run` and `validate` fall back to `FERRUM_MODE=file` only when a spec path is configured **and** no mode was set by any higher-precedence source — matching the documented `CLI > env > conf file > smart defaults > hardcoded` order. The sources differ slightly between the two commands, because only `run` takes a mode flag: `run` checks `-m/--mode` first, then `FERRUM_MODE` in the environment, then a `FERRUM_MODE_FILE`/`_VAULT`/`_AWS`/`_AZURE`/`_GCP` source, then `FERRUM_MODE` in `ferrum.conf`. `validate` accepts only `-s/--settings` and `-c/--spec`, so it has no mode flag to check and takes its mode from those same three env/conf sources alone; passing `-m` to `validate` is rejected by the argument parser. A spec path that is itself supplied by a suffixed source still infers file mode, because it has been materialized into `FERRUM_FILE_CONFIG_PATH` by then. Externalizing the mode and the spec path together is therefore supported: neither shadows the other, and the inference never manufactures a second competing source for `FERRUM_MODE`.
+File-mode inference is likewise the *lowest*-precedence mode source, and it runs after secrets are resolved so that every source above it is visible first. `run` and `validate` fall back to `FERRUM_MODE=file` only when a spec path is configured **and** no mode was set by any higher-precedence source — matching the documented `CLI > env > conf file > smart defaults > hardcoded` order. Both commands check `-m/--mode` first (via `apply_run_overrides` / `apply_validate_overrides`), then `FERRUM_MODE` in the environment, then a `FERRUM_MODE_FILE`/`_VAULT`/`_AWS`/`_AZURE`/`_GCP` source, then `FERRUM_MODE` in `ferrum.conf`. A spec path that is itself supplied by a suffixed source still infers file mode, because it has been materialized into `FERRUM_FILE_CONFIG_PATH` by then. Externalizing the mode and the spec path together is therefore supported: neither shadows the other, and the inference never manufactures a second competing source for `FERRUM_MODE`.
 
 The report withholds externally sourced values, not just the ones that appear in errors. `validate` prints its findings with plain stdout writes, which are not log records and are not an error return, so each value-bearing field is filtered where it is printed. A field whose variable was resolved from an external source is withheld by name — `FERRUM_MODE_FILE` containing `database` prints `Mode: <redacted: value from external secret source>`, not `Mode: Database` — while the surrounding validation result, including `Validation passed.` and the spec-document counts, is unaffected. `run` withholds the same value on its own startup log line for the same reason: `Operating mode:` re-renders the resolved value as the `Database` enum variant, a form the log-record redactor deliberately does not derive, so that line is withheld by variable name too.
 
@@ -150,6 +152,9 @@ ferrum-edge validate --spec resources.yaml
 
 # Validate with explicit settings
 ferrum-edge validate --settings /etc/ferrum/ferrum.conf --spec /etc/ferrum/resources.yaml
+
+# Validate a specific mode without mutating the shell environment
+ferrum-edge validate -m file -c resources.yaml
 
 # Use in CI/CD pipeline
 ferrum-edge validate --spec resources.yaml || exit 1
@@ -203,7 +208,7 @@ ferrum-edge reload --pid 42195
 
 ### PID Auto-Detection
 
-When `--pid` is omitted, the CLI uses `pgrep -x ferrum-edge` to find the running process. If multiple instances are found, it reports all PIDs and asks you to specify one.
+When `--pid` is omitted, the CLI uses `pgrep -x ferrum-edge` to find running processes, then excludes its own PID before selecting a target. A single other `ferrum-edge` process is reloaded automatically. If none remain after excluding self, it reports that no gateway was found. If multiple other instances remain, it reports their PIDs and asks you to specify one with `--pid`. Explicit `--pid` bypasses auto-detection entirely.
 
 ## health
 
@@ -299,7 +304,7 @@ $ ferrum-edge version --json
 
 When using CLI subcommands, the configuration resolution order is (highest precedence first):
 
-1. **CLI flag** (`--settings`, `--spec`, and — on `run` only — `--mode`, `--verbose`)
+1. **CLI flag** (`--settings`, `--spec`, `--mode`, `--verbose` on `run` and `validate`)
 2. **Environment variable** (`FERRUM_CONF_PATH`, `FERRUM_FILE_CONFIG_PATH`, `FERRUM_MODE`, `FERRUM_LOG_LEVEL`)
 3. **Conf file value** (`ferrum.conf`)
 4. **Smart path defaults** (see below)

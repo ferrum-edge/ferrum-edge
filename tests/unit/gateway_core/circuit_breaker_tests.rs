@@ -1461,6 +1461,199 @@ fn test_cache_config_change_replaces_breaker() {
     assert!(cb2.can_execute().is_ok());
 }
 
+/// Concurrent same-key cold creates must share one `Arc` (no detached breakers).
+#[test]
+fn test_concurrent_same_key_creation_shares_arc() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    const THREADS: usize = 32;
+    let cache = Arc::new(CircuitBreakerCache::with_max_entries(100));
+    let config = default_config();
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let mut handles = Vec::with_capacity(THREADS);
+    for _ in 0..THREADS {
+        let cache = Arc::clone(&cache);
+        let config = config.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            cache.get_or_create("proxy-shared", Some("host:8080"), &config)
+        }));
+    }
+
+    let results: Vec<Arc<CircuitBreaker>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("join"))
+        .collect();
+    let first = &results[0];
+    for cb in &results[1..] {
+        assert!(
+            Arc::ptr_eq(first, cb),
+            "concurrent same-key creates must return the same Arc"
+        );
+    }
+    assert_eq!(cache.len(), 1);
+}
+
+/// Failures recorded across concurrent same-key callers must open one shared breaker.
+#[test]
+fn test_concurrent_same_key_failures_open_shared_breaker() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    const THREADS: usize = 8;
+    let cache = Arc::new(CircuitBreakerCache::with_max_entries(100));
+    let config = CircuitBreakerConfig {
+        failure_threshold: THREADS as u32,
+        ..default_config()
+    };
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let mut handles = Vec::with_capacity(THREADS);
+    for _ in 0..THREADS {
+        let cache = Arc::clone(&cache);
+        let config = config.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            let cb = cache.get_or_create("proxy-fail", Some("host:8080"), &config);
+            cb.record_failure(500, false, false);
+            cb
+        }));
+    }
+
+    let results: Vec<Arc<CircuitBreaker>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("join"))
+        .collect();
+    let first = &results[0];
+    for cb in &results[1..] {
+        assert!(Arc::ptr_eq(first, cb));
+    }
+    assert_eq!(first.state_name(), "open");
+    assert_eq!(cache.len(), 1);
+}
+
+/// Concurrent changed-config replacement must publish one new shared generation.
+#[test]
+fn test_concurrent_config_replacement_shares_new_generation() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    const THREADS: usize = 32;
+    let cache = Arc::new(CircuitBreakerCache::with_max_entries(100));
+    let config1 = default_config();
+    let config2 = CircuitBreakerConfig {
+        failure_threshold: 10,
+        ..default_config()
+    };
+
+    let old = cache.get_or_create("proxy-replace", Some("host:8080"), &config1);
+    old.record_failure(500, false, false);
+    assert_eq!(old.state_name(), "closed");
+
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let mut handles = Vec::with_capacity(THREADS);
+    for _ in 0..THREADS {
+        let cache = Arc::clone(&cache);
+        let config2 = config2.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            cache.get_or_create("proxy-replace", Some("host:8080"), &config2)
+        }));
+    }
+
+    let results: Vec<Arc<CircuitBreaker>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("join"))
+        .collect();
+    let first = &results[0];
+    for cb in &results[1..] {
+        assert!(
+            Arc::ptr_eq(first, cb),
+            "concurrent config replacement must converge on one new Arc"
+        );
+    }
+    assert!(!Arc::ptr_eq(&old, first));
+    assert_eq!(first.config().failure_threshold, 10);
+    assert_eq!(first.state_name(), "closed");
+    assert_eq!(cache.len(), 1);
+}
+
+/// Concurrent distinct-key cold admits must never exceed `max_entries`.
+#[test]
+fn test_concurrent_distinct_key_burst_respects_max_entries() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    const MAX_ENTRIES: usize = 8;
+    const THREADS: usize = 64;
+    let cache = Arc::new(CircuitBreakerCache::with_max_entries(MAX_ENTRIES));
+    let config = default_config();
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let mut handles = Vec::with_capacity(THREADS);
+    for i in 0..THREADS {
+        let cache = Arc::clone(&cache);
+        let config = config.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            let proxy = format!("proxy-{i}");
+            let target = format!("host-{i}:8080");
+            cache.get_or_create(&proxy, Some(&target), &config)
+        }));
+    }
+
+    let _results: Vec<Arc<CircuitBreaker>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("join"))
+        .collect();
+    assert!(
+        cache.len() <= MAX_ENTRIES,
+        "cache length {} exceeded max_entries {}",
+        cache.len(),
+        MAX_ENTRIES
+    );
+    assert_eq!(cache.len(), MAX_ENTRIES);
+}
+
+/// Full-cache overflow returns a fresh transient breaker that is not retained.
+#[test]
+fn test_full_cache_overflow_returns_uncached_transient_breaker() {
+    let cache = CircuitBreakerCache::with_max_entries(1);
+    let config = CircuitBreakerConfig {
+        failure_threshold: 1,
+        ..default_config()
+    };
+
+    let cached = cache.get_or_create("cached", Some("host1:8080"), &config);
+    assert_eq!(cache.len(), 1);
+
+    let transient = cache.get_or_create("overflow", Some("host2:8080"), &config);
+    assert!(!Arc::ptr_eq(&cached, &transient));
+    transient.record_failure(500, false, false);
+    assert_eq!(transient.state_name(), "open");
+    assert_eq!(cache.len(), 1, "overflow must not grow the cache");
+
+    // Documented full-cache behavior: overflow breakers are not cached, so a
+    // later call for the same overflow key gets a fresh closed instance.
+    let again = cache.get_or_create("overflow", Some("host2:8080"), &config);
+    assert!(!Arc::ptr_eq(&transient, &again));
+    assert_eq!(again.state_name(), "closed");
+    assert_eq!(cache.len(), 1);
+
+    // Existing key remains replaceable at capacity.
+    let config2 = CircuitBreakerConfig {
+        failure_threshold: 9,
+        ..default_config()
+    };
+    let replaced = cache.get_or_create("cached", Some("host1:8080"), &config2);
+    assert!(!Arc::ptr_eq(&cached, &replaced));
+    assert_eq!(replaced.config().failure_threshold, 9);
+    assert_eq!(cache.len(), 1);
+}
+
 // ─── Half-open probe tracking regression tests ─────────────────────────────
 
 /// `can_execute()` returns `Ok(false)` in CLOSED state and `Ok(true)` in HALF_OPEN.

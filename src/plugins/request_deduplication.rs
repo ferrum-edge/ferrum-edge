@@ -572,6 +572,10 @@ impl RequestDeduplication {
         // decision can opt only its mandatory transform back in. Ordinary
         // rejection header hooks still run and cache headers are re-sanitized.
         ctx.finalized_response_replay = true;
+        ctx.metadata.insert(
+            "request_deduplication.replayed".to_string(),
+            "true".to_string(),
+        );
         let mut response_headers = sanitize_cached_headers(&cached.headers);
         response_headers.insert("x-idempotent-replayed".to_string(), "true".to_string());
         PluginResult::RejectBinary {

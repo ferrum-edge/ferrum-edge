@@ -716,12 +716,13 @@ impl Http2ConnectionPool {
                         // ready())`ed on it, which serialized ~100-
                         // concurrent bursts onto the already-busy shard and
                         // net-pessimized throughput (5 MB/100-conc HTTP/2
-                        // stuck at 81 RPS vs direct 232). Skip — we would
-                        // rather open a fresh connection than wait on this
-                        // one. `create_or_get_existing_owned` is per-key-
-                        // coalesced, so a burst of concurrent callers for
-                        // the same shard key dedupes onto ONE create future
-                        // (no thundering herd).
+                        // stuck at 81 RPS vs direct 232). Skip — phase 2's
+                        // `create_or_get_existing_owned` checks `cached()`
+                        // first; the existing sender is still healthy
+                        // (`!is_closed()`), so the create closure never runs
+                        // and the pool does NOT grow beyond the shard ring.
+                        // Callers queue on the start shard's existing sender
+                        // via H2 readiness / stream-cap backpressure.
                         None => {}
                     }
                 }
@@ -862,6 +863,17 @@ fn thread_id_mix() -> u64 {
 /// `"denied"` in a wrapper would have silently changed the `error_class` label.
 pub fn classify_http2_pool_error(err: &Http2PoolError) -> crate::retry::ErrorClass {
     use crate::retry::ErrorClass;
+
+    // Coalesced-create waiter reconstruction attaches the broadcast payload as
+    // `BackendUnavailableSource::Shared`. Prefer its captured ErrorClass so
+    // DNS/TLS/timeout/egress/port-exhaustion stay aligned with the creator.
+    if let Http2PoolError::BackendUnavailable {
+        source: Some(BackendUnavailableSource::Shared(shared)),
+        ..
+    } = err
+    {
+        return shared.error_class();
+    }
 
     // A DnsCacheResolver egress-policy denial (a hostname that resolves — or
     // rebinds — to a blocked IP) surfaces here inside a `BackendUnavailable`
@@ -1171,6 +1183,9 @@ pub enum BackendUnavailableSource {
     /// (invalid SNI label). Classified as `DnsLookupError` because the
     /// remediation is a DNS/config change.
     InvalidDnsName,
+    /// Classification captured when broadcasting a coalesced create failure.
+    /// Carries no live IO handle; classifiers read [`SharedPoolCreateError::error_class`].
+    Shared(crate::pool::SharedPoolCreateError),
 }
 
 impl std::error::Error for BackendUnavailableSource {
@@ -1178,6 +1193,7 @@ impl std::error::Error for BackendUnavailableSource {
         match self {
             Self::Io(e) | Self::Tls(e) => Some(e),
             Self::Hyper(e) => Some(e),
+            Self::Shared(e) => Some(e),
             Self::Dns | Self::InvalidDnsName => None,
         }
     }
@@ -1191,6 +1207,7 @@ impl std::fmt::Display for BackendUnavailableSource {
             Self::Hyper(e) => write!(f, "{}", e),
             Self::Dns => write!(f, "dns resolution failed"),
             Self::InvalidDnsName => write!(f, "invalid dns name"),
+            Self::Shared(e) => write!(f, "{}", e),
         }
     }
 }
@@ -1307,6 +1324,95 @@ impl Http2PoolError {
             // message. The dispatching caller routes via reqwest on this
             // variant rather than surfacing the message to clients.
             Self::BackendSelectedHttp1 { .. } => "backend does not support http/2",
+        }
+    }
+}
+
+impl From<crate::pool::SharedPoolCreateError> for Http2PoolError {
+    fn from(err: crate::pool::SharedPoolCreateError) -> Self {
+        use crate::pool::SharedPoolCreateKind;
+
+        let message = err.message().to_string();
+        match err.kind() {
+            SharedPoolCreateKind::TimedOut => Self::BackendTimeout {
+                message: message.clone(),
+                source: Some(std::io::Error::new(std::io::ErrorKind::TimedOut, message)),
+            },
+            SharedPoolCreateKind::Internal => Self::Internal {
+                message: message.clone(),
+                source: Some(InternalSource::Message(message)),
+            },
+            SharedPoolCreateKind::NegotiatedHttp1 => Self::BackendSelectedHttp1 {
+                pool_key: err.detail().unwrap_or(err.message()).to_string(),
+            },
+            SharedPoolCreateKind::Dns
+            | SharedPoolCreateKind::Tls
+            | SharedPoolCreateKind::ConnectionRefused
+            | SharedPoolCreateKind::ConnectionClosed
+            | SharedPoolCreateKind::Protocol
+            | SharedPoolCreateKind::PortExhaustion
+            | SharedPoolCreateKind::DispatchPolicyRejected
+            | SharedPoolCreateKind::Unavailable
+            | SharedPoolCreateKind::Other => {
+                // Always attach the broadcast payload. Reconstructed io/DNS/TLS
+                // markers can drift from the creator's captured ErrorClass
+                // (egress denial, port exhaustion, ConnectionClosed wire
+                // boundary). `classify_http2_pool_error` prefers Shared so
+                // waiters keep creator ErrorClass / connection_error / retry
+                // semantics without cloning non-Clone sources.
+                Self::BackendUnavailable {
+                    message,
+                    source: Some(BackendUnavailableSource::Shared(err)),
+                }
+            }
+        }
+    }
+}
+
+impl crate::pool::ShareablePoolCreateError for Http2PoolError {
+    fn to_shared(&self) -> crate::pool::SharedPoolCreateError {
+        use crate::pool::{SharedPoolCreateError, SharedPoolCreateKind};
+        use crate::retry::ErrorClass;
+
+        let error_class = classify_http2_pool_error(self);
+        match self {
+            Self::BackendSelectedHttp1 { pool_key } => SharedPoolCreateError::new(
+                self.message().to_string(),
+                SharedPoolCreateKind::NegotiatedHttp1,
+                ErrorClass::ProtocolError,
+                Some(pool_key.clone()),
+            ),
+            Self::BackendTimeout { message, .. } => SharedPoolCreateError::new(
+                message.clone(),
+                SharedPoolCreateKind::TimedOut,
+                error_class,
+                None,
+            ),
+            Self::Internal { message, .. } => SharedPoolCreateError::new(
+                message.clone(),
+                SharedPoolCreateKind::Internal,
+                error_class,
+                None,
+            ),
+            Self::BackendUnavailable { message, .. } => {
+                let kind = match error_class {
+                    ErrorClass::DnsLookupError => SharedPoolCreateKind::Dns,
+                    ErrorClass::TlsError => SharedPoolCreateKind::Tls,
+                    ErrorClass::ConnectionRefused => SharedPoolCreateKind::ConnectionRefused,
+                    ErrorClass::ConnectionClosed => SharedPoolCreateKind::ConnectionClosed,
+                    ErrorClass::ProtocolError => SharedPoolCreateKind::Protocol,
+                    ErrorClass::PortExhaustion => SharedPoolCreateKind::PortExhaustion,
+                    ErrorClass::DispatchPolicyRejected => {
+                        SharedPoolCreateKind::DispatchPolicyRejected
+                    }
+                    ErrorClass::ConnectionTimeout | ErrorClass::ReadWriteTimeout => {
+                        SharedPoolCreateKind::TimedOut
+                    }
+                    ErrorClass::ConnectionPoolError => SharedPoolCreateKind::Unavailable,
+                    _ => SharedPoolCreateKind::from_error_class(error_class),
+                };
+                SharedPoolCreateError::new(message.clone(), kind, error_class, None)
+            }
         }
     }
 }

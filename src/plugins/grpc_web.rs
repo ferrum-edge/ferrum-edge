@@ -23,13 +23,13 @@
 //!
 //! ## Response path (native gRPC → gRPC-Web)
 //!
-//! 1. Collect response data frames from the backend
+//! 1. Forward backend response DATA incrementally
 //! 2. Embed gRPC trailers (`grpc-status`, `grpc-message`, binary `*-bin`
-//!    metadata, and valid ASCII custom trailing metadata) as a length-prefixed
-//!    trailer frame (flag byte 0x80) appended to the body. Hop-by-hop,
+//!    metadata, and valid ASCII custom trailing metadata) as exactly one final
+//!    length-prefixed trailer DATA frame (flag byte 0x80). Hop-by-hop,
 //!    forbidden, pseudo, connection-listed, and invalid names/values are
 //!    excluded; only backend-trailer provenance (when recorded) is embedded
-//! 3. Text mode: base64-encode the entire response body
+//! 3. Text mode: base64-encode each runtime flush independently
 //! 4. Rewrite response content-type to the **negotiated** gRPC-Web variant
 //!
 //! ## Response media-type negotiation
@@ -92,6 +92,7 @@
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use bytes::Bytes;
 use http::header::HeaderName;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1307,10 +1308,9 @@ pub(crate) fn is_grpc_web_text(ct: &str) -> bool {
 ///
 /// Dispatch paths use this to tell a translated gRPC-Web request apart from
 /// native gRPC: by dispatch time both carry `content-type: application/grpc`
-/// (rewritten in `before_proxy`), but a translated response MUST buffer — the
-/// plugin re-encodes the backend's terminal trailers (`grpc-status` /
-/// `grpc-message`) INTO the gRPC-Web response body — while a native gRPC
-/// response must NOT buffer (its trailers have to relay on the wire).
+/// (rewritten in `before_proxy`), but a translated response must convert the
+/// backend's terminal trailers (`grpc-status` / `grpc-message`) into one
+/// gRPC-Web body frame while native gRPC relays them on the wire.
 pub fn request_is_grpc_web_translated(ctx: &RequestContext) -> bool {
     ctx.metadata.contains_key(META_GRPC_WEB_MODE)
 }
@@ -1914,6 +1914,93 @@ pub(crate) fn build_trailer_frame(
     build_trailer_frame_with_provenance(response_headers, http_status, None)
 }
 
+/// Build one terminal gRPC-Web DATA frame for a streaming response.
+///
+/// DATA emitted before this frame is relayed incrementally. The caller passes
+/// only genuine backend trailers (or a Trailers-Only initial-header snapshot),
+/// so initial response metadata cannot be copied into the terminal block.
+/// Text mode deliberately base64-encodes this frame as its own padded segment;
+/// the gRPC-Web protocol permits padding at runtime flush boundaries.
+pub(crate) fn build_streaming_trailer_data(
+    trailers: &HashMap<String, String>,
+    http_status: u16,
+    text_mode: bool,
+) -> (Bytes, u32) {
+    let grpc_status = trailers
+        .get("grpc-status")
+        .filter(|value| !value.contains('\r'))
+        .and_then(|value| {
+            value
+                .split('\n')
+                .find_map(|occurrence| occurrence.trim().parse::<u32>().ok())
+        })
+        .unwrap_or_else(|| http_response_status_to_grpc_status(http_status));
+    let frame = build_trailer_frame(trailers, Some(http_status));
+    let data = if text_mode {
+        Bytes::from(BASE64.encode(frame))
+    } else {
+        Bytes::from(frame)
+    };
+    (data, grpc_status)
+}
+
+/// Encode one streaming gRPC DATA chunk for the selected gRPC-Web transport.
+///
+/// Binary mode is zero-copy. Text mode emits a self-contained base64 segment
+/// so arbitrary backend chunk boundaries stay independently flushable and the
+/// adapter never retains an unbounded tail.
+pub(crate) fn encode_streaming_data(data: Bytes, text_mode: bool) -> Bytes {
+    if text_mode {
+        Bytes::from(BASE64.encode(data))
+    } else {
+        data
+    }
+}
+
+/// Separate initial terminal metadata from the client-visible header map.
+///
+/// A genuine Trailers-Only response uses its pristine END_STREAM HEADERS block
+/// as terminal provenance. Response hooks may remove or sanitize those fields,
+/// but a later gateway-authored initial header must not become trailing
+/// application metadata merely because the response has no DATA. Reserved
+/// terminal fields are removed from ordinary initial headers on every
+/// translated stream, including malformed non-ended responses.
+pub(crate) fn take_streaming_initial_terminal_metadata(
+    response_headers: &mut HashMap<String, String>,
+    body_ended: bool,
+    pristine_terminal_names: Option<&HashSet<String>>,
+) -> HashMap<String, String> {
+    let mut terminal = HashMap::new();
+    if body_ended && let Some(pristine_terminal_names) = pristine_terminal_names {
+        for (name, value) in response_headers.iter() {
+            if pristine_terminal_names.contains(name) {
+                terminal.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    let application_terminal_names = terminal
+        .keys()
+        .filter(|name| {
+            !is_reserved_grpc_web_terminal_metadata(name)
+                && is_valid_trailer_header(name).is_some()
+                && !is_forbidden_grpc_web_trailer_name(name)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in application_terminal_names {
+        response_headers.remove(&name);
+    }
+    for name in ["grpc-status", "grpc-message", "grpc-status-details-bin"] {
+        if let Some(value) = response_headers.remove(name)
+            && body_ended
+            && pristine_terminal_names.is_some_and(|names| names.contains(name))
+        {
+            terminal.insert(name.to_string(), value);
+        }
+    }
+    terminal
+}
+
 /// Like [`build_trailer_frame`], optionally restricting embedded names to a
 /// backend-trailer provenance allowlist (plus reserved gRPC terminal keys).
 pub(crate) fn build_trailer_frame_with_provenance(
@@ -2278,43 +2365,34 @@ impl Plugin for GrpcWebPlugin {
     }
 
     fn requires_response_body_buffering(&self) -> bool {
-        // Both binary and text modes require response buffering because HTTP/2
-        // trailers from the backend (grpc-status, grpc-message) must be embedded
-        // as a length-prefixed trailer frame (0x80) in the response body — this
-        // is the core gRPC-Web wire format difference from native gRPC. Text mode
-        // additionally needs base64 encoding of the complete body.
-        true
+        // The shared streaming adapter relays DATA incrementally and converts
+        // the terminal native trailer block into one body-framed gRPC-Web
+        // trailer. Explicit buffer mode and other body plugins may still select
+        // the slice-based transform below.
+        false
     }
 
-    fn should_buffer_response_body(&self, ctx: &RequestContext) -> bool {
-        // Buffer whenever a translation owner claimed this request. Sibling
-        // instances must agree with the owner so the body stays buffered for
-        // the single trailer-frame transform. Accept-negotiation failures must
-        // not buffer — the intentional HTTP 406 is not a gRPC-Web response.
-        !ctx.metadata.contains_key(META_GRPC_WEB_ACCEPT_REJECTED)
-            && ctx.metadata.contains_key(META_GRPC_WEB_OWNER)
-            && ctx.metadata.contains_key(META_GRPC_WEB_MODE)
+    fn should_buffer_response_body(&self, _ctx: &RequestContext) -> bool {
+        false
     }
 
     fn should_buffer_response_body_for_content_type(
         &self,
-        ctx: &RequestContext,
+        _ctx: &RequestContext,
         _content_type: Option<&str>,
-        response_status: u16,
+        _response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        self.should_buffer_response_body(ctx)
-            && super::response_body_rewrite_allowed(response_status)
+        false
     }
 
     fn should_release_response_body_before_content_type_rewrite(
         &self,
-        ctx: &RequestContext,
-        response_status: u16,
+        _ctx: &RequestContext,
+        _response_status: u16,
         _response_headers: &HashMap<String, String>,
     ) -> bool {
-        self.should_buffer_response_body(ctx)
-            && !super::response_body_rewrite_allowed(response_status)
+        false
     }
 
     async fn on_request_received(&self, ctx: &mut RequestContext) -> PluginResult {
@@ -2608,11 +2686,10 @@ impl Plugin for GrpcWebPlugin {
         // `after_proxy` relabels the response `Content-Type` to the gRPC-Web
         // variant exactly when `on_request_received` recorded the original
         // gRPC-Web content-type — independent of the backend response type, so
-        // the request marker alone is the precise signal. (gRPC-Web responses
-        // are already unconditionally buffered to embed trailers, so this never
-        // newly pins a streaming body.) Signal that so the proxy keeps the body
-        // buffered for final-response inspection instead of trusting the
-        // backend's `application/grpc` header for the buffer/stream decision.
+        // the request marker alone is the precise signal. Signal that so an
+        // already-buffered response is inspected against its final gRPC-Web
+        // representation instead of trusting the backend's
+        // `application/grpc` header for the content-type refinement decision.
         retained_response_content_type(ctx).is_some()
     }
 

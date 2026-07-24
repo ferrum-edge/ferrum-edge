@@ -4530,16 +4530,28 @@ async fn handle_h3_request(
 
         // Build the same TransactionSummary shape the native H3 pool path
         // emits so log plugins see a consistent record across dispatch
-        // kinds. `latency_backend_total_ms` is populated (not -1.0) because
-        // the bridge returns once the response is fully delivered — no
-        // deferred completion signal is needed.
+        // kinds. Streamed responses use the shared unknown-backend-total
+        // contract: concurrent backend-body / client-delivery lifetime must
+        // not be labeled as gateway work.
         let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
         let plugin_external_io_ms = ctx
             .plugin_http_call_ns
             .load(std::sync::atomic::Ordering::Relaxed) as f64
             / 1_000_000.0;
-        let gateway_processing_ms = total_ms - outcome.backend_total_ms;
+        let backend_ttfb_ms = outcome.backend_ttfb_ms;
+        let backend_total_ms = if outcome.response_streamed {
+            crate::plugins::LATENCY_UNKNOWN_MS
+        } else {
+            outcome.backend_total_ms
+        };
+        let (gateway_processing_ms, gateway_overhead_ms) =
+            TransactionSummary::derive_gateway_latencies(
+                total_ms,
+                backend_total_ms,
+                plugin_execution_ms,
+                outcome.response_streamed,
+            );
         if outcome.response_streamed {
             let stream_outcome = BodyOutcome {
                 body_completed: outcome.body_completed,
@@ -4577,11 +4589,11 @@ async fn handle_h3_request(
             response_status_code: outcome.response_status,
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
-            latency_backend_ttfb_ms: outcome.backend_total_ms,
-            latency_backend_total_ms: outcome.backend_total_ms,
+            latency_backend_ttfb_ms: backend_ttfb_ms,
+            latency_backend_total_ms: backend_total_ms,
             latency_plugin_execution_ms: plugin_execution_ms,
             latency_plugin_external_io_ms: plugin_external_io_ms,
-            latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms).max(0.0),
+            latency_gateway_overhead_ms: gateway_overhead_ms,
             request_user_agent: proxy_headers.get("user-agent").cloned(),
             response_streamed: outcome.response_streamed,
             client_disconnected: outcome.client_disconnected,
@@ -5474,15 +5486,24 @@ async fn handle_h3_request(
             backend_admission_response_elapsed,
         );
 
-        let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+        let backend_ttfb_ms = backend_admission_response_elapsed.as_secs_f64() * 1000.0;
+        // Concurrent backend-body / client-delivery lifetime cannot be split on
+        // the synchronous H3 streaming pipe — emit the shared unknown sentinel
+        // rather than labeling the residual as backend total or gateway work.
+        let backend_total_ms = crate::plugins::LATENCY_UNKNOWN_MS;
         let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
         let plugin_external_io_ms = ctx
             .plugin_http_call_ns
             .load(std::sync::atomic::Ordering::Relaxed) as f64
             / 1_000_000.0;
-        let gateway_processing_ms = total_ms - backend_total_ms;
-        let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+        let (gateway_processing_ms, gateway_overhead_ms) =
+            TransactionSummary::derive_gateway_latencies(
+                total_ms,
+                backend_total_ms,
+                plugin_execution_ms,
+                true,
+            );
 
         // Native H3 drives the inspector in this task rather than a detached
         // body task. Drop it explicitly so the shared completion signal is set
@@ -5512,11 +5533,7 @@ async fn handle_h3_request(
             response_status_code: response_status,
             latency_total_ms: total_ms,
             latency_gateway_processing_ms: gateway_processing_ms,
-            latency_backend_ttfb_ms: backend_total_ms,
-            // Native H3 streaming completes the `'outer` loop synchronously
-            // before constructing this summary, so the full backend duration
-            // (TTFB + body relay) is known here. Mirrors the symmetric H3
-            // native streaming path in `proxy_to_backend_h3_streaming`.
+            latency_backend_ttfb_ms: backend_ttfb_ms,
             latency_backend_total_ms: backend_total_ms,
             latency_plugin_execution_ms: plugin_execution_ms,
             latency_plugin_external_io_ms: plugin_external_io_ms,
@@ -6062,8 +6079,11 @@ async fn handle_h3_request(
             h3_stream_result.backend_admission_elapsed,
         );
 
-        let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
-        let backend_ttfb_ms = backend_total_ms; // Approximation for streaming
+        // Admission elapsed above still drives adaptive concurrency. TTFB is
+        // only concrete when response headers were observed — pre-header
+        // dispatch failures report LATENCY_UNKNOWN_MS (mirrors native-H3 gRPC).
+        let backend_ttfb_ms = h3_stream_backend_ttfb_ms(&h3_stream_result);
+        let backend_total_ms = crate::plugins::LATENCY_UNKNOWN_MS;
 
         let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
@@ -6071,8 +6091,13 @@ async fn handle_h3_request(
             .plugin_http_call_ns
             .load(std::sync::atomic::Ordering::Relaxed) as f64
             / 1_000_000.0;
-        let gateway_processing_ms = total_ms - backend_total_ms;
-        let gateway_overhead_ms = (total_ms - backend_total_ms - plugin_execution_ms).max(0.0);
+        let (gateway_processing_ms, gateway_overhead_ms) =
+            TransactionSummary::derive_gateway_latencies(
+                total_ms,
+                backend_total_ms,
+                plugin_execution_ms,
+                true,
+            );
 
         let stream_outcome = BodyOutcome {
             body_completed: h3_stream_result.body_completed,
@@ -7588,9 +7613,13 @@ fn h3_streaming_body_failure_outcome(
 /// no `Drop` safety net.
 ///
 /// This means H3 summary sites are the only HTTP-family sites that populate
-/// all outcome fields at the same synchronous point in the code — no
-/// re-derivation of latency fields is needed because the "now" at summary
-/// construction time already coincides with body completion.
+/// terminal body outcome fields at the same synchronous point in the code.
+/// Streamed responses still follow the shared unknown-backend-total contract
+/// (`LATENCY_UNKNOWN_MS` for backend total / gateway fields) because concurrent
+/// backend-body and client-delivery lifetime cannot be separated on the pipe;
+/// only `latency_total_ms` is always concrete. `latency_backend_ttfb_ms` is
+/// concrete from `backend_admission_elapsed` only when response headers were
+/// observed; pre-header dispatch failures report `LATENCY_UNKNOWN_MS`.
 struct H3StreamResult {
     /// Client-facing HTTP status (what was/will be sent downstream). On an
     /// `after_proxy` reject or a gateway-side size-limit rejection this is the
@@ -7666,6 +7695,25 @@ fn h3_backend_unavailable_stream_result(
         body_error_class: None,
         request_on_wire,
         backend_admission_elapsed,
+    }
+}
+
+/// Backend TTFB for a completed native-H3 stream result.
+///
+/// `backend_admission_elapsed` is always preserved for adaptive-concurrency
+/// sampling. TTFB itself requires observed response headers:
+/// * pre-header dispatch failure (`error_class` set, `body_error_class` unset,
+///   via [`h3_backend_unavailable_stream_result`]) → `LATENCY_UNKNOWN_MS`
+/// * content-length `ResponseBodyTooLarge` reject after headers → real TTFB
+/// * success / body-phase outcomes → real TTFB from admission elapsed
+fn h3_stream_backend_ttfb_ms(result: &H3StreamResult) -> f64 {
+    match (result.error_class, result.body_error_class) {
+        (Some(crate::retry::ErrorClass::ResponseBodyTooLarge), None) => {
+            // Headers were received before the gateway size-limit reject.
+            result.backend_admission_elapsed.as_secs_f64() * 1000.0
+        }
+        (Some(_), None) => crate::plugins::LATENCY_UNKNOWN_MS,
+        _ => result.backend_admission_elapsed.as_secs_f64() * 1000.0,
     }
 }
 
@@ -8864,7 +8912,10 @@ async fn dispatch_grpc_native_h3(
                 Some(h3_error_class),
                 None,
                 start_time,
-                backend_start,
+                // No response headers / first byte were observed on this
+                // pre-headers failure path, so TTFB is unknown rather than
+                // admission elapsed time.
+                crate::plugins::LATENCY_UNKNOWN_MS,
                 *plugin_execution_ns,
             )
             .await;
@@ -8963,7 +9014,7 @@ async fn dispatch_grpc_native_h3(
             Some(crate::retry::ErrorClass::ResponseBodyTooLarge),
             None,
             start_time,
-            backend_start,
+            backend_admission_response_elapsed.as_secs_f64() * 1000.0,
             *plugin_execution_ns,
         )
         .await;
@@ -9067,7 +9118,7 @@ async fn dispatch_grpc_native_h3(
             None,
             None,
             start_time,
-            backend_start,
+            backend_admission_response_elapsed.as_secs_f64() * 1000.0,
             *plugin_execution_ns,
         )
         .await;
@@ -9214,7 +9265,7 @@ async fn dispatch_grpc_native_h3(
             response_header_client_disconnected
                 .then_some(crate::retry::ErrorClass::ClientDisconnect),
             start_time,
-            backend_start,
+            backend_admission_response_elapsed.as_secs_f64() * 1000.0,
             *plugin_execution_ns,
         )
         .await;
@@ -9825,7 +9876,7 @@ async fn dispatch_grpc_native_h3(
         None,
         body_error_class,
         start_time,
-        backend_start,
+        backend_admission_response_elapsed.as_secs_f64() * 1000.0,
         *plugin_execution_ns,
     )
     .await;
@@ -9856,17 +9907,22 @@ async fn log_h3_grpc_transaction(
     error_class: Option<crate::retry::ErrorClass>,
     body_error_class: Option<crate::retry::ErrorClass>,
     start_time: std::time::Instant,
-    backend_start: std::time::Instant,
+    backend_ttfb_ms: f64,
     plugin_execution_ns: u64,
 ) {
-    let backend_total_ms = backend_start.elapsed().as_secs_f64() * 1000.0;
+    let backend_total_ms = crate::plugins::LATENCY_UNKNOWN_MS;
     let total_ms = start_time.elapsed().as_secs_f64() * 1000.0;
     let plugin_execution_ms = plugin_execution_ns as f64 / 1_000_000.0;
     let plugin_external_io_ms = ctx
         .plugin_http_call_ns
         .load(std::sync::atomic::Ordering::Relaxed) as f64
         / 1_000_000.0;
-    let gateway_processing_ms = total_ms - backend_total_ms;
+    let (gateway_processing_ms, gateway_overhead_ms) = TransactionSummary::derive_gateway_latencies(
+        total_ms,
+        backend_total_ms,
+        plugin_execution_ms,
+        true,
+    );
     let summary = TransactionSummary {
         namespace: proxy.namespace.clone(),
         timestamp_received: ctx.timestamp_received.to_rfc3339(),
@@ -9882,11 +9938,11 @@ async fn log_h3_grpc_transaction(
         response_status_code,
         latency_total_ms: total_ms,
         latency_gateway_processing_ms: gateway_processing_ms,
-        latency_backend_ttfb_ms: backend_total_ms,
+        latency_backend_ttfb_ms: backend_ttfb_ms,
         latency_backend_total_ms: backend_total_ms,
         latency_plugin_execution_ms: plugin_execution_ms,
         latency_plugin_external_io_ms: plugin_external_io_ms,
-        latency_gateway_overhead_ms: (gateway_processing_ms - plugin_execution_ms).max(0.0),
+        latency_gateway_overhead_ms: gateway_overhead_ms,
         request_user_agent: proxy_headers.get("user-agent").cloned(),
         response_streamed: true,
         client_disconnected,
@@ -12547,6 +12603,80 @@ mod h3_streaming_outcome_tests {
         assert_eq!(
             delivered.backend_admission_elapsed,
             std::time::Duration::from_millis(11)
+        );
+    }
+
+    #[test]
+    fn pre_header_failure_reports_unknown_backend_ttfb() {
+        // Plain native-H3 completion must not label admission elapsed as TTFB
+        // when response headers never arrived. Adaptive concurrency still sees
+        // the real admission duration via record_h3_backend_admission_outcome.
+        let failed = super::h3_backend_unavailable_stream_result(
+            502,
+            ErrorClass::ConnectionRefused,
+            /* request_on_wire = */ false,
+            /* reject_sent = */ true,
+            std::time::Duration::from_millis(42),
+        );
+        assert_eq!(
+            failed.backend_admission_elapsed,
+            std::time::Duration::from_millis(42),
+            "admission elapsed must remain available for adaptive concurrency"
+        );
+        assert_eq!(
+            super::h3_stream_backend_ttfb_ms(&failed),
+            crate::plugins::LATENCY_UNKNOWN_MS,
+            "pre-header failure must report TTFB as unavailable"
+        );
+
+        let headers_ok = super::H3StreamResult {
+            status: 200,
+            backend_status: 200,
+            error_class: None,
+            body_completed: true,
+            bytes_streamed: 64,
+            client_disconnected: false,
+            body_error_class: None,
+            request_on_wire: true,
+            backend_admission_elapsed: std::time::Duration::from_millis(7),
+        };
+        assert!(
+            (super::h3_stream_backend_ttfb_ms(&headers_ok) - 7.0).abs() < f64::EPSILON,
+            "successful first-header timing must remain intact"
+        );
+
+        // Content-length ResponseBodyTooLarge rejects after headers arrive —
+        // TTFB is a real first-header observation (matches native-H3 gRPC).
+        let oversized = super::H3StreamResult {
+            status: 502,
+            backend_status: 200,
+            error_class: Some(ErrorClass::ResponseBodyTooLarge),
+            body_completed: false,
+            bytes_streamed: 0,
+            client_disconnected: false,
+            body_error_class: None,
+            request_on_wire: true,
+            backend_admission_elapsed: std::time::Duration::from_millis(11),
+        };
+        assert!(
+            (super::h3_stream_backend_ttfb_ms(&oversized) - 11.0).abs() < f64::EPSILON,
+            "post-header size reject must keep real TTFB"
+        );
+
+        let body_abort = super::H3StreamResult {
+            status: 200,
+            backend_status: 200,
+            error_class: None,
+            body_completed: false,
+            bytes_streamed: 16,
+            client_disconnected: true,
+            body_error_class: Some(ErrorClass::ClientDisconnect),
+            request_on_wire: true,
+            backend_admission_elapsed: std::time::Duration::from_millis(5),
+        };
+        assert!(
+            (super::h3_stream_backend_ttfb_ms(&body_abort) - 5.0).abs() < f64::EPSILON,
+            "body-phase abort after headers must keep real TTFB"
         );
     }
 }

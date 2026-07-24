@@ -1374,3 +1374,36 @@ fn h3_header_limits_precede_grpc_web_response_negotiation() {
         "header-limit rejection must not depend on pre-validation gRPC-Web response negotiation"
     );
 }
+
+#[test]
+fn h3_streaming_grpc_web_preserves_native_statuses_and_metadata() {
+    let source = include_str!("../../../src/http3/cross_protocol.rs");
+    let handler = source
+        .split("async fn handle_h3_grpc_streaming_response")
+        .nth(1)
+        .expect("H3 cross-protocol streaming gRPC response handler")
+        .split("/// Mesh-transport fail-closed guard")
+        .next()
+        .expect("bounded streaming handler body");
+
+    let translation_gate = handler
+        .find("response_body_rewrite_allowed(streaming.status)")
+        .expect("H3 gRPC-Web streaming adapter must honor preserved statuses");
+    let terminal_take = handler
+        .find("take_streaming_initial_terminal_metadata(")
+        .expect("H3 streaming terminal metadata extraction");
+    assert!(
+        translation_gate < terminal_take,
+        "preserved statuses must bypass H3 body and terminal translation"
+    );
+
+    let metadata_refresh = handler
+        .find("refresh_grpc_status_metadata(")
+        .expect("H3 client-visible gRPC status refresh");
+    assert!(
+        metadata_refresh < terminal_take,
+        "Trailers-Only status must be recorded before translation removes it from headers"
+    );
+    assert!(handler.contains("grpc_web_translation_mode"));
+    assert!(!handler.contains("grpc_web_text_mode"));
+}

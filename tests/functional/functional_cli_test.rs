@@ -455,9 +455,10 @@ async fn functional_cli_validate_resolves_file_secret_suffix() {
     // into the base variable.
     assert!(stdout.contains("Validation passed."));
     // The report is part of validate's stdout report block, not a tracing
-    // record: `init_logging()` defaults `FERRUM_LOG_LEVEL` to `warn` and
-    // `validate` has no `-v/--verbose` flag, so an `info!` would be
-    // unreachable. The hermetic helper's `env_clear()` drops `RUST_LOG` and
+    // record: `init_logging()` defaults `FERRUM_LOG_LEVEL` to `warn`, and the
+    // secret-source report is an unconditional `println!` (not gated on
+    // `-v/--verbose`), so an `info!` would be unreachable at the default level.
+    // The hermetic helper's `env_clear()` drops `RUST_LOG` and
     // `FERRUM_LOG_LEVEL` and pins an empty settings file, so this asserts the
     // *default* invocation is visible — it cannot pass via an inherited
     // verbosity setting.

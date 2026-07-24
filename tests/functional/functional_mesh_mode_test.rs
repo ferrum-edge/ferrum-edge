@@ -9,13 +9,13 @@
 //! Run with:
 //!   cargo test --test functional_tests functional_mesh_mode -- --ignored --nocapture
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -342,28 +342,37 @@ struct MeshPorts {
     east_west: u16,
 }
 
+/// Ports already handed to mesh gateway subprocesses in this test process.
+///
+/// A reservation must be released before a subprocess can bind it. Without
+/// remembering released ports, the kernel can immediately return the same port
+/// to a later `reserve_mesh_ports()` call before either subprocess starts. The
+/// gateway's reusable listeners can then both bind that address and
+/// nondeterministically receive each other's fixture traffic.
+static USED_MESH_PORTS: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+
+async fn reserve_unique_mesh_port() -> u16 {
+    loop {
+        let reservation = reserve_port().await.expect("reserve unique mesh port");
+        let port = reservation.port;
+        let inserted = USED_MESH_PORTS
+            .get_or_init(|| Mutex::new(HashSet::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(port);
+        if inserted {
+            return reservation.drop_and_take_port();
+        }
+    }
+}
+
 async fn reserve_mesh_ports() -> MeshPorts {
     MeshPorts {
-        inbound: reserve_port()
-            .await
-            .expect("reserve mesh inbound port")
-            .drop_and_take_port(),
-        outbound: reserve_port()
-            .await
-            .expect("reserve mesh outbound port")
-            .drop_and_take_port(),
-        hbone: reserve_port()
-            .await
-            .expect("reserve mesh hbone port")
-            .drop_and_take_port(),
-        egress: reserve_port()
-            .await
-            .expect("reserve mesh egress port")
-            .drop_and_take_port(),
-        east_west: reserve_port()
-            .await
-            .expect("reserve mesh east-west port")
-            .drop_and_take_port(),
+        inbound: reserve_unique_mesh_port().await,
+        outbound: reserve_unique_mesh_port().await,
+        hbone: reserve_unique_mesh_port().await,
+        egress: reserve_unique_mesh_port().await,
+        east_west: reserve_unique_mesh_port().await,
     }
 }
 

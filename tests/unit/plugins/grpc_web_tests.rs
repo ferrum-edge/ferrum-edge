@@ -351,9 +351,9 @@ async fn test_may_modify_response_content_type_tracks_grpc_web_request() {
 
     // A gRPC-Web request records its original content-type in
     // on_request_received; after_proxy relabels the response back to the
-    // gRPC-Web variant, so the proxy must keep the body buffered for
-    // final-response inspection rather than trusting the backend's
-    // application/grpc header.
+    // gRPC-Web variant, so an independently buffered response must be
+    // inspected against the final representation rather than trusting the
+    // backend's application/grpc header.
     let mut ctx = create_grpc_web_context("application/grpc-web");
     let _ = plugin.on_request_received(&mut ctx).await;
     // The marker is the precise signal; the backend response type is irrelevant
@@ -366,7 +366,7 @@ async fn test_may_modify_response_content_type_tracks_grpc_web_request() {
 }
 
 #[tokio::test]
-async fn test_response_buffering_only_for_grpc_web_requests() {
+async fn test_grpc_web_response_translation_does_not_vote_for_buffering() {
     let plugin = create_plugin_default();
 
     let native = create_grpc_web_context("application/grpc");
@@ -378,12 +378,58 @@ async fn test_response_buffering_only_for_grpc_web_requests() {
     let mut grpc_web = create_grpc_web_context("application/grpc-web");
     let result = plugin.on_request_received(&mut grpc_web).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(plugin.should_buffer_response_body(&grpc_web));
+    assert!(!plugin.should_buffer_response_body(&grpc_web));
 
     let mut grpc_web_text = create_grpc_web_context("application/grpc-web-text");
     let result = plugin.on_request_received(&mut grpc_web_text).await;
     assert!(matches!(result, PluginResult::Continue));
-    assert!(plugin.should_buffer_response_body(&grpc_web_text));
+    assert!(!plugin.should_buffer_response_body(&grpc_web_text));
+}
+
+#[test]
+fn streaming_trailers_only_excludes_gateway_authored_initial_headers() {
+    let pristine_names = std::collections::HashSet::from([
+        "content-type".to_string(),
+        "grpc-status".to_string(),
+        "grpc-message".to_string(),
+        "x-backend-terminal".to_string(),
+    ]);
+    let mut headers = HashMap::from([
+        (
+            "content-type".to_string(),
+            "application/grpc-web+proto".to_string(),
+        ),
+        ("grpc-status".to_string(), "7".to_string()),
+        ("grpc-message".to_string(), "denied".to_string()),
+        ("x-backend-terminal".to_string(), "kept".to_string()),
+        (
+            "x-security-policy".to_string(),
+            "gateway-enforced".to_string(),
+        ),
+    ]);
+
+    let terminal = ferrum_edge::_test_support::take_streaming_initial_terminal_metadata_for_test(
+        &mut headers,
+        true,
+        &pristine_names,
+    );
+
+    assert_eq!(terminal.get("grpc-status").map(String::as_str), Some("7"));
+    assert_eq!(
+        terminal.get("x-backend-terminal").map(String::as_str),
+        Some("kept")
+    );
+    assert!(!terminal.contains_key("x-security-policy"));
+    assert!(!headers.contains_key("grpc-status"));
+    assert!(!headers.contains_key("x-backend-terminal"));
+    assert_eq!(
+        headers.get("content-type").map(String::as_str),
+        Some("application/grpc-web+proto")
+    );
+    assert_eq!(
+        headers.get("x-security-policy").map(String::as_str),
+        Some("gateway-enforced")
+    );
 }
 
 #[tokio::test]
@@ -1018,7 +1064,7 @@ async fn test_after_proxy_rewrites_content_type_text() {
 }
 
 #[tokio::test]
-async fn test_preserved_statuses_keep_native_headers_and_release_buffering() {
+async fn test_preserved_statuses_keep_native_headers_without_buffering_transition() {
     let plugin = create_plugin_default();
 
     for status in [206, 226] {
@@ -1036,11 +1082,13 @@ async fn test_preserved_statuses_keep_native_headers_and_release_buffering() {
             &response_headers
         ));
         assert!(
-            plugin.should_release_response_body_before_content_type_rewrite(
+            !plugin.should_release_response_body_before_content_type_rewrite(
                 &ctx,
                 status,
                 &response_headers
-            )
+            ),
+            "streaming gRPC-Web never entered response buffering, so preserved statuses \
+             have no buffering transition to release"
         );
         assert!(matches!(
             plugin
@@ -1291,9 +1339,9 @@ fn test_modifies_request_body() {
 }
 
 #[test]
-fn test_requires_response_body_buffering() {
+fn test_requires_request_but_not_response_body_buffering() {
     let plugin = create_plugin_default();
-    assert!(plugin.requires_response_body_buffering());
+    assert!(!plugin.requires_response_body_buffering());
     assert!(plugin.requires_request_body_buffering());
     assert!(!plugin.needs_request_body_bytes());
     assert!(!plugin.applies_after_proxy_on_reject());
@@ -2857,9 +2905,8 @@ fn test_parse_grpc_frames_truncated() {
 // ── request_is_grpc_web_translated — mesh dispatch distinction (codex r1-4) ──
 //
 // The mesh-mTLS dispatch path uses this marker to tell a gRPC-Web request the
-// plugin translated to native gRPC (response MUST buffer: trailers are
-// re-encoded into the gRPC-Web body) apart from native gRPC (response must
-// NOT buffer: trailers must relay on the wire).
+// plugin translated to native gRPC (the streaming adapter body-frames terminal
+// trailers) apart from native gRPC (trailers relay on the wire).
 
 #[tokio::test]
 async fn test_translated_marker_set_only_after_grpc_web_translation() {

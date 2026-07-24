@@ -584,6 +584,7 @@ impl Plugin for AiTokenMetrics {
                 max_decoded_bytes: MAX_INSPECTION_BYTES,
                 max_cumulative_bytes: MAX_CUMULATIVE_DECODED_BYTES,
                 max_codings: MAX_CONTENT_CODINGS,
+                max_amplification_ratio: 0,
             },
         ) {
             Ok(decoded) => decoded,

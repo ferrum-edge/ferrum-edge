@@ -676,6 +676,13 @@ async fn test_first_request_passes_then_replay() {
             assert_eq!(status_code, 201);
             assert_eq!(headers.get("x-idempotent-replayed").unwrap(), "true");
             assert_eq!(&body[..], b"{\"id\": 123}");
+            assert_eq!(
+                ctx2.metadata
+                    .get("request_deduplication.replayed")
+                    .map(String::as_str),
+                Some("true"),
+                "replays must publish the bounded marker consumed by transcript audit"
+            );
         }
         _ => panic!("Expected RejectBinary replay, got {:?}", result),
     }

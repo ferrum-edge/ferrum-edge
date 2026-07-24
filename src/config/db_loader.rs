@@ -61,6 +61,12 @@ const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
 pub(crate) const MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL: &str = "INSERT INTO mtls_dns_admission_locks \
      (namespace, updated_at) VALUES (?, ?) \
      ON DUPLICATE KEY UPDATE updated_at = mtls_dns_admission_locks.updated_at";
+pub(crate) const MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL: &str = "INSERT INTO config_change_locks \
+     (lock_name, updated_at) VALUES (?, ?) \
+     ON DUPLICATE KEY UPDATE updated_at = config_change_locks.updated_at";
+pub(crate) const MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL: &str = "INSERT INTO proxy_route_locks \
+     (namespace, route_key_hash, created_at) VALUES (?, ?, ?) \
+     ON DUPLICATE KEY UPDATE created_at = proxy_route_locks.created_at";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FullLoadPurpose {
@@ -673,9 +679,11 @@ impl DatabaseStore {
 
     fn proxy_route_lock_insert_sql(&self) -> String {
         match self.db_type.as_str() {
-            "mysql" => "INSERT IGNORE INTO proxy_route_locks \
-                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"
-                .to_string(),
+            // Same S->X upgrade trap as config_change_locks / mTLS DNS
+            // admission: INSERT IGNORE takes a shared duplicate-key lock, then
+            // SELECT ... FOR UPDATE upgrades it. Prefer the no-op upsert so
+            // MySQL holds the exclusive row lock up front.
+            "mysql" => MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL.to_string(),
             "sqlite" => "INSERT OR IGNORE INTO proxy_route_locks \
                  (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"
                 .to_string(),
@@ -687,9 +695,11 @@ impl DatabaseStore {
 
     fn config_change_lock_insert_sql(&self) -> String {
         match self.db_type.as_str() {
-            "mysql" => "INSERT IGNORE INTO config_change_locks \
-                 (lock_name, updated_at) VALUES (?, ?)"
-                .to_string(),
+            // Cross-namespace writers share the single 'global' row and are not
+            // serialized by per-namespace admission. INSERT IGNORE + FOR UPDATE
+            // deadlocks on the S->X upgrade under concurrent namespaces; the
+            // no-op upsert acquires the exclusive lock immediately.
+            "mysql" => MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL.to_string(),
             "sqlite" => "INSERT OR IGNORE INTO config_change_locks \
                  (lock_name, updated_at) VALUES (?, ?)"
                 .to_string(),
@@ -870,11 +880,17 @@ impl DatabaseStore {
         sqlx::query(&insert_sql)
             .bind(namespace)
             .bind(&route_key_hash)
-            .bind(now)
+            .bind(&now)
             .execute(&mut **tx)
             .await?;
 
-        if self.db_type != "sqlite" {
+        // SQLite: INSERT OR IGNORE serializes via the DB writer lock.
+        // MySQL: the no-op ON DUPLICATE KEY UPDATE already holds X; a follow-up
+        // SELECT ... FOR UPDATE would be redundant and reintroduce S->X races
+        // if the insert shape ever regresses to INSERT IGNORE.
+        // PostgreSQL: INSERT ... DO NOTHING does not lock the existing row, so
+        // SELECT ... FOR UPDATE remains required.
+        if self.db_type != "sqlite" && self.db_type != "mysql" {
             let lock_sql = self.q("SELECT route_key_hash FROM proxy_route_locks \
                  WHERE namespace = ? AND route_key_hash = ? FOR UPDATE");
             sqlx::query(&lock_sql)
@@ -897,17 +913,24 @@ impl DatabaseStore {
         let insert_sql = self.config_change_lock_insert_sql();
         sqlx::query(&insert_sql)
             .bind(Self::CONFIG_CHANGE_LOCK_NAME)
-            .bind(now)
+            .bind(&now)
             .execute(&mut **tx)
             .await?;
 
         if self.db_type == "sqlite" {
+            // SQLite has no SELECT ... FOR UPDATE. This write takes the
+            // database writer lock inside the same transaction that will
+            // insert the change-log row.
             sqlx::query("UPDATE config_change_locks SET updated_at = ? WHERE lock_name = ?")
                 .bind(Utc::now().to_rfc3339())
                 .bind(Self::CONFIG_CHANGE_LOCK_NAME)
                 .execute(&mut **tx)
                 .await?;
-        } else {
+        } else if self.db_type != "mysql" {
+            // PostgreSQL: INSERT ... DO NOTHING does not lock the existing row.
+            // MySQL: MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL already holds the
+            // exclusive row lock for the rest of this transaction — do not
+            // follow with SELECT ... FOR UPDATE (that was the S->X deadlock).
             let lock_sql =
                 self.q("SELECT lock_name FROM config_change_locks WHERE lock_name = ? FOR UPDATE");
             sqlx::query(&lock_sql)

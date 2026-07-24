@@ -328,7 +328,7 @@ pub const BUILTIN_PLUGIN_PARITY_META: &[BuiltinPluginParityMeta] = &[
     BuiltinPluginParityMeta {
         name: "ai_transcript_audit",
         classification: BuiltinPluginClassification::Public,
-        priority: 2924,
+        priority: 2740,
         active_phases: "before_proxy, on_final_request_body, on_final_response_body, on_response_committed, response_stream_inspector, on_response_stream_terminated, log",
         matrix_protocols: HTTP_ONLY_PROTOCOLS,
         protocol_rationale: "HTTP-only AI transcript capture to a configured sink",

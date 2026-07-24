@@ -8258,6 +8258,10 @@ fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
         .expect("AiSemanticCacheConfig description");
     assert!(description.contains("Unknown root"));
     assert!(description.contains("KeepLastKnownGood"));
+    assert!(
+        description.contains("ai_semantic_cache.<instance_id>"),
+        "OpenAPI AiSemanticCacheConfig must describe per-instance staging isolation"
+    );
 
     assert_component_validity(
         &spec,
@@ -8294,6 +8298,10 @@ fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
     }
     assert!(section.contains("KeepLastKnownGood"));
     assert!(section.contains("unknown retention"));
+    assert!(
+        section.contains("ai_semantic_cache.<instance_id>"),
+        "docs must describe per-instance request-staging isolation"
+    );
 }
 
 #[test]

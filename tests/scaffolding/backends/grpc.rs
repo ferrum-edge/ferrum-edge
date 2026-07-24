@@ -95,6 +95,10 @@ pub enum GrpcStep {
     /// Send a gRPC length-prefixed message as the next DATA frame. The
     /// 5-byte gRPC header is prepended for you (flag=0, big-endian length).
     RespondMessage(Bytes),
+    /// Pause between scripted response frames without closing the stream.
+    /// Useful for proving that a gateway forwards server-streaming DATA before
+    /// the backend reaches EOF.
+    Sleep(Duration),
     /// Send the gRPC status trailer (`grpc-status: <code>` and
     /// `grpc-message: <message>` when non-empty). Implicitly closes the
     /// stream.
@@ -308,6 +312,7 @@ fn lower_grpc_step(step: GrpcStep) -> Vec<H2Step> {
                 end_stream: false,
             }]
         }
+        GrpcStep::Sleep(duration) => vec![H2Step::Sleep(duration)],
         GrpcStep::RespondStatus { code, message } => {
             let mut trailers = vec![("grpc-status", code.to_string())];
             if !message.is_empty() {

@@ -537,6 +537,67 @@ async fn start_counting_backend_on(
     Ok(handle)
 }
 
+async fn start_audit_collector_on(
+    listener: tokio::net::TcpListener,
+    records: Arc<tokio::sync::Mutex<Vec<serde_json::Value>>>,
+) -> Result<tokio::task::JoinHandle<()>, Box<dyn std::error::Error>> {
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let records = Arc::clone(&records);
+            tokio::spawn(async move {
+                let (reader, mut writer) = tokio::io::split(stream);
+                let mut reader = tokio::io::BufReader::new(reader);
+                use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+                loop {
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).await.is_err() || request_line.is_empty()
+                    {
+                        return;
+                    }
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.is_err() {
+                            return;
+                        }
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            break;
+                        }
+                        if let Some((key, value)) = trimmed.split_once(':')
+                            && key.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_length = value.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let mut body = vec![0u8; content_length];
+                    if content_length > 0 && reader.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    if let Ok(serde_json::Value::Array(batch)) =
+                        serde_json::from_slice::<serde_json::Value>(&body)
+                    {
+                        records.lock().await.extend(batch);
+                    }
+                    if writer
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    Ok(handle)
+}
+
 async fn start_counting_large_function_on(
     listener: tokio::net::TcpListener,
     hits: Arc<AtomicUsize>,
@@ -1947,6 +2008,13 @@ async fn test_request_deduplication_redis_blocks_concurrent_cross_instance() {
         return;
     }
 
+    let audit_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let audit_port = audit_listener.local_addr().unwrap().port();
+    let audit_records = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let _audit_collector = start_audit_collector_on(audit_listener, Arc::clone(&audit_records))
+        .await
+        .unwrap();
+
     let backend_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_port = backend_listener.local_addr().unwrap().port();
     let backend_hits = Arc::new(AtomicUsize::new(0));
@@ -2003,6 +2071,22 @@ proxies:
 consumers: []
 
 plugin_configs:
+  - id: "global-ai-audit"
+    plugin_name: "ai_transcript_audit"
+    scope: "global"
+    enabled: true
+    config:
+      capture:
+        request: true
+        response: true
+      sampling:
+        rate: 1.0
+      sink:
+        type: "http"
+        endpoint_url: "http://127.0.0.1:{audit_port}/audit"
+        allow_insecure_loopback: true
+        batch_size: 1
+        flush_interval_ms: 100
   - id: "shared-dedup-plugin"
     plugin_name: "request_deduplication"
     scope: "proxy"
@@ -2076,7 +2160,7 @@ plugin_configs:
     sleep(Duration::from_millis(200)).await;
 
     let client = reqwest::Client::new();
-    let body = r#"{"order":1}"#;
+    let body = r#"{"model":"gpt-test","messages":[{"role":"user","content":"order one"}]}"#;
     let idempotency_key = "shared-order-key";
     let authority = "orders.example";
     let url1 = format!("http://127.0.0.1:{port1}/shared-dedup/orders");
@@ -2163,6 +2247,38 @@ plugin_configs:
         1,
         "Redis replay must not execute the backend again"
     );
+
+    let deadline = SystemTime::now() + Duration::from_secs(10);
+    loop {
+        if audit_records.lock().await.len() >= 3 {
+            break;
+        }
+        if SystemTime::now() >= deadline {
+            panic!(
+                "expected audit records for original, in-flight conflict, and Redis replay; got {}",
+                audit_records.lock().await.len()
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    sleep(Duration::from_millis(200)).await;
+    let records = audit_records.lock().await.clone();
+    assert_eq!(
+        records.len(),
+        3,
+        "each of the three client-visible AI transactions must emit exactly one audit record"
+    );
+    let replay_records: Vec<&serde_json::Value> = records
+        .iter()
+        .filter(|record| record["cache"]["request_deduplication.replayed"].as_str() == Some("true"))
+        .collect();
+    assert_eq!(
+        replay_records.len(),
+        1,
+        "the Redis replay must emit exactly one bounded replay-marked audit record"
+    );
+    assert_eq!(replay_records[0]["status_code"], 200);
+    assert!(replay_records[0]["response_body"].is_string());
 
     delete_redis_keys_by_prefix(&unique_prefix).await;
     sleep(Duration::from_millis(200)).await;
