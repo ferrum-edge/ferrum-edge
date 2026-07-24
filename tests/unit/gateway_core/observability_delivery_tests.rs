@@ -228,3 +228,31 @@ async fn begin_cycle_is_idempotent_while_the_generation_stays_open() {
     assert!(slot.shutdown(Duration::from_secs(5)).await.complete());
     assert!(worker.is_finished());
 }
+
+#[tokio::test]
+async fn reinitialize_does_not_orphan_an_open_generation() {
+    let slot = DeliverySlot::new(0);
+    let generation = slot.begin_cycle();
+    let worker = spawn_draining_worker("reinitialized_sink");
+    slot.register_worker(Arc::clone(&worker));
+
+    slot.initialize(32);
+
+    assert_eq!(
+        slot.current_generation(),
+        generation,
+        "changing the future shard override must preserve the open generation"
+    );
+    assert!(
+        worker.accepting() && !worker.is_finished(),
+        "reinitialization must not orphan a worker registered in the open generation"
+    );
+
+    assert!(slot.shutdown(Duration::from_secs(5)).await.complete());
+    assert!(worker.is_finished());
+    assert_ne!(
+        slot.begin_cycle(),
+        generation,
+        "the updated override must take effect through a fresh post-drain generation"
+    );
+}

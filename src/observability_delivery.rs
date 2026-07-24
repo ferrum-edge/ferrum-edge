@@ -65,15 +65,17 @@ fn global() -> &'static DeliverySlot {
 
 /// Configure the hot task registry before serving-mode plugin activation.
 ///
-/// Called once per process from `main` before mode dispatch. It records the
-/// shard override for every generation this slot creates and opens a fresh
-/// generation, so a process that already touched the registry (for example an
-/// auto-sized lazy generation) still serves under the configured sharding.
+/// Called once per process from `main` before mode dispatch. First use creates
+/// the open generation with the configured sharding. If an earlier non-serving
+/// caller already touched the registry, the override is recorded for the next
+/// generation without replacing an open lifecycle that may own live workers.
 ///
 /// Tests and non-serving callers that reach the registry first use the same
 /// auto-sized fallback as other concurrent runtime maps.
 pub fn initialize(pool_shard_override: usize) {
-    global().initialize(pool_shard_override);
+    LIFECYCLE
+        .get_or_init(|| DeliverySlot::new(pool_shard_override))
+        .initialize(pool_shard_override);
 }
 
 /// Open the delivery generation for a serving cycle.
@@ -115,16 +117,15 @@ impl DeliverySlot {
 
     /// Record the shard override and make sure an open generation is current.
     ///
-    /// A generation that is already open is only replaced when the shard
-    /// override changed, so a caller that re-initializes mid-serve cannot
-    /// orphan queue workers that are still registered against it. A drained
-    /// generation is always replaced, which is what lets a second in-process
-    /// serve deliver again.
+    /// A generation that is already open is never replaced, so a caller that
+    /// re-initializes mid-serve cannot orphan queue workers that are still
+    /// registered against it. The new override applies to the next generation.
+    /// A drained generation is replaced immediately, which is what lets a
+    /// second in-process serve deliver again.
     pub fn initialize(&self, pool_shard_override: usize) {
-        let previous = self
-            .pool_shard_override
-            .swap(pool_shard_override, Ordering::AcqRel);
-        if previous == pool_shard_override && self.current.load().state() == GENERATION_OPEN {
+        self.pool_shard_override
+            .store(pool_shard_override, Ordering::Release);
+        if self.current.load().state() == GENERATION_OPEN {
             return;
         }
         self.begin_new_cycle();
