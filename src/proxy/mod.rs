@@ -11629,37 +11629,78 @@ impl EffectiveWsSizeLimits {
         }
     }
 
-    fn plugin_close_for_error(
+    /// Map parser capacity overflows to RFC 6455 close code 1009.
+    ///
+    /// Plugin rules supply the close reason when they determine the effective
+    /// ceiling; otherwise the global binding limit still emits a detailed
+    /// `Close(Size)` so peers never see a silent 1006 reset for the same
+    /// overflow class.
+    pub(crate) fn close_for_capacity_error(
         &self,
         error: &tokio_tungstenite::tungstenite::Error,
-    ) -> Option<(CloseFrame, &'static str, usize, usize)> {
+    ) -> Option<(CloseFrame, &'static str, usize, usize, bool)> {
         use tokio_tungstenite::tungstenite::Error;
         use tokio_tungstenite::tungstenite::error::CapacityError;
 
-        let (size, max_size, rule, kind) = match error {
+        let (size, max_size, kind, reason, plugin_enforced) = match error {
             Error::Capacity(CapacityError::FrameTooLong { size, max_size }) => {
-                let rule = self.plugin_frame.as_ref().filter(|rule| {
-                    self.max_frame_bytes == *max_size && rule.max_bytes == *max_size
-                })?;
-                (*size, *max_size, rule, "frame")
+                if self.max_frame_bytes != *max_size {
+                    return None;
+                }
+                let plugin_rule = self
+                    .plugin_frame
+                    .as_ref()
+                    .filter(|rule| rule.max_bytes == *max_size);
+                (
+                    *size,
+                    *max_size,
+                    "frame",
+                    plugin_rule
+                        .map(|rule| rule.close_reason.as_ref().to_owned())
+                        .unwrap_or_default(),
+                    plugin_rule.is_some(),
+                )
             }
             Error::Capacity(CapacityError::MessageTooLong { size, max_size }) => {
-                let rule = self.plugin_message.as_ref().filter(|rule| {
-                    self.max_message_bytes == *max_size && rule.max_bytes == *max_size
-                })?;
-                (*size, *max_size, rule, "message")
+                if self.max_message_bytes != *max_size {
+                    return None;
+                }
+                let plugin_rule = self
+                    .plugin_message
+                    .as_ref()
+                    .filter(|rule| rule.max_bytes == *max_size);
+                (
+                    *size,
+                    *max_size,
+                    "message",
+                    plugin_rule
+                        .map(|rule| rule.close_reason.as_ref().to_owned())
+                        .unwrap_or_default(),
+                    plugin_rule.is_some(),
+                )
             }
             _ => return None,
         };
         Some((
             CloseFrame {
                 code: CloseCode::Size,
-                reason: rule.close_reason.as_ref().to_owned().into(),
+                reason: reason.into(),
             },
             kind,
             size,
             max_size,
+            plugin_enforced,
         ))
+    }
+}
+
+/// Policy Close published when the connection-wide WebSocket idle timer fires.
+/// Both relay halves emit this frame so peers observe a defined 1001 rather
+/// than asymmetric 1005/1006 teardown.
+pub(crate) fn ws_idle_timeout_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Away,
+        reason: "idle timeout".into(),
     }
 }
 
@@ -12417,6 +12458,15 @@ where
                                 retry::ErrorClass::ReadWriteTimeout,
                                 None,
                             ));
+                            // Publish a defined 1001 before breaking so both
+                            // halves emit a symmetric Close (this sink now;
+                            // the opposite cancel branch uses policy_close).
+                            let close = publish_ws_policy_close(
+                                &policy_close_ctb,
+                                &cancel_ctb,
+                                Some(ws_idle_timeout_close_frame()),
+                            );
+                            send_bounded_ws_close(&mut backend_sink, close).await;
                             break;
                         }
                     };
@@ -12451,12 +12501,23 @@ where
                                 .await;
                                 break;
                             }
+                            // Tungstenite already auto-queues a local Pong for
+                            // every received Ping. Forwarding the Ping would
+                            // invite a second Pong from the far side and make
+                            // dead-backend detection lie. Keep Ping as a local
+                            // gateway keepalive (documented non-transparent);
+                            // frame plugins above still observe/rate-limit it.
+                            if matches!(&outgoing, Message::Ping(_)) {
+                                trace!(
+                                    "Client -> Backend: Ping answered locally (not forwarded)"
+                                );
+                                continue;
+                            }
                             match &outgoing {
                                 Message::Text(_) => trace!("Client -> Backend: Text message"),
                                 Message::Binary(d) => {
                                     trace!(bytes = d.len(), "Client -> Backend: Binary message")
                                 }
-                                Message::Ping(_) => trace!("Client -> Backend: Ping"),
                                 Message::Pong(_) => trace!("Client -> Backend: Pong"),
                                 _ => {}
                             }
@@ -12562,19 +12623,37 @@ where
                             trace!("Client -> Backend: Frame");
                         }
                         Err(e) => {
-                            let error_class = if let Some((close, limit_kind, size, max_size)) =
-                                size_limits_ctb.plugin_close_for_error(&e)
+                            let error_class = if let Some((
+                                close,
+                                limit_kind,
+                                size,
+                                max_size,
+                                plugin_enforced,
+                            )) =
+                                size_limits_ctb.close_for_capacity_error(&e)
                             {
-                                warn!(
-                                    plugin = "ws_message_size_limiting",
-                                    proxy_id = %proxy_id_ctb,
-                                    connection_id,
-                                    direction = "client->backend",
-                                    limit_kind,
-                                    size,
-                                    max_size,
-                                    "WebSocket size policy rejected input before forwarding"
-                                );
+                                if plugin_enforced {
+                                    warn!(
+                                        plugin = "ws_message_size_limiting",
+                                        proxy_id = %proxy_id_ctb,
+                                        connection_id,
+                                        direction = "client->backend",
+                                        limit_kind,
+                                        size,
+                                        max_size,
+                                        "WebSocket size policy rejected input before forwarding"
+                                    );
+                                } else {
+                                    warn!(
+                                        proxy_id = %proxy_id_ctb,
+                                        connection_id,
+                                        direction = "client->backend",
+                                        limit_kind,
+                                        size,
+                                        max_size,
+                                        "WebSocket global size limit rejected input before forwarding"
+                                    );
+                                }
                                 // Cancellation precedes the bounded polite write so policy
                                 // teardown cannot be held by a non-reading destination.
                                 let close = publish_ws_policy_close(
@@ -12653,6 +12732,14 @@ where
                                 retry::ErrorClass::ReadWriteTimeout,
                                 None,
                             ));
+                            // Mirror of c2b: publish defined 1001 so both peers
+                            // observe a symmetric idle Close.
+                            let close = publish_ws_policy_close(
+                                &policy_close_btc,
+                                &cancel_btc,
+                                Some(ws_idle_timeout_close_frame()),
+                            );
+                            send_bounded_ws_close(&mut ws_sink, close).await;
                             break;
                         }
                     };
@@ -12679,12 +12766,18 @@ where
                                 send_bounded_ws_close(&mut ws_sink, close).await;
                                 break;
                             }
+                            // Mirror of c2b: answer Ping locally; do not relay.
+                            if matches!(&outgoing, Message::Ping(_)) {
+                                trace!(
+                                    "Backend -> Client: Ping answered locally (not forwarded)"
+                                );
+                                continue;
+                            }
                             match &outgoing {
                                 Message::Text(_) => trace!("Backend -> Client: Text message"),
                                 Message::Binary(d) => {
                                     trace!(bytes = d.len(), "Backend -> Client: Binary message")
                                 }
-                                Message::Ping(_) => trace!("Backend -> Client: Ping"),
                                 Message::Pong(_) => trace!("Backend -> Client: Pong"),
                                 _ => {}
                             }
@@ -12781,19 +12874,37 @@ where
                             trace!("Backend -> Client: Frame");
                         }
                         Err(e) => {
-                            let error_class = if let Some((close, limit_kind, size, max_size)) =
-                                size_limits_btc.plugin_close_for_error(&e)
+                            let error_class = if let Some((
+                                close,
+                                limit_kind,
+                                size,
+                                max_size,
+                                plugin_enforced,
+                            )) =
+                                size_limits_btc.close_for_capacity_error(&e)
                             {
-                                warn!(
-                                    plugin = "ws_message_size_limiting",
-                                    proxy_id = %proxy_id_btc,
-                                    connection_id,
-                                    direction = "backend->client",
-                                    limit_kind,
-                                    size,
-                                    max_size,
-                                    "WebSocket size policy rejected input before forwarding"
-                                );
+                                if plugin_enforced {
+                                    warn!(
+                                        plugin = "ws_message_size_limiting",
+                                        proxy_id = %proxy_id_btc,
+                                        connection_id,
+                                        direction = "backend->client",
+                                        limit_kind,
+                                        size,
+                                        max_size,
+                                        "WebSocket size policy rejected input before forwarding"
+                                    );
+                                } else {
+                                    warn!(
+                                        proxy_id = %proxy_id_btc,
+                                        connection_id,
+                                        direction = "backend->client",
+                                        limit_kind,
+                                        size,
+                                        max_size,
+                                        "WebSocket global size limit rejected input before forwarding"
+                                    );
+                                }
                                 let close = publish_ws_policy_close(
                                     &policy_close_btc,
                                     &cancel_btc,

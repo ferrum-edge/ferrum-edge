@@ -7,7 +7,7 @@ A comprehensive feature list for Ferrum Edge.
 - **HTTP/1.1** with keep-alive connection pooling
 - **HTTP/2** via ALPN negotiation on TLS connections
 - **HTTP/3** (QUIC) on the same port as HTTPS with streaming responses (backpressure-aware adaptive coalescing), configurable idle timeout, max streams, QUIC flow-control windows, and per-backend connection pooling
-- **WebSocket** (`ws`/`wss`) with transparent upgrade handling — HTTP/1.1 Upgrade (RFC 6455), HTTP/2 Extended CONNECT (RFC 8441), and HTTP/3 Extended CONNECT (RFC 9220, `:protocol=websocket` over QUIC). All three frontends share the same plugin pipeline (`on_ws_frame`, `on_ws_disconnect`, sticky-session cookies); the H3 frontend bridges to HTTP/1.1-Upgrade backends (RFC 9220 §5 unmasked frames on the H3 hop, RFC 6455 masked frames on the H1.1 hop). Gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default `true`)
+- **WebSocket** (`ws`/`wss`) with transparent upgrade handling — HTTP/1.1 Upgrade (RFC 6455), HTTP/2 Extended CONNECT (RFC 8441), and HTTP/3 Extended CONNECT (RFC 9220, `:protocol=websocket` over QUIC). All three frontends share the same plugin pipeline (`on_ws_frame`, `on_ws_disconnect`, sticky-session cookies); the H3 frontend bridges to HTTP/1.1-Upgrade backends (RFC 9220 §5 unmasked frames on the H3 hop, RFC 6455 masked frames on the H1.1 hop). Gated by `FERRUM_HTTP3_WEBSOCKET_ENABLED` (default `true`). Ping is answered locally (not end-to-end transparent); global/plugin size overflows close with 1009; idle timeout closes both peers with 1001
 - **gRPC** (`grpc`/`grpcs`) with HTTP/2 trailer support and full plugin compatibility
 - **TCP** stream proxying with TLS termination, origination, passthrough, and configurable idle timeout
 - **UDP** datagram proxying with DTLS support (frontend termination, backend origination, passthrough)
@@ -150,7 +150,7 @@ Ferrum supports dynamic upstream target discovery through four providers, config
 
 ### WebSocket Plugins
 
-- **WebSocket Message Size Limiting** — enforces maximum frame sizes on WebSocket connections, closing with code 1009 (Message Too Big) on violation
+- **WebSocket Message Size Limiting** — enforces maximum frame sizes on WebSocket connections, closing with code 1009 (Message Too Big) on violation; the global `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` ceiling uses the same 1009 path when no plugin is configured
 - **WebSocket Rate Limiting** — per-connection frame rate limiting using token bucket algorithm, closing with code 1008 (Policy Violation) on excess; supports Redis-backed mode that externalizes per-connection counters with per-plugin/gateway-instance key namespacing (budgets are not portable across reconnects or rebuilds). Compatible with any RESP-protocol server (Redis, Valkey, DragonflyDB, KeyDB, Garnet). TLS uses gateway-level settings
 - **WebSocket Frame Logging** — logs frame metadata (direction, type, size, connection ID) without transforming frames
 

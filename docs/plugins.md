@@ -5224,8 +5224,10 @@ validation, and interleaved Ping/Pong frames do not reset message state.
 On either violation the gateway publishes cancellation before attempting
 bounded polite-close writes and sends close code **1009 (Message Too Big)**
 with the configured reason to both client and backend when their sinks remain
-writable. The same behavior applies in both relay directions and on H1, H2,
-and H3 WebSocket frontends.
+writable. The same **1009** path is used when the binding ceiling is the global
+`FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` / message default (empty close reason)
+rather than a plugin rule. The same behavior applies in both relay directions
+and on H1, H2, and H3 WebSocket frontends.
 
 **Priority:** 2810
 
@@ -5291,7 +5293,7 @@ config:
 
 ### `ws_frame_logging`
 
-Logs metadata for every WebSocket frame the shared H1/H2/H3 relay **successfully delivers** (post-plugin, post-control-frame guard), plus plugin-generated policy Close decisions observed in the mutating chain. Provides frame-level observability without requiring packet captures. This plugin never transforms or drops frames — it is purely observational (`observes_ws_frame_decisions()`), so after an earlier admission plugin synthesizes a terminal Close the shared relay still invokes this hook with that final decision (`outcome=policy_close`). Ordinary Text/Binary/Ping/Pong and peer Close frames are recorded only after the destination sink accepts the write (`outcome=delivered`), on the same success boundary as the per-direction `frames_*` / `bytes_*` counters. Cancelled or failed sends produce no frame event.
+Logs metadata for every WebSocket frame the shared H1/H2/H3 relay **successfully delivers** (post-plugin, post-control-frame guard), plus plugin-generated policy Close decisions observed in the mutating chain. Provides frame-level observability without requiring packet captures. This plugin never transforms or drops frames — it is purely observational (`observes_ws_frame_decisions()`), so after an earlier admission plugin synthesizes a terminal Close the shared relay still invokes this hook with that final decision (`outcome=policy_close`). Ordinary Text/Binary/Pong and peer Close frames are recorded only after the destination sink accepts the write (`outcome=delivered`), on the same success boundary as the per-direction `frames_*` / `bytes_*` counters. **Ping is answered locally by the gateway framer and is not forwarded**, so Ping does not produce a `delivered` frame event (and the auto-Pong is not relay-counted). Cancelled or failed sends produce no frame event.
 
 **Priority:** 9050
 

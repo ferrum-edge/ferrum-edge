@@ -105,6 +105,7 @@ mod functional_tls_lifecycle_test;
 mod functional_tls_only_test;
 mod functional_udp_proxy_test;
 mod functional_url_query_limits_test;
+mod functional_websocket_close_control_test;
 mod functional_websocket_connection_limit_test;
 mod functional_websocket_frame_limit_test;
 mod functional_websocket_limits_test;

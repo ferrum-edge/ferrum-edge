@@ -398,6 +398,10 @@ continuations are reassembled before this ordinary hook. Parser-level size
 policy is the exception: `ws_message_size_limiting` installs the strictest
 configured actual-frame and reassembled-message ceilings before either parser
 reads, so continuation payloads are checked individually before allocation.
+After the frame-plugin chain, **Ping is answered locally by the tungstenite
+framer and is not forwarded** to the opposite peer (documented non-transparent
+keepalive; avoids a double Pong). Pong, Text, and Binary continue to the
+destination send path.
 
 Peer-originated **Close** frames take a separate forward path: mutating
 admission hooks are skipped so a later plugin cannot replace the peer's
@@ -419,6 +423,9 @@ WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy �
 │  │ control-frame guard           │──┼── Restore illegal Ping↔Pong flips
 │  └───────────────────────────────┘  │
 │  ┌───────────────────────────────┐  │
+│  │ local Ping answer             │──┼── Drop Ping after plugins (no forward)
+│  └───────────────────────────────┘  │
+│  ┌───────────────────────────────┐  │
 │  │ destination send              │──┼── Success-only frame/byte counters
 │  └───────────────────────────────┘  │
 │  ┌───────────────────────────────┐  │
@@ -428,9 +435,11 @@ WebSocket Upgrade (HTTP pipeline: authenticate → authorize → before_proxy �
 │  ┌───────────────────────────────┐  │
 │  │ on_ws_frame (BackendToClient) │──┼── For each Text/Binary/Ping/Pong from backend
 │  └───────────────────────────────┘  │
-│  … same guard → send → delivery …   │
+│  … same guard → local Ping drop → send → delivery …   │
 │                                     │
 │  Peer Close → forward → delivery    │── No mutating hooks; log after accept
+│  Idle timeout → Close 1001 both     │── Symmetric Away via policy_close
+│  Size overflow → Close 1009 both    │── Plugin reason or empty global reason
 └─────────────────────────────────────┘
 ```
 

@@ -992,6 +992,34 @@ pub mod _test_support {
         crate::proxy::publish_ws_policy_close(policy_close, cancel, close)
     }
 
+    /// Idle-timeout policy Close used by the shared WebSocket relay (1001).
+    pub fn ws_idle_timeout_close_frame_for_test() -> CloseFrame {
+        crate::proxy::ws_idle_timeout_close_frame()
+    }
+
+    /// Build effective WebSocket size limits from the global frame ceiling and
+    /// optional framing plugins (mirrors relay construction).
+    pub fn effective_ws_size_limits_from_plugins_for_test(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+    ) -> (usize, usize) {
+        let limits =
+            crate::proxy::EffectiveWsSizeLimits::from_plugins(global_frame_bytes, plugins);
+        (limits.max_frame_bytes, limits.max_message_bytes)
+    }
+
+    /// Map a tungstenite capacity error to the relay's RFC 6455 1009 Close.
+    /// Returns `(close, limit_kind, size, max_size, plugin_enforced)`.
+    pub fn ws_capacity_close_for_error_for_test(
+        global_frame_bytes: usize,
+        plugins: &[Arc<dyn crate::plugins::Plugin>],
+        error: &tokio_tungstenite::tungstenite::Error,
+    ) -> Option<(CloseFrame, &'static str, usize, usize, bool)> {
+        let limits =
+            crate::proxy::EffectiveWsSizeLimits::from_plugins(global_frame_bytes, plugins);
+        limits.close_for_capacity_error(error)
+    }
+
     /// Exercise the shared H1/H2/H3 WebSocket frame-plugin composition path.
     pub async fn apply_ws_frame_plugins_for_test(
         plugins: &[Arc<dyn crate::plugins::Plugin>],
