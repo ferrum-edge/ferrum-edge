@@ -1249,7 +1249,8 @@ async fn test_statsd_logging_byte_budget_config_validation_fail_closed() {
         }),
         default_client(),
     )
-    .expect_err("max_entry_bytes below minimum");
+    .err()
+    .expect("max_entry_bytes below minimum");
     assert!(below_min.contains("max_entry_bytes"), "got: {below_min}");
 
     let above_hard = StatsdLogging::new(
@@ -1259,7 +1260,8 @@ async fn test_statsd_logging_byte_budget_config_validation_fail_closed() {
         }),
         default_client(),
     )
-    .expect_err("max_entry_bytes above hard max");
+    .err()
+    .expect("max_entry_bytes above hard max");
     assert!(above_hard.contains("max_entry_bytes"), "got: {above_hard}");
 
     let buffer_too_small = StatsdLogging::new(
@@ -1270,7 +1272,8 @@ async fn test_statsd_logging_byte_budget_config_validation_fail_closed() {
         }),
         default_client(),
     )
-    .expect_err("buffer_max_bytes below accounted minimum");
+    .err()
+    .expect("buffer_max_bytes below accounted minimum");
     assert!(
         buffer_too_small.contains("buffer_max_bytes"),
         "got: {buffer_too_small}"
@@ -1283,7 +1286,8 @@ async fn test_statsd_logging_byte_budget_config_validation_fail_closed() {
         }),
         default_client(),
     )
-    .expect_err("buffer_max_bytes above hard max");
+    .err()
+    .expect("buffer_max_bytes above hard max");
     assert!(
         buffer_above_hard.contains("buffer_max_bytes"),
         "got: {buffer_above_hard}"

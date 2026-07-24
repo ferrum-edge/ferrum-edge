@@ -517,6 +517,7 @@ struct QueuedStatsdPayload {
 }
 
 impl QueuedStatsdPayload {
+    #[allow(dead_code)]
     fn as_bytes(&self) -> &[u8] {
         self.lines.as_bytes()
     }
@@ -525,6 +526,7 @@ impl QueuedStatsdPayload {
         self.lines.as_ref()
     }
 
+    #[allow(dead_code)]
     fn retained_len(&self) -> usize {
         self.lines.len()
     }
@@ -680,21 +682,25 @@ impl StatsdLogging {
     }
 
     /// Test-only: aggregate retained-byte usage for the sink instance.
+    #[allow(dead_code)]
     pub fn byte_budget_used_for_test(&self) -> usize {
         self.byte_budget.used()
     }
 
     /// Test-only: cumulative byte-budget / queue saturation drops.
+    #[allow(dead_code)]
     pub fn byte_budget_drops_for_test(&self) -> u64 {
         self.byte_budget.drops_total()
     }
 
     /// Test-only: configured per-entry retained-byte ceiling.
+    #[allow(dead_code)]
     pub fn max_entry_bytes_for_test(&self) -> usize {
         self.max_entry_bytes
     }
 
     /// Test-only: hold `bytes` against the aggregate budget until the guard drops.
+    #[allow(dead_code)]
     pub fn hold_byte_budget_for_test(&self, bytes: usize) -> Option<StatsdByteLeaseGuardForTest> {
         self.byte_budget
             .try_acquire(bytes)
@@ -717,15 +723,18 @@ impl StatsdLogging {
 }
 
 /// Test-only lease handle that keeps budget bytes reserved until dropped.
+#[allow(dead_code)]
 pub struct StatsdByteLeaseGuardForTest {
     _lease: Arc<ByteLease>,
 }
 
 /// Test-only admitted payload that exposes borrowed bytes and releases on drop.
+#[allow(dead_code)]
 pub struct StatsdAdmittedPayloadForTest {
     payload: QueuedStatsdPayload,
 }
 
+#[allow(dead_code)]
 impl StatsdAdmittedPayloadForTest {
     pub fn as_str(&self) -> &str {
         self.payload.as_str()
@@ -741,6 +750,7 @@ impl StatsdAdmittedPayloadForTest {
 }
 
 /// Test-only: render HTTP metrics under a budget without enqueueing.
+#[allow(dead_code)]
 pub fn render_http_under_budget_for_test(
     budget: &ByteBudget,
     max_entry_bytes: usize,
@@ -1138,6 +1148,7 @@ pub fn format_ws_metrics(
 /// Collects every datagram into a `Vec` for inspection. Production delivery
 /// packs one MTU-bounded buffer at a time via [`send_packed_entries`] so
 /// sibling datagram copies are not retained together.
+#[allow(dead_code)]
 pub fn pack_udp_datagrams(payload: &str, max_payload: usize) -> (Vec<String>, usize) {
     let mut datagrams = Vec::new();
     let dropped = for_each_udp_datagram(payload, max_payload, |datagram| {
@@ -1150,6 +1161,7 @@ pub fn pack_udp_datagrams(payload: &str, max_payload: usize) -> (Vec<String>, us
 ///
 /// `visit` receives borrowed bytes for one datagram at a time (never larger
 /// than `max_payload`). Returns the number of oversized lines dropped.
+#[allow(dead_code)]
 pub fn for_each_udp_datagram(
     payload: &str,
     max_payload: usize,
