@@ -12088,6 +12088,10 @@ components:
         bytes; encoded global_tags (+ namespace) are capped at 400 bytes.
         UDP datagrams never exceed a 1452-byte conservative IPv4/IPv6 payload
         ceiling; indivisible oversized lines are dropped rather than fragmented.
+        Hot-path admission reserves a queue slot and a provisional max_entry_bytes
+        lease before rendering StatsD line protocol, then shrinks the lease to the
+        exact retained size under buffer_max_bytes. Delivery retains admitted
+        payloads plus at most one MTU-bounded datagram buffer.
         Mirror summaries are excluded from request.* families. Timers require
         finite non-negative samples (the -1.0 no-backend TTFB sentinel is
         omitted). gRPC transactions add a bounded grpc_status tag and
@@ -12157,6 +12161,24 @@ components:
           minimum: 1
           maximum: 10000
           description: Max metric entries to batch before flushing
+        max_entry_bytes:
+          type: integer
+          default: 65536
+          minimum: 1024
+          maximum: 1048576
+          description: >-
+            Maximum rendered StatsD line-protocol bytes for one admitted
+            transaction. Oversized renders are dropped before enqueue.
+        buffer_max_bytes:
+          type: integer
+          default: 16777216
+          minimum: 2050
+          maximum: 268435456
+          description: >-
+            Aggregate retained rendered-content budget across queued entries,
+            one MTU-bounded datagram buffer, and retries. Admission reserves
+            two copies plus framing before rendering and shrinks that lease to
+            the exact retained size. Must be at least 2 * (max_entry_bytes + 1).
         max_retries:
           type: integer
           default: 0
