@@ -6418,6 +6418,10 @@ async fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
     );
 
     let http_client = PluginHttpClient::default();
+    // SAFETY: allowlisted sink secret for OpenAPI/runtime construction parity.
+    unsafe {
+        std::env::set_var("AUDIT_TOKEN", "openapi-parity-audit-token");
+    }
     let parity_cases = [
         (
             json!({

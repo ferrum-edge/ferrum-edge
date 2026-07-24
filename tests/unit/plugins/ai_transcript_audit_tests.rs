@@ -15,6 +15,9 @@ use ferrum_edge::plugins::ai_transcript_audit::{
     AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS, AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
     AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS, AI_TRANSCRIPT_AUDIT_REDACTION_KEYS,
     AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS, AI_TRANSCRIPT_AUDIT_SINK_KEYS, AiTranscriptAudit,
+    HARD_MAX_CAPTURE_AGGREGATE_BYTES, HARD_MAX_CAPTURE_BYTES, HARD_MAX_MODEL_CHARS,
+    HARD_MAX_STAGING_RESERVATION_SECS, HARD_MAX_TOOL_COUNT, HARD_MAX_TOOL_NAME_CHARS,
+    HARD_MAX_TOOL_NAMES_BYTES,
 };
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
@@ -552,6 +555,10 @@ async fn rejects_privacy_capture_sampling_redaction_limits_and_fail_posture_typo
 
 #[tokio::test]
 async fn null_optional_nested_objects_keep_defaults_and_custom_headers_stay_free_form() {
+    // SAFETY: test-local secret for allowlisted header expansion.
+    unsafe {
+        std::env::set_var("AUDIT_TOKEN", "unit-test-audit-token");
+    }
     let config = json!({
         "mode": null,
         "allow_full_body": null,
@@ -650,6 +657,12 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
             "max_request_bytes",
             "max_response_bytes",
             "max_stream_capture_bytes",
+            "max_model_chars",
+            "max_tool_count",
+            "max_tool_name_chars",
+            "max_tool_names_bytes",
+            "hash_full_stream",
+            "max_staging_reservation_secs",
         ]
     );
     assert_eq!(
@@ -670,6 +683,8 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
             "batch_size",
             "flush_interval_ms",
             "buffer_capacity",
+            "max_entry_bytes",
+            "buffer_max_bytes",
             "max_retries",
             "retry_delay_ms",
             "on_buffer_full",
@@ -2492,9 +2507,11 @@ async fn downstream_stream_cut_omits_pre_cut_capture_and_forces_guardrail_sample
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn redaction_runs_before_truncation_at_capture_boundary() {
-    // Build a body where the SSN straddles the max_request_bytes boundary; a
-    // truncate-then-redact order would emit the raw prefix of the SSN.
+async fn oversized_redacted_body_omits_excerpt_at_capture_boundary() {
+    // Build a body where the SSN straddles the max_request_bytes boundary. The
+    // export budget bounds redaction work: oversized bodies omit the excerpt
+    // (matching truncated stream semantics) instead of scanning the full tail
+    // or emitting a raw SSN prefix.
     let body = format!(
         r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{}my ssn is 123-45-6789"}}]}}"#,
         "x".repeat(64)
@@ -2522,12 +2539,12 @@ async fn redaction_runs_before_truncation_at_capture_boundary() {
         .await;
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
-    let excerpt = records[0]["request_body"].as_str().expect("request body");
     assert!(
-        !excerpt.contains("123-45") && !excerpt.contains("123-4"),
-        "raw SSN prefix leaked across the capture boundary: {excerpt}"
+        records[0]["request_body"].is_null(),
+        "oversized redacted_body capture must omit the excerpt rather than leak a boundary fragment"
     );
     assert_eq!(records[0]["request_body_truncated"], true);
+    assert!(records[0]["request_hash"].is_string());
 }
 
 #[tokio::test]
@@ -2980,10 +2997,12 @@ async fn buffered_json_response_not_captured_when_response_capture_disabled() {
 }
 
 #[tokio::test]
-async fn custom_sink_headers_are_sent_with_env_expansion() {
-    // Exercises parse_sink_headers + the send_batch header loop + `${VAR}`
-    // expansion across all forms: a set var, an unset var, an invalid name, and
-    // an unterminated placeholder (kept literal).
+async fn custom_sink_headers_are_sent_with_allowlisted_secret_expansion() {
+    // SAFETY: isolated allowlisted secret for this expansion fixture.
+    unsafe {
+        std::env::set_var("AUDIT_TOKEN", "sink-secret-value");
+        std::env::set_var("FERRUM_AUDIT_COLLECTOR", "fleet-a");
+    }
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let config = json!({
@@ -2994,7 +3013,9 @@ async fn custom_sink_headers_are_sent_with_env_expansion() {
             "batch_size": 1,
             "flush_interval_ms": 100,
             "custom_headers": {
-                "x-audit-token": "set:${PATH}|unset:${FERRUM_AUDIT_UNSET_XYZ}|bad:${9nope}|open:${trail"
+                "x-audit-token": "Bearer ${AUDIT_TOKEN}",
+                "x-audit-fleet": "${FERRUM_AUDIT_COLLECTOR}",
+                "x-literal": "plain"
             }
         }
     });
@@ -3012,36 +3033,25 @@ async fn custom_sink_headers_are_sent_with_env_expansion() {
     let records = wait_for_records(&server).await;
     assert_eq!(records.len(), 1);
     let received = server.received_requests().await.unwrap_or_default();
-    let header = received
-        .iter()
-        .find_map(|request| {
-            request
-                .headers
-                .get("x-audit-token")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        })
-        .expect("custom header present on the sink request");
-    assert!(
-        !header.contains("${FERRUM_AUDIT_UNSET_XYZ}"),
-        "unset var must expand away: {header}"
-    );
-    assert!(
-        header.contains("unset:|"),
-        "unset var expands to empty: {header}"
-    );
-    assert!(
-        header.contains("bad:${9nope}"),
-        "invalid env name kept literal: {header}"
-    );
-    assert!(
-        header.contains("open:${trail"),
-        "unterminated placeholder kept literal: {header}"
-    );
+    let header = |name: &str| {
+        received
+            .iter()
+            .find_map(|request| {
+                request
+                    .headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| panic!("missing header {name}"))
+    };
+    assert_eq!(header("x-audit-token"), "Bearer sink-secret-value");
+    assert_eq!(header("x-audit-fleet"), "fleet-a");
+    assert_eq!(header("x-literal"), "plain");
 }
 
 #[tokio::test]
-async fn custom_sink_headers_validation_errors() {
+async fn custom_sink_headers_reject_unrelated_and_unset_secret_refs() {
     let cfg = |custom: Value| {
         json!({
             "sink": {
@@ -3056,6 +3066,40 @@ async fn custom_sink_headers_validation_errors() {
     assert!(
         AiTranscriptAudit::new(&cfg(json!({ "bad name!": "v" })), loopback_http_client()).is_err()
     );
+    let err = AiTranscriptAudit::new(
+        &cfg(json!({ "Authorization": "Bearer ${FERRUM_DATABASE_PASSWORD}" })),
+        loopback_http_client(),
+    )
+    .expect_err("unrelated FERRUM_* secret must be rejected");
+    assert!(
+        err.contains("AUDIT_*") || err.contains("FERRUM_AUDIT_*"),
+        "got: {err}"
+    );
+    let err = AiTranscriptAudit::new(
+        &cfg(json!({ "Authorization": "Bearer ${PATH}" })),
+        loopback_http_client(),
+    )
+    .expect_err("system PATH must be rejected");
+    assert!(err.contains("PATH") || err.contains("AUDIT_*"), "got: {err}");
+    let err = AiTranscriptAudit::new(
+        &cfg(json!({ "Authorization": "Bearer ${AWS_SECRET_ACCESS_KEY}" })),
+        loopback_http_client(),
+    )
+    .expect_err("cloud secret must be rejected");
+    assert!(
+        err.contains("AWS_SECRET_ACCESS_KEY") || err.contains("AUDIT_*"),
+        "got: {err}"
+    );
+    // SAFETY: ensure the allowlisted name is unset for this negative case.
+    unsafe {
+        std::env::remove_var("FERRUM_AUDIT_MISSING_TOKEN");
+    }
+    let err = AiTranscriptAudit::new(
+        &cfg(json!({ "Authorization": "Bearer ${FERRUM_AUDIT_MISSING_TOKEN}" })),
+        loopback_http_client(),
+    )
+    .expect_err("unset allowlisted secret must be rejected at admission");
+    assert!(err.contains("unset") || err.contains("FERRUM_AUDIT_MISSING_TOKEN"), "got: {err}");
 }
 
 #[tokio::test]
@@ -5134,3 +5178,427 @@ async fn ai_transcript_audit_reuses_http11_connection_across_retry() {
 // `http_batch_response_drain_tests.rs` (asserts `HttpBatchDrainOutcome::LimitExceeded`).
 // A caller-level wall-clock check cannot distinguish capped abort from an
 // uncapped EOF read of ~1.1 MiB, so the redundant audit fixture was removed.
+
+// ---------------------------------------------------------------------------
+// Hardening workstream (#3045–#3053)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn capture_limits_reject_above_hard_maxima_and_expose_admitted_status() {
+    let over = HARD_MAX_CAPTURE_BYTES as u64 + 1;
+    let err = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "limits": { "max_request_bytes": over } }),
+        ),
+        loopback_http_client(),
+    )
+    .expect_err("over hard max");
+    assert!(err.contains("max_request_bytes"), "got: {err}");
+
+    let ok = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "limits": {
+                    "max_request_bytes": HARD_MAX_CAPTURE_BYTES,
+                    "max_response_bytes": HARD_MAX_CAPTURE_BYTES / 2,
+                    "max_stream_capture_bytes": HARD_MAX_CAPTURE_BYTES / 2
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("at hard max");
+    let admitted = ok.admitted_limits();
+    assert_eq!(admitted.max_request_bytes, HARD_MAX_CAPTURE_BYTES);
+    assert_eq!(admitted.max_response_bytes, HARD_MAX_CAPTURE_BYTES / 2);
+    assert_eq!(admitted.max_stream_capture_bytes, HARD_MAX_CAPTURE_BYTES / 2);
+    assert_eq!(admitted.max_model_chars, HARD_MAX_MODEL_CHARS);
+    assert_eq!(admitted.max_tool_count, HARD_MAX_TOOL_COUNT);
+    assert_eq!(admitted.max_tool_name_chars, HARD_MAX_TOOL_NAME_CHARS);
+    assert_eq!(admitted.max_tool_names_bytes, HARD_MAX_TOOL_NAMES_BYTES);
+    assert!(!admitted.hash_full_stream);
+    assert_eq!(
+        admitted.max_staging_reservation_secs,
+        HARD_MAX_STAGING_RESERVATION_SECS
+    );
+    assert!(admitted.max_entry_bytes >= 1024);
+    assert!(admitted.buffer_max_bytes >= admitted.max_entry_bytes);
+
+    let aggregate_err = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "limits": {
+                    "max_request_bytes": HARD_MAX_CAPTURE_BYTES,
+                    "max_response_bytes": HARD_MAX_CAPTURE_BYTES,
+                    "max_stream_capture_bytes": HARD_MAX_CAPTURE_BYTES
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect_err("aggregate over hard max");
+    assert!(
+        aggregate_err.contains("sum")
+            || aggregate_err.contains(&HARD_MAX_CAPTURE_AGGREGATE_BYTES.to_string()),
+        "got: {aggregate_err}"
+    );
+}
+
+#[tokio::test]
+async fn model_and_tool_metadata_are_bounded_with_truncation_flags() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "limits": {
+                    "max_model_chars": 8,
+                    "max_tool_count": 2,
+                    "max_tool_name_chars": 4,
+                    "max_tool_names_bytes": 16
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let mut huge_tools = Vec::new();
+    for i in 0..8 {
+        huge_tools.push(json!({
+            "type": "function",
+            "function": { "name": format!("tool_name_that_is_very_long_{i}") }
+        }));
+    }
+    let body = json!({
+        "model": "abcdefghijklmnopqrstuvwxyz",
+        "messages": [{"role":"user","content":"hi"}],
+        "tools": huge_tools
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, &body_bytes)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["model"], "abcdefgh");
+    assert_eq!(records[0]["model_truncated"], true);
+    assert_eq!(records[0]["tool_names_truncated"], true);
+    let tools = records[0]["tool_names"].as_array().expect("tools");
+    assert!(tools.len() <= 2, "{tools:?}");
+    for tool in tools {
+        assert!(tool.as_str().unwrap().chars().count() <= 4);
+    }
+}
+
+#[tokio::test]
+async fn byte_budget_lease_releases_on_drop_and_reject_paths() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/x",
+                    "max_entry_bytes": 1024,
+                    "buffer_max_bytes": 2050,
+                    "buffer_capacity": 8,
+                    "on_buffer_full": "drop"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    assert_eq!(plugin.byte_budget_used_for_test(), 0);
+    {
+        let guard = plugin
+            .hold_byte_budget_for_test(2050)
+            .expect("full budget lease");
+        assert_eq!(plugin.byte_budget_used_for_test(), 2050);
+        assert!(plugin.hold_byte_budget_for_test(1).is_none());
+        drop(guard);
+    }
+    assert_eq!(plugin.byte_budget_used_for_test(), 0);
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(30)))
+        .mount(&server)
+        .await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "redacted_body",
+                "limits": { "max_request_bytes": 256, "max_response_bytes": 256 },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint,
+                    "allow_insecure_loopback": true,
+                    "batch_size": 50,
+                    "flush_interval_ms": 60_000,
+                    "buffer_capacity": 4,
+                    "max_entry_bytes": 1024,
+                    "buffer_max_bytes": 2050,
+                    "on_buffer_full": "drop"
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+    for _ in 0..6 {
+        let mut ctx = make_ctx();
+        let body = format!(
+            r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{}"}}]}}"#,
+            "x".repeat(180)
+        );
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await;
+        plugin
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+    }
+    // Budget/slot pressure must not permanently retain leases after drop/reject.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        plugin.byte_budget_used_for_test() <= 2050,
+        "retained bytes {}",
+        plugin.byte_budget_used_for_test()
+    );
+    assert!(plugin.byte_budget_drops_for_test() >= 1 || plugin.byte_budget_used_for_test() > 0);
+}
+
+#[tokio::test]
+async fn unchanged_request_body_skips_second_keyed_hmac() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink("https://audit.example.com/x", json!({})),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    let after_stage = plugin.keyed_request_hash_calls_for_test();
+    assert_eq!(after_stage, 1);
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    assert_eq!(
+        plugin.keyed_request_hash_calls_for_test(),
+        after_stage,
+        "identical final body must not recompute keyed HMAC"
+    );
+
+    let transformed = br#"{"model":"gpt-4o","messages":[{"role":"user","content":"changed"}]}"#;
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, transformed)
+        .await;
+    assert_eq!(plugin.keyed_request_hash_calls_for_test(), after_stage + 1);
+}
+
+#[tokio::test]
+async fn redacted_body_omits_excerpt_instead_of_scanning_oversized_tail() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "limits": { "max_request_bytes": 64, "max_response_bytes": 64 } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let huge_tail = "z".repeat(200_000);
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"hi {huge_tail}"}}]}}"#
+    );
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert!(records[0]["request_body"].is_null());
+    assert_eq!(records[0]["request_body_truncated"], true);
+    assert!(records[0]["request_hash"].is_string());
+}
+
+#[tokio::test]
+async fn stream_hash_stops_at_capture_cap_unless_full_stream_opt_in() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "capture": { "streaming_response": true },
+                "limits": { "max_stream_capture_bytes": 32, "hash_full_stream": false }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let chunk = format!(
+        "data: {{\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+        "a".repeat(200)
+    );
+    let _ = inspector.on_chunk(chunk.as_bytes()).await;
+    let _ = inspector.on_chunk(b"data: [DONE]\n\n").await;
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(
+            &mut ctx,
+            200,
+            &BodyOutcome::success(chunk.len() as u64 + 14),
+        )
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["response_hash_complete"], false);
+    assert_eq!(records[0]["response_hashed_bytes"], 32);
+    assert!(records[0]["response_hash"].is_string());
+    assert_eq!(records[0]["response_body_truncated"], true);
+}
+
+#[tokio::test]
+async fn staging_ttl_expires_active_streams_with_reserved_permits() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "limits": { "max_staging_reservation_secs": 1 } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    let record_id = ctx
+        .metadata
+        .get("ai_transcript_audit.record_id")
+        .cloned()
+        .expect("record id");
+    plugin.mark_stream_active_for_test(&record_id);
+    plugin.set_staging_captured_at_for_test(
+        &record_id,
+        std::time::Instant::now() - std::time::Duration::from_secs(5),
+    );
+    assert_eq!(plugin.staging_len_for_test(), 1);
+    plugin.force_sweep_staging_for_test();
+    assert_eq!(
+        plugin.staging_len_for_test(),
+        0,
+        "active+reserved staging must still expire"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sink_health_follows_ack_body_drain_outcome() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        // First ACK: 200 then stall the body so drain times out.
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.flush();
+            thread::sleep(std::time::Duration::from_secs(3));
+        }
+    });
+
+    let endpoint = format!("http://{addr}/ingest");
+    let plugin = AiTranscriptAudit::new(
+        &json!({
+            "mode": "metadata_only",
+            "sink": {
+                "type": "http",
+                "endpoint_url": endpoint,
+                "allow_insecure_loopback": true,
+                "batch_size": 1,
+                "flush_interval_ms": 50,
+                "max_retries": 0,
+                "on_sink_error": "reject"
+            }
+        }),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    assert!(plugin.sink_healthy_for_test());
+
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+
+    for _ in 0..80 {
+        if !plugin.sink_healthy_for_test() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        !plugin.sink_healthy_for_test(),
+        "2xx with stalled ACK body must mark sink unhealthy"
+    );
+
+    // Concurrent fail-closed admission must reject while unhealthy.
+    let mut ctx2 = make_ctx();
+    let rejected = plugin
+        .on_final_request_body_with_context(&mut ctx2, &headers, ai_request_body())
+        .await;
+    assert!(
+        matches!(rejected, PluginResult::Reject { status_code: 503, .. }),
+        "got {rejected:?}"
+    );
+}

@@ -52,7 +52,8 @@ pub use batching_logger::{
     wait_until_committed, wait_until_committed_or_closed,
 };
 pub use byte_budget::{
-    ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES, HARD_MAX_BUFFER_MAX_BYTES, admit_byte_limits,
+    ByteBudget, ByteLease, DEFAULT_BUFFER_MAX_BYTES, HARD_MAX_BUFFER_MAX_BYTES, HARD_MAX_ENTRY_BYTES,
+    admit_byte_limits,
 };
 pub use http_client::PluginHttpClient;
 pub use log_helpers::{

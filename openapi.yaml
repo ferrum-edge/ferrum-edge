@@ -18290,7 +18290,7 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and cache metadata, then exports them asynchronously to an HTTPS collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and cache metadata, then exports them asynchronously to an HTTPS collector in batches under record-count and retained-byte budgets. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and ages out by max_staging_reservation_secs (including active streams with reserved permits). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map, but ${NAME} expansions are restricted to AUDIT_* / FERRUM_AUDIT_*. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
@@ -18387,25 +18387,62 @@ components:
         limits:
           type: [object, "null"]
           additionalProperties: false
-          description: "Capture size caps. Omit or null to keep defaults."
+          description: "Capture size caps and metadata/reservation budgets. Omit or null to keep defaults. Each capture byte limit is hard-capped at 1048576; their sum must be <= 2097152. Effective admitted limits are exposed via plugin status helpers."
           properties:
             max_request_bytes:
               type: integer
               minimum: 1
+              maximum: 1048576
               default: 65536
             max_response_bytes:
               type: integer
               minimum: 1
+              maximum: 1048576
               default: 65536
             max_stream_capture_bytes:
               type: integer
               minimum: 1
+              maximum: 1048576
               default: 65536
+            max_model_chars:
+              type: integer
+              minimum: 1
+              maximum: 256
+              default: 256
+              description: "Maximum retained characters for the request model string."
+            max_tool_count:
+              type: integer
+              minimum: 1
+              maximum: 128
+              default: 128
+              description: "Maximum number of retained tool/function names."
+            max_tool_name_chars:
+              type: integer
+              minimum: 1
+              maximum: 256
+              default: 256
+              description: "Maximum characters retained for one tool name."
+            max_tool_names_bytes:
+              type: integer
+              minimum: 1
+              maximum: 8192
+              default: 8192
+              description: "Aggregate UTF-8 byte budget across retained tool names."
+            hash_full_stream:
+              type: boolean
+              default: false
+              description: "When true, streaming capture continues keyed HMAC over the full SSE body after max_stream_capture_bytes. When false (default), hashing stops at the capture cap and partial digests are domain-separated with response_hashed_bytes."
+            max_staging_reservation_secs:
+              type: integer
+              minimum: 1
+              maximum: 3600
+              default: 3600
+              description: "Maximum age of in-flight staging entries, including active streams that hold reserved sink permits. Expired entries release staging and queue capacity."
         sink:
           type: object
           required: [endpoint_url]
           additionalProperties: false
-          description: "Async batched HTTPS sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Cleartext HTTP requires allow_insecure_loopback=true and is then limited to localhost or a loopback IP. Unknown sink keys are rejected; custom_headers remains an open string map."
+          description: "Async batched HTTPS sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Cleartext HTTP requires allow_insecure_loopback=true and is then limited to localhost or a loopback IP. Unknown sink keys are rejected; custom_headers remains an open string map whose ${NAME} expansions are restricted to AUDIT_* / FERRUM_AUDIT_* and must be set at admission."
           properties:
             type:
               type: string
@@ -18423,7 +18460,7 @@ components:
               type: object
               additionalProperties:
                 type: string
-              description: "Extra headers sent on every batch. Values support ${ENV_VAR} expansion resolved lazily at send time, so secrets are not stored in config (e.g. Authorization: 'Bearer ${AUDIT_TOKEN}'). Arbitrary header names are accepted; this is the only intentional free-form map in the plugin config."
+              description: "Extra headers sent on every batch. Values may expand only ${AUDIT_*} or ${FERRUM_AUDIT_*} references (validated and required to be set at construction; re-expanded at send time). Arbitrary unrelated process environment names are rejected. Arbitrary header names are accepted; this is the only intentional free-form map in the plugin config."
             batch_size:
               type: integer
               minimum: 1
@@ -18439,6 +18476,18 @@ components:
               minimum: 1
               maximum: 1000000
               default: 10000
+            max_entry_bytes:
+              type: integer
+              minimum: 1024
+              maximum: 1048576
+              default: 65536
+              description: "Maximum serialized size of one admitted audit record (1024–1048576). Oversized records are dropped or rejected before enqueue."
+            buffer_max_bytes:
+              type: integer
+              minimum: 2050
+              maximum: 268435456
+              default: 16777216
+              description: "Aggregate retained serialized-content budget across queued, assembled, and retrying records (must be >= 2 * (max_entry_bytes + 1); hard max 268435456). Byte leases stay coupled to payload lifetime through retries."
             max_retries:
               type: integer
               minimum: 0
@@ -18454,12 +18503,12 @@ components:
               type: string
               enum: [drop, reject]
               default: drop
-              description: "drop: silently drop when the queue or 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
+              description: "drop: silently drop when the queue, retained-byte budget, or 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue/byte slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
             on_sink_error:
               type: string
               enum: [warn, reject]
               default: warn
-              description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Any non-2xx collector response marks the sink unhealthy — including non-retryable 4xx (401/403/413, e.g. an expired token) whose batch is discarded rather than retried — so records silently lost at the collector stop audited traffic instead of letting it flow unaudited. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a successful batch send restores sink health automatically."
+              description: "warn: log and drop on permanent sink failure. reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit while the sink is unhealthy. Streaming admission honors sampling plus configured error/guardrail overrides. Sink health becomes true only after a 2xx response whose acknowledgement body drains successfully within the shared bound/deadline; incomplete drains, transport failures, and any non-2xx (including non-retryable 4xx such as 401/403/413) mark the sink unhealthy. Rejected transactions still build and enqueue their audit record — the background flush of those records is the recovery probe, and a fully successful batch send restores sink health automatically."
         privacy:
           type: [object, "null"]
           additionalProperties: false

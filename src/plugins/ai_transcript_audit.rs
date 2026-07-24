@@ -45,11 +45,15 @@ use tracing::warn;
 
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
+use super::utils::byte_budget::{
+    BoundedJsonWriter, ByteBudget, ByteLease, HARD_MAX_ENTRY_BYTES, accounted_summary_bytes,
+    admit_byte_limits,
+};
 use super::utils::metadata_redaction::{REDACTED_PLACEHOLDER, is_sensitive_metadata_key};
 use super::utils::{
-    BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, DeferredBatchingLogger, LoggerHooks,
-    PluginHttpClient, build_batch_config, handle_http_batch_response, parse_http_endpoint,
-    validate_batch_config,
+    BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, DeferredBatchingLogger,
+    HttpBatchDrainOutcome, LoggerHooks, PluginHttpClient, build_batch_config,
+    drain_http_batch_response_body, parse_http_endpoint, validate_batch_config,
 };
 use super::{
     HTTP_ONLY_PROTOCOLS, Plugin, PluginResult, ProxyProtocol, RequestContext, ResponseStreamAction,
@@ -112,7 +116,34 @@ pub const AI_TRANSCRIPT_AUDIT_LIMITS_KEYS: &[&str] = &[
     "max_request_bytes",
     "max_response_bytes",
     "max_stream_capture_bytes",
+    "max_model_chars",
+    "max_tool_count",
+    "max_tool_name_chars",
+    "max_tool_names_bytes",
+    "hash_full_stream",
+    "max_staging_reservation_secs",
 ];
+
+/// Hard maximum for each capture excerpt / stream buffer limit (1 MiB).
+pub const HARD_MAX_CAPTURE_BYTES: usize = HARD_MAX_ENTRY_BYTES;
+/// Hard maximum for the sum of the three capture byte limits.
+pub const HARD_MAX_CAPTURE_AGGREGATE_BYTES: usize = HARD_MAX_CAPTURE_BYTES.saturating_mul(2);
+/// Default / hard maximum model string length retained in staging and records.
+pub const HARD_MAX_MODEL_CHARS: usize = 256;
+/// Default / hard maximum number of tool names retained per record.
+pub const HARD_MAX_TOOL_COUNT: usize = 128;
+/// Default / hard maximum length of one tool name.
+pub const HARD_MAX_TOOL_NAME_CHARS: usize = 256;
+/// Default / hard maximum aggregate UTF-8 bytes across retained tool names.
+pub const HARD_MAX_TOOL_NAMES_BYTES: usize = 8_192;
+/// Default / hard maximum age for staging entries, including active streams with
+/// reserved commit permits.
+pub const HARD_MAX_STAGING_RESERVATION_SECS: u64 = 60 * 60;
+/// Domain separator mixed into capped stream HMACs so partial digests cannot be
+/// confused with full-stream digests.
+const PARTIAL_STREAM_HASH_DOMAIN: &[u8] = b"\0ferrum.ai_transcript_audit.partial_stream_hash/v1\0";
+/// Env-var prefixes permitted inside `sink.custom_headers` `${NAME}` references.
+const AUDIT_SECRET_ENV_PREFIXES: &[&str] = &["AUDIT_", "FERRUM_AUDIT_"];
 
 /// Accepted keys under `privacy`.
 pub const AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS: &[&str] = &[
@@ -131,6 +162,8 @@ pub const AI_TRANSCRIPT_AUDIT_SINK_KEYS: &[&str] = &[
     "batch_size",
     "flush_interval_ms",
     "buffer_capacity",
+    "max_entry_bytes",
+    "buffer_max_bytes",
     "max_retries",
     "retry_delay_ms",
     "on_buffer_full",
@@ -244,6 +277,28 @@ struct LimitsConfig {
     max_request_bytes: usize,
     max_response_bytes: usize,
     max_stream_capture_bytes: usize,
+    max_model_chars: usize,
+    max_tool_count: usize,
+    max_tool_name_chars: usize,
+    max_tool_names_bytes: usize,
+    hash_full_stream: bool,
+    max_staging_reservation_secs: u64,
+}
+
+/// Effective capture / metadata / reservation limits after admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmittedCaptureLimits {
+    pub max_request_bytes: usize,
+    pub max_response_bytes: usize,
+    pub max_stream_capture_bytes: usize,
+    pub max_model_chars: usize,
+    pub max_tool_count: usize,
+    pub max_tool_name_chars: usize,
+    pub max_tool_names_bytes: usize,
+    pub hash_full_stream: bool,
+    pub max_staging_reservation_secs: u64,
+    pub max_entry_bytes: usize,
+    pub buffer_max_bytes: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -263,12 +318,18 @@ struct AuditStaging {
     request_excerpt: Option<String>,
     request_truncated: bool,
     request_hash: Option<String>,
+    /// Unkeyed SHA-256 of the staged request bytes. Used only to detect
+    /// transforms before recomputing the exported keyed HMAC; never exported.
+    request_content_digest: [u8; 32],
     request_model: Option<String>,
+    model_truncated: bool,
     tool_names: Vec<String>,
-    commit_permit: Option<BatchingLoggerPermit<AuditRecord>>,
+    tool_names_truncated: bool,
+    commit_permit: Option<BatchingLoggerPermit<QueuedAuditRecord>>,
     /// True only after the response path confirms that this transaction is
     /// actively streaming. A pre-commit reservation alone is not sufficient:
     /// requests abandoned before stream selection must remain TTL-collectable.
+    /// Active streams still age out at `max_staging_reservation_secs`.
     stream_active: bool,
 }
 
@@ -279,6 +340,8 @@ struct StreamCaptured {
     response_excerpt: Option<String>,
     response_truncated: bool,
     response_hash: String,
+    response_hash_complete: bool,
+    response_hashed_bytes: u64,
 }
 
 struct StreamSlot {
@@ -328,8 +391,14 @@ struct AuditRecord {
     request_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_hash_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_hashed_bytes: Option<u64>,
     request_body_truncated: bool,
     response_body_truncated: bool,
+    model_truncated: bool,
+    tool_names_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -344,6 +413,13 @@ struct AuditRecord {
     tool_names: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     headers: Option<BTreeMap<String, String>>,
+}
+
+/// Pre-serialized audit record retained in the batching queue under a byte lease.
+#[derive(Clone)]
+struct QueuedAuditRecord {
+    json: Arc<str>,
+    _lease: Arc<ByteLease>,
 }
 
 /// Owned request/response envelope fields, sourced from either a live
@@ -412,8 +488,9 @@ impl RecordsPerMinute {
 #[derive(Clone)]
 struct HttpFlushConfig {
     endpoint_url: String,
-    /// Header name + `${VAR}`-expandable value template. The template (not the
-    /// resolved secret) is stored, so a config dump never leaks the token.
+    /// Header name + value. `${AUDIT_*}` / `${FERRUM_AUDIT_*}` references are
+    /// validated (allowlisted and present) at construction; values are expanded
+    /// again at send time from that same allowlist only.
     custom_headers: Vec<(HeaderName, String)>,
     http_client: PluginHttpClient,
     sink_healthy: Arc<AtomicBool>,
@@ -430,7 +507,9 @@ pub struct AiTranscriptAudit {
     redactor: Arc<PiiRedactor>,
     batch_config: BatchConfig,
     flush_config: HttpFlushConfig,
-    logger: DeferredBatchingLogger<AuditRecord>,
+    logger: DeferredBatchingLogger<QueuedAuditRecord>,
+    byte_budget: Arc<ByteBudget>,
+    max_entry_bytes: usize,
     endpoint_hostname: String,
     namespace: String,
     staging: Arc<DashMap<String, AuditStaging>>,
@@ -443,6 +522,8 @@ pub struct AiTranscriptAudit {
     staging_ttl: Duration,
     /// Monotonic process-relative second at which another staging sweep may run.
     next_staging_sweep_at: AtomicU64,
+    /// Test-only counter of keyed HMAC body hashes computed on the request path.
+    keyed_request_hash_calls: AtomicU64,
 }
 
 impl AiTranscriptAudit {
@@ -590,23 +671,83 @@ impl AiTranscriptAudit {
             AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
         )?;
         let limits_obj = cfg_object(config, "limits", "limits")?.unwrap_or(&empty);
+        let max_request_bytes = cfg_bounded_usize(
+            limits_obj,
+            "max_request_bytes",
+            65536,
+            1,
+            HARD_MAX_CAPTURE_BYTES,
+            "limits",
+        )?;
+        let max_response_bytes = cfg_bounded_usize(
+            limits_obj,
+            "max_response_bytes",
+            65536,
+            1,
+            HARD_MAX_CAPTURE_BYTES,
+            "limits",
+        )?;
+        let max_stream_capture_bytes = cfg_bounded_usize(
+            limits_obj,
+            "max_stream_capture_bytes",
+            65536,
+            1,
+            HARD_MAX_CAPTURE_BYTES,
+            "limits",
+        )?;
+        let capture_aggregate = max_request_bytes
+            .saturating_add(max_response_bytes)
+            .saturating_add(max_stream_capture_bytes);
+        if capture_aggregate > HARD_MAX_CAPTURE_AGGREGATE_BYTES {
+            return Err(format!(
+                "ai_transcript_audit: sum of limits.max_request_bytes, \
+                 limits.max_response_bytes, and limits.max_stream_capture_bytes \
+                 must be <= {HARD_MAX_CAPTURE_AGGREGATE_BYTES}"
+            ));
+        }
         let limits = LimitsConfig {
-            max_request_bytes: cfg_positive_usize(
+            max_request_bytes,
+            max_response_bytes,
+            max_stream_capture_bytes,
+            max_model_chars: cfg_bounded_usize(
                 limits_obj,
-                "max_request_bytes",
-                65536,
+                "max_model_chars",
+                HARD_MAX_MODEL_CHARS,
+                1,
+                HARD_MAX_MODEL_CHARS,
                 "limits",
             )?,
-            max_response_bytes: cfg_positive_usize(
+            max_tool_count: cfg_bounded_usize(
                 limits_obj,
-                "max_response_bytes",
-                65536,
+                "max_tool_count",
+                HARD_MAX_TOOL_COUNT,
+                1,
+                HARD_MAX_TOOL_COUNT,
                 "limits",
             )?,
-            max_stream_capture_bytes: cfg_positive_usize(
+            max_tool_name_chars: cfg_bounded_usize(
                 limits_obj,
-                "max_stream_capture_bytes",
-                65536,
+                "max_tool_name_chars",
+                HARD_MAX_TOOL_NAME_CHARS,
+                1,
+                HARD_MAX_TOOL_NAME_CHARS,
+                "limits",
+            )?,
+            max_tool_names_bytes: cfg_bounded_usize(
+                limits_obj,
+                "max_tool_names_bytes",
+                HARD_MAX_TOOL_NAMES_BYTES,
+                1,
+                HARD_MAX_TOOL_NAMES_BYTES,
+                "limits",
+            )?,
+            hash_full_stream: cfg_bool(limits_obj, "hash_full_stream", false, "limits")?,
+            max_staging_reservation_secs: cfg_bounded_u64(
+                limits_obj,
+                "max_staging_reservation_secs",
+                HARD_MAX_STAGING_RESERVATION_SECS,
+                1,
+                HARD_MAX_STAGING_RESERVATION_SECS,
                 "limits",
             )?,
         };
@@ -670,6 +811,7 @@ impl AiTranscriptAudit {
             }
         }
         let custom_headers = parse_sink_headers(sink_obj)?;
+        let byte_limits = admit_byte_limits(sink_obj, "ai_transcript_audit")?;
         let batch_defaults = BatchConfigDefaults {
             batch_size_key: "batch_size",
             batch_size: 50,
@@ -712,6 +854,10 @@ impl AiTranscriptAudit {
             sink_healthy: Arc::clone(&sink_healthy),
         };
         let batch_config = build_batch_config(sink_obj, "ai_transcript_audit", batch_defaults)?;
+        let byte_budget = Arc::new(ByteBudget::new(
+            "ai_transcript_audit",
+            byte_limits.buffer_max_bytes,
+        ));
 
         let active = capture.request || capture.response || streaming != StreamingCapture::Off;
         let namespace = std::env::var("FERRUM_NAMESPACE")
@@ -731,6 +877,8 @@ impl AiTranscriptAudit {
             batch_config,
             flush_config,
             logger: DeferredBatchingLogger::new(),
+            byte_budget,
+            max_entry_bytes: byte_limits.max_entry_bytes,
             endpoint_hostname,
             namespace,
             staging: Arc::new(DashMap::with_shard_amount(shard_amount)),
@@ -739,9 +887,89 @@ impl AiTranscriptAudit {
             rate_limiter: Arc::new(RecordsPerMinute::new(sampling.max_records_per_minute)),
             sink_healthy,
             active,
-            staging_ttl: Duration::from_secs(60 * 60),
+            staging_ttl: Duration::from_secs(limits.max_staging_reservation_secs),
             next_staging_sweep_at: AtomicU64::new(0),
+            keyed_request_hash_calls: AtomicU64::new(0),
         })
+    }
+
+    /// Effective capture, metadata, and sink byte limits after admission.
+    pub fn admitted_limits(&self) -> AdmittedCaptureLimits {
+        AdmittedCaptureLimits {
+            max_request_bytes: self.limits.max_request_bytes,
+            max_response_bytes: self.limits.max_response_bytes,
+            max_stream_capture_bytes: self.limits.max_stream_capture_bytes,
+            max_model_chars: self.limits.max_model_chars,
+            max_tool_count: self.limits.max_tool_count,
+            max_tool_name_chars: self.limits.max_tool_name_chars,
+            max_tool_names_bytes: self.limits.max_tool_names_bytes,
+            hash_full_stream: self.limits.hash_full_stream,
+            max_staging_reservation_secs: self.limits.max_staging_reservation_secs,
+            max_entry_bytes: self.max_entry_bytes,
+            buffer_max_bytes: self.byte_budget.max_bytes(),
+        }
+    }
+
+    pub fn byte_budget_used_for_test(&self) -> usize {
+        self.byte_budget.used()
+    }
+
+    pub fn byte_budget_drops_for_test(&self) -> u64 {
+        self.byte_budget.drops_total()
+    }
+
+    pub fn keyed_request_hash_calls_for_test(&self) -> u64 {
+        self.keyed_request_hash_calls.load(Ordering::Relaxed)
+    }
+
+    pub fn staging_len_for_test(&self) -> usize {
+        self.staging.len()
+    }
+
+    pub fn sink_healthy_for_test(&self) -> bool {
+        self.sink_healthy.load(Ordering::Relaxed)
+    }
+
+    pub fn set_sink_healthy_for_test(&self, healthy: bool) {
+        self.sink_healthy.store(healthy, Ordering::Relaxed);
+    }
+
+    pub fn force_sweep_staging_for_test(&self) {
+        let now = Instant::now();
+        let ttl = self.staging_ttl;
+        let expired: Vec<String> = self
+            .staging
+            .iter()
+            .filter_map(|entry| {
+                if now.duration_since(entry.captured_at) >= ttl {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for record_id in expired {
+            self.staging.remove(&record_id);
+            self.pending_streams.remove(&record_id);
+        }
+    }
+
+    pub fn mark_stream_active_for_test(&self, record_id: &str) {
+        if let Some(mut staging) = self.staging.get_mut(record_id) {
+            staging.stream_active = true;
+        }
+    }
+
+    pub fn set_staging_captured_at_for_test(&self, record_id: &str, captured_at: Instant) {
+        if let Some(mut staging) = self.staging.get_mut(record_id) {
+            staging.captured_at = captured_at;
+        }
+    }
+
+    pub fn hold_byte_budget_for_test(&self, bytes: usize) -> Option<AuditByteLeaseGuardForTest> {
+        self.byte_budget
+            .try_acquire(bytes)
+            .map(|lease| AuditByteLeaseGuardForTest { _lease: lease })
     }
 
     /// (emit?, reason) — guardrail/error overrides beat the sampling roll.
@@ -766,11 +994,22 @@ impl AiTranscriptAudit {
         if !self.rate_limiter.try_acquire() {
             return SinkOutcome::Dropped;
         }
+        let Some(queued) = serialize_audit_under_byte_budget(
+            &self.byte_budget,
+            self.max_entry_bytes,
+            &record,
+        ) else {
+            return if self.on_buffer_full == BufferFullPolicy::Reject {
+                SinkOutcome::Rejected
+            } else {
+                SinkOutcome::Dropped
+            };
+        };
         if let Some(permit) = staging.and_then(|staging| staging.commit_permit.take()) {
-            permit.send(record);
+            permit.send(queued);
             return SinkOutcome::Queued;
         }
-        if self.logger.try_send(record) {
+        if self.logger.try_send(queued) {
             SinkOutcome::Queued
         } else if self.on_buffer_full == BufferFullPolicy::Reject {
             SinkOutcome::Rejected
@@ -897,10 +1136,23 @@ impl AiTranscriptAudit {
         }
         let now = Instant::now();
         let ttl = self.staging_ttl;
-        self.staging.retain(|_, staging| {
-            (staging.stream_active && staging.commit_permit.is_some())
-                || now.duration_since(staging.captured_at) < ttl
-        });
+        let expired: Vec<String> = self
+            .staging
+            .iter()
+            .filter_map(|entry| {
+                // Active streams with reserved permits still age out: abandoned
+                // or never-ending streams must not pin staging/queue capacity.
+                if now.duration_since(entry.captured_at) >= ttl {
+                    Some(entry.key().clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for record_id in expired {
+            self.staging.remove(&record_id);
+            self.pending_streams.remove(&record_id);
+        }
     }
 
     fn discard_staged_candidate(&self, ctx: &mut RequestContext) {
@@ -970,7 +1222,8 @@ impl AiTranscriptAudit {
         // placeholders): a plain SHA-256 of a mostly-predictable body (a fixed
         // chat JSON wrapper around one secret) would be an offline brute-force
         // oracle for the secret in every mode, including hash_only.
-        let request_hash = self.redactor.keyed_hash_hex(body);
+        let request_content_digest = content_digest(body);
+        let request_hash = self.keyed_request_hash(body);
 
         ctx.metadata
             .insert(MD_RECORD_ID.to_string(), record_id.clone());
@@ -1008,11 +1261,24 @@ impl AiTranscriptAudit {
         // guardrails (2925–2978, which run after this plugin's staging at 2740)
         // have already published their metadata. Non-AI JSON POSTs are never
         // staged, so they stay on the native-H3 path.
-        let request_model = parsed.as_ref().and_then(extract_model);
-        let tool_names = if self.capture.tool_calls {
-            parsed.as_ref().map(extract_tool_names).unwrap_or_default()
+        let (request_model, model_truncated) = parsed
+            .as_ref()
+            .map(|json| admit_model(json, self.limits.max_model_chars))
+            .unwrap_or((None, false));
+        let (tool_names, tool_names_truncated) = if self.capture.tool_calls {
+            parsed
+                .as_ref()
+                .map(|json| {
+                    admit_tool_names(
+                        json,
+                        self.limits.max_tool_count,
+                        self.limits.max_tool_name_chars,
+                        self.limits.max_tool_names_bytes,
+                    )
+                })
+                .unwrap_or_default()
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
         let (request_excerpt, request_truncated) = if self.capture.request {
             self.shape_body(body, self.limits.max_request_bytes)
@@ -1029,8 +1295,11 @@ impl AiTranscriptAudit {
                 request_excerpt,
                 request_truncated,
                 request_hash: Some(request_hash),
+                request_content_digest,
                 request_model,
+                model_truncated,
                 tool_names,
+                tool_names_truncated,
                 commit_permit: None,
                 stream_active: false,
             },
@@ -1038,10 +1307,17 @@ impl AiTranscriptAudit {
         PluginResult::Continue
     }
 
+    fn keyed_request_hash(&self, body: &[u8]) -> String {
+        self.keyed_request_hash_calls
+            .fetch_add(1, Ordering::Relaxed);
+        self.redactor.keyed_hash_hex(body)
+    }
+
     /// Refresh an already-staged candidate with the FINAL backend-visible
     /// request body (request transforms run after `before_proxy`, where the
     /// candidate was staged). No-op when the body is unchanged, so the common
-    /// no-transform path costs one keyed-hash pass.
+    /// no-transform path costs one keyed-hash pass at staging plus a cheap
+    /// content-digest compare here.
     fn refresh_staged_request(&self, ctx: &mut RequestContext, body: &[u8]) {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
@@ -1051,15 +1327,19 @@ impl AiTranscriptAudit {
             self.discard_staged_candidate(ctx);
             return;
         }
-        let request_hash = self.redactor.keyed_hash_hex(body);
+        let digest = content_digest(body);
         if self
             .staging
             .get(&record_id)
-            .and_then(|staging| staging.request_hash.clone())
-            .is_some_and(|existing| existing == request_hash)
+            .is_some_and(|staging| staging.request_content_digest == digest)
         {
+            // Body bytes are identical to staging; only refresh the stream
+            // marker from the already-validated JSON shape when needed. The
+            // stream flag cannot change without changing bytes, so leave
+            // metadata as-is and skip the second keyed HMAC.
             return;
         }
+        let request_hash = self.keyed_request_hash(body);
         if let Some(mut staged) = self.staging.get_mut(&record_id) {
             let (request_excerpt, request_truncated) = if self.capture.request {
                 self.shape_body(body, self.limits.max_request_bytes)
@@ -1069,9 +1349,27 @@ impl AiTranscriptAudit {
             staged.request_excerpt = request_excerpt;
             staged.request_truncated = request_truncated;
             staged.request_hash = Some(request_hash.clone());
-            staged.request_model = parsed.as_ref().and_then(extract_model);
+            staged.request_content_digest = digest;
+            let (request_model, model_truncated) = parsed
+                .as_ref()
+                .map(|json| admit_model(json, self.limits.max_model_chars))
+                .unwrap_or((None, false));
+            staged.request_model = request_model;
+            staged.model_truncated = model_truncated;
             if self.capture.tool_calls {
-                staged.tool_names = parsed.as_ref().map(extract_tool_names).unwrap_or_default();
+                let (tool_names, tool_names_truncated) = parsed
+                    .as_ref()
+                    .map(|json| {
+                        admit_tool_names(
+                            json,
+                            self.limits.max_tool_count,
+                            self.limits.max_tool_name_chars,
+                            self.limits.max_tool_names_bytes,
+                        )
+                    })
+                    .unwrap_or_default();
+                staged.tool_names = tool_names;
+                staged.tool_names_truncated = tool_names_truncated;
             }
         }
         // Re-detect `stream` on the FINAL backend-visible body: a
@@ -1251,6 +1549,8 @@ impl AiTranscriptAudit {
         response_excerpt: Option<String>,
         response_truncated: bool,
         response_hash: Option<String>,
+        response_hash_complete: Option<bool>,
+        response_hashed_bytes: Option<u64>,
         sampled: bool,
         reason: &'static str,
         response_headers: Option<&HashMap<String, String>>,
@@ -1266,6 +1566,8 @@ impl AiTranscriptAudit {
         let request_truncated = staging.map(|s| s.request_truncated).unwrap_or(false);
         let request_hash = staging.and_then(|s| s.request_hash.clone());
         let req_model = staging.and_then(|s| s.request_model.clone());
+        let model_truncated = staging.map(|s| s.model_truncated).unwrap_or(false);
+        let tool_names_truncated = staging.map(|s| s.tool_names_truncated).unwrap_or(false);
         // `model` and `tool_names` are copied straight out of the user request
         // body, so they bypass the body-excerpt redaction path. Run them through
         // the same redactor before export in every mode except the explicit
@@ -1326,8 +1628,12 @@ impl AiTranscriptAudit {
             capture_reason: reason,
             request_hash,
             response_hash,
+            response_hash_complete,
+            response_hashed_bytes,
             request_body_truncated: request_truncated,
             response_body_truncated: response_truncated,
+            model_truncated,
+            tool_names_truncated,
             request_body: request_excerpt,
             response_body: response_excerpt,
             tokens: harvest.tokens,
@@ -1414,7 +1720,7 @@ impl Plugin for AiTranscriptAudit {
         let flush_config = self.flush_config.clone();
         let healthy = Arc::clone(&self.sink_healthy);
         let hooks = LoggerHooks {
-            on_failed_batch: Some(Arc::new(move |_batch: Vec<AuditRecord>, _error: String| {
+            on_failed_batch: Some(Arc::new(move |_batch: Vec<QueuedAuditRecord>, _error: String| {
                 healthy.store(false, Ordering::Relaxed);
             })),
             ..LoggerHooks::default()
@@ -1809,6 +2115,10 @@ impl Plugin for AiTranscriptAudit {
             response_excerpt,
             response_truncated,
             response_hash,
+            response_hash.as_ref().map(|_| true),
+            response_hash
+                .as_ref()
+                .map(|_| body.len() as u64),
             sample_hit,
             reason,
             Some(response_headers),
@@ -1911,11 +2221,15 @@ impl Plugin for AiTranscriptAudit {
             record_id,
             slot,
             pending_streams: Arc::clone(&self.pending_streams),
+            staging: Arc::clone(&self.staging),
             hasher: self.redactor.keyed_hasher(),
             redactor: Arc::clone(&self.redactor),
             mode: self.mode,
             max_bytes: self.limits.max_stream_capture_bytes,
+            hash_full_stream: self.limits.hash_full_stream,
             accumulated: Vec::new(),
+            hashed_bytes: 0,
+            hashing: true,
             truncated: false,
             registered: false,
         }))
@@ -1951,16 +2265,18 @@ impl Plugin for AiTranscriptAudit {
             .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
         let errored = response_status >= 400 || !outcome.body_completed;
         let guardrail = guardrail_fired(&ctx.metadata) || downstream_terminated;
-        let (excerpt, truncated, hash) = if downstream_terminated {
-            (None, true, None)
+        let (excerpt, truncated, hash, hash_complete, hashed_bytes) = if downstream_terminated {
+            (None, true, None, None, None)
         } else {
             match captured {
                 Some(captured) => (
                     captured.response_excerpt,
                     captured.response_truncated,
                     Some(captured.response_hash),
+                    Some(captured.response_hash_complete),
+                    Some(captured.response_hashed_bytes),
                 ),
-                None => (None, true, None), // abnormal end: on_end never ran
+                None => (None, true, None, None, None), // abnormal end: on_end never ran
             }
         };
         if let Some(response_hash) = hash.as_ref() {
@@ -1989,6 +2305,8 @@ impl Plugin for AiTranscriptAudit {
             excerpt,
             truncated,
             hash,
+            hash_complete,
+            hashed_bytes,
             sample_hit,
             reason,
             None,
@@ -2043,6 +2361,8 @@ impl Plugin for AiTranscriptAudit {
             None,
             false,
             None,
+            None,
+            None,
             sample_hit,
             reason,
             None,
@@ -2052,17 +2372,22 @@ impl Plugin for AiTranscriptAudit {
 }
 
 /// Tees streaming (SSE) response bytes into a bounded accumulator while
-/// forwarding every chunk unchanged, and hashes the full stream incrementally
-/// with the redactor's keyed HMAC (same key as the buffered body hashes).
+/// forwarding every chunk unchanged. Keyed HMAC covers the full stream only
+/// when `hash_full_stream` is set; otherwise hashing stops with the capture cap
+/// and the digest is domain-separated as partial.
 struct AuditStreamInspector {
     record_id: String,
     slot: Arc<StreamSlot>,
     pending_streams: Arc<DashMap<String, Arc<StreamSlot>>>,
+    staging: Arc<DashMap<String, AuditStaging>>,
     redactor: Arc<PiiRedactor>,
     mode: AuditMode,
     max_bytes: usize,
+    hash_full_stream: bool,
     accumulated: Vec<u8>,
     hasher: KeyedBodyHasher,
+    hashed_bytes: u64,
+    hashing: bool,
     truncated: bool,
     registered: bool,
 }
@@ -2075,13 +2400,44 @@ impl AuditStreamInspector {
             self.registered = true;
         }
     }
+
+    fn clear_stream_active(&self) {
+        if let Some(mut staging) = self.staging.get_mut(&self.record_id) {
+            staging.stream_active = false;
+        }
+    }
+}
+
+impl Drop for AuditStreamInspector {
+    fn drop(&mut self) {
+        // Cancellation / task drop must not leave stream_active pinned forever.
+        // Terminal hooks also clear this; clearing twice is harmless.
+        self.clear_stream_active();
+    }
 }
 
 #[async_trait]
 impl ResponseStreamInspector for AuditStreamInspector {
     async fn on_chunk(&mut self, chunk: &[u8]) -> ResponseStreamAction {
         self.ensure_registered();
-        self.hasher.update(chunk);
+        if self.hashing {
+            if self.hash_full_stream {
+                self.hasher.update(chunk);
+                self.hashed_bytes = self.hashed_bytes.saturating_add(chunk.len() as u64);
+            } else {
+                let remaining = self
+                    .max_bytes
+                    .saturating_sub(self.hashed_bytes as usize);
+                if remaining > 0 {
+                    let take = remaining.min(chunk.len());
+                    self.hasher.update(&chunk[..take]);
+                    self.hashed_bytes = self.hashed_bytes.saturating_add(take as u64);
+                }
+                if self.hashed_bytes as usize >= self.max_bytes {
+                    self.hashing = false;
+                }
+            }
+        }
         if self.accumulated.len() < self.max_bytes {
             let remaining = self.max_bytes - self.accumulated.len();
             let take = remaining.min(chunk.len());
@@ -2098,8 +2454,13 @@ impl ResponseStreamInspector for AuditStreamInspector {
 
     async fn on_end(&mut self) -> ResponseStreamAction {
         self.ensure_registered();
-        let response_hash =
-            std::mem::replace(&mut self.hasher, self.redactor.keyed_hasher()).finalize_hex();
+        let hash_complete = self.hash_full_stream || !self.truncated;
+        let mut hasher = std::mem::replace(&mut self.hasher, self.redactor.keyed_hasher());
+        if !hash_complete {
+            hasher.update(PARTIAL_STREAM_HASH_DOMAIN);
+            hasher.update(&self.hashed_bytes.to_be_bytes());
+        }
+        let response_hash = hasher.finalize_hex();
         // A cap-truncated redacted stream can cut through an unbounded secret or
         // a custom pattern, leaving only a raw prefix that no regex can match.
         // Omit the excerpt rather than exporting a boundary fragment. Full-body
@@ -2114,6 +2475,8 @@ impl ResponseStreamInspector for AuditStreamInspector {
                 response_excerpt,
                 response_truncated: self.truncated,
                 response_hash,
+                response_hash_complete: hash_complete,
+                response_hashed_bytes: self.hashed_bytes,
             });
         }
         ResponseStreamAction::Forward(Bytes::new())
@@ -2132,42 +2495,143 @@ impl ResponseStreamInspector for AuditStreamInspector {
 
 // ---- sink ----
 
-async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<(), String> {
+async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<QueuedAuditRecord>) -> Result<(), String> {
     let entry_count = batch.len();
-    let mut request = cfg.http_client.get().post(&cfg.endpoint_url).json(&batch);
+    let body = assemble_audit_json_array(&batch);
+    let mut request = cfg
+        .http_client
+        .get()
+        .post(&cfg.endpoint_url)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(body);
     for (name, template) in &cfg.custom_headers {
-        let value = expand_env_vars(template);
+        let value = expand_audit_secret_refs(template)?;
         match HeaderValue::from_str(&value) {
             Ok(header_value) => request = request.header(name.clone(), header_value),
-            Err(_) => warn!(
-                header = %name,
-                "ai_transcript_audit: dropping custom header with an invalid value after env expansion"
-            ),
+            Err(_) => {
+                // Never log the expanded value — it may contain a sink token.
+                warn!(
+                    header = %name,
+                    "ai_transcript_audit: dropping custom header with an invalid value after secret expansion"
+                );
+            }
         }
     }
     let response = cfg
         .http_client
         .execute(request, "ai_transcript_audit")
         .await;
-    // Sink health is derived from the raw collector response, NOT from the
-    // shared `handle_http_batch_response` result: that helper treats a
-    // non-retryable non-2xx (401/403/413, e.g. an expired ${AUDIT_TOKEN}) as a
-    // discarded-but-Ok batch so the other logging sinks do not retry it, but
-    // for this plugin every record in that batch was silently lost — under
-    // `on_sink_error: reject` the sink must go unhealthy so audited traffic
-    // stops flowing unaudited. Recovery keeps the existing probe model: the
-    // next successful batch send flips `sink_healthy` back to true.
+    // Health tracks the full delivery contract: HTTP status AND a successful
+    // bounded acknowledgement-body drain. A 2xx whose body times out, overflows,
+    // or resets is a failed batch (retried) and must not advertise a healthy
+    // sink to fail-closed admission. Non-retryable 4xx also mark unhealthy so
+    // silently discarded batches stop audited traffic. Recovery: the next fully
+    // successful batch flips health back to true (rejected traffic still enqueues
+    // recovery probes).
     match response {
         Ok(resp) => {
-            cfg.sink_healthy
-                .store(resp.status().is_success(), Ordering::Relaxed);
-            handle_http_batch_response("ai_transcript_audit", entry_count, Ok(resp)).await
+            let status = resp.status();
+            let drain = drain_http_batch_response_body(resp).await;
+            let delivered =
+                status.is_success() && matches!(drain, HttpBatchDrainOutcome::Complete(_));
+            cfg.sink_healthy.store(delivered, Ordering::Relaxed);
+            classify_audit_batch_response(entry_count, status, drain)
         }
         Err(err) => {
             cfg.sink_healthy.store(false, Ordering::Relaxed);
-            handle_http_batch_response("ai_transcript_audit", entry_count, Err(err)).await
+            Err(format!("ai_transcript_audit batch failed: {err}"))
         }
     }
+}
+
+fn classify_audit_batch_response(
+    entry_count: usize,
+    status: reqwest::StatusCode,
+    drain: HttpBatchDrainOutcome,
+) -> Result<(), String> {
+    if status.is_success() {
+        return match drain {
+            HttpBatchDrainOutcome::Complete(_) => Ok(()),
+            other => Err(format!(
+                "ai_transcript_audit batch failed: successful response acknowledgement incomplete ({})",
+                other.diagnostic()
+            )),
+        };
+    }
+
+    if status.is_client_error()
+        && status != reqwest::StatusCode::REQUEST_TIMEOUT
+        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        warn!(
+            "ai_transcript_audit batch discarded due to {} response ({} entries lost); {}",
+            status,
+            entry_count,
+            drain.diagnostic(),
+        );
+        return Ok(());
+    }
+
+    Err(format!(
+        "ai_transcript_audit batch failed with status {status}; {}",
+        drain.diagnostic()
+    ))
+}
+
+fn assemble_audit_json_array(batch: &[QueuedAuditRecord]) -> String {
+    let capacity = batch.iter().fold(2usize, |total, entry| {
+        total.saturating_add(entry.json.len().saturating_add(1))
+    });
+    let mut body = String::with_capacity(capacity);
+    body.push('[');
+    for (idx, entry) in batch.iter().enumerate() {
+        if idx > 0 {
+            body.push(',');
+        }
+        body.push_str(entry.json.as_ref());
+    }
+    body.push(']');
+    body
+}
+
+fn serialize_audit_under_byte_budget(
+    budget: &ByteBudget,
+    max_entry_bytes: usize,
+    record: &AuditRecord,
+) -> Option<QueuedAuditRecord> {
+    let lease = budget.try_acquire(accounted_summary_bytes(max_entry_bytes))?;
+    let mut writer = BoundedJsonWriter::new(max_entry_bytes);
+    if let Err(error) = serde_json::to_writer(&mut writer, record) {
+        if writer.limit_exceeded {
+            budget.record_drop("serialized entry exceeded max_entry_bytes");
+        } else {
+            warn!("ai_transcript_audit: failed to serialize audit record: {error}");
+            budget.record_drop("serialization failed");
+        }
+        return None;
+    }
+    let retained = writer.bytes.len();
+    if retained > max_entry_bytes {
+        budget.record_drop("serialized entry exceeded max_entry_bytes");
+        return None;
+    }
+    lease.shrink_to(accounted_summary_bytes(retained));
+    let json = match String::from_utf8(writer.bytes) {
+        Ok(line) => Arc::<str>::from(line),
+        Err(_) => {
+            budget.record_drop("serialized entry was not UTF-8");
+            return None;
+        }
+    };
+    Some(QueuedAuditRecord {
+        json,
+        _lease: lease,
+    })
+}
+
+/// Test-only lease handle so unit tests can saturate the retained-byte budget.
+pub struct AuditByteLeaseGuardForTest {
+    _lease: Arc<ByteLease>,
 }
 
 // ---- free helpers ----
@@ -2212,11 +2676,10 @@ fn reject_audit_unavailable() -> PluginResult {
 /// Shape a captured payload into an excerpt. Returns the shaped excerpt (or
 /// `None` for non-body modes) and whether it was truncated.
 ///
-/// Ordering matters for `redacted_body`: redaction runs over the FULL buffered
-/// payload first and the redacted text is capped afterwards, so a sensitive
-/// value straddling the `max_bytes` boundary can never leak as an unmatched
-/// raw prefix. (`full_body` deliberately captures raw excerpts, so it caps
-/// first and skips the extra scan.)
+/// For `redacted_body`, work is bounded by `max_bytes`: bodies larger than the
+/// export budget omit the excerpt rather than scanning/allocating the full
+/// payload (matching truncated stream semantics and avoiding boundary-fragment
+/// leaks). `full_body` truncates first by design.
 fn shape_bytes(
     mode: AuditMode,
     redactor: &PiiRedactor,
@@ -2226,18 +2689,20 @@ fn shape_bytes(
     if !mode.captures_body() {
         return (None, false);
     }
-    let mut truncated = raw.len() > max_bytes;
-    let shaped = if mode.redacts_body() {
-        redact_body_decoded_json_strings(redactor, raw)
-    } else {
-        String::from_utf8_lossy(&raw[..raw.len().min(max_bytes)]).into_owned()
-    };
-    let shaped = if shaped.len() > max_bytes {
-        truncated = true;
-        truncate_on_char_boundary(shaped, max_bytes)
-    } else {
-        shaped
-    };
+    let truncated = raw.len() > max_bytes;
+    if mode.redacts_body() {
+        if truncated {
+            return (None, true);
+        }
+        let shaped = redact_body_decoded_json_strings(redactor, raw);
+        let shaped = if shaped.len() > max_bytes {
+            truncate_on_char_boundary(shaped, max_bytes)
+        } else {
+            shaped
+        };
+        return (Some(shaped), false);
+    }
+    let shaped = String::from_utf8_lossy(&raw[..raw.len().min(max_bytes)]).into_owned();
     (Some(shaped), truncated)
 }
 
@@ -2719,6 +3184,17 @@ fn extract_model(json: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+fn admit_model(json: &Value, max_chars: usize) -> (Option<String>, bool) {
+    let Some(model) = extract_model(json) else {
+        return (None, false);
+    };
+    if model.chars().count() <= max_chars {
+        return (Some(model), false);
+    }
+    let truncated: String = model.chars().take(max_chars).collect();
+    (Some(truncated), true)
+}
+
 fn extract_tool_names(json: &Value) -> Vec<String> {
     let mut names = Vec::new();
     for key in ["tools", "functions"] {
@@ -2738,6 +3214,41 @@ fn extract_tool_names(json: &Value) -> Vec<String> {
     names.sort();
     names.dedup();
     names
+}
+
+fn admit_tool_names(
+    json: &Value,
+    max_count: usize,
+    max_name_chars: usize,
+    max_aggregate_bytes: usize,
+) -> (Vec<String>, bool) {
+    let raw = extract_tool_names(json);
+    let mut out = Vec::new();
+    let mut aggregate = 0usize;
+    let mut truncated = false;
+    for name in raw {
+        if out.len() >= max_count {
+            truncated = true;
+            break;
+        }
+        let mut admitted = name;
+        if admitted.chars().count() > max_name_chars {
+            admitted = admitted.chars().take(max_name_chars).collect();
+            truncated = true;
+        }
+        let next = aggregate.saturating_add(admitted.len());
+        if next > max_aggregate_bytes {
+            truncated = true;
+            break;
+        }
+        aggregate = next;
+        out.push(admitted);
+    }
+    (out, truncated)
+}
+
+fn content_digest(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
 }
 
 fn is_event_stream(content_type: &str) -> bool {
@@ -2770,12 +3281,15 @@ fn bool_str(value: bool) -> String {
     if value { "true" } else { "false" }.to_string()
 }
 
-/// Expand `${NAME}` occurrences from the process environment (unset/unknown ->
-/// empty). Malformed `${...}` is left literal. Applied lazily at send time so
-/// the resolved secret is never stored in config.
-fn expand_env_vars(template: &str) -> String {
+/// Expand `${NAME}` occurrences, but only for the audit-sink secret allowlist
+/// (`AUDIT_*` / `FERRUM_AUDIT_*`). Unknown names are rejected; unset allowlisted
+/// names fail closed so a missing token cannot become an empty Authorization
+/// header. Applied at send time so the resolved secret is never stored in
+/// config files; construction already verified each reference is allowlisted
+/// and present.
+fn expand_audit_secret_refs(template: &str) -> Result<String, String> {
     if !template.contains("${") {
-        return template.to_string();
+        return Ok(template.to_string());
     }
     let mut out = String::with_capacity(template.len());
     let mut rest = template;
@@ -2785,8 +3299,15 @@ fn expand_env_vars(template: &str) -> String {
         if let Some(end) = after.find('}') {
             let name = &after[..end];
             if is_valid_env_name(name) {
-                if let Ok(value) = std::env::var(name) {
-                    out.push_str(&value);
+                ensure_audit_secret_env_name(name)?;
+                match std::env::var(name) {
+                    Ok(value) => out.push_str(&value),
+                    Err(_) => {
+                        return Err(format!(
+                            "ai_transcript_audit: sink.custom_headers secret reference \
+                             '${{{name}}}' is unset"
+                        ));
+                    }
                 }
                 rest = &after[end + 1..];
                 continue;
@@ -2796,7 +3317,21 @@ fn expand_env_vars(template: &str) -> String {
         rest = after;
     }
     out.push_str(rest);
-    out
+    Ok(out)
+}
+
+fn ensure_audit_secret_env_name(name: &str) -> Result<(), String> {
+    if AUDIT_SECRET_ENV_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "ai_transcript_audit: sink.custom_headers may only expand \
+             ${{AUDIT_*}} or ${{FERRUM_AUDIT_*}} secret references (got '${{{name}}}')"
+        ))
+    }
 }
 
 fn is_valid_env_name(name: &str) -> bool {
@@ -2882,10 +3417,34 @@ fn parse_sink_headers(obj: &Value) -> Result<Vec<(HeaderName, String)>, String> 
         let name = HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
             format!("ai_transcript_audit: invalid sink.custom_headers name '{key}': {error}")
         })?;
+        validate_sink_header_secret_refs(value)?;
         out.retain(|(existing, _)| *existing != name);
         out.push((name, value.to_string()));
     }
     Ok(out)
+}
+
+fn validate_sink_header_secret_refs(template: &str) -> Result<(), String> {
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            // Unterminated placeholders are left literal at expansion time.
+            break;
+        };
+        let name = &after[..end];
+        if is_valid_env_name(name) {
+            ensure_audit_secret_env_name(name)?;
+            if std::env::var(name).is_err() {
+                return Err(format!(
+                    "ai_transcript_audit: sink.custom_headers secret reference \
+                     '${{{name}}}' is unset"
+                ));
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    Ok(())
 }
 
 fn cfg_object<'a>(config: &'a Value, key: &str, ctx: &str) -> Result<Option<&'a Value>, String> {
@@ -2934,19 +3493,53 @@ fn cfg_f64(obj: &Value, key: &str, default: f64, ctx: &str) -> Result<f64, Strin
     }
 }
 
-fn cfg_positive_usize(obj: &Value, key: &str, default: usize, ctx: &str) -> Result<usize, String> {
+fn cfg_bounded_usize(
+    obj: &Value,
+    key: &str,
+    default: usize,
+    minimum: usize,
+    maximum: usize,
+    ctx: &str,
+) -> Result<usize, String> {
     match obj.get(key) {
         None | Some(Value::Null) => Ok(default),
         Some(value) => {
             let number = value.as_u64().ok_or_else(|| {
                 format!("ai_transcript_audit: '{ctx}.{key}' must be a positive integer")
             })?;
-            if number == 0 {
+            let parsed = usize::try_from(number).map_err(|_| {
+                format!("ai_transcript_audit: '{ctx}.{key}' must be between {minimum} and {maximum}")
+            })?;
+            if parsed < minimum || parsed > maximum {
                 return Err(format!(
-                    "ai_transcript_audit: '{ctx}.{key}' must be greater than 0"
+                    "ai_transcript_audit: '{ctx}.{key}' must be between {minimum} and {maximum}"
                 ));
             }
-            Ok(usize::try_from(number).unwrap_or(usize::MAX))
+            Ok(parsed)
+        }
+    }
+}
+
+fn cfg_bounded_u64(
+    obj: &Value,
+    key: &str,
+    default: u64,
+    minimum: u64,
+    maximum: u64,
+    ctx: &str,
+) -> Result<u64, String> {
+    match obj.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => {
+            let number = value.as_u64().ok_or_else(|| {
+                format!("ai_transcript_audit: '{ctx}.{key}' must be a positive integer")
+            })?;
+            if number < minimum || number > maximum {
+                return Err(format!(
+                    "ai_transcript_audit: '{ctx}.{key}' must be between {minimum} and {maximum}"
+                ));
+            }
+            Ok(number)
         }
     }
 }
