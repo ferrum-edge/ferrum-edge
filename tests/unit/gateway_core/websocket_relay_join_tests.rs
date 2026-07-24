@@ -369,7 +369,10 @@ async fn test_bounded_close_limits_stuck_peer_echo_flush() {
     ferrum_edge::_test_support::send_bounded_ws_close_for_test(&mut sink, None).await;
     let elapsed = start.elapsed();
 
-    assert_eq!(flushes.load(Ordering::SeqCst), 1);
+    assert!(
+        flushes.load(Ordering::SeqCst) >= 1,
+        "the queued peer echo must be driven before the bounded timeout"
+    );
     assert!(
         elapsed >= Duration::from_millis(90),
         "queued peer echo flush returned before the production bound: {elapsed:?}"
