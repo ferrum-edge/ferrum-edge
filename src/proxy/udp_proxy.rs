@@ -188,6 +188,15 @@ impl UdpSession {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.take();
     }
+
+    /// Wake every session-owned stop waiter (backend reply task and optional
+    /// client-forward/plugin task). Uses `notify_waiters` so a single stop
+    /// event cannot leave a sibling task parked until unrelated traffic.
+    fn signal_stop_waiters(&self) {
+        self.stop_reply_task
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.stop_notify.notify_waiters();
+    }
 }
 
 /// UDP session map using ahash (AES-NI accelerated) for faster per-datagram lookups.
@@ -2311,15 +2320,18 @@ fn spawn_session_cleanup(
                             if let Some(ref dtls) = session.dtls_conn {
                                 let _ = dtls.close().await;
                             }
-                            // Signal plain-UDP backend reply tasks to stop even
-                            // when no backend datagram arrives to wake recv().
-                            session
-                                .stop_reply_task
-                                .store(true, std::sync::atomic::Ordering::Release);
-                            // `notify_one` stores a permit so a stop that races
-                            // between the reply task's flag check and its
-                            // `notified()` registration cannot be lost.
-                            session.stop_notify.notify_one();
+                            // Signal every session-owned waiter (backend reply
+                            // task and optional client-forward/plugin task) to
+                            // stop even when no backend or forward-channel
+                            // traffic arrives to wake them.
+                            // `signal_stop_waiters` broadcasts via
+                            // `notify_waiters` (no stored permit): each waiter
+                            // constructs `notified()` (and `enable`s) before
+                            // loading the flag so a stop that races after
+                            // registration is observed, while a stop that
+                            // races before registration is caught by the
+                            // subsequent Acquire load.
+                            session.signal_stop_waiters();
                             let bs = session.bytes_sent.load(Ordering::Relaxed);
                             let br = session.bytes_received.load(Ordering::Relaxed);
                             session.release_overload_guard();
@@ -3715,10 +3727,14 @@ async fn create_session(
         let forward_stop = Arc::clone(&session.stop_notify);
         tokio::spawn(async move {
             loop {
-                // Register stop waiters before checking the flag so store→notify
-                // cannot be lost between the load and select registration.
+                // Register for `notify_waiters` before loading the flag so a
+                // cleanup broadcast cannot be lost between the check and
+                // select. Creation alone registers for `notify_waiters`;
+                // `enable` matches the repo's register-before-check pattern
+                // and surfaces a broadcast that already fired.
                 let stop = forward_stop.notified();
                 tokio::pin!(stop);
+                stop.as_mut().enable();
                 if forward_session
                     .stop_reply_task
                     .load(std::sync::atomic::Ordering::Acquire)
@@ -3824,11 +3840,14 @@ async fn create_session(
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
         loop {
-            // Create the stop waiter *before* loading the flag so a
-            // store→notify_one that races between the check and select
-            // registration still delivers a permit to this future.
+            // Register for the cleanup `notify_waiters` broadcast *before*
+            // loading the flag. `notify_waiters` stores no permit: creation
+            // registers this future, `enable` observes a broadcast that
+            // already fired, and a stop that raced before registration is
+            // caught by the Acquire load below.
             let stop = reply_stop_notify.notified();
             tokio::pin!(stop);
+            stop.as_mut().enable();
             if reply_session
                 .stop_reply_task
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -4165,6 +4184,10 @@ async fn create_session(
                                 reply_session
                                     .expired
                                     .store(true, std::sync::atomic::Ordering::Release);
+                                // Wake the optional client-forward task; setting
+                                // `expired` alone leaves it parked on the
+                                // forward channel until unrelated traffic.
+                                reply_session.signal_stop_waiters();
                                 if reply_sessions
                                     .remove_if(&client_addr, |_, v| Arc::ptr_eq(v, &reply_session))
                                     .is_some()
@@ -4338,6 +4361,11 @@ async fn create_session(
         reply_session
             .expired
             .store(true, std::sync::atomic::Ordering::Release);
+        // Wake the optional client-forward/plugin task as well as any other
+        // session-owned stop waiter. Idle cleanup does the same broadcast;
+        // reply-task exit must not leave the forward task parked on an empty
+        // channel after this Arc is the only remaining session owner.
+        reply_session.signal_stop_waiters();
         // Only decrement active_sessions if we actually removed THIS session
         // (the cleanup task may have already removed and decremented it, or a
         // newer session may have been re-created at the same client address —
@@ -6008,11 +6036,11 @@ listen_port: 5300
         assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
     }
 
-    /// #2958 — store + notify_one must wake a reply-style waiter even when the
-    /// notify lands in the window between the stop-flag check and select
-    /// registration of a fresh `notified()` future (the classic lost-wakeup).
+    /// #2958 — store + `notify_waiters` must wake a reply-style waiter even
+    /// when the broadcast lands after `notified()` registration / `enable`
+    /// and before the flag load is re-checked (no permit is stored).
     #[tokio::test(start_paused = true)]
-    async fn reply_stop_notify_one_is_observed_without_backend_traffic() {
+    async fn reply_stop_notify_waiters_is_observed_without_backend_traffic() {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_notify = Arc::new(tokio::sync::Notify::new());
         let stop_notify_task = Arc::clone(&stop_notify);
@@ -6022,11 +6050,13 @@ listen_port: 5300
             loop {
                 let notified = stop_notify_task.notified();
                 tokio::pin!(notified);
+                notified.as_mut().enable();
                 if stop_flag_task.load(Ordering::Acquire) {
                     return;
                 }
-                // Park until notified (no backend recv). With notify_one the
-                // permit stored before this future is polled still wakes us.
+                // Park until broadcast (no backend recv). Registration before
+                // the flag load closes the lost-wakeup window for
+                // `notify_waiters`, which does not stash a permit.
                 notified.await;
                 if stop_flag_task.load(Ordering::Acquire) {
                     return;
@@ -6038,12 +6068,95 @@ listen_port: 5300
         tokio::task::yield_now().await;
 
         stop_flag.store(true, Ordering::Release);
-        stop_notify.notify_one();
+        stop_notify.notify_waiters();
 
         tokio::time::timeout(Duration::from_secs(1), waiter)
             .await
             .expect("stop signal must be observed without backend traffic")
             .expect("waiter task");
+    }
+
+    /// #2958 / #2956 — one cleanup stop must wake *both* session-owned
+    /// waiters (reply-style backend recv and forward-style channel recv).
+    /// `notify_one` stores a single permit and wakes at most one waiter; the
+    /// sibling would remain parked until unrelated traffic arrived.
+    /// `notify_waiters` broadcasts to every future that has already called
+    /// `notified()`. A stop that races before registration remains safe
+    /// because each loop loads the atomic after constructing / enabling its
+    /// `Notified` future.
+    #[tokio::test(start_paused = true)]
+    async fn session_stop_broadcast_wakes_reply_and_forward_waiters() {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_notify = Arc::new(tokio::sync::Notify::new());
+        let parked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let spawn_style = |label: &'static str,
+                           flag: Arc<AtomicBool>,
+                           notify: Arc<tokio::sync::Notify>,
+                           parked: Arc<std::sync::atomic::AtomicUsize>| {
+            tokio::spawn(async move {
+                loop {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if flag.load(Ordering::Acquire) {
+                        return label;
+                    }
+                    // Publish registration only after enable so the test's
+                    // stop broadcast cannot race before this waiter is on the
+                    // notify_waiters list.
+                    parked.fetch_add(1, Ordering::Release);
+                    // No backend / forward-channel traffic — only the stop
+                    // broadcast may wake us.
+                    notified.await;
+                    if flag.load(Ordering::Acquire) {
+                        return label;
+                    }
+                }
+            })
+        };
+
+        let reply = spawn_style(
+            "reply",
+            Arc::clone(&stop_flag),
+            Arc::clone(&stop_notify),
+            Arc::clone(&parked),
+        );
+        let forward = spawn_style(
+            "forward",
+            Arc::clone(&stop_flag),
+            Arc::clone(&stop_notify),
+            Arc::clone(&parked),
+        );
+
+        // Deterministically wait until both session-owned waiters have
+        // registered, then fire a single cleanup-style stop event.
+        for _ in 0..32 {
+            if parked.load(Ordering::Acquire) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            parked.load(Ordering::Acquire),
+            2,
+            "both reply- and forward-style waiters must register before stop"
+        );
+
+        stop_flag.store(true, Ordering::Release);
+        // One cleanup event — must wake every registered session waiter.
+        stop_notify.notify_waiters();
+
+        let reply_label = tokio::time::timeout(Duration::from_secs(1), reply)
+            .await
+            .expect("reply-style waiter must exit after one cleanup broadcast")
+            .expect("reply task");
+        let forward_label = tokio::time::timeout(Duration::from_secs(1), forward)
+            .await
+            .expect("forward-style waiter must exit after one cleanup broadcast")
+            .expect("forward task");
+        assert_eq!(reply_label, "reply");
+        assert_eq!(forward_label, "forward");
     }
 
     /// #2956 — per-session forward channel keeps a slow datagram hook for
