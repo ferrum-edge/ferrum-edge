@@ -125,24 +125,11 @@ impl DeliverySlot {
     pub fn initialize(&self, pool_shard_override: usize) {
         self.pool_shard_override
             .store(pool_shard_override, Ordering::Release);
-        if self.current.load().state() == GENERATION_OPEN {
-            return;
-        }
-        self.begin_new_cycle();
-    }
-
-    /// Install a fresh generation, retrying if a concurrent caller wins.
-    ///
-    /// The swap is a compare-and-swap against the exact generation this caller
-    /// observed, so two concurrent cycles cannot both replace it and drop one
-    /// of the installed generations on the floor.
-    fn begin_new_cycle(&self) -> u64 {
-        loop {
-            let current = self.current.load_full();
-            if let Some(generation) = self.try_install_generation(&current) {
-                return generation;
-            }
-        }
+        // Reuse the same state-aware CAS loop as serving-cycle admission.
+        // Re-checking after every failed CAS is essential: another caller may
+        // have installed an open generation after we first observed a drained
+        // one, and replacing that generation would orphan its live workers.
+        self.begin_cycle();
     }
 
     /// Swap a fresh generation in for `observed`, or fail if it already moved.
