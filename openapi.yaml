@@ -724,6 +724,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsCertificate
       summary: Delete an unreferenced admin-managed TLS certificate
@@ -836,6 +838,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsCaBundle
       summary: Delete an unreferenced admin-managed TLS CA bundle
@@ -948,6 +952,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsCrl
       summary: Delete an unreferenced admin-managed TLS CRL bundle
@@ -1060,6 +1066,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsOcspResponse
       summary: Delete an unreferenced admin-managed OCSP response
@@ -1172,6 +1180,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsJwks
       summary: Delete an unreferenced admin-managed JWKS document
@@ -5824,7 +5834,11 @@ components:
       properties:
         id:
           type: string
-          description: Optional stable id. Generated when omitted on create.
+          description: >
+            Optional stable id. Generated when omitted on create. Managed TLS
+            ids are globally unique across certificates, CA bundles, CRLs, OCSP
+            responses, and JWKS records; create-with-overwrite cannot change an
+            existing record's material kind.
         name:
           type: string
         description:
@@ -5841,6 +5855,9 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            When true, replace an existing record with the same id and the same
+            material kind. Cross-kind collisions return 409 Conflict.
         allow_expired:
           type: boolean
           default: false
@@ -5855,6 +5872,9 @@ components:
       properties:
         id:
           type: string
+          description: >
+            Optional stable id. Generated when omitted on create. Ids are
+            globally unique across all managed TLS material kinds.
         name:
           type: string
         description:
@@ -5864,6 +5884,9 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            When true, replace an existing same-kind record. Cross-kind
+            collisions return 409 Conflict.
         allow_expired:
           type: boolean
           default: false
@@ -5878,6 +5901,9 @@ components:
       properties:
         id:
           type: string
+          description: >
+            Optional stable id. Generated when omitted on create. Ids are
+            globally unique across all managed TLS material kinds.
         name:
           type: string
         description:
@@ -5887,6 +5913,9 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            When true, replace an existing same-kind record. Cross-kind
+            collisions return 409 Conflict.
 
     ManagedTlsOcspResponseRequest:
       type: object
@@ -5894,6 +5923,9 @@ components:
       properties:
         id:
           type: string
+          description: >
+            Optional stable id. Generated when omitted on create. Ids are
+            globally unique across all managed TLS material kinds.
         name:
           type: string
         description:
@@ -5904,6 +5936,9 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            When true, replace an existing same-kind record. Cross-kind
+            collisions return 409 Conflict.
 
     ManagedTlsJwksRequest:
       type: object
@@ -5911,6 +5946,9 @@ components:
       properties:
         id:
           type: string
+          description: >
+            Optional stable id. Generated when omitted on create. Ids are
+            globally unique across all managed TLS material kinds.
         name:
           type: string
         description:
@@ -5921,6 +5959,9 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            When true, replace an existing same-kind record. Cross-kind
+            collisions return 409 Conflict.
 
     TlsInventoryListResponse:
       type: object

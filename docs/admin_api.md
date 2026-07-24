@@ -254,7 +254,9 @@ Managed certificates, CA bundles, OCSP responses, CRLs, and JWKS documents are a
 
 `GET/POST /admin/tls/jwks`, `GET/PUT/DELETE /admin/tls/jwks/{id}`
 
-Responses return non-secret metadata only: source URI, subject, issuer, SANs, validity, public-material fingerprint, counts, and timestamps. Private keys are persisted in the managed store but never returned. Configure the store directory with `FERRUM_TLS_MANAGED_STORE_PATH`; on Unix, the JSON store files are written with owner-only permissions.
+Record ids are **globally unique across all managed material kinds** in one store (`managed-tls.json`). Create-with-overwrite and typed `PUT` updates may replace same-kind material (for rotation) but return `409 Conflict` when the id already belongs to a different kind. `DELETE` still returns `409 Conflict` when the current runtime/config inventory references the record; same-kind rotation does not require clearing those references first.
+
+Responses return non-secret metadata only: source URI, subject, issuer, SANs, validity, public-material fingerprint, counts, and timestamps. Private keys are persisted in the managed store but never returned. Configure the store directory with `FERRUM_TLS_MANAGED_STORE_PATH`; on Unix, the JSON store files are written with owner-only permissions. Mutations persist a candidate snapshot before publishing it into the live in-memory map, so a failed write leaves readers on the previous durable state.
 
 Create, update, and delete operations ask active TLS source watchers to re-pull immediately. Surfaces without a live watcher still pick up managed records when their owning config/runtime is rebuilt.
 

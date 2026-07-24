@@ -237,8 +237,10 @@ pub(super) async fn handle_update_certificate(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
-        return Ok(managed_error_response(error));
+    if let Err(response) =
+        require_managed_record_kind(store.as_ref(), id, ManagedTlsMaterialKind::Certificate)
+    {
+        return Ok(response);
     }
     let (record, _) = match certificate_record_from_request(Some(id), request, true) {
         Ok(value) => value,
@@ -313,8 +315,10 @@ pub(super) async fn handle_update_ca_bundle(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
-        return Ok(managed_error_response(error));
+    if let Err(response) =
+        require_managed_record_kind(store.as_ref(), id, ManagedTlsMaterialKind::CaBundle)
+    {
+        return Ok(response);
     }
     let (record, _) = match ca_bundle_record_from_request(Some(id), request, true) {
         Ok(value) => value,
@@ -389,8 +393,10 @@ pub(super) async fn handle_update_crl(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
-        return Ok(managed_error_response(error));
+    if let Err(response) =
+        require_managed_record_kind(store.as_ref(), id, ManagedTlsMaterialKind::Crl)
+    {
+        return Ok(response);
     }
     let (record, _) = match crl_record_from_request(Some(id), request, true) {
         Ok(value) => value,
@@ -465,8 +471,10 @@ pub(super) async fn handle_update_ocsp_response(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
-        return Ok(managed_error_response(error));
+    if let Err(response) =
+        require_managed_record_kind(store.as_ref(), id, ManagedTlsMaterialKind::OcspResponse)
+    {
+        return Ok(response);
     }
     let (record, _) = match ocsp_response_record_from_request(Some(id), request, true) {
         Ok(value) => value,
@@ -977,8 +985,10 @@ pub(super) async fn handle_update_jwks(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
-        return Ok(managed_error_response(error));
+    if let Err(response) =
+        require_managed_record_kind(store.as_ref(), id, ManagedTlsMaterialKind::Jwks)
+    {
+        return Ok(response);
     }
     let (record, _) = match jwks_record_from_request(Some(id), request, true) {
         Ok(value) => value,
@@ -1010,15 +1020,8 @@ pub(super) async fn handle_delete_managed(
         return Ok(response);
     }
     let usage = managed_record_usage(state, id);
-    if !usage.is_empty() {
-        return Ok(super::json_response(
-            StatusCode::CONFLICT,
-            &json!({
-                "error": "managed TLS record is still referenced",
-                "id": id,
-                "used_by": usage,
-            }),
-        ));
+    if let Some(response) = referenced_managed_delete_conflict(id, &usage) {
+        return Ok(response);
     }
     let store = match managed_store_response() {
         Ok(store) => store,
@@ -1600,7 +1603,9 @@ fn acme_account_store_response()
 fn managed_error_response(error: ManagedTlsError) -> Response<Full<Bytes>> {
     let status = match &error {
         ManagedTlsError::NotFound(_) => StatusCode::NOT_FOUND,
-        ManagedTlsError::AlreadyExists(_) => StatusCode::CONFLICT,
+        ManagedTlsError::AlreadyExists(_) | ManagedTlsError::KindConflict { .. } => {
+            StatusCode::CONFLICT
+        }
         ManagedTlsError::InvalidId(_)
         | ManagedTlsError::InvalidPath(_)
         | ManagedTlsError::MissingMaterial { .. }
@@ -2144,6 +2149,45 @@ fn managed_record_usage(
         .collect()
 }
 
+fn require_managed_record_kind(
+    store: &crate::tls::managed::ManagedTlsStore,
+    id: &str,
+    kind: ManagedTlsMaterialKind,
+) -> Result<ManagedTlsRecord, Response<Full<Bytes>>> {
+    match store.get(id) {
+        Ok(record) if record.kind == kind => Ok(record),
+        Ok(record) => Err(super::json_response(
+            StatusCode::CONFLICT,
+            &json!({
+                "error": format!(
+                    "managed TLS record '{}' already exists as {}, cannot overwrite with {}",
+                    id,
+                    record.kind.as_str(),
+                    kind.as_str()
+                )
+            }),
+        )),
+        Err(error) => Err(managed_error_response(error)),
+    }
+}
+
+fn referenced_managed_delete_conflict(
+    id: &str,
+    usage: &[crate::tls::inventory::TlsInventoryUsage],
+) -> Option<Response<Full<Bytes>>> {
+    if usage.is_empty() {
+        return None;
+    }
+    Some(super::json_response(
+        StatusCode::CONFLICT,
+        &json!({
+            "error": "managed TLS record is still referenced",
+            "id": id,
+            "used_by": usage,
+        }),
+    ))
+}
+
 fn acme_certificate_usage(
     state: &AdminState,
     id: &str,
@@ -2314,5 +2358,107 @@ mod tests {
         );
         assert_eq!(record.account_id.as_deref(), Some("account-1"));
         assert!(overwrite);
+    }
+
+    #[test]
+    fn typed_update_routes_reject_cross_kind_collisions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::tls::managed::ManagedTlsStore::open(dir.path()).expect("open store");
+        store
+            .upsert(
+                ManagedTlsRecord::new_ca_bundle(
+                    "shared".to_string(),
+                    "Shared CA".to_string(),
+                    None,
+                    "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+                        .to_string(),
+                ),
+                false,
+            )
+            .expect("seed ca bundle");
+
+        let kinds = [
+            ManagedTlsMaterialKind::Certificate,
+            ManagedTlsMaterialKind::Crl,
+            ManagedTlsMaterialKind::OcspResponse,
+            ManagedTlsMaterialKind::Jwks,
+        ];
+        for kind in kinds {
+            let response = require_managed_record_kind(&store, "shared", kind)
+                .expect_err("cross-kind update must conflict");
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+        }
+
+        require_managed_record_kind(&store, "shared", ManagedTlsMaterialKind::CaBundle)
+            .expect("same-kind update remains allowed");
+
+        let (cert_pem, key_pem) = generated_cert_and_key();
+        let error = store
+            .upsert(
+                ManagedTlsRecord::new_certificate(
+                    "shared".to_string(),
+                    "Shared Cert".to_string(),
+                    None,
+                    cert_pem,
+                    key_pem,
+                    None,
+                ),
+                true,
+            )
+            .expect_err("create-with-overwrite cross-kind rejected");
+        assert!(matches!(error, ManagedTlsError::KindConflict { .. }));
+        assert_eq!(
+            managed_error_response(error).status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn referenced_delete_still_conflicts_while_same_kind_overwrite_is_allowed() {
+        let usage = vec![crate::tls::inventory::TlsInventoryUsage {
+            surface: "proxy_https".to_string(),
+            role: "cert".to_string(),
+            resource_type: "env".to_string(),
+            resource_id: "FERRUM_FRONTEND_TLS_CERT_SOURCE".to_string(),
+            field: "cert_source".to_string(),
+        }];
+        let conflict = referenced_managed_delete_conflict("shared", &usage)
+            .expect("referenced delete must conflict");
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        assert!(referenced_managed_delete_conflict("shared", &[]).is_none());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::tls::managed::ManagedTlsStore::open(dir.path()).expect("open store");
+        let (cert_pem, key_pem) = generated_cert_and_key();
+        store
+            .upsert(
+                ManagedTlsRecord::new_certificate(
+                    "shared".to_string(),
+                    "Shared Cert".to_string(),
+                    None,
+                    cert_pem.clone(),
+                    key_pem.clone(),
+                    None,
+                ),
+                false,
+            )
+            .expect("seed certificate");
+        store
+            .upsert(
+                ManagedTlsRecord::new_certificate(
+                    "shared".to_string(),
+                    "Shared Cert Rotated".to_string(),
+                    None,
+                    cert_pem,
+                    key_pem,
+                    None,
+                ),
+                true,
+            )
+            .expect("same-kind overwrite remains allowed for rotation");
+        assert_eq!(
+            store.get("shared").expect("rotated").name,
+            "Shared Cert Rotated"
+        );
     }
 }

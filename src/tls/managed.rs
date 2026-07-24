@@ -6,14 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock, RwLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use uuid::Uuid;
 use x509_parser::extensions::{GeneralName, ParsedExtension};
 use x509_parser::prelude::*;
 
@@ -128,6 +127,14 @@ pub enum ManagedTlsError {
     NotFound(String),
     #[error("managed TLS record '{0}' already exists")]
     AlreadyExists(String),
+    #[error(
+        "managed TLS record '{id}' already exists as {actual}, cannot overwrite with {expected}"
+    )]
+    KindConflict {
+        id: String,
+        actual: &'static str,
+        expected: &'static str,
+    },
     #[error("managed TLS record '{id}' does not contain {kind} material")]
     MissingMaterial { id: String, kind: &'static str },
     #[error("managed TLS record '{id}' has kind {actual}, expected {expected}")]
@@ -217,14 +224,23 @@ impl ManagedTlsStore {
             if !allow_overwrite {
                 return Err(ManagedTlsError::AlreadyExists(record.id));
             }
+            if existing.kind != record.kind {
+                return Err(ManagedTlsError::KindConflict {
+                    id: record.id,
+                    actual: existing.kind.as_str(),
+                    expected: record.kind.as_str(),
+                });
+            }
             record.created_at = existing.created_at;
             record.updated_at = now;
         } else {
             record.created_at = now;
             record.updated_at = now;
         }
-        records.insert(record.id.clone(), record.clone());
-        self.persist_locked(&records)?;
+        let mut candidate = records.clone();
+        candidate.insert(record.id.clone(), record.clone());
+        self.persist_locked(&candidate)?;
+        *records = candidate;
         Ok(record)
     }
 
@@ -233,10 +249,15 @@ impl ManagedTlsStore {
         let mut records = self.records.write().map_err(|_| {
             ManagedTlsError::Write("managed TLS store lock is poisoned".to_string())
         })?;
-        let removed = records
+        if !records.contains_key(id) {
+            return Err(ManagedTlsError::NotFound(id.to_string()));
+        }
+        let mut candidate = records.clone();
+        let removed = candidate
             .remove(id)
             .ok_or_else(|| ManagedTlsError::NotFound(id.to_string()))?;
-        self.persist_locked(&records)?;
+        self.persist_locked(&candidate)?;
+        *records = candidate;
         Ok(removed)
     }
 
@@ -258,18 +279,8 @@ impl ManagedTlsStore {
             records: records.clone(),
         })
         .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-        let parent = self.path.parent().ok_or_else(|| {
-            ManagedTlsError::InvalidPath("store file has no parent directory".to_string())
-        })?;
-        let tmp_path = parent.join(format!(
-            ".{}.tmp-{}",
-            STORE_FILE_NAME,
-            Uuid::new_v4().simple()
-        ));
-        write_private_file(&tmp_path, &payload)?;
-        std::fs::rename(&tmp_path, &self.path)
-            .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-        Ok(())
+        crate::tls::private_file::replace_private_file(&self.path, &payload)
+            .map_err(|error| ManagedTlsError::Write(error.to_string()))
     }
 }
 
@@ -703,12 +714,6 @@ pub fn global_store() -> Result<Arc<ManagedTlsStore>, String> {
         .clone()
 }
 
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ManagedTlsError> {
-    crate::tls::private_file::write_private_file(path, bytes)
-        .map_err(|error| ManagedTlsError::Write(error.to_string()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,6 +725,18 @@ mod tests {
             rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
         let cert = params.self_signed(&key_pair).expect("self-sign cert");
         (cert.pem(), key_pair.serialize_pem())
+    }
+
+    fn assert_no_temp_files(dir: &std::path::Path) {
+        for entry in std::fs::read_dir(dir).expect("read store dir") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.contains(".tmp-"),
+                "orphaned temporary file left behind: {name}"
+            );
+        }
     }
 
     #[test]
@@ -770,6 +787,50 @@ mod tests {
     }
 
     #[test]
+    fn store_rejects_cross_kind_overwrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ManagedTlsStore::open(dir.path()).expect("open store");
+        store
+            .upsert(
+                ManagedTlsRecord::new_ca_bundle(
+                    "shared".to_string(),
+                    "Shared CA".to_string(),
+                    None,
+                    "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+                        .to_string(),
+                ),
+                false,
+            )
+            .expect("create ca bundle");
+        let (cert_pem, key_pem) = generated_cert_and_key();
+        let error = store
+            .upsert(
+                ManagedTlsRecord::new_certificate(
+                    "shared".to_string(),
+                    "Shared Cert".to_string(),
+                    None,
+                    cert_pem,
+                    key_pem,
+                    None,
+                ),
+                true,
+            )
+            .expect_err("cross-kind overwrite rejected");
+        assert!(matches!(
+            error,
+            ManagedTlsError::KindConflict {
+                actual: "ca_bundle",
+                expected: "certificate",
+                ..
+            }
+        ));
+        assert_eq!(
+            store.get("shared").expect("still present").kind,
+            ManagedTlsMaterialKind::CaBundle
+        );
+    }
+
+    #[test]
     fn store_loads_ocsp_response_material() {
         use base64::Engine as _;
 
@@ -793,5 +854,134 @@ mod tests {
         let summaries = store.list(ManagedTlsMaterialKind::OcspResponse);
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].byte_length, Some(5));
+    }
+
+    #[test]
+    fn failed_create_leaves_memory_and_disk_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ManagedTlsStore::open(dir.path()).expect("open store");
+        let (cert_pem, key_pem) = generated_cert_and_key();
+        store
+            .upsert(
+                ManagedTlsRecord::new_certificate(
+                    "edge-cert".to_string(),
+                    "Edge Cert".to_string(),
+                    None,
+                    cert_pem.clone(),
+                    key_pem.clone(),
+                    None,
+                ),
+                false,
+            )
+            .expect("seed");
+        crate::tls::private_file::inject_replace_failure("rename");
+
+        let error = store
+            .upsert(
+                ManagedTlsRecord::new_certificate(
+                    "other-cert".to_string(),
+                    "Other Cert".to_string(),
+                    None,
+                    cert_pem,
+                    key_pem,
+                    None,
+                ),
+                false,
+            )
+            .expect_err("create must fail");
+        assert!(matches!(error, ManagedTlsError::Write(_)));
+        assert!(store.get("other-cert").is_err());
+        assert_eq!(store.list(ManagedTlsMaterialKind::Certificate).len(), 1);
+        assert_no_temp_files(dir.path());
+
+        let reopened = ManagedTlsStore::open(dir.path()).expect("reopen after failed create");
+        assert_eq!(reopened.list(ManagedTlsMaterialKind::Certificate).len(), 1);
+        assert_eq!(
+            reopened.get("edge-cert").expect("seed retained").id,
+            "edge-cert"
+        );
+    }
+
+    #[test]
+    fn failed_update_leaves_memory_and_disk_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ManagedTlsStore::open(dir.path()).expect("open store");
+        let (cert_pem, key_pem) = generated_cert_and_key();
+        store
+            .upsert(
+                ManagedTlsRecord::new_certificate(
+                    "edge-cert".to_string(),
+                    "Edge Cert A".to_string(),
+                    None,
+                    cert_pem.clone(),
+                    key_pem.clone(),
+                    None,
+                ),
+                false,
+            )
+            .expect("seed");
+        let before = store.get("edge-cert").expect("seed get");
+        crate::tls::private_file::inject_replace_failure("write");
+
+        let error = store
+            .upsert(
+                ManagedTlsRecord::new_certificate(
+                    "edge-cert".to_string(),
+                    "Edge Cert B".to_string(),
+                    None,
+                    cert_pem,
+                    key_pem,
+                    None,
+                ),
+                true,
+            )
+            .expect_err("update must fail");
+        assert!(matches!(error, ManagedTlsError::Write(_)));
+        let after = store.get("edge-cert").expect("live get");
+        assert_eq!(after.name, before.name);
+        assert_eq!(after.updated_at, before.updated_at);
+        assert_no_temp_files(dir.path());
+
+        let reopened = ManagedTlsStore::open(dir.path()).expect("reopen after failed update");
+        assert_eq!(
+            reopened.get("edge-cert").expect("disk get").name,
+            "Edge Cert A"
+        );
+    }
+
+    #[test]
+    fn failed_delete_leaves_memory_and_disk_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ManagedTlsStore::open(dir.path()).expect("open store");
+        let (cert_pem, key_pem) = generated_cert_and_key();
+        store
+            .upsert(
+                ManagedTlsRecord::new_certificate(
+                    "edge-cert".to_string(),
+                    "Edge Cert".to_string(),
+                    None,
+                    cert_pem,
+                    key_pem,
+                    None,
+                ),
+                false,
+            )
+            .expect("seed");
+        crate::tls::private_file::inject_replace_failure("rename");
+
+        let error = store.delete("edge-cert").expect_err("delete must fail");
+        assert!(matches!(error, ManagedTlsError::Write(_)));
+        assert!(store.get("edge-cert").is_ok());
+        assert_eq!(
+            store
+                .material("certificates/edge-cert#cert", MaterialKind::Cert)
+                .expect("material")
+                .kind,
+            MaterialKind::Cert
+        );
+        assert_no_temp_files(dir.path());
+
+        let reopened = ManagedTlsStore::open(dir.path()).expect("reopen after failed delete");
+        assert!(reopened.get("edge-cert").is_ok());
     }
 }

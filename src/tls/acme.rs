@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 #[cfg(feature = "acme")]
 use std::time::Duration;
@@ -411,8 +411,10 @@ impl AcmeCertificateStore {
             record.created_at = now;
             record.updated_at = now;
         }
-        certificates.insert(record.id.clone(), record.clone());
-        self.persist_locked(&certificates)?;
+        let mut candidate = certificates.clone();
+        candidate.insert(record.id.clone(), record.clone());
+        self.persist_locked(&candidate)?;
+        *certificates = candidate;
         Ok(record)
     }
 
@@ -422,10 +424,15 @@ impl AcmeCertificateStore {
             .certificates
             .write()
             .map_err(|_| AcmeError::Write("ACME certificate store lock is poisoned".to_string()))?;
-        let removed = certificates
+        if !certificates.contains_key(id) {
+            return Err(AcmeError::NotFound(id.to_string()));
+        }
+        let mut candidate = certificates.clone();
+        let removed = candidate
             .remove(id)
             .ok_or_else(|| AcmeError::NotFound(id.to_string()))?;
-        self.persist_locked(&certificates)?;
+        self.persist_locked(&candidate)?;
+        *certificates = candidate;
         Ok(removed)
     }
 
@@ -447,18 +454,8 @@ impl AcmeCertificateStore {
             certificates: certificates.clone(),
         })
         .map_err(|error| AcmeError::Write(error.to_string()))?;
-        let parent = self.path.parent().ok_or_else(|| {
-            AcmeError::InvalidPath("store file has no parent directory".to_string())
-        })?;
-        let tmp_path = parent.join(format!(
-            ".{}.tmp-{}",
-            STORE_FILE_NAME,
-            Uuid::new_v4().simple()
-        ));
-        write_private_file(&tmp_path, &payload)?;
-        std::fs::rename(&tmp_path, &self.path)
-            .map_err(|error| AcmeError::Write(error.to_string()))?;
-        Ok(())
+        crate::tls::private_file::replace_private_file(&self.path, &payload)
+            .map_err(|error| AcmeError::Write(error.to_string()))
     }
 }
 
@@ -549,8 +546,10 @@ impl AcmeOrderStore {
             record.created_at = now;
             record.updated_at = now;
         }
-        orders.insert(record.id.clone(), record.clone());
-        self.persist_locked(&orders)?;
+        let mut candidate = orders.clone();
+        candidate.insert(record.id.clone(), record.clone());
+        self.persist_locked(&candidate)?;
+        *orders = candidate;
         Ok(record)
     }
 
@@ -560,10 +559,15 @@ impl AcmeOrderStore {
             .orders
             .write()
             .map_err(|_| AcmeError::Write("ACME order store lock is poisoned".to_string()))?;
-        let removed = orders
+        if !orders.contains_key(id) {
+            return Err(AcmeError::OrderNotFound(id.to_string()));
+        }
+        let mut candidate = orders.clone();
+        let removed = candidate
             .remove(id)
             .ok_or_else(|| AcmeError::OrderNotFound(id.to_string()))?;
-        self.persist_locked(&orders)?;
+        self.persist_locked(&candidate)?;
+        *orders = candidate;
         Ok(removed)
     }
 
@@ -654,18 +658,8 @@ impl AcmeOrderStore {
             orders: orders.clone(),
         })
         .map_err(|error| AcmeError::Write(error.to_string()))?;
-        let parent = self.path.parent().ok_or_else(|| {
-            AcmeError::InvalidPath("store file has no parent directory".to_string())
-        })?;
-        let tmp_path = parent.join(format!(
-            ".{}.tmp-{}",
-            ORDER_STORE_FILE_NAME,
-            Uuid::new_v4().simple()
-        ));
-        write_private_file(&tmp_path, &payload)?;
-        std::fs::rename(&tmp_path, &self.path)
-            .map_err(|error| AcmeError::Write(error.to_string()))?;
-        Ok(())
+        crate::tls::private_file::replace_private_file(&self.path, &payload)
+            .map_err(|error| AcmeError::Write(error.to_string()))
     }
 }
 
@@ -751,8 +745,10 @@ impl AcmeAccountStore {
                 last_used_at: Some(now),
             }
         };
-        accounts.insert(key, record.clone());
-        self.persist_locked(&accounts)?;
+        let mut candidate = accounts.clone();
+        candidate.insert(key, record.clone());
+        self.persist_locked(&candidate)?;
+        *accounts = candidate;
         Ok(record)
     }
 
@@ -764,18 +760,8 @@ impl AcmeAccountStore {
             accounts: accounts.clone(),
         })
         .map_err(|error| AcmeError::Write(error.to_string()))?;
-        let parent = self.path.parent().ok_or_else(|| {
-            AcmeError::InvalidPath("store file has no parent directory".to_string())
-        })?;
-        let tmp_path = parent.join(format!(
-            ".{}.tmp-{}",
-            ACCOUNT_STORE_FILE_NAME,
-            Uuid::new_v4().simple()
-        ));
-        write_private_file(&tmp_path, &payload)?;
-        std::fs::rename(&tmp_path, &self.path)
-            .map_err(|error| AcmeError::Write(error.to_string()))?;
-        Ok(())
+        crate::tls::private_file::replace_private_file(&self.path, &payload)
+            .map_err(|error| AcmeError::Write(error.to_string()))
     }
 }
 
@@ -2316,12 +2302,6 @@ pub mod client {
     }
 }
 
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), AcmeError> {
-    crate::tls::private_file::write_private_file(path, bytes)
-        .map_err(|error| AcmeError::Write(error.to_string()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2798,5 +2778,172 @@ mod tests {
 
         assert!(!summary.contains(&key_pem));
         assert!(summary.contains("acme://certificates/edge-cert"));
+    }
+
+    fn assert_no_temp_files(dir: &std::path::Path) {
+        for entry in std::fs::read_dir(dir).expect("read store dir") {
+            let entry = entry.expect("dir entry");
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.contains(".tmp-"),
+                "orphaned temporary file left behind: {name}"
+            );
+        }
+    }
+
+    fn sample_certificate(id: &str, domains: &[&str]) -> AcmeCertificateRecord {
+        let (cert_pem, key_pem) = generated_cert_and_key();
+        AcmeCertificateRecord::new_issued(AcmeIssuedCertificateInput {
+            id: id.to_string(),
+            domains: domains.iter().map(|value| (*value).to_string()).collect(),
+            directory_url: "https://acme.example/directory".to_string(),
+            account_id: None,
+            order_url: None,
+            cert_pem,
+            key_pem,
+            chain_pem: None,
+        })
+        .expect("certificate")
+    }
+
+    fn sample_order(id: &str) -> AcmeOrderRecord {
+        AcmeOrderRecord::new_http01(AcmeHttp01OrderInput {
+            id: id.to_string(),
+            certificate_id: Some("edge-cert".to_string()),
+            domains: vec!["example.com".to_string()],
+            directory_url: "https://acme.example/directory".to_string(),
+            account_id: Some("https://acme.example/acct/1".to_string()),
+            account_credentials_json: None,
+            order_url: None,
+            status: AcmeOrderStatus::PendingChallenges,
+            http01_challenges: Vec::new(),
+            tls_alpn01_challenges: Vec::new(),
+            dns01_challenges: Vec::new(),
+            error: None,
+        })
+        .expect("order")
+    }
+
+    #[test]
+    fn acme_certificate_failed_mutations_leave_memory_and_disk_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = AcmeCertificateStore::open(dir.path()).expect("open store");
+        store
+            .upsert_certificate(sample_certificate("edge-cert", &["example.com"]), false)
+            .expect("seed");
+
+        crate::tls::private_file::inject_replace_failure("rename");
+        let error = store
+            .upsert_certificate(sample_certificate("other-cert", &["other.example"]), false)
+            .expect_err("create must fail");
+        assert!(matches!(error, AcmeError::Write(_)));
+        assert!(store.get_certificate("other-cert").is_err());
+
+        crate::tls::private_file::inject_replace_failure("write");
+        let before = store.get_certificate("edge-cert").expect("seed get");
+        let error = store
+            .upsert_certificate(sample_certificate("edge-cert", &["example.com"]), true)
+            .expect_err("update must fail");
+        assert!(matches!(error, AcmeError::Write(_)));
+        assert_eq!(
+            store.get_certificate("edge-cert").expect("live get").updated_at,
+            before.updated_at
+        );
+
+        crate::tls::private_file::inject_replace_failure("rename");
+        let error = store
+            .delete_certificate("edge-cert")
+            .expect_err("delete must fail");
+        assert!(matches!(error, AcmeError::Write(_)));
+        assert!(store.get_certificate("edge-cert").is_ok());
+        assert_no_temp_files(dir.path());
+
+        let reopened = AcmeCertificateStore::open(dir.path()).expect("reopen");
+        assert_eq!(reopened.list_certificates().len(), 1);
+        assert!(reopened.get_certificate("edge-cert").is_ok());
+    }
+
+    #[test]
+    fn acme_order_failed_mutations_leave_memory_and_disk_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = AcmeOrderStore::open(dir.path()).expect("open store");
+        store
+            .upsert_order(sample_order("edge-order"), false)
+            .expect("seed");
+
+        crate::tls::private_file::inject_replace_failure("rename");
+        let error = store
+            .upsert_order(sample_order("other-order"), false)
+            .expect_err("create must fail");
+        assert!(matches!(error, AcmeError::Write(_)));
+        assert!(store.get_order("other-order").is_err());
+
+        crate::tls::private_file::inject_replace_failure("write");
+        let before = store.get_order("edge-order").expect("seed get");
+        let error = store
+            .upsert_order(sample_order("edge-order"), true)
+            .expect_err("update must fail");
+        assert!(matches!(error, AcmeError::Write(_)));
+        assert_eq!(
+            store.get_order("edge-order").expect("live get").updated_at,
+            before.updated_at
+        );
+
+        crate::tls::private_file::inject_replace_failure("rename");
+        let error = store.delete_order("edge-order").expect_err("delete must fail");
+        assert!(matches!(error, AcmeError::Write(_)));
+        assert!(store.get_order("edge-order").is_ok());
+        assert_no_temp_files(dir.path());
+
+        let reopened = AcmeOrderStore::open(dir.path()).expect("reopen");
+        assert_eq!(reopened.list_orders().len(), 1);
+        assert!(reopened.get_order("edge-order").is_ok());
+    }
+
+    #[test]
+    fn acme_account_failed_upsert_leaves_memory_and_disk_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = AcmeAccountStore::open(dir.path()).expect("open store");
+        store
+            .upsert_account(
+                "https://acme.example/acct/1".to_string(),
+                "https://acme.example/directory".to_string(),
+                r#"{"private_key":"version-a"}"#.to_string(),
+            )
+            .expect("seed");
+
+        crate::tls::private_file::inject_replace_failure("rename");
+        let error = store
+            .upsert_account(
+                "https://acme.example/acct/1".to_string(),
+                "https://acme.example/directory".to_string(),
+                r#"{"private_key":"version-b"}"#.to_string(),
+            )
+            .expect_err("upsert must fail");
+        assert!(matches!(error, AcmeError::Write(_)));
+        assert_eq!(
+            store
+                .get_credentials(
+                    "https://acme.example/directory",
+                    "https://acme.example/acct/1"
+                )
+                .expect("live credentials")
+                .as_deref(),
+            Some(r#"{"private_key":"version-a"}"#)
+        );
+        assert_no_temp_files(dir.path());
+
+        let reopened = AcmeAccountStore::open(dir.path()).expect("reopen");
+        assert_eq!(
+            reopened
+                .get_credentials(
+                    "https://acme.example/directory",
+                    "https://acme.example/acct/1"
+                )
+                .expect("disk credentials")
+                .as_deref(),
+            Some(r#"{"private_key":"version-a"}"#)
+        );
     }
 }
