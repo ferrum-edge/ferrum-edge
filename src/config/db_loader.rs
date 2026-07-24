@@ -61,6 +61,23 @@ const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
 pub(crate) const MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL: &str = "INSERT INTO mtls_dns_admission_locks \
      (namespace, updated_at) VALUES (?, ?) \
      ON DUPLICATE KEY UPDATE updated_at = mtls_dns_admission_locks.updated_at";
+/// MySQL exclusive lock acquire for the global config-change sequence row.
+///
+/// `INSERT IGNORE` only takes a shared duplicate-key lock, so a follow-up
+/// `SELECT ... FOR UPDATE` upgrades S→X and deadlocks under cross-namespace
+/// concurrent writers. The no-op `ON DUPLICATE KEY UPDATE` takes the row
+/// exclusively up front (same pattern as [`MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL`]).
+pub(crate) const MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL: &str = "INSERT INTO config_change_locks \
+     (lock_name, updated_at) VALUES (?, ?) \
+     ON DUPLICATE KEY UPDATE updated_at = config_change_locks.updated_at";
+/// MySQL exclusive lock acquire for a proxy-route uniqueness bucket row.
+///
+/// Same S→X upgrade hazard as [`MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL`]; fixed
+/// for defense in depth even though callers currently hold the per-namespace
+/// mTLS admission row first.
+pub(crate) const MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL: &str = "INSERT INTO proxy_route_locks \
+     (namespace, route_key_hash, created_at) VALUES (?, ?, ?) \
+     ON DUPLICATE KEY UPDATE created_at = proxy_route_locks.created_at";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FullLoadPurpose {
@@ -673,9 +690,7 @@ impl DatabaseStore {
 
     fn proxy_route_lock_insert_sql(&self) -> String {
         match self.db_type.as_str() {
-            "mysql" => "INSERT IGNORE INTO proxy_route_locks \
-                 (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"
-                .to_string(),
+            "mysql" => MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL.to_string(),
             "sqlite" => "INSERT OR IGNORE INTO proxy_route_locks \
                  (namespace, route_key_hash, created_at) VALUES (?, ?, ?)"
                 .to_string(),
@@ -687,9 +702,7 @@ impl DatabaseStore {
 
     fn config_change_lock_insert_sql(&self) -> String {
         match self.db_type.as_str() {
-            "mysql" => "INSERT IGNORE INTO config_change_locks \
-                 (lock_name, updated_at) VALUES (?, ?)"
-                .to_string(),
+            "mysql" => MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL.to_string(),
             "sqlite" => "INSERT OR IGNORE INTO config_change_locks \
                  (lock_name, updated_at) VALUES (?, ?)"
                 .to_string(),

@@ -1991,6 +1991,14 @@ pub mod _test_support {
         crate::config::db_loader::MYSQL_MTLS_DNS_ADMISSION_LOCK_INSERT_SQL
     }
 
+    pub fn mysql_config_change_lock_insert_sql() -> &'static str {
+        crate::config::db_loader::MYSQL_CONFIG_CHANGE_LOCK_INSERT_SQL
+    }
+
+    pub fn mysql_proxy_route_lock_insert_sql() -> &'static str {
+        crate::config::db_loader::MYSQL_PROXY_ROUTE_LOCK_INSERT_SQL
+    }
+
     pub fn mtls_dns_policy_requires_consumer_load(
         config: &crate::config::types::GatewayConfig,
     ) -> bool {

@@ -3021,6 +3021,12 @@ impl AdminResource for Upstream {
     const RESOURCE_LABEL: &'static str = "Upstream";
     const VALIDATION_ERROR_LABEL: &'static str = "upstream fields";
     const NOT_FOUND_MESSAGE: &'static str = "Upstream not found";
+    // Serialize create/update uniqueness prechecks under the namespace config
+    // admission lease so concurrent writers cannot both pass the advisory
+    // name check before either commits (issue #2999). Matches Proxy/Consumer/
+    // PluginConfig; the SQL/Mongo unique `(namespace, name)` index remains the
+    // datastore backstop.
+    const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;
 
     fn id(&self) -> &str {
         &self.id

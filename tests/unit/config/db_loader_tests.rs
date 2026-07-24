@@ -2,7 +2,8 @@ use ferrum_edge::_test_support::{
     DbPoolConfig, db_append_connect_timeout, db_code_is_transient, db_diff_removed,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
     db_wrap_mysql_isolation_read_error, is_config_validation_rejection,
-    mysql_mtls_dns_admission_lock_insert_sql, parse_auth_mode, parse_scheme, statement_timeout_sql,
+    mysql_config_change_lock_insert_sql, mysql_mtls_dns_admission_lock_insert_sql,
+    mysql_proxy_route_lock_insert_sql, parse_auth_mode, parse_scheme, statement_timeout_sql,
     validate_tcp_connection_throttle_attachments,
 };
 use ferrum_edge::config::db_backend::{
@@ -68,6 +69,28 @@ fn mysql_mtls_dns_lock_insert_takes_an_exclusive_duplicate_key_lock() {
     assert!(sql.contains("ON DUPLICATE KEY UPDATE"), "{sql}");
     assert!(
         sql.contains("updated_at = mtls_dns_admission_locks.updated_at"),
+        "{sql}"
+    );
+    assert!(!sql.contains("INSERT IGNORE"), "{sql}");
+}
+
+#[test]
+fn mysql_config_change_lock_insert_takes_an_exclusive_duplicate_key_lock() {
+    let sql = mysql_config_change_lock_insert_sql();
+    assert!(sql.contains("ON DUPLICATE KEY UPDATE"), "{sql}");
+    assert!(
+        sql.contains("updated_at = config_change_locks.updated_at"),
+        "{sql}"
+    );
+    assert!(!sql.contains("INSERT IGNORE"), "{sql}");
+}
+
+#[test]
+fn mysql_proxy_route_lock_insert_takes_an_exclusive_duplicate_key_lock() {
+    let sql = mysql_proxy_route_lock_insert_sql();
+    assert!(sql.contains("ON DUPLICATE KEY UPDATE"), "{sql}");
+    assert!(
+        sql.contains("created_at = proxy_route_locks.created_at"),
         "{sql}"
     );
     assert!(!sql.contains("INSERT IGNORE"), "{sql}");

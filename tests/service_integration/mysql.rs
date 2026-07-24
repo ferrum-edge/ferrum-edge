@@ -1,8 +1,19 @@
-//! Live MySQL contracts for custom-plugin migration recovery.
+//! Live MySQL contracts for custom-plugin migration recovery and for the
+//! concurrency / identity-integrity workstream (#2991, #2994, #2999):
+//! cross-namespace config/route writes without S→X deadlock, byte-exact
+//! identity uniqueness under `utf8mb4_bin`, and concurrent duplicate-Upstream
+//! admission with exactly one winner.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use ferrum_edge::_test_support::DbPoolConfig;
+use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::migrations::MigrationRunner;
+use ferrum_edge::config::types::{
+    Consumer, LoadBalancerAlgorithm, Proxy, Upstream, UpstreamTarget,
+};
+use serde_json::json;
 use sqlx::Row;
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
@@ -12,6 +23,7 @@ use super::common::containers::{BoxError, fail_in_ci_else_skip};
 
 struct MySqlFixture {
     _container: ContainerAsync<GenericImage>,
+    url: String,
     pool: sqlx::AnyPool,
 }
 
@@ -31,7 +43,7 @@ async fn start_mysql() -> Result<MySqlFixture, BoxError> {
     let mut last_error = String::new();
     for _ in 0..90 {
         match sqlx::any::AnyPoolOptions::new()
-            .max_connections(2)
+            .max_connections(8)
             .acquire_timeout(Duration::from_secs(2))
             .connect(&url)
             .await
@@ -39,6 +51,7 @@ async fn start_mysql() -> Result<MySqlFixture, BoxError> {
             Ok(pool) => {
                 return Ok(MySqlFixture {
                     _container: container,
+                    url,
                     pool,
                 });
             }
@@ -49,6 +62,98 @@ async fn start_mysql() -> Result<MySqlFixture, BoxError> {
         }
     }
     Err(format!("MySQL did not become ready within 45s: {last_error}").into())
+}
+
+async fn connect_store(url: &str) -> DatabaseStore {
+    let pool_config = DbPoolConfig {
+        max_connections: 16,
+        min_connections: 2,
+        ..DbPoolConfig::default()
+    };
+    DatabaseStore::connect_with_pool_config("mysql", url, pool_config)
+        .await
+        .expect("MySQL DatabaseStore connect + V001 migrations must succeed")
+}
+
+fn is_mysql_deadlock(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("1213")
+            || message.to_ascii_lowercase().contains("deadlock")
+            || message.contains("ER_LOCK_DEADLOCK")
+    })
+}
+
+fn is_unique_constraint_violation(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let lower = cause.to_string().to_ascii_lowercase();
+        lower.contains("duplicate") || lower.contains("unique constraint")
+    })
+}
+
+fn make_consumer(namespace: &str, id: &str, username: &str) -> Consumer {
+    Consumer {
+        id: id.to_string(),
+        namespace: namespace.to_string(),
+        username: username.to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: Vec::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+fn make_http_proxy(namespace: &str, id: &str, listen_path: &str) -> Proxy {
+    serde_json::from_value(json!({
+        "id": id,
+        "namespace": namespace,
+        "name": id,
+        "hosts": [format!("{id}.test")],
+        "listen_path": listen_path,
+        "backend_scheme": "http",
+        "backend_host": "127.0.0.1",
+        "backend_port": 8080
+    }))
+    .expect("proxy fixture must deserialize")
+}
+
+fn make_upstream(namespace: &str, id: &str, name: &str) -> Upstream {
+    Upstream {
+        id: id.to_string(),
+        namespace: namespace.to_string(),
+        name: Some(name.to_string()),
+        targets: vec![UpstreamTarget {
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+            service_port_policy_key: None,
+            weight: 100,
+            tags: Default::default(),
+            locality: None,
+            path: None,
+        }],
+        algorithm: LoadBalancerAlgorithm::RoundRobin,
+        hash_on: None,
+        hash_on_cookie_config: None,
+        health_checks: None,
+        service_discovery: None,
+        subsets: None,
+        port_overrides: Default::default(),
+        source_locality: None,
+        locality_lb_strict: false,
+        locality_lb_setting: None,
+        backend_tls_client_cert_path: None,
+        backend_tls_client_key_path: None,
+        backend_tls_verify_server_cert: true,
+        backend_tls_server_ca_cert_path: None,
+        backend_tls_sni: None,
+        backend_tls_san_allow_list: Vec::new(),
+        resolved_subset_tls: Default::default(),
+        dispatch_port_override_fallback: None,
+        api_spec_id: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
 }
 
 async fn index_definition(pool: &sqlx::AnyPool, index_name: &str) -> Vec<(String, i64)> {
@@ -243,4 +348,208 @@ async fn mysql_example_audit_partial_ddl_recovers_and_accepts_text_bindings() {
         ]
     );
     assert!(runner.run_plugin_pending(&list).await.unwrap().is_empty());
+}
+
+/// Cross-namespace consumer (config-change lock) and proxy (route + config-
+/// change locks) writers must not deadlock on the global `config_change_locks`
+/// row after the MySQL exclusive upsert fix (#2991).
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_cross_namespace_config_and_route_writes_do_not_deadlock() {
+    let fixture = match start_mysql().await {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            fail_in_ci_else_skip(
+                "mysql_cross_namespace_config_and_route_writes_do_not_deadlock",
+                "MySQL 8.4",
+                &error,
+            );
+            return;
+        }
+    };
+    let store = Arc::new(connect_store(&fixture.url).await);
+
+    const ITERATIONS: usize = 40;
+    for i in 0..ITERATIONS {
+        let store_a = Arc::clone(&store);
+        let store_b = Arc::clone(&store);
+        let consumer = make_consumer("ns-config", &format!("c-{i}"), &format!("user-{i}"));
+        let proxy = make_http_proxy("ns-route", &format!("p-{i}"), &format!("/p-{i}"));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let barrier_a = Arc::clone(&barrier);
+        let barrier_b = Arc::clone(&barrier);
+
+        let (result_a, result_b) = tokio::join!(
+            async move {
+                barrier_a.wait().await;
+                store_a.create_consumer(&consumer).await
+            },
+            async move {
+                barrier_b.wait().await;
+                store_b.create_proxy(&proxy).await
+            },
+        );
+
+        if let Err(error) = &result_a {
+            assert!(
+                !is_mysql_deadlock(error),
+                "cross-namespace config write hit MySQL deadlock: {error:#}"
+            );
+        }
+        if let Err(error) = &result_b {
+            assert!(
+                !is_mysql_deadlock(error),
+                "cross-namespace route write hit MySQL deadlock: {error:#}"
+            );
+        }
+        result_a.expect("consumer create in ns-config must succeed");
+        result_b.expect("proxy create in ns-route must succeed");
+    }
+}
+
+/// NFC and NFD forms of the same grapheme must remain distinct consumer
+/// identities under MySQL `utf8mb4_bin` (#2994), matching Postgres/SQLite.
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_byte_exact_identity_accepts_nfc_and_nfd_usernames() {
+    let fixture = match start_mysql().await {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            fail_in_ci_else_skip(
+                "mysql_byte_exact_identity_accepts_nfc_and_nfd_usernames",
+                "MySQL 8.4",
+                &error,
+            );
+            return;
+        }
+    };
+    let store = connect_store(&fixture.url).await;
+
+    // U+00E9 (é) vs e + U+0301 combining acute — canonically equivalent under
+    // UCA, distinct as UTF-8 bytes.
+    let nfc_username = "caf\u{00e9}";
+    let nfd_username = "cafe\u{0301}";
+    assert_ne!(
+        nfc_username.as_bytes(),
+        nfd_username.as_bytes(),
+        "fixture usernames must differ by bytes"
+    );
+
+    store
+        .create_consumer(&make_consumer("ferrum", "nfc-consumer", nfc_username))
+        .await
+        .expect("NFC username must insert");
+    store
+        .create_consumer(&make_consumer("ferrum", "nfd-consumer", nfd_username))
+        .await
+        .expect("NFD username must insert as a distinct identity under utf8mb4_bin");
+
+    assert!(
+        store
+            .check_consumer_identity_unique("ferrum", "other", nfc_username, None, None)
+            .await
+            .expect("identity probe")
+            .is_some(),
+        "NFC username must collide with the NFC consumer only"
+    );
+    assert!(
+        store
+            .check_consumer_identity_unique("ferrum", "other", nfd_username, None, None)
+            .await
+            .expect("identity probe")
+            .is_some(),
+        "NFD username must collide with the NFD consumer only"
+    );
+
+    let loaded_nfc = store
+        .get_consumer("ferrum", "nfc-consumer")
+        .await
+        .expect("load NFC consumer")
+        .expect("NFC consumer present");
+    let loaded_nfd = store
+        .get_consumer("ferrum", "nfd-consumer")
+        .await
+        .expect("load NFD consumer")
+        .expect("NFD consumer present");
+    assert_eq!(loaded_nfc.username.as_bytes(), nfc_username.as_bytes());
+    assert_eq!(loaded_nfd.username.as_bytes(), nfd_username.as_bytes());
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM consumers WHERE namespace = 'ferrum'",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count consumers");
+    assert_eq!(count, 2);
+}
+
+/// Concurrent `create_upstream` with the same `(namespace, name)` must commit
+/// exactly one row (#2999). The unique index is the datastore backstop; the
+/// admin admission lease keeps the advisory 409 path serialized.
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_concurrent_duplicate_upstream_name_has_exactly_one_winner() {
+    let fixture = match start_mysql().await {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            fail_in_ci_else_skip(
+                "mysql_concurrent_duplicate_upstream_name_has_exactly_one_winner",
+                "MySQL 8.4",
+                &error,
+            );
+            return;
+        }
+    };
+    let store = Arc::new(connect_store(&fixture.url).await);
+    let upstream_a = make_upstream("ferrum", "upstream-a", "shared-name");
+    let upstream_b = make_upstream("ferrum", "upstream-b", "shared-name");
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let barrier_a = Arc::clone(&barrier);
+    let barrier_b = Arc::clone(&barrier);
+    let store_a = Arc::clone(&store);
+    let store_b = Arc::clone(&store);
+
+    let (result_a, result_b) = tokio::join!(
+        async move {
+            barrier_a.wait().await;
+            store_a.create_upstream(&upstream_a).await
+        },
+        async move {
+            barrier_b.wait().await;
+            store_b.create_upstream(&upstream_b).await
+        },
+    );
+
+    let success_count = [result_a.is_ok(), result_b.is_ok()]
+        .into_iter()
+        .filter(|ok| *ok)
+        .count();
+    let failure = result_a.err().or_else(|| result_b.err());
+    assert_eq!(
+        success_count, 1,
+        "exactly one concurrent upstream create must succeed"
+    );
+    let failure = failure.expect("exactly one concurrent upstream create must fail");
+    assert!(
+        is_unique_constraint_violation(&failure),
+        "losing writer must hit the unique (namespace, name) backstop: {failure:#}"
+    );
+    assert!(
+        !is_mysql_deadlock(&failure),
+        "losing writer must not be a deadlock victim: {failure:#}"
+    );
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM upstreams \
+         WHERE namespace = 'ferrum' AND name = 'shared-name'",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count duplicate-named upstreams");
+    assert_eq!(count, 1, "exactly one upstream with the shared name may persist");
+
+    assert!(
+        !store
+            .check_upstream_name_unique("ferrum", "shared-name", None)
+            .await
+            .expect("name uniqueness probe"),
+        "shared name must no longer be unique after the winner commits"
+    );
 }

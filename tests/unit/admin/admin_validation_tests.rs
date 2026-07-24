@@ -41,6 +41,22 @@ fn test_proxy_and_plugin_writes_run_plugin_graph_candidate_validation() {
 }
 
 #[test]
+fn test_upstream_serializes_namespace_config_admission() {
+    let source = include_str!("../../../src/admin/crud.rs");
+    let upstream_impl = source
+        .split("impl AdminResource for Upstream")
+        .nth(1)
+        .expect("Upstream AdminResource impl")
+        .split("impl AdminResource for PluginConfig")
+        .next()
+        .expect("PluginConfig AdminResource impl follows Upstream");
+    assert!(
+        upstream_impl.contains("const SERIALIZE_NAMESPACE_CONFIG_ADMISSION: bool = true;"),
+        "Upstream must hold the namespace config admission lease around uniqueness checks"
+    );
+}
+
+#[test]
 fn proxy_and_api_spec_deletes_validate_the_post_cascade_plugin_graph() {
     let crud = include_str!("../../../src/admin/crud.rs");
     assert!(

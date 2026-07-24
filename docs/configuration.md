@@ -224,18 +224,22 @@ bundle that may need them is alive.
 #### MySQL minimum version
 
 MySQL backends require **MySQL 8.0+**. The V001 schema applies an explicit
-`COLLATE utf8mb4_0900_as_cs` on identifier columns (`id`, `namespace`, `name`,
+`COLLATE utf8mb4_bin` on identifier columns (`id`, `namespace`, `name`,
 `username`, `custom_id`, `plugin_name`, `proxy_id`, `upstream_id`,
 `upstream_subset`, `api_spec_id`, `content_hash`, `spec_version`,
-`backend_host`, `backend_tls_sni`), which is only available on MySQL 8.0 and
-later. This makes uniqueness on `(namespace, name)`, `(namespace, username)`,
-etc. **byte-exact** rather than the case-insensitive default — so `Alpha` and
-`alpha` are distinct identifiers on MySQL just as they are on PostgreSQL and
-SQLite. Operators upgrading a populated 5.x MySQL deployment must run the
-matching `ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE
-utf8mb4_0900_as_cs` themselves; this is consistent with the build-out
-compatibility policy of folding schema changes into the V001 baseline rather
-than shipping incremental migrations.
+`backend_host`, `backend_tls_sni`). Binary collation makes uniqueness on
+`(namespace, name)`, `(namespace, username)`, etc. **byte-exact** — matching
+PostgreSQL and SQLite — so both case variants (`Alpha` vs `alpha`) and
+Unicode canonical equivalents (NFC `café` vs NFD `cafe\u{0301}`) remain
+distinct. A UCA collation such as `utf8mb4_0900_as_cs` is accent-/case-
+sensitive but still folds canonically equivalent sequences, which would
+diverge from the runtime's byte-keyed identity indexes. Operators upgrading a
+populated deployment that still uses `utf8mb4_0900_as_cs` (or an older
+case-insensitive default) must run the matching
+`ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_bin`
+themselves; this is consistent with the build-out compatibility policy of
+folding schema changes into the V001 baseline rather than shipping
+incremental migrations.
 
 MySQL full runtime loads require `REPEATABLE READ` transaction isolation. If the
 server or session default is weaker, Ferrum rejects the candidate full load and
