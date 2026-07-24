@@ -2445,6 +2445,55 @@ fn test_env_config_http_header_read_timeout_disabled() {
 }
 
 #[test]
+fn test_env_config_admin_body_read_timeout_default_and_custom() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+        ],
+        || {
+            remove_var("FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS");
+            remove_var("FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS");
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.admin_body_read_timeout_seconds, 10);
+            assert_eq!(config.admin_http2_max_concurrent_streams, 32);
+        },
+    );
+
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS", "0"),
+            ("FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS", "8"),
+        ],
+        || {
+            let config = EnvConfig::from_env().unwrap();
+            assert_eq!(config.admin_body_read_timeout_seconds, 0);
+            assert_eq!(config.admin_http2_max_concurrent_streams, 8);
+        },
+    );
+}
+
+#[test]
+fn test_env_config_admin_http2_max_concurrent_streams_rejects_zero() {
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS", "0"),
+        ],
+        || {
+            let err = EnvConfig::from_env().unwrap_err();
+            assert!(
+                err.contains("FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS"),
+                "zero streams must fail closed: {err}"
+            );
+        },
+    );
+}
+
+#[test]
 fn test_env_config_frontend_tls_handshake_timeout_default() {
     with_env_vars(
         &[

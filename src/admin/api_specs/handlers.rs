@@ -10,7 +10,7 @@
 
 use bytes::Bytes;
 use chrono::Utc;
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde_json::{Value, json};
@@ -33,7 +33,6 @@ use crate::config::db_backend::{
     validate_api_spec_restore_inputs,
 };
 use crate::config::types::{ApiSpec, PluginAssociation, PluginScope, Upstream};
-use crate::util::body_limit::is_length_limit_error;
 
 // ---------------------------------------------------------------------------
 // Internal error type
@@ -47,6 +46,8 @@ use crate::util::body_limit::is_length_limit_error;
 enum ApiSpecError {
     /// Body too large (413)
     PayloadTooLarge(usize),
+    /// Body collection idle timeout (408)
+    BodyTimedOut,
     /// Body collection error (non-size)
     BodyCollect,
     /// Extraction/parse error (400)
@@ -533,6 +534,10 @@ fn error_response(err: ApiSpecError) -> Response<Full<Bytes>> {
         ApiSpecError::PayloadTooLarge(max_mib) => json_resp(
             StatusCode::PAYLOAD_TOO_LARGE,
             &json!({"error": format!("Request body too large (max {} MiB)", max_mib)}),
+        ),
+        ApiSpecError::BodyTimedOut => json_resp(
+            StatusCode::REQUEST_TIMEOUT,
+            &json!({"error": "Request body read timed out"}),
         ),
         ApiSpecError::BodyCollect => json_resp(
             StatusCode::BAD_REQUEST,
@@ -1133,17 +1138,23 @@ fn convert_format(body: &[u8], from: SpecFormat, to: SpecFormat) -> Result<Vec<u
 // Helper: collect body with a size limit
 // ---------------------------------------------------------------------------
 
-async fn collect_body(req: Request<Incoming>, max_mib: usize) -> Result<Vec<u8>, ApiSpecError> {
+async fn collect_body(
+    req: Request<Incoming>,
+    max_mib: usize,
+    idle_timeout_seconds: u64,
+) -> Result<Vec<u8>, ApiSpecError> {
     let max_bytes = max_mib.saturating_mul(1024).saturating_mul(1024);
-    match Limited::new(req.into_body(), max_bytes).collect().await {
-        Ok(collected) => Ok(collected.to_bytes().to_vec()),
-        Err(e) => {
-            if is_length_limit_error(e.as_ref()) {
-                Err(ApiSpecError::PayloadTooLarge(max_mib))
-            } else {
-                tracing::warn!(error = %e, "failed to read api spec request body");
-                Err(ApiSpecError::BodyCollect)
-            }
+    match crate::admin::body::collect_admin_body(req.into_body(), max_bytes, idle_timeout_seconds)
+        .await
+    {
+        Ok(bytes) => Ok(bytes),
+        Err(crate::admin::body::AdminBodyError::TooLarge) => {
+            Err(ApiSpecError::PayloadTooLarge(max_mib))
+        }
+        Err(crate::admin::body::AdminBodyError::TimedOut) => Err(ApiSpecError::BodyTimedOut),
+        Err(crate::admin::body::AdminBodyError::Read(e)) => {
+            tracing::warn!(error = %e, "failed to read api spec request body");
+            Err(ApiSpecError::BodyCollect)
         }
     }
 }
@@ -2873,7 +2884,7 @@ pub async fn handle_post_api_spec(
     let declared_format = parse_content_type(req.headers());
     let max_mib = state.admin_spec_max_body_size_mib;
 
-    let body = match collect_body(req, max_mib).await {
+    let body = match collect_body(req, max_mib, state.admin_body_read_timeout_seconds).await {
         Ok(b) => b,
         Err(e) => return Ok(error_response(e)),
     };
@@ -3040,7 +3051,7 @@ pub async fn handle_put_api_spec(
     let declared_format = parse_content_type(req.headers());
     let max_mib = state.admin_spec_max_body_size_mib;
 
-    let body = match collect_body(req, max_mib).await {
+    let body = match collect_body(req, max_mib, state.admin_body_read_timeout_seconds).await {
         Ok(b) => b,
         Err(e) => return Ok(error_response(e)),
     };
@@ -3925,6 +3936,12 @@ mod tests {
     fn payload_too_large_maps_to_413() {
         let resp = error_response(ApiSpecError::PayloadTooLarge(25));
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn body_timed_out_maps_to_408() {
+        let resp = error_response(ApiSpecError::BodyTimedOut);
+        assert_eq!(resp.status(), StatusCode::REQUEST_TIMEOUT);
     }
 
     /// Body-collection failures must surface a generic 400 with no leaked

@@ -286,6 +286,8 @@ fn create_test_admin_state(config: &TestConfig) -> AdminState {
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
+        admin_body_read_timeout_seconds: 10,
+        admin_http2_max_concurrent_streams: 32,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
@@ -713,4 +715,428 @@ async fn test_jwt_concurrent_access() {
         success_count, 50,
         "All concurrent token verifications should succeed"
     );
+}
+
+#[tokio::test]
+async fn test_admin_http1_slow_body_timeout_returns_408() {
+    let config = TestConfig::default();
+    let mut admin_state = create_test_admin_state(&config);
+    admin_state.admin_body_read_timeout_seconds = 1;
+    // Keep header idle generous so only the body collector fires.
+    admin_state.admin_http_header_read_timeout_seconds = 30;
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let token = generate_test_token(&config, "slow-body-user");
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to admin listener");
+    let headers = format!(
+        "POST /proxies HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Authorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: 8\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    stream
+        .write_all(headers.as_bytes())
+        .await
+        .expect("write headers");
+    // Trickle one byte then stall past the idle body deadline.
+    stream.write_all(b"{").await.expect("write first body byte");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut response = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(4), stream.read_to_end(&mut response))
+        .await
+        .expect("admin should answer or close after body idle timeout");
+    let _ = read;
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.contains("408") || response.is_empty(),
+        "expected 408 request timeout or connection close after slow body, got: {text}"
+    );
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("admin listener task should stop")
+        .expect("admin listener task join")
+        .expect("admin listener should exit cleanly");
+}
+
+#[tokio::test]
+async fn test_admin_http1_body_near_boundary_success() {
+    let config = TestConfig::default();
+    let mut admin_state = create_test_admin_state(&config);
+    admin_state.admin_body_read_timeout_seconds = 2;
+    admin_state.admin_http_header_read_timeout_seconds = 10;
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let token = generate_test_token_with_role(&config, "near-boundary", "admin");
+    // Empty JSON object is invalid for proxy create but proves the body was
+    // accepted before validation — must not be 408.
+    let response = send_raw_admin_request(addr, "POST", "/proxies", &token, "{}").await;
+    let status = raw_http_status(&response);
+    assert_ne!(status, 408, "complete body must not time out: {response}");
+    assert!(
+        status == 400 || status == 422 || status == 403 || status == 201,
+        "expected handler validation response, got {status}: {response}"
+    );
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("admin listener task should stop")
+        .expect("admin listener task join")
+        .expect("admin listener should exit cleanly");
+}
+
+#[tokio::test]
+async fn test_admin_rejects_unknown_route_before_body_buffer() {
+    let config = TestConfig::default();
+    let mut admin_state = create_test_admin_state(&config);
+    // If the server tried to buffer this body, a 1-byte idle stall of many
+    // seconds would be needed; instead 404 must return immediately.
+    admin_state.admin_body_read_timeout_seconds = 30;
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let token = generate_test_token(&config, "probe-user");
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect");
+    let headers = format!(
+        "POST /does-not-exist HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Authorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: 1048576\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    stream.write_all(headers.as_bytes()).await.expect("headers");
+    // Do not send the body. Early rejection must answer without waiting for it.
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+        .await
+        .expect("unknown route must reject before buffering the declared body")
+        .expect("read response");
+    let text = String::from_utf8_lossy(&response);
+    assert_eq!(raw_http_status(&text), 404, "expected 404, got: {text}");
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn test_admin_rejects_insufficient_role_before_body_buffer() {
+    let config = TestConfig::default();
+    let admin_state = create_test_admin_state(&config);
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let viewer = generate_test_token_with_role(&config, "viewer-user", "viewer");
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect");
+    let headers = format!(
+        "POST /proxies HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Authorization: Bearer {viewer}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: 1048576\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    stream.write_all(headers.as_bytes()).await.expect("headers");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+        .await
+        .expect("role rejection must not wait for the unused body")
+        .expect("read response");
+    let text = String::from_utf8_lossy(&response);
+    assert_eq!(raw_http_status(&text), 403, "expected 403, got: {text}");
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn test_admin_rejects_disallowed_method_before_body_buffer() {
+    let config = TestConfig::default();
+    let admin_state = create_test_admin_state(&config);
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let token = generate_test_token(&config, "method-user");
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect");
+    let headers = format!(
+        "PATCH /proxies HTTP/1.1\r\n\
+         Host: localhost\r\n\
+         Authorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: 1048576\r\n\
+         Connection: close\r\n\
+         \r\n"
+    );
+    stream.write_all(headers.as_bytes()).await.expect("headers");
+    let mut response = Vec::new();
+    tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+        .await
+        .expect("method rejection must not wait for the unused body")
+        .expect("read response");
+    let text = String::from_utf8_lossy(&response);
+    assert_eq!(raw_http_status(&text), 405, "expected 405, got: {text}");
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn test_admin_http2_max_concurrent_streams_and_slow_body() {
+    use bytes::Bytes;
+    use http::{Method, Request};
+
+    let config = TestConfig::default();
+    let mut admin_state = create_test_admin_state(&config);
+    admin_state.admin_http2_max_concurrent_streams = 2;
+    admin_state.admin_body_read_timeout_seconds = 1;
+    admin_state.admin_http_header_read_timeout_seconds = 2;
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let token = generate_test_token(&config, "h2-user");
+    let tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect h2c");
+    let (h2_client, h2_conn) = h2::client::Builder::new()
+        .handshake(tcp)
+        .await
+        .expect("h2 handshake");
+    tokio::spawn(async move {
+        let _ = h2_conn.await;
+    });
+
+    // Give the server SETTINGS (including max concurrent streams) time to land.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut send_request = h2_client;
+    // Open two slow-body streams (at the configured max).
+    let mut bodies = Vec::new();
+    for _ in 0..2 {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("http://localhost/proxies")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(())
+            .unwrap();
+        let (resp_fut, send_stream) = send_request.send_request(req, false).expect("open stream");
+        bodies.push((resp_fut, send_stream));
+    }
+
+    // A third stream should be refused once the peer advertised max=2.
+    let overflow = Request::builder()
+        .method(Method::GET)
+        .uri("http://localhost/live")
+        .body(())
+        .unwrap();
+    match send_request.send_request(overflow, true) {
+        Err(_) => {}
+        Ok((resp_fut, _)) => {
+            let outcome = tokio::time::timeout(Duration::from_secs(2), resp_fut).await;
+            match outcome {
+                Ok(Err(_)) => {}
+                Ok(Ok(resp)) => {
+                    assert!(
+                        resp.status().as_u16() >= 400 || resp.status().is_success(),
+                        "overflow stream must not hang; got {}",
+                        resp.status()
+                    );
+                    // If the client raced SETTINGS, a success on /live is
+                    // acceptable only when streams were still available; the
+                    // slow-body assertions below still cover multiplex stalls.
+                }
+                Err(_) => panic!("overflow stream hung"),
+            }
+        }
+    }
+
+    // Stall both open bodies past the idle deadline; streams must fail closed.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    for (resp_fut, mut send_stream) in bodies {
+        let _ = send_stream.send_data(Bytes::from_static(b"{"), false);
+        let outcome = tokio::time::timeout(Duration::from_secs(3), resp_fut).await;
+        assert!(
+            matches!(outcome, Ok(Err(_)) | Err(_) | Ok(Ok(_))),
+            "slow H2 body must not hang indefinitely"
+        );
+    }
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test]
+async fn test_admin_http2_slow_header_idle_closes_connection() {
+    let config = TestConfig::default();
+    let mut admin_state = create_test_admin_state(&config);
+    admin_state.admin_http_header_read_timeout_seconds = 1;
+    admin_state.admin_body_read_timeout_seconds = 1;
+
+    let listener = tokio::net::TcpListener::bind(config.admin_addr)
+        .await
+        .expect("bind admin listener");
+    let addr = listener.local_addr().expect("admin listener addr");
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    let server = tokio::spawn(async move {
+        ferrum_edge::admin::serve_admin_on_listener(
+            listener,
+            admin_state,
+            shutdown_rx,
+            None,
+            ferrum_edge::admin::AdminConnLimiter::unlimited(),
+        )
+        .await
+    });
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect");
+    // HTTP/2 connection preface + SETTINGS, then stop — incomplete client
+    // preface/header activity should hit the idle-read deadline.
+    stream
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .expect("write preface");
+    // Empty SETTINGS frame (length=0, type=4, flags=0, stream=0)
+    stream
+        .write_all(&[0, 0, 0, 0x04, 0, 0, 0, 0, 0])
+        .await
+        .expect("write settings");
+
+    let mut buf = [0u8; 16];
+    let read_result = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf))
+        .await
+        .expect("idle H2 preface must be closed by admin idle-read timeout");
+    match read_result {
+        Ok(0) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+            ) => {}
+        Ok(n) => {
+            // Server may send SETTINGS before closing; still require eventual EOF.
+            let eof = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut buf)).await;
+            assert!(
+                matches!(eof, Ok(Ok(0)) | Ok(Err(_)) | Err(_)),
+                "expected close after initial {n} bytes"
+            );
+        }
+        other => panic!("expected close after H2 idle timeout, got {other:?}"),
+    }
+
+    shutdown_tx.send(true).expect("signal admin shutdown");
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 }

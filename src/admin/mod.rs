@@ -3,21 +3,23 @@
 pub mod api_specs;
 pub mod audit;
 mod backup;
+pub(crate) mod body;
 pub mod conn_limit;
 pub(crate) mod crud;
+mod idle_io;
 pub mod jwt_auth;
 pub mod mesh_config_drift;
 pub mod mesh_remote_clusters;
 pub mod metrics;
+mod route_preflight;
 pub mod spec_codec;
 mod tls_management;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use http_body_util::{BodyExt, Full, Limited};
+use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{HeaderValue, RETRY_AFTER};
-use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -53,7 +55,6 @@ use crate::grpc::mesh_registry::MeshNodeRegistry;
 use crate::plugins;
 use crate::proxy::ProxyState;
 use crate::tls::managed::ManagedTlsMaterialKind;
-use crate::util::body_limit::is_length_limit_error;
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 
@@ -314,6 +315,15 @@ pub struct AdminState {
     pub mesh_runtime_state: Option<crate::modes::mesh::runtime::MeshRuntimeState>,
     /// Admin HTTP header read timeout (seconds). 0 disables.
     pub admin_http_header_read_timeout_seconds: u64,
+    /// Admin request-body idle read timeout (seconds). 0 disables.
+    ///
+    /// Bounds inter-frame stalls while collecting admin request bodies on both
+    /// HTTP/1.1 and HTTP/2. Progressing uploads re-arm the deadline; a stalled
+    /// trickle returns `408 Request Timeout`.
+    pub admin_body_read_timeout_seconds: u64,
+    /// Max concurrent HTTP/2 streams per admin connection. Bounds multiplexed
+    /// slow-stream retention independently of the TCP connection cap.
+    pub admin_http2_max_concurrent_streams: u32,
     /// Admin TLS handshake timeout (seconds). 0 disables.
     pub admin_tls_handshake_timeout_seconds: u64,
     /// Configured backend IP egress policy (`FERRUM_BACKEND_ALLOW_IPS`). Used to
@@ -621,6 +631,30 @@ pub async fn serve_admin_on_listener_with_dynamic_tls(
     }
 }
 
+/// Apply admin-plane HTTP/1.1 + HTTP/2 slowloris settings to an auto builder.
+fn configure_admin_http_builder(
+    builder: &mut hyper_util::server::conn::auto::Builder<hyper_util::rt::TokioExecutor>,
+    header_read_timeout_seconds: u64,
+    h2_max_concurrent_streams: u32,
+) {
+    if header_read_timeout_seconds > 0 {
+        let mut http1 = builder.http1();
+        http1.timer(hyper_util::rt::TokioTimer::new());
+        http1.header_read_timeout(Duration::from_secs(header_read_timeout_seconds));
+    }
+    {
+        let mut http2 = builder.http2();
+        http2.max_concurrent_streams(h2_max_concurrent_streams);
+        // Keep-alive detects fully stalled H2 peers; pair with the idle IO
+        // wrapper so incomplete header streams cannot linger forever.
+        if header_read_timeout_seconds > 0 {
+            http2.timer(hyper_util::rt::TokioTimer::new());
+            http2.keep_alive_interval(Duration::from_secs(header_read_timeout_seconds));
+            http2.keep_alive_timeout(Duration::from_secs(header_read_timeout_seconds));
+        }
+    }
+}
+
 /// Handle TLS connections for Admin API.
 async fn handle_admin_tls_connection(
     stream: tokio::net::TcpStream,
@@ -633,6 +667,7 @@ async fn handle_admin_tls_connection(
     let acceptor = TlsAcceptor::from(tls_config);
     let tls_handshake_timeout = state.admin_tls_handshake_timeout_seconds;
     let header_read_timeout = state.admin_http_header_read_timeout_seconds;
+    let h2_max_streams = state.admin_http2_max_concurrent_streams;
     let tls_stream = crate::tls::accept_with_optional_timeout(
         &acceptor,
         stream,
@@ -643,28 +678,24 @@ async fn handle_admin_tls_connection(
     .await?;
     info!("Admin TLS connection established from {}", remote_addr.ip());
 
-    // Convert TLS stream to TokioIo for hyper
-    let io = hyper_util::rt::TokioIo::new(tls_stream);
+    // Idle-read deadline covers incomplete HTTP/2 HEADERS/CONTINUATION streams
+    // that never reach the service layer (Hyper's header timer is H1-only).
+    // Use max(header, body) so a longer body idle setting is not preempted by
+    // the connection-level wrapper during a progressing-but-slow upload.
+    let idle_secs = header_read_timeout.max(state.admin_body_read_timeout_seconds);
+    let idle = Duration::from_secs(idle_secs);
+    let io = TokioIo::new(idle_io::IdleTimeoutStream::new(tls_stream, idle));
 
-    // Use the same HTTP service function
     let client_ip = remote_addr.ip();
     let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let state = state.clone();
         async move { handle_admin_request(req, state, client_ip).await }
     });
 
-    // Use auto builder to support both HTTP/1.1 and HTTP/2 via ALPN negotiation.
-    // The TLS config advertises both h2 and http/1.1, so clients can negotiate
-    // either protocol.
+    // Auto builder: ALPN may negotiate HTTP/1.1 or HTTP/2.
     let mut builder =
         hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
-    // This header timer only applies to the HTTP/1 admin path; this builder
-    // does not expose an equivalent HTTP/2 admin header deadline.
-    if header_read_timeout > 0 {
-        let mut http1 = builder.http1();
-        http1.timer(hyper_util::rt::TokioTimer::new());
-        http1.header_read_timeout(Duration::from_secs(header_read_timeout));
-    }
+    configure_admin_http_builder(&mut builder, header_read_timeout, h2_max_streams);
     let conn = builder.serve_connection(io, svc);
 
     if let Err(e) = conn.await {
@@ -674,25 +705,29 @@ async fn handle_admin_tls_connection(
     Ok(())
 }
 
-/// Handle a single admin connection.
+/// Handle a single admin connection (plaintext HTTP/1.1 or prior-knowledge H2).
 async fn handle_admin_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
     state: AdminState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let io = TokioIo::new(stream);
     let header_read_timeout_seconds = state.admin_http_header_read_timeout_seconds;
+    let h2_max_streams = state.admin_http2_max_concurrent_streams;
+    let idle_secs =
+        header_read_timeout_seconds.max(state.admin_body_read_timeout_seconds);
+    let idle = Duration::from_secs(idle_secs);
+    let io = TokioIo::new(idle_io::IdleTimeoutStream::new(stream, idle));
     let client_ip = remote_addr.ip();
     let svc = service_fn(move |req: Request<Incoming>| {
         let state = state.clone();
         async move { handle_admin_request(req, state, client_ip).await }
     });
 
-    let mut builder = http1::Builder::new();
-    if header_read_timeout_seconds > 0 {
-        builder.timer(hyper_util::rt::TokioTimer::new());
-        builder.header_read_timeout(Duration::from_secs(header_read_timeout_seconds));
-    }
+    // Auto builder so plaintext admin gets the same H2 stream caps / idle
+    // protection as TLS (h2c prior knowledge), not only HTTP/1.1.
+    let mut builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    configure_admin_http_builder(&mut builder, header_read_timeout_seconds, h2_max_streams);
 
     if let Err(e) = builder.serve_connection(io, svc).await {
         error!("Admin HTTP connection error: {}", e);
@@ -1704,14 +1739,6 @@ pub async fn handle_admin_request(
         _ => {}
     }
 
-    if method == Method::POST
-        && matches!(segments_peek.as_slice(), ["restore"] | ["batch"])
-        && let Some(resp) = require_admin_role(&auth, AdminRole::Admin)
-    {
-        drop(req.into_body());
-        return Ok(resp);
-    }
-
     // Pagination lives in the request line, not the body, so validate it for the
     // GET list routes that consume it BEFORE the shared body read below. Without
     // this, `GET /proxies?limit=abc` carrying an oversized (and entirely unused)
@@ -1719,6 +1746,23 @@ pub async fn handle_admin_request(
     // malformed-pagination `400`. The route's own role gate is replayed here
     // first so pagination can never preempt the `403` the arm would return; the
     // in-arm gates below remain authoritative and simply re-run idempotently.
+    //
+    // Route / method / role preflight also runs here so unknown paths,
+    // disallowed methods, and insufficient roles reject before any body collect
+    // (issue #2404). API-spec arms above already returned.
+    let body_policy = match route_preflight::classify_admin_route(
+        &method,
+        segments_peek.as_slice(),
+        &auth,
+        state.admin_restore_max_body_size_mib,
+    ) {
+        route_preflight::AdminRoutePreflight::Proceed(policy) => policy,
+        route_preflight::AdminRoutePreflight::Reject(resp) => {
+            drop(req.into_body());
+            return Ok(resp);
+        }
+    };
+
     let prevalidated_pagination =
         match paginated_get_list_route_role(&method, segments_peek.as_slice()) {
             Some(required_role) => {
@@ -1750,34 +1794,48 @@ pub async fn handle_admin_request(
             None => None,
         };
 
-    // Read body with size limit.
-    // /restore gets a configurable limit (default 100 MiB) for large-scale
-    // backups (30K+ proxies / 90K+ plugins can reach ~80 MB);
-    // all other endpoints use the standard 1 MiB limit.
-    let restore_max_mib: usize = if path == "/restore" {
-        state.admin_restore_max_body_size_mib
-    } else {
-        1
-    };
-    let max_body_size = restore_max_mib * 1024 * 1024;
-    let body_bytes = match Limited::new(req.into_body(), max_body_size).collect().await {
-        Ok(collected) => collected.to_bytes().to_vec(),
-        Err(e) => {
-            if is_length_limit_error(e.as_ref()) {
-                return Ok(json_response(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    &json!({"error": format!("Request body too large (max {} MiB)", restore_max_mib)}),
-                ));
+    // Read body with size + idle-time limits, or discard when the route does
+    // not consume one. /restore keeps its configurable MiB cap; all other
+    // body-reading endpoints use the standard 1 MiB limit.
+    let body_bytes = match body_policy {
+        route_preflight::AdminBodyPolicy::Discard => {
+            drop(req.into_body());
+            Vec::new()
+        }
+        route_preflight::AdminBodyPolicy::Collect { max_body_mib } => {
+            let max_body_size = max_body_mib.saturating_mul(1024).saturating_mul(1024);
+            match body::collect_admin_body(
+                req.into_body(),
+                max_body_size,
+                state.admin_body_read_timeout_seconds,
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(body::AdminBodyError::TooLarge) => {
+                    return Ok(json_response(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        &json!({"error": format!("Request body too large (max {} MiB)", max_body_mib)}),
+                    ));
+                }
+                Err(body::AdminBodyError::TimedOut) => {
+                    return Ok(json_response(
+                        StatusCode::REQUEST_TIMEOUT,
+                        &json!({"error": "Request body read timed out"}),
+                    ));
+                }
+                Err(body::AdminBodyError::Read(e)) => {
+                    warn!(
+                        path = %path,
+                        error = %e,
+                        "Admin request body collection failed"
+                    );
+                    return Ok(json_response(
+                        StatusCode::BAD_REQUEST,
+                        &json!({"error": "Failed to read request body"}),
+                    ));
+                }
             }
-            warn!(
-                path = %path,
-                error = %e,
-                "Admin request body collection failed"
-            );
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                &json!({"error": "Failed to read request body"}),
-            ));
         }
     };
 

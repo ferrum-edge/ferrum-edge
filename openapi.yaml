@@ -68,6 +68,18 @@ info:
     endpoint has a higher configurable limit (default 100 MiB, controlled by
     `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB`) to accommodate large-scale
     backups (30K+ proxies / 90K+ plugins can reach ~80 MB).
+
+    ## Request body read timeouts
+
+    Admin body collection applies an idle inter-frame deadline from
+    `FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS` (default `10`). A stalled upload
+    returns `408 Request Timeout`. Incomplete HTTP/1.1 headers and incomplete
+    HTTP/2 HEADERS/CONTINUATION streams are bounded by
+    `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` (admin idle-read + keep-alive).
+    Concurrent HTTP/2 streams per admin connection are capped by
+    `FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS` (default `32`). Unknown routes,
+    disallowed methods, and insufficient roles are rejected before the body is
+    collected whenever routing permits.
   version: 0.2.0
   license:
     name: PolyForm Noncommercial 1.0.0
@@ -3438,6 +3450,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/ReadOnly"
+        "408":
+          description: Request body read timed out (idle deadline from FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS)
         "413":
           description: Request body too large (default max 100 MiB, configurable via FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB)
         "503":
@@ -4755,6 +4769,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "408":
+          description: Request body read timed out (idle deadline from FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS)
         "413":
           description: Request body exceeds `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` (default 25 MiB)
           content:
@@ -4981,6 +4997,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "408":
+          description: Request body read timed out (idle deadline from FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS)
         "413":
           description: Request body exceeds the configured size limit
           content:

@@ -657,6 +657,8 @@ async fn start_node_agent_admin_listeners(
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: env_config.http_header_read_timeout_seconds,
+        admin_body_read_timeout_seconds: env_config.admin_body_read_timeout_seconds,
+        admin_http2_max_concurrent_streams: env_config.admin_http2_max_concurrent_streams,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: env_config.frontend_tls_handshake_timeout_seconds,
         backend_allow_ips: env_config.backend_allow_ips.clone(),

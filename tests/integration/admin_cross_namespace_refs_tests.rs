@@ -116,6 +116,8 @@ async fn build_admin_state(tc: &TestConfig) -> (AdminState, tempfile::TempDir) {
         mesh_registry: None,
         cp_connection_state: None,
         admin_http_header_read_timeout_seconds: 10,
+        admin_body_read_timeout_seconds: 10,
+        admin_http2_max_concurrent_streams: 32,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),

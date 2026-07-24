@@ -2042,6 +2042,15 @@ pub struct EnvConfig {
     /// Default: 25 MiB.
     pub admin_spec_max_body_size_mib: usize,
 
+    /// Idle timeout in seconds while reading an admin request body. Applies to
+    /// shared admin collectors and `/api-specs` body reads. `0` disables the
+    /// idle deadline (size limit only). Default: 10.
+    pub admin_body_read_timeout_seconds: u64,
+
+    /// Max concurrent HTTP/2 streams per admin connection. Bounds multiplexed
+    /// slow-stream retention on the management plane. Default: 32.
+    pub admin_http2_max_concurrent_streams: u32,
+
     /// Migration action: up, status, config (migrate mode only).
     /// Default: "up".
     pub migrate_action: String,
@@ -2559,6 +2568,8 @@ impl Default for EnvConfig {
             admin_max_connections_per_ip: 0,
             admin_restore_max_body_size_mib: 100,
             admin_spec_max_body_size_mib: 25,
+            admin_body_read_timeout_seconds: 10,
+            admin_http2_max_concurrent_streams: 32,
             migrate_action: "up".into(),
             migrate_dry_run: false,
             auto_apply_plugin_migrations: false,
@@ -2993,6 +3004,8 @@ impl EnvConfig {
             admin_max_connections_per_ip: usize = "FERRUM_ADMIN_MAX_CONNECTIONS_PER_IP" => 0usize;
             admin_restore_max_body_size_mib: usize = "FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB" => 100usize;
             admin_spec_max_body_size_mib: usize = "FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB" => 25usize;
+            admin_body_read_timeout_seconds: u64 = "FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS" => 10u64;
+            admin_http2_max_concurrent_streams: u32 = "FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS" => 32u32, max(1u32);
             migrate_action: String = "FERRUM_MIGRATE_ACTION" => "up".to_string(), lowercase();
             migrate_dry_run: bool = "FERRUM_MIGRATE_DRY_RUN" => false;
             auto_apply_plugin_migrations: bool = "FERRUM_AUTO_APPLY_PLUGIN_MIGRATIONS" => false;
@@ -3613,6 +3626,8 @@ impl EnvConfig {
             admin_max_connections_per_ip,
             admin_restore_max_body_size_mib,
             admin_spec_max_body_size_mib,
+            admin_body_read_timeout_seconds,
+            admin_http2_max_concurrent_streams,
             migrate_action,
             migrate_dry_run,
             auto_apply_plugin_migrations,

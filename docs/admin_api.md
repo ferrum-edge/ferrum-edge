@@ -24,6 +24,16 @@ Most endpoints require a valid HS256 JWT in the `Authorization: Bearer <token>` 
 
 The whole admin listener can additionally be restricted at the TCP layer with `FERRUM_ADMIN_ALLOWED_CIDRS`.
 
+### Slowloris and request-body protection
+
+Admin listeners apply layered idle deadlines so a low-privilege client cannot hold request tasks open indefinitely:
+
+- `FERRUM_HTTP_HEADER_READ_TIMEOUT_SECONDS` (default `10`) closes incomplete HTTP/1.1 header blocks and, on admin connections, also arms a connection idle-read deadline plus HTTP/2 keep-alive so incomplete HTTP/2 HEADERS/CONTINUATION streams cannot linger.
+- `FERRUM_ADMIN_BODY_READ_TIMEOUT_SECONDS` (default `10`) is an inter-frame idle deadline while collecting request bodies on HTTP/1.1 and HTTP/2. Progressing uploads re-arm the timer; a stall returns `408 Request Timeout`. Byte caps are unchanged (`1 MiB` for ordinary writes, `FERRUM_ADMIN_RESTORE_MAX_BODY_SIZE_MIB` / `FERRUM_ADMIN_SPEC_MAX_BODY_SIZE_MIB` for restore and API specs).
+- `FERRUM_ADMIN_HTTP2_MAX_CONCURRENT_STREAMS` (default `32`) bounds multiplexed streams per admin connection independently of `FERRUM_ADMIN_MAX_CONNECTIONS`.
+
+Unknown routes, disallowed methods, and insufficient roles are rejected **before** the shared body collect whenever routing permits, so a probing client cannot force the admin task to buffer an unused upload.
+
 Admin JWTs must include `iss`, `sub`, `exp`, `iat`, `nbf`, `jti`, and a string `role` claim. `iss` must match `FERRUM_ADMIN_JWT_ISSUER` (default `ferrum-edge`), and `nbf`/`exp` are validated. The `FERRUM_ADMIN_JWT_MAX_TTL` cap (default `3600` seconds) is enforced against verifier time, not just the claims, and counts the accepted clock-skew leeway (60 seconds) exactly once: `exp - iat` must be positive and within the maximum, `iat` must not be later than verifier time plus the leeway, `exp - now` must stay within the maximum plus that same leeway, and `exp` must still be in the future at verifier time (the cap path applies no expiry grace, so the skew allowance is not counted a second time at expiration). Effective maximum real validity is therefore `FERRUM_ADMIN_JWT_MAX_TTL + 60s`, and shifting `iat` and `exp` together into the future cannot extend a token's real lifetime beyond that bound. Setting `FERRUM_ADMIN_JWT_MAX_TTL=0` intentionally disables the lifetime cap; a configured value above `9223372036854775807` is rejected at startup as invalid rather than treated as unlimited. When `FERRUM_ADMIN_JWT_AUDIENCE` is set, tokens must also carry a matching `aud` claim. When unset (default), tokens without an `aud` claim are accepted, but tokens that carry `aud` are rejected per RFC 7519 §4.1.3 (no acceptable audience is configured) — if your token minter stamps `aud`, set `FERRUM_ADMIN_JWT_AUDIENCE` to that value.
 
 ### Per-namespace tenancy (`FERRUM_ADMIN_REQUIRE_NAMESPACE_CLAIM`)
