@@ -28,9 +28,11 @@
 //! `(namespace, listen_path)`: path uniqueness is host-scoped, so only
 //! namespace/name and namespace/listen_port uniqueness constraints belong in
 //! V001. A non-unique secondary `idx_proxies_ns_listen_path` still covers the
-//! listen-path candidate scan under the route-bucket write lock
-//! (`utf8mb4` key length for `VARCHAR(255)+VARCHAR(512)` is 3068 bytes,
-//! inside InnoDB's 3072-byte limit — no prefix required).
+//! listen-path candidate scan under the route-bucket write lock. MySQL uses a
+//! 255-character `listen_path` prefix because InnoDB appends the `VARCHAR(255)`
+//! primary key to secondary-index records; full namespace + path + primary-key
+//! columns can exceed its 3072-byte key limit. The query retains its full
+//! `listen_path = ?` predicate, so prefix collisions are filtered correctly.
 //!
 //! ## Foreign key constraints
 //!
@@ -288,6 +290,10 @@ impl V001SqlBuilder {
     ) -> Result<(), anyhow::Error> {
         for idx_sql in [
             "CREATE INDEX IF NOT EXISTS idx_proxies_ns_id ON proxies (namespace, id)",
+            // Also run on the compatibility pass so databases that recorded
+            // V001 before this secondary index was folded into the baseline
+            // receive it without a new migration.
+            self.proxies_ns_listen_path_index_sql(),
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_id ON consumers (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_id ON plugin_configs (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_id ON upstreams (namespace, id)",
@@ -346,13 +352,15 @@ impl V001SqlBuilder {
     }
 
     fn proxies_ns_listen_path_index_sql(&self) -> &'static str {
-        // Same SQL on every dialect. MySQL key length under utf8mb4 is
-        // `255*4 + 512*4 = 3068` bytes, inside InnoDB's 3072-byte limit, so
-        // no prefix is required and equality filtering stays full-column.
-        // Keep the helper so index-presence tests can assert without relying
-        // on create_indexes()'s opaque string array.
         match self.dialect {
-            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+            // InnoDB secondary-index records include the table's primary key.
+            // namespace(255) + listen_path(255) + id(255) under utf8mb4 is
+            // 3060 bytes, below the 3072-byte default-page limit. The full
+            // equality predicate remains in the query as a residual filter.
+            SqlDialect::MySql => {
+                "CREATE INDEX IF NOT EXISTS idx_proxies_ns_listen_path ON proxies (namespace, listen_path(255))"
+            }
+            SqlDialect::Postgres | SqlDialect::Sqlite => {
                 "CREATE INDEX IF NOT EXISTS idx_proxies_ns_listen_path ON proxies (namespace, listen_path)"
             }
         }
@@ -1264,11 +1272,9 @@ mod tests {
     }
 
     #[test]
-    fn test_proxies_ns_listen_path_index_is_non_unique_and_full_column() {
+    fn test_proxies_ns_listen_path_index_is_non_unique_and_dialect_safe() {
         // Covers listen_path_candidate_sql without weakening the host-overlap
-        // uniqueness lease (which remains application-enforced). MySQL key
-        // length for namespace VARCHAR(255) + listen_path VARCHAR(512) under
-        // utf8mb4 is 3068 bytes (< 3072), so no prefix is required.
+        // uniqueness lease (which remains application-enforced).
         for dialect in ["postgres", "mysql", "sqlite"] {
             let builder = V001SqlBuilder::new(dialect);
             let sql = builder.proxies_ns_listen_path_index_sql();
@@ -1277,17 +1283,24 @@ mod tests {
                 "{dialect} must name the listen_path secondary index consistently"
             );
             assert!(
-                sql.contains("ON proxies (namespace, listen_path)"),
-                "{dialect} must index full (namespace, listen_path) columns for equality filtering"
-            );
-            assert!(
                 !sql.contains("UNIQUE"),
                 "{dialect} must not add a unique lease on (namespace, listen_path)"
             );
-            assert!(
-                !sql.contains("listen_path("),
-                "{dialect} must not use a MySQL prefix length that weakens equality filtering"
-            );
+            if dialect == "mysql" {
+                assert!(
+                    sql.contains("ON proxies (namespace, listen_path(255))"),
+                    "MySQL must leave room for InnoDB's appended VARCHAR(255) primary key"
+                );
+            } else {
+                assert!(
+                    sql.contains("ON proxies (namespace, listen_path)"),
+                    "{dialect} must index full (namespace, listen_path) columns"
+                );
+                assert!(
+                    !sql.contains("listen_path("),
+                    "{dialect} must not use a prefix length"
+                );
+            }
         }
     }
 
