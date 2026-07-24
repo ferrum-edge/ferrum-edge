@@ -1156,28 +1156,240 @@ async fn test_srv_resolution_nonexistent_service() {
 // ============================================================================
 
 #[tokio::test]
-async fn test_per_proxy_ttl_override_does_not_affect_resolution() {
-    // Per-proxy TTL override is an internal caching parameter — it should not
-    // change the resolved IP, only how long the entry lives in cache.
+async fn test_per_proxy_ttl_override_does_not_affect_resolved_address() {
+    // Per-proxy TTL override is a freshness parameter — it must not change the
+    // resolved IP, only when this caller treats the shared entry as stale.
     let config = DnsConfig {
         ttl_override_seconds: Some(300),
+        min_ttl_seconds: 1,
         ..DnsConfig::default()
     };
     let cache = DnsCache::new(config);
 
-    // Resolve with a per-proxy TTL override of 1s
     let result = cache.resolve("127.0.0.1", None, Some(1)).await;
     assert!(result.is_ok());
 
-    // Wait for the per-proxy TTL to expire (but global 300s TTL would still hold)
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
-    // Entry should still resolve (still cached; per-proxy TTL affects the
-    // internal expires_at but the entry is served stale-while-revalidate)
     let result2 = cache.resolve("127.0.0.1", None, Some(1)).await;
     assert!(result2.is_ok());
     assert_eq!(result.unwrap(), result2.unwrap());
 }
+
+// ============================================================================
+// Per-proxy TTL isolation for shared hostnames (#2415)
+// ============================================================================
+
+#[tokio::test]
+async fn test_shared_hostname_ttl_isolation_short_then_long() {
+    // 5s then 600s insertion order: short consumer must expire independently.
+    let cache = DnsCache::new(DnsConfig {
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 0,
+        ttl_override_seconds: None,
+        ..DnsConfig::default()
+    });
+    let metrics = ferrum_edge::runtime_metrics::global_ref();
+    use std::sync::atomic::Ordering;
+
+    let _ = cache.resolve("127.0.0.1", None, Some(5)).await.unwrap();
+    let _ = cache.resolve("127.0.0.1", None, Some(600)).await.unwrap();
+
+    let hits_before = metrics.dns_cache_hits.load(Ordering::Relaxed);
+    let misses_before = metrics.dns_cache_misses.load(Ordering::Relaxed);
+
+    // Still within 5s — both should hit.
+    let _ = cache.resolve("127.0.0.1", None, Some(5)).await.unwrap();
+    let _ = cache.resolve("127.0.0.1", None, Some(600)).await.unwrap();
+    assert!(
+        metrics.dns_cache_hits.load(Ordering::Relaxed) >= hits_before + 2,
+        "both consumers must hit while within the short TTL window"
+    );
+    let _ = misses_before;
+
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    let misses_mid = metrics.dns_cache_misses.load(Ordering::Relaxed);
+
+    // Short TTL is expired (stale_ttl=0) → miss / re-resolve.
+    let _ = cache.resolve("127.0.0.1", None, Some(5)).await.unwrap();
+    assert!(
+        metrics.dns_cache_misses.load(Ordering::Relaxed) > misses_mid,
+        "5s consumer must re-resolve after its TTL elapses"
+    );
+
+    // Long TTL still fresh against the shared resolved_at (possibly refreshed
+    // by the short consumer's re-resolve above).
+    let hits_before_long = metrics.dns_cache_hits.load(Ordering::Relaxed);
+    let _ = cache.resolve("127.0.0.1", None, Some(600)).await.unwrap();
+    assert!(
+        metrics.dns_cache_hits.load(Ordering::Relaxed) > hits_before_long,
+        "600s consumer must hit the shared record after the short consumer refreshed"
+    );
+}
+
+#[tokio::test]
+async fn test_shared_hostname_ttl_isolation_long_then_short() {
+    // 600s then 5s insertion order must behave the same as the reverse order.
+    let cache = DnsCache::new(DnsConfig {
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 0,
+        ttl_override_seconds: None,
+        ..DnsConfig::default()
+    });
+    let metrics = ferrum_edge::runtime_metrics::global_ref();
+    use std::sync::atomic::Ordering;
+
+    let _ = cache.resolve("127.0.0.1", None, Some(600)).await.unwrap();
+    let _ = cache.resolve("127.0.0.1", None, Some(5)).await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    let misses_before = metrics.dns_cache_misses.load(Ordering::Relaxed);
+    let _ = cache.resolve("127.0.0.1", None, Some(5)).await.unwrap();
+    assert!(
+        metrics.dns_cache_misses.load(Ordering::Relaxed) > misses_before,
+        "5s consumer must re-resolve even when a 600s consumer populated the entry first"
+    );
+
+    let hits_before = metrics.dns_cache_hits.load(Ordering::Relaxed);
+    let _ = cache.resolve("127.0.0.1", None, Some(600)).await.unwrap();
+    assert!(
+        metrics.dns_cache_hits.load(Ordering::Relaxed) > hits_before,
+        "600s consumer must still hit after the short consumer refreshed"
+    );
+}
+
+#[tokio::test]
+async fn test_warmup_order_does_not_select_winning_ttl() {
+    let cache = DnsCache::new(DnsConfig {
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 0,
+        ..DnsConfig::default()
+    });
+    let metrics = ferrum_edge::runtime_metrics::global_ref();
+    use std::sync::atomic::Ordering;
+
+    // Warm with long TTL first (historical first-writer-wins failure mode).
+    cache
+        .warmup(vec![
+            ("127.0.0.1".to_string(), None, Some(600)),
+            ("127.0.0.1".to_string(), None, Some(5)),
+        ])
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    let misses_before = metrics.dns_cache_misses.load(Ordering::Relaxed);
+    let _ = cache.resolve("127.0.0.1", None, Some(5)).await.unwrap();
+    assert!(
+        metrics.dns_cache_misses.load(Ordering::Relaxed) > misses_before,
+        "warmup with 600s first must not pin a short-TTL consumer to a long freshness window"
+    );
+}
+
+#[tokio::test]
+async fn test_reload_reorder_warmup_preserves_per_caller_ttl() {
+    let cache = DnsCache::new(DnsConfig {
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 0,
+        ..DnsConfig::default()
+    });
+    let metrics = ferrum_edge::runtime_metrics::global_ref();
+    use std::sync::atomic::Ordering;
+
+    // Simulate reload reordering: short TTL listed first on the second warmup.
+    cache
+        .warmup(vec![
+            ("127.0.0.1".to_string(), None, Some(600)),
+            ("127.0.0.1".to_string(), None, Some(5)),
+        ])
+        .await;
+    cache
+        .warmup(vec![
+            ("127.0.0.1".to_string(), None, Some(5)),
+            ("127.0.0.1".to_string(), None, Some(600)),
+        ])
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+
+    let misses_before = metrics.dns_cache_misses.load(Ordering::Relaxed);
+    let hits_before = metrics.dns_cache_hits.load(Ordering::Relaxed);
+    let _ = cache.resolve("127.0.0.1", None, Some(5)).await.unwrap();
+    let _ = cache.resolve("127.0.0.1", None, Some(600)).await.unwrap();
+    assert!(
+        metrics.dns_cache_misses.load(Ordering::Relaxed) > misses_before,
+        "short TTL must miss after reload reorder"
+    );
+    assert!(
+        metrics.dns_cache_hits.load(Ordering::Relaxed) > hits_before,
+        "long TTL must still hit after reload reorder"
+    );
+}
+
+#[tokio::test]
+async fn test_global_native_precedence_with_shared_record() {
+    // Per-proxy > global > native, evaluated per caller against shared data.
+    let cache = DnsCache::new(DnsConfig {
+        ttl_override_seconds: Some(3600),
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 0,
+        ..DnsConfig::default()
+    });
+    let metrics = ferrum_edge::runtime_metrics::global_ref();
+    use std::sync::atomic::Ordering;
+
+    // Populate via a caller with no per-proxy TTL (uses global 3600).
+    let _ = cache.resolve("127.0.0.1", None, None).await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Caller with per-proxy TTL 1 must be expired despite global 3600 on the
+    // original writer / shared entry.
+    let misses_before = metrics.dns_cache_misses.load(Ordering::Relaxed);
+    let _ = cache.resolve("127.0.0.1", None, Some(1)).await.unwrap();
+    assert!(
+        metrics.dns_cache_misses.load(Ordering::Relaxed) > misses_before,
+        "per-proxy TTL must win over the global override for that caller"
+    );
+
+    // Caller with no per-proxy TTL still uses global 3600 → hit.
+    let hits_before = metrics.dns_cache_hits.load(Ordering::Relaxed);
+    let _ = cache.resolve("127.0.0.1", None, None).await.unwrap();
+    assert!(
+        metrics.dns_cache_hits.load(Ordering::Relaxed) > hits_before,
+        "caller without per-proxy TTL must keep global/native freshness"
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_stale_refresh_dedup_with_divergent_ttls() {
+    let cache = DnsCache::new(DnsConfig {
+        min_ttl_seconds: 1,
+        stale_ttl_seconds: 30,
+        max_concurrent_refreshes: 8,
+        ..DnsConfig::default()
+    });
+
+    let _ = cache.resolve("127.0.0.1", None, Some(1)).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // Many concurrent short-TTL callers in the stale window must single-flight.
+    let mut handles = Vec::new();
+    for _ in 0..32 {
+        let cache = cache.clone();
+        handles.push(tokio::spawn(async move {
+            cache.resolve("127.0.0.1", None, Some(1)).await
+        }));
+    }
+    for handle in handles {
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    // Long-TTL callers hitting the same hostname must not create a second entry.
+    let _ = cache.resolve("127.0.0.1", None, Some(600)).await.unwrap();
+    assert_eq!(cache.cache_len(), 1);
+}
+
 
 // ============================================================================
 // Concurrent refresh limiter tests

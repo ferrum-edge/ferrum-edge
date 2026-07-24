@@ -6,13 +6,26 @@ Ferrum Edge includes a full-featured DNS resolver built on [hickory-resolver](ht
 
 By default, the DNS cache respects each record's **native TTL** from the DNS response. No global TTL override is applied — short-TTL records (e.g., 30s for service discovery) refresh quickly while long-TTL records (e.g., 3600s for stable services) persist longer. A minimum TTL floor (`FERRUM_DNS_MIN_TTL_SECONDS`, default 5s) prevents extremely short TTLs from causing excessive DNS queries.
 
-**TTL priority** (highest to lowest):
+**TTL priority** (highest to lowest) when evaluating freshness for a **specific caller**:
 
-1. **Per-proxy TTL** (`dns_cache_ttl_seconds` on the proxy config) — overrides everything for that proxy's backend
-2. **Global TTL override** (`FERRUM_DNS_TTL_OVERRIDE_SECONDS`) — forces a fixed TTL on all records
+1. **Per-proxy TTL** (`dns_cache_ttl_seconds` on the proxy config) — overrides everything for that proxy's lookups
+2. **Global TTL override** (`FERRUM_DNS_TTL_OVERRIDE_SECONDS`) — forces a fixed TTL on all records when no per-proxy TTL is set
 3. **Native record TTL** — the TTL from the DNS response itself (default behavior)
 
-The final TTL is always clamped to at least `FERRUM_DNS_MIN_TTL_SECONDS`.
+The final TTL is always clamped to at least `FERRUM_DNS_MIN_TTL_SECONDS` and at most one day.
+
+### Shared hostname, per-caller freshness
+
+The DNS cache is keyed by normalized hostname and stores **shared record data** only: resolved addresses, the moment they were obtained (`resolved_at`), and the native TTL from the resolver. Freshness is computed per caller as:
+
+`resolved_at + effective_ttl(native_ttl, caller_dns_cache_ttl_seconds)`
+
+Consequences:
+
+- A short-TTL consumer (e.g. 5s) is never held stale by a long-TTL consumer (e.g. 600s) that resolved or warmed the hostname first.
+- A long-TTL consumer is not forced into needless resolver storms when a short-TTL sibling refreshes more often — refreshes are single-flight per hostname, and the long-TTL caller still treats the updated shared record as fresh for its own window.
+- Warmup / reload ordering does not select a winning TTL; deduplication still performs one lookup per hostname, but subsequent callers apply their own policy at read time.
+- Stale-while-revalidate is also per-caller: when a caller's effective TTL has elapsed but the global stale window has not, the shared addresses are served and a single background refresh is scheduled.
 
 ## Environment Variables
 
@@ -79,18 +92,20 @@ This means: first try the record type that worked last time (for speed), then tr
 
 ## Stale-While-Revalidate
 
-When a cached DNS entry expires (past its TTL), Ferrum Edge doesn't block the request waiting for a fresh DNS lookup. Instead:
+When a cached DNS entry is past a **caller's** effective TTL, Ferrum Edge doesn't block the request waiting for a fresh DNS lookup. Instead:
 
-1. **Fresh** (within TTL): Return cached result immediately.
-2. **Stale** (past TTL, within `stale_ttl`): Return the stale cached result immediately and trigger a **background refresh** task. The next request will get the fresh result.
-3. **Expired** (past both TTL and `stale_ttl`): Perform a synchronous DNS lookup (blocking the request).
+1. **Fresh** (within that caller's effective TTL from `resolved_at`): Return cached result immediately.
+2. **Stale** (past the caller's TTL, within `stale_ttl`): Return the stale cached result immediately and trigger a **background refresh** task (single-flight per hostname). The next request will get the fresh result.
+3. **Expired** (past both the caller's TTL and `stale_ttl`): Perform a synchronous DNS lookup (blocking the request).
+
+Different proxies sharing one hostname can therefore be in different freshness states at the same wall-clock time: a 5s consumer may be stale while a 600s consumer is still fresh against the same shared addresses.
 
 This ensures that DNS resolution almost never blocks the hot request path, even when entries expire.
 
 Background refresh tasks are bounded by a system-wide semaphore (`FERRUM_DNS_MAX_CONCURRENT_REFRESHES`, default 64). When many distinct stale hostnames are hit simultaneously (e.g., after a prolonged DNS outage), at most this many refresh tasks run concurrently. Excess refresh requests are skipped -- the stale entry is served and the next request retries the semaphore. Per-hostname deduplication prevents duplicate refresh tasks for the same hostname.
 
 **Example:** With a DNS record that has a native 60s TTL and `FERRUM_DNS_STALE_TTL=3600`:
-- For the first 60 seconds: cached result served directly.
+- For the first 60 seconds: cached result served directly for callers using native/global TTL.
 - From 60 seconds to ~60 minutes: stale result served while a background refresh runs.
 - After ~60 minutes: full re-resolution required.
 
@@ -250,6 +265,6 @@ In addition to global DNS settings, each proxy can override DNS behavior:
 | Proxy Field | Description |
 |-------------|-------------|
 | `dns_override` | Static IP address override for this proxy's backend. Bypasses all DNS resolution. |
-| `dns_cache_ttl_seconds` | Per-proxy TTL override for cache entries. Takes precedence over both the native record TTL and `FERRUM_DNS_TTL_OVERRIDE_SECONDS`. |
+| `dns_cache_ttl_seconds` | Per-proxy TTL override used when **this proxy** evaluates cache freshness for the shared hostname entry. Takes precedence over both the native record TTL and `FERRUM_DNS_TTL_OVERRIDE_SECONDS` for that caller. Does not rewrite the shared entry's stored native TTL or block other proxies' policies. |
 
 These are configured in the proxy definition (YAML/JSON config file or database).

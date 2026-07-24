@@ -12,7 +12,7 @@ use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 
 thread_local! {
-    static KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(128));
+    static KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(192));
 }
 
 fn now_epoch_ms() -> u64 {

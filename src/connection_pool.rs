@@ -1,7 +1,9 @@
 //! Connection pool manager for HTTP/HTTPS/WebSocket backend clients.
 //!
 //! Provides `reqwest::Client` reuse keyed by connection identity (destination,
-//! protocol, DNS override, TLS trust, mTLS credentials). Each unique key gets
+//! protocol, DNS override, TLS trust, mTLS credentials) **and** reqwest
+//! builder-only settings that cannot be applied per request (idle timeout, TCP
+//! keepalive, HTTP/2 keep-alive / windows / frame size). Each unique key gets
 //! one `reqwest::Client` which internally manages its own TCP connection pool.
 //!
 //! All clients use the gateway's shared `DnsCache` as their resolver, keeping
@@ -41,7 +43,7 @@ struct ReqwestPoolManager {
 
 impl ReqwestPoolManager {
     fn pool_key_owned(&self, proxy: &Proxy) -> String {
-        let mut key = String::with_capacity(128);
+        let mut key = String::with_capacity(192);
         self.build_key(proxy, &proxy.backend_host, proxy.backend_port, 0, &mut key);
         key
     }
@@ -88,19 +90,20 @@ impl ReqwestPoolManager {
             .redirect(reqwest::redirect::Policy::none());
 
         // NOTE: Neither `backend_connect_timeout_ms` nor `backend_read_timeout_ms`
-        // is baked into the client here. The `reqwest::Client` is shared across
-        // all proxies whose pool key resolves to the same identity (same
-        // backend, TLS, DNS override). Baking a timeout into the shared client
-        // means the first proxy to create the client would dictate the timeout
-        // for every other proxy reusing it — cross-route policy leakage.
-        //
-        // Both timeouts are applied per-request on the dispatch side via
-        // `RequestBuilder::connect_timeout()` and `RequestBuilder::timeout()`
-        // which override the (absent) client defaults. The connect-timeout
-        // override is provided by a vendored copy of reqwest 0.13.2 with
-        // PR seanmonstar/reqwest#3017 applied (see
+        // is baked into the client here — both are applied per-request on the
+        // dispatch side via `RequestBuilder::connect_timeout()` and
+        // `RequestBuilder::timeout()`. The connect-timeout override is provided
+        // by a vendored copy of reqwest 0.13.3 with PR seanmonstar/reqwest#3017
+        // applied (see
         // `docs/upstream-reqwest-patches/001-per-request-connect-timeout/`
         // for the lifecycle and retirement plan).
+        //
+        // By contrast, idle timeout / TCP keepalive / HTTP/2 keep-alive /
+        // window / adaptive-window / max-frame-size ARE client-builder-only and
+        // cannot be overridden per request. Those effective values are folded
+        // into the pool key via `PoolConfig::append_reqwest_builder_identity`
+        // so two proxies that diverge on them get distinct clients instead of
+        // silently inheriting whichever proxy materialized the entry first.
 
         if config.enable_http_keep_alive {
             client_builder =
@@ -148,6 +151,11 @@ impl PoolManager for ReqwestPoolManager {
         use std::fmt::Write;
         buf.clear();
 
+        // Resolve effective pool config once. Builder-only settings below are
+        // part of reqwest client identity (they cannot be applied per request),
+        // and `enable_http2` also drives the force-H1 ALPN discriminator.
+        let pool_config = self.global_config.for_proxy(proxy);
+
         if let Some(ref upstream_id) = proxy.upstream_id {
             buf.push_str("u=");
             append_pool_key_component(buf, upstream_id);
@@ -181,7 +189,7 @@ impl PoolManager for ReqwestPoolManager {
             || (proxy
                 .backend_scheme
                 .is_some_and(|scheme| scheme.is_tls_backend())
-                && !self.global_config.for_proxy(proxy).enable_http2);
+                && !pool_config.enable_http2);
         if force_reqwest_http1 {
             buf.push_str("h1");
         }
@@ -216,6 +224,11 @@ impl PoolManager for ReqwestPoolManager {
             verify,
             svid_generation,
         );
+        // Builder-only client settings (idle timeout, TCP keepalive, H2 windows,
+        // etc.) are connection-identity for a shared `reqwest::Client` — fold
+        // them into the key so divergent proxies never silently inherit
+        // first-creator-wins policy. Per-request timeouts stay out of the key.
+        pool_config.append_reqwest_builder_identity(buf);
     }
 
     async fn create(&self, _key: &str, proxy: &Proxy) -> Result<reqwest::Client> {
@@ -318,12 +331,14 @@ impl ConnectionPool {
     ///
     /// `warmup_connection_pools` composes this with the per-target
     /// `host:port` to dedup reqwest HEAD warmup tasks. Including the
-    /// pool key (which carries the TLS-aware client identity:
-    /// `{dest}|{proto}|{dns_override}|{subset}|{ca}|{mtls_cert}|{verify}`)
+    /// pool key (which carries the TLS-aware client identity plus
+    /// reqwest builder-only settings:
+    /// `{dest}|{proto}|{dns_override}|{subset}|{ca}|{mtls_cert}|{verify}|…|{builder}`)
     /// in the dedup means proxies that share `(scheme, host, port)` but
-    /// have divergent TLS configs or different `upstream_subset` selectors
-    /// each get their own warmup task — matching the fact that they end
-    /// up with separate `reqwest::Client`s at runtime.
+    /// have divergent TLS configs, different `upstream_subset` selectors,
+    /// or divergent builder-only pool settings each get their own warmup
+    /// task — matching the fact that they end up with separate
+    /// `reqwest::Client`s at runtime.
     pub fn pool_key_for_warmup(&self, proxy: &Proxy) -> String {
         self.pool.manager().pool_key_owned(proxy)
     }

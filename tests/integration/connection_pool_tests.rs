@@ -469,7 +469,7 @@ async fn test_concurrent_pool_access() {
 }
 
 #[tokio::test]
-async fn test_idle_timeout_does_not_fragment_pool() {
+async fn test_idle_timeout_partitions_reqwest_pool() {
     let pool = ConnectionPool::new(
         PoolConfig::default(),
         create_test_env_config(),
@@ -478,8 +478,7 @@ async fn test_idle_timeout_does_not_fragment_pool() {
         std::sync::Arc::new(Vec::new()),
     );
 
-    // Two proxies with same host/port/protocol but different idle timeouts
-    // should share the same pool entry (idle_timeout is excluded from pool key)
+    // Builder-only idle timeout is part of reqwest client identity (#2951).
     let mut proxy1 = create_test_proxy();
     proxy1.pool_idle_timeout_seconds = Some(30);
 
@@ -491,8 +490,36 @@ async fn test_idle_timeout_does_not_fragment_pool() {
 
     let stats = pool.get_stats();
     assert_eq!(
-        stats.total_pools, 1,
-        "Different idle_timeout_seconds should NOT fragment the pool"
+        stats.total_pools, 2,
+        "Different pool_idle_timeout_seconds must partition the reqwest pool"
+    );
+}
+
+#[tokio::test]
+async fn test_http2_stream_window_partitions_reqwest_pool() {
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+        None,
+        std::sync::Arc::new(Vec::new()),
+    );
+
+    let mut proxy1 = create_test_proxy();
+    proxy1.id = "fragile-backend".to_string();
+    proxy1.pool_http2_initial_stream_window_size = Some(65_535);
+
+    let mut proxy2 = create_test_proxy();
+    proxy2.id = "default-window".to_string();
+    proxy2.pool_http2_initial_stream_window_size = Some(8_388_608);
+
+    let _client1 = pool.get_client(&proxy1).await.unwrap();
+    let _client2 = pool.get_client(&proxy2).await.unwrap();
+
+    let stats = pool.get_stats();
+    assert_eq!(
+        stats.total_pools, 2,
+        "Divergent pool_http2_initial_stream_window_size must partition the reqwest pool"
     );
 }
 

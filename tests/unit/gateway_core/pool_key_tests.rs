@@ -176,10 +176,11 @@ async fn connection_pool_key_direct_backend_format() {
     );
     // BackendScheme::Http = 0
     assert!(key.contains("|0|"), "key should contain protocol 0: {key}");
-    // No DNS override, no subset, no CA, no mTLS, no SNI, no SAN digest, verify=true (1)
+    // No DNS override, no subset, no CA, no mTLS, no SNI, no SAN digest, verify=true (1),
+    // default reqwest builder identity (idle=90, tcp ka=60, default H2 windows).
     assert!(
-        key.ends_with("||||||||1|svidg=static"),
-        "key should end with empty dns/subset/ca/mtls/sni/sans, verify=1, and SVID generation: {key}"
+        key.ends_with("||||||||1|svidg=static|i90|k60|h2:30:45:8388608:33554432:1:1048576"),
+        "key should end with TLS identity + default reqwest builder identity: {key}"
     );
 }
 
@@ -192,7 +193,7 @@ async fn connection_pool_key_uses_numeric_generation_only_for_workload_svid() {
     svid_proxy.resolved_tls.client_key_path = Some("/var/run/ferrum/svid.key".to_string());
     let svid_key = pool.pool_key_for_warmup(&svid_proxy);
     assert!(
-        svid_key.ends_with("|svidg=7"),
+        svid_key.contains("|svidg=7|"),
         "workload SVID client cert should partition by numeric generation: {svid_key}"
     );
 
@@ -201,7 +202,7 @@ async fn connection_pool_key_uses_numeric_generation_only_for_workload_svid() {
     static_proxy.resolved_tls.client_key_path = Some("/operator/client.key".to_string());
     let static_key = pool.pool_key_for_warmup(&static_proxy);
     assert!(
-        static_key.ends_with("|svidg=static"),
+        static_key.contains("|svidg=static|"),
         "operator-supplied client cert should not partition on SVID rotation: {static_key}"
     );
 }
@@ -394,8 +395,8 @@ async fn connection_pool_key_verify_disabled() {
     proxy.resolved_tls.verify_server_cert = false;
     let key = pool.pool_key_for_warmup(&proxy);
     assert!(
-        key.ends_with("|0|svidg=static"),
-        "key should end with verify=0 when disabled: {key}"
+        key.contains("|0|svidg=static|"),
+        "key should contain verify=0 when disabled: {key}"
     );
 }
 
@@ -406,7 +407,7 @@ async fn connection_pool_key_global_no_verify_overrides_proxy() {
     let key = pool.pool_key_for_warmup(&proxy);
     // Global tls_no_verify=true should force effective verify to false
     assert!(
-        key.ends_with("|0|svidg=static"),
+        key.contains("|0|svidg=static|"),
         "global no_verify should override proxy verify=true: {key}"
     );
 }
@@ -417,13 +418,13 @@ async fn connection_pool_key_pipe_delimiter_count() {
     let proxy = minimal_proxy();
     let key = pool.pool_key_for_warmup(&proxy);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
-    // 12 fields (dest, protocol, force-H1 ALPN discriminator, dns, subset, ca,
-    // mtls_cert, mtls_key, sni, san_digest, verify, svid_generation) need 11
-    // pipe delimiters. The force-H1 ALPN discriminator (empty unless
-    // DO_NOT_UPGRADE) was added in F5.1 codex round-1 Finding 1.
+    // Connection-identity fields (dest, protocol, force-H1 ALPN discriminator, dns,
+    // subset, ca, mtls_cert, mtls_key, sni, san_digest, verify, svid_generation)
+    // need 11 pipe delimiters, plus idle/tcp-keepalive/h2 builder-identity
+    // segments add 3 more (`|i…|k…|h2:…`) when HTTP/2 is enabled.
     assert_eq!(
-        pipe_count, 11,
-        "12 fields need 11 pipe delimiters, got {pipe_count} in key: {key}"
+        pipe_count, 14,
+        "expected 14 pipe delimiters with reqwest builder identity, got {pipe_count} in key: {key}"
     );
 }
 
@@ -550,18 +551,52 @@ async fn connection_pool_key_different_ca_paths_differ() {
 }
 
 #[tokio::test]
-async fn connection_pool_key_policy_fields_do_not_fragment() {
-    // Timeouts and pool sizes should NOT affect the pool key
+async fn connection_pool_key_per_request_timeouts_do_not_fragment() {
+    // Connect/read timeouts are applied per-request and must NOT affect the pool key.
     let pool = pool_with_defaults();
     let mut p1 = minimal_proxy();
-    p1.pool_idle_timeout_seconds = Some(30);
-    p1.pool_enable_http2 = Some(true);
     p1.backend_connect_timeout_ms = 1000;
+    p1.backend_read_timeout_ms = 2000;
     let p2 = minimal_proxy();
     assert_eq!(
         pool.pool_key_for_warmup(&p1),
         pool.pool_key_for_warmup(&p2),
-        "policy fields (timeouts, pool sizes) should not affect the key"
+        "per-request timeouts must not affect the reqwest pool key"
+    );
+}
+
+#[tokio::test]
+async fn connection_pool_key_builder_only_settings_partition_clients() {
+    // Builder-only settings are baked into the shared reqwest::Client and must
+    // partition identity so first-creator-wins leakage cannot occur (#2951).
+    let pool = pool_with_defaults();
+    let mut p1 = minimal_proxy();
+    p1.pool_http2_initial_stream_window_size = Some(65_535);
+    let mut p2 = minimal_proxy();
+    p2.pool_http2_initial_stream_window_size = Some(8_388_608);
+    assert_ne!(
+        pool.pool_key_for_warmup(&p1),
+        pool.pool_key_for_warmup(&p2),
+        "divergent HTTP/2 stream window must produce distinct reqwest pool keys"
+    );
+
+    let mut idle_a = minimal_proxy();
+    idle_a.pool_idle_timeout_seconds = Some(30);
+    let mut idle_b = minimal_proxy();
+    idle_b.pool_idle_timeout_seconds = Some(120);
+    assert_ne!(
+        pool.pool_key_for_warmup(&idle_a),
+        pool.pool_key_for_warmup(&idle_b),
+        "divergent idle timeout must produce distinct reqwest pool keys"
+    );
+
+    // Identical builder settings still share.
+    let same_a = minimal_proxy();
+    let same_b = minimal_proxy();
+    assert_eq!(
+        pool.pool_key_for_warmup(&same_a),
+        pool.pool_key_for_warmup(&same_b),
+        "identical builder settings must share a reqwest pool key"
     );
 }
 
@@ -862,8 +897,8 @@ async fn connection_pool_and_h2_pool_keys_have_same_delimiter() {
     let conn_pipes = conn_key.chars().filter(|c| *c == '|').count();
     let h2_pipes = h2_key.chars().filter(|c| *c == '|').count();
     assert_eq!(
-        conn_pipes, 11,
-        "reqwest key should use | as delimiter: {conn_key}"
+        conn_pipes, 14,
+        "reqwest key should use | as delimiter (with builder identity): {conn_key}"
     );
     assert!(h2_pipes >= 9, "H2 key should use | as delimiter: {h2_key}");
 }

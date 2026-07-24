@@ -101,15 +101,17 @@ paths:
 ## Pool Keys And DNS
 
 - Pool keys must include every field affecting connection identity: destination, protocol/TLS, DNS override, upstream subset, CA, mTLS cert/key, SNI, SAN digest, verification flag, and SVID generation.
-- HTTP key shell: `{dest}|{proto}|{dns_override}|{subset}|{ca}|{mtls_cert}|{mtls_key}|{sni}|{san_digest}|{verify}|{svid_generation}`.
+- HTTP/reqwest keys additionally include builder-only client settings that cannot be applied per request (idle timeout, TCP keepalive, HTTP/2 keep-alive / windows / adaptive-window / max-frame-size). Divergent values partition clients so first-creator-wins leakage cannot occur.
+- HTTP key shell: `{dest}|{proto}|{dns_override}|{subset}|{ca}|{mtls_cert}|{mtls_key}|{sni}|{san_digest}|{verify}|{svid_generation}|{reqwest_builder_identity}`.
 - gRPC and direct-H2 keys include host, port, DNS override, subset, TLS identity fields, verification, SVID generation, and shard suffix `#N`.
 - H3 keys include host, port, LB target index, DNS override, subset, TLS identity fields, verification, and SVID generation.
-- Never add policy fields such as timeouts, pool sizes, or keepalives to pool keys.
+- Never add per-request policy fields such as connect/read timeouts or global-only pool sizes to pool keys.
 - Subset must partition pools so DestinationRule subset TLS overlays cannot share connections accidentally.
-- Policy fields are applied per request. Shared reqwest clients must not leak timeouts across proxies.
+- Per-request timeouts are applied per request. Shared reqwest clients must not leak connect/read timeouts across proxies.
+- Direct-H2 still documents a first-materializer tradeoff for TCP keepalive applied at dial time (not in the H2 pool key); that does not apply to the reqwest pool, where builder-only settings are part of client identity.
 - Per-request `connect_timeout` depends on the vendored reqwest patch at `vendor/reqwest-0.13.3-ferrum-patched/` (`docs/upstream-reqwest-patches/001-per-request-connect-timeout/`). Do not change pool sharing or timeout semantics without preserving that request-scoped override behavior.
 - Every production `reqwest::Client::builder()` must install `DnsCacheResolver` from the shared DNS cache.
-- DNS cache is shared, prewarmed, native-TTL by default, floored by `FERRUM_DNS_MIN_TTL_SECONDS`, stale-while-revalidate, and supports TCP fallback for truncated UDP.
+- DNS cache is shared by normalized hostname, prewarmed, native-TTL by default, floored by `FERRUM_DNS_MIN_TTL_SECONDS`, stale-while-revalidate, and supports TCP fallback for truncated UDP. Shared entries store record data (`resolved_at`, native TTL, addresses); each caller evaluates freshness with its own effective TTL (per-proxy > global override > native). Refresh remains single-flight per hostname.
 
 ## Capability, Errors, And Health
 

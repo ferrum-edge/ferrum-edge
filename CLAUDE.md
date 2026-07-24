@@ -86,7 +86,7 @@ Run the full local suite only for shared infrastructure, cross-module refactors,
 - Rebuild `RouterCache`, `PluginCache`, `ConsumerIndex`, and `LoadBalancerCache` on reload, not per request.
 - Atomic config reload uses `ArcSwap`: in-flight requests see old or new config, never partial state.
 - Hot-path `DashMap` construction must use `crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount)`.
-- Pool keys use `|` as delimiter. Include every field that affects connection identity; exclude policy-only fields.
+- Pool keys use `|` as delimiter. Include every field that affects connection identity (including reqwest builder-only settings that cannot be applied per request); exclude per-request policy-only fields such as connect/read timeouts.
 - Keep protocol correctness over shortcuts, especially HTTP/2/gRPC trailers, stream accounting, flow control, and WebSocket CONNECT behavior.
 
 ## Startup And Shutdown

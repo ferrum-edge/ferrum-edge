@@ -109,18 +109,22 @@ This is the single most important pool setting for performance and reliability. 
 
 ### Policy Fields and Cross-Proxy Sharing
 
-The pool is keyed on **connection identity** (backend host/port, protocol, DNS override, TLS trust, mTLS credentials) and intentionally excludes policy fields like timeouts, pool sizes, and keep-alive intervals. This keeps memory and connection count bounded — proxies that all point at the same backend share one underlying client.
+The pool is keyed on **connection identity**: backend host/port, protocol, DNS override, TLS trust, mTLS credentials, **and** reqwest builder-only settings that cannot be applied per request (idle timeout, TCP keepalive, HTTP/2 keep-alive interval/timeout, initial stream/connection windows, adaptive window, max frame size). Proxies that share a destination but diverge on those builder settings get distinct `reqwest::Client`s — there is no silent first-creator-wins leakage.
 
-Per-request policy fields are applied at dispatch time on the `RequestBuilder`, so they're independent per proxy even when the underlying client is shared:
+Per-request policy fields stay out of the key and are applied at dispatch time on the `RequestBuilder`, so they're independent per proxy even when the underlying client is shared:
 
 | Field | Per-proxy override respected? | Why |
 |---|---|---|
 | `backend_read_timeout_ms` | **Yes** — always the requesting proxy's value | Applied per-request via `RequestBuilder::timeout()` at dispatch time. |
 | `backend_connect_timeout_ms` | **Yes** — always the requesting proxy's value | Applied per-request via `RequestBuilder::connect_timeout()` at dispatch time. The per-request `connect_timeout` API ships in a vendored copy of reqwest 0.13.3 with [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) applied — see [`docs/upstream-reqwest-patches/001-per-request-connect-timeout/`](upstream-reqwest-patches/001-per-request-connect-timeout/README.md) for the lifecycle. Once the upstream PR merges in a release we consume, the vendored crate is dropped; the call sites already use the upstream API shape. |
+| `pool_idle_timeout_seconds`, `pool_tcp_keepalive_seconds`, HTTP/2 window/keepalive/frame builder overrides | **Yes** — via distinct pooled clients when values diverge | Baked into `reqwest::Client` construction; folded into the pool key so each effective set gets its own client. |
+| `pool_max_idle_per_host` | Global only | Per-proxy overrides were removed specifically to avoid fragmenting the pool for a setting that is not independently tunable per route. |
 
-Both timeouts can therefore be set independently per proxy without forcing distinct `dns_override` values to fragment the pool. Earlier versions of ferrum-edge documented a `dns_override` work-around for `backend_connect_timeout_ms` — that work-around is no longer needed.
+Both connect/read timeouts can therefore be set independently per proxy without forcing distinct `dns_override` values to fragment the pool. Earlier versions of ferrum-edge documented a `dns_override` work-around for `backend_connect_timeout_ms` — that work-around is no longer needed.
 
 **One nuance for cold pools.** When two simultaneous requests from different proxies arrive at the same shared client and the pool entry is cold (or saturated), only one of them actually performs the TCP/TLS handshake — the others coalesce onto that pending connect via hyper's connection pool. The whole coalesced group resolves when the in-flight handshake finishes (or fails), so a sibling proxy with a tighter `backend_connect_timeout_ms` will not abort the connect early; it observes whatever the first poller's connect timeout governed. This is intrinsic to how hyper deduplicates concurrent connect attempts and was true under the old client-level connect timeout as well. In steady state, almost all dispatches reuse a warm idle connection and skip the coalescing window entirely, so this edge case rarely matters in practice. Paths that can hit it: the very first request to a backend after process start, demand spikes that exceed `pool_max_idle_per_host`, eviction (idle timeout, RST/FIN, keepalive failure), and DNS re-resolution after `pool_max_lifetime`. If you need strictly independent connect timeouts including the cold-pool race, fragment the pool with a distinct `dns_override` per proxy — the same fragmentation lever the docs previously prescribed for the steady-state case.
+
+**Direct-H2 note.** The direct HTTP/2 pool still documents a first-materializer tradeoff for TCP keepalive applied at dial time (keepalive is not in the H2 pool key). That tradeoff does **not** apply to the reqwest pool.
 
 ## Protocol-Specific Recommendations
 

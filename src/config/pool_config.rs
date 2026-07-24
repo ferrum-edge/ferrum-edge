@@ -262,6 +262,47 @@ impl PoolConfig {
         self.apply_proxy_overrides(proxy)
     }
 
+    /// Append reqwest-builder-only settings to a pool-key buffer.
+    ///
+    /// These fields are baked into the shared `reqwest::Client` at construction
+    /// and cannot be applied per request (unlike `backend_connect_timeout_ms` /
+    /// `backend_read_timeout_ms`). Divergent values must therefore partition
+    /// client identity — otherwise the first proxy to materialize the shared
+    /// client silently dictates idle timeout, TCP keepalive, and HTTP/2
+    /// flow-control settings for every other proxy that resolves to the same
+    /// destination/TLS key.
+    ///
+    /// Encoding is fixed-order and label-free so hot-path key builds stay a
+    /// single `write!` into the reusable key buffer (no extra `String`
+    /// allocation). HTTP/2 builder fields are omitted when `enable_http2` is
+    /// false because `create_client` does not apply them in that mode.
+    ///
+    /// `max_idle_per_host` stays global-only (not encoded here) — per-proxy
+    /// overrides were removed specifically to avoid fragmenting the pool for
+    /// a setting that is not independently tunable per route.
+    pub fn append_reqwest_builder_identity(&self, buf: &mut String) {
+        use std::fmt::Write;
+
+        let tcp_keepalive = if self.enable_http_keep_alive {
+            self.tcp_keepalive_seconds
+        } else {
+            0
+        };
+        let _ = write!(buf, "|i{}|k{}", self.idle_timeout_seconds, tcp_keepalive);
+        if self.enable_http2 {
+            let _ = write!(
+                buf,
+                "|h2:{}:{}:{}:{}:{}:{}",
+                self.http2_keep_alive_interval_seconds,
+                self.http2_keep_alive_timeout_seconds,
+                self.http2_initial_stream_window_size,
+                self.http2_initial_connection_window_size,
+                u8::from(self.http2_adaptive_window),
+                self.http2_max_frame_size,
+            );
+        }
+    }
+
     /// Validate and clamp `max_idle_per_host` to the allowed range, logging
     /// a warning when the value is adjusted.
     pub fn validate_max_idle_per_host(value: usize, source: &str) -> usize {
