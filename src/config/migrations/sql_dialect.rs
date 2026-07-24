@@ -18,11 +18,19 @@
 //!   `MEDIUMTEXT` (16 MiB): `plugin_configs.config` (1 MiB cap),
 //!   `consumers.credentials` (64 KiB cap — off-by-one over `TEXT`),
 //!   `consumers.acl_groups` (≈130 KiB worst case), `upstreams.targets`
-//!   (1000 targets ≈ 200 KiB), `upstreams.backend_tls_san_allow_list`.
+//!   (1000 targets ≈ 200 KiB), `upstreams.backend_tls_san_allow_list`,
+//!   the six proxy/upstream `backend_tls_*` material path/PEM columns
+//!   (`MAX_TLS_INLINE_PEM_LENGTH` = 1 MiB), `upstreams.subsets` (uncapped
+//!   label-set serialization), and `proxies.allowed_ws_origins` (uncapped
+//!   admitted JSON).
 //!
-//! The proxy schema also intentionally omits a unique index on
+//! The proxy schema intentionally omits a *unique* index on
 //! `(namespace, listen_path)`: path uniqueness is host-scoped, so only
-//! namespace/name and namespace/listen_port constraints belong in V001.
+//! namespace/name and namespace/listen_port uniqueness constraints belong in
+//! V001. A non-unique secondary `idx_proxies_ns_listen_path` still covers the
+//! listen-path candidate scan under the route-bucket write lock
+//! (`utf8mb4` key length for `VARCHAR(255)+VARCHAR(512)` is 3068 bytes,
+//! inside InnoDB's 3072-byte limit — no prefix required).
 //!
 //! ## Foreign key constraints
 //!
@@ -197,6 +205,10 @@ impl V001SqlBuilder {
             // `(namespace, updated_at)` compounds do not cover that access
             // pattern, so keep dedicated `(namespace, id)` indexes.
             "CREATE INDEX IF NOT EXISTS idx_proxies_ns_id ON proxies (namespace, id)",
+            // Non-unique: host-overlap uniqueness stays application-enforced
+            // under the route-bucket lock. This secondary index covers
+            // `listen_path_candidate_sql` equality on `(namespace, listen_path)`.
+            self.proxies_ns_listen_path_index_sql(),
             "CREATE INDEX IF NOT EXISTS idx_consumers_ns_id ON consumers (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_plugin_configs_ns_id ON plugin_configs (namespace, id)",
             "CREATE INDEX IF NOT EXISTS idx_upstreams_ns_id ON upstreams (namespace, id)",
@@ -333,6 +345,19 @@ impl V001SqlBuilder {
         }
     }
 
+    fn proxies_ns_listen_path_index_sql(&self) -> &'static str {
+        // Same SQL on every dialect. MySQL key length under utf8mb4 is
+        // `255*4 + 512*4 = 3068` bytes, inside InnoDB's 3072-byte limit, so
+        // no prefix is required and equality filtering stays full-column.
+        // Keep the helper so index-presence tests can assert without relying
+        // on create_indexes()'s opaque string array.
+        match self.dialect {
+            SqlDialect::MySql | SqlDialect::Postgres | SqlDialect::Sqlite => {
+                "CREATE INDEX IF NOT EXISTS idx_proxies_ns_listen_path ON proxies (namespace, listen_path)"
+            }
+        }
+    }
+
     fn mesh_route_dispatch_index_sql(&self) -> &'static str {
         if self.is_mysql() {
             // MySQL lacks SQL-standard partial indexes; index every row.
@@ -363,11 +388,11 @@ impl V001SqlBuilder {
                 hash_on_cookie_config TEXT,
                 health_checks TEXT,
                 service_discovery TEXT,
-                subsets TEXT,
-                backend_tls_client_cert_path VARCHAR(2048),
-                backend_tls_client_key_path VARCHAR(2048),
+                subsets MEDIUMTEXT,
+                backend_tls_client_cert_path MEDIUMTEXT,
+                backend_tls_client_key_path MEDIUMTEXT,
                 backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1,
-                backend_tls_server_ca_cert_path VARCHAR(2048),
+                backend_tls_server_ca_cert_path MEDIUMTEXT,
                 backend_tls_sni VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
                 backend_tls_san_allow_list MEDIUMTEXT,
                 api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
@@ -514,10 +539,10 @@ impl V001SqlBuilder {
                 backend_connect_timeout_ms INTEGER NOT NULL DEFAULT 5000,
                 backend_read_timeout_ms INTEGER NOT NULL DEFAULT 30000,
                 backend_write_timeout_ms INTEGER NOT NULL DEFAULT 30000,
-                backend_tls_client_cert_path TEXT,
-                backend_tls_client_key_path TEXT,
+                backend_tls_client_cert_path MEDIUMTEXT,
+                backend_tls_client_key_path MEDIUMTEXT,
                 backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1,
-                backend_tls_server_ca_cert_path TEXT,
+                backend_tls_server_ca_cert_path MEDIUMTEXT,
                 dns_override TEXT,
                 dns_cache_ttl_seconds INTEGER,
                 auth_mode VARCHAR(20) NOT NULL DEFAULT 'single',
@@ -547,7 +572,7 @@ impl V001SqlBuilder {
                 tcp_idle_timeout_seconds INTEGER,
                 websocket_idle_timeout_seconds INTEGER,
                 allowed_methods TEXT,
-                allowed_ws_origins TEXT,
+                allowed_ws_origins MEDIUMTEXT,
                 udp_max_response_amplification_factor REAL,
                 stream_proxy_protocol INTEGER,
                 api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
@@ -1192,6 +1217,78 @@ mod tests {
             !sql.contains("listen_path VARCHAR(500)"),
             "listen_path VARCHAR(500) has zero headroom over the code cap"
         );
+    }
+
+    #[test]
+    fn test_mysql_upstreams_tls_material_and_subsets_hold_admitted_caps() {
+        // MAX_TLS_INLINE_PEM_LENGTH = 1 MiB exceeds MySQL TEXT; subsets JSON
+        // is uncapped at admission beyond per-label key/val length.
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_upstreams_sql();
+        for col in [
+            "subsets MEDIUMTEXT",
+            "backend_tls_client_cert_path MEDIUMTEXT",
+            "backend_tls_client_key_path MEDIUMTEXT",
+            "backend_tls_server_ca_cert_path MEDIUMTEXT",
+        ] {
+            assert!(
+                sql.contains(col),
+                "upstreams must use MEDIUMTEXT for {col} so admitted payloads are not truncated"
+            );
+        }
+        assert!(
+            !sql.contains("backend_tls_client_cert_path VARCHAR"),
+            "upstream TLS material columns must not remain VARCHAR-capped"
+        );
+    }
+
+    #[test]
+    fn test_mysql_proxies_tls_material_and_ws_origins_hold_admitted_caps() {
+        // Proxy TLS material shares MAX_TLS_INLINE_PEM_LENGTH = 1 MiB; prior
+        // TEXT columns truncated at 65,535. allowed_ws_origins has no
+        // admission size cap, so MEDIUMTEXT is the smallest existing-schema
+        // fix that preserves uncapped admitted values.
+        let builder = V001SqlBuilder::new("mysql");
+        let sql = builder.create_proxies_sql();
+        for col in [
+            "backend_tls_client_cert_path MEDIUMTEXT",
+            "backend_tls_client_key_path MEDIUMTEXT",
+            "backend_tls_server_ca_cert_path MEDIUMTEXT",
+            "allowed_ws_origins MEDIUMTEXT",
+        ] {
+            assert!(
+                sql.contains(col),
+                "proxies must use MEDIUMTEXT for {col} so admitted payloads are not truncated"
+            );
+        }
+    }
+
+    #[test]
+    fn test_proxies_ns_listen_path_index_is_non_unique_and_full_column() {
+        // Covers listen_path_candidate_sql without weakening the host-overlap
+        // uniqueness lease (which remains application-enforced). MySQL key
+        // length for namespace VARCHAR(255) + listen_path VARCHAR(512) under
+        // utf8mb4 is 3068 bytes (< 3072), so no prefix is required.
+        for dialect in ["postgres", "mysql", "sqlite"] {
+            let builder = V001SqlBuilder::new(dialect);
+            let sql = builder.proxies_ns_listen_path_index_sql();
+            assert!(
+                sql.contains("idx_proxies_ns_listen_path"),
+                "{dialect} must name the listen_path secondary index consistently"
+            );
+            assert!(
+                sql.contains("ON proxies (namespace, listen_path)"),
+                "{dialect} must index full (namespace, listen_path) columns for equality filtering"
+            );
+            assert!(
+                !sql.contains("UNIQUE"),
+                "{dialect} must not add a unique lease on (namespace, listen_path)"
+            );
+            assert!(
+                !sql.contains("listen_path("),
+                "{dialect} must not use a MySQL prefix length that weakens equality filtering"
+            );
+        }
     }
 
     #[test]
