@@ -11037,12 +11037,13 @@ mod inner {
         /// transactions are available. Without a replica set, MongoDB does not
         /// support transactions (server-side error on `start_transaction`).
         ///
-        /// Detection is env-var-based only (`FERRUM_MONGO_REPLICA_SET`).  A
-        /// user pointing at an actual replica set without setting the env var
-        /// silently falls into the compensating-delete path.  A startup
-        /// `hello` probe could detect the mismatch and warn, but the env var
-        /// is the documented contract and false-negative is safe (just slower
-        /// and less atomic).
+        /// Detection reads the effective `ClientOptions::repl_set_name`, which
+        /// `ClientOptions::parse` populates from a URI `?replicaSet=...` option
+        /// as well as from the `FERRUM_MONGO_REPLICA_SET` env var (applied as
+        /// an override at `build_connection_bundle`). A user pointing at an
+        /// actual replica set with `?replicaSet=rs0` in the URI is therefore
+        /// recognized even without setting the env var, so transactions are
+        /// not silently downgraded to the compensating-delete path.
         fn replica_set_configured(&self) -> bool {
             self.replica_set_configured.load(Ordering::Acquire)
         }

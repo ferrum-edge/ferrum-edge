@@ -20,6 +20,7 @@ use serde_json::json;
 
 const OWNER: &str = "test-owner-uuid";
 const MONGO_STORE_SOURCE: &str = include_str!("../../../src/config/mongo_store.rs");
+const MONGODB_DOC: &str = include_str!("../../../docs/mongodb.md");
 // Fixed client-clock instant so the builders are deterministic (no DateTime::now).
 const NOW_MILLIS: i64 = 1_700_000_000_000;
 
@@ -299,5 +300,22 @@ fn classic_renew_update_refreshes_expiry_without_touching_ownership() {
     assert!(
         update.get("$setOnInsert").is_none(),
         "renew must not upsert a new lock document: {update:?}"
+    );
+}
+
+#[test]
+fn mongodb_doc_pins_exactly_one_tls_source_contract() {
+    // `build_connection_bundle` in mongo_store.rs rejects the combination of
+    // `FERRUM_DB_TLS_MODE` with URI TLS options at startup. The docs must not
+    // regress to the stale "take precedence" wording that contradicted that
+    // fail-closed contract.
+    assert!(
+        !MONGODB_DOC.contains("take precedence"),
+        "docs/mongodb.md must not claim URI TLS options 'take precedence' over \
+         FERRUM_DB_TLS_* env vars; the code rejects the combination at startup"
+    );
+    assert!(
+        MONGODB_DOC.contains("exactly one source"),
+        "docs/mongodb.md must document the exactly-one-source TLS contract"
     );
 }

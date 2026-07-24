@@ -188,7 +188,7 @@ FERRUM_DB_TLS_CLIENT_KEY_PATH=/certs/client.key      # mTLS
 FERRUM_DB_URL="mongodb://host:27017/ferrum?tls=true&tlsCAFile=/certs/ca.pem&tlsCertificateKeyFile=/certs/client-combined.pem"
 ```
 
-Connection string TLS options take precedence over `FERRUM_DB_TLS_*` env vars when both are set.
+Configure MongoDB TLS in exactly one source: either the `FERRUM_DB_TLS_*` environment variables **or** connection-string TLS options — not both. If `FERRUM_DB_TLS_MODE` is set and any configured MongoDB URI (`FERRUM_DB_URL` or a `FERRUM_DB_FAILOVER_URLS` entry) also carries TLS options (a `tls`/`ssl` query parameter or the implicit-TLS `mongodb+srv://` scheme), the gateway fails startup with a conflict error rather than silently letting one source win. Unset `FERRUM_DB_TLS_MODE` when you want the connection string to be authoritative.
 
 ### X.509 Certificate Authentication
 
