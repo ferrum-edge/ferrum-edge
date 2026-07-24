@@ -52,23 +52,40 @@ async fn test_inner_completes_before_timeout() {
     assert_eq!(result.unwrap(), "done");
 }
 
-#[tokio::test]
-async fn test_expired_timer_wins_over_future_ready_on_timeout_wake() {
+/// When the deadline wake and the inner future are both ready on the same
+/// poll, prefer the completed value — matching `tokio::time::timeout`.
+#[tokio::test(start_paused = true)]
+async fn test_simultaneous_ready_favors_inner_completion() {
     let polls = Arc::new(AtomicUsize::new(0));
-
-    let result = lazy_timeout(
+    let mut fut = std::pin::pin!(lazy_timeout(
         Duration::from_millis(10),
         ReadyOnSecondPoll {
             polls: polls.clone(),
         },
-    )
-    .await;
+    ));
 
-    assert_eq!(result, Err(LazyTimeoutError));
+    // First poll: inner Pending → timer arms; deadline has not fired yet.
+    std::future::poll_fn(|cx| match fut.as_mut().poll(cx) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(ready) => panic!("expected Pending on first poll, got {ready:?}"),
+    })
+    .await;
     assert_eq!(
         polls.load(Ordering::SeqCst),
         1,
-        "future must not be polled again after the timeout has expired"
+        "first poll must arm the timer after the inner future returns Pending"
+    );
+
+    // Fire the deadline. On the next poll both sleep and ReadyOnSecondPoll
+    // are ready; simultaneous readiness must favor the completed value.
+    tokio::time::advance(Duration::from_millis(10)).await;
+
+    let result = fut.await;
+    assert_eq!(result, Ok("late"));
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        2,
+        "inner future must be polled after the deadline wake"
     );
 }
 

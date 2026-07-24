@@ -2,8 +2,12 @@
 //!
 //! Extracts metrics from `TransactionSummary`, `StreamTransactionSummary`, and
 //! `WsDisconnectContext` entries and sends them to a StatsD-compatible server
-//! (StatsD, Datadog, Telegraf, etc.) over UDP. Uses `BatchingLogger<MetricEntry>`
-//! to decouple the proxy hot path from socket I/O.
+//! (StatsD, Datadog, Telegraf, etc.) over UDP. Hot-path admission reserves a
+//! channel slot and a provisional retained-byte lease before rendering line
+//! protocol, then enqueues a private pre-rendered payload. A
+//! `BatchingLogger<QueuedStatsdPayload>` decouples the proxy hot path from
+//! socket I/O; flush packs and sends one MTU-bounded datagram at a time so the
+//! admitted payload plus at most one datagram buffer are retained together.
 //!
 //! Hostname resolution uses the gateway's shared `DnsCache` (pre-warmed via
 //! `warmup_hostnames()`) with TTL, stale-while-revalidate, and background
@@ -15,16 +19,19 @@ use async_trait::async_trait;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
+use std::fmt;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
 use tracing::warn;
 
+use super::utils::byte_budget::accounted_summary_bytes;
 use super::utils::log_schema::{SchemaCapabilities, SummarySchema, resolve_schema};
 use super::utils::{
-    BatchConfig, BatchConfigDefaults, DeferredBatchingLogger, PluginHttpClient,
-    UDP_RE_RESOLVE_INTERVAL, bind_connected_udp_socket, build_batch_config, parse_socket_host,
-    resolve_udp_endpoint, validate_batch_config,
+    BatchConfig, BatchConfigDefaults, BatchingLoggerPermit, ByteBudget, ByteLease,
+    DeferredBatchingLogger, PluginHttpClient, UDP_RE_RESOLVE_INTERVAL, admit_byte_limits,
+    bind_connected_udp_socket, build_batch_config, parse_socket_host, resolve_udp_endpoint,
+    validate_batch_config,
 };
 use super::{Plugin, StreamTransactionSummary, TransactionSummary, WsDisconnectContext};
 use crate::config::types::MAX_NAMESPACE_LENGTH;
@@ -39,10 +46,12 @@ use crate::dns::DnsCache;
 /// property names are closed.
 pub const STATSD_LOGGING_CONFIG_KEYS: &[&str] = &[
     "buffer_capacity",
+    "buffer_max_bytes",
     "flush_interval_ms",
     "global_tags",
     "host",
     "max_batch_lines",
+    "max_entry_bytes",
     "max_retries",
     "port",
     "prefix",
@@ -496,11 +505,52 @@ pub fn http_body_outcome(summary: &TransactionSummary) -> &'static str {
     "none"
 }
 
+/// Private pre-rendered StatsD lines retained in the batching queue.
+///
+/// Owns the retained-byte lease. Cloning shares the `Arc` handles so retries
+/// do not double-charge; the budget releases when the last clone drops.
+/// Borrowed bytes are exposed only through [`Self::as_bytes`] / [`Self::as_str`].
 #[derive(Clone)]
-enum MetricEntry {
-    Http(TransactionSummary),
-    Stream(StreamTransactionSummary),
-    WebSocket(WsDisconnectContext),
+struct QueuedStatsdPayload {
+    lines: Arc<str>,
+    _lease: Arc<ByteLease>,
+}
+
+impl QueuedStatsdPayload {
+    #[allow(dead_code)]
+    fn as_bytes(&self) -> &[u8] {
+        self.lines.as_bytes()
+    }
+
+    fn as_str(&self) -> &str {
+        self.lines.as_ref()
+    }
+
+    #[allow(dead_code)]
+    fn retained_len(&self) -> usize {
+        self.lines.len()
+    }
+}
+
+/// fmt::Write adapter that fails closed once `max_bytes` would be exceeded.
+struct BoundedFmtWriter<'a> {
+    buf: &'a mut String,
+    max_bytes: usize,
+    exceeded: bool,
+}
+
+impl fmt::Write for BoundedFmtWriter<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if self.exceeded {
+            return Ok(());
+        }
+        if s.len() > self.max_bytes.saturating_sub(self.buf.len()) {
+            self.exceeded = true;
+            return Ok(());
+        }
+        self.buf.push_str(s);
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -523,8 +573,10 @@ pub struct StatsdLogging {
     batch_config: BatchConfig,
     flush_config: StatsdFlushConfig,
     flush_state: Arc<Mutex<StatsdFlushState>>,
-    logger: DeferredBatchingLogger<MetricEntry>,
+    logger: DeferredBatchingLogger<QueuedStatsdPayload>,
     hostname: Option<String>,
+    byte_budget: Arc<ByteBudget>,
+    max_entry_bytes: usize,
 }
 
 impl StatsdLogging {
@@ -591,6 +643,7 @@ impl StatsdLogging {
         let schema = resolve_schema(config, "statsd_logging", SchemaCapabilities::BASE)?;
         let runtime_tag_keys = validate_statsd_schema_keys(schema.as_deref())?;
         let global_tags = build_global_tags(config, ns, &runtime_tag_keys)?;
+        let limits = admit_byte_limits(config, "statsd_logging")?;
 
         let flush_config = StatsdFlushConfig {
             hostname: host.clone(),
@@ -623,8 +676,125 @@ impl StatsdLogging {
             })),
             logger: DeferredBatchingLogger::new(),
             hostname: socket_host.warmup_hostname,
+            byte_budget: Arc::new(ByteBudget::new("statsd_logging", limits.buffer_max_bytes)),
+            max_entry_bytes: limits.max_entry_bytes,
         })
     }
+
+    /// Test-only: aggregate retained-byte usage for the sink instance.
+    #[allow(dead_code)]
+    pub fn byte_budget_used_for_test(&self) -> usize {
+        self.byte_budget.used()
+    }
+
+    /// Test-only: cumulative byte-budget / queue saturation drops.
+    #[allow(dead_code)]
+    pub fn byte_budget_drops_for_test(&self) -> u64 {
+        self.byte_budget.drops_total()
+    }
+
+    /// Test-only: configured per-entry retained-byte ceiling.
+    #[allow(dead_code)]
+    pub fn max_entry_bytes_for_test(&self) -> usize {
+        self.max_entry_bytes
+    }
+
+    /// Test-only: hold `bytes` against the aggregate budget until the guard drops.
+    #[allow(dead_code)]
+    pub fn hold_byte_budget_for_test(&self, bytes: usize) -> Option<StatsdByteLeaseGuardForTest> {
+        self.byte_budget
+            .try_acquire(bytes)
+            .map(|lease| StatsdByteLeaseGuardForTest { _lease: lease })
+    }
+
+    fn admit_rendered(
+        &self,
+        permit: BatchingLoggerPermit<QueuedStatsdPayload>,
+        render: impl FnOnce(&mut dyn fmt::Write),
+    ) {
+        match render_under_byte_budget(&self.byte_budget, self.max_entry_bytes, render) {
+            Some(payload) => permit.send(payload),
+            None => {
+                // Permit drop releases the channel slot; render path already
+                // released any provisional lease.
+            }
+        }
+    }
+}
+
+/// Test-only lease handle that keeps budget bytes reserved until dropped.
+#[allow(dead_code)]
+pub struct StatsdByteLeaseGuardForTest {
+    _lease: Arc<ByteLease>,
+}
+
+/// Test-only admitted payload that exposes borrowed bytes and releases on drop.
+#[allow(dead_code)]
+pub struct StatsdAdmittedPayloadForTest {
+    payload: QueuedStatsdPayload,
+}
+
+#[allow(dead_code)]
+impl StatsdAdmittedPayloadForTest {
+    pub fn as_str(&self) -> &str {
+        self.payload.as_str()
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        self.payload.as_bytes()
+    }
+
+    pub fn retained_len(&self) -> usize {
+        self.payload.retained_len()
+    }
+}
+
+/// Test-only: render HTTP metrics under a budget without enqueueing.
+#[allow(dead_code)]
+pub fn render_http_under_budget_for_test(
+    budget: &ByteBudget,
+    max_entry_bytes: usize,
+    summary: &TransactionSummary,
+    prefix: &str,
+    global_tags: &str,
+    schema: Option<&SummarySchema>,
+) -> Option<StatsdAdmittedPayloadForTest> {
+    render_under_byte_budget(budget, max_entry_bytes, |buf| {
+        format_http_metrics(summary, prefix, global_tags, schema, buf);
+    })
+    .map(|payload| StatsdAdmittedPayloadForTest { payload })
+}
+
+fn render_under_byte_budget(
+    budget: &ByteBudget,
+    max_entry_bytes: usize,
+    render: impl FnOnce(&mut dyn fmt::Write),
+) -> Option<QueuedStatsdPayload> {
+    let lease = budget.try_acquire(accounted_summary_bytes(max_entry_bytes))?;
+    let mut buf = String::new();
+    let mut writer = BoundedFmtWriter {
+        buf: &mut buf,
+        max_bytes: max_entry_bytes,
+        exceeded: false,
+    };
+    render(&mut writer);
+    if writer.exceeded {
+        budget.record_drop("rendered entry exceeded max_entry_bytes");
+        return None;
+    }
+    let retained = buf.len();
+    if retained == 0 {
+        return None;
+    }
+    if retained > max_entry_bytes {
+        budget.record_drop("rendered entry exceeded max_entry_bytes");
+        return None;
+    }
+    lease.shrink_to(accounted_summary_bytes(retained));
+    Some(QueuedStatsdPayload {
+        lines: Arc::<str>::from(buf),
+        _lease: lease,
+    })
 }
 
 #[async_trait]
@@ -665,11 +835,29 @@ impl Plugin for StatsdLogging {
         if summary.mirror {
             return;
         }
-        self.logger.try_send(MetricEntry::Http(summary.clone()));
+        let Some(permit) = self.logger.try_reserve() else {
+            self.byte_budget.record_drop("queue slot exhausted");
+            return;
+        };
+        let prefix = self.flush_config.prefix.as_str();
+        let global_tags = self.flush_config.global_tags.as_str();
+        let schema = self.flush_config.schema.as_deref();
+        self.admit_rendered(permit, |buf| {
+            format_http_metrics(summary, prefix, global_tags, schema, buf);
+        });
     }
 
     async fn on_stream_disconnect(&self, summary: &StreamTransactionSummary) {
-        self.logger.try_send(MetricEntry::Stream(summary.clone()));
+        let Some(permit) = self.logger.try_reserve() else {
+            self.byte_budget.record_drop("queue slot exhausted");
+            return;
+        };
+        let prefix = self.flush_config.prefix.as_str();
+        let global_tags = self.flush_config.global_tags.as_str();
+        let schema = self.flush_config.schema.as_deref();
+        self.admit_rendered(permit, |buf| {
+            format_stream_metrics(summary, prefix, global_tags, schema, buf);
+        });
     }
 
     fn requires_ws_disconnect_hooks(&self) -> bool {
@@ -677,7 +865,16 @@ impl Plugin for StatsdLogging {
     }
 
     async fn on_ws_disconnect(&self, ctx: &WsDisconnectContext) {
-        self.logger.try_send(MetricEntry::WebSocket(ctx.clone()));
+        let Some(permit) = self.logger.try_reserve() else {
+            self.byte_budget.record_drop("queue slot exhausted");
+            return;
+        };
+        let prefix = self.flush_config.prefix.as_str();
+        let global_tags = self.flush_config.global_tags.as_str();
+        let schema = self.flush_config.schema.as_deref();
+        self.admit_rendered(permit, |buf| {
+            format_ws_metrics(ctx, prefix, global_tags, schema, buf);
+        });
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -685,8 +882,7 @@ impl Plugin for StatsdLogging {
     }
 }
 
-fn write_timer(buf: &mut String, prefix: &str, metric: &str, value: f64, tags: &str) {
-    use std::fmt::Write;
+fn write_timer(buf: &mut dyn fmt::Write, prefix: &str, metric: &str, value: f64, tags: &str) {
     if is_valid_timer_sample(value) {
         let _ = writeln!(buf, "{prefix}.{metric}:{value:.2}|ms{tags}");
     }
@@ -698,10 +894,8 @@ pub fn format_http_metrics(
     prefix: &str,
     global_tags: &str,
     schema: Option<&SummarySchema>,
-    buf: &mut String,
+    buf: &mut dyn fmt::Write,
 ) {
-    use std::fmt::Write;
-
     if summary.mirror {
         return;
     }
@@ -798,10 +992,8 @@ pub fn format_stream_metrics(
     prefix: &str,
     global_tags: &str,
     schema: Option<&SummarySchema>,
-    buf: &mut String,
+    buf: &mut dyn fmt::Write,
 ) {
-    use std::fmt::Write;
-
     let effective_schema = schema.filter(|s| s.applies_to_stream());
     let protocol = sanitize_tag_value(&summary.protocol);
     let proxy_raw = summary.proxy_name.as_deref().unwrap_or(&summary.proxy_id);
@@ -891,10 +1083,8 @@ pub fn format_ws_metrics(
     prefix: &str,
     global_tags: &str,
     schema: Option<&SummarySchema>,
-    buf: &mut String,
+    buf: &mut dyn fmt::Write,
 ) {
-    use std::fmt::Write;
-
     let effective_schema = schema.filter(|s| s.applies_to_websocket_disconnect());
     let proxy_raw = ctx.proxy_name.as_deref().unwrap_or(&ctx.proxy_id);
     let proxy_tag = sanitize_tag_value(proxy_raw);
@@ -954,8 +1144,29 @@ pub fn format_ws_metrics(
 /// Pack newline-delimited StatsD lines into UDP datagrams that each stay at
 /// or below `max_payload`. Individual lines larger than the ceiling are
 /// dropped (never fragmented mid-line) and counted in the returned drop tally.
+///
+/// Collects every datagram into a `Vec` for inspection. Production delivery
+/// packs one MTU-bounded buffer at a time via [`send_packed_entries`] so
+/// sibling datagram copies are not retained together.
+#[allow(dead_code)]
 pub fn pack_udp_datagrams(payload: &str, max_payload: usize) -> (Vec<String>, usize) {
     let mut datagrams = Vec::new();
+    let dropped = for_each_udp_datagram(payload, max_payload, |datagram| {
+        datagrams.push(datagram.to_string());
+    });
+    (datagrams, dropped)
+}
+
+/// Visit each packed UDP datagram without retaining sibling copies.
+///
+/// `visit` receives borrowed bytes for one datagram at a time (never larger
+/// than `max_payload`). Returns the number of oversized lines dropped.
+#[allow(dead_code)]
+pub fn for_each_udp_datagram(
+    payload: &str,
+    max_payload: usize,
+    mut visit: impl FnMut(&str),
+) -> usize {
     let mut chunk = String::with_capacity(max_payload.min(payload.len()));
     let mut dropped = 0usize;
 
@@ -972,8 +1183,8 @@ pub fn pack_udp_datagrams(payload: &str, max_payload: usize) -> (Vec<String>, us
             continue;
         }
         if !chunk.is_empty() && chunk.len() + line.len() + 1 > max_payload {
-            datagrams.push(std::mem::take(&mut chunk));
-            chunk = String::with_capacity(max_payload);
+            visit(&chunk);
+            chunk.clear();
         }
         if !chunk.is_empty() {
             chunk.push('\n');
@@ -981,9 +1192,52 @@ pub fn pack_udp_datagrams(payload: &str, max_payload: usize) -> (Vec<String>, us
         chunk.push_str(line);
     }
     if !chunk.is_empty() {
-        datagrams.push(chunk);
+        visit(&chunk);
     }
-    (datagrams, dropped)
+    dropped
+}
+
+/// Pack already-rendered queue entries into MTU-bounded datagrams and send
+/// each one immediately, retaining only the admitted batch plus one chunk.
+async fn send_packed_entries(
+    socket: &tokio::net::UdpSocket,
+    entries: &[QueuedStatsdPayload],
+) -> Result<(), String> {
+    let mut chunk = String::with_capacity(MAX_UDP_PAYLOAD);
+
+    for entry in entries {
+        for line in entry.as_str().lines() {
+            if line.is_empty() {
+                continue;
+            }
+            if line.len() > MAX_UDP_PAYLOAD {
+                warn!(
+                    line_len = line.len(),
+                    max_payload = MAX_UDP_PAYLOAD,
+                    "statsd_logging: dropping metric line exceeding UDP payload ceiling"
+                );
+                continue;
+            }
+            if !chunk.is_empty() && chunk.len() + line.len() + 1 > MAX_UDP_PAYLOAD {
+                debug_assert!(chunk.len() <= MAX_UDP_PAYLOAD);
+                if let Err(error) = socket.send(chunk.as_bytes()).await {
+                    return Err(format!("statsd_logging: failed to send metrics: {error}"));
+                }
+                chunk.clear();
+            }
+            if !chunk.is_empty() {
+                chunk.push('\n');
+            }
+            chunk.push_str(line);
+        }
+    }
+    if !chunk.is_empty() {
+        debug_assert!(chunk.len() <= MAX_UDP_PAYLOAD);
+        if let Err(error) = socket.send(chunk.as_bytes()).await {
+            return Err(format!("statsd_logging: failed to send metrics: {error}"));
+        }
+    }
+    Ok(())
 }
 
 /// Single-allocation builder for the trailing `|#k:v,k:v,…` block.
@@ -1032,42 +1286,9 @@ impl TagBlockBuilder {
 async fn send_batch(
     cfg: &StatsdFlushConfig,
     state: &Mutex<StatsdFlushState>,
-    batch: Vec<MetricEntry>,
+    batch: Vec<QueuedStatsdPayload>,
 ) -> Result<(), String> {
-    let mut payload = String::with_capacity(batch.len() * 128);
-    for entry in &batch {
-        match entry {
-            MetricEntry::Http(summary) => {
-                format_http_metrics(
-                    summary,
-                    &cfg.prefix,
-                    &cfg.global_tags,
-                    cfg.schema.as_deref(),
-                    &mut payload,
-                );
-            }
-            MetricEntry::Stream(summary) => {
-                format_stream_metrics(
-                    summary,
-                    &cfg.prefix,
-                    &cfg.global_tags,
-                    cfg.schema.as_deref(),
-                    &mut payload,
-                );
-            }
-            MetricEntry::WebSocket(ctx) => {
-                format_ws_metrics(
-                    ctx,
-                    &cfg.prefix,
-                    &cfg.global_tags,
-                    cfg.schema.as_deref(),
-                    &mut payload,
-                );
-            }
-        }
-    }
-
-    if payload.is_empty() {
+    if batch.is_empty() {
         return Ok(());
     }
 
@@ -1110,16 +1331,7 @@ async fn send_batch(
     }
 
     let result = if let Some(socket) = socket.as_ref() {
-        let (datagrams, _dropped) = pack_udp_datagrams(&payload, MAX_UDP_PAYLOAD);
-        let mut send_result = Ok(());
-        for datagram in datagrams {
-            debug_assert!(datagram.len() <= MAX_UDP_PAYLOAD);
-            if let Err(error) = socket.send(datagram.as_bytes()).await {
-                send_result = Err(format!("statsd_logging: failed to send metrics: {error}"));
-                break;
-            }
-        }
-        send_result
+        send_packed_entries(socket, &batch).await
     } else {
         Err("statsd_logging: UDP socket unavailable after initialization".to_string())
     };
