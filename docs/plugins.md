@@ -435,12 +435,14 @@ Sends transaction metrics to a StatsD-compatible server (StatsD, Datadog DogStat
 | `flush_interval_ms` | Integer | `500` | Max milliseconds before flushing buffered metrics (50–600000) |
 | `buffer_capacity` | Integer | `10000` | Channel capacity — new entries are dropped when full (1–1000000) |
 | `max_batch_lines` | Integer | `50` | Max metric entries to batch before flushing (1–10000) |
+| `max_entry_bytes` | Integer | `65536` | Maximum rendered StatsD line-protocol size of one admitted transaction (1024–1048576). Oversized renders are dropped before enqueue. |
+| `buffer_max_bytes` | Integer | `16777216` | Aggregate retained rendered-content budget across queued entries, one MTU-bounded datagram buffer, and retries (must be ≥ `2 * (max_entry_bytes + 1)`; hard max 268435456). Admission reserves before rendering. |
 | `max_retries` | Integer | `0` | Retry attempts after the initial UDP send fails (0–10; shared batching logger) |
 | `retry_delay_ms` | Integer | `0` | Delay in milliseconds between retry attempts (0–60000) |
 | `schema` | Object | *(none)* | Inline summary schema; only `rename` / `omit` / `summary_type` affect StatsD tags. Rename targets must pass the same tag-key grammar and must not collide with reserved tags. |
 | `schema_ref` | String | *(none)* | Named schema from `transaction_log_schema`; mutually exclusive with `schema` |
 
-Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Batches are packed into UDP datagrams that never exceed a **1452-byte** conservative IPv4/IPv6 payload ceiling. Multi-line batches split only on newline boundaries; an individual metric line larger than the ceiling is dropped and warned (it is never fragmented mid-line, and sibling valid lines in the same batch are still sent).
+Metrics are flushed when `max_batch_lines` is reached **or** `flush_interval_ms` elapses, whichever comes first. Hot-path admission reserves a queue slot and a provisional `max_entry_bytes` lease before rendering attacker-shaped summary fields into StatsD line protocol, then shrinks that lease to the exact retained size. Batches are packed into UDP datagrams that never exceed a **1452-byte** conservative IPv4/IPv6 payload ceiling; delivery retains the admitted batch plus at most one datagram buffer (it does not materialize every datagram copy up front). Multi-line batches split only on newline boundaries; an individual metric line larger than the ceiling is dropped and warned (it is never fragmented mid-line, and sibling valid lines in the same batch are still sent).
 
 **DNS handling.** The StatsD endpoint is resolved through the gateway's shared `DnsCache` at startup (pre-warmed via `warmup_hostnames()`) and re-resolved every 60 seconds by the background flush task. If the resolved address changes (DNS flip, service discovery update), the UDP socket is rebound to the new address without a gateway restart.
 
