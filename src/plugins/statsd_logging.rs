@@ -674,10 +674,7 @@ impl StatsdLogging {
             })),
             logger: DeferredBatchingLogger::new(),
             hostname: socket_host.warmup_hostname,
-            byte_budget: Arc::new(ByteBudget::new(
-                "statsd_logging",
-                limits.buffer_max_bytes,
-            )),
+            byte_budget: Arc::new(ByteBudget::new("statsd_logging", limits.buffer_max_bytes)),
             max_entry_bytes: limits.max_entry_bytes,
         })
     }
@@ -709,11 +706,7 @@ impl StatsdLogging {
         permit: BatchingLoggerPermit<QueuedStatsdPayload>,
         render: impl FnOnce(&mut dyn fmt::Write),
     ) {
-        match render_under_byte_budget(
-            &self.byte_budget,
-            self.max_entry_bytes,
-            render,
-        ) {
+        match render_under_byte_budget(&self.byte_budget, self.max_entry_bytes, render) {
             Some(payload) => permit.send(payload),
             None => {
                 // Permit drop releases the channel slot; render path already

@@ -1250,10 +1250,7 @@ async fn test_statsd_logging_byte_budget_config_validation_fail_closed() {
         default_client(),
     )
     .expect_err("max_entry_bytes below minimum");
-    assert!(
-        below_min.contains("max_entry_bytes"),
-        "got: {below_min}"
-    );
+    assert!(below_min.contains("max_entry_bytes"), "got: {below_min}");
 
     let above_hard = StatsdLogging::new(
         &json!({
@@ -1263,10 +1260,7 @@ async fn test_statsd_logging_byte_budget_config_validation_fail_closed() {
         default_client(),
     )
     .expect_err("max_entry_bytes above hard max");
-    assert!(
-        above_hard.contains("max_entry_bytes"),
-        "got: {above_hard}"
-    );
+    assert!(above_hard.contains("max_entry_bytes"), "got: {above_hard}");
 
     let buffer_too_small = StatsdLogging::new(
         &json!({
@@ -1352,14 +1346,8 @@ fn test_statsd_logging_oversized_render_releases_lease() {
     global.push_str("namespace:ferrum");
 
     let drops_before = budget.drops_total();
-    let rejected = render_http_under_budget_for_test(
-        &budget,
-        1024,
-        &summary,
-        &prefix,
-        &global,
-        None,
-    );
+    let rejected =
+        render_http_under_budget_for_test(&budget, 1024, &summary, &prefix, &global, None);
     assert!(
         rejected.is_none(),
         "oversized render must fail closed before retention"
@@ -1386,7 +1374,11 @@ fn test_statsd_logging_admitted_payload_releases_on_drop() {
     let expected = accounted_summary_bytes(admitted.retained_len());
     assert_eq!(budget.used(), expected);
     drop(admitted);
-    assert_eq!(budget.used(), 0, "drop must release the retained-byte lease");
+    assert_eq!(
+        budget.used(),
+        0,
+        "drop must release the retained-byte lease"
+    );
 }
 
 #[tokio::test]
