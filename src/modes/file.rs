@@ -672,6 +672,13 @@ pub async fn serve(
         config.consumers.len()
     );
 
+    // Open the observability delivery lifecycle for this serving cycle before
+    // plugin activation registers any queue worker. A previous in-process
+    // cycle that already drained leaves its generation permanently closed, so
+    // without this a second `serve()` would register workers into a closed
+    // generation and lose every deferred record.
+    crate::observability_delivery::begin_serving_cycle();
+
     // A caller-owned admin HTTPS socket is served only when both admin TLS
     // paths are configured (including over `FERRUM_ADMIN_HTTPS_PORT=0`).
     // Without both paths the socket cannot be used — drop it *before*

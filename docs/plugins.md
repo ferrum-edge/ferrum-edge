@@ -1136,6 +1136,20 @@ cancelled tasks and outstanding records through
 `ferrum_observability_delivery_*` metrics. A failed or unavailable sink cannot
 wedge process exit.
 
+A completed drain is terminal for that delivery lifecycle *generation*: its
+task and worker admission stay closed and its drain report stays cached, so
+late producers on a shutting-down process cannot reopen delivery work behind
+the drain. In-process callers that start, stop, and start the gateway again in
+one process get a fresh generation instead: each serving mode opens the
+lifecycle for its cycle before plugin activation registers queue workers, which
+installs a new generation when the previous one already drained. Producers
+always target the current generation, so nothing is admitted into an old
+draining generation and a stale generation's cleanup never closes a newer one.
+`ferrum_observability_delivery_generation` exposes the current generation, and
+the other delivery counters are scoped to it. Overlapping (rather than
+sequential) in-process serving cycles still share one generation, because
+request paths carry no per-instance lifecycle handle.
+
 #### Example: TCP Stream
 
 ```json

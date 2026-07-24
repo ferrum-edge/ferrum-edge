@@ -9130,6 +9130,12 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("invalid mesh runtime configuration: {e}"))?;
     ensure_runtime_config_protocol_supported(&runtime)?;
 
+    // Open the observability delivery lifecycle for this serving cycle before
+    // any plugin activation registers a queue worker. Re-running this mode in
+    // one process after a completed drain otherwise targets the closed
+    // generation of the previous cycle.
+    crate::observability_delivery::begin_serving_cycle();
+
     info!(
         node_id = %runtime.node_id,
         namespace = %runtime.namespace,

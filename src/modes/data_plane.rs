@@ -29,6 +29,12 @@ pub async fn run(
 ) -> Result<(), anyhow::Error> {
     info!("DP mode: starting with empty config, waiting for CP");
 
+    // Open the observability delivery lifecycle for this serving cycle before
+    // any plugin activation registers a queue worker. Re-running this mode in
+    // one process after a completed drain otherwise targets the closed
+    // generation of the previous cycle.
+    crate::observability_delivery::begin_serving_cycle();
+
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: env_config.dns_overrides.clone(),
         resolver_addresses: env_config.dns_resolver_address.clone(),

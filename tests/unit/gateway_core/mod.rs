@@ -26,6 +26,7 @@ mod locality_lb_tests;
 mod mesh_bpf_metrics_contract_tests;
 mod mesh_udp_capture_outcome_tests;
 mod metrics_tests;
+mod observability_delivery_tests;
 mod overload_tests;
 mod per_port_load_balancer_tests;
 mod pool_create_failure_classification_tests;

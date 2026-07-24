@@ -857,6 +857,12 @@ pub async fn run(
     env_config: EnvConfig,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
+    // Open the observability delivery lifecycle for this serving cycle before
+    // any plugin activation registers a queue worker. Re-running this mode in
+    // one process after a completed drain otherwise targets the closed
+    // generation of the previous cycle.
+    crate::observability_delivery::begin_serving_cycle();
+
     let effective_url = env_config
         .effective_db_url()
         .map_err(anyhow::Error::msg)?
