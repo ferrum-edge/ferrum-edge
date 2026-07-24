@@ -7,6 +7,8 @@
 //! The admin API is always read-only in this mode (no database to write to).
 //! If `FERRUM_ADMIN_JWT_SECRET` is not set, a random secret is generated —
 //! any externally-crafted JWT will be rejected since nobody knows the secret.
+//! A configured-but-invalid JWT setting (short secret, malformed TTL, …) fails
+//! startup and `ferrum-edge validate` instead of silently falling back.
 //!
 //! ## Public entry points
 //!
@@ -33,7 +35,7 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use crate::admin::jwt_auth::create_jwt_manager_from_env;
+use crate::admin::jwt_auth::{JwtError, create_jwt_manager_from_env};
 use crate::admin::{self, AdminState};
 use crate::config::EnvConfig;
 use crate::config::file_loader;
@@ -126,6 +128,10 @@ pub struct ServeOptions {
 pub struct ServeHandles {
     /// Shared proxy state. Tests can read metrics, swap config, etc.
     pub proxy_state: ProxyState,
+    /// Sticky flag raised when a SIGHUP load/validation/apply is rejected.
+    /// Authenticated `/health` reports `config_rejected: true` / `degraded`
+    /// while set; cleared by a later Applied or Unchanged reload.
+    pub config_rejected: Arc<AtomicBool>,
     /// Local addresses each listener is bound to (resolved from the pre-bound
     /// listener, **not** read from `EnvConfig`). Tests use this to build
     /// canonical proxy/admin URLs.
@@ -553,6 +559,7 @@ pub async fn run(
     // SIGHUP-driven config reload (Unix only). On non-Unix this future just
     // waits on shutdown so the join order is unchanged.
     let proxy_state_reload = handles.proxy_state.clone();
+    let config_rejected_reload = handles.config_rejected.clone();
     let config_path_owned = config_path;
     let reload_cert_expiry_warning_days = env_config.tls_cert_expiry_warning_days;
     let reload_backend_allow_ips = env_config.backend_allow_ips.clone();
@@ -593,24 +600,16 @@ pub async fn run(
                         .await
                         {
                             Ok(new_config) => {
-                                match proxy_state_reload.update_config(new_config) {
-                                    proxy::ConfigApplyOutcome::Applied => {
-                                        info!("Configuration reloaded successfully");
-                                    }
-                                    proxy::ConfigApplyOutcome::Unchanged => {
-                                        info!("Configuration reload valid but unchanged");
-                                    }
-                                    proxy::ConfigApplyOutcome::Rejected { .. } => {
-                                        error!(
-                                            "Configuration reload rejected, keeping previous config"
-                                        );
-                                    }
-                                }
+                                let outcome = proxy_state_reload.update_config(new_config);
+                                record_file_mode_reload_apply_outcome(
+                                    &outcome,
+                                    &config_rejected_reload,
+                                );
                             }
                             Err(e) => {
-                                error!(
-                                    "Configuration reload failed, keeping previous config: {}",
-                                    e
+                                record_file_mode_reload_load_failure(
+                                    &e,
+                                    &config_rejected_reload,
                                 );
                             }
                         }
@@ -641,6 +640,58 @@ pub async fn run(
     let _ = tokio::time::timeout(Duration::from_secs(5), sighup_handle).await;
 
     listener_result.map_err(|e| anyhow::anyhow!("Gateway listener task failed: {e}"))
+}
+
+/// Record a failed file-mode config load/parse during SIGHUP reload.
+///
+/// Raises `config_rejected` so authenticated `/health` reports degraded while
+/// the gateway keeps serving last-known-good config.
+pub fn record_file_mode_reload_load_failure(err: &anyhow::Error, config_rejected: &AtomicBool) {
+    error!(
+        "Configuration reload failed, keeping previous config: {}",
+        err
+    );
+    if !config_rejected.swap(true, Ordering::Relaxed) {
+        warn!(
+            "File-mode config reload load/validation failure; raising config_rejected \
+             (authenticated /health will report degraded until a valid reload succeeds)"
+        );
+    }
+}
+
+/// Record the outcome of applying a successfully loaded file-mode reload.
+///
+/// `Applied` and `Unchanged` clear `config_rejected`. `Rejected` raises it and
+/// keeps last-known-good runtime config.
+pub fn record_file_mode_reload_apply_outcome(
+    outcome: &proxy::ConfigApplyOutcome,
+    config_rejected: &AtomicBool,
+) {
+    match outcome {
+        proxy::ConfigApplyOutcome::Applied => {
+            info!("Configuration reloaded successfully");
+            crate::modes::clear_config_rejected_after_accepted_full_reload(
+                config_rejected,
+                "file-mode SIGHUP Applied",
+            );
+        }
+        proxy::ConfigApplyOutcome::Unchanged => {
+            info!("Configuration reload valid but unchanged");
+            crate::modes::clear_config_rejected_after_accepted_full_reload(
+                config_rejected,
+                "file-mode SIGHUP Unchanged",
+            );
+        }
+        proxy::ConfigApplyOutcome::Rejected { .. } => {
+            error!("Configuration reload rejected, keeping previous config");
+            if !config_rejected.swap(true, Ordering::Relaxed) {
+                warn!(
+                    "File-mode config reload apply rejected; raising config_rejected \
+                     (authenticated /health will report degraded until a valid reload succeeds)"
+                );
+            }
+        }
+    }
 }
 
 /// In-process entry point.
@@ -984,6 +1035,10 @@ pub async fn serve(
 
     // Listen for SIGHUP — only meaningful for run(); skipped here.
     let startup_ready = Arc::new(AtomicBool::new(false));
+    // Sticky across rejected SIGHUP reloads; cleared by Applied/Unchanged.
+    // `db_available` stays `None` so the `/health` DB-reachability gate treats
+    // file mode as reachable and surfaces `config_rejected` when set.
+    let config_rejected = Arc::new(AtomicBool::new(false));
     let jwt_manager = if let Some(jm) = prebound.admin_jwt_manager.take() {
         // Caller (in-process harness) supplied its own — bypass env reads
         // entirely so parallel tests don't have to serialise on
@@ -992,16 +1047,31 @@ pub async fn serve(
     } else {
         match create_jwt_manager_from_env() {
             Ok(jm) => jm,
-            Err(e) => {
+            Err(JwtError::NotConfigured) => {
                 warn!(
-                    "Admin JWT not configured ({}), admin endpoints will reject requests",
-                    e
+                    "Admin JWT secret not set; generating a random read-only secret \
+                     (externally minted tokens will not validate)"
                 );
                 let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
                 crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
                     secret: random_secret,
                     ..Default::default()
                 })
+            }
+            Err(e) => {
+                let startup_err = anyhow::anyhow!(
+                    "Invalid admin JWT configuration: {e}. \
+                     File mode generates a random secret only when FERRUM_ADMIN_JWT_SECRET \
+                     is unset; a configured-but-invalid secret or TTL must be fixed."
+                );
+                error!("{startup_err}");
+                shutdown_file_background_startup_tasks(
+                    &shutdown_tx,
+                    &proxy_state,
+                    background_handles,
+                )
+                .await;
+                return Err(startup_err);
             }
         }
     };
@@ -1020,7 +1090,7 @@ pub async fn serve(
         serving_degraded: None,
         serving_listener_failures: None,
         db_available: None,
-        config_rejected: None,
+        config_rejected: Some(config_rejected.clone()),
         admin_restore_max_body_size_mib: env_config.admin_restore_max_body_size_mib,
         admin_spec_max_body_size_mib: env_config.admin_spec_max_body_size_mib,
         reserved_ports,
@@ -1450,6 +1520,7 @@ pub async fn serve(
     // accumulate orphan listeners holding sockets across attempts.
     let serve_handles = ServeHandles {
         proxy_state: proxy_state.clone(),
+        config_rejected,
         bound,
         listener_handles: handles,
         background_handles,

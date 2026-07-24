@@ -421,6 +421,12 @@ pub fn execute_validate() -> Result<(), String> {
         report_field("FERRUM_MODE", &format!("{:?}", env_config.mode))
     );
 
+    // Side-effect-free env TLS/security loaders that the selected serving mode
+    // treats as startup-fatal. Must stay free of listeners, servers, migrations,
+    // or other runtime side effects (parity with `run` admission).
+    validate_env_security_surfaces(&env_config)?;
+    println!("Env TLS/security surfaces: OK");
+
     if env_config.mode == OperatingMode::File {
         let config_path = env_config
             .file_config_path
@@ -459,6 +465,174 @@ pub fn execute_validate() -> Result<(), String> {
 
     println!("\nValidation passed.");
     Ok(())
+}
+
+/// Exercise every side-effect-free env TLS/security loader that the selected
+/// serving mode treats as startup-fatal.
+///
+/// Covers TLS policy/CRLs, trusted admin CIDRs, metrics auth, configured
+/// frontend/admin TLS pairs, DTLS certificate expiry, and admin JWT admission
+/// rules (including file/mesh/node_agent "unset → random at runtime" vs
+/// "set-but-invalid → fail").
+pub fn validate_env_security_surfaces(env_config: &crate::config::EnvConfig) -> Result<(), String> {
+    use crate::admin::jwt_auth::create_jwt_manager_from_env;
+    use crate::config::OperatingMode;
+    use crate::tls::{self, TlsPolicy};
+
+    match env_config.mode {
+        OperatingMode::Migrate | OperatingMode::Injector => {
+            // Migrate never starts listeners; injector validates its own TLS
+            // serving paths separately at injector startup.
+            return Ok(());
+        }
+        OperatingMode::NodeAgent => {
+            validate_admin_cidrs_and_metrics_auth(env_config)?;
+            validate_admin_jwt_for_mode(env_config.mode, create_jwt_manager_from_env)?;
+            return Ok(());
+        }
+        OperatingMode::ControlPlane => {
+            let tls_policy = TlsPolicy::from_env_config(env_config)
+                .map_err(|e| format!("TLS policy validation failed: {e}"))?;
+            let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())
+                .map_err(|e| format!("CRL validation failed: {e}"))?;
+            validate_admin_cidrs_and_metrics_auth(env_config)?;
+            validate_admin_tls_pair_if_configured(env_config, &tls_policy, crls.as_slice())?;
+            validate_admin_jwt_for_mode(env_config.mode, create_jwt_manager_from_env)?;
+            return Ok(());
+        }
+        OperatingMode::File
+        | OperatingMode::Database
+        | OperatingMode::DataPlane
+        | OperatingMode::Mesh => {}
+    }
+
+    let tls_policy = TlsPolicy::from_env_config(env_config)
+        .map_err(|e| format!("TLS policy validation failed: {e}"))?;
+    let crls = tls::load_crls(env_config.tls_crl_file_path.as_deref())
+        .map_err(|e| format!("CRL validation failed: {e}"))?;
+    validate_admin_cidrs_and_metrics_auth(env_config)?;
+    validate_frontend_tls_pair_if_configured(env_config, &tls_policy, crls.as_slice())?;
+    validate_dtls_certs_if_configured(env_config)?;
+    validate_admin_tls_pair_if_configured(env_config, &tls_policy, crls.as_slice())?;
+    validate_admin_jwt_for_mode(env_config.mode, create_jwt_manager_from_env)?;
+    Ok(())
+}
+
+fn validate_admin_cidrs_and_metrics_auth(
+    env_config: &crate::config::EnvConfig,
+) -> Result<(), String> {
+    crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
+        .map_err(|e| format!("FERRUM_ADMIN_ALLOWED_CIDRS: {e}"))?;
+    crate::admin::MetricsAuthPolicy::from_env(env_config)?;
+    Ok(())
+}
+
+fn validate_frontend_tls_pair_if_configured(
+    env_config: &crate::config::EnvConfig,
+    tls_policy: &crate::tls::TlsPolicy,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+) -> Result<(), String> {
+    let (Some(cert_path), Some(key_path)) = (
+        env_config.frontend_tls_cert_path.as_deref(),
+        env_config.frontend_tls_key_path.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    crate::tls::load_tls_config_with_client_auth_and_ocsp(
+        cert_path,
+        key_path,
+        env_config.frontend_tls_client_ca_bundle_path.as_deref(),
+        env_config.frontend_tls_ocsp_response_source.as_deref(),
+        false,
+        tls_policy,
+        env_config.tls_cert_expiry_warning_days,
+        crls,
+    )
+    .map_err(|e| format!("Invalid frontend TLS configuration: {e}"))?;
+    Ok(())
+}
+
+fn validate_admin_tls_pair_if_configured(
+    env_config: &crate::config::EnvConfig,
+    tls_policy: &crate::tls::TlsPolicy,
+    crls: &[rustls::pki_types::CertificateRevocationListDer<'static>],
+) -> Result<(), String> {
+    // Mirror serving-mode gates: admin HTTPS port `0` disables the listener
+    // (and material load) unless an in-process embedder supplies a pre-bound
+    // socket — validate never has one, so port `0` skips admin TLS load.
+    if env_config.admin_https_port == 0 {
+        return Ok(());
+    }
+    let (Some(cert_path), Some(key_path)) = (
+        env_config.admin_tls_cert_path.as_deref(),
+        env_config.admin_tls_key_path.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    crate::tls::load_tls_config_with_client_auth_and_ocsp(
+        cert_path,
+        key_path,
+        env_config.admin_tls_client_ca_bundle_path.as_deref(),
+        env_config.admin_tls_ocsp_response_source.as_deref(),
+        env_config.admin_tls_no_verify,
+        tls_policy,
+        env_config.tls_cert_expiry_warning_days,
+        crls,
+    )
+    .map_err(|e| format!("Invalid admin TLS configuration: {e}"))?;
+    Ok(())
+}
+
+fn validate_dtls_certs_if_configured(env_config: &crate::config::EnvConfig) -> Result<(), String> {
+    let (Some(cert_path), Some(_key_path)) = (
+        env_config.dtls_cert_path.as_deref(),
+        env_config.dtls_key_path.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    crate::tls::check_cert_expiry(
+        cert_path,
+        "DTLS frontend cert",
+        env_config.tls_cert_expiry_warning_days,
+    )
+    .map_err(|e| format!("Invalid DTLS frontend cert: {e}"))?;
+    if let Some(ca_path) = env_config.dtls_client_ca_cert_path.as_deref() {
+        crate::tls::check_cert_expiry(
+            ca_path,
+            "DTLS client CA cert",
+            env_config.tls_cert_expiry_warning_days,
+        )
+        .map_err(|e| format!("Invalid DTLS client CA cert: {e}"))?;
+    }
+    Ok(())
+}
+
+fn validate_admin_jwt_for_mode<F>(
+    mode: crate::config::OperatingMode,
+    create: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<crate::admin::jwt_auth::JwtManager, crate::admin::jwt_auth::JwtError>,
+{
+    use crate::admin::jwt_auth::JwtError;
+    use crate::config::OperatingMode;
+
+    match create() {
+        Ok(_) => Ok(()),
+        Err(JwtError::NotConfigured) => match mode {
+            // Read-only modes mint a random secret at runtime when unset.
+            OperatingMode::File | OperatingMode::Mesh | OperatingMode::NodeAgent => Ok(()),
+            other => Err(format!(
+                "FERRUM_ADMIN_JWT_SECRET must be set and non-empty for {:?} mode",
+                other
+            )),
+        },
+        Err(err) => Err(format!(
+            "Invalid admin JWT configuration: {err}. \
+             A configured-but-invalid secret or TTL fails validation (file/mesh/node_agent \
+             generate a random secret only when the secret is unset)."
+        )),
+    }
 }
 
 const HEALTH_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);

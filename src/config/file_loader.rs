@@ -10,12 +10,32 @@
 //!
 //! Validation is strict in file mode (errors fail startup) vs. warn-only in
 //! database mode (stale config is better than no config).
+//!
+//! ## Atomic updates
+//!
+//! Operators must publish config via atomic rename (write temp → `rename(2)`)
+//! or an atomic ConfigMap/symlink swap. In-place editors, shell `>` redirection,
+//! and non-atomic `cp` onto the live path can expose a torn read window. This
+//! loader uses bounded metadata/content stability checks with a short retry
+//! budget and fails closed when the file keeps changing mid-read, so a
+//! syntactically valid truncated tail is never applied. A completed
+//! non-atomic truncate that leaves a stable shorter file still parses; prefer
+//! rename-only updates so last-known-good reload behavior is never asked to
+//! accept a silently shortened resource list.
 
 use crate::config::config_migration::ConfigMigrator;
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use std::path::Path;
+use std::time::Duration;
 use tracing::{info, warn};
+
+/// How many times to retry a config-file read when metadata/content changes
+/// mid-load (non-atomic writer still flushing).
+const CONFIG_FILE_STABILITY_MAX_ATTEMPTS: u32 = 3;
+/// Delay between stability retries. Short enough for atomic renames to win
+/// quickly; long enough for a slow in-place writer to finish or keep moving.
+const CONFIG_FILE_STABILITY_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 /// Load configuration from a YAML or JSON file.
 ///
@@ -50,7 +70,135 @@ pub fn load_config_from_file(
         }
     }
 
-    let content = std::fs::read_to_string(file_path)?;
+    let content = read_config_file_stable(file_path)?;
+    parse_config_content(
+        &content,
+        file_path,
+        cert_expiry_warning_days,
+        backend_allow_ips,
+        namespace,
+    )
+}
+
+/// Options for the bounded config-file stability read.
+#[derive(Debug, Clone, Copy)]
+pub struct StableFileReadOptions {
+    pub max_attempts: u32,
+    pub retry_delay: Duration,
+}
+
+impl Default for StableFileReadOptions {
+    fn default() -> Self {
+        Self {
+            max_attempts: CONFIG_FILE_STABILITY_MAX_ATTEMPTS,
+            retry_delay: CONFIG_FILE_STABILITY_RETRY_DELAY,
+        }
+    }
+}
+
+/// Read a config file with bounded metadata/content stability checks.
+///
+/// Stats size (+ mtime when available), reads, re-stats, and re-reads; any
+/// mismatch retries up to [`StableFileReadOptions::max_attempts`]. Persistent
+/// instability fails closed so a torn non-atomic write cannot be applied.
+pub fn read_config_file_stable(path: &Path) -> Result<String, anyhow::Error> {
+    read_config_file_stable_with(path, StableFileReadOptions::default(), &mut || {})
+}
+
+/// Like [`read_config_file_stable`], but invokes `between_checks` between the
+/// first metadata snapshot and the content reads. Production callers pass an
+/// empty closure; tests use this hook to deterministically mutate the file
+/// mid-check and assert fail-closed rejection.
+pub fn read_config_file_stable_with<F>(
+    path: &Path,
+    options: StableFileReadOptions,
+    between_checks: &mut F,
+) -> Result<String, anyhow::Error>
+where
+    F: FnMut(),
+{
+    let attempts = options.max_attempts.max(1);
+    let mut last_unstable: Option<anyhow::Error> = None;
+    for attempt in 0..attempts {
+        match try_read_config_file_stable_once(path, between_checks) {
+            Ok(content) => return Ok(content),
+            Err(err) if is_unstable_config_file_error(&err) => {
+                last_unstable = Some(err);
+                if attempt + 1 < attempts {
+                    std::thread::sleep(options.retry_delay);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last_unstable.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "Configuration file {} changed while being read (unstable/torn write); \
+             publish via atomic rename or ConfigMap symlink swap and retry",
+            path.display()
+        )
+    }))
+}
+
+fn is_unstable_config_file_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("changed while being read")
+}
+
+fn try_read_config_file_stable_once<F>(
+    path: &Path,
+    between_checks: &mut F,
+) -> Result<String, anyhow::Error>
+where
+    F: FnMut(),
+{
+    let meta_before = std::fs::metadata(path)?;
+    let len_before = meta_before.len();
+    let mtime_before = meta_before.modified().ok();
+
+    // Test hook: mutate the live path between the opening stat and the reads.
+    between_checks();
+
+    let content = std::fs::read_to_string(path)?;
+    let meta_mid = std::fs::metadata(path)?;
+    let len_mid = meta_mid.len();
+    let mtime_mid = meta_mid.modified().ok();
+
+    if content.len() as u64 != len_before
+        || len_mid != len_before
+        || mtime_mid != mtime_before
+    {
+        anyhow::bail!(
+            "Configuration file {} changed while being read (unstable/torn write); \
+             publish via atomic rename or ConfigMap symlink swap and retry",
+            path.display()
+        );
+    }
+
+    // Second read catches same-length rewrites that flip content without a
+    // detectable size change between the first pair of stats.
+    let content_again = std::fs::read_to_string(path)?;
+    let meta_after = std::fs::metadata(path)?;
+    if content_again != content
+        || meta_after.len() != len_before
+        || meta_after.modified().ok() != mtime_before
+    {
+        anyhow::bail!(
+            "Configuration file {} changed while being read (unstable/torn write); \
+             publish via atomic rename or ConfigMap symlink swap and retry",
+            path.display()
+        );
+    }
+
+    Ok(content)
+}
+
+fn parse_config_content(
+    content: &str,
+    file_path: &Path,
+    cert_expiry_warning_days: u64,
+    backend_allow_ips: &crate::config::BackendEgressPolicy,
+    namespace: &str,
+) -> Result<GatewayConfig, anyhow::Error> {
     let ext = file_path
         .extension()
         .and_then(|e| e.to_str())
@@ -63,7 +211,7 @@ pub fn load_config_from_file(
         "json" => false,
         _ => {
             // Heuristic: try YAML parse to detect format
-            serde_yaml::from_str::<serde_yaml::Value>(&content).is_ok()
+            serde_yaml::from_str::<serde_yaml::Value>(content).is_ok()
         }
     };
 
@@ -75,10 +223,10 @@ pub fn load_config_from_file(
 
     // For version detection and migration, parse to serde_json::Value
     let mut value: serde_json::Value = if is_yaml {
-        let yaml_val: serde_yaml::Value = serde_yaml::from_str(&content)?;
+        let yaml_val: serde_yaml::Value = serde_yaml::from_str(content)?;
         serde_json::to_value(yaml_val)?
     } else {
-        serde_json::from_str(&content)?
+        serde_json::from_str(content)?
     };
 
     // Detect config version and migrate in memory if needed
@@ -100,7 +248,7 @@ pub fn load_config_from_file(
     // (like tags for enum variants). Only fall back to JSON deserialization if
     // a migration was applied (since migrations operate on serde_json::Value).
     let mut config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
-        serde_yaml::from_str(&content)?
+        serde_yaml::from_str(content)?
     } else {
         serde_json::from_value(value)?
     };

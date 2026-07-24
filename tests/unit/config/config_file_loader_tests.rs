@@ -2191,3 +2191,113 @@ plugin_configs: []
     assert!(message.contains("file-mode Basic-auth credentials"));
     assert!(!message.contains("must-not-enter-runtime-config"));
 }
+
+// ============================================================================
+// Torn / non-atomic file read stability (issues #2978)
+// ============================================================================
+
+fn yaml_with_trailing_plugin_configs(plugin_count: usize) -> String {
+    let mut yaml = String::from(
+        r#"version: "1"
+proxies:
+  - id: "proxy-1"
+    listen_path: "/api"
+    backend_scheme: http
+    backend_host: "localhost"
+    backend_port: 3000
+consumers: []
+plugin_configs:
+"#,
+    );
+    for i in 0..plugin_count {
+        yaml.push_str(&format!(
+            r#"  - id: "plugin-{i}"
+    plugin_name: "stdout_logging"
+    config: {{}}
+    scope: global
+    enabled: true
+"#
+        ));
+    }
+    yaml
+}
+
+#[test]
+fn test_truncated_trailing_plugin_configs_deserializes_without_stability_guard() {
+    // Documents the hazard: a YAML truncated at a trailing plugin_configs list
+    // item boundary is still syntactically valid and would load N-1 plugins if
+    // accepted without a stability guard / atomic publish.
+    let full = yaml_with_trailing_plugin_configs(2);
+    let truncated = yaml_with_trailing_plugin_configs(1);
+    assert!(full.starts_with(truncated.trim_end()) || full.contains("plugin-0"));
+
+    let parsed: ferrum_edge::config::types::GatewayConfig =
+        serde_yaml::from_str(&truncated).expect("truncated trailing list must still parse");
+    assert_eq!(
+        parsed.plugin_configs.len(),
+        1,
+        "hazard: truncated tail parses with N-1 plugins"
+    );
+}
+
+#[test]
+fn test_stability_guard_rejects_torn_trailing_plugin_configs_mutation() {
+    use ferrum_edge::config::file_loader::{
+        StableFileReadOptions, read_config_file_stable_with,
+    };
+    use std::time::Duration;
+
+    let full = yaml_with_trailing_plugin_configs(2);
+    let truncated = yaml_with_trailing_plugin_configs(1);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    std::fs::write(&path, &full).unwrap();
+
+    let mut flipped = false;
+    let options = StableFileReadOptions {
+        max_attempts: 1,
+        retry_delay: Duration::from_millis(0),
+    };
+    let err = read_config_file_stable_with(&path, options, &mut || {
+        if !flipped {
+            // Simulate a non-atomic writer truncating the live path after the
+            // opening stat — the classic torn trailing plugin_configs window.
+            std::fs::write(&path, &truncated).unwrap();
+            flipped = true;
+        }
+    })
+    .expect_err("stability guard must reject a mid-read truncate of trailing plugins");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("changed while being read") || msg.contains("unstable/torn"),
+        "expected torn-read diagnostic, got: {msg}"
+    );
+}
+
+#[test]
+fn test_atomic_rename_replacement_loads_full_trailing_plugin_configs() {
+    let full = yaml_with_trailing_plugin_configs(2);
+    let dir = tempfile::tempdir().unwrap();
+    let live = dir.path().join("config.yaml");
+    let staging = dir.path().join("config.yaml.tmp");
+
+    // Start with a shorter file, then atomically replace with the full doc.
+    std::fs::write(&live, yaml_with_trailing_plugin_configs(1)).unwrap();
+    std::fs::write(&staging, &full).unwrap();
+    std::fs::rename(&staging, &live).unwrap();
+
+    let config = load_config_from_file(
+        live.to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("atomic rename publish must load");
+    assert_eq!(
+        config.plugin_configs.len(),
+        2,
+        "atomic replacement must keep every trailing plugin_configs entry"
+    );
+}

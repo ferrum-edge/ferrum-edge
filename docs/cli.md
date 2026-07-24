@@ -132,8 +132,9 @@ File-mode inference is likewise the *lowest*-precedence mode source, and it runs
 The report withholds externally sourced values, not just the ones that appear in errors. `validate` prints its findings with plain stdout writes, which are not log records and are not an error return, so each value-bearing field is filtered where it is printed. A field whose variable was resolved from an external source is withheld by name — `FERRUM_MODE_FILE` containing `database` prints `Mode: <redacted: value from external secret source>`, not `Mode: Database` — while the surrounding validation result, including `Validation passed.` and the spec-document counts, is unaffected. `run` withholds the same value on its own startup log line for the same reason: `Operating mode:` re-renders the resolved value as the `Database` enum variant, a form the log-record redactor deliberately does not derive, so that line is withheld by variable name too.
 
 1. **Settings** (`ferrum.conf`) — all 300+ environment variables are parsed and validated (ports, paths, TLS configuration, pool sizes, etc.)
-2. **Spec** (resources YAML/JSON, file mode only):
-   - YAML/JSON syntax and deserialization
+2. **Env TLS/security surfaces** (mode-aware, side-effect-free) — the same loaders `run` treats as startup-fatal for the selected serving mode: TLS policy and CRLs, trusted admin CIDRs, metrics auth, configured frontend/admin TLS certificate pairs, DTLS certificate expiry, and admin JWT admission (`unset` is allowed only for file/mesh/node_agent random-secret fallback; a configured-but-invalid secret or TTL fails). No listeners, servers, or migrations are started.
+3. **Spec** (resources YAML/JSON, file mode only):
+   - YAML/JSON syntax and deserialization (bounded metadata/content stability checks reject torn non-atomic reads)
    - Field-level validation on all proxies, consumers, upstreams, and plugin configs
    - Regex `listen_path` compilation
    - Unique `listen_path` enforcement

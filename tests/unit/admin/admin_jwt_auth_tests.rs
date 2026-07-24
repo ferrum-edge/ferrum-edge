@@ -970,3 +970,43 @@ fn test_audience_unset_rejects_aud_bearing_token() {
         "with no audience configured, a token carrying aud must be rejected (strict RFC 7519 handling)"
     );
 }
+
+#[test]
+fn test_create_jwt_manager_not_configured_when_secret_unset() {
+    use ferrum_edge::admin::jwt_auth::{JwtError, create_jwt_manager_from_env};
+
+    let env = AdminJwtEnvGuard::new();
+    env.unset("FERRUM_ADMIN_JWT_SECRET");
+    env.unset("FERRUM_ADMIN_JWT_ISSUER");
+    env.unset("FERRUM_ADMIN_JWT_AUDIENCE");
+    env.unset("FERRUM_ADMIN_JWT_MAX_TTL");
+
+    match create_jwt_manager_from_env() {
+        Err(JwtError::NotConfigured) => {}
+        other => panic!("unset secret must be NotConfigured, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_create_jwt_manager_short_secret_is_invalid_not_unconfigured() {
+    use ferrum_edge::admin::jwt_auth::{JwtError, create_jwt_manager_from_env};
+
+    let env = AdminJwtEnvGuard::new();
+    env.set("FERRUM_ADMIN_JWT_SECRET", "only-twenty-chars!!!"); // 20 chars
+    env.unset("FERRUM_ADMIN_JWT_ISSUER");
+    env.unset("FERRUM_ADMIN_JWT_AUDIENCE");
+    env.unset("FERRUM_ADMIN_JWT_MAX_TTL");
+
+    match create_jwt_manager_from_env() {
+        Err(JwtError::VerificationFailed(msg)) => {
+            assert!(
+                msg.contains("at least"),
+                "short secret must be an actionable invalid-config error: {msg}"
+            );
+        }
+        Err(JwtError::NotConfigured) => {
+            panic!("short secret must not be treated as NotConfigured")
+        }
+        other => panic!("expected VerificationFailed for short secret, got: {other:?}"),
+    }
+}

@@ -1087,3 +1087,198 @@ fn test_execute_health_tls_uses_shared_interim_response_parser() {
         "TLS must accept the same bounded interim/final framing: {result:?}"
     );
 }
+
+// ============================================================================
+// validate env TLS/security surface parity (issue #2976 / #2977)
+// ============================================================================
+
+fn file_mode_env() -> ferrum_edge::config::EnvConfig {
+    let mut env = ferrum_edge::config::EnvConfig::default();
+    env.mode = ferrum_edge::config::OperatingMode::File;
+    env.admin_https_port = 0; // skip admin TLS unless tests set paths + nonzero port
+    env
+}
+
+#[test]
+fn test_validate_env_security_rejects_missing_frontend_tls_cert() {
+    ensure_rustls_provider();
+    let mut env = file_mode_env();
+    env.frontend_tls_cert_path = Some("/nonexistent/frontend.crt".into());
+    env.frontend_tls_key_path = Some("/nonexistent/frontend.key".into());
+
+    let err = ferrum_edge::cli::validate_env_security_surfaces(&env)
+        .expect_err("missing frontend TLS material must fail validate");
+    assert!(
+        err.contains("frontend TLS") || err.to_lowercase().contains("cert"),
+        "expected frontend TLS diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn test_validate_env_security_rejects_invalid_admin_cidrs() {
+    let mut env = file_mode_env();
+    env.admin_allowed_cidrs = "not-a-cidr".into();
+
+    let err = ferrum_edge::cli::validate_env_security_surfaces(&env)
+        .expect_err("malformed admin CIDRs must fail validate");
+    assert!(
+        err.contains("FERRUM_ADMIN_ALLOWED_CIDRS"),
+        "expected CIDR diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn test_validate_env_security_rejects_invalid_metrics_cidrs() {
+    let mut env = file_mode_env();
+    env.metrics_allowed_cidrs = "1.2.3.4/99".into();
+
+    let err = ferrum_edge::cli::validate_env_security_surfaces(&env)
+        .expect_err("malformed metrics CIDRs must fail validate");
+    assert!(
+        err.contains("FERRUM_METRICS_ALLOWED_CIDRS"),
+        "expected metrics CIDR diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn test_validate_env_security_rejects_unparseable_crl() {
+    ensure_rustls_provider();
+    let dir = tempfile::tempdir().unwrap();
+    let crl_path = dir.path().join("bad.crl");
+    std::fs::write(&crl_path, b"not-a-crl").unwrap();
+
+    let mut env = file_mode_env();
+    env.tls_crl_file_path = Some(crl_path.to_string_lossy().into_owned());
+
+    let err = ferrum_edge::cli::validate_env_security_surfaces(&env)
+        .expect_err("unparseable CRL must fail validate");
+    assert!(
+        err.to_lowercase().contains("crl"),
+        "expected CRL diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn test_validate_env_security_file_mode_accepts_unset_jwt_secret() {
+    without_env_vars(
+        &[
+            "FERRUM_ADMIN_JWT_SECRET",
+            "FERRUM_ADMIN_JWT_MAX_TTL",
+            "FERRUM_ADMIN_JWT_ISSUER",
+            "FERRUM_ADMIN_JWT_AUDIENCE",
+        ],
+        || {
+            let env = file_mode_env();
+            ferrum_edge::cli::validate_env_security_surfaces(&env)
+                .expect("file mode must allow unset JWT secret (random at runtime)");
+        },
+    );
+}
+
+#[test]
+fn test_validate_env_security_file_mode_rejects_short_jwt_secret() {
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let keys = [
+        "FERRUM_ADMIN_JWT_SECRET",
+        "FERRUM_ADMIN_JWT_MAX_TTL",
+        "FERRUM_ADMIN_JWT_ISSUER",
+        "FERRUM_ADMIN_JWT_AUDIENCE",
+    ];
+    let saved: Vec<_> = keys
+        .iter()
+        .map(|&k| (k, std::env::var_os(k)))
+        .collect();
+    unsafe {
+        std::env::set_var("FERRUM_ADMIN_JWT_SECRET", "short-secret-20chars!");
+        std::env::remove_var("FERRUM_ADMIN_JWT_MAX_TTL");
+        std::env::remove_var("FERRUM_ADMIN_JWT_ISSUER");
+        std::env::remove_var("FERRUM_ADMIN_JWT_AUDIENCE");
+    }
+    let env = file_mode_env();
+    let err = ferrum_edge::cli::validate_env_security_surfaces(&env)
+        .expect_err("file mode must fail validate on short JWT secret");
+    for (k, v) in saved {
+        unsafe {
+            match v {
+                Some(val) => std::env::set_var(k, val),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+    assert!(
+        err.contains("JWT") || err.contains("secret") || err.contains("at least"),
+        "expected JWT invalid-config diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn test_validate_env_security_rejects_expired_frontend_cert() {
+    ensure_rustls_provider();
+    use rcgen::{CertificateParams, KeyPair};
+    use time::{Duration, OffsetDateTime};
+
+    let key_pair = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    params.not_before = OffsetDateTime::now_utc() - Duration::days(2);
+    params.not_after = OffsetDateTime::now_utc() - Duration::days(1);
+    let cert = params.self_signed(&key_pair).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let cert_path = dir.path().join("expired.crt");
+    let key_path = dir.path().join("expired.key");
+    std::fs::write(&cert_path, cert.pem()).unwrap();
+    std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+
+    let mut env = file_mode_env();
+    env.frontend_tls_cert_path = Some(cert_path.to_string_lossy().into_owned());
+    env.frontend_tls_key_path = Some(key_path.to_string_lossy().into_owned());
+
+    let err = ferrum_edge::cli::validate_env_security_surfaces(&env)
+        .expect_err("expired frontend cert must fail validate");
+    assert!(
+        err.to_lowercase().contains("expir") || err.to_lowercase().contains("tls"),
+        "expected expiry/TLS diagnostic, got: {err}"
+    );
+}
+
+
+#[test]
+fn test_validate_env_security_rejects_missing_admin_tls_cert() {
+    ensure_rustls_provider();
+    let mut env = file_mode_env();
+    env.admin_https_port = 9443;
+    env.admin_tls_cert_path = Some("/nonexistent/admin.crt".into());
+    env.admin_tls_key_path = Some("/nonexistent/admin.key".into());
+
+    let err = ferrum_edge::cli::validate_env_security_surfaces(&env)
+        .expect_err("missing admin TLS material must fail validate");
+    assert!(
+        err.contains("admin TLS") || err.to_lowercase().contains("cert"),
+        "expected admin TLS diagnostic, got: {err}"
+    );
+}
+
+#[test]
+fn test_validate_env_security_rejects_missing_dtls_cert() {
+    ensure_rustls_provider();
+    let mut env = file_mode_env();
+    env.dtls_cert_path = Some("/nonexistent/dtls.crt".into());
+    env.dtls_key_path = Some("/nonexistent/dtls.key".into());
+
+    let err = ferrum_edge::cli::validate_env_security_surfaces(&env)
+        .expect_err("missing DTLS cert must fail validate");
+    assert!(
+        err.contains("DTLS") || err.to_lowercase().contains("cert"),
+        "expected DTLS diagnostic, got: {err}"
+    );
+}
+
+fn ensure_rustls_provider() {
+    use std::sync::Once;
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}

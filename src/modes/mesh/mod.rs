@@ -10443,16 +10443,23 @@ fn start_mesh_admin_listeners(
     );
     let jwt_manager = match create_jwt_manager_from_env() {
         Ok(manager) => manager,
-        Err(err) => {
+        Err(crate::admin::jwt_auth::JwtError::NotConfigured) => {
             warn!(
-                "Admin JWT not configured for mesh mode ({}), admin endpoints will reject operator tokens",
-                err
+                "Admin JWT secret not set for mesh mode; generating a random read-only secret \
+                 (externally minted tokens will not validate)"
             );
             let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
             crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
                 secret: random_secret,
                 ..Default::default()
             })
+        }
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "Invalid admin JWT configuration for mesh mode: {err}. \
+                 Mesh mode generates a random secret only when FERRUM_ADMIN_JWT_SECRET \
+                 is unset; a configured-but-invalid secret or TTL must be fixed."
+            ));
         }
     };
     let admin_state = AdminState {

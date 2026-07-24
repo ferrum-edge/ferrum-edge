@@ -5,12 +5,13 @@
 //! all six required claims (`iss`, `sub`, `exp`, `iat`, `nbf`, `jti`) and
 //! enforces a max-TTL to prevent very long-lived tokens.
 //!
-//! [`create_jwt_manager_from_env`] requires `FERRUM_ADMIN_JWT_SECRET` to be set
-//! and non-empty, with a minimum length of
-//! [`crate::config::types::MIN_JWT_SECRET_LENGTH`]; otherwise it returns
-//! [`JwtError::VerificationFailed`]. The random-secret fallback used by
-//! read-only file mode (so externally-crafted tokens can never validate) is
-//! handled at the call site that constructs the admin state, not here.
+//! [`create_jwt_manager_from_env`] returns [`JwtError::NotConfigured`] when
+//! `FERRUM_ADMIN_JWT_SECRET` is unset or empty. A present-but-invalid secret
+//! (shorter than [`crate::config::types::MIN_JWT_SECRET_LENGTH`]) or malformed
+//! `FERRUM_ADMIN_JWT_MAX_TTL` returns [`JwtError::VerificationFailed`]. The
+//! random-secret fallback used by read-only file/mesh mode (so
+//! externally-crafted tokens can never validate) must match only
+//! [`JwtError::NotConfigured`] at the call site — never other JWT errors.
 
 use jsonwebtoken::{
     Algorithm, DecodingKey, TokenData, Validation, decode, errors::Error as JwtEncodeError,
@@ -319,6 +320,9 @@ pub enum JwtError {
     MissingHeader,
     InvalidHeaderFormat,
     VerificationFailed(String),
+    /// `FERRUM_ADMIN_JWT_SECRET` is unset or empty. Read-only modes may mint a
+    /// random local secret; writable modes must treat this as fatal.
+    NotConfigured,
 }
 
 impl std::fmt::Debug for JwtError {
@@ -327,6 +331,7 @@ impl std::fmt::Debug for JwtError {
             JwtError::MissingHeader => write!(f, "MissingHeader"),
             JwtError::InvalidHeaderFormat => write!(f, "InvalidHeaderFormat"),
             JwtError::VerificationFailed(msg) => write!(f, "VerificationFailed({})", msg),
+            JwtError::NotConfigured => write!(f, "NotConfigured"),
         }
     }
 }
@@ -337,6 +342,9 @@ impl std::fmt::Display for JwtError {
             JwtError::MissingHeader => "Missing Authorization header",
             JwtError::InvalidHeaderFormat => "Invalid Authorization header format",
             JwtError::VerificationFailed(msg) => msg.as_str(),
+            JwtError::NotConfigured => {
+                "FERRUM_ADMIN_JWT_SECRET must be set and non-empty"
+            }
         };
         write!(f, "{}", msg)
     }
@@ -353,11 +361,7 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
 
     let secret = resolve_ferrum_var("FERRUM_ADMIN_JWT_SECRET")
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            JwtError::VerificationFailed(
-                "FERRUM_ADMIN_JWT_SECRET must be set and non-empty".to_string(),
-            )
-        })?;
+        .ok_or(JwtError::NotConfigured)?;
 
     if secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
         return Err(JwtError::VerificationFailed(format!(
