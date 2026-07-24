@@ -34,7 +34,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use super::plugin_utils::{create_test_transaction_summary, read_http11_request_headers};
+use super::plugin_utils::{
+    create_test_proxy, create_test_transaction_summary, read_http11_request_headers,
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -671,6 +673,8 @@ fn accepted_config_key_sets_are_exported_for_schema_parity() {
             "include_consumer_username",
             "include_client_ip",
             "include_raw_headers",
+            "include_path",
+            "path_mode",
         ]
     );
     assert_eq!(
@@ -5601,4 +5605,353 @@ async fn sink_health_follows_ack_body_drain_outcome() {
         matches!(rejected, PluginResult::Reject { status_code: 503, .. }),
         "got {rejected:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Follow-up findings (#3067–#3069)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn early_admission_skips_parse_hmac_when_nothing_can_emit() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "sampling": {
+                    "rate": 0.0,
+                    "always_capture_on_guardrail": false,
+                    "always_capture_on_error": false
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    // Large AI-shaped body: admission must not pay HMAC/redaction/staging.
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "x".repeat(32_768)
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+        .await;
+    assert_eq!(plugin.keyed_request_hash_calls_for_test(), 0);
+    assert_eq!(plugin.staging_len_for_test(), 0);
+    assert!(
+        !ctx.metadata
+            .get("ai_transcript_audit.candidate")
+            .is_some_and(|value| value == "true")
+    );
+}
+
+#[tokio::test]
+async fn lightweight_override_staging_skips_request_hmac_and_excerpts() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "sampling": {
+                    "rate": 0.0,
+                    "always_capture_on_guardrail": true,
+                    "always_capture_on_error": true
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+
+    // Non-emitting 2xx: lightweight staging only.
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    assert_eq!(plugin.keyed_request_hash_calls_for_test(), 0);
+    assert_eq!(plugin.staging_len_for_test(), 1);
+    assert!(
+        ctx.metadata
+            .get("ai_transcript_audit.request_hash")
+            .is_none(),
+        "lightweight path must not stage request HMAC"
+    );
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(plugin.keyed_request_hash_calls_for_test(), 0);
+
+    // Guardrail override still emits without ever hashing the request body.
+    let mut guard_ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut guard_ctx, &headers, ai_request_body())
+        .await;
+    guard_ctx
+        .metadata
+        .insert("ai_response_guard_detected".to_string(), "true".to_string());
+    plugin
+        .capture_final_response_body(&mut guard_ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    assert_eq!(plugin.keyed_request_hash_calls_for_test(), 0);
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["capture_reason"], "guardrail");
+    assert!(records[0].get("request_hash").is_none());
+    assert!(records[0].get("request_body").is_none());
+}
+
+#[tokio::test]
+async fn path_defaults_to_safe_route_identifier_in_every_mode() {
+    for mode in ["metadata_only", "redacted_body", "hash_only", "full_body"] {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let mut overrides = json!({
+            "mode": mode,
+            "privacy": { "include_path": false }
+        });
+        if mode == "full_body" {
+            overrides
+                .as_object_mut()
+                .unwrap()
+                .insert("allow_full_body".to_string(), json!(true));
+        }
+        let plugin = AiTranscriptAudit::new(
+            &config_with_sink(&endpoint, overrides),
+            loopback_http_client(),
+        )
+        .unwrap();
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        let mut ctx = make_ctx();
+        ctx.path =
+            "/users/alice@example.com/orders/12345/reset/550e8400-e29b-41d4-a716-446655440000"
+                .to_string();
+        ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+        let headers = json_headers();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        plugin
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1, "mode={mode}");
+        assert_eq!(
+            records[0]["path"], "/test",
+            "mode={mode} must export listen_path, not raw path: {}",
+            records[0]["path"]
+        );
+        let path = records[0]["path"].as_str().unwrap();
+        assert!(!path.contains("alice@"), "mode={mode}");
+        assert!(!path.contains("550e8400"), "mode={mode}");
+    }
+}
+
+#[tokio::test]
+async fn include_path_modes_redact_template_and_hash_sensitive_segments() {
+    let sensitive =
+        "/users/alice@example.com/orders/12345/reset/550e8400-e29b-41d4-a716-446655440000";
+    let cases = [
+        ("redacted", true, false),
+        ("template", true, false),
+        ("hash", false, true),
+    ];
+    for (path_mode, expect_shaped, expect_hash_only) in cases {
+        let server = mock_sink().await;
+        let endpoint = format!("{}/ingest", server.uri());
+        let plugin = AiTranscriptAudit::new(
+            &config_with_sink(
+                &endpoint,
+                json!({
+                    "privacy": {
+                        "include_path": true,
+                        "path_mode": path_mode
+                    }
+                }),
+            ),
+            loopback_http_client(),
+        )
+        .unwrap();
+        plugin.start_background_tasks().expect("live start");
+        plugin.commit_background_tasks();
+        let mut ctx = make_ctx();
+        ctx.path = sensitive.to_string();
+        ctx.matched_proxy = Some(Arc::new(create_test_proxy()));
+        let headers = json_headers();
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+            .await;
+        plugin
+            .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+            .await;
+        let records = wait_for_records(&server).await;
+        assert_eq!(records.len(), 1, "path_mode={path_mode}");
+        let path = records[0]["path"].as_str().expect("path");
+        assert!(
+            !path.contains("alice@example.com"),
+            "path_mode={path_mode}: {path}"
+        );
+        if expect_hash_only {
+            assert_eq!(path.len(), 64, "keyed hex digest for path_mode={path_mode}");
+            assert!(!path.contains("/users/"), "path_mode={path_mode}: {path}");
+        }
+        if expect_shaped && path_mode == "template" {
+            assert!(
+                path.contains("{param}"),
+                "path_mode={path_mode}: {path}"
+            );
+            assert!(
+                !path.contains("12345"),
+                "path_mode={path_mode}: {path}"
+            );
+            assert!(
+                !path.contains("550e8400-e29b-41d4-a716-446655440000"),
+                "path_mode={path_mode}: {path}"
+            );
+        }
+        if expect_shaped && path_mode == "redacted" {
+            assert!(
+                path.contains("REDACTED"),
+                "path_mode={path_mode} must PII-redact email: {path}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_header_materialization_fails_closed_on_empty_or_invalid_values() {
+    // SAFETY: isolated allowlisted secret mutation for fail-closed activation.
+    unsafe {
+        std::env::set_var("AUDIT_TOKEN", "present-token");
+    }
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/x",
+                    "custom_headers": {
+                        "Authorization": "Bearer ${AUDIT_TOKEN}"
+                    }
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect("construction with present secret");
+
+    unsafe {
+        std::env::set_var("AUDIT_TOKEN", "");
+    }
+    let err = plugin
+        .start_background_tasks()
+        .expect_err("empty secret must fail activation");
+    assert!(
+        err.contains("empty") || err.contains("AUDIT_TOKEN"),
+        "got: {err}"
+    );
+    assert!(
+        !plugin.sink_healthy_for_test(),
+        "activation failure must mark sink unhealthy"
+    );
+
+    let err = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/x",
+                    "custom_headers": {
+                        "X-Bad": "has\r\ninjection"
+                    }
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .expect_err("CRLF header value must fail construction");
+    assert!(
+        err.contains("header") || err.contains("invalid") || err.contains("X-Bad"),
+        "got: {err}"
+    );
+
+    unsafe {
+        std::env::set_var("AUDIT_TOKEN", "restored-token");
+    }
+}
+
+#[tokio::test]
+async fn custom_headers_materialized_at_activation_are_always_sent() {
+    unsafe {
+        std::env::set_var("AUDIT_TOKEN", "activation-token");
+        std::env::set_var("FERRUM_AUDIT_TENANT", "tenant-a");
+    }
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": endpoint,
+                    "allow_insecure_loopback": true,
+                    "batch_size": 1,
+                    "flush_interval_ms": 100,
+                    "custom_headers": {
+                        "Authorization": "Bearer ${AUDIT_TOKEN}",
+                        "X-Tenant": "${FERRUM_AUDIT_TENANT}"
+                    }
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("materialize + start");
+    plugin.commit_background_tasks();
+    // Rotate env after activation: frozen headers must still be the activation values.
+    unsafe {
+        std::env::set_var("AUDIT_TOKEN", "rotated-ignored");
+        std::env::set_var("FERRUM_AUDIT_TENANT", "rotated-ignored");
+    }
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &headers, br#"{"ok":true}"#)
+        .await;
+    let _ = wait_for_records(&server).await;
+    let received = server.received_requests().await.unwrap_or_default();
+    let auth = received
+        .iter()
+        .find_map(|request| {
+            request
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .expect("authorization header");
+    let tenant = received
+        .iter()
+        .find_map(|request| {
+            request
+                .headers
+                .get("x-tenant")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        })
+        .expect("tenant header");
+    assert_eq!(auth, "Bearer activation-token");
+    assert_eq!(tenant, "tenant-a");
 }

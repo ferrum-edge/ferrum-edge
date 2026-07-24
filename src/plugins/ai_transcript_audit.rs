@@ -150,6 +150,8 @@ pub const AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS: &[&str] = &[
     "include_consumer_username",
     "include_client_ip",
     "include_raw_headers",
+    "include_path",
+    "path_mode",
 ];
 
 /// Accepted keys under `sink`. `custom_headers` remains an intentional free-form
@@ -301,20 +303,42 @@ pub struct AdmittedCaptureLimits {
     pub buffer_max_bytes: usize,
 }
 
+/// How the exported `path` field is derived when `privacy.include_path` is true.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathExportMode {
+    /// Proxy listen_path / name / id — never the raw request path.
+    Route,
+    /// Raw request path after the configured PII redactor.
+    Redacted,
+    /// Dynamic segments replaced with `{param}` placeholders, then redacted.
+    Template,
+    /// Keyed HMAC of the raw request path.
+    Hash,
+}
+
 #[derive(Clone, Copy)]
 struct PrivacyConfig {
     include_consumer_username: bool,
     include_client_ip: bool,
     include_raw_headers: bool,
+    /// When false (default), export only a safe route identifier. When true,
+    /// apply [`PathExportMode`] (still never a silent raw dump: `redacted` /
+    /// `template` / `hash` sanitize; `route` stays identifier-only).
+    include_path: bool,
+    path_mode: PathExportMode,
 }
 
 /// Per-request request-side capture, keyed by `record_id`. Never holds a full
-/// body — only the redacted/capped excerpt (bounded by `max_request_bytes`).
+/// body — only the redacted/capped excerpt (bounded by `max_request_bytes`),
+/// except lightweight override candidates which retain no excerpt/HMAC/tools.
 struct AuditStaging {
     /// Holds one slot in the hard in-flight staging bound.
     _staging_permit: OwnedSemaphorePermit,
     captured_at: Instant,
     sample_hit: bool,
+    /// Full capture ran (HMAC/excerpt/model/tools). Lightweight override
+    /// staging keeps this false so non-exported traffic skips that work.
+    full_capture: bool,
     request_excerpt: Option<String>,
     request_truncated: bool,
     request_hash: Option<String>,
@@ -488,10 +512,13 @@ impl RecordsPerMinute {
 #[derive(Clone)]
 struct HttpFlushConfig {
     endpoint_url: String,
-    /// Header name + value. `${AUDIT_*}` / `${FERRUM_AUDIT_*}` references are
-    /// validated (allowlisted and present) at construction; values are expanded
-    /// again at send time from that same allowlist only.
-    custom_headers: Vec<(HeaderName, String)>,
+    /// Templates kept only until background-task activation materializes them.
+    /// `${AUDIT_*}` / `${FERRUM_AUDIT_*}` references are allowlisted at
+    /// construction; activation expands and validates every header fail-closed.
+    header_templates: Vec<(HeaderName, String)>,
+    /// Materialized at `start_background_tasks`. Send uses these exclusively —
+    /// missing/invalid construction is a batch failure, never a skipped field.
+    custom_headers: Arc<Vec<(HeaderName, HeaderValue)>>,
     http_client: PluginHttpClient,
     sink_healthy: Arc<AtomicBool>,
 }
@@ -760,6 +787,18 @@ impl AiTranscriptAudit {
             AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS,
         )?;
         let privacy_obj = cfg_object(config, "privacy", "privacy")?.unwrap_or(&empty);
+        let path_mode = match cfg_str(privacy_obj, "path_mode", "privacy")?.unwrap_or("route") {
+            "route" => PathExportMode::Route,
+            "redacted" => PathExportMode::Redacted,
+            "template" => PathExportMode::Template,
+            "hash" => PathExportMode::Hash,
+            other => {
+                return Err(format!(
+                    "ai_transcript_audit: 'privacy.path_mode' must be one of route, redacted, \
+                     template, hash (got {other:?})"
+                ));
+            }
+        };
         let privacy = PrivacyConfig {
             include_consumer_username: cfg_bool(
                 privacy_obj,
@@ -769,6 +808,8 @@ impl AiTranscriptAudit {
             )?,
             include_client_ip: cfg_bool(privacy_obj, "include_client_ip", false, "privacy")?,
             include_raw_headers: cfg_bool(privacy_obj, "include_raw_headers", false, "privacy")?,
+            include_path: cfg_bool(privacy_obj, "include_path", false, "privacy")?,
+            path_mode,
         };
 
         // ---- sink ----
@@ -849,7 +890,9 @@ impl AiTranscriptAudit {
         let sink_healthy = Arc::new(AtomicBool::new(true));
         let flush_config = HttpFlushConfig {
             endpoint_url,
-            custom_headers,
+            header_templates: custom_headers,
+            // Empty until `start_background_tasks` materializes templates.
+            custom_headers: Arc::new(Vec::new()),
             http_client,
             sink_healthy: Arc::clone(&sink_healthy),
         };
@@ -1182,14 +1225,22 @@ impl AiTranscriptAudit {
     /// currently known (pre-transform in `before_proxy`, final in the
     /// final-body hook fallback); callers have already checked the JSON
     /// content-type. Body hashes are keyed (see [`PiiRedactor::keyed_hash_hex`]).
+    ///
+    /// Cheap admission runs before JSON parse / HMAC / redaction / excerpt /
+    /// tool staging: requests that cannot be emitted are discarded without that
+    /// work. Sampling losers that may still emit via error/guardrail overrides
+    /// take a lightweight staging path (AI+stream classification only).
     fn stage_candidate(&self, ctx: &mut RequestContext, body: &[u8]) -> PluginResult {
         if body.is_empty() {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
         }
-        let parsed: Option<Value> = serde_json::from_slice(body).ok();
-        let is_ai = parsed.as_ref().is_some_and(json_looks_like_ai_request);
-        if !is_ai {
+
+        // Cheapest gate: nothing can ever emit.
+        if self.sampling.rate <= 0.0
+            && !self.sampling.always_on_error
+            && !self.sampling.always_on_guardrail
+        {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
         }
@@ -1199,6 +1250,34 @@ impl AiTranscriptAudit {
             .get(MD_RECORD_ID)
             .cloned()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
+        let overrides =
+            self.sampling.always_on_error || self.sampling.always_on_guardrail;
+        let full_capture = if sample_hit {
+            true
+        } else if overrides {
+            false
+        } else {
+            // Losing sample with no override path: cannot emit.
+            self.discard_staged_candidate(ctx);
+            return PluginResult::Continue;
+        };
+
+        // Lightweight override path: reject obvious non-AI bodies without a
+        // full serde_json parse. Full-capture winners still parse for model/
+        // tool/excerpt work.
+        if !full_capture && !cheap_ai_json_probe(body) {
+            self.discard_staged_candidate(ctx);
+            return PluginResult::Continue;
+        }
+
+        let parsed: Option<Value> = serde_json::from_slice(body).ok();
+        let is_ai = parsed.as_ref().is_some_and(json_looks_like_ai_request);
+        if !is_ai {
+            self.discard_staged_candidate(ctx);
+            return PluginResult::Continue;
+        }
+
         self.sweep_staging();
         let staging_permit = match Arc::clone(&self.staging_permits).try_acquire_owned() {
             Ok(permit) => permit,
@@ -1217,13 +1296,54 @@ impl AiTranscriptAudit {
                 };
             }
         };
-        let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
-        // Exported body hashes are keyed HMAC-SHA256 (same key as the redaction
-        // placeholders): a plain SHA-256 of a mostly-predictable body (a fixed
-        // chat JSON wrapper around one secret) would be an offline brute-force
-        // oracle for the secret in every mode, including hash_only.
+
         let request_content_digest = content_digest(body);
-        let request_hash = self.keyed_request_hash(body);
+        let (request_hash, request_excerpt, request_truncated, request_model, model_truncated, tool_names, tool_names_truncated) =
+            if full_capture {
+                // Exported body hashes are keyed HMAC-SHA256 (same key as the
+                // redaction placeholders): a plain SHA-256 of a mostly-predictable
+                // body would be an offline brute-force oracle for the secret.
+                let request_hash = self.keyed_request_hash(body);
+                let (request_model, model_truncated) = parsed
+                    .as_ref()
+                    .map(|json| admit_model(json, self.limits.max_model_chars))
+                    .unwrap_or((None, false));
+                let (tool_names, tool_names_truncated) = if self.capture.tool_calls {
+                    parsed
+                        .as_ref()
+                        .map(|json| {
+                            admit_tool_names(
+                                json,
+                                self.limits.max_tool_count,
+                                self.limits.max_tool_name_chars,
+                                self.limits.max_tool_names_bytes,
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    (Vec::new(), false)
+                };
+                let (request_excerpt, request_truncated) = if self.capture.request {
+                    self.shape_body(body, self.limits.max_request_bytes)
+                } else {
+                    (None, false)
+                };
+                (
+                    Some(request_hash),
+                    request_excerpt,
+                    request_truncated,
+                    request_model,
+                    model_truncated,
+                    tool_names,
+                    tool_names_truncated,
+                )
+            } else {
+                // Lightweight override path: classify only. No HMAC, excerpt,
+                // model, or tool staging until/unless an override emits (and
+                // even then request-side capture stays omitted — response /
+                // guardrail evidence is the override signal).
+                (None, None, false, None, false, Vec::new(), false)
+            };
 
         ctx.metadata
             .insert(MD_RECORD_ID.to_string(), record_id.clone());
@@ -1238,8 +1358,12 @@ impl AiTranscriptAudit {
         // re-confirms the same value.
         ctx.metadata
             .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
-        ctx.metadata
-            .insert(MD_REQUEST_HASH.to_string(), request_hash.clone());
+        if let Some(ref request_hash) = request_hash {
+            ctx.metadata
+                .insert(MD_REQUEST_HASH.to_string(), request_hash.clone());
+        } else {
+            ctx.metadata.remove(MD_REQUEST_HASH);
+        }
         // `stream: true` means an SSE response is expected; record it so the
         // response buffer decision streams rather than stalls (buffering a
         // stream holds it until EOF, and under retry the buffered->stream
@@ -1261,40 +1385,16 @@ impl AiTranscriptAudit {
         // guardrails (2925–2978, which run after this plugin's staging at 2740)
         // have already published their metadata. Non-AI JSON POSTs are never
         // staged, so they stay on the native-H3 path.
-        let (request_model, model_truncated) = parsed
-            .as_ref()
-            .map(|json| admit_model(json, self.limits.max_model_chars))
-            .unwrap_or((None, false));
-        let (tool_names, tool_names_truncated) = if self.capture.tool_calls {
-            parsed
-                .as_ref()
-                .map(|json| {
-                    admit_tool_names(
-                        json,
-                        self.limits.max_tool_count,
-                        self.limits.max_tool_name_chars,
-                        self.limits.max_tool_names_bytes,
-                    )
-                })
-                .unwrap_or_default()
-        } else {
-            (Vec::new(), false)
-        };
-        let (request_excerpt, request_truncated) = if self.capture.request {
-            self.shape_body(body, self.limits.max_request_bytes)
-        } else {
-            (None, false)
-        };
-
         self.staging.insert(
             record_id,
             AuditStaging {
                 _staging_permit: staging_permit,
                 captured_at: Instant::now(),
                 sample_hit,
+                full_capture,
                 request_excerpt,
                 request_truncated,
-                request_hash: Some(request_hash),
+                request_hash,
                 request_content_digest,
                 request_model,
                 model_truncated,
@@ -1317,7 +1417,8 @@ impl AiTranscriptAudit {
     /// request body (request transforms run after `before_proxy`, where the
     /// candidate was staged). No-op when the body is unchanged, so the common
     /// no-transform path costs one keyed-hash pass at staging plus a cheap
-    /// content-digest compare here.
+    /// content-digest compare here. Lightweight override staging never runs
+    /// HMAC/excerpt/tool work here either.
     fn refresh_staged_request(&self, ctx: &mut RequestContext, body: &[u8]) {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
@@ -1328,6 +1429,11 @@ impl AiTranscriptAudit {
             return;
         }
         let digest = content_digest(body);
+        let full_capture = self
+            .staging
+            .get(&record_id)
+            .map(|staging| staging.full_capture)
+            .unwrap_or(true);
         if self
             .staging
             .get(&record_id)
@@ -1337,6 +1443,30 @@ impl AiTranscriptAudit {
             // marker from the already-validated JSON shape when needed. The
             // stream flag cannot change without changing bytes, so leave
             // metadata as-is and skip the second keyed HMAC.
+            return;
+        }
+        // Re-detect `stream` on the FINAL backend-visible body: a
+        // `request_transformer` may have added OR removed `"stream": true`
+        // after `before_proxy` staged the candidate. `MD_STREAM_REQUEST` drives
+        // the later buffer-vs-stream response decision
+        // (`buffered_response_capture_wanted`), so — mirroring
+        // `ai_tool_governor` — the marker must track the final body in BOTH
+        // directions.
+        if parsed
+            .as_ref()
+            .and_then(|json| json.get("stream"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            ctx.metadata
+                .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
+        } else {
+            ctx.metadata.remove(MD_STREAM_REQUEST);
+        }
+        if !full_capture {
+            if let Some(mut staged) = self.staging.get_mut(&record_id) {
+                staged.request_content_digest = digest;
+            }
             return;
         }
         let request_hash = self.keyed_request_hash(body);
@@ -1371,24 +1501,6 @@ impl AiTranscriptAudit {
                 staged.tool_names = tool_names;
                 staged.tool_names_truncated = tool_names_truncated;
             }
-        }
-        // Re-detect `stream` on the FINAL backend-visible body: a
-        // `request_transformer` may have added OR removed `"stream": true`
-        // after `before_proxy` staged the candidate. `MD_STREAM_REQUEST` drives
-        // the later buffer-vs-stream response decision
-        // (`buffered_response_capture_wanted`), so — mirroring
-        // `ai_tool_governor` — the marker must track the final body in BOTH
-        // directions.
-        if parsed
-            .as_ref()
-            .and_then(|json| json.get("stream"))
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            ctx.metadata
-                .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
-        } else {
-            ctx.metadata.remove(MD_STREAM_REQUEST);
         }
         ctx.metadata
             .insert(MD_REQUEST_HASH.to_string(), request_hash);
@@ -1461,7 +1573,7 @@ impl AiTranscriptAudit {
                 None
             },
             method: ctx.method.clone(),
-            path: ctx.path.clone(),
+            path: self.export_path(ctx.matched_proxy.as_deref(), &ctx.path),
             status_code: status,
         }
     }
@@ -1486,8 +1598,51 @@ impl AiTranscriptAudit {
                 None
             },
             method: summary.http_method.clone(),
-            path: summary.request_path.clone(),
+            path: self.export_path_from_summary(summary),
             status_code: summary.response_status_code,
+        }
+    }
+
+    /// Safe path export: default is a route identifier (never the raw request
+    /// path). Opt-in `include_path` applies `path_mode` with PII redaction for
+    /// any mode that still carries request-derived text.
+    fn export_path(&self, proxy: Option<&crate::config::types::Proxy>, raw_path: &str) -> String {
+        if !self.privacy.include_path || self.privacy.path_mode == PathExportMode::Route {
+            return safe_route_identifier(proxy);
+        }
+        match self.privacy.path_mode {
+            PathExportMode::Route => safe_route_identifier(proxy),
+            PathExportMode::Redacted => self.redactor.redact(raw_path),
+            PathExportMode::Template => {
+                let templated = template_request_path(raw_path);
+                self.redactor.redact(&templated)
+            }
+            PathExportMode::Hash => self.redactor.keyed_hash_hex(raw_path.as_bytes()),
+        }
+    }
+
+    fn export_path_from_summary(&self, summary: &TransactionSummary) -> String {
+        if !self.privacy.include_path || self.privacy.path_mode == PathExportMode::Route {
+            return summary
+                .proxy_name
+                .clone()
+                .or_else(|| summary.proxy_id.clone())
+                .unwrap_or_else(|| "/".to_string());
+        }
+        match self.privacy.path_mode {
+            PathExportMode::Route => summary
+                .proxy_name
+                .clone()
+                .or_else(|| summary.proxy_id.clone())
+                .unwrap_or_else(|| "/".to_string()),
+            PathExportMode::Redacted => self.redactor.redact(&summary.request_path),
+            PathExportMode::Template => {
+                let templated = template_request_path(&summary.request_path);
+                self.redactor.redact(&templated)
+            }
+            PathExportMode::Hash => self
+                .redactor
+                .keyed_hash_hex(summary.request_path.as_bytes()),
         }
     }
 
@@ -1717,7 +1872,20 @@ impl Plugin for AiTranscriptAudit {
     }
 
     fn start_background_tasks(&self) -> Result<(), String> {
-        let flush_config = self.flush_config.clone();
+        let materialized = match materialize_sink_headers(&self.flush_config.header_templates) {
+            Ok(headers) => headers,
+            Err(error) => {
+                self.sink_healthy.store(false, Ordering::Relaxed);
+                return Err(error);
+            }
+        };
+        let flush_config = HttpFlushConfig {
+            endpoint_url: self.flush_config.endpoint_url.clone(),
+            header_templates: Vec::new(),
+            custom_headers: Arc::new(materialized),
+            http_client: self.flush_config.http_client.clone(),
+            sink_healthy: Arc::clone(&self.sink_healthy),
+        };
         let healthy = Arc::clone(&self.sink_healthy);
         let hooks = LoggerHooks {
             on_failed_batch: Some(Arc::new(move |_batch: Vec<QueuedAuditRecord>, _error: String| {
@@ -2504,18 +2672,11 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<QueuedAuditRecord>) -> Res
         .post(&cfg.endpoint_url)
         .header(http::header::CONTENT_TYPE, "application/json")
         .body(body);
-    for (name, template) in &cfg.custom_headers {
-        let value = expand_audit_secret_refs(template)?;
-        match HeaderValue::from_str(&value) {
-            Ok(header_value) => request = request.header(name.clone(), header_value),
-            Err(_) => {
-                // Never log the expanded value — it may contain a sink token.
-                warn!(
-                    header = %name,
-                    "ai_transcript_audit: dropping custom header with an invalid value after secret expansion"
-                );
-            }
-        }
+    // Headers were fully materialized and validated at activation. Attaching
+    // them cannot skip fields: every configured header is present as a valid
+    // HeaderValue, or activation failed closed before the worker started.
+    for (name, value) in cfg.custom_headers.iter() {
+        request = request.header(name.clone(), value.clone());
     }
     let response = cfg
         .http_client
@@ -3282,11 +3443,10 @@ fn bool_str(value: bool) -> String {
 }
 
 /// Expand `${NAME}` occurrences, but only for the audit-sink secret allowlist
-/// (`AUDIT_*` / `FERRUM_AUDIT_*`). Unknown names are rejected; unset allowlisted
-/// names fail closed so a missing token cannot become an empty Authorization
-/// header. Applied at send time so the resolved secret is never stored in
-/// config files; construction already verified each reference is allowlisted
-/// and present.
+/// (`AUDIT_*` / `FERRUM_AUDIT_*`). Unknown names are rejected; unset or empty
+/// allowlisted names fail closed so a missing token cannot become an empty
+/// Authorization header. Construction validates references; background-task
+/// activation materializes final `HeaderValue`s so send never skips a field.
 fn expand_audit_secret_refs(template: &str) -> Result<String, String> {
     if !template.contains("${") {
         return Ok(template.to_string());
@@ -3301,6 +3461,12 @@ fn expand_audit_secret_refs(template: &str) -> Result<String, String> {
             if is_valid_env_name(name) {
                 ensure_audit_secret_env_name(name)?;
                 match std::env::var(name) {
+                    Ok(value) if value.is_empty() => {
+                        return Err(format!(
+                            "ai_transcript_audit: sink.custom_headers secret reference \
+                             '${{{name}}}' is set but empty"
+                        ));
+                    }
                     Ok(value) => out.push_str(&value),
                     Err(_) => {
                         return Err(format!(
@@ -3418,8 +3584,54 @@ fn parse_sink_headers(obj: &Value) -> Result<Vec<(HeaderName, String)>, String> 
             format!("ai_transcript_audit: invalid sink.custom_headers name '{key}': {error}")
         })?;
         validate_sink_header_secret_refs(value)?;
+        // Literals (and currently-resolvable secret templates) must already form
+        // a non-empty HeaderValue so activation is not the first failure point
+        // for static misconfiguration. Activation re-materializes fail-closed.
+        let expanded = expand_audit_secret_refs(value)?;
+        if expanded.is_empty() {
+            return Err(format!(
+                "ai_transcript_audit: sink.custom_headers['{key}'] expands to an empty value"
+            ));
+        }
+        if let Err(error) = HeaderValue::from_str(&expanded) {
+            return Err(format!(
+                "ai_transcript_audit: sink.custom_headers['{key}'] is not a valid HTTP header \
+                 value: {error}"
+            ));
+        }
         out.retain(|(existing, _)| *existing != name);
         out.push((name, value.to_string()));
+    }
+    Ok(out)
+}
+
+/// Expand, validate, and freeze every custom sink header. Missing, empty, or
+/// invalid values fail closed — callers must not skip individual headers.
+fn materialize_sink_headers(
+    templates: &[(HeaderName, String)],
+) -> Result<Vec<(HeaderName, HeaderValue)>, String> {
+    let mut out = Vec::with_capacity(templates.len());
+    for (name, template) in templates {
+        let expanded = expand_audit_secret_refs(template).map_err(|error| {
+            // Never include the expanded secret material in the error path beyond
+            // the already-safe template diagnostic from expand_audit_secret_refs.
+            error
+        })?;
+        if expanded.is_empty() {
+            return Err(format!(
+                "ai_transcript_audit: sink.custom_headers['{}'] expands to an empty value",
+                name.as_str()
+            ));
+        }
+        let header_value = HeaderValue::from_str(&expanded).map_err(|error| {
+            // Do not log/return the expanded value — it may contain a sink token.
+            format!(
+                "ai_transcript_audit: sink.custom_headers['{}'] is not a valid HTTP header \
+                 value after secret expansion: {error}",
+                name.as_str()
+            )
+        })?;
+        out.push((name.clone(), header_value));
     }
     Ok(out)
 }
@@ -3435,16 +3647,87 @@ fn validate_sink_header_secret_refs(template: &str) -> Result<(), String> {
         let name = &after[..end];
         if is_valid_env_name(name) {
             ensure_audit_secret_env_name(name)?;
-            if std::env::var(name).is_err() {
-                return Err(format!(
-                    "ai_transcript_audit: sink.custom_headers secret reference \
-                     '${{{name}}}' is unset"
-                ));
+            match std::env::var(name) {
+                Ok(value) if value.is_empty() => {
+                    return Err(format!(
+                        "ai_transcript_audit: sink.custom_headers secret reference \
+                         '${{{name}}}' is set but empty"
+                    ));
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    return Err(format!(
+                        "ai_transcript_audit: sink.custom_headers secret reference \
+                         '${{{name}}}' is unset"
+                    ));
+                }
             }
         }
         rest = &after[end + 1..];
     }
     Ok(())
+}
+
+fn safe_route_identifier(proxy: Option<&crate::config::types::Proxy>) -> String {
+    let Some(proxy) = proxy else {
+        return "/".to_string();
+    };
+    if let Some(listen_path) = proxy.listen_path.as_ref().filter(|path| !path.is_empty()) {
+        return listen_path.clone();
+    }
+    if let Some(name) = proxy.name.as_ref().filter(|name| !name.is_empty()) {
+        return name.clone();
+    }
+    if !proxy.id.is_empty() {
+        return proxy.id.clone();
+    }
+    "/".to_string()
+}
+
+/// Replace path segments that look like emails, UUIDs, long hex, or numeric IDs
+/// with `{param}` so route shape is preserved without exporting raw identifiers.
+fn template_request_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for (index, segment) in path.split('/').enumerate() {
+        if index > 0 {
+            out.push('/');
+        }
+        if segment.is_empty() {
+            continue;
+        }
+        if path_segment_looks_dynamic(segment) {
+            out.push_str("{param}");
+        } else {
+            out.push_str(segment);
+        }
+    }
+    if out.is_empty() {
+        "/".to_string()
+    } else {
+        out
+    }
+}
+
+fn path_segment_looks_dynamic(segment: &str) -> bool {
+    if segment.contains('@') {
+        return true;
+    }
+    if segment.len() >= 8 && segment.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return true;
+    }
+    if segment.len() >= 2 && segment.bytes().all(|byte| byte.is_ascii_digit()) {
+        return true;
+    }
+    // UUID-shaped (with hyphens).
+    let parts: Vec<&str> = segment.split('-').collect();
+    if parts.len() == 5
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
+        return true;
+    }
+    false
 }
 
 fn cfg_object<'a>(config: &'a Value, key: &str, ctx: &str) -> Result<Option<&'a Value>, String> {
@@ -3613,4 +3896,33 @@ fn json_looks_like_ai_request(json: &Value) -> bool {
         return true;
     }
     object.contains_key("model") && WEAK_MARKERS.iter().any(|field| object.contains_key(*field))
+}
+
+/// Byte-level AI probe used by the lightweight override staging path so
+/// non-AI JSON can be rejected without `serde_json` allocation. Strong marker
+/// keys (and the weak `model`+`message`/`instructions` pair) are searched as
+/// quoted JSON field names. False positives are filtered by the subsequent
+/// parse; false negatives only affect the override-only path.
+fn cheap_ai_json_probe(body: &[u8]) -> bool {
+    const STRONG: &[&[u8]] = &[
+        br#""messages""#,
+        br#""contents""#,
+        br#""chat_history""#,
+        br#""inputs""#,
+        br#""inputText""#,
+        br#""prompt""#,
+        br#""input""#,
+        br#""previous_response_id""#,
+    ];
+    if STRONG.iter().any(|marker| find_bytes(body, marker)) {
+        return true;
+    }
+    find_bytes(body, br#""model""#)
+        && (find_bytes(body, br#""message""#) || find_bytes(body, br#""instructions""#))
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }

@@ -18442,7 +18442,7 @@ components:
           type: object
           required: [endpoint_url]
           additionalProperties: false
-          description: "Async batched HTTPS sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Cleartext HTTP requires allow_insecure_loopback=true and is then limited to localhost or a loopback IP. Unknown sink keys are rejected; custom_headers remains an open string map whose ${NAME} expansions are restricted to AUDIT_* / FERRUM_AUDIT_* and must be set at admission."
+          description: "Async batched HTTPS sink. The endpoint is SSRF-screened against the backend egress policy at construction (literal IPs) and at send time (resolved hostnames). Cleartext HTTP requires allow_insecure_loopback=true and is then limited to localhost or a loopback IP. Unknown sink keys are rejected; custom_headers remains an open string map whose ${NAME} expansions are restricted to AUDIT_* / FERRUM_AUDIT_*, must be non-empty and valid HeaderValues at admission, and are materialized fail-closed during background-task activation."
           properties:
             type:
               type: string
@@ -18460,7 +18460,7 @@ components:
               type: object
               additionalProperties:
                 type: string
-              description: "Extra headers sent on every batch. Values may expand only ${AUDIT_*} or ${FERRUM_AUDIT_*} references (validated and required to be set at construction; re-expanded at send time). Arbitrary unrelated process environment names are rejected. Arbitrary header names are accepted; this is the only intentional free-form map in the plugin config."
+              description: "Extra headers sent on every batch. Values may expand only ${AUDIT_*} or ${FERRUM_AUDIT_*} references (validated as present, non-empty, and valid HeaderValues at construction; fully materialized again during background-task activation — missing/empty/invalid values fail activation and mark the sink unhealthy; send never skips a configured header). Arbitrary unrelated process environment names are rejected. Arbitrary header names are accepted; this is the only intentional free-form map in the plugin config."
             batch_size:
               type: integer
               minimum: 1
@@ -18512,7 +18512,7 @@ components:
         privacy:
           type: [object, "null"]
           additionalProperties: false
-          description: "Identity/header export controls. Omit or null to keep defaults."
+          description: "Identity/header/path export controls. Omit or null to keep defaults. Raw request paths are never exported by default."
           properties:
             include_consumer_username:
               type: boolean
@@ -18523,6 +18523,15 @@ components:
             include_raw_headers:
               type: boolean
               default: false
+            include_path:
+              type: boolean
+              default: false
+              description: "When false (default), the exported path is a safe route identifier (proxy listen_path, else name, else id) — never the raw request path. When true, path_mode selects redacted/template/hash/route treatment; redacted and template always run the configured PII redactor over any exported path text."
+            path_mode:
+              type: string
+              enum: [route, redacted, template, hash]
+              default: route
+              description: "How path is derived when include_path is true (and the safe default when include_path is false). route: listen_path/name/id only. redacted: raw path after PII redaction. template: dynamic segments replaced with {param}, then PII-redacted. hash: keyed HMAC of the raw path."
 
     AiSemanticFirewallConfig:
       type: object
