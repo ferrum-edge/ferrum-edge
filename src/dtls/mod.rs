@@ -693,6 +693,10 @@ pub struct DtlsServer {
     active_config: ArcSwap<DtlsServerActiveConfig>,
     sessions: Arc<DashMap<SocketAddr, DtlsSessionState>>,
     active_sessions: Arc<AtomicUsize>,
+    /// Monotonic generation assigned to each demux session so removal is
+    /// identity-aware: a stale `SessionGuard` or `Closed`-channel cleanup must
+    /// not evict a newer live session that replaced the same `peer_addr`.
+    next_session_generation: AtomicU64,
     limits: DtlsServerLimits,
     /// Channel to deliver accepted (post-handshake) connections.
     accept_tx: mpsc::Sender<(DtlsServerConn, SocketAddr)>,
@@ -706,6 +710,9 @@ struct DtlsSessionState {
     incoming_tx: mpsc::Sender<Vec<u8>>,
     /// Signal this session's driver task to shut down.
     shutdown_tx: mpsc::Sender<()>,
+    /// Identity token for this map entry. Compared on removal so a racing
+    /// replacement at the same peer address is not evicted.
+    generation: u64,
 }
 
 fn remove_session(
@@ -713,8 +720,12 @@ fn remove_session(
     active_sessions: &AtomicUsize,
     active_session_mirror: Option<&AtomicU64>,
     peer_addr: &SocketAddr,
+    generation: u64,
 ) {
-    if sessions.remove(peer_addr).is_some() {
+    if sessions
+        .remove_if(peer_addr, |_, s| s.generation == generation)
+        .is_some()
+    {
         active_sessions.fetch_sub(1, Ordering::Relaxed);
         if let Some(mirror) = active_session_mirror {
             mirror.fetch_sub(1, Ordering::Relaxed);
@@ -727,6 +738,7 @@ struct SessionGuard {
     active_sessions: Arc<AtomicUsize>,
     active_session_mirror: Option<Arc<AtomicU64>>,
     peer_addr: SocketAddr,
+    generation: u64,
 }
 
 impl Drop for SessionGuard {
@@ -736,6 +748,7 @@ impl Drop for SessionGuard {
             &self.active_sessions,
             self.active_session_mirror.as_deref(),
             &self.peer_addr,
+            self.generation,
         );
     }
 }
@@ -884,6 +897,7 @@ impl DtlsServer {
             active_config,
             sessions: Arc::new(DashMap::new()),
             active_sessions: Arc::new(AtomicUsize::new(0)),
+            next_session_generation: AtomicU64::new(1),
             limits,
             accept_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
@@ -1013,13 +1027,22 @@ impl DtlsServer {
                         );
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        // Driver task exited — remove stale session
-                        remove_session(
-                            &self.sessions,
-                            &self.active_sessions,
-                            self.limits.active_session_mirror.as_deref(),
-                            &peer_addr,
-                        );
+                        // Driver task exited — remove only THIS generation's
+                        // stale map entry. A replacement session for the same
+                        // peer may already have been inserted.
+                        if let Some(generation) = self
+                            .sessions
+                            .get(&peer_addr)
+                            .and_then(|s| s.incoming_tx.same_channel(&tx).then_some(s.generation))
+                        {
+                            remove_session(
+                                &self.sessions,
+                                &self.active_sessions,
+                                self.limits.active_session_mirror.as_deref(),
+                                &peer_addr,
+                                generation,
+                            );
+                        }
                     }
                 }
             } else if len >= 13 && data[0] == 0x16 {
@@ -1092,6 +1115,7 @@ impl DtlsServer {
         let mut app_out_rx = Some(app_out_rx);
         let (app_in_tx, mut app_in_rx) = mpsc::channel::<Vec<u8>>(256);
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let generation = self.next_session_generation.fetch_add(1, Ordering::Relaxed);
         // Terminating DTLS: this is best-effort SNI for the session's identity /
         // logging field only — dimpl runs the real handshake and rejects malformed
         // input itself, so a continuation fragment or no-SNI ClientHello both map
@@ -1108,6 +1132,7 @@ impl DtlsServer {
             DtlsSessionState {
                 incoming_tx: incoming_tx.clone(),
                 shutdown_tx: shutdown_tx.clone(),
+                generation,
             },
         );
 
@@ -1133,6 +1158,7 @@ impl DtlsServer {
                 active_sessions: active_sessions.clone(),
                 active_session_mirror: active_session_mirror.clone(),
                 peer_addr,
+                generation,
             };
 
             let mut dtls = Dtls::new_auto(config, certificate, Instant::now());
@@ -1959,5 +1985,82 @@ mod tests {
             server.active_session_count() <= 1,
             "spawn_session honored admission limits after a live-reload swap"
         );
+    }
+
+    #[test]
+    fn remove_session_is_generation_aware() {
+        let sessions: DashMap<SocketAddr, DtlsSessionState> = DashMap::new();
+        let active = AtomicUsize::new(0);
+        let peer: SocketAddr = "127.0.0.1:5555".parse().unwrap();
+
+        let (tx1, _rx1) = mpsc::channel::<Vec<u8>>(1);
+        let (shutdown1, _) = mpsc::channel::<()>(1);
+        sessions.insert(
+            peer,
+            DtlsSessionState {
+                incoming_tx: tx1,
+                shutdown_tx: shutdown1,
+                generation: 1,
+            },
+        );
+        active.store(1, Ordering::Relaxed);
+
+        // Replacement generation-2 entry for the same peer.
+        let (tx2, _rx2) = mpsc::channel::<Vec<u8>>(1);
+        let (shutdown2, _) = mpsc::channel::<()>(1);
+        sessions.insert(
+            peer,
+            DtlsSessionState {
+                incoming_tx: tx2,
+                shutdown_tx: shutdown2,
+                generation: 2,
+            },
+        );
+        active.store(1, Ordering::Relaxed);
+
+        // Stale generation-1 cleanup must not evict the live generation-2 entry.
+        remove_session(&sessions, &active, None, &peer, 1);
+        assert_eq!(sessions.get(&peer).unwrap().generation, 2);
+        assert_eq!(active.load(Ordering::Relaxed), 1);
+
+        remove_session(&sessions, &active, None, &peer, 2);
+        assert!(sessions.get(&peer).is_none());
+        assert_eq!(active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn session_guard_drop_does_not_evict_replacement_generation() {
+        let sessions = Arc::new(DashMap::new());
+        let active = Arc::new(AtomicUsize::new(1));
+        let peer: SocketAddr = "127.0.0.1:5556".parse().unwrap();
+
+        let (tx2, _rx2) = mpsc::channel::<Vec<u8>>(1);
+        let (shutdown2, _) = mpsc::channel::<()>(1);
+        sessions.insert(
+            peer,
+            DtlsSessionState {
+                incoming_tx: tx2,
+                shutdown_tx: shutdown2,
+                generation: 2,
+            },
+        );
+
+        {
+            let _stale_guard = SessionGuard {
+                sessions: Arc::clone(&sessions),
+                active_sessions: Arc::clone(&active),
+                active_session_mirror: None,
+                peer_addr: peer,
+                generation: 1,
+            };
+            // Drop stale generation-1 guard while generation-2 is live.
+        }
+
+        assert_eq!(
+            sessions.get(&peer).unwrap().generation,
+            2,
+            "stale SessionGuard must not remove a newer live session"
+        );
+        assert_eq!(active.load(Ordering::Relaxed), 1);
     }
 }

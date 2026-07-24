@@ -195,3 +195,54 @@ fn drain_to_sendmmsg_partial_drain_leaves_residual() {
     );
     assert!(buf.is_empty());
 }
+
+#[test]
+fn sendmmsg_default_slot_footprint_is_near_mtu_not_max_udp() {
+    let batch = SendMmsgBatch::new(64);
+    assert_eq!(
+        batch.slot_size(),
+        ferrum_edge::proxy::udp_batch::SENDMMSG_DEFAULT_SLOT_SIZE
+    );
+    let payload_bytes = batch.datagram_buffer_bytes();
+    // 64 × 2048 = 131_072 — not 64 × 65535 ≈ 4.2 MiB.
+    assert_eq!(
+        payload_bytes,
+        64 * ferrum_edge::proxy::udp_batch::SENDMMSG_DEFAULT_SLOT_SIZE
+    );
+    assert!(
+        payload_bytes < 256 * 1024,
+        "default sendmmsg payload footprint must stay well under the old 4.2 MiB preallocation, got {payload_bytes}"
+    );
+}
+
+#[test]
+fn sendmmsg_refuses_oversize_datagram_without_truncating() {
+    let mut batch = SendMmsgBatch::with_slot_size(4, 2048);
+    let oversize = vec![0xABu8; 3000];
+    assert!(
+        !batch.push_with_local(&oversize, dest(), None),
+        "datagrams larger than the slot size must refuse so callers can direct-send"
+    );
+    assert!(batch.is_empty(), "refused push must leave the batch empty");
+
+    let fits = vec![0xCDu8; 2048];
+    assert!(batch.push_with_local(&fits, dest(), None));
+    assert!(!batch.is_empty());
+}
+
+#[test]
+fn gso_drain_leaves_oversize_head_for_direct_send() {
+    // GSO accepted a 3000-byte segment; sendmmsg slots are 2048 — drain must
+    // stop with drained==0 and an empty send batch so the caller can
+    // take_front_segment() for direct-send.
+    let mut gso = GsoBatchBuf::new(65535);
+    assert!(gso.push(&[1u8; 3000]));
+    let mut sendmmsg = SendMmsgBatch::with_slot_size(8, 2048);
+    let drained = gso.drain_to_sendmmsg(&mut sendmmsg, dest(), None);
+    assert_eq!(drained, 0);
+    assert!(sendmmsg.is_empty());
+    assert!(!gso.is_empty());
+    let seg = gso.take_front_segment().expect("oversize head");
+    assert_eq!(seg.len(), 3000);
+    assert!(gso.is_empty());
+}

@@ -20,8 +20,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, info, trace, warn};
 
 use crate::circuit_breaker::CircuitBreakerCache;
 use crate::config::types::{BackendScheme, Proxy};
@@ -39,6 +39,19 @@ use crate::request_epoch::{RequestEpoch, RequestEpochStore};
 
 /// Maximum datagram size for UDP forwarding.
 const MAX_UDP_DATAGRAM_SIZE: usize = 65535;
+
+/// Bounded client→backend forward queue depth when datagram plugin hooks are
+/// opted in. Keeps the shared recv loop non-blocking (try_send) while preserving
+/// per-session hook ordering; overflow drops are UDP-best-effort / fail-closed
+/// under backpressure.
+const CLIENT_FORWARD_CHANNEL_CAP: usize = 256;
+
+/// Datagram handed from the shared recv loop to a per-session forward task when
+/// `on_udp_datagram` hooks are configured for the session.
+struct ClientForwardDatagram {
+    data: Vec<u8>,
+    local_addr: Option<crate::socket_opts::PktinfoLocal>,
+}
 
 /// Canonical identity used at every UDP/DTLS session-admission boundary.
 pub fn udp_session_client_ip(client_addr: SocketAddr) -> Arc<str> {
@@ -151,6 +164,11 @@ struct UdpSession {
     idle_timeout_ms: u64,
     stop_reply_task: std::sync::atomic::AtomicBool,
     stop_notify: Arc<tokio::sync::Notify>,
+    /// When `Some`, established-session client→backend datagrams (and their
+    /// plugin hooks) are enqueued here instead of being awaited inline on the
+    /// shared listener recv loop. `None` when no datagram hooks are configured
+    /// so the zero-plugin fast path stays allocation-free and inline.
+    client_forward_tx: Option<mpsc::Sender<ClientForwardDatagram>>,
     /// RAII guard that increments [`crate::overload::OverloadState::active_connections`]
     /// on construction and decrements on drop. Each UDP session counts as one
     /// connection toward the global pressure-shedding threshold so pure-UDP
@@ -869,6 +887,48 @@ fn flush_sendmmsg_best_effort(
     }
 }
 
+/// Queue `data` into `send_batch`, flushing once if the batch is full. Datagrams
+/// that exceed the per-slot size (or still refuse after a flush) take the
+/// pktinfo-aware direct-send path so oversized replies are never truncated or
+/// silently dropped.
+#[cfg(target_os = "linux")]
+async fn push_sendmmsg_or_direct(
+    send_batch: &mut super::udp_batch::SendMmsgBatch,
+    frontend: &Arc<UdpSocket>,
+    client_addr: SocketAddr,
+    data: &[u8],
+    local_ip: Option<crate::socket_opts::PktinfoLocal>,
+    proxy_id: &str,
+    send_drops: &mut UdpReplySendDrops,
+) {
+    use std::os::unix::io::AsRawFd;
+    if send_batch.push_with_local(data, client_addr, local_ip) {
+        return;
+    }
+    if !send_batch.is_empty() {
+        let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
+        if send_batch.push_with_local(data, client_addr, local_ip) {
+            return;
+        }
+    }
+    debug!(
+        proxy_id = %proxy_id,
+        client = %client_addr,
+        size = data.len(),
+        "sendmmsg push refused datagram, sending directly"
+    );
+    if let Err(e) = direct_send_to_client(frontend, data, client_addr, local_ip).await {
+        send_drops.record_datagram(data.len());
+        warn!(
+            proxy_id = %proxy_id,
+            client = %client_addr,
+            size = data.len(),
+            error = %e,
+            "UDP fallback direct-send failed; datagram lost"
+        );
+    }
+}
+
 /// Try to enqueue a datagram into the GSO batch; on batch-full or size-mismatch,
 /// flush and retry, and on GSO socket failure drain the buffered datagrams
 /// through the sendmmsg fallback.
@@ -935,39 +995,45 @@ async fn try_gso_send_or_fallback(
             );
             *gso_failed = true;
             // Drain already-buffered GSO datagrams through sendmmsg. Loop because
-            // `drain_to_sendmmsg` may partially fill `send_batch`; in that case we
-            // flush and keep draining.
+            // `drain_to_sendmmsg` may partially fill `send_batch`, or leave an
+            // oversize head that must take the direct-send path.
             loop {
-                gso_batch.drain_to_sendmmsg(send_batch, client_addr, local_ip);
+                let drained = gso_batch.drain_to_sendmmsg(send_batch, client_addr, local_ip);
                 if gso_batch.is_empty() {
+                    break;
+                }
+                if send_batch.is_empty() && drained == 0 {
+                    if let Some(seg) = gso_batch.take_front_segment() {
+                        if let Err(e) =
+                            direct_send_to_client(frontend, &seg, client_addr, local_ip).await
+                        {
+                            send_drops.record_datagram(seg.len());
+                            warn!(
+                                proxy_id = %proxy_id,
+                                client = %client_addr,
+                                size = seg.len(),
+                                error = %e,
+                                "UDP GSO→direct-send oversize drain failed; datagram lost"
+                            );
+                        }
+                        continue;
+                    }
                     break;
                 }
                 let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
             }
             // Now push the current datagram, flushing once if necessary.
-            if !send_batch.push_with_local(data, client_addr, local_ip) {
-                let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
-                if !send_batch.push_with_local(data, client_addr, local_ip) {
-                    debug!(
-                        proxy_id = %proxy_id,
-                        client = %client_addr,
-                        size = data.len(),
-                        "sendmmsg post-flush push refused datagram, sending directly"
-                    );
-                    if let Err(e) =
-                        direct_send_to_client(frontend, data, client_addr, local_ip).await
-                    {
-                        send_drops.record_datagram(data.len());
-                        warn!(
-                            proxy_id = %proxy_id,
-                            client = %client_addr,
-                            size = data.len(),
-                            error = %e,
-                            "UDP fallback direct-send failed; datagram lost"
-                        );
-                    }
-                }
-            }
+            // An empty batch + refused push means oversized for the slot.
+            push_sendmmsg_or_direct(
+                send_batch,
+                frontend,
+                client_addr,
+                data,
+                local_ip,
+                proxy_id,
+                send_drops,
+            )
+            .await;
         }
     }
 }
@@ -1741,18 +1807,35 @@ async fn process_datagram(
     // the map but the recv-loop's `Arc` keeps it alive, so without
     // this check we'd keep forwarding through a session the cleanup
     // task already declared dead and the configured
-    // `udp_idle_timeout_seconds` would be quietly ignored.
-    let existing_session = if let Some((cached_addr, ref cached_session)) = *last_client
-        && cached_addr == client_addr
-        && !cached_session
-            .expired
-            .load(std::sync::atomic::Ordering::Acquire)
-    {
-        Some(cached_session.clone())
-    } else {
-        sessions
-            .get(&client_addr)
-            .map(|entry| entry.value().clone())
+    // `udp_idle_timeout_seconds` would be quietly ignored. Clear the
+    // cache entry when the expired check trips so a quiet listener
+    // does not pin the last session's Arc (and backend fd) forever.
+    let existing_session = match last_client.as_ref() {
+        Some((cached_addr, cached_session)) if *cached_addr == client_addr => {
+            if cached_session
+                .expired
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                *last_client = None;
+                sessions
+                    .get(&client_addr)
+                    .map(|entry| entry.value().clone())
+            } else {
+                Some(cached_session.clone())
+            }
+        }
+        _ => {
+            if let Some((_, cached_session)) = last_client.as_ref()
+                && cached_session
+                    .expired
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                *last_client = None;
+            }
+            sessions
+                .get(&client_addr)
+                .map(|entry| entry.value().clone())
+        }
     };
 
     let Some(session) = existing_session else {
@@ -1809,22 +1892,6 @@ async fn process_datagram(
         return Ok(());
     };
 
-    if !udp_datagram_allowed(
-        &session.datagram_plugins,
-        Arc::clone(&session.datagram_client_ip),
-        Arc::clone(&session.datagram_proxy_id),
-        session.datagram_proxy_name.clone(),
-        session.listen_port,
-        data,
-        session.datagram_payload_kind,
-        UdpDatagramDirection::ClientToBackend,
-        Some(UdpMetadataSink::new(&session.metadata)),
-    )
-    .await
-    {
-        return Ok(());
-    }
-
     // Record the per-datagram local (destination) address on the session the
     // first time the kernel exposes one. `OnceLock::set` is a no-op if already
     // set, so this is cheap on subsequent datagrams.
@@ -1835,10 +1902,37 @@ async fn process_datagram(
     // Update cache for next datagram.
     *last_client = Some((client_addr, session.clone()));
 
-    forward_client_datagram_to_backend(&session, data).await?;
-    *batch_dgrams_out += 1;
-    *batch_bytes_out += data.len() as u64;
-    Ok(())
+    // When datagram hooks are configured, enqueue onto the per-session forward
+    // task instead of awaiting plugins inline on this single recv loop. A slow
+    // Redis-backed rate limiter (or any hook I/O) for one client must not
+    // serialize every other session on the listener.
+    if let Some(ref forward_tx) = session.client_forward_tx {
+        match forward_tx.try_send(ClientForwardDatagram {
+            data: data.to_vec(),
+            local_addr,
+        }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                trace!(
+                    proxy_id = %session.proxy_id,
+                    client = %client_addr,
+                    "UDP client-forward channel full; dropping datagram"
+                );
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                // Forward task exited — treat as session dying; next datagram
+                // will miss the cache/map and recreate.
+                Ok(())
+            }
+        }
+    } else {
+        // No datagram hooks: keep the inline zero-overhead forward path.
+        forward_client_datagram_to_backend(&session, data).await?;
+        *batch_dgrams_out += 1;
+        *batch_bytes_out += data.len() as u64;
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2222,7 +2316,10 @@ fn spawn_session_cleanup(
                             session
                                 .stop_reply_task
                                 .store(true, std::sync::atomic::Ordering::Release);
-                            session.stop_notify.notify_waiters();
+                            // `notify_one` stores a permit so a stop that races
+                            // between the reply task's flag check and its
+                            // `notified()` registration cannot be lost.
+                            session.stop_notify.notify_one();
                             let bs = session.bytes_sent.load(Ordering::Relaxed);
                             let br = session.bytes_received.load(Ordering::Relaxed);
                             session.release_overload_guard();
@@ -2355,7 +2452,10 @@ async fn start_dtls_frontend_listener(
                     continue;
                 }
 
-                // Atomically reserve a session slot
+                // Atomically reserve a session slot. Epoch lookup, plugin
+                // admission (`on_stream_connect`), and forwarding run inside the
+                // per-client task — matching the TCP path — so a slow stream
+                // plugin cannot stall accept for every other completed handshake.
                 let prev = metrics.active_sessions.fetch_add(1, Ordering::Relaxed);
                 if prev >= max_sessions as u64 {
                     metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
@@ -2369,154 +2469,148 @@ async fn start_dtls_frontend_listener(
                     continue;
                 }
 
-                let epoch = request_epoch.load();
-                let Some(proxy) = epoch.proxy_by_id(&proxy_id).cloned() else {
-                    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
-                    client_conn.close().await;
-                    warn!(proxy_id = %proxy_id, "DTLS listener proxy no longer exists in request epoch");
-                    continue;
-                };
-                let plugins = epoch
-                    .plugin_cache
-                    .get_plugins_for_protocol(&proxy.id, ProxyProtocol::Udp);
-                let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
-                    .iter()
-                    .filter(|p| p.requires_udp_datagram_hooks())
-                    .cloned()
-                    .collect();
-                let consumer_index =
-                    Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
-                let proxy_name = proxy.name.clone();
-                let proxy_namespace = proxy.namespace.clone();
-                let backend_scheme = proxy.effective_scheme();
-                let client_ip = udp_session_client_ip(client_addr);
-
-                // Run on_stream_connect plugins (with DTLS client cert if available)
-                let stream_client_ip = client_ip.to_string();
-                let mut stream_ctx = StreamConnectionContext::new(
-                    stream_client_ip.clone(),
-                    // PROXY protocol is not supported on UDP/DTLS (TCP-borne only);
-                    // direct_client_ip always equals client_ip for UDP sessions.
-                    stream_client_ip,
-                    proxy.id.clone(),
-                    proxy_name.clone(),
-                    port,
-                    backend_scheme,
-                    consumer_index,
-                );
-                stream_ctx.proxy_lifecycle_generation = epoch
-                    .plugin_cache
-                    .proxy_lifecycle_generation(proxy.id.as_str());
-                stream_ctx.tls_client_cert_der = client_conn.tls_client_cert_der.clone();
-                stream_ctx.tls_client_cert_chain_der =
-                    client_conn.tls_client_cert_chain_der.clone();
-                stream_ctx.sni_hostname = client_conn.sni_hostname.clone();
-                // The constructor intentionally leaves node-waypoint per-pod
-                // policy scope absent: UDP/DTLS cannot wire it without a new
-                // capture path. Identity is keyed by the per-connection socket
-                // cookie (`SO_COOKIE`), which node-agent eBPF stamps from
-                // the source pod via the `connect4`/`connect6` cgroup hooks;
-                // there are no UDP capture hooks, and a UDP stream proxy
-                // serves all clients from one shared frontend socket with a
-                // single cookie, so there is no per-source-pod cookie to
-                // resolve here. With `per_pod_policy_scoping` on
-                // (node-waypoint topology), `mesh_authz` stamps
-                // `mesh_authz.scope_missing` and, because the per-pod scope is
-                // always absent here, fails closed (rejects the stream, 403)
-                // when any namespace/selector-scoped policy is configured;
-                // with only mesh-wide policies it evaluates them normally.
-                // Per-pod scoped enforcement is unavailable for DTLS streams
-                // (TCP and HTTP/HBONE have it). See docs/mesh.md.
-                let mut rejected = false;
-                for plugin in plugins.iter() {
-                    if let PluginResult::Reject { .. } = plugin.on_stream_connect(&mut stream_ctx).await {
-                        debug!(
-                            proxy_id = %proxy_id,
-                            client = %client_addr,
-                            "DTLS connection rejected by plugin"
-                        );
-                        client_conn.close().await;
-                        rejected = true;
-                        break;
-                    }
-                }
-                if rejected {
-                    metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
-                    continue;
-                }
-
-                metrics.total_sessions.fetch_add(1, Ordering::Relaxed);
-
-                debug!(
-                    proxy_id = %proxy_id,
-                    client = %client_addr,
-                    "DTLS frontend connection accepted"
-                );
-
-                // Acquire the OverloadState connection guard for the accepted
-                // (post-handshake) DTLS session. Pre-handshake demux peers are
-                // tracked separately in `metrics.dtls_demux_sessions` and via
-                // the `allow_new_session` callback; we intentionally only
-                // contribute to `OverloadState.active_connections` after the
-                // handshake completed and plugin checks passed, so the global
-                // counter reflects committed sessions (parity with TCP/H3).
-                // The guard is moved into the per-client handler task below
-                // and decrements automatically when the task exits, regardless
-                // of which exit path (graceful, error, or shutdown) ran.
-                let handler_overload_guard =
-                    crate::overload::ConnectionGuard::new(&overload);
-
-                // Spawn per-client handler
-                let handler_proxy_id = proxy.id.clone();
-                let handler_epoch = Arc::clone(&epoch);
+                let handler_proxy_id = proxy_id.clone();
+                let handler_epoch_store = Arc::clone(&request_epoch);
                 let handler_health_checker = health_checker.clone();
                 let handler_dns = dns_cache.clone();
                 let handler_metrics = metrics.clone();
-                let handler_plugins = plugins.clone();
-                let handler_datagram_plugins = Arc::clone(&datagram_plugins);
-                let handler_proxy_name = proxy_name.clone();
-                let handler_proxy_namespace = proxy_namespace.clone();
-                let handler_has_plugins = !plugins.is_empty();
-                let handler_consumer_username = if handler_has_plugins {
-                    stream_ctx.effective_identity().map(str::to_owned)
-                } else {
-                    None
-                };
-                let handler_auth_method = stream_ctx.auth_method;
-                let handler_proxy_lifecycle_generation = stream_ctx.proxy_lifecycle_generation;
-                // Preserve the accepted connection's SNI across the per-session
-                // task so disconnect summaries match `on_stream_connect`.
-                let handler_sni_hostname = stream_ctx.sni_hostname.clone();
-                let (handler_metadata, handler_correlation_ids) = if handler_has_plugins {
-                    stream_ctx.take_metadata_with_correlation_ids()
-                } else {
-                    Default::default()
-                };
                 let handler_cb_cache = circuit_breaker_cache.clone();
                 let handler_crls = crls.clone();
                 let handler_ca_bundle = tls_ca_bundle_path.clone();
                 let handler_dtls_cache = backend_dtls_config_cache.clone();
+                let handler_overload = overload.clone();
                 // Monotonic session start for duration_ms; wall clock is only
                 // for human-readable connect/disconnect timestamps.
                 let connected_mono = Instant::now();
                 let connected_at = chrono::Utc::now();
                 tokio::spawn(async move {
-                    // Hold the guard for the lifetime of the handler task. Drop
-                    // at task exit decrements `OverloadState.active_connections`.
-                    let _overload_guard = handler_overload_guard;
+                    let epoch = handler_epoch_store.load();
+                    let Some(proxy) = epoch.proxy_by_id(&handler_proxy_id).cloned() else {
+                        handler_metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+                        client_conn.close().await;
+                        warn!(
+                            proxy_id = %handler_proxy_id,
+                            "DTLS listener proxy no longer exists in request epoch"
+                        );
+                        return;
+                    };
+                    let plugins = epoch
+                        .plugin_cache
+                        .get_plugins_for_protocol(&proxy.id, ProxyProtocol::Udp);
+                    let datagram_plugins: Arc<[Arc<dyn Plugin>]> = plugins
+                        .iter()
+                        .filter(|p| p.requires_udp_datagram_hooks())
+                        .cloned()
+                        .collect();
+                    let consumer_index =
+                        Arc::new(ConsumerIndex::from_inner(Arc::clone(&epoch.consumer_index)));
+                    let proxy_name = proxy.name.clone();
+                    let proxy_namespace = proxy.namespace.clone();
+                    let backend_scheme = proxy.effective_scheme();
+                    let client_ip = udp_session_client_ip(client_addr);
+
+                    // Run on_stream_connect plugins (with DTLS client cert if available)
+                    let stream_client_ip = client_ip.to_string();
+                    let mut stream_ctx = StreamConnectionContext::new(
+                        stream_client_ip.clone(),
+                        // PROXY protocol is not supported on UDP/DTLS (TCP-borne only);
+                        // direct_client_ip always equals client_ip for UDP sessions.
+                        stream_client_ip,
+                        proxy.id.clone(),
+                        proxy_name.clone(),
+                        port,
+                        backend_scheme,
+                        consumer_index,
+                    );
+                    stream_ctx.proxy_lifecycle_generation = epoch
+                        .plugin_cache
+                        .proxy_lifecycle_generation(proxy.id.as_str());
+                    stream_ctx.tls_client_cert_der = client_conn.tls_client_cert_der.clone();
+                    stream_ctx.tls_client_cert_chain_der =
+                        client_conn.tls_client_cert_chain_der.clone();
+                    stream_ctx.sni_hostname = client_conn.sni_hostname.clone();
+                    // The constructor intentionally leaves node-waypoint per-pod
+                    // policy scope absent: UDP/DTLS cannot wire it without a new
+                    // capture path. Identity is keyed by the per-connection socket
+                    // cookie (`SO_COOKIE`), which node-agent eBPF stamps from
+                    // the source pod via the `connect4`/`connect6` cgroup hooks;
+                    // there are no UDP capture hooks, and a UDP stream proxy
+                    // serves all clients from one shared frontend socket with a
+                    // single cookie, so there is no per-source-pod cookie to
+                    // resolve here. With `per_pod_policy_scoping` on
+                    // (node-waypoint topology), `mesh_authz` stamps
+                    // `mesh_authz.scope_missing` and, because the per-pod scope is
+                    // always absent here, fails closed (rejects the stream, 403)
+                    // when any namespace/selector-scoped policy is configured;
+                    // with only mesh-wide policies it evaluates them normally.
+                    // Per-pod scoped enforcement is unavailable for DTLS streams
+                    // (TCP and HTTP/HBONE have it). See docs/mesh.md.
+                    for plugin in plugins.iter() {
+                        if let PluginResult::Reject { .. } =
+                            plugin.on_stream_connect(&mut stream_ctx).await
+                        {
+                            debug!(
+                                proxy_id = %handler_proxy_id,
+                                client = %client_addr,
+                                "DTLS connection rejected by plugin"
+                            );
+                            client_conn.close().await;
+                            handler_metrics.active_sessions.fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
+
+                    handler_metrics.total_sessions.fetch_add(1, Ordering::Relaxed);
+
+                    debug!(
+                        proxy_id = %handler_proxy_id,
+                        client = %client_addr,
+                        "DTLS frontend connection accepted"
+                    );
+
+                    // Acquire the OverloadState connection guard for the accepted
+                    // (post-handshake, post-plugin) DTLS session. Pre-handshake
+                    // demux peers are tracked separately in
+                    // `metrics.dtls_demux_sessions` and via the
+                    // `allow_new_session` callback; we intentionally only
+                    // contribute to `OverloadState.active_connections` after the
+                    // handshake completed and plugin checks passed, so the global
+                    // counter reflects committed sessions (parity with TCP/H3).
+                    // Drop at task exit decrements automatically.
+                    let _overload_guard =
+                        crate::overload::ConnectionGuard::new(&handler_overload);
+
+                    let handler_proxy_id = proxy.id.clone();
+                    let handler_has_plugins = !plugins.is_empty();
+                    let handler_consumer_username = if handler_has_plugins {
+                        stream_ctx.effective_identity().map(str::to_owned)
+                    } else {
+                        None
+                    };
+                    let handler_auth_method = stream_ctx.auth_method;
+                    let handler_proxy_lifecycle_generation = stream_ctx.proxy_lifecycle_generation;
+                    // Preserve the accepted connection's SNI across the session
+                    // so disconnect summaries match `on_stream_connect`.
+                    let handler_sni_hostname = stream_ctx.sni_hostname.clone();
+                    let (handler_metadata, handler_correlation_ids) = if handler_has_plugins {
+                        stream_ctx.take_metadata_with_correlation_ids()
+                    } else {
+                        Default::default()
+                    };
+
                     let result = handle_dtls_client(
                         client_conn,
                         client_addr,
                         &handler_proxy_id,
-                        &handler_epoch,
+                        &epoch,
                         &handler_health_checker,
                         &handler_dns,
                         &handler_metrics,
                         tls_no_verify,
                         handler_ca_bundle.as_deref(),
                         &handler_cb_cache,
-                        &handler_datagram_plugins,
-                        handler_proxy_name.as_deref(),
+                        &datagram_plugins,
+                        proxy_name.as_deref(),
                         port,
                         &handler_crls,
                         &handler_dtls_cache,
@@ -2561,7 +2655,7 @@ async fn start_dtls_frontend_listener(
                             }
                         };
 
-                    if !handler_plugins.is_empty() || error_class.is_some() {
+                    if !plugins.is_empty() || error_class.is_some() {
                         let duration_ms = connected_mono.elapsed().as_millis() as f64;
                         let disconnected_at = chrono::Utc::now();
                         // Merge per-datagram WAF metadata recorded during
@@ -2570,9 +2664,9 @@ async fn start_dtls_frontend_listener(
                         let mut merged_metadata = handler_metadata;
                         merged_metadata.extend(result.metadata);
                         let summary = build_dtls_stream_summary(DtlsDisconnectContext {
-                            namespace: &handler_proxy_namespace,
+                            namespace: &proxy_namespace,
                             proxy_id: &handler_proxy_id,
-                            proxy_name: handler_proxy_name.as_deref(),
+                            proxy_name: proxy_name.as_deref(),
                             proxy_lifecycle_generation: handler_proxy_lifecycle_generation,
                             client_addr,
                             consumer_username: handler_consumer_username.clone(),
@@ -2597,8 +2691,8 @@ async fn start_dtls_frontend_listener(
                         crate::runtime_metrics::global_ref().record_stream_transaction(&summary);
 
                         // Fire on_stream_disconnect plugins
-                        if !handler_plugins.is_empty() {
-                            for plugin in handler_plugins.iter() {
+                        if !plugins.is_empty() {
+                            for plugin in plugins.iter() {
                                 plugin.on_stream_disconnect(&summary).await;
                             }
                         }
@@ -3548,6 +3642,12 @@ async fn create_session(
     let datagram_proxy_id: Arc<str> = Arc::from(proxy_id);
     let datagram_proxy_name: Option<Arc<str>> = proxy_name.as_deref().map(Arc::from);
     let (metadata, correlation_ids) = stream_ctx.take_metadata_with_correlation_ids();
+    let (client_forward_tx, client_forward_rx) = if datagram_plugins.is_empty() {
+        (None, None)
+    } else {
+        let (tx, rx) = mpsc::channel(CLIENT_FORWARD_CHANNEL_CAP);
+        (Some(tx), Some(rx))
+    };
     let session = Arc::new(UdpSession {
         backend_socket: backend_socket.clone(),
         dtls_conn: dtls_conn.clone(),
@@ -3587,6 +3687,7 @@ async fn create_session(
         idle_timeout_ms: proxy.udp_idle_timeout_seconds.saturating_mul(1000),
         stop_reply_task: std::sync::atomic::AtomicBool::new(false),
         stop_notify: Arc::new(tokio::sync::Notify::new()),
+        client_forward_tx,
         // Increment OverloadState.active_connections for each accepted UDP
         // session so per-session pressure shedding works the same as TCP/H3.
         // Decrements automatically on session drop (idle expiry, backend
@@ -3607,6 +3708,70 @@ async fn create_session(
         backend = %backend_addr,
         "New UDP session created"
     );
+
+    if let Some(mut forward_rx) = client_forward_rx {
+        let forward_session = session.clone();
+        let forward_metrics = metrics.clone();
+        let forward_stop = Arc::clone(&session.stop_notify);
+        tokio::spawn(async move {
+            loop {
+                // Register stop waiters before checking the flag so store→notify
+                // cannot be lost between the load and select registration.
+                let stop = forward_stop.notified();
+                tokio::pin!(stop);
+                if forward_session
+                    .stop_reply_task
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    || forward_session
+                        .expired
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    break;
+                }
+                let dgram = tokio::select! {
+                    dgram = forward_rx.recv() => dgram,
+                    _ = &mut stop => None,
+                };
+                let Some(dgram) = dgram else {
+                    break;
+                };
+                if let Some(la) = dgram.local_addr {
+                    let _ = forward_session.local_addr.set(la);
+                }
+                if !udp_datagram_allowed(
+                    &forward_session.datagram_plugins,
+                    Arc::clone(&forward_session.datagram_client_ip),
+                    Arc::clone(&forward_session.datagram_proxy_id),
+                    forward_session.datagram_proxy_name.clone(),
+                    forward_session.listen_port,
+                    &dgram.data,
+                    forward_session.datagram_payload_kind,
+                    UdpDatagramDirection::ClientToBackend,
+                    Some(UdpMetadataSink::new(&forward_session.metadata)),
+                )
+                .await
+                {
+                    continue;
+                }
+                match forward_client_datagram_to_backend(&forward_session, &dgram.data).await {
+                    Ok(()) => {
+                        forward_metrics
+                            .datagrams_out
+                            .fetch_add(1, Ordering::Relaxed);
+                        forward_metrics
+                            .bytes_out
+                            .fetch_add(dgram.data.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        debug!(
+                            proxy_id = %forward_session.proxy_id,
+                            "UDP client-forward to backend failed: {e}"
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     // Spawn backend → client reply forwarder with batch recv optimization.
     let frontend = frontend_socket.clone();
@@ -3659,6 +3824,11 @@ async fn create_session(
         #[cfg(target_os = "linux")]
         let mut gso_failed = false;
         loop {
+            // Create the stop waiter *before* loading the flag so a
+            // store→notify_one that races between the check and select
+            // registration still delivers a permit to this future.
+            let stop = reply_stop_notify.notified();
+            tokio::pin!(stop);
             if reply_session
                 .stop_reply_task
                 .load(std::sync::atomic::Ordering::Acquire)
@@ -3679,7 +3849,7 @@ async fn create_session(
             if let Some(ref dtls) = reply_dtls {
                 let recv_result = tokio::select! {
                     result = dtls.recv() => Some(result),
-                    _ = reply_stop_notify.notified() => None,
+                    _ = &mut stop => None,
                     _ = reply_listener_shutdown.changed() => None,
                     _ = async {
                         match reply_global_shutdown.as_mut() {
@@ -3717,7 +3887,7 @@ async fn create_session(
             } else if let Some(ref sock) = backend_socket {
                 let recv_result = tokio::select! {
                     result = sock.recv(&mut buf) => Some(result),
-                    _ = reply_stop_notify.notified() => None,
+                    _ = &mut stop => None,
                     _ = reply_listener_shutdown.changed() => None,
                     _ = async {
                         match reply_global_shutdown.as_mut() {
@@ -3849,7 +4019,16 @@ async fn create_session(
                         )
                         .await;
                     } else {
-                        send_batch.push_with_local(send_data, client_addr, session_local_ip);
+                        push_sendmmsg_or_direct(
+                            &mut send_batch,
+                            &frontend,
+                            client_addr,
+                            send_data,
+                            session_local_ip,
+                            &reply_proxy_id,
+                            &mut send_drops,
+                        )
+                        .await;
                     }
                 }
             } else if let Err(e) = frontend.send_to(send_data, client_addr).await {
@@ -3941,25 +4120,17 @@ async fn create_session(
                                             &mut send_drops,
                                         )
                                         .await;
-                                    } else if !send_batch.push_with_local(
-                                        &buf[..len2],
-                                        client_addr,
-                                        session_local_ip,
-                                    ) {
-                                        // Batch full — flush and push again.
-                                        use std::os::unix::io::AsRawFd;
-                                        let _ = flush_sendmmsg_best_effort(
+                                    } else {
+                                        push_sendmmsg_or_direct(
                                             &mut send_batch,
-                                            frontend.as_raw_fd(),
-                                            &mut send_drops,
-                                        );
-                                        if !send_batch.push_with_local(
-                                            &buf[..len2],
+                                            &frontend,
                                             client_addr,
+                                            &buf[..len2],
                                             session_local_ip,
-                                        ) {
-                                            send_drops.record_datagram(len2);
-                                        }
+                                            &reply_proxy_id,
+                                            &mut send_drops,
+                                        )
+                                        .await;
                                     }
                                 }
                             } else if let Err(e) = frontend.send_to(&buf[..len2], client_addr).await
@@ -4057,14 +4228,38 @@ async fn create_session(
                             e
                         );
                         gso_failed = true;
-                        // Replay all buffered datagrams through sendmmsg.
+                        // Replay all buffered datagrams through sendmmsg /
+                        // direct-send for any oversize head segments.
                         loop {
-                            gso_batch.drain_to_sendmmsg(
+                            let drained = gso_batch.drain_to_sendmmsg(
                                 &mut send_batch,
                                 client_addr,
                                 session_local_ip,
                             );
                             if gso_batch.is_empty() {
+                                break;
+                            }
+                            if send_batch.is_empty() && drained == 0 {
+                                if let Some(seg) = gso_batch.take_front_segment() {
+                                    if let Err(e) = direct_send_to_client(
+                                        &frontend,
+                                        &seg,
+                                        client_addr,
+                                        session_local_ip,
+                                    )
+                                    .await
+                                    {
+                                        send_drops.record_datagram(seg.len());
+                                        warn!(
+                                            proxy_id = %reply_proxy_id,
+                                            client = %client_addr,
+                                            size = seg.len(),
+                                            error = %e,
+                                            "UDP GSO→direct-send oversize drain failed; datagram lost"
+                                        );
+                                    }
+                                    continue;
+                                }
                                 break;
                             }
                             use std::os::unix::io::AsRawFd;
@@ -4419,8 +4614,9 @@ mod tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Mutex, MutexGuard};
+    use std::time::{Duration, Instant};
     use tokio::net::UdpSocket;
 
     fn make_udp_session() -> UdpSession {
@@ -4461,6 +4657,7 @@ mod tests {
             idle_timeout_ms: 60_000,
             stop_reply_task: std::sync::atomic::AtomicBool::new(false),
             stop_notify: Arc::new(tokio::sync::Notify::new()),
+            client_forward_tx: None,
             // Tests build sessions without an overload state; the guard slot
             // stays empty for unit tests that exercise summary emission only.
             overload_guard: std::sync::Mutex::new(None),
@@ -5411,6 +5608,7 @@ backend_tls_verify_server_cert: false
             idle_timeout_ms: 60_000,
             stop_reply_task: std::sync::atomic::AtomicBool::new(false),
             stop_notify: Arc::new(tokio::sync::Notify::new()),
+            client_forward_tx: None,
             overload_guard: std::sync::Mutex::new(Some(crate::overload::ConnectionGuard::new(
                 state,
             ))),
@@ -5808,5 +6006,161 @@ listen_port: 5300
         drop(session);
         // Last Arc dropped → UdpSession dropped → guard dropped → counter 0.
         assert_eq!(state.active_connections.load(Ordering::Relaxed), 0);
+    }
+
+    /// #2958 — store + notify_one must wake a reply-style waiter even when the
+    /// notify lands in the window between the stop-flag check and select
+    /// registration of a fresh `notified()` future (the classic lost-wakeup).
+    #[tokio::test(start_paused = true)]
+    async fn reply_stop_notify_one_is_observed_without_backend_traffic() {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_notify = Arc::new(tokio::sync::Notify::new());
+        let stop_notify_task = Arc::clone(&stop_notify);
+        let stop_flag_task = Arc::clone(&stop_flag);
+
+        let waiter = tokio::spawn(async move {
+            loop {
+                let notified = stop_notify_task.notified();
+                tokio::pin!(notified);
+                if stop_flag_task.load(Ordering::Acquire) {
+                    return;
+                }
+                // Park until notified (no backend recv). With notify_one the
+                // permit stored before this future is polled still wakes us.
+                notified.await;
+                if stop_flag_task.load(Ordering::Acquire) {
+                    return;
+                }
+            }
+        });
+
+        // Yield so the waiter reaches the register-before-check / await path.
+        tokio::task::yield_now().await;
+
+        stop_flag.store(true, Ordering::Release);
+        stop_notify.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("stop signal must be observed without backend traffic")
+            .expect("waiter task");
+    }
+
+    /// #2956 — per-session forward channel keeps a slow datagram hook for
+    /// client A from delaying client B's enqueue on the shared recv path.
+    #[tokio::test(start_paused = true)]
+    async fn client_forward_channel_isolates_slow_datagram_hooks() {
+        use crate::plugins::{Plugin, ProxyProtocol, UdpDatagramContext, UdpDatagramVerdict};
+        use async_trait::async_trait;
+
+        struct SlowForSuffix {
+            suffix: String,
+            slow_entered: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl Plugin for SlowForSuffix {
+            fn name(&self) -> &str {
+                "test_slow_datagram"
+            }
+            fn supported_protocols(&self) -> &'static [ProxyProtocol] {
+                &[ProxyProtocol::Udp]
+            }
+            fn requires_udp_datagram_hooks(&self) -> bool {
+                true
+            }
+            async fn on_udp_datagram(&self, ctx: &UdpDatagramContext<'_>) -> UdpDatagramVerdict {
+                if ctx.client_ip.ends_with(&self.suffix) {
+                    self.slow_entered.store(true, Ordering::Release);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                UdpDatagramVerdict::Forward
+            }
+        }
+
+        let slow_entered = Arc::new(AtomicBool::new(false));
+        let plugin: Arc<dyn Plugin> = Arc::new(SlowForSuffix {
+            suffix: "1".to_string(),
+            slow_entered: Arc::clone(&slow_entered),
+        });
+
+        let (tx_a, mut rx_a) = mpsc::channel::<ClientForwardDatagram>(CLIENT_FORWARD_CHANNEL_CAP);
+        let (tx_b, mut rx_b) = mpsc::channel::<ClientForwardDatagram>(CLIENT_FORWARD_CHANNEL_CAP);
+
+        // Simulate the shared recv loop: try_send must return immediately for
+        // both clients even while A's forward task is blocked in the hook.
+        let enqueue_start = Instant::now();
+        tx_a.try_send(ClientForwardDatagram {
+            data: b"from-a".to_vec(),
+            local_addr: None,
+        })
+        .expect("enqueue A");
+        tx_b.try_send(ClientForwardDatagram {
+            data: b"from-b".to_vec(),
+            local_addr: None,
+        })
+        .expect("enqueue B");
+        assert!(
+            enqueue_start.elapsed() < Duration::from_millis(10),
+            "recv-loop enqueue must not await per-client datagram hooks"
+        );
+
+        let plugin_a = Arc::clone(&plugin);
+        let forward_a = tokio::spawn(async move {
+            let dgram = rx_a.recv().await.expect("A datagram");
+            let ctx = UdpDatagramContext {
+                client_ip: Arc::from("10.0.0.1"),
+                proxy_id: Arc::from("p"),
+                proxy_name: None,
+                listen_port: 5300,
+                datagram_size: dgram.data.len(),
+                direction: UdpDatagramDirection::ClientToBackend,
+                payload: &dgram.data,
+                payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
+                metadata_sink: None,
+            };
+            let _ = plugin_a.on_udp_datagram(&ctx).await;
+        });
+
+        let plugin_b = Arc::clone(&plugin);
+        let b_done = Arc::new(AtomicBool::new(false));
+        let b_done_flag = Arc::clone(&b_done);
+        let forward_b = tokio::spawn(async move {
+            let dgram = rx_b.recv().await.expect("B datagram");
+            let ctx = UdpDatagramContext {
+                client_ip: Arc::from("10.0.0.2"),
+                proxy_id: Arc::from("p"),
+                proxy_name: None,
+                listen_port: 5300,
+                datagram_size: dgram.data.len(),
+                direction: UdpDatagramDirection::ClientToBackend,
+                payload: &dgram.data,
+                payload_kind: crate::plugins::StreamBytesKind::PlaintextWire,
+                metadata_sink: None,
+            };
+            let start = Instant::now();
+            let _ = plugin_b.on_udp_datagram(&ctx).await;
+            assert!(
+                start.elapsed() < Duration::from_millis(10),
+                "client B must not inherit client A's hook delay"
+            );
+            b_done_flag.store(true, Ordering::Release);
+        });
+
+        // Advance virtual time so A's 100ms sleep can complete after B finishes.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            b_done.load(Ordering::Acquire),
+            "client B forward must complete while A is still sleeping"
+        );
+        assert!(
+            slow_entered.load(Ordering::Acquire),
+            "client A slow hook must have started"
+        );
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        forward_a.await.expect("A");
+        forward_b.await.expect("B");
     }
 }
