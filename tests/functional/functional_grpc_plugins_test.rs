@@ -269,14 +269,12 @@ proxies:
     listen_path: "/"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
     auth_mode: single
     plugins:
       - plugin_config_id: "grpc-method-router"
-
 consumers: []
-
 plugin_configs:
   - id: "grpc-method-router"
     plugin_name: "grpc_method_router"
@@ -287,6 +285,11 @@ plugin_configs:
       allow_methods:
         - "my.EchoService/Echo"
         - "my.EchoService/Ping"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 
@@ -305,14 +308,12 @@ proxies:
     listen_path: "/"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
     auth_mode: single
     plugins:
       - plugin_config_id: "grpc-method-router"
-
 consumers: []
-
 plugin_configs:
   - id: "grpc-method-router"
     plugin_name: "grpc_method_router"
@@ -322,6 +323,11 @@ plugin_configs:
     config:
       deny_methods:
         - "my.EchoService/Forbidden"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 
@@ -341,14 +347,12 @@ proxies:
     listen_path: "/prefix"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     auth_mode: single
     plugins:
       - plugin_config_id: "grpc-method-router"
-
 consumers: []
-
 plugin_configs:
   - id: "grpc-method-router"
     plugin_name: "grpc_method_router"
@@ -358,6 +362,11 @@ plugin_configs:
     config:
       deny_methods:
         - "pkg.Svc/Denied"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 
@@ -377,15 +386,13 @@ proxies:
     listen_path: "/"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
     auth_mode: single
     plugins:
       - plugin_config_id: "grpc-method-router"
       - plugin_config_id: "mesh-route-dispatch"
-
 consumers: []
-
 plugin_configs:
   - id: "grpc-method-router"
     plugin_name: "grpc_method_router"
@@ -407,9 +414,14 @@ plugin_configs:
               exact: "/public.Service/Allowed"
           destination:
             backend_host: "127.0.0.1"
-            backend_port: {backend_port}
+            backend_port: {backend_port: ''}
           rewrite:
             uri: "/admin.Service/Delete"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 2
 "#
     );
 
@@ -428,14 +440,12 @@ proxies:
     listen_path: "/"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
     auth_mode: single
     plugins:
       - plugin_config_id: "grpc-method-router"
-
 consumers: []
-
 plugin_configs:
   - id: "grpc-method-router"
     plugin_name: "grpc_method_router"
@@ -447,6 +457,11 @@ plugin_configs:
         "my.EchoService/Limited":
           max_requests: 3
           window_seconds: 60
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 
@@ -472,6 +487,11 @@ fn write_deadline_config(
     let config = format!(
         r#"
 version: "1"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 proxies:
   - id: "grpc-deadline-proxy"
     listen_path: "/"
@@ -512,14 +532,12 @@ proxies:
     listen_path: "/"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
     auth_mode: single
     plugins:
       - plugin_config_id: "grpc-response-size-limit"
-
 consumers: []
-
 plugin_configs:
   - id: "grpc-response-size-limit"
     plugin_name: "response_size_limiting"
@@ -529,6 +547,11 @@ plugin_configs:
     config:
       max_bytes: 4
       require_buffered_check: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 
@@ -550,15 +573,13 @@ proxies:
     listen_path: "/"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
     auth_mode: single
     plugins:
       - plugin_config_id: "grpc-jwks-auth"
       - plugin_config_id: "grpc-access-control"
-
 consumers: []
-
 plugin_configs:
   - id: "grpc-jwks-auth"
     plugin_name: "jwks_auth"
@@ -567,7 +588,7 @@ plugin_configs:
     enabled: true
     config:
       providers:
-        - jwks: {jwks}
+        - jwks: {jwks: ''}
   - id: "grpc-access-control"
     plugin_name: "access_control"
     scope: proxy
@@ -576,6 +597,11 @@ plugin_configs:
     config:
       allowed_consumers:
         - "mapped-admin"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 2
 "#
     );
 
@@ -1155,14 +1181,12 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     auth_mode: single
     plugins:
       - plugin_config_id: "grpc-method-router"
-
 consumers: []
-
 plugin_configs:
   - id: "grpc-method-router"
     plugin_name: "grpc_method_router"
@@ -1172,6 +1196,11 @@ plugin_configs:
     config:
       allow_methods:
         - "only.This/Allowed"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 

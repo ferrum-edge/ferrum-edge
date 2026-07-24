@@ -17,7 +17,6 @@ proxies:
     backend_tls_verify_server_cert: true
     auth_mode: single
     plugins: []
-
   - id: "proxy-echo-auth"
     name: "Echo API Proxy (Key Auth)"
     listen_path: "/api/echo-auth"
@@ -35,7 +34,6 @@ proxies:
     pool_idle_timeout_seconds: 180
     plugins:
       - plugin_config_id: "plugin-keyauth-bench"
-
 consumers:
   - id: "consumer-bench"
     username: "benchuser"
@@ -43,7 +41,6 @@ consumers:
     credentials:
       keyauth:
         - key: "test-api-key"
-
 plugin_configs:
   - id: "plugin-keyauth-bench"
     plugin_name: "key_auth"
@@ -52,3 +49,9 @@ plugin_configs:
     scope: proxy
     proxy_id: "proxy-echo-auth"
     enabled: true
+version: "1"
+expected_resource_counts:
+  proxies: 2
+  consumers: 1
+  upstreams: 0
+  plugin_configs: 1

@@ -2471,6 +2471,36 @@ pub struct ApiSpec {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Operator-published expected lengths for every truncatable resource
+/// collection in a file-mode config snapshot.
+///
+/// File-mode loads require a top-level [`GatewayConfig::expected_resource_counts`]
+/// and reject the snapshot when any count disagrees with the deserialized
+/// collections. Legitimate resource deletion must atomically publish updated
+/// counts together with the shortened lists — a completed, stable truncate that
+/// drops a trailing plugin/auth resource cannot pass silently.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedResourceCounts {
+    pub proxies: usize,
+    pub consumers: usize,
+    pub upstreams: usize,
+    pub plugin_configs: usize,
+}
+
+impl ExpectedResourceCounts {
+    /// Build the integrity manifest from the resource collections currently on
+    /// `config` (pre-namespace-filter lengths for file snapshots).
+    pub fn from_gateway_config(config: &GatewayConfig) -> Self {
+        Self {
+            proxies: config.proxies.len(),
+            consumers: config.consumers.len(),
+            upstreams: config.upstreams.len(),
+            plugin_configs: config.plugin_configs.len(),
+        }
+    }
+}
+
 /// Full gateway configuration snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -2482,6 +2512,13 @@ pub struct GatewayConfig {
     pub plugin_configs: Vec<PluginConfig>,
     #[serde(default)]
     pub upstreams: Vec<Upstream>,
+    /// Expected resource-collection lengths for file-mode truncation integrity.
+    ///
+    /// Optional on the shared domain model so database/CP construction can omit
+    /// it. File-mode YAML/JSON loads **require** it and fail closed on mismatch
+    /// or absence (no legacy unguarded fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_resource_counts: Option<ExpectedResourceCounts>,
     #[serde(default = "Utc::now")]
     pub loaded_at: DateTime<Utc>,
     /// All distinct namespaces discovered at config load time (before namespace

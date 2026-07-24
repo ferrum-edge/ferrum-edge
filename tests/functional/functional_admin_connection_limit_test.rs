@@ -52,6 +52,11 @@ proxies:
 consumers: []
 upstreams: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#;
 
 /// Admin connection cap used by both cap tests.

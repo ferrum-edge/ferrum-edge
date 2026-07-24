@@ -141,7 +141,7 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port}
+    backend_port: {port: ''}
     strip_listen_path: false
     pool_enable_http2: false
     plugins:
@@ -159,10 +159,15 @@ plugin_configs:
             methods: ["GET"]
           destination:
             backend_host: "127.0.0.1"
-            backend_port: {port}
+            backend_port: {port: ''}
           rewrite:
             uri: "/internal"
             match_prefix: "/api"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         port = backend.port
     );
@@ -203,7 +208,7 @@ proxies:
     listen_path: "/svc"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port}
+    backend_port: {port: ''}
     strip_listen_path: false
     pool_enable_http2: false
     plugins:
@@ -221,9 +226,14 @@ plugin_configs:
             methods: ["GET"]
           destination:
             backend_host: "127.0.0.1"
-            backend_port: {port}
+            backend_port: {port: ''}
           rewrite:
             authority: "internal.example.com"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         port = backend.port
     );
@@ -264,7 +274,7 @@ proxies:
     listen_path: "/old"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port}
+    backend_port: {port: ''}
     strip_listen_path: false
     pool_enable_http2: false
     plugins:
@@ -278,12 +288,17 @@ plugin_configs:
     enabled: true
     config:
       rules:
-        - match: {{}}
+        - match: {{}: ''}
           redirect:
             uri: "/new"
             authority: "elsewhere.example.com"
             scheme: "https"
             redirect_code: 308
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         port = backend.port
     );
@@ -342,7 +357,7 @@ proxies:
     listen_path: "/shadow"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {primary_port}
+    backend_port: {primary_port: ''}
     strip_listen_path: false
     pool_enable_http2: false
     plugins:
@@ -361,7 +376,7 @@ plugin_configs:
             methods: ["GET"]
           destination:
             backend_host: "127.0.0.1"
-            backend_port: {primary_port}
+            backend_port: {primary_port: ''}
           rewrite:
             uri: "/internal"
             match_prefix: "/shadow"
@@ -373,8 +388,13 @@ plugin_configs:
     enabled: true
     config:
       mirror_host: "127.0.0.1"
-      mirror_port: {mirror_port}
+      mirror_port: {mirror_port: ''}
       percentage: 100.0
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 2
 "#,
         primary_port = primary.port,
         mirror_port = mirror.port,

@@ -363,7 +363,6 @@ proxies:
     backend_port: 30001
     strip_listen_path: true
     upstream_id: "upstream-rr"
-
 upstreams:
   - id: "upstream-rr"
     name: "Round Robin Upstream"
@@ -378,9 +377,13 @@ upstreams:
       - host: "127.0.0.1"
         port: 30003
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -471,7 +474,6 @@ proxies:
     backend_port: 30011
     strip_listen_path: true
     upstream_id: "upstream-wrr"
-
 upstreams:
   - id: "upstream-wrr"
     name: "Weighted Round Robin Upstream"
@@ -483,9 +485,13 @@ upstreams:
       - host: "127.0.0.1"
         port: 30012
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -570,7 +576,6 @@ proxies:
     backend_port: 30021
     strip_listen_path: true
     upstream_id: "upstream-hash"
-
 upstreams:
   - id: "upstream-hash"
     name: "Consistent Hash Upstream"
@@ -585,9 +590,13 @@ upstreams:
       - host: "127.0.0.1"
         port: 30023
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -660,7 +669,6 @@ proxies:
     backend_port: 30031
     strip_listen_path: true
     upstream_id: "upstream-health"
-
 upstreams:
   - id: "upstream-health"
     name: "Health Check Upstream"
@@ -680,9 +688,13 @@ upstreams:
         healthy_threshold: 1
         unhealthy_threshold: 2
         healthy_status_codes: [200]
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -766,7 +778,6 @@ proxies:
     backend_port: 30041
     strip_listen_path: true
     upstream_id: "upstream-passive"
-
 upstreams:
   - id: "upstream-passive"
     name: "Passive Health Check Upstream"
@@ -783,9 +794,13 @@ upstreams:
         unhealthy_status_codes: [500, 502, 503]
         unhealthy_threshold: 3
         unhealthy_window_seconds: 60
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -879,7 +894,6 @@ proxies:
     backend_port: 30051
     strip_listen_path: true
     upstream_id: "upstream-recovery"
-
 upstreams:
   - id: "upstream-recovery"
     name: "Recovery Upstream"
@@ -899,9 +913,13 @@ upstreams:
         healthy_threshold: 1
         unhealthy_threshold: 2
         healthy_status_codes: [200]
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -989,7 +1007,6 @@ proxies:
     backend_port: 30061
     strip_listen_path: true
     upstream_id: "upstream-reload"
-
 upstreams:
   - id: "upstream-reload"
     name: "Reload Upstream"
@@ -1001,9 +1018,13 @@ upstreams:
       - host: "127.0.0.1"
         port: 30062
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -1062,7 +1083,6 @@ proxies:
     backend_port: 30061
     strip_listen_path: true
     upstream_id: "upstream-reload"
-
 upstreams:
   - id: "upstream-reload"
     name: "Reload Upstream"
@@ -1074,9 +1094,13 @@ upstreams:
       - host: "127.0.0.1"
         port: 30063
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -1162,7 +1186,6 @@ proxies:
       retry_on_connect_failure: true
       backoff: !fixed
         delay_ms: 100
-
 upstreams:
   - id: "upstream-retry"
     name: "Retry Upstream"
@@ -1174,9 +1197,13 @@ upstreams:
       - host: "127.0.0.1"
         port: 30172
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -1247,7 +1274,7 @@ proxies:
     listen_path: "/retry-accounting"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {initial_port}
+    backend_port: {initial_port: ''}
     strip_listen_path: true
     upstream_id: "retry-accounting-upstream"
     retry:
@@ -1257,26 +1284,29 @@ proxies:
       retry_on_connect_failure: false
       backoff: !fixed
         delay_ms: 1
-
 upstreams:
   - id: "retry-accounting-upstream"
     name: "Retry Accounting Upstream"
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: {initial_port}
+        port: {initial_port: ''}
         weight: 1
       - host: "127.0.0.1"
-        port: {retry_port}
+        port: {retry_port: ''}
         weight: 1
     health_checks:
       passive:
         unhealthy_status_codes: [429]
         unhealthy_threshold: 1
         unhealthy_window_seconds: 60
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#
     );
 
@@ -1361,7 +1391,6 @@ proxies:
     backend_port: 30081
     strip_listen_path: true
     upstream_id: "upstream-fallback"
-
 upstreams:
   - id: "upstream-fallback"
     name: "Fallback Upstream"
@@ -1381,9 +1410,13 @@ upstreams:
         healthy_threshold: 1
         unhealthy_threshold: 2
         healthy_status_codes: [200]
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -1458,7 +1491,6 @@ proxies:
     backend_port: 30091
     strip_listen_path: true
     upstream_id: "upstream-api"
-
   - id: "static-proxy"
     listen_path: "/static"
     backend_scheme: http
@@ -1466,7 +1498,6 @@ proxies:
     backend_port: 30093
     strip_listen_path: true
     upstream_id: "upstream-static"
-
 upstreams:
   - id: "upstream-api"
     name: "API Servers"
@@ -1478,7 +1509,6 @@ upstreams:
       - host: "127.0.0.1"
         port: 30092
         weight: 1
-
   - id: "upstream-static"
     name: "Static Servers"
     algorithm: round_robin
@@ -1489,9 +1519,13 @@ upstreams:
       - host: "127.0.0.1"
         port: 30094
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 2
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -1600,7 +1634,6 @@ proxies:
     backend_port: 30101
     strip_listen_path: true
     upstream_id: "upstream-wrr3"
-
 upstreams:
   - id: "upstream-wrr3"
     name: "WRR 3 Targets"
@@ -1615,9 +1648,13 @@ upstreams:
       - host: "127.0.0.1"
         port: 30103
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -1706,7 +1743,6 @@ proxies:
     backend_port: 30111
     strip_listen_path: true
     upstream_id: "upstream-combined"
-
 upstreams:
   - id: "upstream-combined"
     name: "Combined Health Check Upstream"
@@ -1733,9 +1769,13 @@ upstreams:
         unhealthy_status_codes: [500, 502, 503]
         unhealthy_threshold: 3
         unhealthy_window_seconds: 60
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -1830,7 +1870,6 @@ proxies:
       retry_on_connect_failure: true
       backoff: !fixed
         delay_ms: 50
-
 upstreams:
   - id: "upstream-unreachable"
     name: "Unreachable Upstream"
@@ -1842,9 +1881,13 @@ upstreams:
       - host: "127.0.0.1"
         port: 39999
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -1918,7 +1961,6 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: 30131
     strip_listen_path: true
-
   - id: "lb-proxy"
     listen_path: "/balanced"
     backend_scheme: http
@@ -1926,7 +1968,6 @@ proxies:
     backend_port: 30131
     strip_listen_path: true
     upstream_id: "upstream-coexist"
-
 upstreams:
   - id: "upstream-coexist"
     name: "Coexist Upstream"
@@ -1938,9 +1979,13 @@ upstreams:
       - host: "127.0.0.1"
         port: 30133
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -2080,7 +2125,6 @@ proxies:
     backend_port: 30201
     strip_listen_path: true
     upstream_id: "upstream-lc"
-
 upstreams:
   - id: "upstream-lc"
     name: "Least Connections Upstream"
@@ -2095,9 +2139,13 @@ upstreams:
       - host: "127.0.0.1"
         port: 30203
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -2204,7 +2252,6 @@ proxies:
     backend_port: 30211
     strip_listen_path: true
     upstream_id: "upstream-rand"
-
 upstreams:
   - id: "upstream-rand"
     name: "Random Upstream"
@@ -2219,9 +2266,13 @@ upstreams:
       - host: "127.0.0.1"
         port: 30213
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -2313,7 +2364,6 @@ proxies:
     backend_port: 30221
     strip_listen_path: true
     upstream_id: "upstream-tcp-probe"
-
 upstreams:
   - id: "upstream-tcp-probe"
     name: "TCP Probe Upstream"
@@ -2332,9 +2382,13 @@ upstreams:
         timeout_ms: 1000
         healthy_threshold: 1
         unhealthy_threshold: 2
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -2413,7 +2467,6 @@ proxies:
     backend_port: 30231
     strip_listen_path: true
     upstream_id: "upstream-recovery-timer"
-
 upstreams:
   - id: "upstream-recovery-timer"
     name: "Recovery Timer Upstream"
@@ -2431,9 +2484,13 @@ upstreams:
         unhealthy_threshold: 3
         unhealthy_window_seconds: 60
         healthy_after_seconds: 4
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)
@@ -2556,7 +2613,6 @@ proxies:
     backend_port: 30241
     strip_listen_path: true
     upstream_id: "upstream-custom-codes"
-
 upstreams:
   - id: "upstream-custom-codes"
     name: "Custom Status Codes Upstream"
@@ -2576,9 +2632,13 @@ upstreams:
         healthy_threshold: 1
         unhealthy_threshold: 2
         healthy_status_codes: [200, 503]
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#;
 
     std::fs::File::create(&config_path)

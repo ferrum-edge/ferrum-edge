@@ -222,13 +222,17 @@ proxies:
   - id: "tcp-passthrough"
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
-    listen_port: {stream_port}
+    backend_port: {backend_port: ''}
+    listen_port: {stream_port: ''}
     passthrough: true
-
 consumers: []
 plugin_configs: []
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#,
             )
         })
@@ -275,8 +279,8 @@ proxies:
   - id: "tcp-passthrough-cb"
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
-    listen_port: {stream_port}
+    backend_port: {backend_port: ''}
+    listen_port: {stream_port: ''}
     passthrough: true
     backend_connect_timeout_ms: 200
     circuit_breaker:
@@ -286,10 +290,14 @@ proxies:
       failure_status_codes: [500, 502, 503]
       half_open_max_requests: 1
       trip_on_connection_errors: true
-
 consumers: []
 plugin_configs: []
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#,
             )
         })
@@ -358,13 +366,17 @@ proxies:
   - id: "tls-passthrough"
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
-    listen_port: {stream_port}
+    backend_port: {backend_port: ''}
+    listen_port: {stream_port: ''}
     passthrough: true
-
 consumers: []
 plugin_configs: []
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#,
             )
         })
@@ -468,13 +480,17 @@ proxies:
   - id: "tcp-passthrough-slow-loris"
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
-    listen_port: {stream_port}
+    backend_port: {backend_port: ''}
+    listen_port: {stream_port: ''}
     passthrough: true
-
 consumers: []
 plugin_configs: []
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#,
                 )
             },

@@ -18,7 +18,6 @@ proxies:
     backend_tls_server_ca_cert_path: "/etc/ferrum/tls/ca.pem"
     auth_mode: single
     plugins: []
-
   - id: "h1-tls-e2e-health"
     name: "HTTP/1.1+TLS E2E Health"
     listen_path: "/health"
@@ -32,6 +31,10 @@ proxies:
     backend_write_timeout_ms: 5000
     auth_mode: single
     plugins: []
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0

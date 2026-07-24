@@ -347,7 +347,6 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: true
-
 consumers: []
 plugin_configs:
   - id: "plugin-security-headers-ws"
@@ -370,6 +369,11 @@ plugin_configs:
       echo_downstream: true
     scope: global
     enabled: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 2
 "#,
         backend_port
     );
@@ -390,7 +394,6 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: true
-
 consumers: []
 plugin_configs:
   - id: "invalid-correlation-plugin"
@@ -398,6 +401,11 @@ plugin_configs:
     config: []
     scope: global
     enabled: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port
     );
@@ -421,7 +429,6 @@ proxies:
     strip_listen_path: true
     allowed_methods:
       - POST
-
 consumers: []
 plugin_configs:
   - id: "plugin-security-headers-ws-method-reject"
@@ -437,6 +444,11 @@ plugin_configs:
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port
     );
@@ -459,7 +471,6 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: true
-
 consumers: []
 plugin_configs:
   - id: "plugin-response-mock-ws"
@@ -474,6 +485,11 @@ plugin_configs:
           body: '{{"mock":"ws-handshake"}}'
     scope: global
     enabled: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port
     );
@@ -496,7 +512,6 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: true
-
 consumers: []
 plugin_configs:
   - id: "plugin-ws-adaptive-concurrency"
@@ -529,6 +544,11 @@ plugin_configs:
       echo_downstream: true
     scope: global
     enabled: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 3
 "#,
         backend_port
     );
@@ -559,7 +579,6 @@ proxies:
       timeout_seconds: 60
       failure_status_codes: [500, 502, 503, 504]
       trip_on_connection_errors: true
-
 consumers: []
 plugin_configs:
   - id: "plugin-security-headers-ws-circuit-breaker"
@@ -585,6 +604,11 @@ plugin_configs:
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port
     );
@@ -608,7 +632,6 @@ proxies:
     strip_listen_path: true
     allowed_ws_origins:
       - "https://app.example.com"
-
 consumers: []
 plugin_configs:
   - id: "plugin-security-headers-ws-origin"
@@ -624,6 +647,11 @@ plugin_configs:
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port
     );
@@ -648,14 +676,12 @@ proxies:
     auth_mode: single
     plugins:
       - plugin_config_id: "plugin-keyauth-ws"
-
 consumers:
   - id: "consumer-ws-client"
     username: "ws-test-client"
     credentials:
       keyauth:
         - key: "ws-valid-api-key-112233"
-
 plugin_configs:
   - id: "plugin-keyauth-ws"
     plugin_name: "key_auth"
@@ -677,6 +703,11 @@ plugin_configs:
       remove: ["server", "x-powered-by"]
     scope: global
     enabled: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 1
+  upstreams: 0
+  plugin_configs: 2
 "#,
         backend_port
     );
@@ -702,7 +733,7 @@ proxies:
     listen_path: "/ws-echo"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {dead_port}
+    backend_port: {dead_port: ''}
     strip_listen_path: true
     upstream_id: "h3-ws-upstream"
     backend_connect_timeout_ms: 200
@@ -711,21 +742,24 @@ proxies:
       retry_on_connect_failure: true
       backoff: !fixed
         delay_ms: 10
-
 upstreams:
   - id: "h3-ws-upstream"
     name: "H3 WS Upstream"
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: {dead_port}
+        port: {dead_port: ''}
         weight: 1
       - host: "127.0.0.1"
-        port: {backend_port}
+        port: {backend_port: ''}
         weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#
     );
 
@@ -743,18 +777,21 @@ proxies:
     listen_path: "/ws-echo"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {ws_backend_port}
+    backend_port: {ws_backend_port: ''}
     strip_listen_path: true
-
   - id: "plain-proxy"
     listen_path: "/plain"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {http_port}
+    backend_port: {http_port: ''}
     strip_listen_path: true
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
 

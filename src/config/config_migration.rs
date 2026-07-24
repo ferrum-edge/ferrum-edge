@@ -158,6 +158,12 @@ impl ConfigMigrator {
             });
         }
 
+        // Stamp file-mode truncation integrity from the post-migration
+        // collections so a persisted migrate write is loadable. Counts always
+        // reflect the migrated lists — operators deleting resources later must
+        // republish matching counts atomically (never auto-derived at load).
+        stamp_expected_resource_counts(&mut value);
+
         // Create backup
         let timestamp = chrono::Utc::now().format("%Y%m%d%H%M%S");
         let backup_path = format!("{}.backup.{}", path, timestamp);
@@ -242,6 +248,28 @@ impl ConfigMigrator {
             );
         }
         Ok(steps)
+    }
+}
+
+/// Stamp `expected_resource_counts` from the resource arrays on a config
+/// `serde_json::Value`. Used when persisting a migrated file so the written
+/// snapshot carries matching integrity metadata.
+fn stamp_expected_resource_counts(value: &mut serde_json::Value) {
+    let len_of = |key: &str| -> usize {
+        value
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    };
+    let counts = serde_json::json!({
+        "proxies": len_of("proxies"),
+        "consumers": len_of("consumers"),
+        "upstreams": len_of("upstreams"),
+        "plugin_configs": len_of("plugin_configs"),
+    });
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("expected_resource_counts".to_string(), counts);
     }
 }
 

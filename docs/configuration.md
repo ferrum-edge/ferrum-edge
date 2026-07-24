@@ -300,7 +300,7 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file. Publish updates with an atomic rename (write a temp file, then `rename(2)` onto this path) or an atomic ConfigMap/symlink swap. In-place editor saves, shell `>` redirection, and non-atomic `cp` can expose a torn read; the loader uses bounded metadata/content stability checks with a short retry and fails closed while the file is still changing, keeping last-known-good config on SIGHUP. A rejected SIGHUP load/validation/apply raises authenticated `/health` `config_rejected: true` / `degraded` until a later Applied or Unchanged reload clears it. |
+| `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file. Publish updates with an atomic rename (write a temp file, then `rename(2)` onto this path) or an atomic ConfigMap/symlink swap. In-place editor saves, shell `>` redirection, and non-atomic `cp` can expose a torn read; the loader uses bounded metadata/content stability checks with a short retry and fails closed while the file is still changing, keeping last-known-good config on SIGHUP. Independently of timing, file-mode loads **require** top-level `expected_resource_counts` (`proxies`, `consumers`, `upstreams`, `plugin_configs`) and reject a stable truncated snapshot whose counts no longer match — legitimate resource deletion must atomically republish matching counts with the shortened lists. A rejected SIGHUP load/validation/apply raises authenticated `/health` `config_rejected: true` / `degraded` until a later Applied or Unchanged reload clears it. |
 
 File mode generates a random read-only admin JWT secret only when `FERRUM_ADMIN_JWT_SECRET` is unset. A configured-but-short secret, malformed `FERRUM_ADMIN_JWT_MAX_TTL`, or other invalid JWT setting fails startup and `ferrum-edge validate` with an actionable error (it does not silently fall back to a random secret).
 
@@ -904,7 +904,23 @@ A reference `ferrum.conf` with all available fields and descriptions is included
 
 Configuration files can be YAML or JSON. See `tests/config.yaml` for a complete example.
 
+File-mode snapshots must include a top-level `expected_resource_counts` object whose
+integer fields (`proxies`, `consumers`, `upstreams`, `plugin_configs`) match the
+lengths of those collections after parse/migration. The loader rejects missing
+fields and any mismatch before normalization or apply, so a completed truncate that
+drops a trailing plugin/auth resource cannot be admitted. When deleting resources,
+atomically publish the shortened lists together with updated counts (rename or
+ConfigMap/symlink swap). Database/CP-constructed `GatewayConfig` values may omit the
+field; file mode never treats omission as optional.
+
 ```yaml
+version: "1"
+expected_resource_counts:
+  proxies: 1
+  consumers: 1
+  upstreams: 0
+  plugin_configs: 1
+
 proxies:
   - id: "my-api"
     name: "My Backend API"

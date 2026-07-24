@@ -322,11 +322,15 @@ proxies:
     listen_path: "/slow"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     let mut config_file = std::fs::File::create(&config_path).expect("create config file");
@@ -352,11 +356,15 @@ proxies:
     listen_path: "/grpc.svc"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     let mut config_file = std::fs::File::create(&config_path).expect("create grpc config");

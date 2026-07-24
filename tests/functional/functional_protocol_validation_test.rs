@@ -506,7 +506,7 @@ proxies:
     listen_path: "/"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
+    backend_port: {echo_port: ''}
     strip_listen_path: false
     plugins:
       - plugin_config_id: "sse-h3"
@@ -539,6 +539,11 @@ plugin_configs:
           target: header
           key: X-Plugin-Kept
           value: "response-transformer-ran"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 2
 "#,
     )
 }

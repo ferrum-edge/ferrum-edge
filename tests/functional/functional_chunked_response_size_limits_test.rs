@@ -100,6 +100,11 @@ fn build_config(backend_port: u16, response_body_mode: Option<&str>) -> String {
     format!(
         r#"
 version: "1"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 proxies:
   - id: "chunked-response-size-proxy"
     listen_path: "/"

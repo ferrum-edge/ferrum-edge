@@ -80,11 +80,15 @@ proxies:
     listen_path: "/echo"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
+    backend_port: {echo_port: ''}
     strip_listen_path: true
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#,
         echo_port = backend.port
     );
@@ -131,10 +135,14 @@ proxies:
     listen_path: "/api/v1"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
-
+    backend_port: {echo_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#,
         echo_port = backend.port
     );
@@ -163,15 +171,19 @@ proxies:
     listen_path: "/api/v1"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
+    backend_port: {echo_port: ''}
   - id: "proxy-new"
     listen_path: "/api/v2"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
-
+    backend_port: {echo_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#,
         echo_port = backend.port
     );
@@ -210,6 +222,11 @@ version: "1"
 proxies: []
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 0
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#;
 
     // Just verify the gateway starts successfully with an empty config.
@@ -235,18 +252,21 @@ proxies:
     listen_path: "/api/backend1"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {p1}
+    backend_port: {p1: ''}
     strip_listen_path: true
-
   - id: "backend2"
     listen_path: "/api/backend2"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {p2}
+    backend_port: {p2: ''}
     strip_listen_path: true
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#,
         p1 = backend1.port,
         p2 = backend2.port,
@@ -286,12 +306,11 @@ proxies:
     listen_path: "/auth-api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
+    backend_port: {echo_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "key-auth-plugin"
       - plugin_config_id: "transaction-debugger-plugin"
-
 consumers:
   - id: "consumer-1"
     username: "test-user"
@@ -299,7 +318,6 @@ consumers:
     credentials:
       keyauth:
         - key: "my-secret-api-key"
-
 plugin_configs:
   - id: "key-auth-plugin"
     proxy_id: "auth-proxy"
@@ -313,7 +331,12 @@ plugin_configs:
     plugin_name: "transaction_debugger"
     scope: proxy
     enabled: true
-    config: {{}}
+    config: {{}: ''}
+expected_resource_counts:
+  proxies: 1
+  consumers: 1
+  upstreams: 0
+  plugin_configs: 2
 "#
     );
 
@@ -407,18 +430,22 @@ proxies:
     listen_path: "/prod"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
+    backend_port: {echo_port: ''}
     strip_listen_path: true
   - id: "staging-proxy"
     namespace: "staging"
     listen_path: "/staging"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
+    backend_port: {echo_port: ''}
     strip_listen_path: true
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#,
         echo_port = backend.port,
     );

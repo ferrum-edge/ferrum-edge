@@ -11,20 +11,24 @@
 //! Validation is strict in file mode (errors fail startup) vs. warn-only in
 //! database mode (stale config is better than no config).
 //!
-//! ## Atomic updates
+//! ## Atomic updates and truncation integrity
 //!
 //! Operators must publish config via atomic rename (write temp → `rename(2)`)
 //! or an atomic ConfigMap/symlink swap. In-place editors, shell `>` redirection,
 //! and non-atomic `cp` onto the live path can expose a torn read window. This
 //! loader uses bounded metadata/content stability checks with a short retry
-//! budget and fails closed when the file keeps changing mid-read, so a
-//! syntactically valid truncated tail is never applied. A completed
-//! non-atomic truncate that leaves a stable shorter file still parses; prefer
-//! rename-only updates so last-known-good reload behavior is never asked to
-//! accept a silently shortened resource list.
+//! budget and fails closed when the file keeps changing mid-read.
+//!
+//! Mid-read stability alone cannot detect a **completed**, stable truncate that
+//! drops a trailing resource while remaining syntactically valid YAML/JSON.
+//! File-mode loads therefore require a top-level `expected_resource_counts`
+//! manifest covering `proxies`, `consumers`, `upstreams`, and `plugin_configs`.
+//! The loader validates it after parse/migration and before normalization or
+//! apply. Legitimate resource deletion must atomically republish matching
+//! counts with the shortened lists — there is no legacy unguarded fallback.
 
 use crate::config::config_migration::ConfigMigrator;
-use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
+use crate::config::types::{CURRENT_CONFIG_VERSION, ExpectedResourceCounts, GatewayConfig};
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
 use std::path::Path;
 use std::time::Duration;
@@ -253,6 +257,10 @@ fn parse_config_content(
         serde_json::from_value(value)?
     };
 
+    // Truncation integrity: require and check expected_resource_counts after
+    // parse/migration and before normalization / field validation / apply.
+    require_file_config_expected_resource_counts(&config)?;
+
     ValidationPipeline::new(&mut config)
         .validate_resource_ids(ValidationAction::FatalCount(
             "Configuration validation failed: {} invalid resource ID(s) found",
@@ -425,6 +433,45 @@ fn parse_config_content(
     );
 
     Ok(config)
+}
+
+/// Fail closed when a file-mode snapshot omits or disagrees with
+/// `expected_resource_counts`.
+///
+/// Counts are checked against the full deserialized collections (before
+/// namespace filtering) so a truncate that drops a trailing resource in any
+/// namespace is rejected even when the active namespace slice looks unchanged.
+pub fn require_file_config_expected_resource_counts(
+    config: &GatewayConfig,
+) -> Result<(), anyhow::Error> {
+    let Some(expected) = config.expected_resource_counts.as_ref() else {
+        anyhow::bail!(
+            "Configuration validation failed: file-mode config requires top-level \
+             'expected_resource_counts' covering proxies, consumers, upstreams, and \
+             plugin_configs; publish it atomically with the resource lists so a \
+             stable truncated snapshot cannot drop trailing resources unnoticed"
+        );
+    };
+    let actual = ExpectedResourceCounts::from_gateway_config(config);
+    if *expected != actual {
+        anyhow::bail!(
+            "Configuration validation failed: expected_resource_counts mismatch \
+             (expected proxies={}, consumers={}, upstreams={}, plugin_configs={}; \
+             actual proxies={}, consumers={}, upstreams={}, plugin_configs={}). \
+             A truncated or partially published file was rejected; atomically \
+             republish the resource lists together with matching \
+             expected_resource_counts",
+            expected.proxies,
+            expected.consumers,
+            expected.upstreams,
+            expected.plugin_configs,
+            actual.proxies,
+            actual.consumers,
+            actual.upstreams,
+            actual.plugin_configs
+        );
+    }
+    Ok(())
 }
 
 /// Load and validate an owned file-mode candidate without blocking an async

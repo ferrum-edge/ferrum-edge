@@ -3,6 +3,41 @@ use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, PluginSc
 use std::io::Write;
 use tempfile::NamedTempFile;
 
+
+/// Stamp matching `expected_resource_counts` onto a fixture YAML/JSON document
+/// that is not deliberately testing integrity mismatch/absence.
+fn with_file_integrity(doc: &str) -> String {
+    let trimmed = doc.trim_start();
+    let mut value: serde_json::Value = if trimmed.starts_with('{') {
+        serde_json::from_str(doc).expect("fixture JSON")
+    } else {
+        let yaml: serde_yaml::Value = serde_yaml::from_str(doc).expect("fixture YAML");
+        serde_json::to_value(yaml).expect("yaml to json value")
+    };
+    let len_of = |key: &str| -> usize {
+        value
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    };
+    value.as_object_mut().expect("config object").insert(
+        "expected_resource_counts".to_string(),
+        serde_json::json!({
+            "proxies": len_of("proxies"),
+            "consumers": len_of("consumers"),
+            "upstreams": len_of("upstreams"),
+            "plugin_configs": len_of("plugin_configs"),
+        }),
+    );
+    if trimmed.starts_with('{') {
+        serde_json::to_string_pretty(&value).expect("serialize JSON fixture")
+    } else {
+        let yaml: serde_yaml::Value = serde_json::from_value(value).expect("json to yaml value");
+        serde_yaml::to_string(&yaml).expect("serialize YAML fixture")
+    }
+}
+
 // ============================================================================
 // Basic Loading Tests
 // ============================================================================
@@ -21,7 +56,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -48,7 +83,7 @@ fn test_load_json_config() {
   "plugin_configs": []
 }"#;
     let mut file = NamedTempFile::with_suffix(".json").unwrap();
-    write!(file, "{}", json).unwrap();
+    write!(file, "{}", with_file_integrity(json)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -75,7 +110,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
 
     let err = load_config_from_file(
         file.path().to_str().unwrap(),
@@ -110,7 +145,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let result = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -193,7 +228,7 @@ plugin_configs:
     enabled: true
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
 
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
@@ -303,7 +338,7 @@ plugin_configs: []
         );
 
         let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-        write!(file, "{}", yaml).unwrap();
+        write!(file, "{}", with_file_integrity(yaml)).unwrap();
         let config = load_config_from_file(
             file.path().to_str().unwrap(),
             30,
@@ -335,7 +370,7 @@ plugin_configs: []
 "#;
 
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -363,7 +398,7 @@ plugin_configs: []
 "#;
 
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -460,7 +495,7 @@ upstreams:
 
     for (label, yaml, expected_field) in cases {
         let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-        write!(file, "{}", yaml).unwrap();
+        write!(file, "{}", with_file_integrity(yaml)).unwrap();
         let result = load_config_from_file(
             file.path().to_str().unwrap(),
             30,
@@ -504,7 +539,7 @@ upstreams:
     locality_lb_strict: true
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let err = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -536,7 +571,7 @@ upstreams:
     source_locality: "us-west/us-west-1/a"
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let err = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -566,7 +601,7 @@ upstreams:
         port: 8080
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -596,7 +631,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -622,7 +657,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -647,7 +682,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -676,7 +711,7 @@ consumers:
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -705,7 +740,7 @@ consumers:
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -737,7 +772,7 @@ consumers:
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -773,7 +808,7 @@ consumers:
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -808,7 +843,7 @@ plugin_configs:
     enabled: true
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -847,7 +882,7 @@ fn test_file_config_rejects_unknown_jwt_auth_policy_keys() {
             }]
         });
         let mut file = NamedTempFile::with_suffix(".json").unwrap();
-        write!(file, "{document}").unwrap();
+        write!(file, "{}", with_file_integrity(&document.to_string())).unwrap();
 
         let err = load_config_from_file(
             file.path().to_str().unwrap(),
@@ -884,7 +919,7 @@ fn test_file_config_rejects_unknown_load_testing_keys() {
         }]
     });
     let mut file = NamedTempFile::with_suffix(".json").unwrap();
-    write!(file, "{document}").unwrap();
+    write!(file, "{}", with_file_integrity(&document.to_string())).unwrap();
 
     let err = load_config_from_file(
         file.path().to_str().unwrap(),
@@ -929,7 +964,7 @@ fn test_file_config_rejects_unknown_ai_semantic_cache_keys() {
             }]
         });
         let mut file = NamedTempFile::with_suffix(".json").unwrap();
-        write!(file, "{document}").unwrap();
+        write!(file, "{}", with_file_integrity(&document.to_string())).unwrap();
 
         let err = load_config_from_file(
             file.path().to_str().unwrap(),
@@ -1079,7 +1114,7 @@ fn test_file_config_admits_invalid_optional_proxy_alerts_configs_for_cache_omiss
             }]
         });
         let mut file = NamedTempFile::with_suffix(".json").unwrap();
-        write!(file, "{document}").unwrap();
+        write!(file, "{}", with_file_integrity(&document.to_string())).unwrap();
 
         let loaded = load_config_from_file(
             file.path().to_str().unwrap(),
@@ -1148,7 +1183,7 @@ fn test_file_config_rejects_unknown_mesh_route_dispatch_nested_policy_keys() {
             }]
         });
         let mut file = NamedTempFile::with_suffix(".json").unwrap();
-        write!(file, "{document}").unwrap();
+        write!(file, "{}", with_file_integrity(&document.to_string())).unwrap();
 
         let err = load_config_from_file(
             file.path().to_str().unwrap(),
@@ -1202,7 +1237,7 @@ fn test_file_config_rejects_unknown_ai_prompt_compressor_policy_keys() {
             }]
         });
         let mut file = NamedTempFile::with_suffix(".json").unwrap();
-        write!(file, "{document}").unwrap();
+        write!(file, "{}", with_file_integrity(&document.to_string())).unwrap();
 
         let err = load_config_from_file(
             file.path().to_str().unwrap(),
@@ -1277,7 +1312,7 @@ fn test_file_config_rejects_unknown_ai_stream_router_policy_keys() {
             }]
         });
         let mut file = NamedTempFile::with_suffix(".json").unwrap();
-        write!(file, "{document}").unwrap();
+        write!(file, "{}", with_file_integrity(&document.to_string())).unwrap();
 
         let err = load_config_from_file(
             file.path().to_str().unwrap(),
@@ -1309,7 +1344,7 @@ fn test_file_config_rejects_unknown_adaptive_concurrency_policy_keys() {
         }]
     });
     let mut file = NamedTempFile::with_suffix(".json").unwrap();
-    write!(file, "{document}").unwrap();
+    write!(file, "{}", with_file_integrity(&document.to_string())).unwrap();
 
     let err = load_config_from_file(
         file.path().to_str().unwrap(),
@@ -1354,7 +1389,7 @@ fn test_file_config_rejects_unknown_compression_config_keys() {
             }]
         });
         let mut file = NamedTempFile::with_suffix(".json").unwrap();
-        write!(file, "{document}").unwrap();
+        write!(file, "{}", with_file_integrity(&document.to_string())).unwrap();
 
         let err = load_config_from_file(
             file.path().to_str().unwrap(),
@@ -1402,7 +1437,7 @@ fn test_file_config_rejects_ip_restriction_typos_and_null_lists() {
             }]
         });
         let mut file = NamedTempFile::with_suffix(".json").unwrap();
-        write!(file, "{document}").unwrap();
+        write!(file, "{}", with_file_integrity(&document.to_string())).unwrap();
 
         let error = load_config_from_file(
             file.path().to_str().unwrap(),
@@ -1430,7 +1465,7 @@ plugin_configs:
     enabled: true
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -1460,7 +1495,7 @@ plugin_configs:
     enabled: true
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -1494,7 +1529,7 @@ plugin_configs:
     enabled: true
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -1530,7 +1565,7 @@ plugin_configs:
     enabled: true
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -1599,7 +1634,7 @@ plugin_configs: []
 "#
     );
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -1642,7 +1677,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -1678,7 +1713,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let file_path = file.path().to_str().unwrap();
 
     // Initial load
@@ -1708,7 +1743,7 @@ proxies:
 consumers: []
 plugin_configs: []
 "#;
-    write!(file.reopen().unwrap(), "{}", yaml_updated).unwrap();
+    write!(file.reopen().unwrap(), "{}", with_file_integrity(yaml_updated)).unwrap();
 
     // Reload should get new config
     let config2 = reload_config_from_file(
@@ -1747,7 +1782,7 @@ plugin_configs:
 "#;
     let dns_policy = exact_policy.replace("subject_cn", "san_dns");
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", exact_policy).unwrap();
+    write!(file, "{}", with_file_integrity(exact_policy)).unwrap();
     let file_path = file.path().to_str().unwrap();
 
     let accepted = reload_config_from_file(
@@ -1762,7 +1797,7 @@ plugin_configs:
         "subject_cn"
     );
 
-    std::fs::write(file.path(), dns_policy).unwrap();
+    std::fs::write(file.path(), with_file_integrity(&dns_policy)).unwrap();
     let error = reload_config_from_file(
         file_path,
         30,
@@ -1809,7 +1844,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let result = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -1830,7 +1865,7 @@ fn test_malformed_json() {
   }],
 }"#;
     let mut file = NamedTempFile::with_suffix(".json").unwrap();
-    write!(file, "{}", json).unwrap();
+    write!(file, "{}", with_file_integrity(json)).unwrap();
     let result = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -1849,7 +1884,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -1881,7 +1916,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".conf").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -1907,7 +1942,7 @@ fn test_unknown_extension_fallback_to_json() {
   "plugin_configs": []
 }"#;
     let mut file = NamedTempFile::with_suffix(".config").unwrap();
-    write!(file, "{}", json).unwrap();
+    write!(file, "{}", with_file_integrity(json)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -1962,7 +1997,7 @@ plugin_configs:
     enabled: true
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -1998,7 +2033,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
         30,
@@ -2041,7 +2076,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
 
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
@@ -2080,7 +2115,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
 
     let err = load_config_from_file(
         file.path().to_str().unwrap(),
@@ -2120,7 +2155,7 @@ consumers: []
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
 
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
@@ -2150,7 +2185,7 @@ consumers:
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
 
     let config = load_config_from_file(
         file.path().to_str().unwrap(),
@@ -2178,7 +2213,7 @@ consumers:
 plugin_configs: []
 "#;
     let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
-    write!(file, "{}", yaml).unwrap();
+    write!(file, "{}", with_file_integrity(yaml)).unwrap();
 
     let error = load_config_from_file(
         file.path().to_str().unwrap(),
@@ -2193,12 +2228,17 @@ plugin_configs: []
 }
 
 // ============================================================================
-// Torn / non-atomic file read stability (issues #2978)
+// Torn / non-atomic file read stability + expected_resource_counts (#2978)
 // ============================================================================
 
-fn yaml_with_trailing_plugin_configs(plugin_count: usize) -> String {
-    let mut yaml = String::from(
+fn yaml_with_trailing_plugin_configs(plugin_count: usize, expected_plugins: usize) -> String {
+    let mut yaml = format!(
         r#"version: "1"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: {expected_plugins}
 proxies:
   - id: "proxy-1"
     listen_path: "/api"
@@ -2207,7 +2247,7 @@ proxies:
     backend_port: 3000
 consumers: []
 plugin_configs:
-"#,
+"#
     );
     for i in 0..plugin_count {
         yaml.push_str(&format!(
@@ -2222,14 +2262,25 @@ plugin_configs:
     yaml
 }
 
+fn load_fixture(yaml: &str) -> Result<ferrum_edge::config::types::GatewayConfig, anyhow::Error> {
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{yaml}").unwrap();
+    load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+}
+
 #[test]
-fn test_truncated_trailing_plugin_configs_deserializes_without_stability_guard() {
+fn test_truncated_trailing_plugin_configs_deserializes_without_integrity_guard() {
     // Documents the hazard: a YAML truncated at a trailing plugin_configs list
     // item boundary is still syntactically valid and would load N-1 plugins if
-    // accepted without a stability guard / atomic publish.
-    let full = yaml_with_trailing_plugin_configs(2);
-    let truncated = yaml_with_trailing_plugin_configs(1);
-    assert!(full.starts_with(truncated.trim_end()) || full.contains("plugin-0"));
+    // accepted without expected_resource_counts.
+    let full = yaml_with_trailing_plugin_configs(2, 2);
+    let truncated = yaml_with_trailing_plugin_configs(1, 2);
+    assert!(full.contains("plugin-0") && truncated.contains("plugin-0"));
 
     let parsed: ferrum_edge::config::types::GatewayConfig =
         serde_yaml::from_str(&truncated).expect("truncated trailing list must still parse");
@@ -2241,14 +2292,256 @@ fn test_truncated_trailing_plugin_configs_deserializes_without_stability_guard()
 }
 
 #[test]
+fn test_stable_truncated_trailing_plugins_rejected_by_expected_resource_counts() {
+    // Fully stable on disk — no mid-read mutation — with old expected counts
+    // after a trailing plugin was removed. Must fail closed (#2978).
+    let truncated_stable = yaml_with_trailing_plugin_configs(1, 2);
+    let err = load_fixture(&truncated_stable)
+        .expect_err("stable truncation with stale expected_resource_counts must be rejected");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("expected_resource_counts mismatch"),
+        "expected integrity mismatch diagnostic, got: {msg}"
+    );
+    assert!(msg.contains("plugin_configs=2") && msg.contains("plugin_configs=1"));
+}
+
+#[test]
+fn test_expected_resource_counts_missing_rejected() {
+    let yaml = r#"
+version: "1"
+proxies: []
+consumers: []
+plugin_configs: []
+"#;
+    let err = load_fixture(yaml).expect_err("missing expected_resource_counts must fail closed");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("requires top-level 'expected_resource_counts'"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn test_expected_resource_counts_partial_object_rejected() {
+    let yaml = r#"
+version: "1"
+expected_resource_counts:
+  proxies: 0
+proxies: []
+consumers: []
+plugin_configs: []
+"#;
+    let err = load_fixture(yaml).expect_err("partial expected_resource_counts must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("expected_resource_counts")
+            || msg.contains("missing field")
+            || msg.contains("consumers"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn test_expected_resource_counts_negative_overflow_rejected() {
+    let yaml = r#"
+version: "1"
+expected_resource_counts:
+  proxies: -1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
+proxies: []
+consumers: []
+plugin_configs: []
+"#;
+    let err = load_fixture(yaml).expect_err("negative expected_resource_counts must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("expected_resource_counts")
+            || msg.contains("invalid type")
+            || msg.contains("u64")
+            || msg.contains("usize"),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn test_expected_resource_counts_mismatch_directions_and_categories() {
+    // Overflow: expected higher than actual for each truncatable category.
+    for (field, yaml) in [
+        (
+            "proxies",
+            r#"
+version: "1"
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
+proxies: []
+consumers: []
+plugin_configs: []
+"#,
+        ),
+        (
+            "consumers",
+            r#"
+version: "1"
+expected_resource_counts:
+  proxies: 0
+  consumers: 3
+  upstreams: 0
+  plugin_configs: 0
+proxies: []
+consumers: []
+plugin_configs: []
+"#,
+        ),
+        (
+            "upstreams",
+            r#"
+version: "1"
+expected_resource_counts:
+  proxies: 0
+  consumers: 0
+  upstreams: 5
+  plugin_configs: 0
+proxies: []
+consumers: []
+plugin_configs: []
+"#,
+        ),
+        (
+            "plugin_configs",
+            r#"
+version: "1"
+expected_resource_counts:
+  proxies: 0
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 4
+proxies: []
+consumers: []
+plugin_configs: []
+"#,
+        ),
+    ] {
+        let err = load_fixture(yaml).expect_err("overflow mismatch must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("expected_resource_counts mismatch"),
+            "{field}: {msg}"
+        );
+    }
+
+    // Underflow: expected lower than actual (extra resource without bumping counts).
+    let underflow = r#"
+version: "1"
+expected_resource_counts:
+  proxies: 0
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
+proxies:
+  - id: "proxy-1"
+    listen_path: "/api"
+    backend_scheme: http
+    backend_host: "localhost"
+    backend_port: 3000
+consumers: []
+plugin_configs: []
+"#;
+    let err = load_fixture(underflow).expect_err("underflow mismatch must be rejected");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("expected_resource_counts mismatch"), "{msg}");
+    assert!(msg.contains("proxies=0") && msg.contains("proxies=1"));
+}
+
+#[test]
+fn test_expected_resource_counts_valid_atomic_update() {
+    let before = r#"
+version: "1"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 2
+proxies:
+  - id: "proxy-1"
+    listen_path: "/api"
+    backend_scheme: http
+    backend_host: "localhost"
+    backend_port: 3000
+consumers: []
+plugin_configs:
+  - id: "plugin-0"
+    plugin_name: "stdout_logging"
+    config: {}
+    scope: global
+    enabled: true
+  - id: "plugin-1"
+    plugin_name: "stdout_logging"
+    config: {}
+    scope: global
+    enabled: true
+"#;
+    let after_delete = r#"
+version: "1"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
+proxies:
+  - id: "proxy-1"
+    listen_path: "/api"
+    backend_scheme: http
+    backend_host: "localhost"
+    backend_port: 3000
+consumers: []
+plugin_configs:
+  - id: "plugin-0"
+    plugin_name: "stdout_logging"
+    config: {}
+    scope: global
+    enabled: true
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let live = dir.path().join("config.yaml");
+    let staging = dir.path().join("config.yaml.tmp");
+    std::fs::write(&live, before).unwrap();
+    let loaded = load_config_from_file(
+        live.to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("initial snapshot with matching counts must load");
+    assert_eq!(loaded.plugin_configs.len(), 2);
+
+    std::fs::write(&staging, after_delete).unwrap();
+    std::fs::rename(&staging, &live).unwrap();
+    let reloaded = load_config_from_file(
+        live.to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("atomic delete + matching expected_resource_counts must load");
+    assert_eq!(reloaded.plugin_configs.len(), 1);
+    assert_eq!(reloaded.plugin_configs[0].id, "plugin-0");
+}
+
+#[test]
 fn test_stability_guard_rejects_torn_trailing_plugin_configs_mutation() {
     use ferrum_edge::config::file_loader::{
         StableFileReadOptions, read_config_file_stable_with,
     };
     use std::time::Duration;
 
-    let full = yaml_with_trailing_plugin_configs(2);
-    let truncated = yaml_with_trailing_plugin_configs(1);
+    let full = yaml_with_trailing_plugin_configs(2, 2);
+    let truncated = yaml_with_trailing_plugin_configs(1, 2);
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.yaml");
@@ -2278,13 +2571,13 @@ fn test_stability_guard_rejects_torn_trailing_plugin_configs_mutation() {
 
 #[test]
 fn test_atomic_rename_replacement_loads_full_trailing_plugin_configs() {
-    let full = yaml_with_trailing_plugin_configs(2);
+    let full = yaml_with_trailing_plugin_configs(2, 2);
     let dir = tempfile::tempdir().unwrap();
     let live = dir.path().join("config.yaml");
     let staging = dir.path().join("config.yaml.tmp");
 
     // Start with a shorter file, then atomically replace with the full doc.
-    std::fs::write(&live, yaml_with_trailing_plugin_configs(1)).unwrap();
+    std::fs::write(&live, yaml_with_trailing_plugin_configs(1, 1)).unwrap();
     std::fs::write(&staging, &full).unwrap();
     std::fs::rename(&staging, &live).unwrap();
 

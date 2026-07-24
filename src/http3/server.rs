@@ -12932,6 +12932,7 @@ mod build_h3_backend_headers_tests {
             consumers: vec![],
             plugin_configs: vec![],
             upstreams: vec![],
+            expected_resource_counts: None,
             loaded_at: chrono::Utc::now(),
             known_namespaces: Vec::new(),
             frontend_tls_cert_path: None,

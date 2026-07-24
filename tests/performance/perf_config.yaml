@@ -2,7 +2,6 @@
 version: "1"
 # Performance testing configuration for Ferrum Edge
 # Uses global defaults with selective per-proxy overrides
-
 proxies:
   - id: "proxy-health"
     name: "Health Check Proxy"
@@ -17,9 +16,7 @@ proxies:
     backend_write_timeout_ms: 5000
     backend_tls_verify_server_cert: true
     auth_mode: single
-
     plugins: []
-
   - id: "proxy-users"
     name: "Users API Proxy"
     listen_path: "/api/users"
@@ -33,9 +30,7 @@ proxies:
     backend_write_timeout_ms: 5000
     backend_tls_verify_server_cert: true
     auth_mode: single
-
     plugins: []
-
   - id: "proxy-data"
     name: "Data API Proxy"
     listen_path: "/api/data"
@@ -49,9 +44,11 @@ proxies:
     backend_write_timeout_ms: 10000
     backend_tls_verify_server_cert: true
     auth_mode: single
-
     plugins: []
-
 consumers: []
-
 plugin_configs: []
+expected_resource_counts:
+  proxies: 3
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0

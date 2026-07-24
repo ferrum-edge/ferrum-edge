@@ -55,12 +55,16 @@ proxies:
     listen_path: "/early"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
     pool_enable_http2: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     )
 }

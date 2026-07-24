@@ -173,9 +173,8 @@ proxies:
     listen_path: "/static"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
+    backend_port: {echo_port: ''}
     strip_listen_path: true
-
 upstreams:
   - id: "sd-dns-upstream"
     name: "DNS-SD Upstream"
@@ -187,9 +186,13 @@ upstreams:
         service_name: "_http._tcp.nonexistent.invalid"
         poll_interval_seconds: 60
       default_weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#
     );
     let path = write_config(&temp_dir, &config);
@@ -237,9 +240,8 @@ proxies:
     listen_path: "/static"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
+    backend_port: {echo_port: ''}
     strip_listen_path: true
-
 upstreams:
   - id: "sd-k8s-upstream"
     name: "K8s Upstream"
@@ -253,9 +255,13 @@ upstreams:
         port_name: "http"
         poll_interval_seconds: 60
       default_weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#
     );
     let path = write_config(&temp_dir, &config);
@@ -298,9 +304,8 @@ proxies:
     listen_path: "/static"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
+    backend_port: {echo_port: ''}
     strip_listen_path: true
-
 upstreams:
   - id: "sd-consul-dead"
     name: "Consul (dead) Upstream"
@@ -314,9 +319,13 @@ upstreams:
         healthy_only: true
         poll_interval_seconds: 1
       default_weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#
     );
     let path = write_config(&temp_dir, &config);
@@ -410,7 +419,6 @@ proxies:
     backend_port: 1
     strip_listen_path: true
     upstream_id: "sd-consul-live"
-
 upstreams:
   - id: "sd-consul-live"
     name: "Consul (live) Upstream"
@@ -424,9 +432,13 @@ upstreams:
         healthy_only: true
         poll_interval_seconds: 1
       default_weight: 1
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 0
 "#
     );
     let path = write_config(&temp_dir, &config);

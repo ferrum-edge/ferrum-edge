@@ -218,14 +218,18 @@ async fn test_udp_proxy_plain_datagram_forwarding() {
 version: "1"
 proxies:
   - id: "udp-echo"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     udp_idle_timeout_seconds: 30
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -294,15 +298,19 @@ async fn test_udp_proxy_zero_length_request_has_bounded_reply_budget() {
 version: "1"
 proxies:
   - id: "udp-empty-datagram"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     udp_idle_timeout_seconds: 30
     udp_max_response_amplification_factor: 1.0
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -388,14 +396,18 @@ async fn test_udp_proxy_opening_flight_burst_preserved_in_order() {
 version: "1"
 proxies:
   - id: "udp-opening-flight"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     udp_idle_timeout_seconds: 30
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -474,13 +486,17 @@ async fn test_udp_proxy_multiple_clients() {
 version: "1"
 proxies:
   - id: "udp-multi-client"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
-
+    backend_port: {backend_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -546,14 +562,18 @@ async fn test_udp_proxy_new_source_flood_does_not_stall_established_session() {
 version: "1"
 proxies:
   - id: "udp-setup-flood"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     udp_idle_timeout_seconds: 30
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -628,14 +648,18 @@ async fn test_udp_proxy_max_sessions_env_limits_new_clients() {
 version: "1"
 proxies:
   - id: "udp-max-sessions"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     udp_idle_timeout_seconds: 30
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -715,14 +739,18 @@ async fn test_udp_proxy_session_timeout() {
 version: "1"
 proxies:
   - id: "udp-timeout"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     udp_idle_timeout_seconds: 2
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -800,13 +828,17 @@ async fn test_udp_proxy_large_datagram() {
 version: "1"
 proxies:
   - id: "udp-large"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
-
+    backend_port: {backend_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -864,14 +896,18 @@ async fn test_udp_proxy_response_amplification_factor_drops_oversized_backend_da
 version: "1"
 proxies:
   - id: "udp-amplification-guard"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     udp_max_response_amplification_factor: 1.0
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -939,14 +975,18 @@ async fn test_udp_proxy_dtls_backend() {
 version: "1"
 proxies:
   - id: "dtls-proxy"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: dtls
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     backend_tls_verify_server_cert: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -1008,14 +1048,18 @@ async fn test_udp_proxy_dtls_backend_multiple_clients() {
 version: "1"
 proxies:
   - id: "dtls-multi"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: dtls
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     backend_tls_verify_server_cert: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -1081,14 +1125,18 @@ async fn test_udp_proxy_frontend_dtls_termination() {
 version: "1"
 proxies:
   - id: "frontend-dtls"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     frontend_tls: true
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -1161,15 +1209,19 @@ async fn test_udp_proxy_frontend_dtls_backend_push_keeps_session_alive() {
 version: "1"
 proxies:
   - id: "frontend-dtls-backend-push"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     frontend_tls: true
     udp_idle_timeout_seconds: 2
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );
@@ -1243,15 +1295,19 @@ async fn test_udp_proxy_full_dtls_e2e() {
 version: "1"
 proxies:
   - id: "full-dtls"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: dtls
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     backend_tls_verify_server_cert: false
     frontend_tls: true
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         ),
     );

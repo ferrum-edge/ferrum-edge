@@ -86,11 +86,15 @@ proxies:
     hosts: ["a.example.com"]
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_a}
+    backend_port: {port_a: ''}
     strip_listen_path: true
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
 
@@ -141,18 +145,21 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_api}
+    backend_port: {port_api: ''}
     strip_listen_path: false
-
   - id: "host-only-fallback"
     hosts: ["shared.example.com"]
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_fallback}
+    backend_port: {port_fallback: ''}
     strip_listen_path: true
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
 
@@ -201,18 +208,21 @@ proxies:
     hosts: ["a.example.com"]
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_a}
+    backend_port: {port_a: ''}
     strip_listen_path: true
-
   - id: "host-only-b"
     hosts: ["b.example.com"]
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_b}
+    backend_port: {port_b: ''}
     strip_listen_path: true
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
 

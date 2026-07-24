@@ -2,7 +2,11 @@
 # Ferrum Edge - Example Configuration File
 # Used with FERRUM_MODE=file
 version: "1"
-
+expected_resource_counts:
+  proxies: 6
+  consumers: 2
+  upstreams: 0
+  plugin_configs: 9
 proxies:
   - id: "proxy-httpbin"
     name: "HTTPBin Proxy"
@@ -19,8 +23,8 @@ proxies:
     # Override global defaults for this high-traffic external API
     pool_idle_timeout_seconds: 120
     pool_tcp_keepalive_seconds: 45
-    pool_http2_keep_alive_interval_seconds: 20  # More frequent pings for high-traffic API
-    pool_http2_keep_alive_timeout_seconds: 30   # Reasonable timeout for high-traffic API
+    pool_http2_keep_alive_interval_seconds: 20 # More frequent pings for high-traffic API
+    pool_http2_keep_alive_timeout_seconds: 30 # Reasonable timeout for high-traffic API
     # pool_enable_http_keep_alive and pool_enable_http2 use global defaults
     # Response body mode: "stream" (default) or "buffer".
     # Stream forwards chunks as they arrive — lower latency, lower memory.
@@ -29,7 +33,6 @@ proxies:
     # response_body_mode: stream  # (default — omitted is the same as "stream")
     auth_mode: single
     plugins: []
-
   - id: "proxy-jsonplaceholder"
     name: "JSONPlaceholder API"
     listen_path: "/jsonapi"
@@ -43,7 +46,6 @@ proxies:
     # Use global defaults for connection pooling (no overrides)
     auth_mode: single
     plugins: []
-
   - id: "proxy-websocket"
     name: "WebSocket Echo Test"
     listen_path: "/ws-echo"
@@ -53,14 +55,13 @@ proxies:
     strip_listen_path: true
     # Override global defaults for WebSocket connections
     pool_idle_timeout_seconds: 300
-    pool_tcp_keepalive_seconds: 90  # Longer keep-alive for persistent WebSocket connections
-    pool_http2_keep_alive_interval_seconds: 60  # Less frequent pings for persistent connections
-    pool_http2_keep_alive_timeout_seconds: 90  # Longer timeout for WebSocket stability
-    pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
+    pool_tcp_keepalive_seconds: 90 # Longer keep-alive for persistent WebSocket connections
+    pool_http2_keep_alive_interval_seconds: 60 # Less frequent pings for persistent connections
+    pool_http2_keep_alive_timeout_seconds: 90 # Longer timeout for WebSocket stability
+    pool_enable_http2: false # HTTP/1.1 recommended for WebSockets
     # pool_enable_http_keep_alive uses global default (true)
     auth_mode: single
     plugins: []
-
   - id: "proxy-websocket-secure"
     name: "Secure WebSocket Echo Test"
     listen_path: "/wss-echo"
@@ -70,13 +71,12 @@ proxies:
     strip_listen_path: true
     # Override global defaults for secure WebSocket connections
     pool_idle_timeout_seconds: 300
-    pool_tcp_keepalive_seconds: 90  # Longer keep-alive for persistent WebSocket connections
-    pool_http2_keep_alive_interval_seconds: 60  # Less frequent pings for persistent connections
-    pool_http2_keep_alive_timeout_seconds: 90  # Longer timeout for WebSocket stability
-    pool_enable_http2: false  # HTTP/1.1 recommended for WebSockets
+    pool_tcp_keepalive_seconds: 90 # Longer keep-alive for persistent WebSocket connections
+    pool_http2_keep_alive_interval_seconds: 60 # Less frequent pings for persistent connections
+    pool_http2_keep_alive_timeout_seconds: 90 # Longer timeout for WebSocket stability
+    pool_enable_http2: false # HTTP/1.1 recommended for WebSockets
     auth_mode: single
     plugins: []
-
   - id: "proxy-protected"
     name: "Protected API"
     listen_path: "/protected"
@@ -85,7 +85,7 @@ proxies:
     backend_port: 3001
     strip_listen_path: true
     # Conservative settings for auth-protected APIs
-    pool_enable_http2: false  # Better compatibility with auth plugins
+    pool_enable_http2: false # Better compatibility with auth plugins
     # Other settings use global defaults
     # Buffer mode: collect entire response before forwarding to client.
     # Useful when plugins need to inspect/transform the full response body.
@@ -95,7 +95,6 @@ proxies:
       - plugin_config_id: "plugin-keyauth-protected"
       - plugin_config_id: "plugin-acl-protected"
       - plugin_config_id: "plugin-ratelimit-protected"
-
   - id: "proxy-multi-auth"
     name: "Multi-Auth API"
     listen_path: "/multi-auth"
@@ -104,14 +103,13 @@ proxies:
     backend_port: 3002
     strip_listen_path: true
     # Conservative settings for multi-auth APIs
-    pool_enable_http2: false  # Better compatibility with auth plugins
+    pool_enable_http2: false # Better compatibility with auth plugins
     # Other settings use global defaults
     auth_mode: multi
     plugins:
       - plugin_config_id: "plugin-jwtauth"
       - plugin_config_id: "plugin-keyauth-multi-auth"
       - plugin_config_id: "plugin-acl-multi-auth"
-
 consumers:
   - id: "consumer-alice"
     username: "alice"
@@ -125,7 +123,6 @@ consumers:
         - password_hash: "hmac_sha256:0000000000000000000000000000000000000000000000000000000000000000"
     acl_groups:
       - "engineering"
-
   - id: "consumer-bob"
     username: "bob"
     custom_id: "bob-002"
@@ -137,14 +134,12 @@ consumers:
     acl_groups:
       - "engineering"
       - "platform"
-
 plugin_configs:
   - id: "plugin-stdout"
     plugin_name: "stdout_logging"
     config: {}
     scope: global
     enabled: true
-
   - id: "plugin-keyauth-protected"
     plugin_name: "key_auth"
     config:
@@ -152,7 +147,6 @@ plugin_configs:
     scope: proxy
     proxy_id: "proxy-protected"
     enabled: true
-
   - id: "plugin-jwtauth"
     plugin_name: "jwt_auth"
     config:
@@ -161,7 +155,6 @@ plugin_configs:
     scope: proxy
     proxy_id: "proxy-multi-auth"
     enabled: true
-
   - id: "plugin-keyauth-multi-auth"
     plugin_name: "key_auth"
     config:
@@ -169,7 +162,6 @@ plugin_configs:
     scope: proxy
     proxy_id: "proxy-multi-auth"
     enabled: true
-
   - id: "plugin-acl-protected"
     plugin_name: "access_control"
     config:
@@ -183,7 +175,6 @@ plugin_configs:
     scope: proxy
     proxy_id: "proxy-protected"
     enabled: true
-
   - id: "plugin-acl-multi-auth"
     plugin_name: "access_control"
     config:
@@ -194,7 +185,6 @@ plugin_configs:
     scope: proxy
     proxy_id: "proxy-multi-auth"
     enabled: true
-
   - id: "plugin-ratelimit-protected"
     plugin_name: "rate_limiting"
     config:
@@ -206,7 +196,6 @@ plugin_configs:
     scope: proxy
     proxy_id: "proxy-protected"
     enabled: true
-
   - id: "plugin-req-transform"
     plugin_name: "request_transformer"
     config:
@@ -217,7 +206,6 @@ plugin_configs:
           value: "Ferrum"
     scope: global
     enabled: true
-
   - id: "plugin-resp-transform"
     plugin_name: "response_transformer"
     config:

@@ -364,10 +364,15 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -432,10 +437,15 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -501,10 +511,15 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -566,7 +581,7 @@ proxies:
     listen_path: "/api"
     backend_scheme: https
     backend_host: "localhost"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
     backend_tls_verify_server_cert: true
     backend_tls_server_ca_cert_path: "{ca_p}"
@@ -574,6 +589,11 @@ proxies:
     dns_override: "127.0.0.1"
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -634,7 +654,7 @@ proxies:
     listen_path: "/api"
     backend_scheme: https
     backend_host: "localhost"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
     backend_tls_verify_server_cert: true
     backend_tls_server_ca_cert_path: "{ca_p}"
@@ -642,6 +662,11 @@ proxies:
     dns_override: "127.0.0.1"
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -705,7 +730,7 @@ proxies:
     listen_path: "/api"
     backend_scheme: https
     backend_host: "localhost"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
     backend_tls_verify_server_cert: true
     backend_tls_server_ca_cert_path: "{ca_p}"
@@ -715,6 +740,11 @@ proxies:
     dns_override: "127.0.0.1"
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -775,7 +805,7 @@ proxies:
     listen_path: "/api"
     backend_scheme: https
     backend_host: "localhost"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
     backend_tls_verify_server_cert: true
     backend_tls_server_ca_cert_path: "{ca_p}"
@@ -783,6 +813,11 @@ proxies:
     dns_override: "127.0.0.1"
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -846,13 +881,18 @@ proxies:
     listen_path: "/api"
     backend_scheme: https
     backend_host: "localhost"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
     backend_tls_verify_server_cert: true
     pool_enable_http2: false
     dns_override: "127.0.0.1"
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -918,10 +958,15 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -986,10 +1031,15 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -1054,13 +1104,18 @@ async fn test_tcp_frontend_mtls_valid_client() {
 version: "1"
 proxies:
   - id: "t11"
-    listen_port: {pp}
+    listen_port: {pp: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     frontend_tls: true
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -1141,13 +1196,18 @@ async fn test_tcp_frontend_mtls_no_client_cert_rejected() {
 version: "1"
 proxies:
   - id: "t12"
-    listen_port: {pp}
+    listen_port: {pp: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     frontend_tls: true
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -1227,13 +1287,18 @@ proxies:
     listen_path: "/api"
     backend_scheme: https
     backend_host: "localhost"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
     backend_tls_verify_server_cert: true
     pool_enable_http2: false
     dns_override: "127.0.0.1"
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },

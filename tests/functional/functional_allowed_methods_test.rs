@@ -61,6 +61,11 @@ fn build_config(backend_port: u16, allowed_methods: &[&str]) -> String {
         .collect::<String>();
     format!(
         r#"version: "1"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 proxies:
   - id: "allowed-methods"
     listen_path: "/allowed"

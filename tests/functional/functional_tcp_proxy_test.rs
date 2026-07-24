@@ -449,13 +449,17 @@ async fn test_tcp_proxy_plain_bidirectional() {
 version: "1"
 proxies:
   - id: "tcp-echo"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
-
+    backend_port: {backend_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -525,14 +529,18 @@ async fn test_tcp_proxy_frontend_tls_termination() {
 version: "1"
 proxies:
   - id: "tcp-tls-frontend"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     frontend_tls: true
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -591,14 +599,18 @@ async fn test_tcp_proxy_backend_tls_origination() {
 version: "1"
 proxies:
   - id: "tcp-tls-backend"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: tcps
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     backend_tls_verify_server_cert: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -652,15 +664,19 @@ async fn test_tcp_proxy_full_tls() {
 version: "1"
 proxies:
   - id: "tcp-full-tls"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: tcps
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     frontend_tls: true
     backend_tls_verify_server_cert: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -720,14 +736,18 @@ async fn test_tcp_proxy_idle_timeout() {
 version: "1"
 proxies:
   - id: "tcp-idle-timeout"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     tcp_idle_timeout_seconds: 2
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -795,13 +815,17 @@ async fn test_tcp_proxy_global_idle_timeout_env() {
 version: "1"
 proxies:
   - id: "tcp-global-idle-timeout"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
-
+    backend_port: {backend_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -864,15 +888,19 @@ async fn test_tcp_proxy_backend_read_timeout() {
 version: "1"
 proxies:
   - id: "tcp-backend-read-timeout"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     backend_read_timeout_ms: 500
     tcp_idle_timeout_seconds: 30
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -926,13 +954,17 @@ async fn test_tcp_proxy_global_idle_timeout_env_fallback() {
 version: "1"
 proxies:
   - id: "tcp-global-idle-timeout"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
-
+    backend_port: {backend_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -1003,14 +1035,18 @@ async fn test_tcp_proxy_client_half_close_allows_delayed_backend_response() {
 version: "1"
 proxies:
   - id: "tcp-half-close"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     tcp_idle_timeout_seconds: 5
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -1069,13 +1105,17 @@ async fn test_tcp_proxy_active_connection_survives_config_reload() {
 version: "1"
 proxies:
   - id: "tcp-reload-active"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_a_port}
-
+    backend_port: {backend_a_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },
@@ -1094,13 +1134,17 @@ plugin_configs: []
 version: "1"
 proxies:
   - id: "tcp-reload-active"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_b_port}
-
+    backend_port: {backend_b_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     std::fs::write(dir.path().join("config.yaml"), updated).expect("rewrite config");
@@ -1165,14 +1209,18 @@ async fn test_tcp_proxy_backend_unreachable() {
 version: "1"
 proxies:
   - id: "tcp-unreachable"
-    listen_port: {proxy_port}
+    listen_port: {proxy_port: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
     backend_port: 19899
     backend_connect_timeout_ms: 1000
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
             )
         },

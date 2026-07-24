@@ -252,7 +252,7 @@ proxies:
     listen_path: "/fn"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "dedup-1"
@@ -260,9 +260,7 @@ proxies:
       - plugin_config_id: "response-transformer-1"
       - plugin_config_id: "tool-governor-1"
       - plugin_config_id: "response-guard-1"
-
 consumers: []
-
 plugin_configs:
   - id: "dedup-1"
     proxy_id: "serverless-proxy"
@@ -312,8 +310,12 @@ plugin_configs:
     config:
       pii_patterns: ["email"]
       action: "redact"
-
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 5
 "#
     );
 
@@ -619,13 +621,11 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "mirror-1"
-
 consumers: []
-
 plugin_configs:
   - id: "mirror-1"
     proxy_id: "mirror-proxy"
@@ -634,11 +634,15 @@ plugin_configs:
     enabled: true
     config:
       mirror_host: "127.0.0.1"
-      mirror_port: {mirror_port}
+      mirror_port: {mirror_port: ''}
       mirror_protocol: "http"
       percentage: 100.0
-
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 

@@ -1554,6 +1554,14 @@ pub async fn handle_admin_request(
                 &json!({"error": format!("Token verification failed: {}", msg)}),
             ));
         }
+        // `NotConfigured` is only returned by `create_jwt_manager_from_env`, never
+        // by request verification. Treat as an internal auth failure fail-closed.
+        Err(JwtError::NotConfigured) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Token verification failed: admin JWT is not configured"}),
+            ));
+        }
     };
 
     // API chargeback endpoint. Chargeback output contains customer/business data,

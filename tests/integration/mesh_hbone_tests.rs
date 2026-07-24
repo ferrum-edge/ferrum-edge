@@ -97,6 +97,7 @@ fn create_mesh_proxy_state_with_config(
         consumers,
         plugin_configs,
         upstreams: vec![],
+        expected_resource_counts: None,
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,

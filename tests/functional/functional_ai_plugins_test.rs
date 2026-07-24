@@ -187,7 +187,7 @@ proxies:
     listen_path: "/federation-isolation"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     pool_enable_http2: false
     upstream_id: "federation-isolation-upstream"
@@ -201,14 +201,13 @@ proxies:
     plugins:
       - plugin_config_id: "federation-content-type-transformer"
       - plugin_config_id: "federation-isolation-plugin"
-
 consumers: []
 upstreams:
   - id: "federation-isolation-upstream"
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: {backend_port}
+        port: {backend_port: ''}
         weight: 1
     health_checks:
       passive:
@@ -216,7 +215,6 @@ upstreams:
         unhealthy_threshold: 1
         unhealthy_window_seconds: 60
         healthy_after_seconds: 0
-
 plugin_configs:
   - id: "federation-content-type-transformer"
     proxy_id: "federation-isolation"
@@ -250,6 +248,11 @@ plugin_configs:
     enabled: true
     config:
       render_cache_ttl_seconds: 0
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 1
+  plugin_configs: 3
 "#
     );
 
@@ -372,13 +375,11 @@ proxies:
     listen_path: "/ai"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "shield-1"
-
 consumers: []
-
 plugin_configs:
   - id: "shield-1"
     proxy_id: "ai-proxy"
@@ -391,8 +392,12 @@ plugin_configs:
         - "ssn"
         - "credit_card"
         - "email"
-
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 
@@ -464,13 +469,11 @@ proxies:
     listen_path: "/ai"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "shield-1"
-
 consumers: []
-
 plugin_configs:
   - id: "shield-1"
     proxy_id: "ai-proxy"
@@ -483,8 +486,12 @@ plugin_configs:
         - "ssn"
         - "credit_card"
         - "email"
-
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 
@@ -549,13 +556,11 @@ proxies:
     listen_path: "/ai"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "guard-1"
-
 consumers: []
-
 plugin_configs:
   - id: "guard-1"
     proxy_id: "ai-proxy"
@@ -567,8 +572,12 @@ plugin_configs:
       enforce_max_tokens: "reject"
       allowed_models:
         - "gpt-4"
-
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 
@@ -637,13 +646,11 @@ proxies:
     listen_path: "/ai"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "guard-1"
-
 consumers: []
-
 plugin_configs:
   - id: "guard-1"
     proxy_id: "ai-proxy"
@@ -655,8 +662,12 @@ plugin_configs:
       enforce_max_tokens: "reject"
       allowed_models:
         - "gpt-4"
-
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 
@@ -730,13 +741,11 @@ proxies:
     listen_path: "/ai"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "guard-1"
-
 consumers: []
-
 plugin_configs:
   - id: "guard-1"
     proxy_id: "ai-proxy"
@@ -748,8 +757,12 @@ plugin_configs:
       enforce_max_tokens: "reject"
       allowed_models:
         - "gpt-4"
-
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 

@@ -182,39 +182,39 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_a}
+    backend_port: {port_a: ''}
     strip_listen_path: false
-
   - id: "prefix-admin"
     listen_path: "/admin"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_b}
+    backend_port: {port_b: ''}
     strip_listen_path: false
-
   - id: "regex-users"
     listen_path: "~/users/[^/]+"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_c}
+    backend_port: {port_c: ''}
     strip_listen_path: false
-
   - id: "regex-orders"
     listen_path: "~/orders/[0-9]+"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_d}
+    backend_port: {port_d: ''}
     strip_listen_path: false
-
   - id: "prefix-health"
     listen_path: "/health-check"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_e}
+    backend_port: {port_e: ''}
     strip_listen_path: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 5
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     std::fs::write(&config_path, config_content).expect("write config");
@@ -315,11 +315,15 @@ proxies:
     listen_path: "~/users/[^/]+"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_users}
+    backend_port: {port_users: ''}
     strip_listen_path: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     std::fs::write(&config_path, config_content).expect("write config");
@@ -385,11 +389,15 @@ proxies:
     listen_path: "~/api/v[0-9]+/.*"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_v}
+    backend_port: {port_v: ''}
     strip_listen_path: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     std::fs::write(&config_path, config_content).expect("write config");
@@ -458,18 +466,21 @@ proxies:
     listen_path: "~/thing/[^/]+"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_first}
+    backend_port: {port_first: ''}
     strip_listen_path: false
-
   - id: "regex-second-greedy"
     listen_path: "~/thing/.*"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_second}
+    backend_port: {port_second: ''}
     strip_listen_path: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     std::fs::write(&config_path, config_content).expect("write config");
@@ -529,18 +540,21 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_prefix}
+    backend_port: {port_prefix: ''}
     strip_listen_path: false
-
   - id: "regex-api-catchall"
     listen_path: "~/api/.*"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {port_regex}
+    backend_port: {port_regex: ''}
     strip_listen_path: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     std::fs::write(&config_path, config_content).expect("write config");

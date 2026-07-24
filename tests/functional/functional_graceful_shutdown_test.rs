@@ -213,11 +213,15 @@ proxies:
     listen_path: "/slow"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     let mut f = std::fs::File::create(&config_path).expect("create config");
@@ -702,13 +706,17 @@ fn write_tcp_stream_config(
 version: "1"
 proxies:
   - id: "tcp-echo"
-    listen_port: {tcp_listen_port}
+    listen_port: {tcp_listen_port: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {tcp_backend_port}
-
+    backend_port: {tcp_backend_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     let mut f = std::fs::File::create(&config_path).expect("create config");
@@ -730,13 +738,17 @@ fn write_udp_stream_config(
 version: "1"
 proxies:
   - id: "udp-echo"
-    listen_port: {udp_listen_port}
+    listen_port: {udp_listen_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {udp_backend_port}
-
+    backend_port: {udp_backend_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     let mut f = std::fs::File::create(&config_path).expect("create config");

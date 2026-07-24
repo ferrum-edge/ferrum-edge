@@ -176,6 +176,12 @@ fn test_shared_admin_file_and_snapshot_admission_reject_invalid_shapes() {
     let config_path = directory.path().join("grpc-web-bad.json");
     let file_config = json!({
         "version": "1",
+        "expected_resource_counts": {
+            "proxies": 1,
+            "consumers": 0,
+            "upstreams": 0,
+            "plugin_configs": 1
+        },
         "proxies": [{
             "id": "grpc",
             "listen_path": "/",

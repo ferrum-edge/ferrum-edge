@@ -18,12 +18,11 @@ proxies:
     listen_path: "/mock"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     pool_enable_http2: true
     plugins:
       - plugin_config_id: "mock-semantics-plugin"
-
 consumers: []
 plugin_configs:
   - id: "mock-semantics-plugin"
@@ -53,6 +52,11 @@ plugin_configs:
         - path: /not-modified
           status_code: 304
           body: "{FORBIDDEN_BODY}"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     )
 }

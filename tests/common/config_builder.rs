@@ -463,12 +463,23 @@ impl GatewayConfigBuilder {
         self
     }
 
-    /// Produce the `{version: "1", proxies: [...], consumers: [...],
-    /// upstreams: [...], plugin_configs: [...]}` JSON value suitable for
-    /// file-mode YAML.
+    /// Produce the `{version: "1", expected_resource_counts: {...}, proxies: [...],
+    /// consumers: [...], upstreams: [...], plugin_configs: [...]}` JSON value
+    /// suitable for file-mode YAML. Counts always match the built lists so a
+    /// legitimate delete must rebuild (and republish) the manifest atomically.
     pub fn build(self) -> Value {
+        let proxies_len = self.proxies.len();
+        let consumers_len = self.consumers.len();
+        let upstreams_len = self.upstreams.len();
+        let plugin_configs_len = self.plugin_configs.len();
         json!({
             "version": "1",
+            "expected_resource_counts": {
+                "proxies": proxies_len,
+                "consumers": consumers_len,
+                "upstreams": upstreams_len,
+                "plugin_configs": plugin_configs_len,
+            },
             "proxies": self.proxies,
             "consumers": self.consumers,
             "upstreams": self.upstreams,
@@ -612,6 +623,10 @@ mod tests {
             .plugin_config(PluginConfigBuilder::new("pc1", "cors").build())
             .build();
         assert_eq!(cfg["version"], "1");
+        assert_eq!(cfg["expected_resource_counts"]["proxies"], 1);
+        assert_eq!(cfg["expected_resource_counts"]["consumers"], 1);
+        assert_eq!(cfg["expected_resource_counts"]["upstreams"], 1);
+        assert_eq!(cfg["expected_resource_counts"]["plugin_configs"], 1);
         assert_eq!(cfg["proxies"].as_array().unwrap().len(), 1);
         assert_eq!(cfg["consumers"].as_array().unwrap().len(), 1);
         assert_eq!(cfg["upstreams"].as_array().unwrap().len(), 1);

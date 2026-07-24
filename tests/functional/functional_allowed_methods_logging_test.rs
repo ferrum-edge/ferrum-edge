@@ -133,6 +133,11 @@ fn build_logging_config(
         .collect::<String>();
     format!(
         r#"version: "1"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 3
 proxies:
   - id: "allowed-methods-logging"
     listen_path: "/allowed"

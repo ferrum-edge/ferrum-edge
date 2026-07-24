@@ -13,7 +13,6 @@ proxies:
     backend_write_timeout_ms: 30000
     auth_mode: single
     plugins: []
-
   - id: "tcp-health"
     name: "Health Check"
     listen_path: "/health"
@@ -27,6 +26,10 @@ proxies:
     backend_write_timeout_ms: 5000
     auth_mode: single
     plugins: []
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0

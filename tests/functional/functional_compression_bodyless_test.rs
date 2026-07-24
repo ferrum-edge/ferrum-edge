@@ -29,12 +29,11 @@ proxies:
     listen_path: "/cmp"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     pool_enable_http2: true
     plugins:
       - plugin_config_id: "compression-bodyless-plugin"
-
 consumers: []
 plugin_configs:
   - id: "compression-bodyless-plugin"
@@ -46,6 +45,11 @@ plugin_configs:
       algorithms: ["gzip", "br"]
       min_content_length: 256
       remove_accept_encoding: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     )
 }

@@ -296,9 +296,18 @@ fn write_ws_config_with_plugins(
     plugin_configs_yaml: &str,
     proxy_plugins_yaml: &str,
 ) {
+    let plugin_count = plugin_configs_yaml
+        .lines()
+        .filter(|line| line.starts_with("  - id:"))
+        .count();
     let config = format!(
         r#"
 version: "1"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: {plugin_count}
 proxies:
   - id: "ws-echo-proxy"
     listen_path: "/ws-echo"

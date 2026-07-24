@@ -23,7 +23,6 @@ proxies:
     backend_tls_verify_server_cert: false
     auth_mode: single
     plugins: []
-
   - id: "proxy-echo"
     name: "Echo API Proxy (E2E TLS)"
     listen_path: "/api/echo"
@@ -39,7 +38,11 @@ proxies:
     auth_mode: single
     pool_idle_timeout_seconds: 180
     plugins: []
-
 consumers: []
-
 plugin_configs: []
+version: "1"
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0

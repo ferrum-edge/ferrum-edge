@@ -134,7 +134,7 @@ The report withholds externally sourced values, not just the ones that appear in
 1. **Settings** (`ferrum.conf`) — all 300+ environment variables are parsed and validated (ports, paths, TLS configuration, pool sizes, etc.)
 2. **Env TLS/security surfaces** (mode-aware, side-effect-free) — the same loaders `run` treats as startup-fatal for the selected serving mode: TLS policy and CRLs, trusted admin CIDRs, metrics auth, configured frontend/admin TLS certificate pairs, DTLS certificate expiry, and admin JWT admission (`unset` is allowed only for file/mesh/node_agent random-secret fallback; a configured-but-invalid secret or TTL fails). No listeners, servers, or migrations are started.
 3. **Spec** (resources YAML/JSON, file mode only):
-   - YAML/JSON syntax and deserialization (bounded metadata/content stability checks reject torn non-atomic reads)
+   - YAML/JSON syntax and deserialization (bounded metadata/content stability checks reject torn non-atomic reads; `expected_resource_counts` must match resource-collection lengths so a stable truncated snapshot cannot drop trailing resources)
    - Field-level validation on all proxies, consumers, upstreams, and plugin configs
    - Regex `listen_path` compilation
    - Unique `listen_path` enforcement

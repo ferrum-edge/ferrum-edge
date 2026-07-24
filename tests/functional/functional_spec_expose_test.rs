@@ -106,7 +106,7 @@ proxies:
     listen_path: "/api/"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
     pool_enable_http2: false
     allowed_methods: [GET, HEAD]
@@ -114,11 +114,10 @@ proxies:
     listen_path: "/blocked/"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
     pool_enable_http2: false
     allowed_methods: [GET]
-
 consumers: []
 plugin_configs:
   - id: "spec-expose-global"
@@ -139,6 +138,11 @@ plugin_configs:
           target: body
           key: head_parity
           value: checked
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 2
 "#
     )
 }

@@ -313,12 +313,11 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "p-mtls"
       - plugin_config_id: "p-acl"
-
 consumers:
   - id: "alice"
     username: "alice"
@@ -330,7 +329,6 @@ consumers:
     credentials:
       mtls_auth:
         - identity: "eve.client.local"
-
 plugin_configs:
   - id: "p-mtls"
     proxy_id: "mtls-acl-http"
@@ -346,6 +344,11 @@ plugin_configs:
     enabled: true
     config:
       allowed_consumers: ["alice"]
+expected_resource_counts:
+  proxies: 1
+  consumers: 2
+  upstreams: 0
+  plugin_configs: 2
 "#
             )
         },
@@ -495,15 +498,14 @@ async fn test_tcp_mtls_auth_with_acl() {
 version: "1"
 proxies:
   - id: "mtls-acl-tcp"
-    listen_port: {pp}
+    listen_port: {pp: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     frontend_tls: true
     plugins:
       - plugin_config_id: "p-tcp-mtls"
       - plugin_config_id: "p-tcp-acl"
-
 consumers:
   - id: "tcp-alice"
     username: "tcp-alice"
@@ -515,7 +517,6 @@ consumers:
     credentials:
       mtls_auth:
         - identity: "tcp-eve"
-
 plugin_configs:
   - id: "p-tcp-mtls"
     proxy_id: "mtls-acl-tcp"
@@ -531,6 +532,11 @@ plugin_configs:
     enabled: true
     config:
       allowed_consumers: ["tcp-alice"]
+expected_resource_counts:
+  proxies: 1
+  consumers: 2
+  upstreams: 0
+  plugin_configs: 2
 "#
             )
         },
@@ -676,15 +682,14 @@ async fn test_udp_dtls_mtls_auth_with_acl() {
 version: "1"
 proxies:
   - id: "mtls-acl-dtls"
-    listen_port: {pp}
+    listen_port: {pp: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     frontend_tls: true
     plugins:
       - plugin_config_id: "p-dtls-mtls"
       - plugin_config_id: "p-dtls-acl"
-
 consumers:
   - id: "dtls-alice"
     username: "dtls-alice"
@@ -696,7 +701,6 @@ consumers:
     credentials:
       mtls_auth:
         - identity: "dtls-eve"
-
 plugin_configs:
   - id: "p-dtls-mtls"
     proxy_id: "mtls-acl-dtls"
@@ -712,6 +716,11 @@ plugin_configs:
     enabled: true
     config:
       allowed_consumers: ["dtls-alice"]
+expected_resource_counts:
+  proxies: 1
+  consumers: 2
+  upstreams: 0
+  plugin_configs: 2
 "#
             )
         },

@@ -292,21 +292,18 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: true
-
   - id: "grpc-nostrip-proxy"
     listen_path: "/grpc-full"
     backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: false
-
   - id: "grpc-unavailable-proxy"
     listen_path: "/grpc-down"
     backend_scheme: http
     backend_host: "127.0.0.1"
     backend_port: 19999
     strip_listen_path: true
-
 consumers: []
 plugin_configs:
   - id: "grpc-security-policy"
@@ -319,6 +316,11 @@ plugin_configs:
         Grpc-Status: "0"
         Grpc-Message: "policy override"
       remove: []
+expected_resource_counts:
+  proxies: 3
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port, backend_port
     );
@@ -343,14 +345,12 @@ proxies:
     auth_mode: single
     plugins:
       - plugin_config_id: "plugin-keyauth-grpc"
-
 consumers:
   - id: "consumer-grpc-service"
     username: "grpc-test-service"
     credentials:
       keyauth:
         - key: "grpc-valid-api-key-99887766"
-
 plugin_configs:
   - id: "plugin-keyauth-grpc"
     plugin_name: "key_auth"
@@ -359,6 +359,11 @@ plugin_configs:
     scope: proxy
     proxy_id: "grpc-secured-proxy"
     enabled: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 1
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port
     );
@@ -382,7 +387,6 @@ proxies:
     strip_listen_path: true
     allowed_methods:
       - "GET"
-
 consumers: []
 plugin_configs:
   - id: "grpc-method-filter-security"
@@ -398,6 +402,11 @@ plugin_configs:
         Grpc-Status: "0"
         Grpc-Message: "policy override"
       remove: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port
     );
@@ -418,7 +427,6 @@ proxies:
     backend_host: "127.0.0.1"
     backend_port: {}
     strip_listen_path: true
-
 consumers: []
 plugin_configs:
   - id: "grpc-terminal-remove-security"
@@ -431,6 +439,11 @@ plugin_configs:
       remove:
         - Grpc-Status
         - Grpc-Message
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port
     );

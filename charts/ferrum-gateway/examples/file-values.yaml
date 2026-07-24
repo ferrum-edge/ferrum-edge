@@ -23,6 +23,11 @@ file:
         plugins: []
     consumers: []
     plugin_configs: []
+    expected_resource_counts:
+      proxies: 1
+      consumers: 0
+      upstreams: 0
+      plugin_configs: 0
 
 service:
   type: LoadBalancer

@@ -115,13 +115,11 @@ proxies:
     listen_path: "/sse"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "sse-1"
-
 consumers: []
-
 plugin_configs:
   - id: "sse-1"
     proxy_id: "sse-proxy"
@@ -131,6 +129,11 @@ plugin_configs:
     config:
       require_accept_header: true
       require_get_method: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
 

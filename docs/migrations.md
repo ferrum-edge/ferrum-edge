@@ -280,6 +280,11 @@ Configuration files (YAML or JSON) require a `version` field:
 
 ```yaml
 version: "1"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 proxies:
   - id: "proxy-1"
     # ...
@@ -287,7 +292,7 @@ consumers: []
 plugin_configs: []
 ```
 
-When the `version` field is absent, validation fails before migrations run. New configs should declare the current schema explicitly.
+When the `version` field is absent, validation fails before migrations run. New configs should declare the current schema explicitly. File-mode loads also require `expected_resource_counts` matching the resource-collection lengths; a persisted `FERRUM_MIGRATE_ACTION=config` write stamps matching counts from the migrated collections so the rewritten file remains loadable.
 
 ### How Config Migrations Work
 

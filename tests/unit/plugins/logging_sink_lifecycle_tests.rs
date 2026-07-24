@@ -254,6 +254,12 @@ fn malformed_sink_cases() -> Vec<(&'static str, Value, &'static str)> {
 fn write_file_mode_spec(path: &std::path::Path, plugin_name: &str, config: &Value) {
     let spec = json!({
         "version": "1",
+        "expected_resource_counts": {
+            "proxies": 1,
+            "consumers": 0,
+            "upstreams": 0,
+            "plugin_configs": 1
+        },
         "proxies": [{
             "id": "http",
             "listen_path": "/",

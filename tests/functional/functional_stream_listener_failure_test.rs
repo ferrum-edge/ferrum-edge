@@ -640,13 +640,17 @@ async fn functional_stream_listener_reload_remove_and_add() {
 version: "1"
 proxies:
   - id: "stream-a"
-    listen_port: {stream_port_a}
+    listen_port: {stream_port_a: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_a_port}
-
+    backend_port: {backend_a_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         );
         let mut f = std::fs::File::create(&config_path).unwrap();
@@ -715,13 +719,17 @@ plugin_configs: []
 version: "1"
 proxies:
   - id: "stream-b"
-    listen_port: {stream_port_b}
+    listen_port: {stream_port_b: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_b_port}
-
+    backend_port: {backend_b_port: ''}
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     let mut f = std::fs::File::create(&config_path).unwrap();

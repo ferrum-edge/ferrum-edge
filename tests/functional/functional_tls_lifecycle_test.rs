@@ -608,7 +608,7 @@ proxies:
     listen_path: "/api"
     backend_scheme: https
     backend_host: "localhost"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
     backend_tls_verify_server_cert: true
     backend_tls_server_ca_cert_path: "{ca_path}"
@@ -617,6 +617,11 @@ proxies:
 consumers: []
 upstreams: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         );
         std::fs::write(&cfg_path, &config_yaml).unwrap();
@@ -709,7 +714,7 @@ proxies:
     listen_path: "/api"
     backend_scheme: https
     backend_host: "localhost"
-    backend_port: {bp}
+    backend_port: {bp: ''}
     strip_listen_path: true
     backend_tls_verify_server_cert: true
     backend_tls_server_ca_cert_path: "{ca_path}"
@@ -718,6 +723,11 @@ proxies:
 consumers: []
 upstreams: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         );
         std::fs::write(&cfg_path, &config_yaml).unwrap();

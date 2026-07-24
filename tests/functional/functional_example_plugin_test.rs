@@ -120,7 +120,7 @@ proxies:
     listen_path: "/global-example"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
     pool_enable_http2: false
     allowed_methods: ["GET"]
@@ -128,7 +128,7 @@ proxies:
     listen_path: "/scoped-example"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
     pool_enable_http2: false
     allowed_methods: ["GET"]
@@ -149,6 +149,11 @@ plugin_configs:
     enabled: true
     config:
       header_value: "scoped-value"
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 2
 "#
     )
 }

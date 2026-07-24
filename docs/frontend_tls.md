@@ -467,6 +467,11 @@ For per-proxy CA restrictions, use the `mtls_auth` plugin's `allowed_issuers` an
 
 ```yaml
 version: "1"
+expected_resource_counts:
+  proxies: 2
+  consumers: 2
+  upstreams: 0
+  plugin_configs: 2
 proxies:
   - id: "proxy-a"
     listen_path: "/internal/"

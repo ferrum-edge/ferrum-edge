@@ -231,6 +231,11 @@ proxies:
     backend_port: 3000
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#,
     )
     .unwrap();
@@ -1801,10 +1806,15 @@ proxies:
     listen_path: "/sp"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
+    backend_port: {echo_port: ''}
     strip_listen_path: true
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         );
         std::fs::write(temp_dir.path().join("resources.yaml"), spec).unwrap();
@@ -1909,10 +1919,15 @@ proxies:
     listen_path: "/si"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
+    backend_port: {echo_port: ''}
     strip_listen_path: true
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         );
         std::fs::write(&spec_path, spec).unwrap();
@@ -2015,10 +2030,15 @@ proxies:
     listen_path: "/fw"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {echo_port}
+    backend_port: {echo_port: ''}
     strip_listen_path: true
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         );
         std::fs::write(&spec_path, spec).unwrap();

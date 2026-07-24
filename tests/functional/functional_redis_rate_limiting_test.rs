@@ -1237,13 +1237,11 @@ proxies:
     listen_path: "/shared-ai"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "shared-ai-plugin"
-
 consumers: []
-
 plugin_configs:
   - id: "shared-ai-plugin"
     plugin_name: "ai_rate_limiter"
@@ -1257,6 +1255,11 @@ plugin_configs:
       sync_mode: "redis"
       redis_url: "{REDIS_URL}"
       redis_key_prefix: "{prefix}"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         )
     };
@@ -1627,13 +1630,11 @@ proxies:
     listen_path: "/ws-redis"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "ws-redis-rl"
-
 consumers: []
-
 plugin_configs:
   - id: "ws-redis-rl"
     plugin_name: "ws_rate_limiting"
@@ -1646,6 +1647,11 @@ plugin_configs:
       sync_mode: "redis"
       redis_url: "{REDIS_URL}"
       redis_key_prefix: "{unique_prefix}"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
     );
     let mut gateway = spawn_file_gateway(
@@ -1758,13 +1764,11 @@ proxies:
     listen_path: "/ws-shared"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "ws-shared-redis-rl"
-
 consumers: []
-
 plugin_configs:
   - id: "ws-shared-redis-rl"
     plugin_name: "ws_rate_limiting"
@@ -1777,6 +1781,11 @@ plugin_configs:
       sync_mode: "redis"
       redis_url: "{REDIS_URL}"
       redis_key_prefix: "{prefix}"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         )
     };
@@ -1872,13 +1881,11 @@ proxies:
     listen_path: "/shared-rl"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "shared-rl-plugin"
-
 consumers: []
-
 plugin_configs:
   - id: "shared-rl-plugin"
     plugin_name: "rate_limiting"
@@ -1894,6 +1901,11 @@ plugin_configs:
       sync_mode: "redis"
       redis_url: "{REDIS_URL}"
       redis_key_prefix: "{prefix}"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         )
     };
@@ -2054,7 +2066,7 @@ proxies:
     listen_path: "/shared-dedup"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "shared-dedup-plugin"
@@ -2062,14 +2074,12 @@ proxies:
     listen_path: "/terminal-dedup"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "terminal-dedup-plugin"
       - plugin_config_id: "terminal-serverless-plugin"
-
 consumers: []
-
 plugin_configs:
   - id: "global-ai-audit"
     plugin_name: "ai_transcript_audit"
@@ -2126,6 +2136,11 @@ plugin_configs:
       mode: "terminate"
       function_url: "http://127.0.0.1:{function_port}/invoke"
       max_response_body_bytes: 1048576
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 4
 "#,
         )
     };
@@ -2391,9 +2406,7 @@ proxies:
     plugins:
       - plugin_config_id: "dedup"
       - plugin_config_id: "empty-successes"
-
 consumers: []
-
 plugin_configs:
   - id: "dedup"
     namespace: "{namespace}"
@@ -2422,6 +2435,11 @@ plugin_configs:
         - method: POST
           path: /no-content
           status_code: 204
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 2
 "#
     );
 
@@ -2513,14 +2531,12 @@ proxies:
     listen_path: "/orders"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "dedup-short"
       - plugin_config_id: "dedup-long"
-
 consumers: []
-
 plugin_configs:
   - id: "dedup-short"
     namespace: "{namespace}"
@@ -2548,6 +2564,11 @@ plugin_configs:
       inflight_ttl_seconds: 10
       scope_by_consumer: false
       applicable_methods: ["POST"]
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 2
 "#
     );
 
@@ -2679,14 +2700,12 @@ proxies:
     listen_path: "/orders"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "dedup-a"
       - plugin_config_id: "dedup-b"
-
 consumers: []
-
 plugin_configs:
   - id: "dedup-a"
     plugin_name: "request_deduplication"
@@ -2716,6 +2735,11 @@ plugin_configs:
       inflight_ttl_seconds: 30
       scope_by_consumer: false
       applicable_methods: ["POST"]
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 2
 "#
     );
 
@@ -2856,13 +2880,11 @@ proxies:
     listen_path: "/ns-iso"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "ns-iso-rl"
-
 consumers: []
-
 plugin_configs:
   - id: "ns-iso-rl"
     namespace: "{namespace}"
@@ -2878,6 +2900,11 @@ plugin_configs:
           max_requests: 2
       sync_mode: "redis"
       redis_url: "{REDIS_URL}"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
         )
     };

@@ -128,14 +128,12 @@ proxies:
     listen_path: "/v1/chat/completions"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {provider_port}
+    backend_port: {provider_port: ''}
     strip_listen_path: false
     pool_enable_http2: false
     plugins:
       - plugin_config_id: "asr"
-
 consumers: []
-
 plugin_configs:
   - id: "asr"
     proxy_id: "stream-router"
@@ -152,6 +150,11 @@ plugin_configs:
           model_patterns: ["claude-*"]
           allow_plaintext: true
           priority: 1
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     );
     let mut file = std::fs::File::create(&path).unwrap();

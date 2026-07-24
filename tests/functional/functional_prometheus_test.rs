@@ -56,12 +56,10 @@ proxies:
     listen_path: "/test"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
-
 consumers: []
 upstreams: []
-
 plugin_configs:
   - id: "prom-1"
     plugin_name: "prometheus_metrics"
@@ -69,6 +67,11 @@ plugin_configs:
     enabled: true
     config:
       render_cache_ttl_seconds: 0
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port = backend.port,
     );
@@ -149,12 +152,10 @@ proxies:
     listen_path: "/traffic"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
-
 consumers: []
 upstreams: []
-
 plugin_configs:
   - id: "prom-traffic"
     plugin_name: "prometheus_metrics"
@@ -162,6 +163,11 @@ plugin_configs:
     enabled: true
     config:
       render_cache_ttl_seconds: 0
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port = backend.port,
     );
@@ -269,14 +275,12 @@ proxies:
     listen_path: "/ai-metrics"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "ai-usage"
-
 consumers: []
 upstreams: []
-
 plugin_configs:
   - id: "ai-usage"
     proxy_id: "ai-metrics-proxy"
@@ -294,6 +298,11 @@ plugin_configs:
     enabled: true
     config:
       render_cache_ttl_seconds: 0
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 2
 "#
     );
 

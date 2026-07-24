@@ -195,11 +195,16 @@ fn tcp_proxy_config(
 version: "1"
 proxies:
   - id: "{proxy_id}"
-    listen_port: {stream_port}
+    listen_port: {stream_port: ''}
     backend_scheme: tcp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
-    tcp_idle_timeout_seconds: {tcp_idle_timeout_seconds}
+    backend_port: {backend_port: ''}
+    tcp_idle_timeout_seconds: {tcp_idle_timeout_seconds: ''}
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
     if backend_read_timeout_ms > 0 {

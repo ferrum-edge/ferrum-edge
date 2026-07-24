@@ -762,6 +762,12 @@ fn rejected_config_generation_releases_mmdb_handoff() {
     let config_path = directory.path().join("rejected.json");
     let config = json!({
         "version": "1",
+        "expected_resource_counts": {
+            "proxies": 1,
+            "consumers": 0,
+            "upstreams": 0,
+            "plugin_configs": 1
+        },
         "proxies": [{
             "id": "invalid-stream",
             "backend_scheme": "tcp",
@@ -807,6 +813,12 @@ async fn accepted_generation_hands_every_distinct_mmdb_path_to_cache_build() {
     let config_path = directory.path().join("accepted.json");
     let config = json!({
         "version": "1",
+        "expected_resource_counts": {
+            "proxies": 1,
+            "consumers": 0,
+            "upstreams": 0,
+            "plugin_configs": 2
+        },
         "proxies": [{
             "id": "http",
             "listen_path": "/",

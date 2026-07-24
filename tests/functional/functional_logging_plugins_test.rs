@@ -80,13 +80,11 @@ proxies:
     listen_path: "/tcp-log-test"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "tcp-log-plugin-1"
-
 consumers: []
-
 plugin_configs:
   - id: "tcp-log-plugin-1"
     proxy_id: "tcp-log-proxy"
@@ -95,12 +93,16 @@ plugin_configs:
     enabled: true
     config:
       host: "127.0.0.1"
-      port: {tcp_log_port}
+      port: {tcp_log_port: ''}
       tls: false
       batch_size: 1
       flush_interval_ms: 500
-
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port = backend.port,
     );
@@ -154,13 +156,11 @@ proxies:
     listen_path: "/udp-log-test"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "udp-log-plugin-1"
-
 consumers: []
-
 plugin_configs:
   - id: "udp-log-plugin-1"
     proxy_id: "udp-log-proxy"
@@ -169,11 +169,15 @@ plugin_configs:
     enabled: true
     config:
       host: "127.0.0.1"
-      port: {udp_log_port}
+      port: {udp_log_port: ''}
       batch_size: 1
       flush_interval_ms: 500
-
 upstreams: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#,
         backend_port = backend.port,
     );

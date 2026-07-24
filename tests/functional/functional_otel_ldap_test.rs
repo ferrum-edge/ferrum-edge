@@ -283,13 +283,11 @@ proxies:
     listen_path: "/traced"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "otel-1"
-
 consumers: []
-
 plugin_configs:
   - id: "otel-1"
     proxy_id: "traced-proxy"
@@ -298,6 +296,11 @@ plugin_configs:
     enabled: true
     config:
       service_name: "test-gateway"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#;
 
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
@@ -375,13 +378,11 @@ proxies:
     listen_path: "/traced"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "otel-1"
-
 consumers: []
-
 plugin_configs:
   - id: "otel-1"
     proxy_id: "traced-proxy"
@@ -391,6 +392,11 @@ plugin_configs:
     config:
       service_name: "test-gateway"
       trace_context_trust: trusted
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#;
 
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
@@ -622,13 +628,11 @@ proxies:
     listen_path: "/secure"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "ldap-1"
-
 consumers: []
-
 plugin_configs:
   - id: "ldap-1"
     proxy_id: "auth-proxy"
@@ -638,6 +642,11 @@ plugin_configs:
     config:
       ldap_url: "ldap://127.0.0.1:{ldap_port}"
       bind_dn_template: "uid={{username}},ou=users,dc=example,dc=com"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#;
 
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
@@ -696,13 +705,11 @@ proxies:
     listen_path: "/secure"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "ldap-1"
-
 consumers: []
-
 plugin_configs:
   - id: "ldap-1"
     proxy_id: "auth-proxy"
@@ -712,6 +719,11 @@ plugin_configs:
     config:
       ldap_url: "ldap://127.0.0.1:{ldap_port}"
       bind_dn_template: "uid={{username}},ou=users,dc=example,dc=com"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#;
 
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =
@@ -765,13 +777,11 @@ proxies:
     listen_path: "/secure"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "ldap-1"
-
 consumers: []
-
 plugin_configs:
   - id: "ldap-1"
     proxy_id: "auth-proxy"
@@ -783,6 +793,11 @@ plugin_configs:
       bind_dn_template: "uid={{username}},ou=users,dc=example,dc=com"
       allow_plaintext: true
       connect_timeout_seconds: 1
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#;
 
     let (mut gateway_process, echo_handle, proxy_port, _admin_port, _temp_dir) =

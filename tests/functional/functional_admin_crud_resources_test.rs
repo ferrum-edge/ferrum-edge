@@ -1757,20 +1757,18 @@ upstreams:
     algorithm: round_robin
     targets:
       - host: "127.0.0.1"
-        port: {backend_port}
+        port: {backend_port: ''}
         weight: 1
-
 proxies:
   - id: "file-crud-proxy"
     listen_path: "/file-crud"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     upstream_id: "file-crud-upstream"
     plugins:
       - plugin_config_id: "file-crud-key-auth"
-
 consumers:
   - id: "file-crud-consumer"
     username: "file-crud-user"
@@ -1778,7 +1776,6 @@ consumers:
     credentials:
       keyauth:
         - key: "{key}"
-
 plugin_configs:
   - id: "file-crud-key-auth"
     plugin_name: "key_auth"
@@ -1787,6 +1784,11 @@ plugin_configs:
     enabled: true
     config:
       key_location: "header:X-Api-Key"
+expected_resource_counts:
+  proxies: 1
+  consumers: 1
+  upstreams: 1
+  plugin_configs: 1
 "#,
     )
 }
@@ -1798,6 +1800,11 @@ proxies: []
 consumers: []
 upstreams: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 0
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
 }
 

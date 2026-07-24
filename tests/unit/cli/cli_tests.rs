@@ -432,7 +432,15 @@ fn write_non_file_conf(path: &Path, mode: &str) {
 fn write_empty_resources(path: &Path) {
     std::fs::write(
         path,
-        "version: \"1\"\nproxies: []\nconsumers: []\nplugin_configs: []\n",
+        "version: \"1\"\n\
+         expected_resource_counts:\n\
+           proxies: 0\n\
+           consumers: 0\n\
+           upstreams: 0\n\
+           plugin_configs: 0\n\
+         proxies: []\n\
+         consumers: []\n\
+         plugin_configs: []\n",
     )
     .unwrap();
 }

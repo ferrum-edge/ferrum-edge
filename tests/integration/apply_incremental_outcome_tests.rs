@@ -403,7 +403,7 @@ async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() 
     let original_bytes = country_mmdb_bytes();
     std::fs::write(&mmdb_path, &original_bytes).unwrap();
 
-    let config = GatewayConfig {
+    let mut config = GatewayConfig {
         version: ferrum_edge::config::types::CURRENT_CONFIG_VERSION.to_string(),
         proxies: vec![test_proxy("geo-proxy", "/geo")],
         plugin_configs: vec![
@@ -429,6 +429,9 @@ async fn update_config_applies_accepted_mmdb_only_reload_without_config_delta() 
         loaded_at: Utc::now(),
         ..GatewayConfig::default()
     };
+    config.expected_resource_counts = Some(
+        ferrum_edge::config::types::ExpectedResourceCounts::from_gateway_config(&config),
+    );
     std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
     let load = || {
         load_config_from_file(

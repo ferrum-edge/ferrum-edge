@@ -632,6 +632,7 @@ fn config_with_upstreams(upstreams: Vec<Upstream>) -> GatewayConfig {
         consumers: Vec::new(),
         plugin_configs: Vec::new(),
         upstreams,
+        expected_resource_counts: None,
         loaded_at: Utc::now(),
         known_namespaces: Vec::new(),
         frontend_tls_cert_path: None,

@@ -85,11 +85,15 @@ proxies:
     listen_path: "/api"
     backend_scheme: http
     backend_host: "localhost"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
 
@@ -138,16 +142,19 @@ proxies:
     backend_host: "this-host-does-not-exist-k5k5k5k5k5.invalid"
     backend_port: 80
     strip_listen_path: false
-
   - id: "good-proxy"
     listen_path: "/good"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {good_port}
+    backend_port: {good_port: ''}
     strip_listen_path: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
 
@@ -210,12 +217,16 @@ proxies:
     listen_path: "/ttl"
     backend_scheme: http
     backend_host: "localhost"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     dns_cache_ttl_seconds: 5
     strip_listen_path: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
 
@@ -266,11 +277,15 @@ proxies:
     listen_path: "/env"
     backend_scheme: http
     backend_host: "localhost"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: false
-
 consumers: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
     );
 

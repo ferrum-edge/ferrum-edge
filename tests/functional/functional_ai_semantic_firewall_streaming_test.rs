@@ -362,13 +362,11 @@ proxies:
     listen_path: "/ai"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     plugins:
       - plugin_config_id: "asf-1"
-
 consumers: []
-
 plugin_configs:
   - id: "asf-1"
     proxy_id: "asf-proxy"
@@ -394,6 +392,11 @@ plugin_configs:
         indirect_prompt_injection: false
         tool_abuse: false
         response_leakage: true
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     )
 }

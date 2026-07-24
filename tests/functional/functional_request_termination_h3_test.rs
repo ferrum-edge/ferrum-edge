@@ -16,12 +16,11 @@ proxies:
     listen_path: "/term"
     backend_scheme: http
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     strip_listen_path: true
     pool_enable_http2: false
     plugins:
       - plugin_config_id: "h3-termination-plugin"
-
 consumers: []
 plugin_configs:
   - id: "h3-termination-plugin"
@@ -33,6 +32,11 @@ plugin_configs:
       status_code: 503
       content_type: application/json
       message: "h3 maintenance window"
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 1
 "#
     )
 }

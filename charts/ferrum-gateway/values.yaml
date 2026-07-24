@@ -207,12 +207,18 @@ file:
   # GatewayConfig deserialization (src/config/types.rs, deny_unknown_fields)
   # requires version, proxies, consumers, and plugin_configs with no serde
   # defaults, so all four top-level lists must be present or the file-mode pod
-  # fails to boot.
+  # fails to boot. File mode also requires expected_resource_counts matching
+  # those list lengths (truncation integrity).
   inlineConfig: |
     version: "1"
     proxies: []
     consumers: []
     plugin_configs: []
+    expected_resource_counts:
+      proxies: 0
+      consumers: 0
+      upstreams: 0
+      plugin_configs: 0
   # Reference an out-of-band ConfigMap instead of inlineConfig.
   existingConfigMap: ""
 

@@ -316,15 +316,19 @@ async fn udp_session_idle_timeout_cleans_session_map() {
 version: "1"
 proxies:
   - id: "udp-idle"
-    listen_port: {listen_port}
+    listen_port: {listen_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     udp_idle_timeout_seconds: 2
-
 consumers: []
 upstreams: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         )
     };
@@ -452,16 +456,20 @@ async fn udp_amplification_bound_enforced() {
 version: "1"
 proxies:
   - id: "udp-amp"
-    listen_port: {listen_port}
+    listen_port: {listen_port: ''}
     backend_scheme: udp
     backend_host: "127.0.0.1"
-    backend_port: {backend_port}
+    backend_port: {backend_port: ''}
     udp_max_response_amplification_factor: 1
     udp_idle_timeout_seconds: 30
-
 consumers: []
 upstreams: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 1
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         )
     };
@@ -569,25 +577,29 @@ async fn dtls_passthrough_sni_routes_to_correct_backend() {
 version: "1"
 proxies:
   - id: "dtls-a"
-    listen_port: {listen_port}
+    listen_port: {listen_port: ''}
     backend_scheme: dtls
     backend_host: "127.0.0.1"
-    backend_port: {backend_a_port}
+    backend_port: {backend_a_port: ''}
     hosts:
       - "backend-a.test"
     passthrough: true
   - id: "dtls-b"
-    listen_port: {listen_port}
+    listen_port: {listen_port: ''}
     backend_scheme: dtls
     backend_host: "127.0.0.1"
-    backend_port: {backend_b_port}
+    backend_port: {backend_b_port: ''}
     hosts:
       - "backend-b.test"
     passthrough: true
-
 consumers: []
 upstreams: []
 plugin_configs: []
+expected_resource_counts:
+  proxies: 2
+  consumers: 0
+  upstreams: 0
+  plugin_configs: 0
 "#
         )
     };
