@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use ferrum_edge::_test_support::{
-    finalize_plugin_rejection_for_test, request_deduplication_completed_size_snapshot_for_test,
+    finalize_plugin_rejection_for_test, finalize_plugin_rejection_without_committed_hooks_for_test,
+    request_deduplication_completed_size_snapshot_for_test,
     request_deduplication_expire_completed_entries_for_test,
     request_deduplication_expire_inflight_entries_for_test,
     request_deduplication_logical_keys_from_context_for_test,
@@ -1097,6 +1098,72 @@ async fn empty_synthetic_200_releases_dedup_inflight_via_finalized_signal() {
 #[tokio::test]
 async fn synthetic_204_releases_dedup_inflight_via_finalized_signal() {
     finalize_empty_synthetic_and_assert_second_request_continues(204, "empty-204-key").await;
+}
+
+#[tokio::test]
+async fn h3_deferred_committed_hooks_keep_finalized_signal_for_empty_synthetic_success() {
+    let dedup = Arc::new(make_plugin(json!({})));
+    let plugins: Vec<Arc<dyn Plugin>> = vec![Arc::clone(&dedup) as Arc<dyn Plugin>];
+
+    let mut ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut headers = HashMap::new();
+    headers.insert(
+        "idempotency-key".to_string(),
+        "h3-empty-204-key".to_string(),
+    );
+    assert!(matches!(
+        dedup.before_proxy(&mut ctx, &mut headers).await,
+        PluginResult::Continue
+    ));
+
+    let finalized = finalize_plugin_rejection_without_committed_hooks_for_test(
+        &plugins,
+        &mut ctx,
+        PluginResult::Reject {
+            status_code: 204,
+            body: String::new(),
+            headers: HashMap::new(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        finalized,
+        PluginResult::RejectBinary {
+            status_code: 204,
+            ..
+        }
+    ));
+    assert!(
+        ctx.metadata
+            .contains_key(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY),
+        "H3 finalizer mode must preserve the marker for its later committed-hook phase"
+    );
+
+    dedup
+        .on_response_committed(&mut ctx, 204, &HashMap::new(), &[])
+        .await;
+    ctx.metadata
+        .remove(FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
+
+    let mut retry_ctx = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/orders".to_string(),
+    );
+    let mut retry_headers = HashMap::new();
+    retry_headers.insert(
+        "idempotency-key".to_string(),
+        "h3-empty-204-key".to_string(),
+    );
+    let retry = dedup.before_proxy(&mut retry_ctx, &mut retry_headers).await;
+    assert!(
+        matches!(retry, PluginResult::Continue),
+        "later H3 committed hook must release in-flight ownership; got {retry:?}"
+    );
 }
 
 #[tokio::test]

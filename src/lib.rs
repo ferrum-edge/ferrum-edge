@@ -636,6 +636,33 @@ pub mod _test_support {
         crate::plugins::request_deduplication::logical_keys_from_request_context_for_test(ctx)
     }
 
+    pub async fn finalize_plugin_rejection_without_committed_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        rejection: crate::plugins::PluginResult,
+    ) -> crate::plugins::PluginResult {
+        let Some(parts) = crate::proxy::plugin_result_into_reject_parts(rejection) else {
+            return crate::plugins::PluginResult::Continue;
+        };
+        let mut status = parts.status_code;
+        let mut headers = parts.headers;
+        let mut body = parts.body;
+        crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
+            plugins,
+            ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            false,
+            false,
+        )
+        .await;
+        crate::plugins::PluginResult::RejectBinary {
+            status_code: status,
+            body: bytes::Bytes::from(body),
+            headers,
+        }
+    }
     pub async fn finalize_plugin_rejection_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
