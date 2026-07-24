@@ -139,6 +139,11 @@ pub const HARD_MAX_TOOL_NAMES_BYTES: usize = 8_192;
 /// Default / hard maximum age for staging entries, including active streams with
 /// reserved commit permits.
 pub const HARD_MAX_STAGING_RESERVATION_SECS: u64 = 60 * 60;
+/// Independent hard ceiling for JSON `Value` parse / redaction / model-tool tree
+/// work. Export caps (`max_*_bytes`) may be lower; bodies above this bound never
+/// force a full `serde_json` tree merely to omit an excerpt. Keyed HMAC still
+/// covers the raw bytes.
+pub const HARD_MAX_BODY_PROCESSING_BYTES: usize = HARD_MAX_CAPTURE_BYTES;
 /// Domain separator mixed into capped stream HMACs so partial digests cannot be
 /// confused with full-stream digests.
 const PARTIAL_STREAM_HASH_DOMAIN: &[u8] = b"\0ferrum.ai_transcript_audit.partial_stream_hash/v1\0";
@@ -172,17 +177,21 @@ pub const AI_TRANSCRIPT_AUDIT_SINK_KEYS: &[&str] = &[
     "on_sink_error",
 ];
 
-/// Above this many staged entries, opportunistically drop expired orphans (a
-/// request that never reached the `log` hook). The common path removes staging
-/// at emit/log time, so this only guards pathological cases.
+/// Above this many staged entries, the hot path may opportunistically expire
+/// orphans between background ticks. Background TTL cleanup always runs even
+/// below this threshold and does not depend on request traffic.
 const STAGING_SWEEP_THRESHOLD: usize = 512;
 /// Hard bound for in-flight request excerpts and permits. At the default
 /// fail-open policy, excess candidates are omitted; fail-closed policies reject
 /// instead of forwarding a transaction that cannot be staged.
 const MAX_STAGING_ENTRIES: usize = 4096;
-/// Amortize orphan cleanup so request admission never repeats a full shared-map
+/// Amortize hot-path orphan cleanup so admission never repeats a full shared-map
 /// scan for every request while the live set remains above the threshold.
 const STAGING_SWEEP_INTERVAL_SECS: u64 = 60;
+/// Background TTL sweep cadence upper bound. Actual interval is
+/// `min(STAGING_SWEEP_INTERVAL_SECS, max(1, staging_ttl_secs))` so short
+/// reservation ages still expire without waiting a full minute.
+const STAGING_TTL_BACKGROUND_SWEEP_MAX_SECS: u64 = STAGING_SWEEP_INTERVAL_SECS;
 
 // Metadata keys written into `ctx.metadata` (small strings only — never bodies).
 // These flow into the transaction log via the summary metadata.
@@ -488,6 +497,23 @@ impl RecordsPerMinute {
         }
     }
 
+    /// Peek whether the current window still has capacity. Does not charge.
+    fn is_available(&self) -> bool {
+        if self.max_per_minute == 0 {
+            return true;
+        }
+        let mut guard = match self.window.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Instant::now();
+        if now.duration_since(guard.0) >= Duration::from_secs(60) {
+            guard.0 = now;
+            guard.1 = 0;
+        }
+        guard.1 < self.max_per_minute
+    }
+
     fn try_acquire(&self) -> bool {
         if self.max_per_minute == 0 {
             return true;
@@ -547,10 +573,16 @@ pub struct AiTranscriptAudit {
     /// `true` when at least one capture path is enabled (validated in `new`).
     active: bool,
     staging_ttl: Duration,
-    /// Monotonic process-relative second at which another staging sweep may run.
+    /// Monotonic process-relative second at which another hot-path staging
+    /// sweep may run (threshold-gated amortization only).
     next_staging_sweep_at: AtomicU64,
+    /// Lifecycle-owned background TTL sweeper. Staged in
+    /// `start_background_tasks`; aborted on `Drop` / generation retirement.
+    staging_sweep_abort: Mutex<Option<tokio::task::AbortHandle>>,
     /// Test-only counter of keyed HMAC body hashes computed on the request path.
     keyed_request_hash_calls: AtomicU64,
+    /// Test-only counter of full `serde_json::Value` parses of request bodies.
+    json_value_parse_calls: AtomicU64,
 }
 
 impl AiTranscriptAudit {
@@ -932,7 +964,9 @@ impl AiTranscriptAudit {
             active,
             staging_ttl: Duration::from_secs(limits.max_staging_reservation_secs),
             next_staging_sweep_at: AtomicU64::new(0),
+            staging_sweep_abort: Mutex::new(None),
             keyed_request_hash_calls: AtomicU64::new(0),
+            json_value_parse_calls: AtomicU64::new(0),
         })
     }
 
@@ -965,8 +999,23 @@ impl AiTranscriptAudit {
         self.keyed_request_hash_calls.load(Ordering::Relaxed)
     }
 
+    pub fn json_value_parse_calls_for_test(&self) -> u64 {
+        self.json_value_parse_calls.load(Ordering::Relaxed)
+    }
+
     pub fn staging_len_for_test(&self) -> usize {
         self.staging.len()
+    }
+
+    pub fn pending_streams_len_for_test(&self) -> usize {
+        self.pending_streams.len()
+    }
+
+    pub fn staging_sweep_abort_for_test(&self) -> Option<tokio::task::AbortHandle> {
+        self.staging_sweep_abort
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
     }
 
     pub fn sink_healthy_for_test(&self) -> bool {
@@ -978,23 +1027,7 @@ impl AiTranscriptAudit {
     }
 
     pub fn force_sweep_staging_for_test(&self) {
-        let now = Instant::now();
-        let ttl = self.staging_ttl;
-        let expired: Vec<String> = self
-            .staging
-            .iter()
-            .filter_map(|entry| {
-                if now.duration_since(entry.captured_at) >= ttl {
-                    Some(entry.key().clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for record_id in expired {
-            self.staging.remove(&record_id);
-            self.pending_streams.remove(&record_id);
-        }
+        self.expire_stale_staging_entries();
     }
 
     pub fn mark_stream_active_for_test(&self, record_id: &str) {
@@ -1158,7 +1191,7 @@ impl AiTranscriptAudit {
         PluginResult::Continue
     }
 
-    fn sweep_staging(&self) {
+    fn sweep_staging_hot_path(&self) {
         if self.staging.len() < STAGING_SWEEP_THRESHOLD {
             return;
         }
@@ -1177,25 +1210,15 @@ impl AiTranscriptAudit {
         {
             return;
         }
-        let now = Instant::now();
-        let ttl = self.staging_ttl;
-        let expired: Vec<String> = self
-            .staging
-            .iter()
-            .filter_map(|entry| {
-                // Active streams with reserved permits still age out: abandoned
-                // or never-ending streams must not pin staging/queue capacity.
-                if now.duration_since(entry.captured_at) >= ttl {
-                    Some(entry.key().clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        for record_id in expired {
-            self.staging.remove(&record_id);
-            self.pending_streams.remove(&record_id);
-        }
+        self.expire_stale_staging_entries();
+    }
+
+    /// Expire every staging entry (and its pending stream) older than the
+    /// configured TTL, including active streams that still hold commit permits.
+    /// Used by the lifecycle-owned background sweeper and by tests; the hot
+    /// path only invokes this under the threshold/interval amortization gate.
+    fn expire_stale_staging_entries(&self) {
+        expire_stale_staging_maps(&self.staging, &self.pending_streams, self.staging_ttl);
     }
 
     fn discard_staged_candidate(&self, ctx: &mut RequestContext) {
@@ -1219,6 +1242,12 @@ impl AiTranscriptAudit {
         shape_bytes(self.mode, &self.redactor, raw, max_bytes)
     }
 
+    fn parse_request_json(&self, body: &[u8]) -> Option<Value> {
+        self.json_value_parse_calls
+            .fetch_add(1, Ordering::Relaxed);
+        serde_json::from_slice(body).ok()
+    }
+
     /// Classify `body` and stage the audit candidate: writes the
     /// `ai_transcript_audit.*` request-side metadata and inserts the staging
     /// entry keyed by the new `record_id`. `body` is the request body as
@@ -1229,7 +1258,10 @@ impl AiTranscriptAudit {
     /// Cheap admission runs before JSON parse / HMAC / redaction / excerpt /
     /// tool staging: requests that cannot be emitted are discarded without that
     /// work. Sampling losers that may still emit via error/guardrail overrides
-    /// take a lightweight staging path (AI+stream classification only).
+    /// take a lightweight staging path (bounded AI+stream probes only — no
+    /// full `Value` parse). Rate-exhausted sampled winners likewise skip
+    /// expensive capture when they cannot be exported; enqueue remains the
+    /// sole charge point for `max_records_per_minute`.
     fn stage_candidate(&self, ctx: &mut RequestContext, body: &[u8]) -> PluginResult {
         if body.is_empty() {
             self.discard_staged_candidate(ctx);
@@ -1253,7 +1285,7 @@ impl AiTranscriptAudit {
         let sample_hit = sample_from_record_id(&record_id) < self.sampling.rate;
         let overrides =
             self.sampling.always_on_error || self.sampling.always_on_guardrail;
-        let full_capture = if sample_hit {
+        let mut full_capture = if sample_hit {
             true
         } else if overrides {
             false
@@ -1263,22 +1295,147 @@ impl AiTranscriptAudit {
             return PluginResult::Continue;
         };
 
-        // Lightweight override path: reject obvious non-AI bodies without a
-        // full serde_json parse. Full-capture winners still parse for model/
-        // tool/excerpt work.
-        if !full_capture && !cheap_ai_json_probe(body) {
-            self.discard_staged_candidate(ctx);
-            return PluginResult::Continue;
+        // Early rate peek (no charge): sampled traffic that is already
+        // rate-exhausted must not pay parse/HMAC/redaction/excerpt work.
+        // Override-only candidates keep the lightweight path. Enqueue is still
+        // the only `try_acquire` so a record is never double-charged.
+        if full_capture && !self.rate_limiter.is_available() {
+            if overrides {
+                full_capture = false;
+            } else {
+                self.discard_staged_candidate(ctx);
+                return PluginResult::Continue;
+            }
         }
 
-        let parsed: Option<Value> = serde_json::from_slice(body).ok();
+        let over_processing_bound = body.len() > HARD_MAX_BODY_PROCESSING_BYTES;
+
+        if !full_capture {
+            // Lightweight override path: reject obvious non-AI bodies without a
+            // full serde_json parse. Retain only stream classification state.
+            if !cheap_ai_json_probe(body) {
+                self.discard_staged_candidate(ctx);
+                return PluginResult::Continue;
+            }
+            return self.insert_staging_entry(
+                ctx,
+                record_id,
+                sample_hit,
+                false,
+                body,
+                None,
+                None,
+                false,
+                None,
+                false,
+                Vec::new(),
+                false,
+                cheap_stream_true_probe(body),
+            );
+        }
+
+        // Full-capture winners beyond the hard processing bound: keyed hash +
+        // cheap classification only. Never build a JSON tree or model/tool
+        // collections merely to omit an over-limit excerpt.
+        if over_processing_bound {
+            if !cheap_ai_json_probe(body) {
+                self.discard_staged_candidate(ctx);
+                return PluginResult::Continue;
+            }
+            let request_hash = self.keyed_request_hash(body);
+            let request_truncated = self.capture.request && self.mode.captures_body();
+            return self.insert_staging_entry(
+                ctx,
+                record_id,
+                sample_hit,
+                true,
+                body,
+                Some(request_hash),
+                None,
+                request_truncated,
+                None,
+                false,
+                Vec::new(),
+                false,
+                cheap_stream_true_probe(body),
+            );
+        }
+
+        let parsed = self.parse_request_json(body);
         let is_ai = parsed.as_ref().is_some_and(json_looks_like_ai_request);
         if !is_ai {
             self.discard_staged_candidate(ctx);
             return PluginResult::Continue;
         }
 
-        self.sweep_staging();
+        // Exported body hashes are keyed HMAC-SHA256 (same key as the
+        // redaction placeholders): a plain SHA-256 of a mostly-predictable
+        // body would be an offline brute-force oracle for the secret.
+        let request_hash = self.keyed_request_hash(body);
+        let (request_model, model_truncated) = parsed
+            .as_ref()
+            .map(|json| admit_model(json, self.limits.max_model_chars))
+            .unwrap_or((None, false));
+        let (tool_names, tool_names_truncated) = if self.capture.tool_calls {
+            parsed
+                .as_ref()
+                .map(|json| {
+                    admit_tool_names(
+                        json,
+                        self.limits.max_tool_count,
+                        self.limits.max_tool_name_chars,
+                        self.limits.max_tool_names_bytes,
+                    )
+                })
+                .unwrap_or_default()
+        } else {
+            (Vec::new(), false)
+        };
+        let (request_excerpt, request_truncated) = if self.capture.request {
+            self.shape_body(body, self.limits.max_request_bytes)
+        } else {
+            (None, false)
+        };
+        let stream_request = parsed
+            .as_ref()
+            .and_then(|json| json.get("stream"))
+            .and_then(Value::as_bool)
+            == Some(true);
+
+        self.insert_staging_entry(
+            ctx,
+            record_id,
+            sample_hit,
+            true,
+            body,
+            Some(request_hash),
+            request_excerpt,
+            request_truncated,
+            request_model,
+            model_truncated,
+            tool_names,
+            tool_names_truncated,
+            stream_request,
+        )
+    }
+
+    fn insert_staging_entry(
+        &self,
+        ctx: &mut RequestContext,
+        record_id: String,
+        sample_hit: bool,
+        full_capture: bool,
+        body: &[u8],
+        request_hash: Option<String>,
+        request_excerpt: Option<String>,
+        request_truncated: bool,
+        request_model: Option<String>,
+        model_truncated: bool,
+        tool_names: Vec<String>,
+        tool_names_truncated: bool,
+        stream_request: bool,
+    ) -> PluginResult {
+        self.sweep_staging_hot_path();
         let staging_permit = match Arc::clone(&self.staging_permits).try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) => {
@@ -1298,53 +1455,6 @@ impl AiTranscriptAudit {
         };
 
         let request_content_digest = content_digest(body);
-        let (request_hash, request_excerpt, request_truncated, request_model, model_truncated, tool_names, tool_names_truncated) =
-            if full_capture {
-                // Exported body hashes are keyed HMAC-SHA256 (same key as the
-                // redaction placeholders): a plain SHA-256 of a mostly-predictable
-                // body would be an offline brute-force oracle for the secret.
-                let request_hash = self.keyed_request_hash(body);
-                let (request_model, model_truncated) = parsed
-                    .as_ref()
-                    .map(|json| admit_model(json, self.limits.max_model_chars))
-                    .unwrap_or((None, false));
-                let (tool_names, tool_names_truncated) = if self.capture.tool_calls {
-                    parsed
-                        .as_ref()
-                        .map(|json| {
-                            admit_tool_names(
-                                json,
-                                self.limits.max_tool_count,
-                                self.limits.max_tool_name_chars,
-                                self.limits.max_tool_names_bytes,
-                            )
-                        })
-                        .unwrap_or_default()
-                } else {
-                    (Vec::new(), false)
-                };
-                let (request_excerpt, request_truncated) = if self.capture.request {
-                    self.shape_body(body, self.limits.max_request_bytes)
-                } else {
-                    (None, false)
-                };
-                (
-                    Some(request_hash),
-                    request_excerpt,
-                    request_truncated,
-                    request_model,
-                    model_truncated,
-                    tool_names,
-                    tool_names_truncated,
-                )
-            } else {
-                // Lightweight override path: classify only. No HMAC, excerpt,
-                // model, or tool staging until/unless an override emits (and
-                // even then request-side capture stays omitted — response /
-                // guardrail evidence is the override signal).
-                (None, None, false, None, false, Vec::new(), false)
-            };
-
         ctx.metadata
             .insert(MD_RECORD_ID.to_string(), record_id.clone());
         ctx.metadata
@@ -1368,14 +1478,11 @@ impl AiTranscriptAudit {
         // response buffer decision streams rather than stalls (buffering a
         // stream holds it until EOF, and under retry the buffered->stream
         // content-type downgrade is disabled).
-        if parsed
-            .as_ref()
-            .and_then(|json| json.get("stream"))
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
+        if stream_request {
             ctx.metadata
                 .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
+        } else {
+            ctx.metadata.remove(MD_STREAM_REQUEST);
         }
 
         // Every staged AI candidate is eligible for stream capture.
@@ -1423,17 +1530,77 @@ impl AiTranscriptAudit {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return;
         };
-        let parsed: Option<Value> = serde_json::from_slice(body).ok();
-        if !parsed.as_ref().is_some_and(json_looks_like_ai_request) {
-            self.discard_staged_candidate(ctx);
-            return;
-        }
-        let digest = content_digest(body);
         let full_capture = self
             .staging
             .get(&record_id)
             .map(|staging| staging.full_capture)
             .unwrap_or(true);
+        let digest = content_digest(body);
+
+        if !full_capture {
+            if !cheap_ai_json_probe(body) {
+                self.discard_staged_candidate(ctx);
+                return;
+            }
+            if self
+                .staging
+                .get(&record_id)
+                .is_some_and(|staging| staging.request_content_digest == digest)
+            {
+                return;
+            }
+            if cheap_stream_true_probe(body) {
+                ctx.metadata
+                    .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
+            } else {
+                ctx.metadata.remove(MD_STREAM_REQUEST);
+            }
+            if let Some(mut staged) = self.staging.get_mut(&record_id) {
+                staged.request_content_digest = digest;
+            }
+            return;
+        }
+
+        if body.len() > HARD_MAX_BODY_PROCESSING_BYTES {
+            if !cheap_ai_json_probe(body) {
+                self.discard_staged_candidate(ctx);
+                return;
+            }
+            if self
+                .staging
+                .get(&record_id)
+                .is_some_and(|staging| staging.request_content_digest == digest)
+            {
+                return;
+            }
+            if cheap_stream_true_probe(body) {
+                ctx.metadata
+                    .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
+            } else {
+                ctx.metadata.remove(MD_STREAM_REQUEST);
+            }
+            let request_hash = self.keyed_request_hash(body);
+            let request_truncated = self.capture.request && self.mode.captures_body();
+            if let Some(mut staged) = self.staging.get_mut(&record_id) {
+                staged.request_excerpt = None;
+                staged.request_truncated = request_truncated;
+                staged.request_hash = Some(request_hash.clone());
+                staged.request_content_digest = digest;
+                staged.request_model = None;
+                staged.model_truncated = false;
+                staged.tool_names.clear();
+                staged.tool_names_truncated = false;
+            }
+            ctx.metadata
+                .insert(MD_REQUEST_HASH.to_string(), request_hash);
+            return;
+        }
+
+        let parsed = self.parse_request_json(body);
+        if !parsed.as_ref().is_some_and(json_looks_like_ai_request) {
+            self.discard_staged_candidate(ctx);
+            return;
+        }
         if self
             .staging
             .get(&record_id)
@@ -1462,12 +1629,6 @@ impl AiTranscriptAudit {
                 .insert(MD_STREAM_REQUEST.to_string(), "true".to_string());
         } else {
             ctx.metadata.remove(MD_STREAM_REQUEST);
-        }
-        if !full_capture {
-            if let Some(mut staged) = self.staging.get_mut(&record_id) {
-                staged.request_content_digest = digest;
-            }
-            return;
         }
         let request_hash = self.keyed_request_hash(body);
         if let Some(mut staged) = self.staging.get_mut(&record_id) {
@@ -1500,6 +1661,9 @@ impl AiTranscriptAudit {
                     .unwrap_or_default();
                 staged.tool_names = tool_names;
                 staged.tool_names_truncated = tool_names_truncated;
+            } else {
+                staged.tool_names.clear();
+                staged.tool_names_truncated = false;
             }
         }
         ctx.metadata
@@ -1857,6 +2021,40 @@ impl AiTranscriptAudit {
     }
 }
 
+impl AiTranscriptAudit {
+    /// Stage the lifecycle-owned staging TTL sweeper. Idempotent; requires a
+    /// Tokio runtime (same contract as the batching logger).
+    fn start_staging_ttl_sweeper(&self) -> Result<(), String> {
+        let mut guard = self.staging_sweep_abort.lock().map_err(|_| {
+            "ai_transcript_audit: staging sweep lock poisoned; refusing to start sweeper"
+                .to_string()
+        })?;
+        if guard.is_some() {
+            return Ok(());
+        }
+        let _runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+            "ai_transcript_audit: start_background_tasks requires a Tokio runtime".to_string()
+        })?;
+        let staging = Arc::clone(&self.staging);
+        let pending_streams = Arc::clone(&self.pending_streams);
+        let ttl = self.staging_ttl;
+        let interval_secs = self
+            .staging_ttl
+            .as_secs()
+            .clamp(1, STAGING_TTL_BACKGROUND_SWEEP_MAX_SECS);
+        let handle = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                expire_stale_staging_maps(&staging, &pending_streams, ttl);
+            }
+        });
+        *guard = Some(handle.abort_handle());
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Plugin for AiTranscriptAudit {
     fn name(&self) -> &str {
@@ -1901,7 +2099,9 @@ impl Plugin for AiTranscriptAudit {
                 let flush_config = flush_config.clone();
                 async move { send_batch(&flush_config, batch).await }
             },
-        )
+        )?;
+        self.start_staging_ttl_sweeper()?;
+        Ok(())
     }
 
     fn commit_background_tasks(&self) {
@@ -2539,6 +2739,20 @@ impl Plugin for AiTranscriptAudit {
     }
 }
 
+impl Drop for AiTranscriptAudit {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.staging_sweep_abort.lock()
+            && let Some(abort) = guard.take()
+        {
+            abort.abort();
+        }
+        // Generation retirement / shutdown must release every staging slot and
+        // reserved commit permit without waiting for request traffic.
+        self.staging.clear();
+        self.pending_streams.clear();
+    }
+}
+
 /// Tees streaming (SSE) response bytes into a bounded accumulator while
 /// forwarding every chunk unchanged. Keyed HMAC covers the full stream only
 /// when `hash_full_stream` is set; otherwise hashing stops with the capture cap
@@ -2837,10 +3051,11 @@ fn reject_audit_unavailable() -> PluginResult {
 /// Shape a captured payload into an excerpt. Returns the shaped excerpt (or
 /// `None` for non-body modes) and whether it was truncated.
 ///
-/// For `redacted_body`, work is bounded by `max_bytes`: bodies larger than the
-/// export budget omit the excerpt rather than scanning/allocating the full
-/// payload (matching truncated stream semantics and avoiding boundary-fragment
-/// leaks). `full_body` truncates first by design.
+/// For `redacted_body`, bodies larger than `max_bytes` omit the excerpt rather
+/// than scanning/allocating a redacted `Value` tree (matching truncated stream
+/// semantics and avoiding boundary-fragment leaks). Independently,
+/// [`HARD_MAX_BODY_PROCESSING_BYTES`] caps request-path JSON tree / model-tool
+/// work before shaping runs. `full_body` truncates first by design.
 fn shape_bytes(
     mode: AuditMode,
     redactor: &PiiRedactor,
@@ -2855,6 +3070,8 @@ fn shape_bytes(
         if truncated {
             return (None, true);
         }
+        // Bodies that reach redaction are already within both the export cap
+        // and the hard processing bound (callers omit earlier when larger).
         let shaped = redact_body_decoded_json_strings(redactor, raw);
         let shaped = if shaped.len() > max_bytes {
             truncate_on_char_boundary(shaped, max_bytes)
@@ -3339,42 +3556,17 @@ fn is_guardrail_key(key: &str) -> bool {
     PREFIXES.iter().any(|prefix| key.starts_with(prefix))
 }
 
-fn extract_model(json: &Value) -> Option<String> {
-    json.get("model")
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
-}
-
 fn admit_model(json: &Value, max_chars: usize) -> (Option<String>, bool) {
-    let Some(model) = extract_model(json) else {
+    let Some(model) = json.get("model").and_then(Value::as_str) else {
         return (None, false);
     };
+    // Admit from the borrowed JSON string; never clone the full attacker
+    // value before applying the character cap.
     if model.chars().count() <= max_chars {
-        return (Some(model), false);
+        return (Some(model.to_string()), false);
     }
     let truncated: String = model.chars().take(max_chars).collect();
     (Some(truncated), true)
-}
-
-fn extract_tool_names(json: &Value) -> Vec<String> {
-    let mut names = Vec::new();
-    for key in ["tools", "functions"] {
-        if let Some(entries) = json.get(key).and_then(|value| value.as_array()) {
-            for entry in entries {
-                let name = entry
-                    .get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(|name| name.as_str())
-                    .or_else(|| entry.get("name").and_then(|name| name.as_str()));
-                if let Some(name) = name {
-                    names.push(name.to_string());
-                }
-            }
-        }
-    }
-    names.sort();
-    names.dedup();
-    names
 }
 
 fn admit_tool_names(
@@ -3383,29 +3575,50 @@ fn admit_tool_names(
     max_name_chars: usize,
     max_aggregate_bytes: usize,
 ) -> (Vec<String>, bool) {
-    let raw = extract_tool_names(json);
-    let mut out = Vec::new();
+    // Admit directly from borrowed JSON strings. Stop scanning once count or
+    // aggregate caps are reached; retained names are sorted/deduped within the
+    // admitted prefix for deterministic export order.
+    let mut admitted: BTreeSet<String> = BTreeSet::new();
     let mut aggregate = 0usize;
     let mut truncated = false;
-    for name in raw {
-        if out.len() >= max_count {
-            truncated = true;
-            break;
+
+    'scan: for key in ["tools", "functions"] {
+        let Some(entries) = json.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            let Some(name) = entry
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .or_else(|| entry.get("name").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            if admitted.len() >= max_count {
+                truncated = true;
+                break 'scan;
+            }
+            let name_truncated = name.chars().count() > max_name_chars;
+            let owned = if name_truncated {
+                truncated = true;
+                name.chars().take(max_name_chars).collect::<String>()
+            } else {
+                name.to_string()
+            };
+            if admitted.contains(&owned) {
+                continue;
+            }
+            let next = aggregate.saturating_add(owned.len());
+            if next > max_aggregate_bytes {
+                truncated = true;
+                break 'scan;
+            }
+            aggregate = next;
+            admitted.insert(owned);
         }
-        let mut admitted = name;
-        if admitted.chars().count() > max_name_chars {
-            admitted = admitted.chars().take(max_name_chars).collect();
-            truncated = true;
-        }
-        let next = aggregate.saturating_add(admitted.len());
-        if next > max_aggregate_bytes {
-            truncated = true;
-            break;
-        }
-        aggregate = next;
-        out.push(admitted);
     }
-    (out, truncated)
+    (admitted.into_iter().collect(), truncated)
 }
 
 fn content_digest(bytes: &[u8]) -> [u8; 32] {
@@ -3901,8 +4114,8 @@ fn json_looks_like_ai_request(json: &Value) -> bool {
 /// Byte-level AI probe used by the lightweight override staging path so
 /// non-AI JSON can be rejected without `serde_json` allocation. Strong marker
 /// keys (and the weak `model`+`message`/`instructions` pair) are searched as
-/// quoted JSON field names. False positives are filtered by the subsequent
-/// parse; false negatives only affect the override-only path.
+/// quoted JSON field names. False positives are filtered by later emit gates;
+/// false negatives only affect the override-only path.
 fn cheap_ai_json_probe(body: &[u8]) -> bool {
     const STRONG: &[&[u8]] = &[
         br#""messages""#,
@@ -3921,8 +4134,46 @@ fn cheap_ai_json_probe(body: &[u8]) -> bool {
         && (find_bytes(body, br#""message""#) || find_bytes(body, br#""instructions""#))
 }
 
+/// Byte-level `"stream": true` probe for lightweight / over-bound paths that
+/// must not allocate a full JSON tree merely to set the SSE marker.
+fn cheap_stream_true_probe(body: &[u8]) -> bool {
+    // Accept common spacing variants without a full parse.
+    const PATTERNS: &[&[u8]] = &[
+        br#""stream":true"#,
+        br#""stream": true"#,
+        br#""stream" : true"#,
+        br#""stream":true,"#,
+        br#""stream": true,"#,
+    ];
+    PATTERNS.iter().any(|pattern| find_bytes(body, pattern))
+}
+
 fn find_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
         .any(|window| window == needle)
+}
+
+fn expire_stale_staging_maps(
+    staging: &DashMap<String, AuditStaging>,
+    pending_streams: &DashMap<String, Arc<StreamSlot>>,
+    ttl: Duration,
+) {
+    let now = Instant::now();
+    let expired: Vec<String> = staging
+        .iter()
+        .filter_map(|entry| {
+            // Active streams with reserved permits still age out: abandoned
+            // or never-ending streams must not pin staging/queue capacity.
+            if now.duration_since(entry.captured_at) >= ttl {
+                Some(entry.key().clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    for record_id in expired {
+        staging.remove(&record_id);
+        pending_streams.remove(&record_id);
+    }
 }

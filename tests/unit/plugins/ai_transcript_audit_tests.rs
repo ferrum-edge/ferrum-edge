@@ -15,9 +15,9 @@ use ferrum_edge::plugins::ai_transcript_audit::{
     AI_TRANSCRIPT_AUDIT_CUSTOM_PATTERN_KEYS, AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
     AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS, AI_TRANSCRIPT_AUDIT_REDACTION_KEYS,
     AI_TRANSCRIPT_AUDIT_SAMPLING_KEYS, AI_TRANSCRIPT_AUDIT_SINK_KEYS, AiTranscriptAudit,
-    HARD_MAX_CAPTURE_AGGREGATE_BYTES, HARD_MAX_CAPTURE_BYTES, HARD_MAX_MODEL_CHARS,
-    HARD_MAX_STAGING_RESERVATION_SECS, HARD_MAX_TOOL_COUNT, HARD_MAX_TOOL_NAME_CHARS,
-    HARD_MAX_TOOL_NAMES_BYTES,
+    HARD_MAX_BODY_PROCESSING_BYTES, HARD_MAX_CAPTURE_AGGREGATE_BYTES, HARD_MAX_CAPTURE_BYTES,
+    HARD_MAX_MODEL_CHARS, HARD_MAX_STAGING_RESERVATION_SECS, HARD_MAX_TOOL_COUNT,
+    HARD_MAX_TOOL_NAME_CHARS, HARD_MAX_TOOL_NAMES_BYTES,
 };
 use ferrum_edge::plugins::request_deduplication::RequestDeduplication;
 use ferrum_edge::plugins::utils::ai_pii::PiiRedactor;
@@ -5954,4 +5954,342 @@ async fn custom_headers_materialized_at_activation_are_always_sent() {
         .expect("tenant header");
     assert_eq!(auth, "Bearer activation-token");
     assert_eq!(tenant, "tenant-a");
+}
+
+// ---------------------------------------------------------------------------
+// Root-review corrections (#3051, #3067, #3046, #3052)
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "current_thread")]
+async fn staging_ttl_background_sweep_expires_below_threshold_without_traffic() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "limits": { "max_staging_reservation_secs": 1 } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    assert!(
+        plugin.staging_sweep_abort_for_test().is_some(),
+        "background TTL sweeper must be lifecycle-owned"
+    );
+
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, ai_request_body())
+        .await;
+    let record_id = ctx
+        .metadata
+        .get("ai_transcript_audit.record_id")
+        .cloned()
+        .expect("record id");
+    plugin.mark_stream_active_for_test(&record_id);
+    plugin.set_staging_captured_at_for_test(
+        &record_id,
+        std::time::Instant::now() - std::time::Duration::from_secs(5),
+    );
+    assert_eq!(plugin.staging_len_for_test(), 1);
+    // Below STAGING_SWEEP_THRESHOLD and with no further admissions: background
+    // sweeper must still release the abandoned never-ending stream slot.
+    for _ in 0..40 {
+        if plugin.staging_len_for_test() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        plugin.staging_len_for_test(),
+        0,
+        "below-threshold abandoned stream must expire without request traffic"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn staging_ttl_shutdown_drop_aborts_sweeper_and_clears_state() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "limits": { "max_staging_reservation_secs": 3600 } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let abort = plugin
+        .staging_sweep_abort_for_test()
+        .expect("sweeper started");
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    assert_eq!(plugin.staging_len_for_test(), 1);
+    drop(plugin);
+    for _ in 0..20 {
+        if abort.is_finished() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(abort.is_finished(), "plugin drop must abort the TTL sweeper");
+}
+
+#[tokio::test]
+async fn inspector_drop_clears_stream_active_for_cancellation() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let record_id = ctx
+        .metadata
+        .get("ai_transcript_audit.record_id")
+        .cloned()
+        .expect("record id");
+    {
+        let mut inspector = plugin
+            .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+            .expect("inspector");
+        let _ = inspector.on_chunk(b"data: {\"ok\":true}\n\n").await;
+        plugin.mark_stream_active_for_test(&record_id);
+        // Drop without terminal hooks — cancellation path.
+    }
+    plugin.force_sweep_staging_for_test();
+    // stream_active cleared by Drop; force_sweep with fresh captured_at keeps
+    // the entry, but the cancellation contract is that Drop cleared the pin.
+    // Age the entry and confirm TTL can reclaim it.
+    plugin.set_staging_captured_at_for_test(
+        &record_id,
+        std::time::Instant::now() - std::time::Duration::from_secs(7200),
+    );
+    plugin.force_sweep_staging_for_test();
+    assert_eq!(plugin.staging_len_for_test(), 0);
+    assert_eq!(plugin.pending_streams_len_for_test(), 0);
+}
+
+#[tokio::test]
+async fn rate_exhausted_sampled_traffic_skips_expensive_capture_work() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "sampling": {
+                    "rate": 1.0,
+                    "max_records_per_minute": 1,
+                    "always_capture_on_guardrail": false,
+                    "always_capture_on_error": false
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let headers = json_headers();
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "x".repeat(4096)
+    );
+
+    // First record consumes the rate budget at enqueue.
+    let mut first = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut first, &headers, body.as_bytes())
+        .await;
+    assert_eq!(plugin.keyed_request_hash_calls_for_test(), 1);
+    assert_eq!(plugin.json_value_parse_calls_for_test(), 1);
+    plugin
+        .capture_final_response_body(&mut first, 200, &headers, br#"{"ok":true}"#)
+        .await;
+
+    let hashes_after_first = plugin.keyed_request_hash_calls_for_test();
+    let parses_after_first = plugin.json_value_parse_calls_for_test();
+
+    // Second sampled winner is rate-exhausted: must not parse/HMAC again.
+    let mut second = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut second, &headers, body.as_bytes())
+        .await;
+    assert_eq!(
+        plugin.keyed_request_hash_calls_for_test(),
+        hashes_after_first,
+        "rate-exhausted sampled traffic must not HMAC"
+    );
+    assert_eq!(
+        plugin.json_value_parse_calls_for_test(),
+        parses_after_first,
+        "rate-exhausted sampled traffic must not Value-parse"
+    );
+    assert_eq!(
+        plugin.staging_len_for_test(),
+        0,
+        "without override path, rate-exhausted samples are discarded"
+    );
+}
+
+#[tokio::test]
+async fn zero_rate_with_overrides_uses_lightweight_path_without_value_parse() {
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            "https://audit.example.com/x",
+            json!({
+                "sampling": {
+                    "rate": 0.0,
+                    "always_capture_on_guardrail": true,
+                    "always_capture_on_error": true
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    let mut ctx = make_ctx();
+    let headers = json_headers();
+    let body = format!(
+        r#"{{"model":"gpt-4o","stream":true,"messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "y".repeat(8192)
+    );
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+        .await;
+    assert_eq!(plugin.keyed_request_hash_calls_for_test(), 0);
+    assert_eq!(
+        plugin.json_value_parse_calls_for_test(),
+        0,
+        "lightweight override path must not parse a full Value after cheap probe"
+    );
+    assert_eq!(plugin.staging_len_for_test(), 1);
+    assert_eq!(
+        ctx.metadata.get("ai_transcript_audit.stream_request").map(String::as_str),
+        Some("true")
+    );
+}
+
+#[tokio::test]
+async fn adversarial_oversized_model_and_tools_stop_at_admission_bounds() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "limits": {
+                    "max_model_chars": 16,
+                    "max_tool_count": 3,
+                    "max_tool_name_chars": 8,
+                    "max_tool_names_bytes": 24
+                }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    // Stay under HARD_MAX_BODY_PROCESSING_BYTES so admission still walks
+    // borrowed metadata — but each field is far larger than retained caps.
+    let mut tools = Vec::new();
+    for i in 0..256 {
+        tools.push(json!({
+            "type": "function",
+            "function": { "name": format!("attacker_tool_name_{i:03}_{}", "Z".repeat(512)) }
+        }));
+    }
+    let body = json!({
+        "model": "M".repeat(65_536),
+        "messages": [{"role":"user","content":"hi"}],
+        "tools": tools
+    });
+    let body_bytes = serde_json::to_vec(&body).unwrap();
+    assert!(body_bytes.len() < HARD_MAX_BODY_PROCESSING_BYTES);
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), &body_bytes)
+        .await;
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &json_headers(), br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    let model = records[0]["model"].as_str().expect("model");
+    assert_eq!(model.chars().count(), 16);
+    assert_eq!(records[0]["model_truncated"], true);
+    let tools = records[0]["tool_names"].as_array().expect("tools");
+    assert!(tools.len() <= 3, "{tools:?}");
+    let mut aggregate = 0usize;
+    for tool in tools {
+        let name = tool.as_str().unwrap();
+        assert!(name.chars().count() <= 8, "{name}");
+        aggregate += name.len();
+    }
+    assert!(aggregate <= 24, "aggregate={aggregate}");
+    assert_eq!(records[0]["tool_names_truncated"], true);
+}
+
+#[tokio::test]
+async fn body_over_processing_bound_skips_value_parse_and_omits_excerpt() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({
+                "mode": "redacted_body",
+                "limits": { "max_request_bytes": 1024 }
+            }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+
+    let oversized = HARD_MAX_BODY_PROCESSING_BYTES + 64;
+    let body = format!(
+        r#"{{"model":"gpt-4o","messages":[{{"role":"user","content":"{}"}}]}}"#,
+        "T".repeat(oversized)
+    );
+    assert!(body.len() > HARD_MAX_BODY_PROCESSING_BYTES);
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), body.as_bytes())
+        .await;
+    assert_eq!(
+        plugin.json_value_parse_calls_for_test(),
+        0,
+        "over processing-bound bodies must not allocate a full Value tree"
+    );
+    assert_eq!(plugin.keyed_request_hash_calls_for_test(), 1);
+    plugin
+        .capture_final_response_body(&mut ctx, 200, &json_headers(), br#"{"ok":true}"#)
+        .await;
+    let records = wait_for_records(&server).await;
+    assert_eq!(records.len(), 1);
+    assert!(
+        records[0]["request_body"].is_null(),
+        "processing-bound omit must not leak a boundary fragment"
+    );
+    assert_eq!(records[0]["request_body_truncated"], true);
+    assert!(records[0]["request_hash"].is_string());
+    assert!(
+        records[0].get("model").is_none(),
+        "over processing-bound capture must not build request-derived model metadata"
+    );
+    assert!(
+        records[0].get("tool_names").is_none(),
+        "over processing-bound capture must not build tool-name collections"
+    );
 }

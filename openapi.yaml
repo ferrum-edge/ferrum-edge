@@ -18290,7 +18290,7 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and cache metadata, then exports them asynchronously to an HTTPS collector in batches under record-count and retained-byte budgets. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and ages out by max_staging_reservation_secs (including active streams with reserved permits). Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map, but ${NAME} expansions are restricted to AUDIT_* / FERRUM_AUDIT_*. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and cache metadata, then exports them asynchronously to an HTTPS collector in batches under record-count and retained-byte budgets. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and ages out by max_staging_reservation_secs (including active streams with reserved permits) via a lifecycle-owned background sweeper that does not depend on later request traffic; request JSON Value parse/redaction/model-tool work is independently hard-capped at 1048576 bytes. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map, but ${NAME} expansions are restricted to AUDIT_* / FERRUM_AUDIT_*. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
@@ -18349,7 +18349,7 @@ components:
               type: integer
               minimum: 0
               default: 0
-              description: "Records-per-minute cap (0 = unlimited). Over the cap, records are dropped (never reject traffic)."
+              description: "Records-per-minute cap (0 = unlimited). Over the cap, records are dropped (never reject traffic). Sampled winners that are already rate-exhausted skip JSON parse / HMAC / redaction / excerpt / tool work at staging; enqueue remains the sole charge point so a record is never double-counted. Error/guardrail override candidates keep a separately bounded lightweight path."
         redaction:
           type: [object, "null"]
           additionalProperties: false
@@ -18387,7 +18387,7 @@ components:
         limits:
           type: [object, "null"]
           additionalProperties: false
-          description: "Capture size caps and metadata/reservation budgets. Omit or null to keep defaults. Each capture byte limit is hard-capped at 1048576; their sum must be <= 2097152. Effective admitted limits are exposed via plugin status helpers."
+          description: "Capture size caps and metadata/reservation budgets. Omit or null to keep defaults. Each capture byte limit is hard-capped at 1048576; their sum must be <= 2097152. Independently, request JSON Value parse / redaction / model-tool tree work is hard-capped at 1048576 bytes: larger bodies use bounded classification + keyed HMAC only and omit excerpts rather than allocating a full tree merely to produce no excerpt. Effective admitted limits are exposed via plugin status helpers."
           properties:
             max_request_bytes:
               type: integer
@@ -18437,7 +18437,7 @@ components:
               minimum: 1
               maximum: 3600
               default: 3600
-              description: "Maximum age of in-flight staging entries, including active streams that hold reserved sink permits. Expired entries release staging and queue capacity."
+              description: "Maximum age of in-flight staging entries, including active streams that hold reserved sink permits. A lifecycle-owned background sweeper (started with the sink worker, aborted on plugin drop/shutdown) expires every stale entry even below the hot-path 512-entry amortization threshold and without requiring later request traffic. Expired entries release staging and queue capacity."
         sink:
           type: object
           required: [endpoint_url]
