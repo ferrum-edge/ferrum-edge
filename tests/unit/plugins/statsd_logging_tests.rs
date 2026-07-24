@@ -1423,8 +1423,10 @@ async fn test_statsd_logging_failed_reserve_does_not_take_lease() {
 
 #[test]
 fn test_statsd_logging_for_each_udp_datagram_stays_mtu_safe() {
-    let line_a = "a".repeat(700);
-    let line_b = "b".repeat(700);
+    // Each line fits independently, while the pair plus delimiter exceeds the
+    // 1452-byte payload ceiling and therefore must visit two datagrams.
+    let line_a = "a".repeat(800);
+    let line_b = "b".repeat(800);
     let payload = format!("{line_a}\n{line_b}");
     let mut seen = Vec::new();
     let dropped = for_each_udp_datagram(&payload, MAX_UDP_PAYLOAD, |datagram| {
