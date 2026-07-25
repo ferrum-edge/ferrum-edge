@@ -1,8 +1,10 @@
 //! File-backed managed TLS material store.
 //!
 //! Managed records are used by the admin TLS lifecycle endpoints and by the
-//! `managed://` source loader. Private key PEM is persisted because rustls
-//! needs it to rebuild configs, but API summaries never serialize it.
+//! `managed://` source loader. Record IDs are globally unique across
+//! certificates, CA bundles, CRLs, OCSP responses, and JWKS. Private key PEM is
+//! persisted because rustls needs it to rebuild configs, but API summaries never
+//! serialize it.
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -128,6 +130,19 @@ pub enum ManagedTlsError {
     NotFound(String),
     #[error("managed TLS record '{0}' already exists")]
     AlreadyExists(String),
+    /// Cross-kind ID collision on create-with-overwrite or typed update.
+    ///
+    /// Managed TLS IDs are globally unique across certificates, CA bundles,
+    /// CRLs, OCSP responses, and JWKS records. Overwriting an existing ID
+    /// requires the existing material kind to match the requested kind.
+    #[error(
+        "managed TLS record '{id}' already exists with kind {existing_kind}, cannot overwrite with kind {requested_kind}"
+    )]
+    KindConflict {
+        id: String,
+        existing_kind: &'static str,
+        requested_kind: &'static str,
+    },
     #[error("managed TLS record '{id}' does not contain {kind} material")]
     MissingMaterial { id: String, kind: &'static str },
     #[error("managed TLS record '{id}' has kind {actual}, expected {expected}")]
@@ -213,18 +228,39 @@ impl ManagedTlsStore {
             ManagedTlsError::Write("managed TLS store lock is poisoned".to_string())
         })?;
         let now = Utc::now();
-        if let Some(existing) = records.get(&record.id) {
+        let previous = if let Some(existing) = records.get(&record.id) {
             if !allow_overwrite {
                 return Err(ManagedTlsError::AlreadyExists(record.id));
             }
+            if existing.kind != record.kind {
+                return Err(ManagedTlsError::KindConflict {
+                    id: record.id,
+                    existing_kind: existing.kind.as_str(),
+                    requested_kind: record.kind.as_str(),
+                });
+            }
             record.created_at = existing.created_at;
             record.updated_at = now;
+            Some(existing.clone())
         } else {
             record.created_at = now;
             record.updated_at = now;
+            None
+        };
+        let id = record.id.clone();
+        records.insert(id.clone(), record.clone());
+        if let Err(error) = self.persist_locked(&records) {
+            // Roll back the in-memory mutation so a failed write is not visible.
+            match previous {
+                Some(previous) => {
+                    records.insert(id, previous);
+                }
+                None => {
+                    records.remove(&id);
+                }
+            }
+            return Err(error);
         }
-        records.insert(record.id.clone(), record.clone());
-        self.persist_locked(&records)?;
         Ok(record)
     }
 
@@ -236,7 +272,11 @@ impl ManagedTlsStore {
         let removed = records
             .remove(id)
             .ok_or_else(|| ManagedTlsError::NotFound(id.to_string()))?;
-        self.persist_locked(&records)?;
+        if let Err(error) = self.persist_locked(&records) {
+            // Restore the removed record so a failed delete is not visible.
+            records.insert(removed.id.clone(), removed);
+            return Err(error);
+        }
         Ok(removed)
     }
 
@@ -793,5 +833,191 @@ mod tests {
         let summaries = store.list(ManagedTlsMaterialKind::OcspResponse);
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].byte_length, Some(5));
+    }
+
+    fn sample_record(kind: ManagedTlsMaterialKind, id: &str) -> ManagedTlsRecord {
+        match kind {
+            ManagedTlsMaterialKind::Certificate => ManagedTlsRecord::new_certificate(
+                id.to_string(),
+                id.to_string(),
+                None,
+                "cert".to_string(),
+                "key".to_string(),
+                None,
+            ),
+            ManagedTlsMaterialKind::CaBundle => ManagedTlsRecord::new_ca_bundle(
+                id.to_string(),
+                id.to_string(),
+                None,
+                "ca".to_string(),
+            ),
+            ManagedTlsMaterialKind::Crl => {
+                ManagedTlsRecord::new_crl(id.to_string(), id.to_string(), None, "crl".to_string())
+            }
+            ManagedTlsMaterialKind::OcspResponse => ManagedTlsRecord::new_ocsp_response(
+                id.to_string(),
+                id.to_string(),
+                None,
+                "b2NzcA==".to_string(),
+            ),
+            ManagedTlsMaterialKind::Jwks => ManagedTlsRecord::new_jwks(
+                id.to_string(),
+                id.to_string(),
+                None,
+                r#"{"keys":[{"kty":"oct","k":"dGVzdA"}]}"#.to_string(),
+            ),
+        }
+    }
+
+    const ALL_KINDS: [ManagedTlsMaterialKind; 5] = [
+        ManagedTlsMaterialKind::Certificate,
+        ManagedTlsMaterialKind::CaBundle,
+        ManagedTlsMaterialKind::Crl,
+        ManagedTlsMaterialKind::OcspResponse,
+        ManagedTlsMaterialKind::Jwks,
+    ];
+
+    #[test]
+    fn store_rejects_cross_kind_overwrite_for_all_kind_pairs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ManagedTlsStore::open(dir.path()).expect("open store");
+
+        for existing_kind in ALL_KINDS {
+            for requested_kind in ALL_KINDS {
+                if existing_kind == requested_kind {
+                    continue;
+                }
+                let id = format!(
+                    "pair-{}-{}",
+                    existing_kind.as_str(),
+                    requested_kind.as_str()
+                );
+                store
+                    .upsert(sample_record(existing_kind, &id), false)
+                    .expect("seed existing");
+                let error = store
+                    .upsert(sample_record(requested_kind, &id), true)
+                    .expect_err("cross-kind overwrite must fail");
+                match error {
+                    ManagedTlsError::KindConflict {
+                        id: conflict_id,
+                        existing_kind: actual,
+                        requested_kind: requested,
+                    } => {
+                        assert_eq!(conflict_id, id);
+                        assert_eq!(actual, existing_kind.as_str());
+                        assert_eq!(requested, requested_kind.as_str());
+                    }
+                    other => panic!("expected KindConflict, got {other:?}"),
+                }
+                let kept = store.get(&id).expect("original retained");
+                assert_eq!(kept.kind, existing_kind);
+                store.delete(&id).expect("cleanup");
+            }
+        }
+    }
+
+    #[test]
+    fn store_allows_same_kind_overwrite_and_keeps_material_resolvable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ManagedTlsStore::open(dir.path()).expect("open store");
+        let first = ManagedTlsRecord::new_ca_bundle(
+            "shared-ca".to_string(),
+            "shared".to_string(),
+            None,
+            "first-ca".to_string(),
+        );
+        store.upsert(first, false).expect("create");
+        let second = ManagedTlsRecord::new_ca_bundle(
+            "shared-ca".to_string(),
+            "shared".to_string(),
+            None,
+            "second-ca".to_string(),
+        );
+        store.upsert(second, true).expect("same-kind replace");
+        let material = store
+            .material("ca-bundles/shared-ca", MaterialKind::CaBundle)
+            .expect("resolves after same-kind replacement");
+        assert_eq!(material.bytes, b"second-ca");
+        assert_eq!(material.kind, MaterialKind::CaBundle);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_upsert_persist_does_not_leave_mutation_visible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ManagedTlsStore::open(dir.path()).expect("open store");
+        let original = sample_record(ManagedTlsMaterialKind::CaBundle, "persist-ca");
+        store.upsert(original, false).expect("seed");
+
+        let mut perms = std::fs::metadata(dir.path())
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), perms).expect("chmod read-only");
+
+        let replacement = ManagedTlsRecord::new_ca_bundle(
+            "persist-ca".to_string(),
+            "persist-ca".to_string(),
+            None,
+            "replaced-ca".to_string(),
+        );
+        let error = store
+            .upsert(replacement, true)
+            .expect_err("persist should fail on read-only dir");
+        assert!(matches!(error, ManagedTlsError::Write(_)));
+
+        let mut perms = std::fs::metadata(dir.path())
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dir.path(), perms).expect("chmod restore");
+
+        let kept = store
+            .get("persist-ca")
+            .expect("in-memory original retained");
+        assert_eq!(kept.kind, ManagedTlsMaterialKind::CaBundle);
+        assert_eq!(kept.ca_bundle_pem.as_deref(), Some("ca"));
+        let reopened = ManagedTlsStore::open(dir.path()).expect("reopen");
+        let on_disk = reopened.get("persist-ca").expect("disk original retained");
+        assert_eq!(on_disk.ca_bundle_pem.as_deref(), Some("ca"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_delete_persist_does_not_leave_removal_visible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ManagedTlsStore::open(dir.path()).expect("open store");
+        store
+            .upsert(
+                sample_record(ManagedTlsMaterialKind::Jwks, "persist-jwks"),
+                false,
+            )
+            .expect("seed");
+
+        let mut perms = std::fs::metadata(dir.path())
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(dir.path(), perms).expect("chmod read-only");
+
+        let error = store
+            .delete("persist-jwks")
+            .expect_err("persist should fail on read-only dir");
+        assert!(matches!(error, ManagedTlsError::Write(_)));
+
+        let mut perms = std::fs::metadata(dir.path())
+            .expect("metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(dir.path(), perms).expect("chmod restore");
+
+        assert!(store.get("persist-jwks").is_ok());
+        let reopened = ManagedTlsStore::open(dir.path()).expect("reopen");
+        assert!(reopened.get("persist-jwks").is_ok());
     }
 }

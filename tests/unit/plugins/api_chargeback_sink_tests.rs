@@ -2147,8 +2147,8 @@ fn clickhouse_status_classification_distinguishes_permanent_and_retryable() {
     assert_eq!(classify_clickhouse_http_status_for_tests(200), "delivered");
     assert_eq!(classify_clickhouse_http_status_for_tests(204), "delivered");
     assert_eq!(classify_clickhouse_http_status_for_tests(400), "permanent");
-    assert_eq!(classify_clickhouse_http_status_for_tests(401), "permanent");
-    assert_eq!(classify_clickhouse_http_status_for_tests(403), "permanent");
+    assert_eq!(classify_clickhouse_http_status_for_tests(401), "retryable");
+    assert_eq!(classify_clickhouse_http_status_for_tests(403), "retryable");
     assert_eq!(classify_clickhouse_http_status_for_tests(408), "retryable");
     assert_eq!(
         classify_clickhouse_http_status_for_tests(413),
@@ -2417,28 +2417,8 @@ async fn replay_keeps_original_when_dead_letter_metadata_cannot_be_written() {
 }
 
 #[tokio::test]
-async fn replay_dead_letters_permanent_401_and_403() {
-    for status in [401u16, 403u16] {
-        let server = MockServer::start().await;
-        mount_status_sequence(&server, &[status]).await;
-
-        let temp = tempfile::tempdir().unwrap();
-        let spool = test_spool(&temp);
-        let path = spool
-            .write_events(&[sample_event(&format!("evt-{status}"))])
-            .unwrap();
-
-        replay_spool_once_for_tests(&spool, &server.uri())
-            .await
-            .unwrap();
-
-        assert_rejected_sidecar(&path, status, "permanent_http");
-    }
-}
-
-#[tokio::test]
-async fn replay_stops_on_retryable_redirect_408_429_and_5xx_without_removing_file() {
-    for status in [302u16, 408u16, 429u16, 500u16, 503u16] {
+async fn replay_stops_on_retryable_redirect_auth_408_429_and_5xx_without_removing_file() {
+    for status in [302u16, 401u16, 403u16, 408u16, 429u16, 500u16, 503u16] {
         let server = MockServer::start().await;
         mount_status_sequence(&server, &[status]).await;
 

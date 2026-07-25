@@ -21,8 +21,9 @@
 //!     finalize against a real broker.
 //!   - **mysql** — MySQL 8.4. Exercises custom-plugin migration recovery
 //!     across implicit-commit DDL boundaries, the example audit schema's
-//!     SQLx Any text bindings, and a cross-namespace `config_change_locks`
-//!     concurrency regression against ER_LOCK_DEADLOCK 1213.
+//!     SQLx Any text bindings, a cross-namespace `config_change_locks`
+//!     concurrency regression against ER_LOCK_DEADLOCK 1213, and byte-exact
+//!     NFC/NFD consumer identity uniqueness under `utf8mb4_0900_bin` (#2994).
 //!
 //! Container-backed tests self-skip (with a printed notice) when Docker is
 //! unavailable, so the suite is safe to run locally without Docker. In CI the

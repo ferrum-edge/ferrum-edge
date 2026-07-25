@@ -1151,6 +1151,13 @@ impl Plugin for Waf {
         PluginResult::Continue
     }
 
+    fn requires_buffered_grpc_web_trailer_policy(&self, ctx: &RequestContext) -> bool {
+        self.active
+            && self.config.response_inspection
+            && self.compiled.response_header_rules_active
+            && !self.exemptions.request_short_circuits(ctx)
+    }
+
     fn requires_response_body_buffering(&self) -> bool {
         self.active
             && self.config.response_inspection

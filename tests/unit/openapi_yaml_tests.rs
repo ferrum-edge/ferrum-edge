@@ -8246,6 +8246,7 @@ fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
         .iter()
         .chain(AI_SEMANTIC_CACHE_SEMANTIC_POLICY_KEYS.iter())
         .chain(REDIS_PLUGIN_CONFIG_KEYS.iter())
+        .chain(std::iter::once(&"redis_integrity_key"))
         .copied()
         .collect();
     assert_eq!(
@@ -8301,6 +8302,44 @@ fn ai_semantic_cache_schema_matches_runtime_unknown_key_contract() {
     assert!(
         section.contains("ai_semantic_cache.<instance_id>"),
         "docs must describe per-instance request-staging isolation"
+    );
+    assert_eq!(
+        schema["properties"]["semantic_vector_max_candidates"]["maximum"],
+        json!(1024),
+        "OpenAPI maximum must match the runtime HNSW candidate hard cap"
+    );
+    assert_eq!(
+        schema["properties"]["semantic_vector_max_candidates"]["minimum"],
+        json!(1),
+        "OpenAPI minimum must match positive candidate admission"
+    );
+    assert!(
+        section.contains("Hard maximum 1024"),
+        "docs must advertise the semantic_vector_max_candidates hard maximum"
+    );
+    assert!(
+        AiSemanticCache::new(
+            &json!({
+                "semantic_similarity_enabled": true,
+                "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",
+                "semantic_vector_max_candidates": 1024,
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_ok(),
+        "OpenAPI maximum must be runtime-admissible"
+    );
+    assert!(
+        AiSemanticCache::new(
+            &json!({
+                "semantic_similarity_enabled": true,
+                "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",
+                "semantic_vector_max_candidates": 1025,
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_err(),
+        "values above the OpenAPI maximum must fail runtime admission"
     );
 }
 

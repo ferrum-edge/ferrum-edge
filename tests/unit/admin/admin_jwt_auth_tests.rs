@@ -853,7 +853,13 @@ fn test_create_jwt_manager_rejects_invalid_max_ttl() {
     env.unset("FERRUM_ADMIN_JWT_ISSUER");
     env.unset("FERRUM_ADMIN_JWT_AUDIENCE");
 
-    for invalid in ["18446744073709551615", "9223372036854775808", "-1", "abc"] {
+    for invalid in [
+        "",
+        "18446744073709551615",
+        "9223372036854775808",
+        "-1",
+        "abc",
+    ] {
         env.set("FERRUM_ADMIN_JWT_MAX_TTL", invalid);
         assert!(
             create_jwt_manager_from_env().is_err(),
@@ -870,6 +876,72 @@ fn test_create_jwt_manager_rejects_invalid_max_ttl() {
             "FERRUM_ADMIN_JWT_MAX_TTL='{valid}' must be accepted"
         );
     }
+}
+
+/// Only an unset secret is [`JwtError::NotConfigured`]; an explicitly empty
+/// or otherwise invalid admin JWT setting is a distinct fail-closed error so
+/// read-only modes cannot silently replace operator intent with a random
+/// secret (#2977).
+#[test]
+fn test_create_jwt_manager_distinguishes_unset_from_invalid_explicit_config() {
+    use ferrum_edge::admin::jwt_auth::{JwtError, create_jwt_manager_from_env};
+
+    let env = AdminJwtEnvGuard::new();
+    env.unset("FERRUM_ADMIN_JWT_ISSUER");
+    env.unset("FERRUM_ADMIN_JWT_AUDIENCE");
+    env.unset("FERRUM_ADMIN_JWT_MAX_TTL");
+
+    env.unset("FERRUM_ADMIN_JWT_SECRET");
+    assert!(
+        matches!(create_jwt_manager_from_env(), Err(JwtError::NotConfigured)),
+        "unset secret must be NotConfigured"
+    );
+
+    env.set("FERRUM_ADMIN_JWT_SECRET", "");
+    let Err(empty_err) = create_jwt_manager_from_env() else {
+        panic!("explicit empty secret must fail");
+    };
+    assert!(
+        matches!(empty_err, JwtError::VerificationFailed(_)),
+        "explicit empty secret must not be treated as NotConfigured: {empty_err:?}"
+    );
+    assert!(
+        empty_err.to_string().contains("at least"),
+        "empty-secret diagnostic must name the length rule: {empty_err}"
+    );
+
+    // 20 chars — below MIN_JWT_SECRET_LENGTH (32).
+    env.set("FERRUM_ADMIN_JWT_SECRET", "short-secret-20-chars");
+    let Err(short_err) = create_jwt_manager_from_env() else {
+        panic!("short secret must fail");
+    };
+    assert!(
+        matches!(short_err, JwtError::VerificationFailed(_)),
+        "short secret must not be treated as NotConfigured: {short_err:?}"
+    );
+    assert!(
+        short_err.to_string().contains("at least"),
+        "short-secret diagnostic must name the length rule: {short_err}"
+    );
+    assert!(
+        !short_err.to_string().contains("short-secret-20-chars"),
+        "diagnostic must not echo the secret value: {short_err}"
+    );
+
+    // Related setting present-but-invalid even when the secret is unset.
+    env.unset("FERRUM_ADMIN_JWT_SECRET");
+    env.set("FERRUM_ADMIN_JWT_MAX_TTL", "not-a-number");
+    let Err(ttl_err) = create_jwt_manager_from_env() else {
+        panic!("invalid max TTL must fail even when secret is unset");
+    };
+    assert!(
+        matches!(ttl_err, JwtError::VerificationFailed(_)),
+        "invalid max TTL must not be NotConfigured: {ttl_err:?}"
+    );
+    assert!(
+        ttl_err.to_string().contains("FERRUM_ADMIN_JWT_MAX_TTL"),
+        "diagnostic must name the setting: {ttl_err}"
+    );
 }
 
 // ── Optional audience (`aud`) enforcement ─────────────────────────────

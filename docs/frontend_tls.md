@@ -40,7 +40,7 @@ export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_PATH="/path/to/client-ca-bundle.pem"
 export FERRUM_FRONTEND_TLS_CLIENT_CA_BUNDLE_SOURCE="file:///path/to/client-ca-bundle.pem"
 ```
 
-`*_SOURCE` values override their matching `*_PATH` values when both are set. They can be ordinary filesystem paths, `file://` URIs, inline PEM beginning with `-----BEGIN `, provider URIs, Kubernetes Secret URIs such as `k8s://edge/frontend#tls.crt`, ACME-issued records such as `acme://certificates/edge-cert#cert`, or admin-managed URIs such as `managed://certificates/edge-cert#cert` and `managed://ocsp-responses/edge-ocsp#ocsp`. Frontend/admin server key sources can also use non-extractable RSA PKCS#11 keys when the binary is built with the `pkcs11` Cargo feature. Inline PEM is redacted in debug output. File/external-source-backed frontend/admin cert, key, client-CA, OCSP response, and CRL sources can be live-reloaded when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`; inline PEM remains static until config reload.
+`*_SOURCE` values override their matching `*_PATH` values when both are set. They can be ordinary filesystem paths, `file://` URIs, inline PEM beginning with `-----BEGIN `, provider URIs, Kubernetes Secret URIs such as `k8s://edge/frontend#tls.crt`, ACME-issued records such as `acme://certificates/edge-cert#cert`, or admin-managed URIs such as `managed://certificates/edge-cert#cert` and `managed://ocsp-responses/edge-ocsp#ocsp`. Managed TLS record IDs are globally unique across certificates, CA bundles, CRLs, OCSP responses, and JWKS (not namespaced by collection); typed admin overwrite paths reject cross-kind ID collisions with `409 Conflict`. Frontend/admin server key sources can also use non-extractable RSA PKCS#11 keys when the binary is built with the `pkcs11` Cargo feature. Inline PEM is redacted in debug output. File/external-source-backed frontend/admin cert, key, client-CA, OCSP response, and CRL sources can be live-reloaded when `FERRUM_FRONTEND_TLS_LIVE_RELOAD_ENABLED=true`; inline PEM remains static until config reload.
 
 PKCS#11 key sources use the token for TLS signing without exporting the private key:
 
@@ -435,6 +435,19 @@ All TLS sources are validated at startup and config load time when their owning 
 The frontend/admin live-reload poller atomically swaps a validated `rustls::ServerConfig` for new handshakes. The frontend DTLS poller swaps the active DTLS server material for new DTLS sessions. Existing TLS/DTLS sessions keep the config they negotiated with. A failed reload keeps the previous config in service and logs a warning without exposing PEM contents.
 
 For backend HTTP-family TLS, keep `FERRUM_BACKEND_TLS_LIVE_RELOAD_ENABLED=true` to pick up in-place cert/key/CA/CRL source changes and to watch backend TLS sources added by later config reloads. Database TLS can opt in with `FERRUM_DB_TLS_LIVE_RELOAD_ENABLED=true` in database and CP modes. CP gRPC TLS swaps the server TLS slot for new handshakes when watched source bytes change; DP gRPC TLS reconnects the CP stream with fresh client-side TLS material.
+
+### TLS Inventory Visibility and Metrics
+
+`GET /admin/tls/inventory` collects live: it loads every configured source on each request, including private keys (parse-checked and dropped immediately), so an operator request may reach the filesystem, the Kubernetes API, and secret managers.
+
+Prometheus `/metrics` deliberately does not. Its `ferrum_tls_cert_expiry_seconds` / `ferrum_tls_cert_not_before_seconds` gauges are rendered from a cached, non-secret inventory snapshot, so a scrape performs **zero** certificate, private-key, Kubernetes, HSM, or cloud-secret I/O and never blocks on a secret provider (a Prometheus fleet cannot amplify a secret-backend incident, and an allowed scraper cannot drive private-key materialization outside the reload lifecycle).
+
+The snapshot is produced off the request path by a bounded, single-flight background refresh:
+
+- It reads only public certificate-family material — certificate, CA bundle, CRL. Private-key, JWKS, and OCSP sources are never materialized for metrics; those entries report health from the owning validated config/reload state (startup and every reload validate a source before adopting it, and a recorded watcher load/rebuild failure downgrades the entry without re-reading a byte).
+- A scrape refreshes nothing itself. When the snapshot is older than `FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS` (default 300; `0` disables the refresh and leaves the gauges absent) the scrape only schedules the refresh, and at most one refresh runs process-wide at a time.
+- Validated rotation and reload outcomes mark the snapshot stale, so a rotated certificate is picked up on the next scrape instead of at the end of the TTL window.
+- Freshness is explicit: `ferrum_tls_inventory_snapshot_timestamp_seconds` carries the snapshot's collection time and `ferrum_tls_inventory_snapshot_max_age_seconds` carries the configured bound. Alert on `time() - ferrum_tls_inventory_snapshot_timestamp_seconds` exceeding that bound rather than assuming scrape-time collection.
 
 ### Backend Connection Pool and TLS Paths
 

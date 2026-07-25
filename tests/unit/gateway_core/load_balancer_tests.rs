@@ -718,7 +718,8 @@ fn test_least_latency_target_unhealthy_at_startup_then_recovers() {
     // If a target is unhealthy at startup, the other targets should complete
     // warm-up and enter latency-based selection without being blocked.
     // When the unhealthy target later recovers and joins the healthy pool,
-    // it should NOT force the entire upstream back into round-robin warm-up.
+    // it should NOT force the entire upstream back into round-robin warm-up,
+    // and must not pin 100% of traffic via an unconditional warm-up bias.
     let targets = make_targets(3);
     let lb = LoadBalancer::new(
         TEST_UPSTREAM,
@@ -748,15 +749,26 @@ fn test_least_latency_target_unhealthy_at_startup_then_recovers() {
     // Now host2 recovers — remove from unhealthy set
     unhealthy.remove(&format!("{}::host2:8080", TEST_UPSTREAM));
 
-    // host2 has 0 samples, but host0/host1 are warmed up.
-    // The algorithm should NOT regress to round-robin for all traffic.
-    // Instead, host2 should be favored (min EWMA - LATENCY_WARMUP_BIAS_US)
-    // to get traffic and establish a real baseline.
-    let sel = lb.select("", Some(&active_health_ctx(&unhealthy))).unwrap();
-    assert_eq!(
-        sel.target.host, "host2",
-        "Recovered host2 should be favored as a late joiner to establish baseline, got {}",
-        sel.target.host
+    // host2 has 0 samples, but host0/host1 are warmed up. Bounded exploration
+    // gives the late joiner a minority share; majority stays on warmed peers.
+    let n = 200;
+    let mut host2_hits = 0usize;
+    let mut host1_hits = 0usize;
+    for _ in 0..n {
+        let sel = lb.select("", Some(&active_health_ctx(&unhealthy))).unwrap();
+        if sel.target.host == "host2" {
+            host2_hits += 1;
+        } else if sel.target.host == "host1" {
+            host1_hits += 1;
+        }
+    }
+    assert!(
+        host2_hits > 0 && host2_hits < n / 2,
+        "recovered late joiner gets bounded exploration, not a pin (hits={host2_hits})"
+    );
+    assert!(
+        host1_hits > n / 2,
+        "warmed lowest-latency target should keep the majority share"
     );
 
     // After host2 gets enough samples (simulate warm-up completing), the
@@ -777,7 +789,7 @@ fn test_least_latency_target_unhealthy_at_startup_then_recovers() {
 fn test_least_latency_late_joiner_does_not_disrupt_routing() {
     // When a new target joins (e.g., added via config reload or recovered from
     // unhealthy), the existing latency-based routing should continue uninterrupted.
-    // The new target should get a fair share via optimistic EWMA estimation.
+    // The new target receives bounded exploration, not an unconditional preference.
     let targets = make_targets(2);
     let lb = LoadBalancer::new(
         TEST_UPSTREAM,
@@ -803,13 +815,24 @@ fn test_least_latency_late_joiner_does_not_disrupt_routing() {
         .unwrap()
         .store(0, Ordering::Relaxed);
 
-    // The algorithm should NOT fall back to pure round-robin.
-    // host0 (unwarmed) gets min EWMA - LATENCY_WARMUP_BIAS_US, so it should
-    // be favored to establish its real baseline.
-    let sel = lb.select("", None).unwrap();
-    assert_eq!(
-        sel.target.host, "host0",
-        "Late joiner (host0) should be slightly favored to establish baseline"
+    let n = 200;
+    let mut host0_hits = 0usize;
+    let mut host1_hits = 0usize;
+    for _ in 0..n {
+        let sel = lb.select("", None).unwrap();
+        if sel.target.host == "host0" {
+            host0_hits += 1;
+        } else {
+            host1_hits += 1;
+        }
+    }
+    assert!(
+        host0_hits > 0 && host0_hits < n / 2,
+        "late joiner gets bounded exploration (hits={host0_hits})"
+    );
+    assert!(
+        host1_hits > n / 2,
+        "warmed preferred target keeps majority share"
     );
 
     // After host0 re-warms with its real (higher) latency, host1 should win again.
@@ -825,17 +848,8 @@ fn test_least_latency_late_joiner_does_not_disrupt_routing() {
 }
 
 #[test]
-fn test_least_latency_warmup_bias_applied_to_unsampled_target() {
-    // Verify that the LATENCY_WARMUP_BIAS_US constant is applied via
-    // saturating_sub when selecting among a mix of warmed and unsampled
-    // targets.  The unsampled target gets `min_known_ewma - bias`, which
-    // is strictly less than any warmed EWMA when min_known_ewma > bias.
-    //
-    // Note: any nonzero bias (including 1) produces the same winner --
-    // `saturating_sub(N)` for N >= 1 always yields a value < min_known_ewma
-    // when min_known_ewma > 0.  The named constant (1000 us = 1 ms)
-    // documents the intended preference gap without changing selection
-    // outcomes.
+fn test_least_latency_unsampled_target_gets_bounded_exploration_not_pin() {
+    // Mixed warm-up must explore unsampled targets without pinning all traffic.
     let targets = make_targets(3);
     let lb = LoadBalancer::new(
         TEST_UPSTREAM,
@@ -845,23 +859,31 @@ fn test_least_latency_warmup_bias_applied_to_unsampled_target() {
     );
 
     // Warm up host0 and host1 with low latencies (1.5ms and 2ms).
-    // min_known_ewma converges to ~1500 us after 10 samples.
     for _ in 0..10 {
         lb.record_latency(&targets[0], 1_500); // 1.5ms
         lb.record_latency(&targets[1], 2_000); // 2ms
     }
 
-    // host2 has 0 samples -- the bias makes its effective latency
-    // ~1500 - 1000 = ~500 us, strictly below both warmed targets.
-    let sel = lb.select("", None).unwrap();
-    assert_eq!(
-        sel.target.host, "host2",
-        "Unsampled host2 should be selected via warm-up bias"
+    let n = 200;
+    let mut host2_hits = 0usize;
+    let mut host0_hits = 0usize;
+    for _ in 0..n {
+        let sel = lb.select("", None).unwrap();
+        match sel.target.host.as_str() {
+            "host2" => host2_hits += 1,
+            "host0" => host0_hits += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        host2_hits > 0 && host2_hits < n,
+        "unsampled host2 must receive some exploration without pinning all traffic"
+    );
+    assert!(
+        host0_hits > host2_hits,
+        "warmed lowest-EWMA target should outpace unsampled exploration"
     );
 
-    // Confirm host0's EWMA is in the expected range (sanity check that
-    // the EWMA arithmetic converged and the bias subtracted from a
-    // meaningful value).
     let host0_ewma = lb
         .latency_ewma
         .get("host0:8080")
@@ -875,14 +897,39 @@ fn test_least_latency_warmup_bias_applied_to_unsampled_target() {
 }
 
 #[test]
-fn test_least_latency_warmup_bias_saturates_to_zero() {
-    // When min_known_ewma < LATENCY_WARMUP_BIAS_US, saturating_sub
-    // clamps to 0.  The unsampled target still wins because 0 < any
-    // positive warmed EWMA.
-    //
-    // This also covers the edge case where min_known_ewma == 0: both
-    // the old bias (1) and the new bias (1000) saturate to 0, producing
-    // a tie broken by iteration order (first-in-list wins).
+fn test_least_latency_exploration_reaches_multiple_unsampled_targets() {
+    let targets = make_targets(3);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
+
+    for _ in 0..10 {
+        lb.record_latency(&targets[0], 1_500);
+    }
+
+    let mut host1_hits = 0usize;
+    let mut host2_hits = 0usize;
+    for _ in 0..400 {
+        let selected = lb.select("", None).unwrap();
+        match selected.target.host.as_str() {
+            "host1" => host1_hits += 1,
+            "host2" => host2_hits += 1,
+            _ => {}
+        }
+    }
+    assert!(
+        host1_hits > 0 && host2_hits > 0,
+        "bounded exploration must reach every unsampled peer (host1={host1_hits}, host2={host2_hits})"
+    );
+}
+
+#[test]
+fn test_least_latency_failed_attempts_exit_warmup_without_pinning() {
+    // A never-successful peer that accumulates failure penalties must leave
+    // warm-up and stop receiving exploration-driven preference.
     let targets = make_targets(2);
     let lb = LoadBalancer::new(
         TEST_UPSTREAM,
@@ -891,17 +938,23 @@ fn test_least_latency_warmup_bias_saturates_to_zero() {
         None,
     );
 
-    // Warm up host0 with a sub-millisecond latency (500 us).
-    // min_known_ewma = 500, bias = 1000, so 500.saturating_sub(1000) = 0.
-    // 0 < 500, so unsampled host1 still wins.
     for _ in 0..10 {
         lb.record_latency(&targets[0], 500);
     }
+    for _ in 0..5 {
+        lb.record_failed_attempt(&targets[1]);
+    }
 
-    let sel = lb.select("", None).unwrap();
+    let mut host1_hits = 0usize;
+    for _ in 0..100 {
+        let sel = lb.select("", None).unwrap();
+        if sel.target.host == "host1" {
+            host1_hits += 1;
+        }
+    }
     assert_eq!(
-        sel.target.host, "host1",
-        "Unsampled host1 should win even when bias saturates to 0"
+        host1_hits, 0,
+        "failure-penalized target must not win steady-state selection"
     );
 }
 
@@ -1833,7 +1886,14 @@ fn test_passive_health_filters_targets() {
     };
 
     // Mark host1 as passively unhealthy
-    checker.report_response("test-proxy", &targets[1], 500, false, Some(&config));
+    checker.report_response(
+        "test-proxy",
+        "test-upstream",
+        &targets[1],
+        500,
+        false,
+        Some(&config),
+    );
 
     let active: DashMap<String, u64> = DashMap::new();
     let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
@@ -1886,20 +1946,65 @@ fn ejection_cap_readmits_when_too_many_passively_ejected() {
     };
 
     // Eject 3 targets (host0, host1, host2) — exceeds 50% cap (max 2)
-    checker.report_response("test-proxy", &targets[0], 500, false, Some(&config));
-    checker.report_response("test-proxy", &targets[1], 500, false, Some(&config));
-    checker.report_response("test-proxy", &targets[2], 500, false, Some(&config));
+    checker.report_response(
+        "test-proxy",
+        "test-upstream",
+        &targets[0],
+        500,
+        false,
+        Some(&config),
+    );
+    checker.report_response(
+        "test-proxy",
+        "test-upstream",
+        &targets[1],
+        500,
+        false,
+        Some(&config),
+    );
+    checker.report_response(
+        "test-proxy",
+        "test-upstream",
+        &targets[2],
+        500,
+        false,
+        Some(&config),
+    );
     let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
     let proxy_passive = proxy_passive.expect("passive state should be created");
-    proxy_passive
-        .unhealthy
-        .insert(target_host_port_key(&targets[0]), 100);
-    proxy_passive
-        .unhealthy
-        .insert(target_host_port_key(&targets[1]), 200);
-    proxy_passive
-        .unhealthy
-        .insert(target_host_port_key(&targets[2]), 300);
+    proxy_passive.unhealthy.insert(
+        target_host_port_key(&targets[0]),
+        ferrum_edge::health_check::PassiveEjection {
+            ejected_at_ms: 100,
+            recover_at_ms: 100,
+            auto_recover: false,
+            upstream_id: TEST_UPSTREAM.to_string(),
+            host: targets[0].host.clone(),
+            port: targets[0].port,
+        },
+    );
+    proxy_passive.unhealthy.insert(
+        target_host_port_key(&targets[1]),
+        ferrum_edge::health_check::PassiveEjection {
+            ejected_at_ms: 200,
+            recover_at_ms: 200,
+            auto_recover: false,
+            upstream_id: TEST_UPSTREAM.to_string(),
+            host: targets[1].host.clone(),
+            port: targets[1].port,
+        },
+    );
+    proxy_passive.unhealthy.insert(
+        target_host_port_key(&targets[2]),
+        ferrum_edge::health_check::PassiveEjection {
+            ejected_at_ms: 300,
+            recover_at_ms: 300,
+            auto_recover: false,
+            upstream_id: TEST_UPSTREAM.to_string(),
+            host: targets[2].host.clone(),
+            port: targets[2].port,
+        },
+    );
 
     let active: DashMap<String, u64> = DashMap::new();
 
@@ -1954,7 +2059,7 @@ fn ejection_cap_zero_percent_readmits_all() {
 
     // Eject all 3 targets
     for t in &targets {
-        checker.report_response("test-proxy", t, 500, false, Some(&config));
+        checker.report_response("test-proxy", "test-upstream", t, 500, false, Some(&config));
     }
 
     let active: DashMap<String, u64> = DashMap::new();
@@ -2013,7 +2118,14 @@ fn ejection_cap_does_not_affect_active_health_ejections() {
         gateway_error_codes: None,
         split_external_local_origin_errors: None,
     };
-    checker.report_response("test-proxy", &targets[1], 500, false, Some(&config));
+    checker.report_response(
+        "test-proxy",
+        "test-upstream",
+        &targets[1],
+        500,
+        false,
+        Some(&config),
+    );
 
     let proxy_passive = checker.passive_health.get("test-proxy").map(|e| e.clone());
 
@@ -2127,7 +2239,7 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
     let dial_decision = |ejected: &[(&UpstreamTarget, u64)]| -> bool {
         let checker = HealthChecker::new();
         for (t, _) in ejected {
-            checker.report_response("test-proxy", t, 500, false, Some(&config));
+            checker.report_response("test-proxy", "test-upstream", t, 500, false, Some(&config));
         }
         let proxy_passive = checker
             .passive_health
@@ -2136,7 +2248,17 @@ fn passthrough_ejection_cap_scoped_to_candidate_pool_not_whole_upstream() {
             .expect("passive state should be created");
         // Deterministic ejection timestamps (earliest = the in-pool target).
         for (t, ts) in ejected {
-            proxy_passive.unhealthy.insert(target_host_port_key(t), *ts);
+            proxy_passive.unhealthy.insert(
+                target_host_port_key(t),
+                ferrum_edge::health_check::PassiveEjection {
+                    ejected_at_ms: *ts,
+                    recover_at_ms: *ts,
+                    auto_recover: false,
+                    upstream_id: "test-upstream".to_string(),
+                    host: t.host.clone(),
+                    port: t.port,
+                },
+            );
         }
         let ctx = HealthContext {
             active_unhealthy: &active,
@@ -2571,5 +2693,162 @@ fn update_targets_preserves_existing_subsets() {
             "v2-b".to_string(),
             "v2-c".to_string()
         ])
+    );
+}
+
+// ─── LeastLatency warm-up / passive recovery (#2942) ────────────────────────
+
+#[test]
+fn least_latency_persistent_failure_does_not_pin_all_traffic() {
+    // Warm target A with real samples; never-sampled failing target B must not
+    // win every selection (bounded exploration + failure accounting).
+    let targets = make_targets(2);
+    let lb = LoadBalancer::new(
+        TEST_UPSTREAM,
+        LoadBalancerAlgorithm::LeastLatency,
+        &targets,
+        None,
+    );
+
+    for _ in 0..5 {
+        lb.record_latency(&targets[0], 10_000); // 10ms
+    }
+
+    // Simulate persistent failure on B without ever recording a success sample.
+    // Even without failures recorded, bounded exploration must not pin 100%.
+    let n = 200;
+    let mut b_hits = 0usize;
+    for _ in 0..n {
+        let sel = lb.select("", None).unwrap();
+        if sel.target.host == "host1" {
+            b_hits += 1;
+        }
+    }
+    assert!(
+        b_hits < n,
+        "unsampled target must not pin all {n} selections (got {b_hits})"
+    );
+    assert!(
+        b_hits > 0,
+        "healthy late-joiner / unsampled peer still receives bounded exploration"
+    );
+
+    // After enough failure penalties, B exits warm-up with a poor EWMA and
+    // should receive ~0 steady-state traffic vs warmed A.
+    for _ in 0..5 {
+        lb.record_failed_attempt(&targets[1]);
+    }
+    let mut b_hits_after = 0usize;
+    for _ in 0..100 {
+        let sel = lb.select("", None).unwrap();
+        if sel.target.host == "host1" {
+            b_hits_after += 1;
+        }
+    }
+    assert_eq!(
+        b_hits_after, 0,
+        "after failure penalties, persistently failing target must not win steady-state selection"
+    );
+}
+
+#[test]
+fn least_latency_passive_recovery_does_not_restore_warmup_bias() {
+    use ferrum_edge::config::types::{HealthCheckConfig, PassiveHealthCheck};
+    use ferrum_edge::health_check::HealthChecker;
+    use std::sync::Arc;
+
+    let targets = make_targets(2);
+    let config = GatewayConfig {
+        upstreams: vec![Upstream {
+            id: TEST_UPSTREAM.into(),
+            namespace: ferrum_edge::config::types::default_namespace(),
+            name: Some("ll".into()),
+            targets: targets.clone(),
+            algorithm: LoadBalancerAlgorithm::LeastLatency,
+            hash_on: None,
+            hash_on_cookie_config: None,
+            health_checks: Some(HealthCheckConfig {
+                active: None,
+                passive: Some(PassiveHealthCheck {
+                    unhealthy_threshold: 1,
+                    healthy_after_seconds: 1,
+                    ..PassiveHealthCheck::default()
+                }),
+            }),
+            service_discovery: None,
+            subsets: None,
+            port_overrides: HashMap::new(),
+            source_locality: None,
+            locality_lb_strict: false,
+            locality_lb_setting: None,
+            backend_tls_client_cert_path: None,
+            backend_tls_client_key_path: None,
+            backend_tls_verify_server_cert: true,
+            backend_tls_server_ca_cert_path: None,
+            backend_tls_sni: None,
+            backend_tls_san_allow_list: Vec::new(),
+            resolved_subset_tls: HashMap::new(),
+            dispatch_port_override_fallback: None,
+            api_spec_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }],
+        ..Default::default()
+    };
+
+    let lb_cache = Arc::new(LoadBalancerCache::new(&config));
+    let mut checker = HealthChecker::new();
+    checker.set_load_balancer_cache(Arc::clone(&lb_cache));
+
+    // Warm A; leave B unsampled, then eject+recover B via passive timer path.
+    let inner = lb_cache.load();
+    let balancer = inner.balancers().get(TEST_UPSTREAM).unwrap();
+    for _ in 0..5 {
+        balancer.record_latency(&targets[0], 10_000);
+    }
+
+    let pasv = PassiveHealthCheck {
+        unhealthy_threshold: 1,
+        healthy_after_seconds: 1,
+        ..PassiveHealthCheck::default()
+    };
+    checker.report_response("p1", TEST_UPSTREAM, &targets[1], 500, false, Some(&pasv));
+    assert!(
+        checker
+            .passive_health
+            .get("p1")
+            .unwrap()
+            .unhealthy
+            .contains_key("host1:8080")
+    );
+
+    {
+        let ps = checker.passive_health.get("p1").unwrap();
+        ps.unhealthy.get_mut("host1:8080").unwrap().recover_at_ms = 1;
+    }
+    checker.recover_due_passive_ejections();
+    assert!(
+        !checker
+            .passive_health
+            .get("p1")
+            .unwrap()
+            .unhealthy
+            .contains_key("host1:8080")
+    );
+
+    // Post-recovery: B must participate as a warmed peer (sample count seeded),
+    // not as biased-best warm-up. With no real latency yet it shares A's min EWMA
+    // seed — selections should not be 100% B.
+    let mut b_hits = 0usize;
+    let n = 100;
+    for _ in 0..n {
+        let sel = balancer.select("", None).unwrap();
+        if sel.target.host == "host1" {
+            b_hits += 1;
+        }
+    }
+    assert!(
+        b_hits < n,
+        "passive recovery must not restore unconditional warm-up preference for B (hits={b_hits})"
     );
 }

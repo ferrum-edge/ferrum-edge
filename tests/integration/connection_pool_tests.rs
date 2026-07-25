@@ -469,7 +469,7 @@ async fn test_concurrent_pool_access() {
 }
 
 #[tokio::test]
-async fn test_idle_timeout_does_not_fragment_pool() {
+async fn test_idle_timeout_fragments_reqwest_pool() {
     let pool = ConnectionPool::new(
         PoolConfig::default(),
         create_test_env_config(),
@@ -478,8 +478,8 @@ async fn test_idle_timeout_does_not_fragment_pool() {
         std::sync::Arc::new(Vec::new()),
     );
 
-    // Two proxies with same host/port/protocol but different idle timeouts
-    // should share the same pool entry (idle_timeout is excluded from pool key)
+    // Idle timeout is baked into the shared reqwest::Client, so divergent
+    // values must isolate distinct pool entries (issue #2951).
     let mut proxy1 = create_test_proxy();
     proxy1.pool_idle_timeout_seconds = Some(30);
 
@@ -491,8 +491,82 @@ async fn test_idle_timeout_does_not_fragment_pool() {
 
     let stats = pool.get_stats();
     assert_eq!(
-        stats.total_pools, 1,
-        "Different idle_timeout_seconds should NOT fragment the pool"
+        stats.total_pools, 2,
+        "Different idle_timeout_seconds must fragment the reqwest pool"
+    );
+}
+
+/// Issue #2951: same endpoint + same client-level settings share one client;
+/// divergent client-baked settings (H2 stream window with adaptive off) must not.
+#[tokio::test]
+async fn test_client_level_pool_settings_share_and_isolate() {
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+        None,
+        std::sync::Arc::new(Vec::new()),
+    );
+
+    let mut same_a = create_test_proxy();
+    same_a.id = "same-a".to_string();
+    same_a.pool_http2_adaptive_window = Some(false);
+    same_a.pool_http2_initial_stream_window_size = Some(65_535);
+
+    let mut same_b = create_test_proxy();
+    same_b.id = "same-b".to_string();
+    same_b.pool_http2_adaptive_window = Some(false);
+    same_b.pool_http2_initial_stream_window_size = Some(65_535);
+
+    let _c1 = pool.get_client(&same_a).await.unwrap();
+    let _c2 = pool.get_client(&same_b).await.unwrap();
+    assert_eq!(
+        pool.get_stats().total_pools,
+        1,
+        "identical endpoint + identical client-level settings must share one reqwest client"
+    );
+
+    let mut divergent = create_test_proxy();
+    divergent.id = "divergent".to_string();
+    divergent.pool_http2_adaptive_window = Some(false);
+    divergent.pool_http2_initial_stream_window_size = Some(8_388_608);
+
+    let _c3 = pool.get_client(&divergent).await.unwrap();
+    assert_eq!(
+        pool.get_stats().total_pools,
+        2,
+        "divergent pool_http2_initial_stream_window_size must not share a reqwest client"
+    );
+}
+
+/// Adaptive window overrides fixed initial windows in reqwest/hyper, so two
+/// proxies with `aw=1` and different fixed windows still share one client.
+#[tokio::test]
+async fn test_adaptive_window_precedence_does_not_fragment() {
+    let pool = ConnectionPool::new(
+        PoolConfig::default(),
+        create_test_env_config(),
+        create_test_dns_cache(),
+        None,
+        std::sync::Arc::new(Vec::new()),
+    );
+
+    let mut a = create_test_proxy();
+    a.id = "aw-a".to_string();
+    a.pool_http2_adaptive_window = Some(true);
+    a.pool_http2_initial_stream_window_size = Some(65_535);
+
+    let mut b = create_test_proxy();
+    b.id = "aw-b".to_string();
+    b.pool_http2_adaptive_window = Some(true);
+    b.pool_http2_initial_stream_window_size = Some(8_388_608);
+
+    let _c1 = pool.get_client(&a).await.unwrap();
+    let _c2 = pool.get_client(&b).await.unwrap();
+    assert_eq!(
+        pool.get_stats().total_pools,
+        1,
+        "adaptive-window precedence: divergent fixed windows must not fragment"
     );
 }
 

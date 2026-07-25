@@ -2371,3 +2371,295 @@ plugin_configs: []
         "expected missing-field diagnostic, got: {msg}"
     );
 }
+
+// ============================================================================
+// File stability / atomicity contract (issue #2978)
+// ============================================================================
+
+fn two_plugin_config_yaml(include_second_plugin: bool, declare_counts: Option<usize>) -> String {
+    let mut yaml = String::from(
+        r#"
+version: "1"
+"#,
+    );
+    if let Some(plugin_count) = declare_counts {
+        yaml.push_str(&format!(
+            r#"resource_counts:
+  proxies: 1
+  consumers: 0
+  plugin_configs: {plugin_count}
+  upstreams: 0
+"#
+        ));
+    }
+    yaml.push_str(
+        r#"proxies:
+  - id: "proxy-1"
+    listen_path: "/api"
+    backend_scheme: http
+    backend_host: "localhost"
+    backend_port: 3000
+    plugins:
+      - plugin_config_id: "log-plugin"
+"#,
+    );
+    if include_second_plugin {
+        yaml.push_str(
+            r#"      - plugin_config_id: "key-auth"
+"#,
+        );
+    }
+    yaml.push_str(
+        r#"consumers: []
+plugin_configs:
+  - id: "log-plugin"
+    plugin_name: "stdout_logging"
+    config: {}
+    scope: proxy
+    proxy_id: "proxy-1"
+    enabled: true
+"#,
+    );
+    if include_second_plugin {
+        yaml.push_str(
+            r#"  - id: "key-auth"
+    plugin_name: "key_auth"
+    config: {}
+    scope: proxy
+    proxy_id: "proxy-1"
+    enabled: true
+"#,
+        );
+    }
+    yaml
+}
+
+#[test]
+fn test_torn_trailing_plugin_configs_rejected_by_resource_counts() {
+    // Truncation at the list-item boundary after plugin N-1 still parses as
+    // valid YAML with N-1 plugins. resource_counts near the top of the file
+    // survives that truncation and fails closed before admission.
+    let truncated = two_plugin_config_yaml(false, Some(2));
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{truncated}").unwrap();
+
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("truncated trailing plugin_configs must fail resource_counts seal");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("resource_counts mismatch"),
+        "expected resource_counts diagnostic, got: {message}"
+    );
+    assert!(
+        message.contains("plugin_configs=2") && message.contains("plugin_configs=1"),
+        "diagnostic should show declared vs observed plugin counts: {message}"
+    );
+}
+
+#[test]
+fn test_resource_counts_matching_full_document_accepted() {
+    let full = two_plugin_config_yaml(true, Some(2));
+    let mut file = NamedTempFile::with_suffix(".yaml").unwrap();
+    write!(file, "{full}").unwrap();
+
+    let config = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("matching resource_counts must admit the candidate");
+    assert_eq!(config.plugin_configs.len(), 2);
+    assert_eq!(config.plugin_configs[1].id, "key-auth");
+}
+
+#[test]
+fn test_stable_atomic_rename_replacement_accepted() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let live_path = dir.path().join("config.yaml");
+    std::fs::write(&live_path, two_plugin_config_yaml(false, Some(1))).unwrap();
+
+    let initial = load_config_from_file(
+        live_path.to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("initial stable snapshot must load");
+    assert_eq!(initial.plugin_configs.len(), 1);
+
+    let staging = dir.path().join("config.yaml.staging");
+    std::fs::write(&staging, two_plugin_config_yaml(true, Some(2))).unwrap();
+    std::fs::rename(&staging, &live_path).unwrap();
+
+    let reloaded = load_config_from_file(
+        live_path.to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("atomic rename replacement must be admitted");
+    assert_eq!(reloaded.plugin_configs.len(), 2);
+    assert_eq!(reloaded.plugin_configs[1].plugin_name, "key_auth");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_reload_keeps_caller_snapshot_when_candidate_is_torn() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let live_path = dir.path().join("config.yaml");
+    let path = live_path.to_str().unwrap();
+    std::fs::write(&live_path, two_plugin_config_yaml(true, Some(2))).unwrap();
+
+    let accepted = reload_config_from_file(
+        path,
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect("full document must reload");
+    assert_eq!(accepted.plugin_configs.len(), 2);
+
+    // Simulate a paused torn write: truncate at the trailing plugin_configs
+    // list-item boundary while leaving resource_counts declaring two plugins.
+    std::fs::write(&live_path, two_plugin_config_yaml(false, Some(2))).unwrap();
+    let error = reload_config_from_file(
+        path,
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("torn truncation must fail closed");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("resource_counts mismatch"),
+        "reload must reject the torn candidate: {message}"
+    );
+    assert_eq!(
+        accepted.plugin_configs.len(),
+        2,
+        "caller retains the last known-good snapshot when reload fails closed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_non_regular_fifo_config_path_rejected() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let fifo_path = dir.path().join("config.yaml");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo_path)
+        .status()
+        .expect("mkfifo must be available on Unix CI images");
+    assert!(status.success(), "mkfifo failed: {status}");
+
+    let err = load_config_from_file(
+        fifo_path.to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("FIFO config paths must fail closed");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("not a regular file"),
+        "expected regular-file diagnostic, got: {message}"
+    );
+}
+
+#[test]
+fn test_oversized_config_rejected_before_read_and_parse() {
+    let file = NamedTempFile::with_suffix(".yaml").unwrap();
+    file.as_file()
+        .set_len(64 * 1024 * 1024 + 1)
+        .expect("create sparse oversized config fixture");
+
+    let err = load_config_from_file(
+        file.path().to_str().unwrap(),
+        30,
+        &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+        "ferrum",
+    )
+    .expect_err("oversized config must fail before parsing");
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("maximum supported size is 67108864 bytes"),
+        "expected bounded-size diagnostic, got: {message}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_in_place_content_churn_fails_closed_or_never_admits_torn_plugin_list() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let live_path = dir.path().join("config.yaml");
+    // resource_counts seals the paused-torn case where both stable-read probes
+    // could otherwise observe identical truncated bytes with unchanged metadata.
+    let full = two_plugin_config_yaml(true, Some(2));
+    let torn = two_plugin_config_yaml(false, Some(2));
+    std::fs::write(&live_path, &full).unwrap();
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::clone(&stop);
+    let writer_path = live_path.clone();
+    let writer = std::thread::spawn(move || {
+        let mut flip = false;
+        while !writer_stop.load(Ordering::Relaxed) {
+            let body = if flip { &full } else { &torn };
+            // In-place rewrite without rename — the hazard surface for editors
+            // and shell redirection. Ignore transient errors from concurrent readers.
+            let _ = std::fs::write(&writer_path, body);
+            flip = !flip;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let path = live_path.to_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut saw_reject = false;
+    let mut successes = 0usize;
+    while Instant::now() < deadline {
+        match load_config_from_file(
+            path,
+            30,
+            &ferrum_edge::config::BackendEgressPolicy::unrestricted(),
+            "ferrum",
+        ) {
+            Ok(config) => {
+                successes += 1;
+                assert_eq!(
+                    config.plugin_configs.len(),
+                    2,
+                    "must never admit the torn one-plugin truncation while an \
+                     in-place writer is churning the path"
+                );
+            }
+            Err(error) => {
+                let message = format!("{error:#}");
+                if message.contains("unstable")
+                    || message.contains("changed between")
+                    || message.contains("resource_counts mismatch")
+                {
+                    saw_reject = true;
+                }
+            }
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread");
+
+    assert!(
+        saw_reject || successes > 0,
+        "churn test must observe either fail-closed rejects or only full two-plugin successes"
+    );
+}

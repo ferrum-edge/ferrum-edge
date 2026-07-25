@@ -4240,6 +4240,47 @@ async fn multipart_encoding_headers_respect_header_object_required_default() {
     }
 }
 
+#[tokio::test]
+async fn multipart_encoding_bare_schema_headers_remain_required() {
+    let plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/bare-required-header",
+            "path_regex": "^/bare-required-header$",
+            "request_body": {
+                "content": {
+                    "multipart/form-data": {
+                        "schema": {
+                            "type": "object",
+                            "required": ["title"],
+                            "properties": {"title": {"type": "string"}}
+                        },
+                        "encoding": {
+                            "title": {
+                                "headers": {
+                                    "X-Part-Token": {"type": "string", "minLength": 5}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }]
+    }))
+    .unwrap();
+    let headers = content_type_headers("multipart/form-data; boundary=abc");
+    let body =
+        "--abc\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n--abc--\r\n";
+    let mut ctx = post_ctx("/bare-required-header");
+    ctx.headers = headers.clone();
+    assert_reject(
+        plugin
+            .on_final_request_body_with_context(&mut ctx, &headers, body.as_bytes())
+            .await,
+        Some(400),
+    );
+}
+
 #[test]
 fn multipart_encoding_header_bare_object_schema_is_not_a_header_object_wrapper() {
     OpenapiValidator::new(&json!({
@@ -4573,6 +4614,144 @@ fn composed_scalar_validators_are_precompiled_outside_request_conversion() {
     );
     assert!(source.contains("composed_scalar_validators"));
     assert!(source.contains("ConversionPlan::compile"));
+    assert!(
+        source.contains("schema_types: AHashMap<usize, SchemaTypeSet>"),
+        "type/shape metadata must be cached on ConversionPlan"
+    );
+    assert!(
+        source.contains("fallback_type_computes"),
+        "regression counter must track uncached type metadata computation"
+    );
+}
+
+#[tokio::test]
+async fn composed_schema_type_metadata_is_cached_across_repeated_form_and_multipart_values() {
+    use ferrum_edge::_test_support::openapi_validator_schema_type_cache_stats_for_test;
+
+    // Wide/deep composed item schema: request conversion must reuse the compile
+    // cache instead of re-walking composition for every repeated value.
+    let composed_item = json!({
+        "anyOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "string", "pattern": "^[0-9]+$"},
+            {"oneOf": [
+                {"type": "integer", "maximum": -1},
+                {"allOf": [
+                    {"type": "string"},
+                    {"minLength": 1}
+                ]}
+            ]}
+        ]
+    });
+
+    let form_plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/form-tags",
+            "path_regex": "^/form-tags$",
+            "request_body": {"content": {"application/x-www-form-urlencoded": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["tags"],
+                "properties": {
+                    "tags": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": composed_item.clone()
+                    }
+                }
+            }}}
+        }]
+    }))
+    .unwrap();
+    let (cached_after_form_compile, fallback_after_form_compile) =
+        openapi_validator_schema_type_cache_stats_for_test(&form_plugin);
+    assert!(
+        cached_after_form_compile > 0,
+        "compile must cache type metadata once per registered schema node"
+    );
+    assert_eq!(
+        fallback_after_form_compile, 0,
+        "compile must not record request-time fallback computes"
+    );
+
+    let form_headers = content_type_headers("application/x-www-form-urlencoded");
+    let form_body = (0..1024)
+        .map(|index| format!("tags={index}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    let mut ctx = post_ctx("/form-tags");
+    ctx.headers = form_headers.clone();
+    assert_continue(
+        form_plugin
+            .on_final_request_body_with_context(&mut ctx, &form_headers, form_body.as_bytes())
+            .await,
+    );
+    let (cached_after_form_request, fallback_after_form_request) =
+        openapi_validator_schema_type_cache_stats_for_test(&form_plugin);
+    assert_eq!(
+        cached_after_form_request, cached_after_form_compile,
+        "cache size must stay fixed after request conversion"
+    );
+    assert_eq!(
+        fallback_after_form_request, 0,
+        "urlencoded conversion must reuse cached type metadata across 1024 repeated values"
+    );
+
+    let multipart_plugin = OpenapiValidator::new(&json!({
+        "operations": [{
+            "method": "POST",
+            "path_template": "/multipart-tags",
+            "path_regex": "^/multipart-tags$",
+            "request_body": {"content": {"multipart/form-data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["tags"],
+                "properties": {
+                    "tags": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": composed_item
+                    }
+                }
+            }}}
+        }]
+    }))
+    .unwrap();
+    let (cached_after_multipart_compile, fallback_after_multipart_compile) =
+        openapi_validator_schema_type_cache_stats_for_test(&multipart_plugin);
+    assert!(
+        cached_after_multipart_compile > 0,
+        "multipart compile must cache type metadata once per registered schema node"
+    );
+    assert_eq!(fallback_after_multipart_compile, 0);
+
+    let multipart_headers = content_type_headers("multipart/form-data; boundary=abc");
+    let mut multipart_body = Vec::new();
+    for index in 0..1024 {
+        multipart_body.extend_from_slice(
+            format!("--abc\r\nContent-Disposition: form-data; name=\"tags\"\r\n\r\n{index}\r\n")
+                .as_bytes(),
+        );
+    }
+    multipart_body.extend_from_slice(b"--abc--\r\n");
+    let mut ctx = post_ctx("/multipart-tags");
+    ctx.headers = multipart_headers.clone();
+    assert_continue(
+        multipart_plugin
+            .on_final_request_body_with_context(&mut ctx, &multipart_headers, &multipart_body)
+            .await,
+    );
+    let (cached_after_multipart_request, fallback_after_multipart_request) =
+        openapi_validator_schema_type_cache_stats_for_test(&multipart_plugin);
+    assert_eq!(
+        cached_after_multipart_request, cached_after_multipart_compile,
+        "multipart cache size must stay fixed after request conversion"
+    );
+    assert_eq!(
+        fallback_after_multipart_request, 0,
+        "multipart conversion must reuse cached type metadata across 1024 repeated parts"
+    );
 }
 
 #[tokio::test]

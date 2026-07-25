@@ -51,6 +51,73 @@ pub(super) fn collect_inventory(state: &AdminState) -> crate::tls::inventory::Tl
     crate::tls::inventory::TlsInventory::collect(env_config, config.as_deref())
 }
 
+/// Metrics-safe inventory producer for the cached snapshot (issue #2410).
+///
+/// Holds the resolved `EnvConfig` and the *live* gateway-config `ArcSwap`, so a
+/// background refresh always collects against the currently published config
+/// without the admin state having to re-register on every reload.
+struct AdminTlsInventoryCollector {
+    env_config: Option<Arc<crate::config::EnvConfig>>,
+    config: Option<Arc<arc_swap::ArcSwap<crate::config::types::GatewayConfig>>>,
+    /// Every clone of one `AdminState` shares this allocation. Retaining it
+    /// also prevents allocator address reuse while this collector remains
+    /// registered, making the pointer a stable serving-cycle identity.
+    serving_cycle_guard: Arc<arc_swap::ArcSwap<Option<crate::admin::CachedDbHealthResult>>>,
+}
+
+impl crate::tls::inventory_cache::TlsInventoryCollector for AdminTlsInventoryCollector {
+    fn collect_public_metadata(&self) -> crate::tls::inventory::TlsInventory {
+        let config = self.config.as_ref().map(|config| config.load_full());
+        crate::tls::inventory::TlsInventory::collect_public_metadata(
+            self.env_config.as_deref(),
+            config.as_deref(),
+        )
+    }
+
+    fn serving_cycle_key(&self) -> Option<usize> {
+        Some(Arc::as_ptr(&self.serving_cycle_guard) as usize)
+    }
+}
+
+fn metrics_inventory_collector(
+    state: &AdminState,
+) -> Arc<dyn crate::tls::inventory_cache::TlsInventoryCollector> {
+    let env_config = state
+        .proxy_state
+        .as_ref()
+        .map(|proxy| Arc::clone(&proxy.env_config));
+    let config = state
+        .proxy_state
+        .as_ref()
+        .map(|proxy| Arc::clone(&proxy.config))
+        .or_else(|| state.cached_config.clone());
+    Arc::new(AdminTlsInventoryCollector {
+        env_config,
+        config,
+        serving_cycle_guard: Arc::clone(&state.cached_db_health),
+    })
+}
+
+/// Ensure the process-wide collector exists for direct metrics-handler callers
+/// that did not start through an admin serving path.
+pub(super) fn install_metrics_inventory_collector(state: &AdminState) {
+    if crate::tls::inventory_cache::collector_installed() {
+        return;
+    }
+    crate::tls::inventory_cache::install_collector(metrics_inventory_collector(state));
+}
+
+/// Install the collector owned by this admin serving cycle.
+///
+/// Unlike scrape-time installation, a sequential in-process restart must
+/// replace the prior cycle's captured config handles. The cache marks its
+/// current snapshot stale so the warmup refresh publishes the new cycle.
+pub(super) fn replace_metrics_inventory_collector_for_serving_cycle(state: &AdminState) {
+    crate::tls::inventory_cache::replace_collector_for_serving_cycle(metrics_inventory_collector(
+        state,
+    ));
+}
+
 pub(super) async fn handle_events(
     pagination: &PaginationParams,
     query: Option<&str>,
@@ -237,7 +304,9 @@ pub(super) async fn handle_update_certificate(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
+    if let Err(error) =
+        require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::Certificate)
+    {
         return Ok(managed_error_response(error));
     }
     let (record, _) = match certificate_record_from_request(Some(id), request, true) {
@@ -313,7 +382,8 @@ pub(super) async fn handle_update_ca_bundle(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
+    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::CaBundle)
+    {
         return Ok(managed_error_response(error));
     }
     let (record, _) = match ca_bundle_record_from_request(Some(id), request, true) {
@@ -389,7 +459,7 @@ pub(super) async fn handle_update_crl(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
+    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::Crl) {
         return Ok(managed_error_response(error));
     }
     let (record, _) = match crl_record_from_request(Some(id), request, true) {
@@ -465,7 +535,9 @@ pub(super) async fn handle_update_ocsp_response(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
+    if let Err(error) =
+        require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::OcspResponse)
+    {
         return Ok(managed_error_response(error));
     }
     let (record, _) = match ocsp_response_record_from_request(Some(id), request, true) {
@@ -977,7 +1049,7 @@ pub(super) async fn handle_update_jwks(
         Ok(store) => store,
         Err(response) => return Ok(*response),
     };
-    if let Err(error) = store.get(id) {
+    if let Err(error) = require_existing_managed_kind(&store, id, ManagedTlsMaterialKind::Jwks) {
         return Ok(managed_error_response(error));
     }
     let (record, _) = match jwks_record_from_request(Some(id), request, true) {
@@ -1567,6 +1639,26 @@ fn managed_store_response()
     })
 }
 
+/// Typed PUT requires an existing record whose kind matches the route collection.
+///
+/// IDs are globally unique across managed TLS collections; a cross-kind hit is a
+/// stable `409 Conflict` (`KindConflict`), matching create-with-overwrite.
+fn require_existing_managed_kind(
+    store: &crate::tls::managed::ManagedTlsStore,
+    id: &str,
+    kind: ManagedTlsMaterialKind,
+) -> Result<(), ManagedTlsError> {
+    let existing = store.get(id)?;
+    if existing.kind != kind {
+        return Err(ManagedTlsError::KindConflict {
+            id: id.to_string(),
+            existing_kind: existing.kind.as_str(),
+            requested_kind: kind.as_str(),
+        });
+    }
+    Ok(())
+}
+
 fn acme_certificate_store_response()
 -> Result<Arc<crate::tls::acme::AcmeCertificateStore>, Box<Response<Full<Bytes>>>> {
     crate::tls::acme::global_certificate_store().map_err(|error| {
@@ -1600,7 +1692,9 @@ fn acme_account_store_response()
 fn managed_error_response(error: ManagedTlsError) -> Response<Full<Bytes>> {
     let status = match &error {
         ManagedTlsError::NotFound(_) => StatusCode::NOT_FOUND,
-        ManagedTlsError::AlreadyExists(_) => StatusCode::CONFLICT,
+        ManagedTlsError::AlreadyExists(_) | ManagedTlsError::KindConflict { .. } => {
+            StatusCode::CONFLICT
+        }
         ManagedTlsError::InvalidId(_)
         | ManagedTlsError::InvalidPath(_)
         | ManagedTlsError::MissingMaterial { .. }
@@ -1632,6 +1726,10 @@ fn acme_error_response(error: AcmeError) -> Response<Full<Bytes>> {
 }
 
 fn request_managed_source_reloads() {
+    // Same-kind replacement keeps `managed://{collection}/{id}` references valid.
+    // Admission already validated PEM/DER/JWKS before the store write; watchers
+    // rebuild from the new fingerprint and retain the previous runtime config on
+    // failed activation (TLS live-reload contract).
     let _ = crate::tls::source::subscription::request_all_material_set_reloads();
 }
 

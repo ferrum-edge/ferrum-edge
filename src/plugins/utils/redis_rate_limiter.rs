@@ -70,6 +70,13 @@ use tokio::task::AbortHandle;
 use tracing::{info, warn};
 use url::{Host, Url};
 
+/// Operational upper bound for Redis ConnectionManager pool slots per plugin.
+///
+/// Each slot owns an ArcSwap, a Tokio mutex, and may lazily establish one
+/// multiplexed Redis TCP connection, so configuration must keep this value a
+/// small operational cardinality rather than an unbounded allocation size.
+pub const MAX_REDIS_POOL_SIZE: usize = 128;
+
 /// Redis sliding-window index and elapsed fraction from a single epoch timestamp.
 ///
 /// `elapsed_fraction` is always in `[0, 1)`: at an exact window boundary the
@@ -208,6 +215,11 @@ impl RedisConfig {
         }
         let pool_size = usize::try_from(pool_size)
             .map_err(|_| "redis rate limiter: 'redis_pool_size' is too large".to_string())?;
+        if pool_size > MAX_REDIS_POOL_SIZE {
+            return Err(format!(
+                "redis rate limiter: 'redis_pool_size' must be <= {MAX_REDIS_POOL_SIZE}"
+            ));
+        }
 
         let connect_timeout_seconds =
             parse_optional_u64(object, "redis_connect_timeout_seconds")?.unwrap_or(5);
@@ -502,6 +514,48 @@ async fn screen_redis_endpoint(
 struct ConnectionSlot {
     connection: ArcSwap<Option<redis::aio::ConnectionManager>>,
     connect_mutex: tokio::sync::Mutex<()>,
+}
+
+/// Outcome of a size-bounded Redis fetch ([`RedisRateLimitClient::get_bytes_bounded`]).
+#[derive(Debug)]
+pub enum BoundedRedisValue {
+    /// Key is absent.
+    Missing,
+    /// Key exists but holds an empty value. Callers must quarantine rather than
+    /// treating this as a permanent miss that leaves the empty key in place.
+    Empty,
+    /// Value present and within the requested byte cap.
+    Found(Vec<u8>),
+    /// Value present but its true length exceeds the cap; only a bounded prefix
+    /// was transferred. Callers should treat it as invalid and quarantine it.
+    Oversized { length: usize },
+}
+
+/// Why a Redis `GETRANGE` inclusive end index cannot be derived from a byte cap.
+///
+/// Callers must fail closed on either variant: Redis treats a negative end as
+/// "read to the end of the string", so an unrepresentable or zero cap must never
+/// be cast into a sentinel that would transfer an attacker-controlled value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedisGetrangeEndIndexError {
+    /// Cap was zero (no positive inclusive end index).
+    ZeroCap,
+    /// Cap cannot be represented as a non-negative `isize` on this platform.
+    Overflow,
+}
+
+/// Convert a Redis `GETRANGE` inclusive end index from a byte cap.
+///
+/// Redis treats a negative end index as an offset from the end of the string
+/// (`-1` = last byte / whole value). Casting an unbounded `usize` cap with
+/// `as isize` can therefore saturate to `-1` and ask Redis for the entire
+/// attacker-controlled value. Fail closed before dispatch when the cap cannot
+/// be represented as a non-negative `isize`.
+pub fn redis_getrange_end_index(max_bytes: usize) -> Result<isize, RedisGetrangeEndIndexError> {
+    if max_bytes == 0 {
+        return Err(RedisGetrangeEndIndexError::ZeroCap);
+    }
+    isize::try_from(max_bytes).map_err(|_| RedisGetrangeEndIndexError::Overflow)
 }
 
 /// gateway's shared DNS cache. On connection failure, every pool slot is cleared
@@ -1457,6 +1511,123 @@ impl RedisRateLimitClient {
         }
     }
 
+    /// Get a raw byte value from Redis, bounded to `max_bytes` before
+    /// allocation.
+    ///
+    /// A plain `GET` would allocate the full stored value regardless of size, so
+    /// a compromised or oversized entry could force an unbounded allocation. This
+    /// reads `EXISTS`, `STRLEN`, and `GETRANGE key 0 max_bytes` in one pipelined
+    /// round-trip: the true length gates the outcome while the range read caps
+    /// the transferred/allocated bytes at `max_bytes + 1`. The inclusive end
+    /// index is converted with [`redis_getrange_end_index`] so an oversized cap
+    /// cannot become Redis's "read to end" (`-1`) sentinel. Returned prefixes are
+    /// independently verified against the bound before admission. Callers treat
+    /// [`BoundedRedisValue::Oversized`] and [`BoundedRedisValue::Empty`] as
+    /// invalid entries and quarantine them.
+    pub async fn get_bytes_bounded(
+        &self,
+        key: &str,
+        max_bytes: usize,
+    ) -> Result<BoundedRedisValue, ()> {
+        // Fail closed before any Redis dispatch when the cap cannot be expressed
+        // as a non-negative GETRANGE end index (for example `usize::MAX` → `-1`).
+        let end = redis_getrange_end_index(max_bytes).map_err(|_| ())?;
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        // GETRANGE end index is inclusive, so `0..=max_bytes` reads at most
+        // `max_bytes + 1` bytes — enough to confirm an over-cap value without
+        // materializing it. EXISTS distinguishes a missing key from an empty
+        // value so callers can quarantine empty poisoned keys. Pipelined in one
+        // round-trip (non-transactional like `get_two_counters`); a concurrent
+        // rewrite between the commands can only cause a benign spurious
+        // quarantine/miss, never an unbounded allocation.
+        let result: Result<(i64, usize, Vec<u8>), redis::RedisError> = redis::pipe()
+            .cmd("EXISTS")
+            .arg(key)
+            .cmd("STRLEN")
+            .arg(key)
+            .cmd("GETRANGE")
+            .arg(key)
+            .arg(0)
+            .arg(end)
+            .query_async(&mut conn)
+            .await;
+
+        match result {
+            Ok((exists, length, prefix)) => {
+                self.available.store(true, Ordering::Relaxed);
+                if exists == 0 {
+                    return Ok(BoundedRedisValue::Missing);
+                }
+                if length == 0 {
+                    return Ok(BoundedRedisValue::Empty);
+                }
+                // Independently verify Redis honored the bound. An over-cap probe
+                // may return at most `max_bytes + 1` bytes; an in-cap value must
+                // never exceed `max_bytes`.
+                let max_prefix = if length > max_bytes {
+                    max_bytes.saturating_add(1)
+                } else {
+                    max_bytes
+                };
+                if prefix.len() > max_prefix {
+                    warn!(
+                        key = %key,
+                        prefix_len = prefix.len(),
+                        max_bytes,
+                        "Redis GETRANGE returned more bytes than the requested bound; failing closed"
+                    );
+                    return Err(());
+                }
+                if length > max_bytes {
+                    Ok(BoundedRedisValue::Oversized { length })
+                } else if prefix.len() != length {
+                    // Length/prefix disagreement under the cap is treated as an
+                    // invalid entry so callers quarantine rather than replay.
+                    Ok(BoundedRedisValue::Oversized {
+                        length: prefix.len().max(length),
+                    })
+                } else {
+                    Ok(BoundedRedisValue::Found(prefix))
+                }
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis EXISTS+STRLEN+GETRANGE failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
+    /// Best-effort unconditional key deletion, used to quarantine a poisoned or
+    /// invalid cache entry so it is not re-served on the next request.
+    pub async fn delete(&self, key: &str) -> Result<(), ()> {
+        let mut conn = self.get_connection().await.ok_or(())?;
+
+        let result: Result<i64, redis::RedisError> =
+            redis::cmd("DEL").arg(key).query_async(&mut conn).await;
+
+        match result {
+            Ok(_) => {
+                self.available.store(true, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    key = %key,
+                    error = %e,
+                    "Redis DEL failed"
+                );
+                self.mark_unavailable();
+                Err(())
+            }
+        }
+    }
+
     /// Set a raw byte value in Redis with a TTL.
     ///
     /// Uses a pipelined `SET` + `EXPIRE` in a single round-trip.
@@ -1683,7 +1854,24 @@ impl std::fmt::Debug for RedisRateLimitClient {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_floored_total, floor_zero_compensation};
+    use super::{
+        RedisGetrangeEndIndexError, clamp_floored_total, floor_zero_compensation,
+        redis_getrange_end_index,
+    };
+
+    #[test]
+    fn redis_getrange_end_index_rejects_zero_and_platform_overflow() {
+        assert_eq!(
+            redis_getrange_end_index(0),
+            Err(RedisGetrangeEndIndexError::ZeroCap)
+        );
+        assert_eq!(
+            redis_getrange_end_index(usize::MAX),
+            Err(RedisGetrangeEndIndexError::Overflow)
+        );
+        assert_eq!(redis_getrange_end_index(1).expect("1 fits"), 1);
+        assert_eq!(redis_getrange_end_index(1024).expect("1 KiB fits"), 1024);
+    }
 
     #[test]
     fn floor_zero_compensation_skips_non_negative_totals() {

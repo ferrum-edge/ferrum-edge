@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use crate::admin::jwt_auth::create_jwt_manager_from_env;
@@ -28,6 +29,12 @@ pub async fn run(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
 ) -> Result<(), anyhow::Error> {
     info!("DP mode: starting with empty config, waiting for CP");
+
+    // Open the observability delivery lifecycle for this serving cycle before
+    // any plugin activation registers a queue worker. Re-running this mode in
+    // one process after a completed drain otherwise targets the closed
+    // generation of the previous cycle.
+    crate::observability_delivery::begin_serving_cycle();
 
     let dns_cache = DnsCache::new(DnsConfig {
         global_overrides: env_config.dns_overrides.clone(),
@@ -330,8 +337,12 @@ pub async fn run(
             .await;
     }
 
-    // Start separate listeners for HTTP and HTTPS
-    let mut handles = Vec::new();
+    // Serving listener JoinHandles are supervised concurrently (see
+    // `await_dp_listener_handles`). Long-lived bridge / background tasks are
+    // kept separate so a pending TLS revision bridge cannot mask a later
+    // listener panic (issue #2368).
+    let mut listener_handles = Vec::new();
+    let mut background_handles: Vec<JoinHandle<()>> = Vec::new();
     let mut startup_signals = Vec::new();
 
     // Shared readiness flag. DP defers flipping it to `true` until the DP client
@@ -387,7 +398,8 @@ pub async fn run(
                 }
             }
         });
-        handles.push(bridge_handle);
+        // Bridge lives until shutdown; keep it out of fatal listener supervision.
+        background_handles.push(bridge_handle);
     }
 
     // HTTP listener (disabled when port is 0)
@@ -424,7 +436,7 @@ pub async fn run(
                 );
             }
         });
-        handles.push(http_handle);
+        listener_handles.push(http_handle);
         startup_signals.push(("HTTP proxy listener".to_string(), http_started_rx));
     } else {
         info!(
@@ -470,7 +482,7 @@ pub async fn run(
                 );
             }
         });
-        handles.push(https_handle);
+        listener_handles.push(https_handle);
         startup_signals.push(("HTTPS proxy listener".to_string(), https_started_rx));
     } else if env_config.proxy_https_port == 0 {
         info!(
@@ -541,7 +553,7 @@ pub async fn run(
                     );
                 }
             });
-            handles.push(h3_handle);
+            listener_handles.push(h3_handle);
             startup_signals.push(("HTTP/3 proxy listener".to_string(), h3_started_rx));
             h3_listener_started = true;
         } else {
@@ -648,7 +660,7 @@ pub async fn run(
                 );
             }
         });
-        handles.push(admin_http_handle);
+        listener_handles.push(admin_http_handle);
         startup_signals.push(("Admin HTTP listener".to_string(), admin_http_started_rx));
     } else {
         info!(
@@ -764,7 +776,7 @@ pub async fn run(
                 );
             }
         });
-        handles.push(admin_https_handle);
+        listener_handles.push(admin_https_handle);
         startup_signals.push(("Admin HTTPS listener".to_string(), admin_https_started_rx));
     } else {
         info!("Admin TLS not configured - HTTPS listener disabled");
@@ -823,21 +835,12 @@ pub async fn run(
         .await;
     });
 
-    // Wait for all listeners to complete (these exit when the shutdown signal fires).
-    // If no listener handles were spawned (e.g., all plaintext ports disabled and no
-    // TLS configured), block on the shutdown signal so stream proxies keep running.
-    if handles.is_empty() {
-        let mut wait_shutdown = shutdown_tx.subscribe();
-        while !*wait_shutdown.borrow() {
-            if wait_shutdown.changed().await.is_err() {
-                break;
-            }
-        }
-    } else {
-        for handle in handles {
-            handle.await?;
-        }
-    }
+    // Supervise serving listeners concurrently. A later listener panic must be
+    // observed promptly even while an earlier listener remains pending; on
+    // panic we fire shared shutdown so siblings drain (issue #2368). The TLS
+    // revision bridge and other long-lived tasks stay in `background_handles`
+    // so they cannot mask listener failures under sequential join.
+    let listener_result = await_dp_listener_handles(listener_handles, shutdown_tx.clone()).await;
 
     // Stop accepting new TCP/UDP/DTLS stream connections. The accept loops
     // also observe the global shutdown receiver wired above and will already
@@ -861,35 +864,27 @@ pub async fn run(
     // `health_check_handles` is normally empty in DP mode (empty initial
     // config — see comment at `ProxyState::new` call site) but plumbed
     // through anyway so a future change that starts health checks at DP
-    // startup is already drained by this loop.
+    // startup is already drained by this loop. Includes the TLS revision
+    // bridge (pushed above) so external shutdown still joins it.
+    background_handles.push(dns_handle);
+    if let Some(h) = dns_retry_handle {
+        background_handles.push(h);
+    }
+    background_handles.push(dp_client_handle);
+    if let Some(h) = dp_grpc_tls_reload_watcher {
+        background_handles.push(h);
+    }
+    background_handles.push(overload_handle);
+    background_handles.push(metrics_handle);
+    background_handles.push(runtime_system_handle);
+    background_handles.push(runtime_window_handle);
+    if let Some(h) = per_ip_cleanup_handle {
+        background_handles.push(h);
+    }
     let mut health_check_handles = health_check_handles;
     health_check_handles.extend(proxy_state.health_checker.take_active_check_handles());
-    let bg_drain = async {
-        let _ = dns_handle.await;
-        if let Some(h) = dns_retry_handle {
-            let _ = h.await;
-        }
-        let _ = dp_client_handle.await;
-        if let Some(h) = dp_grpc_tls_reload_watcher {
-            let _ = h.await;
-        }
-        let _ = overload_handle.await;
-        let _ = metrics_handle.await;
-        let _ = runtime_system_handle.await;
-        let _ = runtime_window_handle.await;
-        if let Some(h) = per_ip_cleanup_handle {
-            let _ = h.await;
-        }
-        for h in health_check_handles {
-            let _ = h.await;
-        }
-    };
-    if tokio::time::timeout(Duration::from_secs(5), bg_drain)
-        .await
-        .is_err()
-    {
-        warn!("Background tasks did not drain within 5s, proceeding with shutdown");
-    }
+    background_handles.extend(health_check_handles);
+    crate::modes::file::join_background_handles(background_handles, Duration::from_secs(5)).await;
     crate::observability_delivery::shutdown(Duration::from_millis(
         env_config.log_shutdown_drain_timeout_ms,
     ))
@@ -897,7 +892,36 @@ pub async fn run(
     crate::plugins::api_chargeback_sink::finalize_all_snapshot_generations().await;
     crate::plugins::kafka_logging::finalize_all_generations().await;
 
+    listener_result?;
     Ok(())
+}
+
+/// Await DP serving-listener handles concurrently and trigger shared shutdown
+/// on the first panic so siblings can exit.
+///
+/// Mirrors mesh / file-mode listener supervision: empty handle sets wait on
+/// the shutdown watch channel (stream-only deployments), and panics propagate
+/// as `Err` after draining remaining listeners. Long-lived bridge tasks must
+/// not be passed here — keep them on the background drain path so a pending
+/// earlier handle cannot mask a later listener panic (issue #2368).
+pub(crate) async fn await_dp_listener_handles(
+    listener_handles: Vec<JoinHandle<()>>,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> Result<(), tokio::task::JoinError> {
+    if listener_handles.is_empty() {
+        let mut wait_shutdown = shutdown_tx.subscribe();
+        while !*wait_shutdown.borrow() {
+            if wait_shutdown.changed().await.is_err() {
+                break;
+            }
+        }
+        return Ok(());
+    }
+
+    let shutdown_on_panic = move || {
+        let _ = shutdown_tx.send(true);
+    };
+    crate::modes::file::await_listener_handles(listener_handles, shutdown_on_panic).await
 }
 
 fn proxy_frontend_tls_slot_from_operator(

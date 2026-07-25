@@ -20,6 +20,7 @@ pub mod backend;
 pub mod events;
 pub mod frontend_reload;
 pub mod inventory;
+pub mod inventory_cache;
 pub mod managed;
 #[cfg(feature = "pkcs11")]
 pub mod pkcs11;

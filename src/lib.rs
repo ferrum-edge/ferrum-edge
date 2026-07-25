@@ -92,6 +92,15 @@ pub mod _test_support {
     use crate::config::types::{AuthMode, BackendScheme};
     use crate::plugins::Plugin;
 
+    /// Exercise DP's crate-private concurrent listener supervisor without
+    /// expanding the production API solely for external regression tests.
+    pub async fn await_dp_listener_handles(
+        listener_handles: Vec<tokio::task::JoinHandle<()>>,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+    ) -> Result<(), tokio::task::JoinError> {
+        crate::modes::data_plane::await_dp_listener_handles(listener_handles, shutdown_tx).await
+    }
+
     /// Report private compression ownership without exposing it through public
     /// transaction metadata in production.
     pub fn compression_ownership_for_test(
@@ -807,6 +816,33 @@ pub mod _test_support {
         crate::plugins::request_deduplication::logical_keys_from_request_context_for_test(ctx)
     }
 
+    pub async fn finalize_plugin_rejection_without_committed_hooks_for_test(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut crate::plugins::RequestContext,
+        rejection: crate::plugins::PluginResult,
+    ) -> crate::plugins::PluginResult {
+        let Some(parts) = crate::proxy::plugin_result_into_reject_parts(rejection) else {
+            return crate::plugins::PluginResult::Continue;
+        };
+        let mut status = parts.status_code;
+        let mut headers = parts.headers;
+        let mut body = parts.body;
+        crate::proxy::apply_reject_after_proxy_and_synthetic_body_hooks(
+            plugins,
+            ctx,
+            &mut status,
+            &mut headers,
+            &mut body,
+            false,
+            false,
+        )
+        .await;
+        crate::plugins::PluginResult::RejectBinary {
+            status_code: status,
+            body: bytes::Bytes::from(body),
+            headers,
+        }
+    }
     pub async fn finalize_plugin_rejection_for_test(
         plugins: &[Arc<dyn Plugin>],
         ctx: &mut crate::plugins::RequestContext,
@@ -955,6 +991,15 @@ pub mod _test_support {
         content_type: &str,
     ) -> Result<String, String> {
         crate::plugins::soap_ws_security::decode_soap_xml_body_for_test(bytes, content_type)
+    }
+
+    /// Schema type-cache stats for an openapi_validator instance: `(cached nodes,
+    /// request-time fallback computes)`. Cached nodes are filled once per
+    /// registered schema during ConversionPlan compile (#3024).
+    pub fn openapi_validator_schema_type_cache_stats_for_test(
+        plugin: &crate::plugins::openapi_validator::OpenapiValidator,
+    ) -> (usize, usize) {
+        plugin.schema_type_cache_stats_for_test()
     }
 
     // ── proxy/tcp_proxy ──────────────────────────────────────────────────────
@@ -1285,6 +1330,17 @@ pub mod _test_support {
         Ok((handshake.stream, proto))
     }
 
+    /// Inspect whether a buffered rustls `ServerConnection` may be abandoned
+    /// for kTLS. Always returns `false`: the public buffered API cannot prove
+    /// that the inbound deframer is empty and record-aligned (issue #2955).
+    /// The shared borrow is part of the contract — external tests use it to
+    /// pin that the refusal leaves every staged application byte readable.
+    pub fn ktls_rustls_buffers_safe_for_kernel_handoff(
+        server_conn: &rustls::ServerConnection,
+    ) -> bool {
+        crate::proxy::tcp_proxy::ktls_rustls_buffers_safe_for_kernel_handoff(server_conn)
+    }
+
     /// Invoke the internal `bidirectional_splice` (Linux zero-copy relay) for
     /// unit tests. Only available on Linux — on other platforms there is no
     /// splice path to exercise.
@@ -1359,14 +1415,32 @@ pub mod _test_support {
     // ── plugins/ai_semantic_cache ────────────────────────────────────────────
     pub async fn rebuild_ai_semantic_cache_vector_index(
         plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
-    ) {
-        plugin.rebuild_vector_index_for_tests().await;
+    ) -> usize {
+        plugin.rebuild_vector_index_for_tests().await
     }
 
     pub fn ai_semantic_cache_size_accounting_snapshot_for_test(
         plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
     ) -> (usize, usize) {
         plugin.size_accounting_snapshot_for_tests()
+    }
+
+    pub fn ai_semantic_cache_vector_snapshot_accounted_bytes_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> usize {
+        plugin.vector_snapshot_accounted_bytes_for_tests()
+    }
+
+    pub fn ai_semantic_cache_cache_budget_used_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> usize {
+        plugin.cache_budget_used_for_tests()
+    }
+
+    pub async fn ai_semantic_cache_force_vector_rebuild_budget_failure_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> bool {
+        plugin.force_vector_rebuild_budget_failure_for_tests().await
     }
 
     pub fn ai_semantic_cache_vector_index_dirty_for_test(
@@ -1398,6 +1472,43 @@ pub mod _test_support {
         plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
     ) {
         plugin.force_cleanup_for_tests();
+    }
+
+    pub fn ai_semantic_cache_maintenance_staged_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> bool {
+        plugin.maintenance_staged_for_tests()
+    }
+
+    pub fn ai_semantic_cache_maintenance_committed_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> bool {
+        plugin.maintenance_committed_for_tests()
+    }
+
+    pub fn ai_semantic_cache_maintenance_handle_count_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) -> usize {
+        plugin.maintenance_handle_count_for_tests()
+    }
+
+    pub fn ai_semantic_cache_notify_cleanup_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) {
+        plugin.notify_cleanup_for_tests();
+    }
+
+    pub fn ai_semantic_cache_notify_rebuild_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+    ) {
+        plugin.notify_rebuild_for_tests();
+    }
+
+    pub fn ai_semantic_cache_set_singleflight_wait_override_for_test(
+        plugin: &crate::plugins::ai_semantic_cache::AiSemanticCache,
+        wait: Option<std::time::Duration>,
+    ) {
+        plugin.set_singleflight_wait_override_for_tests(wait);
     }
 
     pub fn ai_semantic_cache_set_store_post_admit_hook_for_test(
@@ -1873,6 +1984,7 @@ pub mod _test_support {
     }
 
     // ── plugins/utils/redis_rate_limiter ─────────────────────────────────────
+    pub use crate::plugins::utils::redis_rate_limiter::MAX_REDIS_POOL_SIZE;
     pub use crate::plugins::utils::redis_rate_limiter::RedisConfig;
     pub use crate::plugins::utils::redis_rate_limiter::RedisRateLimitClient;
     pub use crate::plugins::utils::redis_rate_limiter::RedisWindowProgress;
@@ -1920,8 +2032,21 @@ pub mod _test_support {
     // ── config/db_loader ─────────────────────────────────────────────────────
     pub use crate::config::db_loader::DbPoolConfig;
 
-    pub fn db_append_connect_timeout(url: &str, db_type: &str, timeout: u64) -> String {
-        crate::config::db_loader::DatabaseStore::append_connect_timeout(url, db_type, timeout)
+    pub async fn await_pool_connect_with_timeout<F, T>(
+        timeout_seconds: u64,
+        connect: F,
+    ) -> Result<T, sqlx::Error>
+    where
+        F: std::future::Future<Output = Result<T, sqlx::Error>>,
+    {
+        crate::config::db_loader::await_pool_connect_with_timeout(timeout_seconds, connect).await
+    }
+
+    pub fn effective_pool_connect_timeout_seconds(db_type: &str, configured_seconds: u64) -> u64 {
+        crate::config::db_loader::effective_pool_connect_timeout_seconds(
+            db_type,
+            configured_seconds,
+        )
     }
 
     pub fn db_diff_removed(known: &HashSet<String>, current: &HashSet<String>) -> Vec<String> {
@@ -3394,6 +3519,13 @@ pub mod _test_support {
         )
     }
 
+    /// External regression coverage for issue #2959 (DTLS demux identity-aware
+    /// session removal). See
+    /// [`crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test`].
+    pub fn dtls_stale_session_removal_preserves_newer_generation_for_test() -> Result<(), String> {
+        crate::dtls::dtls_stale_session_removal_preserves_newer_generation_for_test()
+    }
+
     pub fn udp_logging_dtls_send_timeout_requires_sender_reset_for_test() -> bool {
         crate::plugins::udp_logging::dtls_send_timeout_requires_sender_reset_for_test()
     }
@@ -3513,5 +3645,20 @@ pub mod _test_support {
                 Err(EarlyUploadWaitError::Read)
             }
         }
+    }
+
+    /// Drive CP listener supervision the same way `control_plane::run` does,
+    /// so external tests can assert Ok/Err without constructing a full CP.
+    pub async fn wait_for_cp_listeners_until_shutdown_or_exit_for_test(
+        listener_handles: Vec<(String, tokio::task::JoinHandle<Result<(), anyhow::Error>>)>,
+        shutdown_tx: tokio::sync::watch::Sender<bool>,
+        drain_timeout: std::time::Duration,
+    ) -> Result<(), anyhow::Error> {
+        crate::modes::control_plane::wait_for_cp_listeners_until_shutdown_or_exit(
+            listener_handles,
+            shutdown_tx,
+            drain_timeout,
+        )
+        .await
     }
 }

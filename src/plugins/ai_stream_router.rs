@@ -7,7 +7,7 @@
 //! Unlike `ai_federation` — which uses the buffered "terminate and respond"
 //! pattern and rejects `"stream": true` — this plugin claims **only** streaming
 //! OpenAI Chat Completions requests and preserves true end-to-end streaming. It
-//! runs in `before_proxy` at priority 2984 (after `ai_semantic_cache` at 2980,
+//! runs in `before_proxy` at priority 2984 (before `ai_semantic_cache` at 2996,
 //! before `ai_federation` at 4060) and, instead of making its own HTTP call,
 //! rewrites the routing decision via `RequestContext.route_override_*` so the
 //! normal proxy dispatch path streams the provider response straight back to the

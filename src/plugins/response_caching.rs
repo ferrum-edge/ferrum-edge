@@ -4,6 +4,37 @@
 //! backend load for repeated identical requests. Supports Cache-Control,
 //! ETag/Last-Modified revalidation, backend `Vary` awareness, binary bodies,
 //! configurable TTL, entry size limits, and automatic eviction.
+//!
+//! ## Replay provenance
+//!
+//! A HIT / REVALIDATED reply is a *finalized* client representation: the
+//! synthetic replay path deliberately skips presentation transforms
+//! (`RequestContext::finalized_response_replay`) so non-idempotent
+//! `response_transformer` header/body `add` sequences cannot run a second time
+//! over an already-transformed entry.
+//!
+//! Static rules cannot change under a live instance — a config reload builds a
+//! new plugin instance with a new, empty cache — but RTDS runtime-overlay gates
+//! (`runtime_overlay_scope`) can flip at any moment without one. Without
+//! provenance, an entry stored while a redaction rule was disabled would keep
+//! being replayed unredacted after an operator enabled it.
+//!
+//! Every entry therefore carries an opaque publication identity, pinned from
+//! the same atomically published state as the response-side gate map by
+//! `RequestContext::pin_response_policy_stamp`. Two rules keep it honest:
+//!
+//! - **Lookup**: an entry whose identity differs from the current request's
+//!   pinned identity is invalidated and refetched — checked before freshness,
+//!   for both HIT and REVALIDATED, so neither can serve a superseded policy.
+//! - **Store**: a response whose request straddled a gate publication is not
+//!   stored at all; its bytes belong to neither policy.
+//!
+//! The result is deterministic and fail-closed across arbitrarily many
+//! enable/disable cycles: a replayed representation is always provably the
+//! product of the live policy, so transforms are neither skipped when policy
+//! tightened nor stacked when it did not change. Reapplying the identical live
+//! map is a no-op; every real policy transition receives a fresh, collision-free
+//! identity and retires entries from the preceding publication.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -22,6 +53,7 @@ use tracing::debug;
 
 use crate::util::unknown_keys::reject_unknown_keys;
 
+use super::utils::runtime_bool_gate::GatePolicyStamp;
 use super::{Plugin, PluginResult, RequestContext};
 
 /// Authoritative closed set of top-level `response_caching` configuration keys.
@@ -252,6 +284,20 @@ struct CacheEntry {
     ///
     /// [`prune_vary_index_locked`]: ResponseCaching::prune_vary_index_locked
     base_key_len: usize,
+    /// Response-side runtime-overlay gate map this representation was produced
+    /// under (`RequestContext::pin_response_policy_stamp`).
+    ///
+    /// A cached entry is a *finalized* client representation: the replay path
+    /// deliberately skips presentation transforms so non-idempotent header /
+    /// body rules cannot run twice. That contract is only sound while the
+    /// stored bytes were produced by the same response-side policy that is
+    /// live now. Runtime-overlay-gated rules (`response_transformer`'s
+    /// `runtime_overlay_scope`) can be enabled or disabled without a config
+    /// reload, so this stamp is the entry's provenance: a lookup whose pinned
+    /// publication identity differs invalidates the entry and misses to the origin
+    /// instead of replaying a representation from a superseded policy. It is
+    /// opaque and carries no rule, header, or body content.
+    response_policy_stamp: GatePolicyStamp,
 }
 
 impl CacheEntry {
@@ -1660,6 +1706,13 @@ impl Plugin for ResponseCaching {
         ctx: &mut RequestContext,
         headers: &mut HashMap<String, String>,
     ) -> PluginResult {
+        // Pin the response-side gate provenance before anything on this
+        // request can read a gate. Both directions of the cached-representation
+        // provenance contract read this single pinned value: the lookup below
+        // compares it against the stored entry, and `on_final_response_body`
+        // refuses to store a representation produced across a publication.
+        // One ArcSwap load, memoized on the context for sibling instances.
+        let policy_stamp = ctx.pin_response_policy_stamp().clone();
         if !self.is_cacheable_method(&ctx.method) {
             // Only genuinely unsafe methods evict: a safe method that is
             // merely ineligible for storage (OPTIONS with the default
@@ -1740,9 +1793,26 @@ impl Plugin for ResponseCaching {
         if let Some(entry) = self.cache.get(&cache_key) {
             let now = self.now_monotonic();
             let current_age = entry.current_age(now);
-            if !entry.is_fresh_at(now) {
+            // Provenance gate, ahead of freshness: a stored entry is replayed
+            // as a finalized representation with presentation transforms
+            // skipped, so it may only be served while the response-side
+            // runtime-overlay policy that produced it is still the live one.
+            // Every real gate publication carries a fresh, atomically paired
+            // identity. Pointer identity cannot collide or wrap, so a
+            // representation is either provably current or refetched, never
+            // stacked with a second pass of non-idempotent rules.
+            let stale_policy = entry.response_policy_stamp != policy_stamp;
+            if stale_policy || !entry.is_fresh_at(now) {
                 drop(entry);
                 self.invalidate_cache_key(&base_key, &cache_key);
+                if stale_policy {
+                    // Content-free by construction: no key, policy identity,
+                    // header, or body material is recorded.
+                    debug!(
+                        "response_caching: cached representation predates the current \
+                         runtime-overlay response policy, refetching"
+                    );
+                }
             } else {
                 debug!(cache_key = %cache_key, "response_caching: cache HIT");
 
@@ -1849,6 +1919,22 @@ impl Plugin for ResponseCaching {
             Some(base_key) => base_key.clone(),
             None => return PluginResult::Continue,
         };
+
+        // Provenance stamp for this representation. `before_proxy` pinned the
+        // stamp before any gate read on this request; this hook runs after
+        // every response-side transform, so an unchanged atomic publication
+        // identity proves the whole response pipeline saw one policy. If a
+        // publication landed in between, the bytes belong to neither policy —
+        // drop the store rather than cache a representation of unknown provenance.
+        // Not an uncacheable-response signal, so the predictor is left alone.
+        let policy_stamp = ctx.pin_response_policy_stamp().clone();
+        if !ctx.response_policy_stamp_stable() {
+            debug!(
+                "response_caching: runtime-overlay policy changed mid-request, \
+                 skipping store of an unattributable representation"
+            );
+            return PluginResult::Continue;
+        }
         // Use the variant-specific predict key (set during before_proxy) for
         // predictor marking so that uncacheability of one Vary variant does not
         // suppress cache lookups for other variants of the same route.
@@ -2050,6 +2136,7 @@ impl Plugin for ResponseCaching {
                 // `cache_key` is `base_key` plus an optional `:<vary>` suffix,
                 // so `base_key.len()` recovers this entry's base key.
                 base_key_len: base_key.len(),
+                response_policy_stamp: policy_stamp,
             };
             let entry_size = entry.approx_size();
             let mut old_size = self

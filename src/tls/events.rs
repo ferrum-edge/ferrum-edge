@@ -45,6 +45,41 @@ pub fn global_event_log() -> &'static TlsEventLog {
     })
 }
 
+/// Non-initializing accessor for the process event log.
+///
+/// [`global_event_log`] creates and persists the on-disk event store on first
+/// use. Read-only consumers that merely *observe* rotation state — the cached
+/// TLS inventory snapshot — must not create that store as a side effect, so
+/// they take this accessor and treat "no log yet" as "no recorded failure".
+pub fn event_log_if_initialized() -> Option<&'static TlsEventLog> {
+    TLS_EVENT_LOG.get()
+}
+
+/// Latest recorded failure for a configured source identity.
+#[derive(Debug, Clone)]
+pub struct TlsSourceFailure {
+    /// Recorded event outcome (`load_error` or `rebuild_error`).
+    pub outcome: String,
+    /// Sanitized failure detail as recorded by the producer.
+    pub error: Option<String>,
+    pub at: DateTime<Utc>,
+}
+
+/// Return the most recent event naming `source_id` when — and only when — that
+/// event was a failure. A later success clears the failure, so a rotated source
+/// stops reporting a stale error without re-reading its material.
+pub fn latest_source_failure(source_id: &str) -> Option<TlsSourceFailure> {
+    let event = event_log_if_initialized()?.latest_for_source(source_id)?;
+    match event.outcome.as_str() {
+        "load_error" | "rebuild_error" => Some(TlsSourceFailure {
+            outcome: event.outcome,
+            error: event.error,
+            at: event.at,
+        }),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct TlsEventFilter {
     pub cert_id: Option<String>,
@@ -160,6 +195,18 @@ impl TlsEventLog {
             .collect()
     }
 
+    /// Newest event naming `source_id`, or `None` when the source has no
+    /// recorded rotation history.
+    pub fn latest_for_source(&self, source_id: &str) -> Option<TlsSourceEvent> {
+        let events = self.events.lock().ok()?;
+        for event in events.iter().rev() {
+            if event.sources.iter().any(|s| s.source_id == source_id) {
+                return Some(event.clone());
+            }
+        }
+        None
+    }
+
     fn persist_snapshot(&self) -> Result<(), String> {
         let events = self
             .events
@@ -205,6 +252,10 @@ pub fn record_rotation_success(
         revision: Some(revision),
         error: None,
     });
+    // Rotated material changes the public certificate metadata the cached
+    // metrics snapshot exports, so let the next scrape refresh it immediately
+    // instead of waiting out the snapshot TTL.
+    crate::tls::inventory_cache::mark_stale();
 }
 
 pub fn record_rebuild_error(
@@ -226,6 +277,9 @@ pub fn record_rebuild_error(
         revision: None,
         error: Some(error.to_string()),
     });
+    // A recorded failure is the owning reload state the cached snapshot reports
+    // key/JWKS/OCSP health from; refresh it on the next scrape.
+    crate::tls::inventory_cache::mark_stale();
 }
 
 pub fn record_load_error(surface: &'static str, sources: &[WatchedMaterialSource], error: &str) {
@@ -243,6 +297,9 @@ pub fn record_load_error(surface: &'static str, sources: &[WatchedMaterialSource
         revision: None,
         error: Some(error.to_string()),
     });
+    // A recorded failure is the owning reload state the cached snapshot reports
+    // key/JWKS/OCSP health from; refresh it on the next scrape.
+    crate::tls::inventory_cache::mark_stale();
 }
 
 fn record_rotation_metrics(

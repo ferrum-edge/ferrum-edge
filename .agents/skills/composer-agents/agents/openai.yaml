@@ -1,0 +1,4 @@
+interface:
+  display_name: "Composer 2.5 Agents"
+  short_description: "Orchestrate local Cursor Composer 2.5 coding agents for fast, scoped tasks"
+  default_prompt: "Use $composer-agents to dispatch Cursor Composer 2.5 agents for this small Ferrum Edge task."

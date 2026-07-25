@@ -869,6 +869,150 @@ fn flush_sendmmsg_best_effort(
     }
 }
 
+/// Direct-send a reply datagram that the batched paths cannot represent
+/// (GSO-incompatible, sendmmsg-oversized, or post-flush refusal).
+#[cfg(target_os = "linux")]
+async fn direct_send_reply_or_drop(
+    frontend: &Arc<UdpSocket>,
+    data: &[u8],
+    client_addr: SocketAddr,
+    local_ip: Option<crate::socket_opts::PktinfoLocal>,
+    proxy_id: &str,
+    reason: &str,
+    send_drops: &mut UdpReplySendDrops,
+) {
+    debug!(
+        proxy_id = %proxy_id,
+        client = %client_addr,
+        size = data.len(),
+        reason,
+        "UDP reply using direct-send escape hatch"
+    );
+    if let Err(e) = direct_send_to_client(frontend, data, client_addr, local_ip).await {
+        send_drops.record_datagram(data.len());
+        warn!(
+            proxy_id = %proxy_id,
+            client = %client_addr,
+            size = data.len(),
+            error = %e,
+            "UDP fallback direct-send failed; datagram lost"
+        );
+    }
+}
+
+/// Queue into `send_batch`, flushing once on `Full` and direct-sending on
+/// `Oversized` (datagram larger than the lazy sendmmsg slot) or a stubborn
+/// post-flush `Full`.
+#[cfg(target_os = "linux")]
+async fn enqueue_sendmmsg_or_direct(
+    send_batch: &mut super::udp_batch::SendMmsgBatch,
+    frontend: &Arc<UdpSocket>,
+    client_addr: SocketAddr,
+    data: &[u8],
+    local_ip: Option<crate::socket_opts::PktinfoLocal>,
+    proxy_id: &str,
+    send_drops: &mut UdpReplySendDrops,
+) {
+    use super::udp_batch::SendMmsgPushResult;
+    use std::os::unix::io::AsRawFd;
+
+    match send_batch.push_with_local(data, client_addr, local_ip) {
+        SendMmsgPushResult::Queued => {}
+        SendMmsgPushResult::Oversized => {
+            // Preserve backend reply order: an oversized direct send must not
+            // overtake ordinary datagrams already queued in sendmmsg.
+            while !send_batch.is_empty() {
+                if flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops).is_err()
+                {
+                    break;
+                }
+            }
+            direct_send_reply_or_drop(
+                frontend,
+                data,
+                client_addr,
+                local_ip,
+                proxy_id,
+                "sendmmsg_oversized",
+                send_drops,
+            )
+            .await;
+        }
+        SendMmsgPushResult::Full => {
+            let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
+            match send_batch.push_with_local(data, client_addr, local_ip) {
+                SendMmsgPushResult::Queued => {}
+                SendMmsgPushResult::Oversized => {
+                    direct_send_reply_or_drop(
+                        frontend,
+                        data,
+                        client_addr,
+                        local_ip,
+                        proxy_id,
+                        "sendmmsg_oversized",
+                        send_drops,
+                    )
+                    .await;
+                }
+                SendMmsgPushResult::Full => {
+                    // Still full after flush (socket likely congested / flush
+                    // dropped the queue). Best-effort UDP: direct-send once.
+                    direct_send_reply_or_drop(
+                        frontend,
+                        data,
+                        client_addr,
+                        local_ip,
+                        proxy_id,
+                        "sendmmsg_post_flush_full",
+                        send_drops,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+/// Drain a GSO buffer into sendmmsg, flushing when the batch fills and
+/// direct-sending when a segment exceeds the sendmmsg slot size.
+#[cfg(target_os = "linux")]
+async fn drain_gso_to_sendmmsg_or_direct(
+    gso_batch: &mut super::udp_batch::GsoBatchBuf,
+    send_batch: &mut super::udp_batch::SendMmsgBatch,
+    frontend: &Arc<UdpSocket>,
+    client_addr: SocketAddr,
+    local_ip: Option<crate::socket_opts::PktinfoLocal>,
+    proxy_id: &str,
+    send_drops: &mut UdpReplySendDrops,
+) {
+    use std::os::unix::io::AsRawFd;
+
+    loop {
+        gso_batch.drain_to_sendmmsg(send_batch, client_addr, local_ip);
+        if gso_batch.is_empty() {
+            break;
+        }
+        if send_batch.is_empty() {
+            // Stuck on an oversized front segment — escape via direct-send.
+            let Some(dgram) = gso_batch.take_front_datagram() else {
+                break;
+            };
+            direct_send_reply_or_drop(
+                frontend,
+                &dgram,
+                client_addr,
+                local_ip,
+                proxy_id,
+                "gso_drain_sendmmsg_oversized",
+                send_drops,
+            )
+            .await;
+            continue;
+        }
+        let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
+    }
+}
+
 /// Try to enqueue a datagram into the GSO batch; on batch-full or size-mismatch,
 /// flush and retry, and on GSO socket failure drain the buffered datagrams
 /// through the sendmmsg fallback.
@@ -894,8 +1038,6 @@ async fn try_gso_send_or_fallback(
     local_ip: Option<crate::socket_opts::PktinfoLocal>,
     send_drops: &mut UdpReplySendDrops,
 ) {
-    use std::os::unix::io::AsRawFd;
-
     if gso_batch.push(data) {
         return;
     }
@@ -907,22 +1049,16 @@ async fn try_gso_send_or_fallback(
                 // >max_bytes — GSO cannot represent either). Send it directly
                 // as a single datagram through the pktinfo-aware path so the
                 // reply still leaves with the captured source address.
-                debug!(
-                    proxy_id = %proxy_id,
-                    client = %client_addr,
-                    size = data.len(),
-                    "GSO post-flush push refused datagram, sending directly"
-                );
-                if let Err(e) = direct_send_to_client(frontend, data, client_addr, local_ip).await {
-                    send_drops.record_datagram(data.len());
-                    warn!(
-                        proxy_id = %proxy_id,
-                        client = %client_addr,
-                        size = data.len(),
-                        error = %e,
-                        "UDP fallback direct-send failed; datagram lost"
-                    );
-                }
+                direct_send_reply_or_drop(
+                    frontend,
+                    data,
+                    client_addr,
+                    local_ip,
+                    proxy_id,
+                    "gso_post_flush_refused",
+                    send_drops,
+                )
+                .await;
             }
         }
         Err(e) => {
@@ -934,40 +1070,27 @@ async fn try_gso_send_or_fallback(
                 e
             );
             *gso_failed = true;
-            // Drain already-buffered GSO datagrams through sendmmsg. Loop because
-            // `drain_to_sendmmsg` may partially fill `send_batch`; in that case we
-            // flush and keep draining.
-            loop {
-                gso_batch.drain_to_sendmmsg(send_batch, client_addr, local_ip);
-                if gso_batch.is_empty() {
-                    break;
-                }
-                let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
-            }
-            // Now push the current datagram, flushing once if necessary.
-            if !send_batch.push_with_local(data, client_addr, local_ip) {
-                let _ = flush_sendmmsg_best_effort(send_batch, frontend.as_raw_fd(), send_drops);
-                if !send_batch.push_with_local(data, client_addr, local_ip) {
-                    debug!(
-                        proxy_id = %proxy_id,
-                        client = %client_addr,
-                        size = data.len(),
-                        "sendmmsg post-flush push refused datagram, sending directly"
-                    );
-                    if let Err(e) =
-                        direct_send_to_client(frontend, data, client_addr, local_ip).await
-                    {
-                        send_drops.record_datagram(data.len());
-                        warn!(
-                            proxy_id = %proxy_id,
-                            client = %client_addr,
-                            size = data.len(),
-                            error = %e,
-                            "UDP fallback direct-send failed; datagram lost"
-                        );
-                    }
-                }
-            }
+            drain_gso_to_sendmmsg_or_direct(
+                gso_batch,
+                send_batch,
+                frontend,
+                client_addr,
+                local_ip,
+                proxy_id,
+                send_drops,
+            )
+            .await;
+            // Now push the current datagram (or direct-send if oversized/full).
+            enqueue_sendmmsg_or_direct(
+                send_batch,
+                frontend,
+                client_addr,
+                data,
+                local_ip,
+                proxy_id,
+                send_drops,
+            )
+            .await;
         }
     }
 }
@@ -3849,7 +3972,16 @@ async fn create_session(
                         )
                         .await;
                     } else {
-                        send_batch.push_with_local(send_data, client_addr, session_local_ip);
+                        enqueue_sendmmsg_or_direct(
+                            &mut send_batch,
+                            &frontend,
+                            client_addr,
+                            send_data,
+                            session_local_ip,
+                            &reply_proxy_id,
+                            &mut send_drops,
+                        )
+                        .await;
                     }
                 }
             } else if let Err(e) = frontend.send_to(send_data, client_addr).await {
@@ -3941,25 +4073,17 @@ async fn create_session(
                                             &mut send_drops,
                                         )
                                         .await;
-                                    } else if !send_batch.push_with_local(
-                                        &buf[..len2],
-                                        client_addr,
-                                        session_local_ip,
-                                    ) {
-                                        // Batch full — flush and push again.
-                                        use std::os::unix::io::AsRawFd;
-                                        let _ = flush_sendmmsg_best_effort(
+                                    } else {
+                                        enqueue_sendmmsg_or_direct(
                                             &mut send_batch,
-                                            frontend.as_raw_fd(),
-                                            &mut send_drops,
-                                        );
-                                        if !send_batch.push_with_local(
-                                            &buf[..len2],
+                                            &frontend,
                                             client_addr,
+                                            &buf[..len2],
                                             session_local_ip,
-                                        ) {
-                                            send_drops.record_datagram(len2);
-                                        }
+                                            &reply_proxy_id,
+                                            &mut send_drops,
+                                        )
+                                        .await;
                                     }
                                 }
                             } else if let Err(e) = frontend.send_to(&buf[..len2], client_addr).await
@@ -4057,23 +4181,18 @@ async fn create_session(
                             e
                         );
                         gso_failed = true;
-                        // Replay all buffered datagrams through sendmmsg.
-                        loop {
-                            gso_batch.drain_to_sendmmsg(
-                                &mut send_batch,
-                                client_addr,
-                                session_local_ip,
-                            );
-                            if gso_batch.is_empty() {
-                                break;
-                            }
-                            use std::os::unix::io::AsRawFd;
-                            let _ = flush_sendmmsg_best_effort(
-                                &mut send_batch,
-                                frontend.as_raw_fd(),
-                                &mut send_drops,
-                            );
-                        }
+                        // Replay all buffered datagrams through sendmmsg /
+                        // direct-send for segments that exceed the slot size.
+                        drain_gso_to_sendmmsg_or_direct(
+                            &mut gso_batch,
+                            &mut send_batch,
+                            &frontend,
+                            client_addr,
+                            session_local_ip,
+                            &reply_proxy_id,
+                            &mut send_drops,
+                        )
+                        .await;
                     }
                 }
                 // Flush sendmmsg batch (used when GSO is disabled/failed, or GSO drain).

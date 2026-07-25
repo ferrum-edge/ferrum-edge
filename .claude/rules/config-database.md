@@ -53,7 +53,9 @@ paths:
 - New config fields go in `src/config/types.rs` with `#[serde(default)]` when optional.
 - Env-driven fields also update `src/config/env_config.rs`, `docs/configuration.md`, and `ferrum.conf`.
 - SQL storage changes are folded into `src/config/migrations/v001_initial_schema.rs` during build-out, with parsing in `db_loader.rs`.
-- MongoDB persists through serde BSON unless a queried field needs an index in `MongoStore::run_migrations()`.
+- MongoDB persists through serde BSON unless a queried field needs an index in
+  `src/config/mongo_index_plan.rs` (consumed by `MongoStore::run_migrations()`,
+  migrate dry-run, and migrate status).
 - Add unit tests under `tests/unit/config/` and update `openapi.yaml` when admin-exposed.
 - Required new fields need a migration/versioning plan even in build-out; do not silently make old config deserialize differently unless intended.
 - Check parent structs for `#[serde(deny_unknown_fields)]` before adding fields.

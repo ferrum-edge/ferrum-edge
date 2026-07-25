@@ -184,7 +184,7 @@ Error: Spec validation failed: Configuration file not found: /nonexistent.yaml
 
 ## reload
 
-Send SIGHUP to a running gateway instance to trigger a hot config reload. Only supported on Unix platforms (Linux, macOS, BSDs). In file mode, SIGHUP causes the gateway to re-parse the spec file and atomically swap the config without dropping connections.
+Send SIGHUP to a running gateway instance to trigger a hot config reload. Only supported on Unix platforms (Linux, macOS, BSDs). In file mode, SIGHUP re-reads the spec under the same fail-closed stability contract as startup (byte-identical consecutive probes; rejects non-atomic/torn updates), then atomically swaps a valid candidate without dropping connections. An unstable or invalid candidate keeps the last known-good live generation and marks authenticated `/health` as `degraded` with `config_rejected: true` until a later successful (Applied or Unchanged) reload clears it.
 
 ```
 ferrum-edge reload [OPTIONS]

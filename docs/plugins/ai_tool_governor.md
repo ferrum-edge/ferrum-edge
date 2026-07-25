@@ -14,7 +14,7 @@ decision is a deterministic function of the request/response bytes plus the
 approval endpoint's answer.
 
 - **Priority:** `2978` (Admission band) — after `ai_request_guard` (2975), before
-  `ai_semantic_cache` (2980) and `ai_federation` (4060, Response band), so
+  `ai_semantic_cache` (2996) and `ai_federation` (4060, Response band), so
   disallowed tool schemas are screened before caching or federation routing. Set
   `priority_override` (e.g. `2994`, just after `a2a_gateway`) if you want to
   consume MCP/A2A metadata emitted by `mcp_gateway`/`a2a_gateway` first — that

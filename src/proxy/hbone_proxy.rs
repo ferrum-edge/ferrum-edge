@@ -707,6 +707,7 @@ pub(super) async fn handle_hbone_request(
         let passive = backend_dispatch::passive_health_for_target(proxy, &upstream, target);
         state.health_checker.report_response(
             &proxy.id,
+            upstream_id,
             target,
             StatusCode::OK.as_u16(),
             false,

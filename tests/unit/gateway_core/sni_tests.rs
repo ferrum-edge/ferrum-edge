@@ -1,23 +1,41 @@
 use ferrum_edge::proxy::sni::{
     DtlsSniResult, extract_sni_from_client_hello, extract_sni_from_dtls_client_hello,
-    extract_sni_from_tcp_stream, resolve_proxy_by_sni,
+    extract_sni_from_tcp_stream, initial_peek_capacity, next_peek_capacity, resolve_proxy_by_sni,
 };
 
 fn build_tls_client_hello(hostname: &str) -> Vec<u8> {
+    build_tls_client_hello_with_padding_before_sni(hostname, 0)
+}
+
+/// Build a TLS ClientHello whose extensions are `padding_len` bytes of TLS
+/// padding (type 0x0015) followed by SNI. Used to synthesize modern oversized
+/// hellos where SNI lands after fat extensions (PQ key_share / ECH stand-in).
+fn build_tls_client_hello_with_padding_before_sni(hostname: &str, padding_len: usize) -> Vec<u8> {
     let name_bytes = hostname.as_bytes();
     let sni_entry_len = 1 + 2 + name_bytes.len();
     let sni_list_len = sni_entry_len;
     let sni_ext_data_len = 2 + sni_list_len;
 
-    let mut sni_ext = Vec::new();
-    sni_ext.extend_from_slice(&0x0000u16.to_be_bytes());
-    sni_ext.extend_from_slice(&(sni_ext_data_len as u16).to_be_bytes());
-    sni_ext.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
-    sni_ext.push(0x00);
-    sni_ext.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
-    sni_ext.extend_from_slice(name_bytes);
+    let mut extensions = Vec::new();
+    if padding_len > 0 {
+        // TLS padding extension (RFC 7685): type 0x0015 + length + zeros.
+        extensions.extend_from_slice(&0x0015u16.to_be_bytes());
+        extensions.extend_from_slice(&(padding_len as u16).to_be_bytes());
+        extensions.extend_from_slice(&vec![0u8; padding_len]);
+    }
 
-    let extensions_len = sni_ext.len();
+    extensions.extend_from_slice(&0x0000u16.to_be_bytes());
+    extensions.extend_from_slice(&(sni_ext_data_len as u16).to_be_bytes());
+    extensions.extend_from_slice(&(sni_list_len as u16).to_be_bytes());
+    extensions.push(0x00);
+    extensions.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
+    extensions.extend_from_slice(name_bytes);
+
+    let extensions_len = extensions.len();
+    assert!(
+        extensions_len <= u16::MAX as usize,
+        "extensions must fit in u16 length field"
+    );
 
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]);
@@ -28,7 +46,7 @@ fn build_tls_client_hello(hostname: &str) -> Vec<u8> {
     body.push(1);
     body.push(0);
     body.extend_from_slice(&(extensions_len as u16).to_be_bytes());
-    body.extend_from_slice(&sni_ext);
+    body.extend_from_slice(&extensions);
 
     let mut handshake = Vec::new();
     handshake.push(0x01);
@@ -37,6 +55,14 @@ fn build_tls_client_hello(hostname: &str) -> Vec<u8> {
     handshake.push((body_len >> 8) as u8);
     handshake.push(body_len as u8);
     handshake.extend_from_slice(&body);
+
+    // A single TLS record can carry at most u16::MAX payload bytes. Fixtures
+    // stay under that so they remain one record unless callers re-frame them.
+    // The >16 KiB fail-closed peek test intentionally exceeds the peek bound.
+    assert!(
+        handshake.len() <= u16::MAX as usize,
+        "handshake must fit in one TLS record length field"
+    );
 
     let mut record = Vec::new();
     record.push(0x16);
@@ -226,6 +252,94 @@ fn test_extract_sni_long_hostname() {
 }
 
 #[test]
+fn test_extract_sni_rejects_oversized_hostname() {
+    let hostname = "a".repeat(254);
+    let data = build_tls_client_hello(&hostname);
+
+    assert_eq!(extract_sni_from_client_hello(&data), None);
+}
+
+#[test]
+fn test_extract_sni_rejects_invalid_dns_hostname_characters() {
+    for hostname in [
+        "bad_name.example.com",
+        "-bad.example.com",
+        "bad-.example.com",
+        "bad..example.com",
+        "bad.example.com.",
+        "bäd.example.com",
+    ] {
+        let data = build_tls_client_hello(hostname);
+        assert_eq!(
+            extract_sni_from_client_hello(&data),
+            None,
+            "hostname {hostname:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn test_extract_sni_rejects_oversized_label() {
+    let hostname = format!("{}.example.com", "a".repeat(64));
+    let data = build_tls_client_hello(&hostname);
+
+    assert_eq!(extract_sni_from_client_hello(&data), None);
+}
+
+/// Build a presentation-form DNS hostname of exactly 253 bytes where every
+/// label is within the 63-byte DNS label limit (63+63+63+61 plus three dots).
+fn max_length_dns_hostname(label_byte: u8) -> String {
+    let label63 = String::from_utf8(vec![label_byte; 63]).expect("ASCII label byte");
+    let label61 = String::from_utf8(vec![label_byte; 61]).expect("ASCII label byte");
+    let hostname = format!("{label63}.{label63}.{label63}.{label61}");
+    assert_eq!(
+        hostname.len(),
+        253,
+        "fixture must sit on the DNS hostname length boundary"
+    );
+    assert!(
+        hostname.split('.').all(|label| label.len() <= 63),
+        "every label must stay within the DNS label limit"
+    );
+    hostname
+}
+
+#[test]
+fn test_extract_sni_accepts_max_length_dns_hostname() {
+    let hostname = max_length_dns_hostname(b'a');
+    let data = build_tls_client_hello(&hostname);
+
+    assert_eq!(
+        extract_sni_from_client_hello(&data),
+        Some(hostname),
+        "a valid 253-byte DNS hostname with labels ≤63 must be accepted"
+    );
+}
+
+#[test]
+fn test_extract_sni_normalizes_uppercase_at_max_length_boundary() {
+    let hostname = max_length_dns_hostname(b'A');
+    let data = build_tls_client_hello(&hostname);
+
+    assert_eq!(
+        extract_sni_from_client_hello(&data),
+        Some(hostname.to_ascii_lowercase()),
+        "ASCII uppercase SNI at the 253-byte boundary must normalize to lowercase"
+    );
+}
+
+#[test]
+fn test_extract_sni_from_dtls_rejects_oversized_hostname() {
+    let hostname = "a".repeat(254);
+    let data = build_dtls_client_hello(&hostname);
+
+    assert_eq!(
+        extract_sni_from_dtls_client_hello(&data),
+        DtlsSniResult::NoSni
+    );
+}
+
+#[test]
 fn test_extract_sni_no_sni_extension() {
     let mut body = Vec::new();
     body.extend_from_slice(&[0x03, 0x03]);
@@ -317,6 +431,49 @@ fn extract_sni_single_record_fast_path_unchanged() {
     assert_eq!(
         extract_sni_from_client_hello(&data),
         Some("whole.example.com".to_string())
+    );
+}
+
+/// Padding sized so the framed ClientHello exceeds the historical 4096-byte peek
+/// cap while remaining under the raised 16 KiB hard bound. SNI is serialized
+/// AFTER the padding — matching modern clients that put fat extensions first.
+const OVERSIZED_HELLO_PADDING: usize = 4500;
+
+#[test]
+fn extract_sni_from_oversized_clienthello_with_sni_after_padding() {
+    let data =
+        build_tls_client_hello_with_padding_before_sni("pq.example.com", OVERSIZED_HELLO_PADDING);
+    assert!(
+        data.len() > 4096,
+        "fixture must exceed the historical 4096-byte peek cap (got {} bytes)",
+        data.len()
+    );
+    assert!(
+        data.len() <= 16 * 1024,
+        "fixture must fit in the raised 16 KiB peek bound (got {} bytes)",
+        data.len()
+    );
+    assert_eq!(
+        extract_sni_from_client_hello(&data),
+        Some("pq.example.com".to_string()),
+        "SNI after large padding must still be recovered from an oversized ClientHello"
+    );
+}
+
+#[test]
+fn extract_sni_reassembles_oversized_clienthello_across_tls_records() {
+    let single = build_tls_client_hello_with_padding_before_sni(
+        "pq-split.example.com",
+        OVERSIZED_HELLO_PADDING,
+    );
+    assert!(single.len() > 4096, "fixture must exceed 4096 bytes");
+    // Split early so the padding+SNI trail lives in the second record — exercises
+    // multi-record reassembly on an oversized hello, not only the tiny fixture.
+    let two_records = split_tls_client_hello_into_records(&single, 64);
+    assert_eq!(
+        extract_sni_from_client_hello(&two_records),
+        Some("pq-split.example.com".to_string()),
+        "oversized ClientHello fragmented across TLS records must still yield SNI"
     );
 }
 
@@ -919,6 +1076,189 @@ async fn test_extract_sni_from_tcp_stream_header_split_across_records() {
         elapsed < std::time::Duration::from_secs(2),
         "header-split ClientHello stalled until the handshake timeout instead of \
          reassembling the handshake header across records: {elapsed:?}"
+    );
+}
+
+/// An oversized (>4096-byte) ClientHello with SNI after padding, delivered in
+/// split TCP writes, must still yield SNI under the raised peek bound. A single
+/// peek of the first fragment cannot see the hostname.
+#[tokio::test]
+async fn test_extract_sni_from_tcp_stream_handles_split_oversized_clienthello() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let hello = build_tls_client_hello_with_padding_before_sni(
+        "pq-tcp.example.com",
+        OVERSIZED_HELLO_PADDING,
+    );
+    assert!(hello.len() > 4096, "fixture must exceed 4096 bytes");
+    // Split well before the trailing SNI (inside the early handshake / padding).
+    let split_at = 128.min(hello.len() - 1);
+    let (first, rest) = hello.split_at(split_at);
+    let (first, rest) = (first.to_vec(), rest.to_vec());
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        extract_sni_from_tcp_stream(&server_stream, Some(std::time::Duration::from_secs(5))).await
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&first).await.expect("write first");
+    client.flush().await.expect("flush first");
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    client.write_all(&rest).await.expect("write rest");
+    client.flush().await.expect("flush rest");
+
+    let result = accept_task.await.expect("accept_task");
+    assert_eq!(
+        result,
+        Some("pq-tcp.example.com".to_string()),
+        "split-write oversized ClientHello with SNI after padding must yield SNI"
+    );
+}
+
+/// Oversized ClientHello fragmented across TLS records and delivered as separate
+/// TCP segments: the peek loop must buffer the full multi-record span (under the
+/// 16 KiB hard bound) and reassemble before parsing SNI.
+#[tokio::test]
+async fn test_extract_sni_from_tcp_stream_oversized_split_across_records() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let single = build_tls_client_hello_with_padding_before_sni(
+        "pq-rec.example.com",
+        OVERSIZED_HELLO_PADDING,
+    );
+    assert!(single.len() > 4096, "fixture must exceed 4096 bytes");
+    let two_records = split_tls_client_hello_into_records(&single, 64);
+    // First record = 5-byte TLS header + 64 handshake bytes.
+    let (first, rest) = two_records.split_at(5 + 64);
+    let (first, rest) = (first.to_vec(), rest.to_vec());
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        let started = std::time::Instant::now();
+        let result =
+            extract_sni_from_tcp_stream(&server_stream, Some(std::time::Duration::from_secs(5)))
+                .await;
+        (result, started.elapsed())
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&first).await.expect("write first");
+    client.flush().await.expect("flush first");
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    client.write_all(&rest).await.expect("write rest");
+    client.flush().await.expect("flush rest");
+
+    let (result, elapsed) = accept_task.await.expect("accept_task");
+    assert_eq!(
+        result,
+        Some("pq-rec.example.com".to_string()),
+        "oversized multi-record ClientHello must yield SNI after reassembly"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "oversized multi-record peek stalled until handshake timeout: {elapsed:?}"
+    );
+}
+
+/// Lazy peek-buffer sizing: ordinary small ClientHellos must not grow the
+/// buffer to the 16 KiB hard cap. The accept path starts at the historical
+/// 4 KiB floor and only steps up when the initial buffer is full.
+#[test]
+fn peek_buffer_starts_small_and_grows_lazily_toward_hard_cap() {
+    let initial = initial_peek_capacity();
+    assert_eq!(
+        initial,
+        4 * 1024,
+        "initial peek floor must stay at the historical 4 KiB size so ordinary \
+         connections do not pay the 16 KiB hard-cap allocation"
+    );
+    assert!(
+        initial < 16 * 1024,
+        "initial peek capacity must be strictly below the 16 KiB hard cap"
+    );
+    // An ordinary small ClientHello (~200-600 bytes) must not trigger growth.
+    assert_eq!(
+        next_peek_capacity(512),
+        initial,
+        "small observed prefix must keep capacity at the initial floor"
+    );
+    assert_eq!(
+        next_peek_capacity(initial - 1),
+        initial,
+        "partial fill of the initial buffer must not grow toward the hard cap"
+    );
+    // Growth happens only once the initial buffer is full.
+    assert_eq!(
+        next_peek_capacity(initial),
+        16 * 1024,
+        "full initial buffer grows to the hard cap in one step"
+    );
+    assert_eq!(
+        next_peek_capacity(16 * 1024),
+        16 * 1024,
+        "capacity must never exceed the hard peek bound"
+    );
+}
+
+/// A ClientHello whose handshake span exceeds the 16 KiB hard peek bound, with
+/// SNI serialized after the padding, must fail closed (no SNI) rather than
+/// allocate unboundedly, wait out the handshake deadline, or invent a hostname
+/// from a truncated prefix.
+#[tokio::test]
+async fn test_extract_sni_from_tcp_stream_fails_closed_when_hello_exceeds_peek_cap() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    // Padding large enough that the framed hello exceeds 16 KiB and SNI sits
+    // past the peek buffer — the parser on the full buffer still finds SNI, but
+    // the bounded peek must not.
+    let hello = build_tls_client_hello_with_padding_before_sni("overcap.example.com", 20_000);
+    assert!(
+        hello.len() > 16 * 1024,
+        "fixture must exceed the 16 KiB peek bound (got {} bytes)",
+        hello.len()
+    );
+    assert_eq!(
+        extract_sni_from_client_hello(&hello),
+        Some("overcap.example.com".to_string()),
+        "full-buffer parse control: SNI is present past the peek cap"
+    );
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        let started = std::time::Instant::now();
+        let result =
+            extract_sni_from_tcp_stream(&server_stream, Some(std::time::Duration::from_secs(5)))
+                .await;
+        (result, started.elapsed())
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&hello).await.expect("write");
+    client.flush().await.expect("flush");
+
+    let (result, elapsed) = accept_task.await.expect("accept_task");
+    assert_eq!(
+        result, None,
+        "ClientHello exceeding the hard peek bound with SNI past the cap must \
+         fail closed (None), not allocate past the bound or mis-parse a hostname"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "over-cap peek must fail closed at the hard bound without waiting out \
+         the handshake deadline: {elapsed:?}"
     );
 }
 

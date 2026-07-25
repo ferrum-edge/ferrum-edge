@@ -1987,3 +1987,76 @@ fn cumulative_ai_cost_saturates_instead_of_wrapping() {
         "ferrum_ai_estimated_cost_currency_units_total{proxy_id=\"saturated-ai\",provider=\"openai\"} 18446744073709.551615"
     ));
 }
+
+// --- Cached TLS inventory snapshot freshness (issue #2410) -------------------
+
+const SNAPSHOT_TIMESTAMP_LINE: &str =
+    "ferrum_tls_inventory_snapshot_timestamp_seconds{namespace=\"ferrum\"} 1700000000";
+const SNAPSHOT_REFRESHED_LINE: &str =
+    "ferrum_tls_inventory_snapshot_timestamp_seconds{namespace=\"ferrum\"} 1700000060";
+const SNAPSHOT_MAX_AGE_LINE: &str =
+    "ferrum_tls_inventory_snapshot_max_age_seconds{namespace=\"ferrum\"} 300";
+
+#[test]
+fn tls_inventory_freshness_renders_timestamp_and_configured_bound() {
+    let registry = MetricsRegistry::new();
+    registry.configure(5, 3600, 60_000, "ferrum");
+
+    registry.set_tls_inventory_freshness(Some((1_700_000_000, 300)));
+
+    let output = registry.render_uncached();
+    assert!(
+        output.contains(SNAPSHOT_TIMESTAMP_LINE),
+        "snapshot collection timestamp must be exported:\n{output}"
+    );
+    assert!(
+        output.contains(SNAPSHOT_MAX_AGE_LINE),
+        "configured snapshot bound must be exported:\n{output}"
+    );
+}
+
+#[test]
+fn tls_inventory_freshness_omitted_until_a_snapshot_exists() {
+    let registry = MetricsRegistry::new();
+    registry.set_tls_inventory_freshness(None);
+
+    let output = registry.render_uncached();
+    assert!(
+        !output.contains("ferrum_tls_inventory_snapshot_"),
+        "no freshness series may be exported before the first snapshot:\n{output}"
+    );
+}
+
+#[tokio::test]
+async fn unchanged_tls_inventory_freshness_preserves_the_render_cache() {
+    // Issue #2240 discipline: the scrape path publishes freshness on every
+    // request, so an unchanged value must not evict the rendered exposition.
+    // A high invalidation min-age keeps `record()` from clearing the cache, so
+    // the only candidate invalidation source is the freshness publication.
+    let registry = MetricsRegistry::new();
+    registry.configure(5, 3600, 60_000, "ferrum");
+    registry.set_tls_inventory_freshness(Some((1_700_000_000, 300)));
+
+    let first = registry.render();
+    assert!(first.contains(SNAPSHOT_TIMESTAMP_LINE));
+
+    registry.record(&make_summary("freshness-hidden", "GET", 200, 10.0, 5.0));
+    registry.set_tls_inventory_freshness(Some((1_700_000_000, 300)));
+    let cached = registry.render();
+    assert!(
+        !cached.contains("freshness-hidden"),
+        "republishing the same freshness must not evict the render cache:\n{cached}"
+    );
+
+    // A real snapshot refresh (new timestamp) does invalidate it.
+    registry.set_tls_inventory_freshness(Some((1_700_000_060, 300)));
+    let refreshed = registry.render();
+    assert!(
+        refreshed.contains(SNAPSHOT_REFRESHED_LINE),
+        "a newer snapshot must be rendered:\n{refreshed}"
+    );
+    assert!(
+        refreshed.contains("freshness-hidden"),
+        "the invalidated cache must also expose the recorded series:\n{refreshed}"
+    );
+}

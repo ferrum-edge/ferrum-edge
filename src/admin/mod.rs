@@ -268,17 +268,21 @@ pub struct AdminState {
     /// Set by the database- or CP-mode poll loop when the latest full config
     /// load was rejected by the shared runtime-config *validation* contract (a
     /// reachable backend served a semantically-invalid snapshot) rather than
-    /// failing on connectivity. Orthogonal to `db_available`: on a validation
-    /// rejection the backend is reachable and admin writes are the in-band repair
-    /// tool, so `db_available` stays `true` while this flag rises. Cleared only by
-    /// the next accepted authoritative full reload. Surfaced only in the
+    /// failing on connectivity — and by file-mode SIGHUP reload when a
+    /// candidate fails read/parse/validation/apply. Orthogonal to `db_available`:
+    /// on a DB/CP validation rejection the backend is reachable and admin writes
+    /// are the in-band repair tool, so `db_available` stays `true` while this
+    /// flag rises. File mode has no DB (`db_available` is `None`, treated as
+    /// reachable for `/health` gating) and stays read-only; operators repair by
+    /// fixing the file and reloading. Cleared only by the next accepted
+    /// authoritative full reload (Applied or Unchanged). Surfaced only in the
     /// authenticated `/health` detail (`config_rejected`) and coarsely as a
-    /// `"degraded"` status; `None` in modes without a writable poll loop.
+    /// `"degraded"` status; `None` in modes without a reload rejection signal.
     ///
     /// The stored flag is deliberately sticky across a later connectivity outage;
     /// the `/health` handler suppresses the detailed `config_rejected` field while
     /// `db_available=false` so it never advertises the writable repair path when
-    /// admin writes are actually blocked. See issue #2158.
+    /// admin writes are actually blocked. See issue #2158 (DB/CP) and #2979 (file).
     pub config_rejected: Option<Arc<AtomicBool>>,
     /// Max request body size in MiB for POST /restore.
     pub admin_restore_max_body_size_mib: usize,
@@ -350,6 +354,30 @@ impl AdminState {
     }
 }
 
+/// Configured maximum age of the cached TLS inventory snapshot behind the
+/// `/metrics` certificate gauges (`FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS`).
+/// `0` disables the bounded background refresh. Modes without proxy state fall
+/// back to the built-in default.
+fn tls_inventory_snapshot_ttl_seconds(state: &AdminState) -> u64 {
+    state
+        .proxy_state
+        .as_ref()
+        .map(|proxy| proxy.env_config.tls_inventory_snapshot_ttl_seconds)
+        .unwrap_or(crate::tls::inventory_cache::DEFAULT_SNAPSHOT_TTL_SECONDS)
+}
+
+/// Register the metrics inventory collector and warm the snapshot when an admin
+/// listener starts, so the first Prometheus scrape already has certificate
+/// metadata instead of waiting for its own background refresh to land.
+fn warm_tls_inventory_snapshot(state: &AdminState) {
+    tls_management::replace_metrics_inventory_collector_for_serving_cycle(state);
+    let ttl_seconds = tls_inventory_snapshot_ttl_seconds(state);
+    if ttl_seconds > 0 {
+        let ttl = Duration::from_secs(ttl_seconds);
+        crate::tls::inventory_cache::schedule_refresh_if_due(ttl);
+    }
+}
+
 /// Start the Admin API listener with optional TLS support and signal readiness
 /// after the TCP socket binds successfully.
 pub async fn start_admin_listener_with_tls_and_signal(
@@ -411,6 +439,10 @@ pub async fn serve_admin_on_listener(
     // Publish the limiter so `/metrics` can render its gauge/counters.
     crate::plugins::prometheus_metrics::global_registry()
         .set_admin_conn_metrics(conn_limiter.clone());
+    // Publish the metrics-safe TLS inventory collector and warm its snapshot so
+    // the first scrape reads cached certificate metadata instead of loading
+    // TLS material inline (issue #2410).
+    warm_tls_inventory_snapshot(&state);
     let mut shutdown_rx = shutdown;
     let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
     let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
@@ -530,6 +562,10 @@ pub async fn serve_admin_on_listener_with_dynamic_tls(
     // Publish the limiter so `/metrics` can render its gauge/counters.
     crate::plugins::prometheus_metrics::global_registry()
         .set_admin_conn_metrics(conn_limiter.clone());
+    // Publish the metrics-safe TLS inventory collector and warm its snapshot so
+    // the first scrape reads cached certificate metadata instead of loading
+    // TLS material inline (issue #2410).
+    warm_tls_inventory_snapshot(&state);
     let mut shutdown_rx = shutdown;
     let mut accept_backoff = crate::util::accept_backoff::AcceptBackoff::new();
     let mut accept_err_log = crate::util::accept_backoff::LogRateLimiter::new();
@@ -1352,15 +1388,18 @@ pub async fn handle_admin_request(
             }
         }
 
-        // Config-rejection signal (issue #2158): the latest full config load was
-        // rejected by the runtime-config validation contract while the backend
-        // stayed reachable. Admin writes remain ENABLED (they are the in-band
-        // repair path — `db_available` is left `true`), so surface the condition
-        // as a coarse `"degraded"` status plus a `config_rejected` detail flag.
-        // The boolean detail is authenticated-only: it is added to
-        // `health_status`, which the minimal unauthenticated body below does not
-        // echo. The coarse status is consistent with the other DB-driven
-        // degradations above. Cleared by the next accepted full reload.
+        // Config-rejection signal (issues #2158 / #2979): the latest full config
+        // load was rejected by the runtime-config validation contract (DB/CP) or
+        // a file-mode SIGHUP candidate failed read/parse/validation/apply while
+        // the previous generation kept serving. In DB/CP, admin writes remain
+        // ENABLED (they are the in-band repair path — `db_available` is left
+        // `true`), so surface the condition as a coarse `"degraded"` status plus
+        // a `config_rejected` detail flag. File mode has `db_available: None`
+        // (treated as reachable below) and stays read-only; repair is a fixed
+        // file + reload. The boolean detail is authenticated-only: it is added
+        // to `health_status`, which the minimal unauthenticated body below does
+        // not echo. The coarse status is consistent with the other degradations
+        // above. Cleared by the next accepted full reload (Applied or Unchanged).
         //
         // The stored flag is intentionally STICKY across a later connectivity
         // outage (it clears only on an accepted authoritative full reload). But
@@ -1491,8 +1530,35 @@ pub async fn handle_admin_request(
             return Ok(metrics_unauthorized_response());
         }
         let registry = crate::plugins::prometheus_metrics::global_registry();
-        let inventory = tls_management::collect_inventory(&state);
-        registry.refresh_tls_certificate_inventory(&inventory);
+        // TLS certificate metadata comes from the cached, non-secret inventory
+        // snapshot (issue #2410). The scrape performs zero filesystem,
+        // Kubernetes, HSM, or cloud-secret I/O and never blocks on a provider:
+        // it reads the snapshot lock-free and, when the snapshot is older than
+        // the configured bound, only *schedules* a single-flight background
+        // refresh. Private-key bytes are never materialized for metrics.
+        tls_management::install_metrics_inventory_collector(&state);
+        let snapshot_ttl_seconds = tls_inventory_snapshot_ttl_seconds(&state);
+        if snapshot_ttl_seconds > 0 {
+            let ttl = Duration::from_secs(snapshot_ttl_seconds);
+            crate::tls::inventory_cache::schedule_refresh_if_due(ttl);
+        }
+        match crate::tls::inventory_cache::snapshot() {
+            Some(snapshot) => {
+                let collected_at = snapshot.collected_at.timestamp();
+                registry.refresh_tls_certificate_inventory(&snapshot.inventory);
+                registry.set_tls_inventory_freshness(Some((collected_at, snapshot_ttl_seconds)));
+            }
+            None => {
+                // A serving-cycle collector replacement invalidates the prior
+                // cycle's snapshot. Clear any gauges derived from it rather
+                // than exposing stale certificate metadata until the new
+                // generation's background refresh publishes.
+                registry.refresh_tls_certificate_inventory(
+                    &crate::tls::inventory::TlsInventory::default(),
+                );
+                registry.set_tls_inventory_freshness(None);
+            }
+        }
         let mut metrics_output = registry.render();
         metrics_output.push_str(&crate::logging::render_prometheus());
         metrics_output.push_str(&crate::observability_delivery::render_prometheus());
@@ -1533,6 +1599,12 @@ pub async fn handle_admin_request(
                 ));
             }
         },
+        Err(JwtError::NotConfigured) => {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &json!({"error": "Admin authentication is unavailable"}),
+            ));
+        }
         Err(JwtError::MissingHeader) => {
             return Ok(json_response(
                 StatusCode::UNAUTHORIZED,

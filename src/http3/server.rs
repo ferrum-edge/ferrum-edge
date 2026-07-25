@@ -10867,6 +10867,8 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
         .iter()
         .any(|plugin| plugin.requires_response_committed_hook())
     {
+        ctx.metadata
+            .remove(crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
         return false;
     }
 
@@ -10937,6 +10939,8 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
         };
 
         if terminal_gateway_deadline {
+            ctx.metadata
+                .remove(crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
             crate::proxy::spawn_detached_response_committed_hooks(
                 pending_hook,
                 plugins[index + 1..].to_vec(),
@@ -10971,6 +10975,8 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
                 );
                 (normalized.http_status, normalized.headers, normalized.body)
             };
+        ctx.metadata
+            .remove(crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
         crate::proxy::spawn_detached_response_committed_hooks(
             pending_hook,
             plugins[index + 1..].to_vec(),
@@ -10980,6 +10986,8 @@ async fn run_h3_deadline_bounded_reject_committed_hooks_with_policy(
         );
         return true;
     }
+    ctx.metadata
+        .remove(crate::proxy::FINALIZED_SYNTHETIC_RESPONSE_METADATA_KEY);
     false
 }
 

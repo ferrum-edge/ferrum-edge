@@ -538,22 +538,53 @@ For config files, restore from the `.backup.*` file that was created before the 
 
 ## MongoDB Migrations
 
-MongoDB does not use SQL migrations. Instead, `MongoStore::run_migrations()` creates indexes using idempotent `createIndex` operations. Running the same migration multiple times is safe — `createIndex` is a no-op if the index already exists.
+MongoDB does not use SQL migrations. Instead, `MongoStore::run_migrations()`
+creates indexes from the canonical plan in
+`src/config/mongo_index_plan.rs` using idempotent `createIndex` operations.
+Running the same migration multiple times is safe — `createIndex` is a no-op if
+the full index spec (keys + options) already matches. Migrate dry-run prints
+that same plan without connecting; migrate status connects, runs `listIndexes`,
+and reports each required index as present, missing, or mismatched, plus whether
+the required guard-collection shells exist (connectivity or authentication
+failures return nonzero).
 
 ### What Gets Created
 
-| Collection | Indexes |
-|-----------|---------|
-| `proxies` | `(namespace, name)` unique sparse, `updated_at`, `upstream_id`, `(namespace, listen_port)` unique sparse, `namespace`, `(namespace, updated_at)` |
-| `consumers` | `(namespace, username)` unique, `(namespace, custom_id)` unique sparse, `updated_at`, `namespace`, `(namespace, updated_at)` |
-| `plugin_configs` | `proxy_id`, `updated_at`, `namespace`, `(namespace, updated_at)`, `(namespace, scope)`, `(namespace, plugin_name)` |
-| `upstreams` | `(namespace, name)` unique sparse, `updated_at`, `namespace`, `(namespace, updated_at)` |
+The authoritative index and empty-shell collection list lives only in
+`src/config/mongo_index_plan.rs` (`required_mongo_indexes` /
+`REQUIRED_GUARD_COLLECTIONS`). Do not maintain a second summary of keys or
+options here — it will drift. Collections covered by the baseline plan include
+`proxies`, `consumers`, `consumer_identity_index`, `plugin_configs`,
+`upstreams`, `api_specs`, `audit_events`, `config_changes`, plus the guard
+collections `proxy_route_locks`, `upstream_ref_guards`, and
+`mtls_dns_admission_locks`.
 
 ### Running MongoDB Migrations
 
 ```bash
 FERRUM_MODE=migrate \
   FERRUM_MIGRATE_ACTION=up \
+  FERRUM_DB_TYPE=mongodb \
+  FERRUM_DB_URL="mongodb://localhost:27017" \
+  FERRUM_MONGO_DATABASE=ferrum \
+  ferrum-edge
+```
+
+Preview the canonical plan without connecting:
+
+```bash
+FERRUM_MODE=migrate \
+  FERRUM_MIGRATE_ACTION=up \
+  FERRUM_MIGRATE_DRY_RUN=true \
+  FERRUM_DB_TYPE=mongodb \
+  ferrum-edge
+```
+
+Compare live indexes to the plan (connects; does not mutate):
+
+```bash
+FERRUM_MODE=migrate \
+  FERRUM_MIGRATE_ACTION=status \
   FERRUM_DB_TYPE=mongodb \
   FERRUM_DB_URL="mongodb://localhost:27017" \
   FERRUM_MONGO_DATABASE=ferrum \

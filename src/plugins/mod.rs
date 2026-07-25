@@ -127,6 +127,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use self::utils::runtime_bool_gate::GatePolicyStamp;
 use crate::config::types::{
     BackendScheme, BackendTlsConfig, Consumer, DispatchKind, HttpFlavor, Proxy,
     ResolvedPortOverride, RetryConfig, Upstream, UpstreamTarget,
@@ -1901,6 +1902,17 @@ pub struct RequestContext {
     /// Kept private so request metadata cannot suppress transforms or inspection,
     /// and unrelated synthetic short-circuits cannot opt into the skip.
     pub(crate) finalized_response_replay: bool,
+    /// Response-side runtime-overlay gate provenance, pinned once for this
+    /// request (see [`GatePolicyStamp`]).
+    ///
+    /// Plugins that persist a client-visible representation across requests
+    /// (today `response_caching`) stamp this value onto the stored entry and
+    /// refuse to replay an entry stamped with a different policy, so a
+    /// representation produced under one runtime-overlay policy can never be
+    /// replayed under another. Pinning once per request — rather than reading
+    /// the gates again at storage time — is what makes the stamp provenance
+    /// rather than a guess. Kept private so request metadata cannot forge one.
+    pub(crate) response_policy_stamp: Option<GatePolicyStamp>,
     /// Deduplication instances whose in-flight ownership can be released after
     /// a serverless rejection proven to occur before external invocation. Each
     /// committed hook consumes only its own entry, preserving exactly-once
@@ -2361,6 +2373,7 @@ impl RequestContext {
             ai_semantic_firewall_response_hashes: HashMap::new(),
             request_deduplication_states: HashMap::new(),
             finalized_response_replay: false,
+            response_policy_stamp: None,
             serverless_pre_invocation_rejection_owners: HashSet::new(),
             serverless_external_side_effect_owners: HashSet::new(),
             serverless_terminate_response: false,
@@ -3126,6 +3139,7 @@ impl RequestContext {
             ai_semantic_firewall_response_hashes: self.ai_semantic_firewall_response_hashes.clone(),
             request_deduplication_states: self.request_deduplication_states.clone(),
             finalized_response_replay: self.finalized_response_replay,
+            response_policy_stamp: self.response_policy_stamp.clone(),
             serverless_pre_invocation_rejection_owners: self
                 .serverless_pre_invocation_rejection_owners
                 .clone(),
@@ -3219,6 +3233,28 @@ impl RequestContext {
             mesh_outbound_destination_authz_port: self.mesh_outbound_destination_authz_port,
             mesh_inbound_listener_authz_port: self.mesh_inbound_listener_authz_port,
         }
+    }
+
+    /// Pin (once) and return this request's response-side policy stamp.
+    ///
+    /// One ArcSwap load on first call, then a memoized opaque identity. Callers
+    /// pin as early as possible on the request path so the pinned value covers
+    /// every gate read the response pipeline will later perform.
+    pub(crate) fn pin_response_policy_stamp(&mut self) -> &GatePolicyStamp {
+        self.response_policy_stamp
+            .get_or_insert_with(response_transformer::runtime_overlay::policy_stamp)
+    }
+
+    /// Whether no response-side gate publication happened since this request
+    /// pinned its stamp.
+    ///
+    /// A `false` result means some gate read during this request may have used
+    /// a different policy than the pinned stamp describes, so any
+    /// representation produced by this request has unprovable provenance and
+    /// must not be persisted for later replay.
+    pub(crate) fn response_policy_stamp_stable(&mut self) -> bool {
+        let current = response_transformer::runtime_overlay::policy_stamp();
+        self.pin_response_policy_stamp() == &current
     }
 
     pub(crate) fn ensure_waf_metadata_initialized(&mut self) {
@@ -5590,7 +5626,7 @@ pub struct StreamTransactionSummary {
 /// |-----------|-------------|-------------------------------------------|---------|
 /// | Early     | 0–949       | Matched-request tracing and preflight     | otel_tracing (25), correlation_id (50), cors (100), request_termination (125), mesh_outbound_registry (130), ip_restriction (150), bot_detection (200), sse (250), grpc_web (260), grpc_method_router (275), spiffe_identity (940) |
 /// | AuthN     | 950–1999    | Authentication / identity verification    | mtls_auth (950), jwks_auth (1000), oauth2_introspection (1050), oidc_relying_party (1075), jwt_auth (1100), key_auth (1200), ldap_auth (1250), basic_auth (1300), hmac_auth (1400), soap_ws_security (1500) |
-/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_semantic_cache (2980), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993) |
+/// | AuthZ     | 2000–2999   | Authorization and admission control       | access_control (2000), tcp_connection_throttle (2050), mesh_authz (2075), opa (2080), adaptive_concurrency (2090), ai_transcript_audit (2740), request_deduplication (2750), request_size_limiting (2800), graphql (2850), rate_limiting (2900), ai_prompt_shield (2925), waf (2930), body_validator (2950), openapi_validator (2960), ai_semantic_firewall (2968), ai_request_guard (2975), ai_tool_governor (2978), ai_stream_router (2984), mcp_gateway (2992), a2a_gateway (2993), mesh_route_dispatch (2995), ai_semantic_cache (2996) |
 /// | Transform | 3000–3999   | Request shaping and response buffering    | request_transformer (3000), serverless_function (3025), response_mock (3030), grpc_deadline (3050), load_testing (3070), request_mirror (3075), response_size_limiting (3490), response_caching (3500) |
 /// | Response  | 4000–4999   | Response transformation, security headers, and AI accounting | response_transformer (4000), compression (4050), ai_prompt_compressor (4055), ai_federation (4060), ai_response_guard (4075), security_headers (4080), ai_token_metrics (4100), ai_rate_limiter (4200) |
 /// | Logging   | 9000–9999   | Observability and frame logging           | stdout_logging (9000), ws_frame_logging (9050), statsd_logging (9075), http_logging (9100), tcp_logging (9125), kafka_logging (9150), loki_logging (9155), udp_logging (9160), ws_logging (9175), transaction_debugger (9200), prometheus_metrics (9300), api_chargeback (9350), api_chargeback_sink (9351), workload_metrics (9360), __mesh_bpf_metrics (9365), transaction_log_schema (9999, config-only) |
@@ -5650,13 +5686,13 @@ pub mod priority {
     /// `ai_federation` so disallowed tool schemas are screened before caching or
     /// federation routing.
     pub const AI_TOOL_GOVERNOR: u16 = 2978;
-    pub const AI_SEMANTIC_CACHE: u16 = 2980;
     /// `ai_stream_router`: claims streaming (`"stream": true`) OpenAI Chat
     /// Completions requests, rewrites `route_override_*` to the matched provider,
     /// and normalizes provider-native SSE to OpenAI `chat.completion.chunk` SSE.
-    /// Runs after `ai_semantic_cache` and before `ai_federation` (now in the
-    /// response band at 4060) so the non-streaming federation path can defer to
-    /// it via the `ai_stream_router_claimed` marker.
+    /// Runs before `ai_semantic_cache` (and before `ai_federation` at 4060) so
+    /// cache lookup observes the effective provider destination for streaming
+    /// claims while the non-streaming federation path can still defer via the
+    /// `ai_stream_router_claimed` marker.
     pub const AI_STREAM_ROUTER: u16 = 2984;
     /// `mcp_gateway`: parses MCP JSON-RPC bodies and applies MCP-aware route
     /// overrides after generic admission/auth plugins but before final dispatch.
@@ -5666,9 +5702,16 @@ pub mod priority {
     pub const A2A_GATEWAY: u16 = 2993;
     /// `mesh_route_dispatch`: rewrites `route_override_*` on `RequestContext`
     /// based on Istio VirtualService method/header/query-param predicates.
-    /// Runs after admission plugins and immediately before request-transform
-    /// plugins; backend dispatch applies the override after `before_proxy`.
+    /// Runs after admission plugins and immediately before `ai_semantic_cache`
+    /// so cache identity can bind the post-routing effective destination;
+    /// backend dispatch applies the override after `before_proxy`.
     pub const MESH_ROUTE_DISPATCH: u16 = 2995;
+    /// `ai_semantic_cache`: exact/semantic LLM response cache. Runs after
+    /// route-dispatch plugins (`ai_stream_router`, `mcp_gateway`, `a2a_gateway`,
+    /// `mesh_route_dispatch`) so exact and semantic keys include the canonical
+    /// route/operation identity and the effective destination/provider that
+    /// will serve a miss, and before request transformers / `ai_federation`.
+    pub const AI_SEMANTIC_CACHE: u16 = 2996;
     pub const REQUEST_TRANSFORMER: u16 = 3000;
     pub const SERVERLESS_FUNCTION: u16 = 3025;
     pub const RESPONSE_MOCK: u16 = 3030;

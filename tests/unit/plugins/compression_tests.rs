@@ -1,3 +1,8 @@
+// These tests intentionally serialize complete async cache lifecycles against
+// process-global RTDS publications. The guard is test-only and no task in the
+// guarded lifecycle reacquires it.
+#![allow(clippy::await_holding_lock)]
+
 use super::plugin_utils::create_test_proxy;
 use ferrum_edge::_test_support::{
     apply_buffered_request_body_normalization_before_before_proxy_for_test,
@@ -96,6 +101,18 @@ async fn plan_response_algorithm(
 }
 
 // ────────────────────── Config defaults ──────────────────────
+
+/// Serialize against RTDS runtime-overlay publications.
+///
+/// `response_caching` stamps every stored entry with the live response-side
+/// runtime-overlay gate fingerprint and retires entries whose stamp no longer
+/// matches, so an overlay publication in a concurrently running test would
+/// legitimately turn a HIT into a MISS. Every test that stores an entry and
+/// then asserts a HIT/REVALIDATED replay takes this process-wide lock, which
+/// is the same lock every overlay publisher holds.
+fn response_cache_replay_policy_guard() -> std::sync::MutexGuard<'static, ()> {
+    ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock()
+}
 
 #[test]
 fn test_default_config() {
@@ -985,6 +1002,7 @@ fn test_h1_h2_h3_paths_reach_shared_after_proxy_chokepoint() {
 
 #[tokio::test]
 async fn test_shared_cache_identity_first_then_gzip_brotli_variants() {
+    let _policy_guard = response_cache_replay_policy_guard();
     // #2355 acceptance: populate the built-in shared cache with an eligible
     // identity/default variant first, then prove later gzip / Brotli /
     // identity;q=0 requests miss that entry instead of replaying identity.

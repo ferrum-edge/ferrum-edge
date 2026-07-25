@@ -26,8 +26,9 @@ use crate::config::db_backend::{
 use crate::config::db_loader::is_proxy_plugin_association_load_error;
 use crate::config::types::{
     Consumer, GatewayConfig, PluginConfig, PluginScope, Proxy, RetryConfig, Upstream,
-    first_effective_mesh_transport_conflict_with_mesh, mesh_transport_retry_conflict_message,
-    proxy_retry_is_effective, proxy_with_resolved_port_caps, validate_resource_id,
+    backend_tls_sni_direct_h2_conflict_messages, first_effective_mesh_transport_conflict_with_mesh,
+    mesh_transport_retry_conflict_message, proxy_retry_is_effective, proxy_with_resolved_port_caps,
+    validate_resource_id,
 };
 use crate::plugins::mesh_route_dispatch::MeshRouteDispatchConfig;
 
@@ -3231,6 +3232,34 @@ impl AdminResource for Upstream {
                             &conflict,
                         ));
                     }
+
+                    // Reverse write order for issue #2954: adding SNI onto an
+                    // upstream that a retry / buffering / http2-disabled proxy
+                    // already targets must fail closed at admission.
+                    let mut admission_proxy = proxy_with_resolved_port_caps(&proxy, resource);
+                    admission_proxy.resolved_tls =
+                        crate::config::types::BackendTlsConfig::from_upstream(resource);
+                    if let Some(subset_name) = proxy.upstream_subset.as_deref()
+                        && let Some(subset_tls) = resource
+                            .resolved_subset_tls
+                            .get(subset_name)
+                            .and_then(|resolved| resolved.tls.clone())
+                    {
+                        admission_proxy.resolved_tls = subset_tls;
+                    }
+                    admission_proxy.dispatch_kind = crate::config::types::DispatchKind::from(
+                        admission_proxy.effective_scheme(),
+                    );
+                    let empty_plugins: &[PluginConfig] = &[];
+                    let plugin_configs = cached_config
+                        .as_ref()
+                        .map(|config| config.plugin_configs.as_slice())
+                        .unwrap_or(empty_plugins);
+                    errors.extend(backend_tls_sni_direct_h2_conflict_messages(
+                        &admission_proxy,
+                        Some(resource),
+                        plugin_configs,
+                    ));
                 }
 
                 // A retry-enabled proxy can also reach this upstream through an
@@ -4322,6 +4351,37 @@ impl AdminResource for Proxy {
                                 &conflict,
                             ),
                         ]));
+                    }
+
+                    // Plain-HTTPS SNI overrides require direct-H2. Reject retry /
+                    // body-buffering / pool_enable_http2=false combinations at
+                    // admission (issue #2954), matching full-config validate.
+                    let mut admission_proxy = proxy_with_resolved_port_caps(resource, &upstream);
+                    admission_proxy.resolved_tls =
+                        crate::config::types::BackendTlsConfig::from_upstream(&upstream);
+                    if let Some(subset_name) = resource.upstream_subset.as_deref()
+                        && let Some(subset_tls) = upstream
+                            .resolved_subset_tls
+                            .get(subset_name)
+                            .and_then(|resolved| resolved.tls.clone())
+                    {
+                        admission_proxy.resolved_tls = subset_tls;
+                    }
+                    admission_proxy.dispatch_kind = crate::config::types::DispatchKind::from(
+                        admission_proxy.effective_scheme(),
+                    );
+                    let empty_plugins: &[PluginConfig] = &[];
+                    let plugin_configs = cached_config
+                        .as_ref()
+                        .map(|config| config.plugin_configs.as_slice())
+                        .unwrap_or(empty_plugins);
+                    let sni_errors = backend_tls_sni_direct_h2_conflict_messages(
+                        &admission_proxy,
+                        Some(&upstream),
+                        plugin_configs,
+                    );
+                    if !sni_errors.is_empty() {
+                        return Err(AfterValidateError::BadRequest(sni_errors));
                     }
                 }
                 Ok(None) => {

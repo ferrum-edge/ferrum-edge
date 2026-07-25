@@ -12,3 +12,4 @@ mod api_specs_schema_anchor_tests;
 mod api_specs_server_base_path_tests;
 mod mesh_remote_clusters_tests;
 mod openapi_validator_generated_config_contract_tests;
+mod tls_managed_kind_overwrite_tests;

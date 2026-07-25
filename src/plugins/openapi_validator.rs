@@ -1,10 +1,10 @@
 //! OpenAPI contract validation plugin.
 //!
 //! Validates request and response bodies against operation schemas extracted
-//! from an attached OpenAPI document. All regexes and JSON Schema validators
-//! are compiled at plugin construction time; request-time work is limited to
-//! operation matching, optional decompression, media-type parsing, and schema
-//! validation.
+//! from an attached OpenAPI document. All regexes, JSON Schema validators, and
+//! compact schema type/shape metadata are compiled at plugin construction time;
+//! request-time work is limited to operation matching, optional decompression,
+//! media-type parsing, O(1) conversion metadata lookups, and schema validation.
 
 use ahash::AHashMap;
 use async_trait::async_trait;
@@ -86,10 +86,17 @@ struct MediaValidator {
 
 #[derive(Default)]
 struct ConversionPlan {
+    /// Compact type/shape metadata keyed by schema pointer. Populated once per
+    /// registered schema node during compile; request conversion uses O(1)
+    /// lookups instead of re-walking `allOf`/`oneOf`/`anyOf` graphs.
+    schema_types: AHashMap<usize, SchemaTypeSet>,
     object_schemas: AHashMap<usize, Arc<Value>>,
     array_item_schemas: AHashMap<usize, Arc<Value>>,
     composed_scalar_validators: AHashMap<usize, jsonschema::Validator>,
     pattern_property_schemas: AHashMap<usize, Vec<(Regex, Arc<Value>)>>,
+    /// Cache-miss computes for synthetic/unregistered schemas. Registered
+    /// request-path lookups must keep this at zero.
+    fallback_type_computes: AtomicUsize,
 }
 
 impl ConversionPlan {
@@ -115,27 +122,21 @@ impl ConversionPlan {
             return Ok(());
         }
 
+        let types = collect_schema_types(schema);
+        self.schema_types.insert(key, types);
+
         if schema_is_composed(schema) {
-            let scalar_types = collect_scalar_types(schema);
-            if scalar_types.iter().any(|kind| {
-                matches!(
-                    kind,
-                    ScalarType::Integer
-                        | ScalarType::Number
-                        | ScalarType::Boolean
-                        | ScalarType::String
-                )
-            }) {
+            if types.has_scalar_primitive() {
                 let validator = compile_schema(schema, schema_draft)
                     .map_err(|error| format!("invalid composed scalar schema: {error}"))?;
                 self.composed_scalar_validators.insert(key, validator);
             }
-            if schema_accepts_object(schema) {
+            if types.contains(ScalarType::Object) {
                 let merged = Arc::new(build_object_schema_for_conversion(schema));
                 self.object_schemas.insert(key, Arc::clone(&merged));
                 self.register_schema(merged.as_ref(), schema_draft, visited, depth + 1)?;
             }
-            if schema_accepts_array(schema) {
+            if types.contains(ScalarType::Array) {
                 let items = Arc::new(build_array_item_schema_for_conversion(schema));
                 self.array_item_schemas.insert(key, Arc::clone(&items));
                 self.register_schema(items.as_ref(), schema_draft, visited, depth + 1)?;
@@ -172,6 +173,34 @@ impl ConversionPlan {
             }
         }
         Ok(())
+    }
+
+    fn schema_types(&self, schema: &Value) -> SchemaTypeSet {
+        let key = schema as *const Value as usize;
+        if let Some(types) = self.schema_types.get(&key) {
+            return *types;
+        }
+        // Synthetic/unregistered schemas (for example temporary Null placeholders)
+        // fall back to a one-shot compute; registered request-path schemas hit the
+        // map above and never allocate or re-walk composition here.
+        self.fallback_type_computes.fetch_add(1, Ordering::Relaxed);
+        collect_schema_types(schema)
+    }
+
+    fn cached_schema_type_nodes(&self) -> usize {
+        self.schema_types.len()
+    }
+
+    fn fallback_type_computes(&self) -> usize {
+        self.fallback_type_computes.load(Ordering::Relaxed)
+    }
+
+    fn accepts_object(&self, schema: &Value) -> bool {
+        self.schema_types(schema).contains(ScalarType::Object)
+    }
+
+    fn accepts_array(&self, schema: &Value) -> bool {
+        self.schema_types(schema).contains(ScalarType::Array)
     }
 
     fn object_schema<'a>(&'a self, schema: &'a Value) -> &'a Value {
@@ -211,10 +240,7 @@ impl ConversionPlan {
             if first_match.is_none() {
                 first_match = Some(child);
             }
-            if !collect_scalar_types(child).is_empty()
-                || schema_accepts_object(child)
-                || schema_accepts_array(child)
-            {
+            if !self.schema_types(child).is_empty() {
                 return Some(child);
             }
         }
@@ -245,6 +271,8 @@ struct PropertyEncoding {
 struct EncodingHeaderValidator {
     required: bool,
     schema: Value,
+    /// Precomputed at admission so header scalar conversion never re-walks.
+    schema_types: SchemaTypeSet,
     validator: jsonschema::Validator,
 }
 
@@ -482,6 +510,53 @@ impl OpenapiValidator {
             error_content_type,
             error_truncate_chars,
         })
+    }
+
+    /// External-test seam: `(cached schema-type nodes, request-time fallback computes)`.
+    /// Cached nodes are populated once per registered schema during compile;
+    /// fallback computes must stay zero for registered form/multipart conversion.
+    #[allow(dead_code)] // reached via `_test_support` from the external test crate
+    pub(crate) fn schema_type_cache_stats_for_test(&self) -> (usize, usize) {
+        let mut cached_nodes = 0usize;
+        let mut fallback_computes = 0usize;
+        for bucket in self.ops_by_method.values() {
+            for entry in &bucket.entries {
+                for media in entry.request_validators.values() {
+                    cached_nodes =
+                        cached_nodes.saturating_add(media.conversion.cached_schema_type_nodes());
+                    fallback_computes =
+                        fallback_computes.saturating_add(media.conversion.fallback_type_computes());
+                }
+                for media in entry
+                    .response_validators
+                    .exact
+                    .values()
+                    .flat_map(|validators| validators.values())
+                {
+                    cached_nodes =
+                        cached_nodes.saturating_add(media.conversion.cached_schema_type_nodes());
+                    fallback_computes =
+                        fallback_computes.saturating_add(media.conversion.fallback_type_computes());
+                }
+                for range in &entry.response_validators.ranges {
+                    for media in range.validators.values() {
+                        cached_nodes = cached_nodes
+                            .saturating_add(media.conversion.cached_schema_type_nodes());
+                        fallback_computes = fallback_computes
+                            .saturating_add(media.conversion.fallback_type_computes());
+                    }
+                }
+                if let Some(default) = &entry.response_validators.default {
+                    for media in default.values() {
+                        cached_nodes = cached_nodes
+                            .saturating_add(media.conversion.cached_schema_type_nodes());
+                        fallback_computes = fallback_computes
+                            .saturating_add(media.conversion.fallback_type_computes());
+                    }
+                }
+            }
+        }
+        (cached_nodes, fallback_computes)
     }
 
     fn active(&self) -> bool {
@@ -1519,8 +1594,9 @@ fn parse_property_encoding(
             }
             // Header Object may wrap `schema`; accept either that public OAS
             // shape or the internal bare-schema representation. Header Object
-            // `required` defaults to false (OAS 3.1 §4.8.21), so an optional
-            // part header must not reject an otherwise valid multipart body.
+            // `required` defaults to false (OAS 3.1 §4.8.21), while the
+            // internal bare-schema representation preserves its historical
+            // fail-closed presence requirement.
             let header_object = header_schema.as_object();
             // `required`, `description`, and `examples` are also valid JSON
             // Schema keywords, so they cannot distinguish the supported bare
@@ -1540,7 +1616,7 @@ fn parse_property_encoding(
                     }
                 }
             } else {
-                false
+                true
             };
             if is_header_object
                 && header_object.is_some_and(|object| object.contains_key("content"))
@@ -1581,11 +1657,13 @@ fn parse_property_encoding(
                     "encoding['{property}'].headers['{header_name}'] schema is invalid: {error}"
                 )
             })?;
+            let schema_types = collect_schema_types(schema_value);
             headers.insert(
                 name,
                 EncodingHeaderValidator {
                     required,
                     schema: schema_value.clone(),
+                    schema_types,
                     validator,
                 },
             );
@@ -1756,7 +1834,7 @@ fn xml_node_to_value(
     schema: &Value,
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
-    if schema_accepts_array(schema) {
+    if conversion.accepts_array(schema) {
         let item_schema = array_item_schema_for_conversion(schema, conversion);
         let values = node
             .children()
@@ -1766,7 +1844,7 @@ fn xml_node_to_value(
         return Ok(Value::Array(values));
     }
     let object_schema = object_schema_for_conversion(schema, conversion);
-    if schema_accepts_object(object_schema) || object_schema.get("properties").is_some() {
+    if conversion.accepts_object(object_schema) || object_schema.get("properties").is_some() {
         let empty_properties = serde_json::Map::new();
         let properties =
             merged_object_properties(object_schema, conversion).unwrap_or(&empty_properties);
@@ -1786,7 +1864,7 @@ fn xml_node_to_value(
                 }
                 continue;
             }
-            if schema_accepts_array(property_schema) {
+            if conversion.accepts_array(property_schema) {
                 mark_xml_array_modeled_names(
                     property_name,
                     property_schema,
@@ -2454,7 +2532,7 @@ fn fields_to_schema_object(
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
     let object_schema = object_schema_for_conversion(schema, conversion);
-    if !(schema_accepts_object(object_schema) || object_schema.get("properties").is_some()) {
+    if !(conversion.accepts_object(object_schema) || object_schema.get("properties").is_some()) {
         let Some(values) = fields.values().next() else {
             return Ok(Value::Null);
         };
@@ -2478,7 +2556,7 @@ fn fields_to_schema_object(
             }
             continue;
         }
-        if schema_accepts_object(property_schema)
+        if conversion.accepts_object(property_schema)
             && let Some(property_encoding) = property_encoding
         {
             if property_encoding.style == EncodingStyle::Form && property_encoding.explode {
@@ -2649,7 +2727,7 @@ fn form_values_to_schema_value(
     let Some(encoding) = encoding.filter(|encoding| !encoding.explode) else {
         return values_to_schema_value(values, schema, encoding, conversion);
     };
-    if !schema_accepts_array(schema) {
+    if !conversion.accepts_array(schema) {
         return values_to_schema_value(values, schema, Some(encoding), conversion);
     }
     let Some(raw_values) = raw_values else {
@@ -2823,7 +2901,7 @@ fn multipart_parts_to_schema_object(
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
     let object_schema = object_schema_for_conversion(schema, conversion);
-    if !(schema_accepts_object(object_schema) || object_schema.get("properties").is_some()) {
+    if !(conversion.accepts_object(object_schema) || object_schema.get("properties").is_some()) {
         let Some(values) = parts.values().next() else {
             return Ok(Value::Null);
         };
@@ -2836,7 +2914,7 @@ fn multipart_parts_to_schema_object(
     let mut consumed_keys = HashSet::new();
     for (property, property_schema) in properties {
         let property_encoding = encoding.get(property.as_str());
-        if schema_accepts_object(property_schema)
+        if conversion.accepts_object(property_schema)
             && let Some(values) = parts.get(property)
             && values.len() == 1
             && values[0].filename.is_none()
@@ -2854,7 +2932,7 @@ fn multipart_parts_to_schema_object(
             );
             continue;
         }
-        if schema_accepts_object(property_schema)
+        if conversion.accepts_object(property_schema)
             && let Some(property_encoding) = property_encoding
         {
             if property_encoding.style == EncodingStyle::DeepObject {
@@ -2906,7 +2984,7 @@ fn multipart_parts_to_schema_object(
         };
         consumed_keys.insert(property.clone());
         let explode = property_encoding.map(|enc| enc.explode).unwrap_or(true);
-        if schema_accepts_array(property_schema) && explode {
+        if conversion.accepts_array(property_schema) && explode {
             let item_schema = array_item_schema_for_conversion(property_schema, conversion);
             let array = values
                 .iter()
@@ -2917,7 +2995,7 @@ fn multipart_parts_to_schema_object(
             out.insert(property.clone(), Value::Array(array));
             continue;
         }
-        if schema_accepts_array(property_schema) && !explode {
+        if conversion.accepts_array(property_schema) && !explode {
             if values.len() != 1 {
                 return Err(
                     "Serialized multipart array property must occur exactly once when explode=false"
@@ -3091,7 +3169,7 @@ fn multipart_values_to_schema_value(
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
     let explode = encoding.map(|enc| enc.explode).unwrap_or(true);
-    if schema_accepts_array(schema) && explode {
+    if conversion.accepts_array(schema) && explode {
         let item_schema = array_item_schema_for_conversion(schema, conversion);
         return values
             .iter()
@@ -3099,7 +3177,7 @@ fn multipart_values_to_schema_value(
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array);
     }
-    if schema_accepts_array(schema) && !explode {
+    if conversion.accepts_array(schema) && !explode {
         if values.len() != 1 {
             return Err(
                 "Serialized multipart array property must occur exactly once when explode=false"
@@ -3168,10 +3246,11 @@ fn multipart_part_to_schema_value(
                 }
                 continue;
             };
-            let converted = scalar_to_schema_value_with_validator(
+            let converted = scalar_to_schema_value_with_types(
                 header_value,
                 &header_validator.schema,
-                Some(&header_validator.validator),
+                header_validator.schema_types,
+                schema_is_composed(&header_validator.schema).then_some(&header_validator.validator),
             )?;
             header_validator
                 .validator
@@ -3185,7 +3264,7 @@ fn multipart_part_to_schema_value(
         }
     }
 
-    if schema_accepts_object(schema) || schema.get("properties").is_some() {
+    if conversion.accepts_object(schema) || schema.get("properties").is_some() {
         if part.filename.is_none()
             && let Some(media_type) = part
                 .content_type
@@ -3238,7 +3317,8 @@ fn multipart_part_to_schema_value(
     }
     let text = std::str::from_utf8(&part.body)
         .map_err(|error| format!("Multipart field '{}' is not UTF-8: {error}", part.name))?;
-    if let Some(encoding) = encoding.filter(|enc| schema_accepts_array(schema) && !enc.explode) {
+    if let Some(encoding) = encoding.filter(|enc| conversion.accepts_array(schema) && !enc.explode)
+    {
         return values_to_schema_value(&[text.to_string()], schema, Some(encoding), conversion);
     }
     scalar_to_schema_value(text, schema, conversion)
@@ -3283,7 +3363,7 @@ fn values_to_schema_value(
     encoding: Option<&PropertyEncoding>,
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
-    if schema_accepts_array(schema) {
+    if conversion.accepts_array(schema) {
         let item_schema = array_item_schema_for_conversion(schema, conversion);
         let explode = encoding.map(|enc| enc.explode).unwrap_or(true);
         let style = encoding.map(|enc| enc.style).unwrap_or(EncodingStyle::Form);
@@ -3321,19 +3401,20 @@ fn scalar_to_schema_value(
     schema: &Value,
     conversion: &ConversionPlan,
 ) -> Result<Value, String> {
-    scalar_to_schema_value_with_validator(
+    scalar_to_schema_value_with_types(
         value,
         schema,
+        conversion.schema_types(schema),
         conversion.composed_scalar_validator(schema),
     )
 }
 
-fn scalar_to_schema_value_with_validator(
+fn scalar_to_schema_value_with_types(
     value: &str,
     schema: &Value,
+    types: SchemaTypeSet,
     composed_validator: Option<&jsonschema::Validator>,
 ) -> Result<Value, String> {
-    let types = collect_scalar_types(schema);
     if types.is_empty() {
         return Ok(Value::String(value.to_string()));
     }
@@ -3351,23 +3432,23 @@ fn scalar_to_schema_value_with_validator(
         // both branch-order selection and the old failure where an integer
         // parse succeeded even though its branch constraints failed while a
         // string/boolean candidate would have satisfied another branch.
-        if types.contains(&ScalarType::Integer)
+        if types.contains(ScalarType::Integer)
             && let Ok(candidate) = parse_integer_value(value)
         {
             parsed.push(candidate);
         }
-        if types.contains(&ScalarType::Number)
+        if types.contains(ScalarType::Number)
             && let Ok(candidate) = parse_number_value(value)
             && !parsed.contains(&candidate)
         {
             parsed.push(candidate);
         }
-        if types.contains(&ScalarType::Boolean)
+        if types.contains(ScalarType::Boolean)
             && let Ok(candidate) = parse_boolean_value(value)
         {
             parsed.push(candidate);
         }
-        if types.contains(&ScalarType::String) {
+        if types.contains(ScalarType::String) {
             parsed.push(Value::String(value.to_string()));
         }
         if let Some(candidate) = parsed
@@ -3385,28 +3466,28 @@ fn scalar_to_schema_value_with_validator(
     let mut last_error = None;
 
     // Deterministic try order — never depends on oneOf/anyOf branch order.
-    if types.contains(&ScalarType::Integer) {
+    if types.contains(ScalarType::Integer) {
         match parse_integer_value(value) {
             Ok(parsed) => return Ok(parsed),
             Err(error) if !multi => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
-    if types.contains(&ScalarType::Number) {
+    if types.contains(ScalarType::Number) {
         match parse_number_value(value) {
             Ok(parsed) => return Ok(parsed),
             Err(error) if !multi => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
-    if types.contains(&ScalarType::Boolean) {
+    if types.contains(ScalarType::Boolean) {
         match parse_boolean_value(value) {
             Ok(parsed) => return Ok(parsed),
             Err(error) if !multi => return Err(error),
             Err(error) => last_error = Some(error),
         }
     }
-    if types.contains(&ScalarType::String) {
+    if types.contains(ScalarType::String) {
         return Ok(Value::String(value.to_string()));
     }
     Err(last_error.unwrap_or_else(|| format!("Unsupported scalar conversion for '{value}'")))
@@ -3447,7 +3528,7 @@ fn parse_boolean_value(value: &str) -> Result<Value, String> {
     Err(format!("Invalid boolean value '{value}'"))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalarType {
     Integer,
     Number,
@@ -3458,13 +3539,63 @@ enum ScalarType {
     Array,
 }
 
-fn collect_scalar_types(schema: &Value) -> HashSet<ScalarType> {
-    let mut out = HashSet::new();
+/// Compact, allocation-free set of JSON Schema types/shapes discovered for a
+/// schema node (including `allOf`/`oneOf`/`anyOf` contributions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct SchemaTypeSet(u8);
+
+impl SchemaTypeSet {
+    const INTEGER: u8 = 1 << 0;
+    const NUMBER: u8 = 1 << 1;
+    const BOOLEAN: u8 = 1 << 2;
+    const STRING: u8 = 1 << 3;
+    const NULL: u8 = 1 << 4;
+    const OBJECT: u8 = 1 << 5;
+    const ARRAY: u8 = 1 << 6;
+
+    fn bit(kind: ScalarType) -> u8 {
+        match kind {
+            ScalarType::Integer => Self::INTEGER,
+            ScalarType::Number => Self::NUMBER,
+            ScalarType::Boolean => Self::BOOLEAN,
+            ScalarType::String => Self::STRING,
+            ScalarType::Null => Self::NULL,
+            ScalarType::Object => Self::OBJECT,
+            ScalarType::Array => Self::ARRAY,
+        }
+    }
+
+    fn insert(&mut self, kind: ScalarType) {
+        self.0 |= Self::bit(kind);
+    }
+
+    fn contains(self, kind: ScalarType) -> bool {
+        self.0 & Self::bit(kind) != 0
+    }
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn len(self) -> u32 {
+        self.0.count_ones()
+    }
+
+    fn has_scalar_primitive(self) -> bool {
+        self.contains(ScalarType::Integer)
+            || self.contains(ScalarType::Number)
+            || self.contains(ScalarType::Boolean)
+            || self.contains(ScalarType::String)
+    }
+}
+
+fn collect_schema_types(schema: &Value) -> SchemaTypeSet {
+    let mut out = SchemaTypeSet::default();
     collect_types_into(schema, &mut out, 0);
     out
 }
 
-fn collect_types_into(schema: &Value, out: &mut HashSet<ScalarType>, depth: usize) {
+fn collect_types_into(schema: &Value, out: &mut SchemaTypeSet, depth: usize) {
     if depth > 32 {
         return;
     }
@@ -3483,7 +3614,7 @@ fn collect_types_into(schema: &Value, out: &mut HashSet<ScalarType>, depth: usiz
     }
 }
 
-fn push_declared_types(schema: &Value, out: &mut HashSet<ScalarType>) {
+fn push_declared_types(schema: &Value, out: &mut SchemaTypeSet) {
     match schema.get("type") {
         Some(Value::String(value)) => {
             if let Some(parsed) = parse_scalar_type(value) {
@@ -3526,12 +3657,14 @@ fn schema_is_composed(schema: &Value) -> bool {
     schema.get("allOf").is_some() || schema.get("oneOf").is_some() || schema.get("anyOf").is_some()
 }
 
+/// Admission-time helper for Encoding Object checks before a ConversionPlan exists.
 fn schema_accepts_object(schema: &Value) -> bool {
-    collect_scalar_types(schema).contains(&ScalarType::Object) || schema.get("properties").is_some()
+    collect_schema_types(schema).contains(ScalarType::Object)
 }
 
+/// Admission-time helper for Encoding Object checks before a ConversionPlan exists.
 fn schema_accepts_array(schema: &Value) -> bool {
-    collect_scalar_types(schema).contains(&ScalarType::Array) || schema.get("items").is_some()
+    collect_schema_types(schema).contains(ScalarType::Array)
 }
 
 /// Resolve the item schema used to deserialize textual array members without
@@ -3717,8 +3850,8 @@ fn binary_to_schema_value(body: &[u8], schema: &Value) -> Result<Value, String> 
 }
 
 fn validate_binary_length(len: usize, schema: &Value) -> Result<(), String> {
-    let types = collect_scalar_types(schema);
-    if schema.get("type").is_some() && !types.contains(&ScalarType::String) {
+    let types = collect_schema_types(schema);
+    if schema.get("type").is_some() && !types.contains(ScalarType::String) {
         return Err(
             "Non-UTF-8 binary bodies require a string schema with optional minLength/maxLength"
                 .to_string(),

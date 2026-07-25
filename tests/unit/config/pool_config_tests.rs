@@ -8,6 +8,45 @@ use ferrum_edge::config::types::{
     MIN_HTTP2_MAX_FRAME_SIZE, MIN_HTTP2_WINDOW_SIZE, Proxy,
 };
 
+use crate::unit::env_lock::ENV_LOCK;
+
+const POOL_H2_WINDOW_ENV_VARS: &[&str] = &[
+    "FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE",
+    "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
+    "FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW",
+];
+
+fn with_env_vars<F: FnOnce()>(vars: &[(&str, &str)], f: F) {
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for key in POOL_H2_WINDOW_ENV_VARS {
+        // SAFETY: We hold ENV_LOCK preventing concurrent env access.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+    for (k, v) in vars {
+        // SAFETY: We hold ENV_LOCK preventing concurrent env access.
+        unsafe {
+            std::env::set_var(k, v);
+        }
+    }
+    f();
+    for (k, _) in vars {
+        // SAFETY: We hold ENV_LOCK preventing concurrent env access.
+        unsafe {
+            std::env::remove_var(k);
+        }
+    }
+    for key in POOL_H2_WINDOW_ENV_VARS {
+        // SAFETY: We hold ENV_LOCK preventing concurrent env access.
+        unsafe {
+            std::env::remove_var(key);
+        }
+    }
+}
+
 fn create_test_proxy() -> Proxy {
     Proxy {
         id: "test".to_string(),
@@ -82,9 +121,104 @@ fn test_default_config() {
     assert_eq!(config.http2_keep_alive_interval_seconds, 30);
     assert_eq!(config.http2_keep_alive_timeout_seconds, 45);
     assert!(config.http2_adaptive_window);
+    assert_eq!(config.http2_initial_stream_window_size, 8_388_608);
+    assert_eq!(config.http2_initial_connection_window_size, 33_554_432);
     assert_eq!(config.http2_max_frame_size, 1_048_576);
     assert!(config.enable_http_keep_alive);
     assert!(config.enable_http2);
+}
+
+#[test]
+fn test_from_env_default_keeps_adaptive_window() {
+    // No window/adaptive env overrides: shipped adaptive-on contract stays intact.
+    with_env_vars(&[], || {
+        let config = PoolConfig::from_env();
+        assert!(config.http2_adaptive_window);
+        assert_eq!(config.http2_initial_stream_window_size, 8_388_608);
+        assert_eq!(config.http2_initial_connection_window_size, 33_554_432);
+    });
+}
+
+#[test]
+fn test_from_env_explicit_stream_window_disables_inherited_adaptive() {
+    // Explicit global window without an explicit adaptive setting must not stay
+    // inert under the shipped adaptive-on default.
+    with_env_vars(
+        &[("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE", "16777216")],
+        || {
+            let config = PoolConfig::from_env();
+            assert_eq!(config.http2_initial_stream_window_size, 16_777_216);
+            assert!(!config.http2_adaptive_window);
+        },
+    );
+}
+
+#[test]
+fn test_from_env_explicit_connection_window_disables_inherited_adaptive() {
+    with_env_vars(
+        &[(
+            "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
+            "67108864",
+        )],
+        || {
+            let config = PoolConfig::from_env();
+            assert_eq!(config.http2_initial_connection_window_size, 67_108_864);
+            assert!(!config.http2_adaptive_window);
+        },
+    );
+}
+
+#[test]
+fn test_from_env_explicit_adaptive_remains_authoritative_with_windows() {
+    // Explicit adaptive=true alongside window overrides keeps BDP probing on.
+    with_env_vars(
+        &[
+            ("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE", "16777216"),
+            (
+                "FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE",
+                "67108864",
+            ),
+            ("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW", "true"),
+        ],
+        || {
+            let config = PoolConfig::from_env();
+            assert_eq!(config.http2_initial_stream_window_size, 16_777_216);
+            assert_eq!(config.http2_initial_connection_window_size, 67_108_864);
+            assert!(config.http2_adaptive_window);
+        },
+    );
+}
+
+#[test]
+fn test_from_env_explicit_adaptive_false_with_windows() {
+    with_env_vars(
+        &[
+            ("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE", "16777216"),
+            ("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW", "false"),
+        ],
+        || {
+            let config = PoolConfig::from_env();
+            assert_eq!(config.http2_initial_stream_window_size, 16_777_216);
+            assert!(!config.http2_adaptive_window);
+        },
+    );
+}
+
+#[test]
+fn test_from_env_unparseable_adaptive_window_does_not_suppress_auto_disable() {
+    // A typo like "yes" must not count as explicit adaptive intent; fixed windows
+    // must still take effect.
+    with_env_vars(
+        &[
+            ("FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE", "16777216"),
+            ("FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW", "yes"),
+        ],
+        || {
+            let config = PoolConfig::from_env();
+            assert_eq!(config.http2_initial_stream_window_size, 16_777_216);
+            assert!(!config.http2_adaptive_window);
+        },
+    );
 }
 
 #[test]
@@ -127,6 +261,71 @@ fn test_no_overrides() {
     );
     assert_eq!(config.enable_http_keep_alive, global.enable_http_keep_alive);
     assert_eq!(config.enable_http2, global.enable_http2);
+    assert_eq!(config.http2_adaptive_window, global.http2_adaptive_window);
+}
+
+#[test]
+fn test_proxy_explicit_stream_window_disables_inherited_adaptive() {
+    // Global adaptive default true + per-proxy window override → adaptive off.
+    let global = PoolConfig::default();
+    assert!(global.http2_adaptive_window);
+    let mut proxy = create_test_proxy();
+    proxy.pool_http2_initial_stream_window_size = Some(16_777_216);
+
+    let config = global.for_proxy(&proxy);
+    assert_eq!(config.http2_initial_stream_window_size, 16_777_216);
+    assert!(!config.http2_adaptive_window);
+}
+
+#[test]
+fn test_proxy_explicit_connection_window_disables_inherited_adaptive() {
+    let global = PoolConfig::default();
+    let mut proxy = create_test_proxy();
+    proxy.pool_http2_initial_connection_window_size = Some(67_108_864);
+
+    let config = global.for_proxy(&proxy);
+    assert_eq!(config.http2_initial_connection_window_size, 67_108_864);
+    assert!(!config.http2_adaptive_window);
+}
+
+#[test]
+fn test_proxy_explicit_adaptive_remains_authoritative_with_windows() {
+    let global = PoolConfig::default();
+    let mut proxy = create_test_proxy();
+    proxy.pool_http2_initial_stream_window_size = Some(16_777_216);
+    proxy.pool_http2_initial_connection_window_size = Some(67_108_864);
+    proxy.pool_http2_adaptive_window = Some(true);
+
+    let config = global.for_proxy(&proxy);
+    assert_eq!(config.http2_initial_stream_window_size, 16_777_216);
+    assert_eq!(config.http2_initial_connection_window_size, 67_108_864);
+    assert!(config.http2_adaptive_window);
+}
+
+#[test]
+fn test_proxy_explicit_adaptive_false_overrides_global_default() {
+    let global = PoolConfig::default();
+    let mut proxy = create_test_proxy();
+    proxy.pool_http2_adaptive_window = Some(false);
+
+    let config = global.for_proxy(&proxy);
+    assert!(!config.http2_adaptive_window);
+}
+
+#[test]
+fn test_proxy_window_override_disables_even_when_global_adaptive_was_explicit() {
+    // Per-proxy explicit window without per-proxy adaptive must not stay inert
+    // under a globally explicit adaptive-on setting.
+    let global = PoolConfig {
+        http2_adaptive_window: true,
+        ..PoolConfig::default()
+    };
+    let mut proxy = create_test_proxy();
+    proxy.pool_http2_initial_stream_window_size = Some(4_194_304);
+
+    let config = global.for_proxy(&proxy);
+    assert_eq!(config.http2_initial_stream_window_size, 4_194_304);
+    assert!(!config.http2_adaptive_window);
 }
 
 #[test]
@@ -206,4 +405,45 @@ fn test_validate_accepts_boundary_values() {
         PoolConfig::validate_max_idle_per_host(MAX_IDLE_PER_HOST, "test"),
         MAX_IDLE_PER_HOST
     );
+}
+
+#[test]
+fn test_append_reqwest_client_behavior_pool_key_adaptive_precedence() {
+    let global = PoolConfig::default();
+    let mut adaptive = create_test_proxy();
+    adaptive.pool_http2_adaptive_window = Some(true);
+    adaptive.pool_http2_initial_stream_window_size = Some(65_535);
+
+    let mut buf = String::new();
+    global.append_reqwest_client_behavior_pool_key(&adaptive, &mut buf);
+    assert_eq!(buf, "|rcfg=i90;ka60;h2=1;h2i30;h2t45;aw1;mf1048576");
+    assert!(
+        !buf.contains(";sw"),
+        "adaptive on must omit fixed windows: {buf}"
+    );
+
+    let mut fixed = create_test_proxy();
+    fixed.pool_http2_adaptive_window = Some(false);
+    fixed.pool_http2_initial_stream_window_size = Some(65_535);
+    fixed.pool_http2_initial_connection_window_size = Some(131_072);
+
+    buf.clear();
+    global.append_reqwest_client_behavior_pool_key(&fixed, &mut buf);
+    assert_eq!(
+        buf,
+        "|rcfg=i90;ka60;h2=1;h2i30;h2t45;aw0;sw65535;cw131072;mf1048576"
+    );
+}
+
+#[test]
+fn test_append_reqwest_client_behavior_pool_key_keepalive_disabled() {
+    let global = PoolConfig::default();
+    let mut proxy = create_test_proxy();
+    proxy.pool_enable_http_keep_alive = Some(false);
+    proxy.pool_tcp_keepalive_seconds = Some(15);
+    proxy.pool_enable_http2 = Some(false);
+
+    let mut buf = String::new();
+    global.append_reqwest_client_behavior_pool_key(&proxy, &mut buf);
+    assert_eq!(buf, "|rcfg=i90;ka0;h2=0");
 }

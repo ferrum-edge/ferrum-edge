@@ -17,15 +17,13 @@
 
 use std::sync::LazyLock;
 
-use arc_swap::ArcSwap;
-
 use crate::modes::mesh::config::MeshRuntimeOverlay;
-use crate::plugins::utils::runtime_bool_gate::{self, BoolGateMap};
+use crate::plugins::utils::runtime_bool_gate::{self, BoolGateStore};
 
 pub(crate) const KEY_PREFIX: &str = "ferrum.request_transformer.";
 pub(crate) const ENABLED_SUFFIX: &str = ".enabled";
 
-static GATES: LazyLock<ArcSwap<BoolGateMap>> = LazyLock::new(runtime_bool_gate::new_store);
+static GATES: LazyLock<BoolGateStore> = LazyLock::new(runtime_bool_gate::new_store);
 
 pub type GateSnapshot = runtime_bool_gate::BoolGateSnapshot;
 

@@ -169,7 +169,7 @@ async fn connection_pool_key_direct_backend_format() {
     let proxy = minimal_proxy();
     let key = pool.pool_key_for_warmup(&proxy);
     // Direct backend:
-    // d=host:port|protocol|dns|subset|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N
+    // d=host:port|protocol|h1?|dns|subset|ca|mtls_cert|mtls_key|sni|sans|verify|svidg=N|rcfg=…
     assert!(
         key.starts_with("d=backend.example.com:8080|"),
         "key should start with d= prefix: {key}"
@@ -178,8 +178,13 @@ async fn connection_pool_key_direct_backend_format() {
     assert!(key.contains("|0|"), "key should contain protocol 0: {key}");
     // No DNS override, no subset, no CA, no mTLS, no SNI, no SAN digest, verify=true (1)
     assert!(
-        key.ends_with("||||||||1|svidg=static"),
-        "key should end with empty dns/subset/ca/mtls/sni/sans, verify=1, and SVID generation: {key}"
+        key.contains("||||||||1|svidg=static|rcfg="),
+        "key should carry empty dns/subset/ca/mtls/sni/sans, verify=1, SVID generation, and rcfg: {key}"
+    );
+    // Defaults: adaptive window on → fixed windows omitted from rcfg.
+    assert!(
+        key.ends_with("|rcfg=i90;ka60;h2=1;h2i30;h2t45;aw1;mf1048576"),
+        "default client-behavior suffix mismatch: {key}"
     );
 }
 
@@ -192,7 +197,7 @@ async fn connection_pool_key_uses_numeric_generation_only_for_workload_svid() {
     svid_proxy.resolved_tls.client_key_path = Some("/var/run/ferrum/svid.key".to_string());
     let svid_key = pool.pool_key_for_warmup(&svid_proxy);
     assert!(
-        svid_key.ends_with("|svidg=7"),
+        svid_key.contains("|svidg=7|rcfg="),
         "workload SVID client cert should partition by numeric generation: {svid_key}"
     );
 
@@ -201,7 +206,7 @@ async fn connection_pool_key_uses_numeric_generation_only_for_workload_svid() {
     static_proxy.resolved_tls.client_key_path = Some("/operator/client.key".to_string());
     let static_key = pool.pool_key_for_warmup(&static_proxy);
     assert!(
-        static_key.ends_with("|svidg=static"),
+        static_key.contains("|svidg=static|rcfg="),
         "operator-supplied client cert should not partition on SVID rotation: {static_key}"
     );
 }
@@ -289,10 +294,18 @@ async fn connection_pool_key_force_http1_discriminator() {
     let mut http_disabled_h2_proxy = minimal_proxy();
     http_disabled_h2_proxy.pool_enable_http2 = Some(false);
     let http_disabled_h2_key = pool.pool_key_for_warmup(&http_disabled_h2_proxy);
-    assert_eq!(
+    assert_ne!(
         default_key, http_disabled_h2_key,
-        "pool_enable_http2=false must not fragment plaintext HTTP reqwest pools; \
-         reqwest does not speak h2c on this path"
+        "pool_enable_http2=false still changes create_client (skips H2 client knobs) \
+         and must partition via rcfg even on plaintext HTTP"
+    );
+    assert!(
+        http_disabled_h2_key.contains("|rcfg=") && http_disabled_h2_key.contains(";h2=0"),
+        "plaintext H2-disabled key must carry rcfg h2=0: {http_disabled_h2_key}"
+    );
+    assert!(
+        !http_disabled_h2_key.contains("|h1|"),
+        "plaintext HTTP must not use the TLS force-H1 ALPN discriminator: {http_disabled_h2_key}"
     );
 
     // `Upgrade` and `Default` are probe-driven — they stay h2-capable and must
@@ -394,8 +407,8 @@ async fn connection_pool_key_verify_disabled() {
     proxy.resolved_tls.verify_server_cert = false;
     let key = pool.pool_key_for_warmup(&proxy);
     assert!(
-        key.ends_with("|0|svidg=static"),
-        "key should end with verify=0 when disabled: {key}"
+        key.contains("|0|svidg=static|rcfg="),
+        "key should carry verify=0 when disabled: {key}"
     );
 }
 
@@ -406,7 +419,7 @@ async fn connection_pool_key_global_no_verify_overrides_proxy() {
     let key = pool.pool_key_for_warmup(&proxy);
     // Global tls_no_verify=true should force effective verify to false
     assert!(
-        key.ends_with("|0|svidg=static"),
+        key.contains("|0|svidg=static|rcfg="),
         "global no_verify should override proxy verify=true: {key}"
     );
 }
@@ -417,13 +430,12 @@ async fn connection_pool_key_pipe_delimiter_count() {
     let proxy = minimal_proxy();
     let key = pool.pool_key_for_warmup(&proxy);
     let pipe_count = key.chars().filter(|c| *c == '|').count();
-    // 12 fields (dest, protocol, force-H1 ALPN discriminator, dns, subset, ca,
-    // mtls_cert, mtls_key, sni, san_digest, verify, svid_generation) need 11
-    // pipe delimiters. The force-H1 ALPN discriminator (empty unless
-    // DO_NOT_UPGRADE) was added in F5.1 codex round-1 Finding 1.
+    // 13 fields (dest, protocol, force-H1 ALPN discriminator, dns, subset, ca,
+    // mtls_cert, mtls_key, sni, san_digest, verify, svid_generation, rcfg) need
+    // 12 pipe delimiters.
     assert_eq!(
-        pipe_count, 11,
-        "12 fields need 11 pipe delimiters, got {pipe_count} in key: {key}"
+        pipe_count, 12,
+        "13 fields need 12 pipe delimiters, got {pipe_count} in key: {key}"
     );
 }
 
@@ -550,18 +562,69 @@ async fn connection_pool_key_different_ca_paths_differ() {
 }
 
 #[tokio::test]
-async fn connection_pool_key_policy_fields_do_not_fragment() {
-    // Timeouts and pool sizes should NOT affect the pool key
+async fn connection_pool_key_request_only_policy_does_not_fragment() {
+    // Request-only timeouts stay out of the reqwest pool key (applied per
+    // request). Client-baked settings are covered by dedicated isolation tests.
     let pool = pool_with_defaults();
     let mut p1 = minimal_proxy();
-    p1.pool_idle_timeout_seconds = Some(30);
-    p1.pool_enable_http2 = Some(true);
     p1.backend_connect_timeout_ms = 1000;
-    let p2 = minimal_proxy();
+    p1.backend_read_timeout_ms = 5_000;
+    let mut p2 = minimal_proxy();
+    p2.backend_connect_timeout_ms = 30_000;
+    p2.backend_read_timeout_ms = 60_000;
     assert_eq!(
         pool.pool_key_for_warmup(&p1),
         pool.pool_key_for_warmup(&p2),
-        "policy fields (timeouts, pool sizes) should not affect the key"
+        "request-only connect/read timeouts must not affect the reqwest pool key"
+    );
+}
+
+#[tokio::test]
+async fn connection_pool_key_client_level_settings_partition() {
+    let pool = pool_with_defaults();
+    let baseline = minimal_proxy();
+    let baseline_key = pool.pool_key_for_warmup(&baseline);
+
+    let mut idle = minimal_proxy();
+    idle.pool_idle_timeout_seconds = Some(30);
+    assert_ne!(
+        baseline_key,
+        pool.pool_key_for_warmup(&idle),
+        "divergent pool_idle_timeout_seconds must partition the reqwest key"
+    );
+
+    let mut stream_window = minimal_proxy();
+    // Adaptive defaults to true and overrides fixed windows — disable it so
+    // the window override is material to create_client behavior.
+    stream_window.pool_http2_adaptive_window = Some(false);
+    stream_window.pool_http2_initial_stream_window_size = Some(65_535);
+    let mut other_window = minimal_proxy();
+    other_window.pool_http2_adaptive_window = Some(false);
+    other_window.pool_http2_initial_stream_window_size = Some(8_388_608);
+    assert_ne!(
+        pool.pool_key_for_warmup(&stream_window),
+        pool.pool_key_for_warmup(&other_window),
+        "divergent H2 stream windows (adaptive off) must partition the reqwest key"
+    );
+
+    let mut aw_a = minimal_proxy();
+    aw_a.pool_http2_adaptive_window = Some(true);
+    aw_a.pool_http2_initial_stream_window_size = Some(65_535);
+    let mut aw_b = minimal_proxy();
+    aw_b.pool_http2_adaptive_window = Some(true);
+    aw_b.pool_http2_initial_stream_window_size = Some(8_388_608);
+    assert_eq!(
+        pool.pool_key_for_warmup(&aw_a),
+        pool.pool_key_for_warmup(&aw_b),
+        "with adaptive window on, fixed window overrides must not fragment (adaptive precedence)"
+    );
+
+    let mut tcp_ka = minimal_proxy();
+    tcp_ka.pool_tcp_keepalive_seconds = Some(15);
+    assert_ne!(
+        baseline_key,
+        pool.pool_key_for_warmup(&tcp_ka),
+        "divergent TCP keepalive must partition the reqwest key"
     );
 }
 
@@ -862,7 +925,7 @@ async fn connection_pool_and_h2_pool_keys_have_same_delimiter() {
     let conn_pipes = conn_key.chars().filter(|c| *c == '|').count();
     let h2_pipes = h2_key.chars().filter(|c| *c == '|').count();
     assert_eq!(
-        conn_pipes, 11,
+        conn_pipes, 12,
         "reqwest key should use | as delimiter: {conn_key}"
     );
     assert!(h2_pipes >= 9, "H2 key should use | as delimiter: {h2_key}");

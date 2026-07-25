@@ -3109,6 +3109,11 @@ async fn handle_tcp_connection_inner(
                     // Skip kTLS when first-bytes inspection consumed a decrypted
                     // prefix: those plaintext bytes have already left the TLS
                     // session, so the userspace relay must carry the remainder.
+                    //
+                    // Issue #2955: `try_ktls_splice` additionally refuses handoff
+                    // from the buffered tokio-rustls `TlsStream` because the
+                    // public buffered rustls API cannot prove inbound record
+                    // alignment; those connections keep the userspace relay.
                     #[cfg(target_os = "linux")]
                     {
                         if ktls_enabled && client_first_bytes_forward.is_none() {
@@ -3732,7 +3737,14 @@ mod backend_target_selection_tests {
             unhealthy_threshold: 1,
             ..Default::default()
         };
-        health_checker.report_response(&proxy.id, &unhealthy_target, 500, false, Some(&passive));
+        health_checker.report_response(
+            &proxy.id,
+            "tcp-upstream",
+            &unhealthy_target,
+            500,
+            false,
+            Some(&passive),
+        );
 
         let (host, port, _, _, _) =
             resolve_backend_target(&proxy, &snapshot, &health_checker, "192.0.2.10")
@@ -7424,13 +7436,96 @@ enum KtlsError {
     Installed(anyhow::Error),
 }
 
+/// Return whether a **buffered** rustls `ServerConnection` (as held inside a
+/// tokio-rustls `TlsStream`) may be abandoned for kernel TLS.
+///
+/// Always returns `false`.
+///
+/// ## Why this is fail-closed
+///
+/// `ServerConnection::dangerous_extract_secrets` delegates to
+/// `dangerous_into_kernel_connection`, which refuses handoff only when secret
+/// extraction is disabled, the handshake is incomplete, or **outbound** TLS
+/// records remain in `sendable_tls`. It silently discards:
+/// 1. decrypted-but-unread **received** plaintext, and
+/// 2. any residual **inbound** bytes still sitting in rustls's private
+///    deframer — in particular the head of a partial TLS record.
+///
+/// kTLS resumes decryption straight from the socket at the extracted `rx`
+/// sequence number, so handoff is sound only if the next byte the kernel reads
+/// is the first byte of that record. Case (1) is observable (`wants_read()` is
+/// false while plaintext is staged). Case (2) is **not**: `ConnectionCommon`'s
+/// deframer buffer is private and has no public accessor, so a session that
+/// looks completely idle can still be holding the front of a record the kernel
+/// will never see. Both cases are produced by exactly the client behaviour
+/// that motivated issue #2955 — coalescing application data with the handshake
+/// tail — so on this API there is no narrower predicate that is still sound.
+///
+/// rustls's supported kernel-handoff entry point is the **unbuffered** path:
+/// drive `rustls::server::UnbufferedServerConnection` until
+/// `ConnectionState::WriteTraffic`, then call
+/// `dangerous_into_kernel_connection`. Reaching `WriteTraffic` proves the
+/// caller-owned input buffer is drained at a record boundary. This gateway's
+/// TCP frontend still handshakes through buffered tokio-rustls, so that proof
+/// is unavailable here. Correctness wins over acceleration: keep the
+/// `TlsStream` and relay in userspace.
+///
+/// The session is borrowed **immutably** on purpose. The refusal path must not
+/// be able to consume, drain, or otherwise disturb rustls state: every
+/// application byte already decrypted has to stay readable through the
+/// `TlsStream` the caller falls back to. The logged reason therefore uses the
+/// `&self` observables only (`wants_write`/`wants_read`), which tokio-rustls
+/// has already refreshed via `process_new_packets` while completing `accept()`.
+//
+// Referenced by `try_ktls_splice` (Linux only) and by `crate::_test_support` in
+// the library target. The binary target compiles this module directly and does
+// not include `_test_support`, so non-Linux binaries have no caller.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn ktls_rustls_buffers_safe_for_kernel_handoff(
+    server_conn: &rustls::ServerConnection,
+) -> bool {
+    // Operator-visible evidence that the buffered accept path never hands off.
+    static LOG_ONCE: std::sync::Once = std::sync::Once::new();
+    LOG_ONCE.call_once(|| {
+        info!(
+            "kTLS: kernel handoff from the buffered tokio-rustls TlsStream is disabled - \
+             the public rustls ServerConnection API cannot prove that the inbound deframer \
+             is empty and record-aligned (issue #2955), so frontend-TLS TCP keeps the \
+             userspace relay"
+        );
+    });
+
+    if server_conn.wants_write() {
+        debug!(
+            "kTLS: rustls still holds outbound TLS records; refusing kernel handoff, \
+             retaining userspace TlsStream"
+        );
+    } else if !server_conn.wants_read() {
+        debug!(
+            "kTLS: rustls holds unread decrypted plaintext (or a received close_notify) \
+             after the handshake; refusing kernel handoff, retaining userspace TlsStream"
+        );
+    } else {
+        debug!(
+            "kTLS: buffered rustls ServerConnection cannot prove an empty, record-aligned \
+             inbound deframer; refusing kernel handoff (issue #2955), retaining userspace \
+             TlsStream"
+        );
+    }
+
+    false
+}
+
 /// Attempt kTLS-accelerated splice for a frontend-TLS + plain-backend connection.
 ///
 /// 1. Check that the negotiated cipher is AES-128-GCM or AES-256-GCM.
 /// 2. Check that the negotiated TLS version is TLS 1.2 (see below).
-/// 3. Extract TLS session keys via `dangerous_extract_secrets()`.
-/// 4. Install keys into the kernel via `enable_ktls()`.
-/// 5. Use `bidirectional_splice()` for zero-copy relay.
+/// 3. Refuse handoff from the buffered tokio-rustls `TlsStream` (see
+///    [`ktls_rustls_buffers_safe_for_kernel_handoff`] — always fails closed
+///    until an unbuffered handshake can prove record alignment; issue #2955).
+/// 4. Extract TLS session keys via `dangerous_extract_secrets()`.
+/// 5. Install keys into the kernel via `enable_ktls()`.
+/// 6. Use `bidirectional_splice()` for zero-copy relay.
 ///
 /// Returns `KtlsError::Unsupported` with the original streams if kTLS cannot
 /// be used, allowing the caller to fall back to userspace `bidirectional_copy`.
@@ -7439,6 +7534,12 @@ enum KtlsError {
 /// this implementation does not handle KeyUpdate — the kernel holds a static
 /// copy of the application traffic secret, and a peer-initiated KeyUpdate
 /// would silently desynchronize decryption mid-stream.
+///
+/// **Buffered handoff disabled.** Steps 4–6 are currently unreachable for
+/// connections accepted via tokio-rustls: the public buffered rustls API
+/// cannot prove the inbound deframer is empty, so step 3 always returns the
+/// streams for userspace relay. Secret extraction is never attempted on that
+/// path.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 async fn try_ktls_splice(
@@ -7533,9 +7634,32 @@ async fn try_ktls_splice(
         }
     };
 
+    // Fail closed BEFORE TCP_ULP or `into_inner()`. The buffered tokio-rustls
+    // `ServerConnection` cannot prove inbound record alignment (issue #2955),
+    // so `ktls_rustls_buffers_safe_for_kernel_handoff` always returns false and
+    // we keep the `TlsStream` intact — including any plaintext rustls already
+    // decrypted out of the client's handshake-tail segment. The check only
+    // borrows the session immutably, so the refusal path cannot drop a single
+    // application byte, and it runs before the ULP probe because TCP_ULP is
+    // sticky on the fd once installed.
+    {
+        let (_, server_conn) = tls_stream.get_ref();
+        if !ktls_rustls_buffers_safe_for_kernel_handoff(server_conn) {
+            return Err(KtlsError::Unsupported(Box::new((
+                tls_stream,
+                backend_stream,
+            ))));
+        }
+    }
+
     // Pre-flight: probe TCP_ULP installation on the raw fd BEFORE consuming
     // the TLS stream. If the kernel doesn't support kTLS (ENOPROTOOPT), we
     // can still fall back with the TLS stream intact.
+    //
+    // NOTE: Today the buffered-API gate above always refuses, so this block
+    // is only reached if that gate is later relaxed for an unbuffered
+    // `UnbufferedServerConnection` → `WriteTraffic` →
+    // `dangerous_into_kernel_connection` path that can prove alignment.
     {
         let (tcp_ref, _) = tls_stream.get_ref();
         let fd = tcp_ref.as_raw_fd();
@@ -7563,7 +7687,8 @@ async fn try_ktls_splice(
 
     // Point of no return: consume the TLS stream to extract secrets.
     // TCP_ULP is already installed on the underlying fd, so kTLS key
-    // installation should succeed.
+    // installation should succeed. Only reachable if the buffered-API
+    // alignment gate above is later satisfied by a proven-safe handshake.
     let (tcp_stream, server_conn) = tls_stream.into_inner();
 
     let secrets = match server_conn.dangerous_extract_secrets() {

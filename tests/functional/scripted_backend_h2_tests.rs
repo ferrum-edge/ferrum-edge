@@ -2507,3 +2507,94 @@ async fn h2_grpc_request_headers_strip_hop_by_hop_metadata() {
         stream.headers
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #2954 — backend TLS SNI override must serve under default nonzero
+// body-size limits (direct-H2 in-path enforcement), not 502 all traffic.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h2_backend_tls_sni_serves_under_default_body_limits() {
+    let ca = TestCa::new("h2-sni-default-limits").expect("ca");
+    // Cert SAN is other.test — dial host is connect.example.com, so verification
+    // only succeeds when the gateway presents backend_tls_sni=other.test.
+    let (cert, key) = ca.wrong_san().expect("leaf");
+    let temp_dir = tempfile::TempDir::new().expect("temp dir");
+    let ca_path = temp_dir.path().join("ca.pem");
+    std::fs::write(&ca_path, &ca.cert_pem).expect("write CA");
+
+    let reservation = reserve_port().await.expect("reserve port");
+    let backend_port = reservation.port;
+    let _backend = ScriptedH2Backend::builder_tls(reservation.into_listener(), &cert, &key)
+        .expect("h2 tls backend")
+        .step(H2Step::ExpectHeaders(MatchHeaders::any()))
+        .step(H2Step::RespondHeaders(vec![
+            (":status", "200".into()),
+            ("content-type", "text/plain".into()),
+            ("content-length", "2".into()),
+        ]))
+        .step(H2Step::RespondData {
+            data: Bytes::from_static(b"ok"),
+            end_stream: true,
+        })
+        .spawn()
+        .expect("spawn backend");
+
+    let yaml = serde_yaml::to_string(&json!({
+        "version": "1",
+        "proxies": [{
+            "id": "sni-proxy",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "connect.example.com",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "upstream_id": "sni-upstream",
+            "pool_enable_http2": true,
+            "dns_override": "127.0.0.1",
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+        }],
+        "upstreams": [{
+            "id": "sni-upstream",
+            "name": "SNI upstream",
+            "algorithm": "round_robin",
+            "targets": [{
+                "host": "connect.example.com",
+                "port": backend_port,
+                "weight": 1
+            }],
+            "backend_tls_sni": "other.test",
+            "backend_tls_verify_server_cert": true,
+            "backend_tls_server_ca_cert_path": ca_path.display().to_string(),
+        }],
+        "consumers": [],
+        "plugin_configs": [],
+    }))
+    .expect("yaml");
+
+    let harness = GatewayHarness::builder()
+        .file_config(yaml)
+        .log_level("warn")
+        // Intentionally leave FERRUM_MAX_*_BODY_SIZE_BYTES at defaults
+        // (response default 10 MiB). Pre-fix this combination 502'd every
+        // request with backend_tls_sni_requires_direct_h2.
+        .pool_warmup_enabled(true)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+
+    let client = Http2Client::h2c_prior_knowledge().expect("h2c client");
+    let response = client
+        .get(&format!("{}/api/sni", harness.proxy_base_url()))
+        .await
+        .expect("SNI override must serve under default body limits");
+    let body = String::from_utf8_lossy(&response.body_bytes);
+    assert_eq!(
+        response.status,
+        StatusCode::OK,
+        "expected 200 via direct-H2 SNI under default body limits; body={body}"
+    );
+    assert_eq!(body, "ok");
+}
