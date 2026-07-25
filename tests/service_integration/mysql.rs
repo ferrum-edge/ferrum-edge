@@ -1,5 +1,6 @@
-//! Live MySQL contracts for custom-plugin migration recovery and
-//! cross-namespace config-change lock serialization.
+//! Live MySQL contracts for custom-plugin migration recovery,
+//! cross-namespace config-change lock serialization, and byte-exact
+//! identity uniqueness under `utf8mb4_0900_bin` (#2994).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,7 +9,7 @@ use std::time::Duration;
 use ferrum_edge::_test_support::DbPoolConfig;
 use ferrum_edge::config::db_loader::DatabaseStore;
 use ferrum_edge::config::migrations::MigrationRunner;
-use ferrum_edge::config::types::{LoadBalancerAlgorithm, Upstream, UpstreamTarget};
+use ferrum_edge::config::types::{Consumer, LoadBalancerAlgorithm, Upstream, UpstreamTarget};
 use sqlx::Row;
 use testcontainers::core::IntoContainerPort;
 use testcontainers::runners::AsyncRunner;
@@ -136,6 +137,32 @@ fn make_namespace_upstream(namespace: &str, id: &str) -> Upstream {
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
+}
+
+fn make_consumer(namespace: &str, id: &str, username: &str) -> Consumer {
+    Consumer {
+        id: id.to_string(),
+        namespace: namespace.to_string(),
+        username: username.to_string(),
+        custom_id: None,
+        credentials: Default::default(),
+        acl_groups: Vec::new(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+async fn connect_store(url: &str) -> DatabaseStore {
+    let pool_config = DbPoolConfig {
+        max_connections: 4,
+        min_connections: 1,
+        acquire_timeout_seconds: 10,
+        statement_timeout_seconds: 0,
+        ..DbPoolConfig::default()
+    };
+    DatabaseStore::connect_with_pool_config("mysql", url, pool_config)
+        .await
+        .expect("MySQL DatabaseStore connect + V001 migrations must succeed")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -399,4 +426,150 @@ async fn mysql_cross_namespace_config_change_lock_avoids_deadlock() {
         ITERATIONS * 2,
         "every raced create_upstream must commit a config_changes row"
     );
+}
+
+/// NFC/NFD forms and trailing-space variants must remain distinct consumer
+/// identities under MySQL `utf8mb4_0900_bin` (#2994), matching Postgres/SQLite
+/// and the runtime's byte-keyed `ConsumerIndex`.
+#[tokio::test(flavor = "multi_thread")]
+async fn mysql_byte_exact_identity_accepts_unicode_and_space_variants() {
+    let fixture = match start_mysql().await {
+        Ok(fixture) => fixture,
+        Err(error) => {
+            fail_in_ci_else_skip(
+                "mysql_byte_exact_identity_accepts_unicode_and_space_variants",
+                "MySQL 8.4",
+                &error,
+            );
+            return;
+        }
+    };
+    let store = connect_store(&fixture.url).await;
+
+    let username_collation: String = sqlx::query_scalar(
+        "SELECT COLLATION_NAME FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() \
+           AND TABLE_NAME = 'consumers' AND COLUMN_NAME = 'username'",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("inspect consumers.username collation");
+    assert_eq!(
+        username_collation, "utf8mb4_0900_bin",
+        "V001 must apply binary collation on consumers.username"
+    );
+
+    let identity_collation: String = sqlx::query_scalar(
+        "SELECT COLLATION_NAME FROM information_schema.COLUMNS \
+         WHERE TABLE_SCHEMA = DATABASE() \
+           AND TABLE_NAME = 'consumer_identity_index' \
+           AND COLUMN_NAME = 'identity_value'",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("inspect consumer_identity_index.identity_value collation");
+    assert_eq!(
+        identity_collation, "utf8mb4_0900_bin",
+        "V001 must apply binary collation on identity_value"
+    );
+
+    let pad_attribute: String = sqlx::query_scalar(
+        "SELECT PAD_ATTRIBUTE FROM information_schema.COLLATIONS \
+         WHERE COLLATION_NAME = 'utf8mb4_0900_bin'",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("inspect utf8mb4_0900_bin padding semantics");
+    assert_eq!(
+        pad_attribute, "NO PAD",
+        "byte-exact VARCHAR identity comparison must preserve trailing spaces"
+    );
+
+    // U+00E9 (é) vs e + U+0301 combining acute — canonically equivalent under
+    // UCA, distinct as UTF-8 bytes.
+    let nfc_username = "caf\u{00e9}";
+    let nfd_username = "cafe\u{0301}";
+    assert_ne!(
+        nfc_username.as_bytes(),
+        nfd_username.as_bytes(),
+        "fixture usernames must differ by bytes"
+    );
+
+    store
+        .create_consumer(&make_consumer("ferrum", "nfc-consumer", nfc_username))
+        .await
+        .expect("NFC username must insert");
+    store
+        .create_consumer(&make_consumer("ferrum", "nfd-consumer", nfd_username))
+        .await
+        .expect("NFD username must insert as a distinct identity under utf8mb4_0900_bin");
+    store
+        .create_consumer(&make_consumer("ferrum", "plain-consumer", "alice"))
+        .await
+        .expect("plain username must insert");
+    store
+        .create_consumer(&make_consumer("ferrum", "space-consumer", "alice "))
+        .await
+        .expect("trailing-space username must insert as a distinct identity");
+
+    assert!(
+        store
+            .check_consumer_identity_unique("ferrum", "other", nfc_username, None, None)
+            .await
+            .expect("identity probe")
+            .is_some(),
+        "NFC username must collide with the NFC consumer only"
+    );
+    assert!(
+        store
+            .check_consumer_identity_unique("ferrum", "other", nfd_username, None, None)
+            .await
+            .expect("identity probe")
+            .is_some(),
+        "NFD username must collide with the NFD consumer only"
+    );
+
+    let loaded_nfc = store
+        .get_consumer("ferrum", "nfc-consumer")
+        .await
+        .expect("load NFC consumer")
+        .expect("NFC consumer present");
+    let loaded_nfd = store
+        .get_consumer("ferrum", "nfd-consumer")
+        .await
+        .expect("load NFD consumer")
+        .expect("NFD consumer present");
+    assert_eq!(loaded_nfc.username.as_bytes(), nfc_username.as_bytes());
+    assert_eq!(loaded_nfd.username.as_bytes(), nfd_username.as_bytes());
+    let loaded_space = store
+        .get_consumer("ferrum", "space-consumer")
+        .await
+        .expect("load trailing-space consumer")
+        .expect("trailing-space consumer present");
+    assert_eq!(loaded_space.username.as_bytes(), b"alice ");
+
+    assert!(
+        store
+            .check_consumer_identity_unique("ferrum", "other", "alice", None, None)
+            .await
+            .expect("plain identity probe")
+            .is_some(),
+        "plain username must collide with the plain consumer only"
+    );
+    assert!(
+        store
+            .check_consumer_identity_unique("ferrum", "other", "alice ", None, None)
+            .await
+            .expect("trailing-space identity probe")
+            .is_some(),
+        "trailing-space username must collide with the spaced consumer only"
+    );
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT CAST(COUNT(*) AS SIGNED) FROM consumers WHERE namespace = 'ferrum'",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("count consumers");
+    assert_eq!(count, 4);
 }

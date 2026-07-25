@@ -1,10 +1,10 @@
 use ferrum_edge::_test_support::{
-    DbPoolConfig, db_append_connect_timeout, db_code_is_transient, db_diff_removed,
+    DbPoolConfig, await_pool_connect_with_timeout, db_code_is_transient, db_diff_removed,
     db_mongo_error_is_transient, db_mysql_error_number_is_transient,
-    db_wrap_mysql_isolation_read_error, is_config_validation_rejection,
-    mysql_config_change_lock_insert_sql, mysql_mtls_dns_admission_lock_insert_sql,
-    mysql_proxy_route_lock_insert_sql, parse_auth_mode, parse_scheme, statement_timeout_sql,
-    validate_tcp_connection_throttle_attachments,
+    db_wrap_mysql_isolation_read_error, effective_pool_connect_timeout_seconds,
+    is_config_validation_rejection, mysql_config_change_lock_insert_sql,
+    mysql_mtls_dns_admission_lock_insert_sql, mysql_proxy_route_lock_insert_sql, parse_auth_mode,
+    parse_scheme, statement_timeout_sql, validate_tcp_connection_throttle_attachments,
 };
 use ferrum_edge::config::db_backend::{
     BatchConfigWriteMode, DatabaseBackend, is_incremental_full_reload_required,
@@ -23,6 +23,8 @@ use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 #[derive(Debug)]
 struct TestDatabaseError {
@@ -226,46 +228,137 @@ fn make_global_tcp_throttle(id: &str) -> PluginConfig {
     }
 }
 
-// ── append_connect_timeout ───────────────────────────────────────────────────
+// ── await_pool_connect_with_timeout ──────────────────────────────────────────
+//
+// Deterministic coverage for FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS: drive the
+// shared helper with gated / never-ready futures under tokio's paused clock
+// instead of blackhole networking.
 
-#[test]
-fn test_append_connect_timeout_postgres_no_existing_params() {
-    let result = db_append_connect_timeout("postgres://user:pass@localhost/mydb", "postgres", 10);
-    assert_eq!(
-        result,
-        "postgres://user:pass@localhost/mydb?connect_timeout=10"
+struct DropTrack(Arc<AtomicBool>);
+
+impl Drop for DropTrack {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pool_connect_timeout_fires_on_never_ready_future_without_wall_clock() {
+    let task = tokio::spawn(async {
+        await_pool_connect_with_timeout(2, std::future::pending::<Result<(), sqlx::Error>>()).await
+    });
+    // Arm the timeout waiter before advancing paused time.
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    tokio::task::yield_now().await;
+
+    let err = task
+        .await
+        .expect("join")
+        .expect_err("never-ready connect must time out");
+    match err {
+        sqlx::Error::Io(io_err) => {
+            assert_eq!(io_err.kind(), std::io::ErrorKind::TimedOut);
+            let message = io_err.to_string();
+            assert!(
+                message.contains("database pool connect timed out after 2s"),
+                "timeout message must be non-secret and stable: {message}"
+            );
+            assert!(
+                !message.contains("postgres://")
+                    && !message.contains("mysql://")
+                    && !message.contains("password"),
+                "timeout must not embed DSN/credentials: {message}"
+            );
+        }
+        other => panic!("expected Io(TimedOut), got {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn pool_connect_timeout_drops_hung_connect_future() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let track = DropTrack(Arc::clone(&dropped));
+    let task = tokio::spawn(async move {
+        await_pool_connect_with_timeout(1, async move {
+            let _track = track;
+            std::future::pending::<Result<(), sqlx::Error>>().await
+        })
+        .await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+
+    let _ = task.await.expect("join");
+    assert!(
+        dropped.load(Ordering::SeqCst),
+        "timeout must drop the connect future (no detached attempt)"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pool_connect_completes_when_gated_future_ready_before_timeout() {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        await_pool_connect_with_timeout(5, async move {
+            rx.await.map_err(|_| sqlx::Error::WorkerCrashed)?;
+            Ok(())
+        })
+        .await
+    });
+    tokio::task::yield_now().await;
+    tx.send(()).expect("gate open");
+    tokio::task::yield_now().await;
+
+    assert!(
+        task.await.expect("join").is_ok(),
+        "gated success before the bound must not time out"
+    );
+}
+
+#[tokio::test]
+async fn pool_connect_timeout_zero_waits_for_gated_success() {
+    // `0` disables the Ferrum bound; the future must still be awaitable.
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        await_pool_connect_with_timeout(0, async move {
+            rx.await.map_err(|_| sqlx::Error::WorkerCrashed)?;
+            Ok::<(), sqlx::Error>(())
+        })
+        .await
+    });
+    tx.send(()).expect("gate open");
+    assert!(
+        task.await.expect("join").is_ok(),
+        "timeout_seconds=0 must await the connect future without a Ferrum bound"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pool_connect_timeout_error_stays_transient_for_failover() {
+    let task = tokio::spawn(async {
+        await_pool_connect_with_timeout(1, std::future::pending::<Result<(), sqlx::Error>>()).await
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+
+    let err = anyhow::Error::new(task.await.expect("join").expect_err("timed out"));
+    assert!(
+        !DatabaseStore::is_non_transient_init_error(
+            &DatabaseStore::classify_initial_config_load_error(err)
+        ),
+        "Io(TimedOut) connect bound must remain backup/failover eligible"
     );
 }
 
 #[test]
-fn test_append_connect_timeout_postgres_with_existing_params() {
-    let result = db_append_connect_timeout(
-        "postgres://user:pass@localhost/mydb?sslmode=require",
-        "postgres",
-        15,
-    );
-    assert_eq!(
-        result,
-        "postgres://user:pass@localhost/mydb?sslmode=require&connect_timeout=15"
-    );
-}
-
-#[test]
-fn test_append_connect_timeout_mysql() {
-    let result = db_append_connect_timeout("mysql://user:pass@localhost/mydb", "mysql", 5);
-    assert_eq!(result, "mysql://user:pass@localhost/mydb?connect_timeout=5");
-}
-
-#[test]
-fn test_append_connect_timeout_sqlite_skipped() {
-    let result = db_append_connect_timeout("sqlite://mydb.sqlite", "sqlite", 10);
-    assert_eq!(result, "sqlite://mydb.sqlite");
-}
-
-#[test]
-fn test_append_connect_timeout_zero_disabled() {
-    let result = db_append_connect_timeout("postgres://user:pass@localhost/mydb", "postgres", 0);
-    assert_eq!(result, "postgres://user:pass@localhost/mydb");
+fn pool_connect_timeout_only_applies_to_network_sql_backends() {
+    assert_eq!(effective_pool_connect_timeout_seconds("postgres", 10), 10);
+    assert_eq!(effective_pool_connect_timeout_seconds("mysql", 10), 10);
+    assert_eq!(effective_pool_connect_timeout_seconds("sqlite", 10), 0);
+    assert_eq!(effective_pool_connect_timeout_seconds("postgres", 0), 0);
 }
 
 // ── DbPoolConfig defaults ────────────────────────────────────────────────────
@@ -1954,5 +2047,84 @@ async fn list_namespaces_paginated_insert_after_cursor_keeps_pages_stable() {
             .iter()
             .any(|returned| second.items.contains(returned)),
         "no row from the first page may reappear after the cursor"
+    );
+}
+
+/// Source-level drift guard for issue #3000: trust/routing nullable columns in
+/// `row_to_proxy` / `row_to_upstream` must use `try_get::<Option<_>>(...)?`
+/// so a non-NULL decode failure rejects the candidate load instead of silently
+/// becoming `None` (trust downgrade, mTLS disable, or upstream detach).
+#[test]
+fn row_mappers_use_strict_nullable_decodes_for_tls_and_routing_columns() {
+    let source = include_str!("../../../src/config/db_loader.rs");
+
+    let row_to_proxy = source
+        .split("fn row_to_proxy(")
+        .nth(1)
+        .and_then(|rest| rest.split("fn row_to_consumer(").next())
+        .expect("row_to_proxy body");
+    let row_to_upstream = source
+        .split("fn row_to_upstream(")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split("fn strip_api_spec_id_from_runtime_config(")
+                .next()
+        })
+        .expect("row_to_upstream body");
+
+    // Already-hardened contrast cases that established this contract.
+    assert!(
+        row_to_proxy.contains("try_get::<Option<String>, _>(\"listen_path\")?"),
+        "listen_path must keep the strict Option decode that motivated this fix"
+    );
+    assert!(
+        row_to_proxy.contains("try_get::<Option<i32>, _>(\"stream_proxy_protocol\")?"),
+        "stream_proxy_protocol must keep the strict Option decode"
+    );
+
+    let proxy_columns = [
+        "backend_tls_client_cert_path",
+        "backend_tls_client_key_path",
+        "backend_tls_server_ca_cert_path",
+        "dns_override",
+        "upstream_id",
+        "upstream_subset",
+    ];
+    for column in proxy_columns {
+        assert_strict_nullable_string_decode(row_to_proxy, "row_to_proxy", column);
+    }
+
+    let upstream_columns = [
+        "backend_tls_client_cert_path",
+        "backend_tls_client_key_path",
+        "backend_tls_server_ca_cert_path",
+    ];
+    for column in upstream_columns {
+        assert_strict_nullable_string_decode(row_to_upstream, "row_to_upstream", column);
+    }
+
+    // SNI was already fail-closed; keep that contract pinned.
+    assert!(
+        row_to_upstream.contains("backend_tls_sni")
+            && !row_to_upstream.contains("\"backend_tls_sni\").ok()"),
+        "row_to_upstream must not swallow backend_tls_sni decode errors with .ok()"
+    );
+}
+
+fn assert_strict_nullable_string_decode(body: &str, mapper: &str, column: &str) {
+    let strict = format!("try_get::<Option<String>, _>(\"{column}\")?");
+    assert!(
+        body.contains(&strict),
+        "{mapper} must decode `{column}` with `{strict}` so NULL stays None and \
+         non-NULL decode failures reject the load"
+    );
+    // Reject the historical silent-downgrade shapes.
+    assert!(
+        !body.contains(&format!("try_get(\"{column}\").ok()")),
+        "{mapper} must not use try_get(\"{column}\").ok()"
+    );
+    assert!(
+        !body.contains(&format!("try_get::<String, _>(\"{column}\").ok()")),
+        "{mapper} must not use try_get::<String, _>(\"{column}\").ok()"
     );
 }

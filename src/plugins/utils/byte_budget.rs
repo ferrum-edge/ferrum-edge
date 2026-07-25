@@ -1,9 +1,9 @@
-//! Shared retained-byte budgets for observability delivery queues.
+//! Shared retained-byte budgets for plugin-owned queues, caches, and snapshots.
 //!
-//! Record-count channel caps alone cannot bound attacker-shaped summaries.
-//! Callers reserve a provisional per-entry lease before cloning or
-//! serializing hostile fields, shrink to the exact retained size after
-//! measurement, and release on drop (or when ownership moves downstream).
+//! Count caps alone cannot bound attacker-shaped retained values. Callers
+//! reserve a provisional lease before cloning, serializing, or constructing
+//! retained data; shrink it to the exact retained size after measurement; and
+//! release it on drop (or when ownership moves downstream).
 
 use std::io::Write;
 use std::sync::Arc;
@@ -94,7 +94,7 @@ impl ByteBudget {
         if dropped == 1 || dropped.is_multiple_of(DROP_WARN_EVERY) {
             warn!(
                 plugin = self.plugin_name,
-                "{}: dropping observability record because {} ({} dropped total; logging every {} drops)",
+                "{}: dropping retained admission because {} ({} dropped total; logging every {} drops)",
                 self.plugin_name,
                 reason,
                 dropped,

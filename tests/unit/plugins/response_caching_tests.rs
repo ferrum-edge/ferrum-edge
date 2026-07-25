@@ -1,5 +1,10 @@
 //! Tests for response_caching plugin
 
+// These tests intentionally serialize complete async cache lifecycles against
+// process-global RTDS publications. The guard is test-only and no task in the
+// guarded lifecycle reacquires it.
+#![allow(clippy::await_holding_lock)]
+
 use super::plugin_utils::create_test_proxy;
 use chrono::Utc;
 use ferrum_edge::_test_support::{
@@ -180,6 +185,18 @@ async fn replace_cached_response(
 }
 
 // === Plugin creation ===
+
+/// Serialize against RTDS runtime-overlay publications.
+///
+/// `response_caching` stamps every stored entry with the live response-side
+/// runtime-overlay gate publication and retires entries whose stamp no longer
+/// matches, so an overlay publication in a concurrently running test would
+/// legitimately turn a HIT into a MISS. Every test that stores an entry and
+/// then asserts a HIT/REVALIDATED replay takes this process-wide lock, which
+/// is the same lock every overlay publisher holds.
+fn response_cache_replay_policy_guard() -> std::sync::MutexGuard<'static, ()> {
+    ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock()
+}
 
 #[tokio::test]
 async fn test_creation_defaults() {
@@ -492,6 +509,7 @@ async fn test_raw_query_cache_key_preserves_exact_semantics() {
 
 #[tokio::test]
 async fn test_cache_hit_second_request() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let plugin = default_plugin();
     let mut resp_headers = HashMap::new();
     resp_headers.insert("content-type".to_string(), "application/json".to_string());
@@ -740,6 +758,7 @@ async fn test_old_date_reduces_remaining_freshness() {
 
 #[tokio::test]
 async fn test_date_dominated_age_does_not_double_count_response_delay() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let plugin = default_plugin();
     let mut ctx = make_ctx("GET", "/api/date-delay");
     let mut headers = HashMap::new();
@@ -966,6 +985,7 @@ async fn test_client_no_cache_bypasses() {
 
 #[tokio::test]
 async fn test_bypassed_stale_response_does_not_poison_fresh_entry() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let plugin = default_plugin();
     let mut resp_headers = HashMap::new();
     resp_headers.insert("cache-control".to_string(), "max-age=60".to_string());
@@ -1219,6 +1239,7 @@ async fn test_zero_freshness_auth_rejection_invalidates_existing_entry() {
 
 #[tokio::test]
 async fn test_bypassed_fresh_response_clears_stale_predictor() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let plugin = default_plugin();
 
     let mut stale_ctx = make_ctx("GET", "/api/no-cache-refresh");
@@ -1494,6 +1515,7 @@ async fn test_vary_by_headers() {
 
 #[tokio::test]
 async fn test_backend_vary_accept_encoding_caches_binary_variant() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let plugin = default_plugin();
     let compressed = vec![0x1f, 0x8b, 0x08, 0x00, 0x00, 0xff];
 
@@ -1727,6 +1749,7 @@ async fn test_zero_freshness_invalidates_only_matching_vary_variant() {
 
 #[tokio::test]
 async fn test_if_none_match_returns_304_from_cache() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let plugin = default_plugin();
     let mut response_headers = HashMap::new();
     response_headers.insert("etag".to_string(), r#"W/"abc123""#.to_string());
@@ -3232,6 +3255,7 @@ fn test_sub_total_size_saturates_instead_of_wrapping() {
 /// and must match the actual retained entry sizes.
 #[tokio::test]
 async fn test_concurrent_stores_keep_size_bounded_and_non_wrapping() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let plugin = Arc::new(
         ResponseCaching::new(&json!({
             "ttl_seconds": 60,
@@ -3510,6 +3534,7 @@ async fn multiple_instances_isolate_staging_in_both_priority_orders() {
 
 #[tokio::test]
 async fn later_sibling_without_lookup_state_cannot_overwrite_hit_header() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let hit_instance = plugin_with_config(json!({
         "ttl_seconds": 60,
         "add_cache_status_header": true
@@ -3569,6 +3594,7 @@ async fn later_sibling_without_lookup_state_cannot_overwrite_hit_header() {
 
 #[tokio::test]
 async fn global_hit_signal_is_monotonic_across_sibling_statuses() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let hit_instance = plugin_with_config(json!({"ttl_seconds": 60}));
     let miss_instance = plugin_with_config(json!({"ttl_seconds": 60}));
 
@@ -3610,6 +3636,7 @@ async fn global_hit_signal_is_monotonic_across_sibling_statuses() {
 
 #[tokio::test]
 async fn multiple_instances_method_and_sse_bypass_clear_only_own_staging() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let cacheable = plugin_with_config(json!({
         "ttl_seconds": 60,
         "cacheable_methods": ["GET"],
@@ -3717,6 +3744,7 @@ async fn multiple_instances_method_and_sse_bypass_clear_only_own_staging() {
 
 #[tokio::test]
 async fn status_policy_divergence_does_not_cross_contaminate_stores() {
+    let _policy_guard = response_cache_replay_policy_guard();
     for a_first in [true, false] {
         let only_200 = plugin_with_config(json!({
             "ttl_seconds": 60,
@@ -3782,6 +3810,7 @@ async fn status_policy_divergence_does_not_cross_contaminate_stores() {
 
 #[tokio::test]
 async fn reload_generations_do_not_share_staging_namespaces() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let generation_one = plugin_with_config(json!({
         "ttl_seconds": 60,
         "vary_by_headers": ["x-tenant"],
@@ -3888,6 +3917,7 @@ async fn reload_generations_do_not_share_staging_namespaces() {
 /// but is still an RFC 9110 safe method.
 #[tokio::test]
 async fn test_options_does_not_invalidate_cached_get() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let plugin = default_plugin();
 
     cache_response(
@@ -3928,6 +3958,7 @@ async fn test_options_does_not_invalidate_cached_get() {
 /// cacheable set — it must bypass without invalidating the cached GET entry.
 #[tokio::test]
 async fn test_non_cacheable_head_does_not_invalidate_cached_get() {
+    let _policy_guard = response_cache_replay_policy_guard();
     let plugin = plugin_with_config(json!({
         "cacheable_methods": ["GET"]
     }));

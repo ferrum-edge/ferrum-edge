@@ -100,6 +100,58 @@ fn test_find_by_username_returns_correct_consumer() {
     assert_eq!(found.unwrap().id, "c1");
 }
 
+/// Runtime identity indexes are byte-keyed HashMaps. NFC and NFD forms of the
+/// same grapheme must remain distinct so DB uniqueness (MySQL
+/// `utf8mb4_0900_bin`,
+/// PostgreSQL `texteq`, SQLite BINARY) and runtime lookup stay aligned (#2994).
+#[test]
+fn test_nfc_and_nfd_usernames_are_distinct_runtime_identities() {
+    let nfc_username = "caf\u{00e9}";
+    let nfd_username = "cafe\u{0301}";
+    assert_ne!(nfc_username.as_bytes(), nfd_username.as_bytes());
+
+    let nfc = make_consumer("nfc", nfc_username, None, None);
+    let nfd = make_consumer("nfd", nfd_username, None, None);
+    let index = ConsumerIndex::new(&[nfc, nfd]);
+
+    assert_eq!(
+        index.find_by_username(nfc_username).map(|c| c.id.clone()),
+        Some("nfc".to_string())
+    );
+    assert_eq!(
+        index.find_by_username(nfd_username).map(|c| c.id.clone()),
+        Some("nfd".to_string())
+    );
+    assert_eq!(
+        index.find_by_identity(nfc_username).map(|c| c.id.clone()),
+        Some("nfc".to_string())
+    );
+    assert_eq!(
+        index.find_by_identity(nfd_username).map(|c| c.id.clone()),
+        Some("nfd".to_string())
+    );
+}
+
+#[test]
+fn test_trailing_space_usernames_are_distinct_runtime_identities() {
+    let plain = make_consumer("plain", "alice", None, None);
+    let spaced = make_consumer("spaced", "alice ", None, None);
+    let index = ConsumerIndex::new(&[plain, spaced]);
+
+    assert_eq!(
+        index.find_by_username("alice").map(|c| c.id.clone()),
+        Some("plain".to_string())
+    );
+    assert_eq!(
+        index.find_by_username("alice ").map(|c| c.id.clone()),
+        Some("spaced".to_string())
+    );
+    assert_eq!(
+        index.find_by_identity("alice ").map(|c| c.id.clone()),
+        Some("spaced".to_string())
+    );
+}
+
 #[test]
 fn test_find_by_username_missing_returns_none() {
     let consumer = make_consumer("c1", "bob", Some("key-bob"), None);

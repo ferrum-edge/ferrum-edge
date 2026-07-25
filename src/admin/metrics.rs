@@ -355,7 +355,7 @@ pub fn build_admin_metrics(
             unhealthy_targets.push(AdminMetricsUnhealthyTarget::passive(
                 proxy_id.clone(),
                 target_entry.key().clone(),
-                *target_entry.value(),
+                target_entry.value().ejected_at_ms,
             ));
         }
     }

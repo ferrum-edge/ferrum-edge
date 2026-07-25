@@ -74,6 +74,30 @@ pub struct RecvMmsgBatch {
 #[cfg(target_os = "linux")]
 const MAX_DGRAM_SIZE: usize = 65535;
 
+/// Preferred per-slot datagram buffer size for `SendMmsgBatch`.
+///
+/// Sized near a typical path-MTU payload (Ethernet ~1500) with headroom so
+/// ordinary DNS/QUIC/game-server replies fit without growing. Slots are
+/// allocated lazily on first use; datagrams larger than this cap are refused
+/// by `push_with_local` so the UDP reply path can use the existing
+/// `direct_send_to_client` escape hatch (full UDP datagrams up to
+/// [`MAX_DGRAM_SIZE`] remain supported).
+#[cfg(target_os = "linux")]
+pub const SEND_MMSG_SLOT_SIZE: usize = 2048;
+
+/// Result of attempting to queue a datagram into a [`SendMmsgBatch`].
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendMmsgPushResult {
+    /// Datagram was copied into a free slot.
+    Queued,
+    /// No free slots; caller should flush and retry.
+    Full,
+    /// Datagram exceeds the batch slot size (but is within the UDP maximum).
+    /// The batch is unchanged; caller should send via the direct-send path.
+    Oversized,
+}
+
 // SAFETY: The raw pointers in `iovecs` (`*mut c_void`) and `msgs` (`*mut iovec`)
 // point into `Vec` buffers owned by the same struct. They are only dereferenced
 // inside `recv()` which rebuilds them from scratch before each `recvmmsg` call.
@@ -288,17 +312,25 @@ fn sockaddr_storage_to_std(addr: &libc::sockaddr_storage) -> std::io::Result<Soc
     }
 }
 
-/// Pre-allocated buffers for batched UDP send via `sendmmsg(2)`.
+/// Lazily-allocated buffers for batched UDP send via `sendmmsg(2)`.
 ///
 /// Collects datagrams and their destination addresses, then flushes them all
 /// in a single `sendmmsg` syscall. This reduces syscall overhead on the
 /// backend→client reply path, mirroring the `recvmmsg` optimization on recv.
 ///
+/// Per-slot datagram buffers start empty and are allocated on first use at
+/// [`SEND_MMSG_SLOT_SIZE`] (2 KiB). That avoids the historical eager
+/// `capacity × 65535` (~4.2 MiB) footprint per plain-UDP session. Datagrams
+/// larger than the slot size are refused (`SendMmsgPushResult::Oversized`) so
+/// the reply path can `sendmsg` them directly while still supporting the full
+/// valid UDP datagram size.
+///
 /// Only available on Linux. On other platforms, the UDP proxy falls back to
 /// individual `send_to` calls.
 #[cfg(target_os = "linux")]
 pub struct SendMmsgBatch {
-    /// Per-slot datagram buffers (data copied in on push).
+    /// Per-slot datagram buffers (data copied in on push). Empty until the
+    /// slot is first used; then sized to [`SEND_MMSG_SLOT_SIZE`].
     bufs: Vec<Vec<u8>>,
     /// Per-slot actual datagram length.
     lens: Vec<usize>,
@@ -323,6 +355,8 @@ pub struct SendMmsgBatch {
     cmsg_bufs: Vec<Vec<u8>>,
     /// Maximum datagrams per sendmmsg call.
     capacity: usize,
+    /// Maximum bytes stored per slot. Datagrams larger than this are refused.
+    slot_size: usize,
     /// Number of datagrams queued for the next flush.
     count: usize,
 }
@@ -342,13 +376,25 @@ unsafe impl Send for SendMmsgBatch {}
 
 #[cfg(target_os = "linux")]
 impl SendMmsgBatch {
-    /// Create a new send batch with pre-allocated buffers for `capacity` datagrams.
+    /// Create a send batch for `capacity` datagrams with lazy slot buffers.
+    ///
+    /// Bookkeeping arrays are sized up front; per-slot datagram buffers remain
+    /// empty until first use (then allocated at [`SEND_MMSG_SLOT_SIZE`]).
     pub fn new(capacity: usize) -> Self {
+        Self::with_slot_size(capacity, SEND_MMSG_SLOT_SIZE)
+    }
+
+    /// Create a send batch with an explicit per-slot size (clamped to
+    /// `1..=MAX_DGRAM_SIZE`). Intended for tests and callers that need a
+    /// non-default bound; production uses [`Self::new`].
+    pub fn with_slot_size(capacity: usize, slot_size: usize) -> Self {
         let capacity = capacity.max(1);
+        let slot_size = slot_size.clamp(1, MAX_DGRAM_SIZE);
         let cmsg_space =
             unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::in6_pktinfo>() as u32) as usize };
         Self {
-            bufs: (0..capacity).map(|_| vec![0u8; MAX_DGRAM_SIZE]).collect(),
+            // Lazy: no eager capacity × 65535 (or even capacity × slot_size).
+            bufs: (0..capacity).map(|_| Vec::new()).collect(),
             lens: vec![0usize; capacity],
             dest_addrs: vec![unsafe { std::mem::zeroed() }; capacity],
             dest_addr_lens: vec![0; capacity],
@@ -363,7 +409,38 @@ impl SendMmsgBatch {
             local_ips: vec![None; capacity],
             cmsg_bufs: (0..capacity).map(|_| vec![0u8; cmsg_space]).collect(),
             capacity,
+            slot_size,
             count: 0,
+        }
+    }
+
+    /// Maximum bytes accepted per slot by [`Self::push_with_local`].
+    ///
+    /// The public library's external regression tests use this accessor; the
+    /// binary target compiles the same module without calling it.
+    #[allow(dead_code)]
+    pub fn slot_size(&self) -> usize {
+        self.slot_size
+    }
+
+    /// Total capacity currently reserved across per-slot datagram buffers.
+    ///
+    /// Used by memory-footprint contract tests. Fresh batches report `0`
+    /// because slot buffers are allocated lazily.
+    #[allow(dead_code)]
+    pub fn datagram_buffer_capacity_bytes(&self) -> usize {
+        self.bufs.iter().map(Vec::capacity).sum()
+    }
+
+    /// Ensure slot `i` has a buffer of at least `self.slot_size` bytes.
+    ///
+    /// Allocates on first use only — subsequent pushes into the same slot
+    /// reuse the buffer (no per-datagram hot-path allocation).
+    fn ensure_slot_buf(&mut self, i: usize) {
+        let slot_size = self.slot_size;
+        let buf = &mut self.bufs[i];
+        if buf.len() < slot_size {
+            buf.resize(slot_size, 0);
         }
     }
 
@@ -371,21 +448,28 @@ impl SendMmsgBatch {
     /// IP(v6)_PKTINFO cmsg with `local` as the reply source address and
     /// interface index.
     ///
-    /// Returns `false` if the batch is full. When `local` is `Some`, its
-    /// address family must match `dest` — v4 pktinfo cannot be combined with a
-    /// v6 destination and vice versa. Mismatches are skipped silently; the
-    /// slot is queued without pktinfo so the kernel picks a source itself.
+    /// Returns [`SendMmsgPushResult::Full`] if the batch has no free slots,
+    /// or [`SendMmsgPushResult::Oversized`] if `data` exceeds [`Self::slot_size`]
+    /// (caller should use the direct-send escape hatch). When `local` is
+    /// `Some`, its address family must match `dest` — v4 pktinfo cannot be
+    /// combined with a v6 destination and vice versa. Mismatches are skipped
+    /// silently; the slot is queued without pktinfo so the kernel picks a
+    /// source itself.
     pub fn push_with_local(
         &mut self,
         data: &[u8],
         dest: SocketAddr,
         local: Option<crate::socket_opts::PktinfoLocal>,
-    ) -> bool {
+    ) -> SendMmsgPushResult {
+        let len = data.len().min(MAX_DGRAM_SIZE);
+        if len > self.slot_size {
+            return SendMmsgPushResult::Oversized;
+        }
         if self.count >= self.capacity {
-            return false;
+            return SendMmsgPushResult::Full;
         }
         let i = self.count;
-        let len = data.len().min(MAX_DGRAM_SIZE);
+        self.ensure_slot_buf(i);
         self.bufs[i][..len].copy_from_slice(&data[..len]);
         self.lens[i] = len;
         let (addr, addr_len) = std_to_sockaddr_storage(dest);
@@ -398,7 +482,7 @@ impl SendMmsgBatch {
             _ => None,
         };
         self.count += 1;
-        true
+        SendMmsgPushResult::Queued
     }
 
     /// Whether the batch is empty.
@@ -561,7 +645,7 @@ impl SendMmsgBatch {
 mod sendmmsg_batch_tests {
     use std::net::SocketAddr;
 
-    use super::SendMmsgBatch;
+    use super::{SendMmsgBatch, SendMmsgPushResult};
 
     #[test]
     fn pending_stats_reports_queued_datagrams_and_bytes() {
@@ -569,8 +653,14 @@ mod sendmmsg_batch_tests {
         let dest: SocketAddr = "127.0.0.1:5353".parse().expect("valid socket addr");
 
         assert_eq!(batch.pending_stats().datagrams, 0);
-        assert!(batch.push_with_local(b"abc", dest, None));
-        assert!(batch.push_with_local(b"de", dest, None));
+        assert_eq!(
+            batch.push_with_local(b"abc", dest, None),
+            SendMmsgPushResult::Queued
+        );
+        assert_eq!(
+            batch.push_with_local(b"de", dest, None),
+            SendMmsgPushResult::Queued
+        );
 
         let stats = batch.pending_stats();
         assert_eq!(stats.datagrams, 2);
@@ -656,9 +746,34 @@ pub struct SendMmsgBatch;
 
 #[cfg(not(target_os = "linux"))]
 #[allow(dead_code)]
+pub const SEND_MMSG_SLOT_SIZE: usize = 2048;
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum SendMmsgPushResult {
+    Queued,
+    Full,
+    Oversized,
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
 impl SendMmsgBatch {
     pub fn new(_capacity: usize) -> Self {
         Self
+    }
+
+    pub fn with_slot_size(_capacity: usize, _slot_size: usize) -> Self {
+        Self
+    }
+
+    pub fn slot_size(&self) -> usize {
+        SEND_MMSG_SLOT_SIZE
+    }
+
+    pub fn datagram_buffer_capacity_bytes(&self) -> usize {
+        0
     }
 }
 
@@ -784,9 +899,11 @@ impl GsoBatchBuf {
     /// Drain buffered datagrams into a `SendMmsgBatch` for fallback sending.
     ///
     /// Splits the contiguous GSO buffer back into individual datagrams by
-    /// `segment_size` and pushes each into the sendmmsg batch. If the sendmmsg
-    /// batch fills up, the remaining datagrams stay in the GSO buffer (the
-    /// caller should flush the sendmmsg batch and call drain again).
+    /// `segment_size` and pushes each into the sendmmsg batch. Stops early
+    /// when the sendmmsg batch is full or when a segment exceeds the sendmmsg
+    /// slot size (`SendMmsgPushResult::Oversized`); remaining datagrams stay
+    /// in the GSO buffer. For the oversized case the caller should
+    /// [`Self::take_front_datagram`] and direct-send, then continue draining.
     /// Returns the number of datagrams drained.
     pub fn drain_to_sendmmsg(
         &mut self,
@@ -801,11 +918,15 @@ impl GsoBatchBuf {
         let mut drained = 0;
         while offset < self.buf.len() {
             let end = (offset + self.segment_size).min(self.buf.len());
-            if !send_batch.push_with_local(&self.buf[offset..end], dest, local) {
-                break; // sendmmsg batch full — remaining stays in GSO buffer
+            match send_batch.push_with_local(&self.buf[offset..end], dest, local) {
+                SendMmsgPushResult::Queued => {
+                    offset = end;
+                    drained += 1;
+                }
+                SendMmsgPushResult::Full | SendMmsgPushResult::Oversized => {
+                    break; // remaining stays in GSO buffer
+                }
             }
-            offset = end;
-            drained += 1;
         }
         if offset >= self.buf.len() {
             // All datagrams drained — clear the buffer.
@@ -818,6 +939,27 @@ impl GsoBatchBuf {
             self.count -= drained;
         }
         drained
+    }
+
+    /// Remove and return the front datagram (one `segment_size` slice).
+    ///
+    /// Used when `drain_to_sendmmsg` stops on `SendMmsgPushResult::Oversized`
+    /// so the UDP reply path can direct-send the segment and continue. Returns
+    /// `None` when the buffer is empty.
+    pub fn take_front_datagram(&mut self) -> Option<Vec<u8>> {
+        if self.count == 0 || self.segment_size == 0 || self.buf.is_empty() {
+            return None;
+        }
+        let end = self.segment_size.min(self.buf.len());
+        let dgram = self.buf[..end].to_vec();
+        self.buf.drain(..end);
+        self.count -= 1;
+        if self.count == 0 || self.buf.is_empty() {
+            self.buf.clear();
+            self.count = 0;
+            self.segment_size = 0;
+        }
+        Some(dgram)
     }
 }
 

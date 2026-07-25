@@ -11,20 +11,26 @@
 
 use std::sync::LazyLock;
 
-use arc_swap::ArcSwap;
-
 use crate::modes::mesh::config::MeshRuntimeOverlay;
-use crate::plugins::utils::runtime_bool_gate::{self, BoolGateMap};
+use crate::plugins::utils::runtime_bool_gate::{self, BoolGateStore, GatePolicyStamp};
 
 pub(crate) const KEY_PREFIX: &str = "ferrum.response_transformer.";
 pub(crate) const ENABLED_SUFFIX: &str = ".enabled";
 
-static GATES: LazyLock<ArcSwap<BoolGateMap>> = LazyLock::new(runtime_bool_gate::new_store);
+static GATES: LazyLock<BoolGateStore> = LazyLock::new(runtime_bool_gate::new_store);
 
 pub type GateSnapshot = runtime_bool_gate::BoolGateSnapshot;
 
 pub fn current_gates() -> GateSnapshot {
     runtime_bool_gate::current_snapshot(&GATES)
+}
+
+/// Opaque identity paired atomically with the live response-side gate map.
+///
+/// A cached representation is replayable only while this identity remains
+/// current. The identity carries no gate, rule, header, or body content.
+pub fn policy_stamp() -> GatePolicyStamp {
+    runtime_bool_gate::current_policy_stamp(&GATES)
 }
 
 pub fn apply_overlay(overlay: &MeshRuntimeOverlay) {

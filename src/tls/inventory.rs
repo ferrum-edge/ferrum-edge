@@ -4,6 +4,23 @@
 //! configured TLS sources without exposing private key bytes. Certificate-like
 //! material is parsed for operator metadata; private keys are only checked for
 //! parseability and are never fingerprinted in responses or metrics.
+//!
+//! Collection performs real source I/O (filesystem, Kubernetes, cloud secret
+//! managers) and therefore never runs on a request path. Two scopes exist:
+//!
+//! - [`TlsInventory::collect`] — the full operator inventory behind
+//!   `GET /admin/tls/inventory`, an explicit authenticated request. It loads
+//!   every configured source, including private keys, which are parse-checked
+//!   and immediately dropped.
+//! - [`TlsInventory::collect_public_metadata`] — the metrics-safe scope used by
+//!   the bounded background refresh behind
+//!   [`crate::tls::inventory_cache`]. It loads only public
+//!   certificate-family material (certificates, CA bundles, CRLs) and **never**
+//!   materializes private-key, JWKS, or OCSP bytes: those entries report health
+//!   from the owning validated config/reload state instead (issue #2410).
+//!
+//! `/metrics` itself only ever reads the cached snapshot
+//! ([`crate::tls::inventory_cache::snapshot`]) and performs zero source I/O.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Cursor;
@@ -84,6 +101,39 @@ pub struct TlsInventory {
     pub entries: Vec<TlsInventoryEntry>,
 }
 
+/// How much of each configured source an inventory collection may materialize.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InventoryScope {
+    /// Load every configured source. Private keys are parse-checked and
+    /// dropped; JWKS/OCSP material is fetched so an unreadable source is
+    /// reported as such. Used by the authenticated operator inventory endpoint.
+    Full,
+    /// Load only public certificate-family material (certificate, CA bundle,
+    /// CRL). Private-key, JWKS, and OCSP sources are never materialized; their
+    /// state comes from the owning validated config/reload state. Used by the
+    /// cached snapshot that backs certificate metrics.
+    PublicMetadata,
+}
+
+impl InventoryScope {
+    /// Whether this scope may load `kind` from its configured source.
+    ///
+    /// Only certificate-family material yields public metadata the inventory
+    /// actually renders (subject/issuer/SANs/validity/fingerprint/CRL counts),
+    /// so the metrics scope loads nothing else — in particular never a private
+    /// key, which would let a scraper drive key materialization outside the TLS
+    /// reload lifecycle.
+    fn may_load(self, kind: MaterialKind) -> bool {
+        match self {
+            Self::Full => true,
+            Self::PublicMetadata => matches!(
+                kind,
+                MaterialKind::Cert | MaterialKind::CaBundle | MaterialKind::Crl
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct InventorySourceRef {
     source: CertSource,
@@ -109,7 +159,28 @@ struct InventoryEntryBuilder {
 }
 
 impl TlsInventory {
+    /// Full operator inventory. Loads every configured source, including
+    /// private keys. Blocking; never call from a request path.
     pub fn collect(env_config: Option<&EnvConfig>, gateway_config: Option<&GatewayConfig>) -> Self {
+        Self::collect_with_scope(env_config, gateway_config, InventoryScope::Full)
+    }
+
+    /// Metrics-safe inventory. Loads only public certificate-family material
+    /// and never materializes private-key bytes. Blocking; runs on the bounded
+    /// background refresh in [`crate::tls::inventory_cache`], never on a
+    /// request path.
+    pub fn collect_public_metadata(
+        env_config: Option<&EnvConfig>,
+        gateway_config: Option<&GatewayConfig>,
+    ) -> Self {
+        Self::collect_with_scope(env_config, gateway_config, InventoryScope::PublicMetadata)
+    }
+
+    pub fn collect_with_scope(
+        env_config: Option<&EnvConfig>,
+        gateway_config: Option<&GatewayConfig>,
+        scope: InventoryScope,
+    ) -> Self {
         let mut sources = Vec::new();
         if let Some(env_config) = env_config {
             collect_env_sources(env_config, &mut sources);
@@ -141,14 +212,14 @@ impl TlsInventory {
 
         let entries = grouped
             .into_values()
-            .map(InventoryEntryBuilder::into_entry)
+            .map(|builder| builder.into_entry(scope))
             .collect();
         Self { entries }
     }
 }
 
 impl InventoryEntryBuilder {
-    fn into_entry(self) -> TlsInventoryEntry {
+    fn into_entry(self, scope: InventoryScope) -> TlsInventoryEntry {
         let source_kind = configured_source_kind(&self.source);
         let refreshable = source_is_refreshable(&self.source);
         let material_kind = material_kind_label(self.kind).to_string();
@@ -177,6 +248,11 @@ impl InventoryEntryBuilder {
 
         if is_pkcs11_key_source(&self.source, self.kind) {
             populate_pkcs11_key_entry(&mut entry);
+            return entry;
+        }
+
+        if !scope.may_load(self.kind) {
+            populate_entry_from_reload_state(&mut entry);
             return entry;
         }
 
@@ -241,6 +317,32 @@ impl InventoryEntryBuilder {
 
         entry
     }
+}
+
+/// Report a source that this scope refuses to materialize.
+///
+/// The entry keeps its configured provenance and carries no parsed metadata.
+/// Health comes from the owning validated config/reload state: startup and
+/// every reload validate the source before it is adopted (a broken private key
+/// is fatal in file mode, warned in database mode, and rejected in DP mode), so
+/// "no recorded failure" means the last validated owner accepted it. A recorded
+/// watcher/rebuild failure for the same configured source identity downgrades
+/// the entry without re-reading a single byte.
+fn populate_entry_from_reload_state(entry: &mut TlsInventoryEntry) {
+    let Some(failure) = crate::tls::events::latest_source_failure(&entry.source.identifier) else {
+        return;
+    };
+    tracing::debug!(
+        inventory_id = %entry.id,
+        outcome = %failure.outcome,
+        at = %failure.at,
+        "TLS inventory entry reported from the last recorded source failure"
+    );
+    entry.state = match failure.outcome.as_str() {
+        "load_error" => TlsInventoryState::Unavailable,
+        _ => TlsInventoryState::Invalid,
+    };
+    entry.error = failure.error;
 }
 
 fn is_pkcs11_key_source(source: &CertSource, kind: MaterialKind) -> bool {

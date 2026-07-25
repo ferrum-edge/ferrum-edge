@@ -8,12 +8,17 @@
 //!   `Any` driver does not round-trip MySQL `DATETIME` values into the
 //!   string-based config layer.  RFC 3339 nano-precision timestamps are at most
 //!   35 chars; `VARCHAR(64)` provides comfortable headroom
-//! - identifier / hostname VARCHAR columns use `COLLATE utf8mb4_0900_as_cs`
-//!   (MySQL 8.0+) so uniqueness and ordering on `(namespace, name)` etc. is
-//!   byte-exact rather than the table-default case-insensitive collation.
-//!   Hostnames are pre-normalized to ASCII-lowercase by `normalize_fields()`,
-//!   so case-sensitivity is moot for those, but other identifiers benefit.
-//!   Floor is MySQL 8.0+; the project test infra runs MySQL 8.
+//! - identifier / hostname VARCHAR columns use `COLLATE utf8mb4_0900_bin` so
+//!   uniqueness and ordering on `(namespace, name)` etc. is truly byte-exact
+//!   (matching PostgreSQL `texteq` and SQLite BINARY), not merely accent-/
+//!   case-sensitive UCA comparison. `utf8mb4_0900_as_cs` treats canonically
+//!   equivalent Unicode sequences (NFC vs NFD) as equal, while the older
+//!   `utf8mb4_bin` has `PAD SPACE` semantics that ignore trailing spaces;
+//!   both diverge from the runtime's byte-keyed identity indexes. Hostnames
+//!   are pre-normalized to ASCII-lowercase by `normalize_fields()`, so
+//!   case-sensitivity is moot for those, but other identifiers benefit.
+//!   Floor is MySQL 8.0.17+ (`utf8mb4_0900_bin` was introduced then); the
+//!   project test infra runs MySQL 8.4.
 //! - columns whose code-side cap exceeds MySQL's `TEXT` (65,535 bytes) use
 //!   `MEDIUMTEXT` (16 MiB): `plugin_configs.config` (1 MiB cap),
 //!   `consumers.credentials` (64 KiB cap — off-by-one over `TEXT`),
@@ -387,9 +392,9 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS upstreams (
-                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
-                name VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
+                id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
+                name VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 targets MEDIUMTEXT NOT NULL,
                 algorithm VARCHAR(50) NOT NULL DEFAULT 'round_robin',
                 hash_on TEXT,
@@ -401,9 +406,9 @@ impl V001SqlBuilder {
                 backend_tls_client_key_path MEDIUMTEXT,
                 backend_tls_verify_server_cert INTEGER NOT NULL DEFAULT 1,
                 backend_tls_server_ca_cert_path MEDIUMTEXT,
-                backend_tls_sni VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
+                backend_tls_sni VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 backend_tls_san_allow_list MEDIUMTEXT,
-                api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
+                api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL
             )
@@ -442,10 +447,10 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS consumers (
-                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
-                username VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                custom_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
+                id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
+                username VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                custom_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 credentials MEDIUMTEXT NOT NULL,
                 acl_groups MEDIUMTEXT NOT NULL,
                 created_at VARCHAR(64) NOT NULL,
@@ -474,10 +479,10 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS consumer_credential_index (
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                credential_type VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                credential_hash VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                consumer_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                credential_type VARCHAR(64) COLLATE utf8mb4_0900_bin NOT NULL,
+                credential_hash VARCHAR(64) COLLATE utf8mb4_0900_bin NOT NULL,
+                consumer_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 PRIMARY KEY (namespace, credential_type, credential_hash),
                 CONSTRAINT fk_consumer_credential_index_consumer FOREIGN KEY (namespace, consumer_id) REFERENCES consumers(namespace, id) ON DELETE CASCADE
             )
@@ -507,9 +512,9 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS consumer_identity_index (
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                identity_value VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                consumer_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                identity_value VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                consumer_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 created_at VARCHAR(64) NOT NULL,
                 PRIMARY KEY (namespace, identity_value),
                 CONSTRAINT fk_consumer_identity_index_consumer FOREIGN KEY (namespace, consumer_id) REFERENCES consumers(namespace, id) ON DELETE CASCADE
@@ -533,13 +538,13 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS proxies (
-                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
-                name VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
+                id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
+                name VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 hosts TEXT NOT NULL,
                 listen_path VARCHAR(512),
                 backend_scheme VARCHAR(16) NOT NULL DEFAULT 'https',
-                backend_host VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                backend_host VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 backend_port INTEGER NOT NULL DEFAULT 80,
                 backend_path TEXT,
                 strip_listen_path INTEGER NOT NULL DEFAULT 1,
@@ -554,8 +559,8 @@ impl V001SqlBuilder {
                 dns_override TEXT,
                 dns_cache_ttl_seconds INTEGER,
                 auth_mode VARCHAR(20) NOT NULL DEFAULT 'single',
-                upstream_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
-                upstream_subset VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
+                upstream_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
+                upstream_subset VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 circuit_breaker TEXT,
                 retry TEXT,
                 response_body_mode VARCHAR(50) NOT NULL DEFAULT 'stream',
@@ -583,7 +588,7 @@ impl V001SqlBuilder {
                 allowed_ws_origins MEDIUMTEXT,
                 udp_max_response_amplification_factor REAL,
                 stream_proxy_protocol INTEGER,
-                api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
+                api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL,
                 CONSTRAINT fk_proxies_upstream FOREIGN KEY (upstream_id) REFERENCES upstreams(id) ON DELETE RESTRICT,
@@ -664,15 +669,15 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS plugin_configs (
-                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
-                plugin_name VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
+                plugin_name VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 config MEDIUMTEXT NOT NULL,
                 scope VARCHAR(50) NOT NULL DEFAULT 'global',
-                proxy_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
+                proxy_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 priority_override INTEGER DEFAULT NULL,
-                api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs,
+                api_spec_id VARCHAR(255) COLLATE utf8mb4_0900_bin,
                 created_at VARCHAR(64) NOT NULL,
                 updated_at VARCHAR(64) NOT NULL,
                 CONSTRAINT fk_plugin_configs_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE
@@ -701,8 +706,8 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS proxy_route_locks (
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                route_key_hash VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                route_key_hash VARCHAR(64) COLLATE utf8mb4_0900_bin NOT NULL,
                 created_at VARCHAR(64) NOT NULL,
                 PRIMARY KEY (namespace, route_key_hash)
             )
@@ -735,9 +740,9 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS mtls_dns_admission_locks (
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
                 updated_at VARCHAR(64) NOT NULL,
-                restore_owner VARCHAR(36) COLLATE utf8mb4_0900_as_cs NULL
+                restore_owner VARCHAR(36) COLLATE utf8mb4_0900_bin NULL
             )
             "#
         } else {
@@ -755,8 +760,8 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS proxy_plugins (
-                proxy_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                plugin_config_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                proxy_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                plugin_config_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
                 PRIMARY KEY (proxy_id, plugin_config_id),
                 CONSTRAINT fk_proxy_plugins_proxy FOREIGN KEY (proxy_id) REFERENCES proxies(id) ON DELETE CASCADE,
                 CONSTRAINT fk_proxy_plugins_plugin FOREIGN KEY (plugin_config_id) REFERENCES plugin_configs(id) ON DELETE CASCADE
@@ -777,7 +782,7 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS config_change_locks (
-                lock_name VARCHAR(64) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                lock_name VARCHAR(64) COLLATE utf8mb4_0900_bin PRIMARY KEY,
                 updated_at VARCHAR(64) NOT NULL
             )
             "#
@@ -795,8 +800,8 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS config_admission_locks (
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
-                owner VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
+                owner VARCHAR(64) COLLATE utf8mb4_0900_bin NOT NULL,
                 expires_at BIGINT NOT NULL,
                 generation BIGINT NOT NULL DEFAULT 1
             )
@@ -817,7 +822,7 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS config_change_retention (
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
                 retained_sequence BIGINT NOT NULL DEFAULT 0,
                 updated_at VARCHAR(64) NOT NULL
             )
@@ -838,10 +843,10 @@ impl V001SqlBuilder {
             r#"
             CREATE TABLE IF NOT EXISTS config_changes (
                 sequence BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                resource_type VARCHAR(32) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                resource_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                operation VARCHAR(16) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                resource_type VARCHAR(32) COLLATE utf8mb4_0900_bin NOT NULL,
+                resource_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                operation VARCHAR(16) COLLATE utf8mb4_0900_bin NOT NULL,
                 created_at VARCHAR(64) NOT NULL
             )
             "#
@@ -891,15 +896,15 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS api_specs (
-                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
-                proxy_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                spec_version VARCHAR(50) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
+                proxy_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                spec_version VARCHAR(50) COLLATE utf8mb4_0900_bin NOT NULL,
                 spec_format VARCHAR(10) NOT NULL,
                 spec_content LONGBLOB NOT NULL,
                 content_encoding VARCHAR(50) NOT NULL DEFAULT 'gzip',
                 uncompressed_size BIGINT NOT NULL,
-                content_hash VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
+                content_hash VARCHAR(64) COLLATE utf8mb4_0900_bin NOT NULL,
                 title TEXT,
                 info_version VARCHAR(255),
                 description LONGTEXT,
@@ -978,13 +983,13 @@ impl V001SqlBuilder {
         if self.is_mysql() {
             r#"
             CREATE TABLE IF NOT EXISTS audit_events (
-                id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY,
+                id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY,
                 ts VARCHAR(50) NOT NULL,
-                actor VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                action VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                resource_type VARCHAR(128) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                resource_id VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL,
-                namespace VARCHAR(255) COLLATE utf8mb4_0900_as_cs NOT NULL DEFAULT 'ferrum',
+                actor VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                action VARCHAR(64) COLLATE utf8mb4_0900_bin NOT NULL,
+                resource_type VARCHAR(128) COLLATE utf8mb4_0900_bin NOT NULL,
+                resource_id VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL,
+                namespace VARCHAR(255) COLLATE utf8mb4_0900_bin NOT NULL DEFAULT 'ferrum',
                 diff LONGTEXT NOT NULL
             )
             "#
@@ -1044,7 +1049,7 @@ mod tests {
         assert!(
             builder
                 .create_upstreams_sql()
-                .contains("id VARCHAR(255) COLLATE utf8mb4_0900_as_cs PRIMARY KEY")
+                .contains("id VARCHAR(255) COLLATE utf8mb4_0900_bin PRIMARY KEY")
         );
         assert!(
             builder
@@ -1348,23 +1353,26 @@ mod tests {
     // Collation regression tests
     //
     // MySQL identifier and hostname VARCHAR columns must use explicit
-    // `COLLATE utf8mb4_0900_as_cs` so uniqueness on `(namespace, name)` and
-    // similar is byte-exact rather than relying on the table-default
-    // case-insensitive collation. MySQL 8.0+ floor; the project test infra
-    // already runs MySQL 8 (tests/scripts/setup_db_tls.sh).
+    // `COLLATE utf8mb4_0900_bin` so uniqueness on `(namespace, name)` and similar
+    // is truly byte-exact (matching PostgreSQL/SQLite and runtime HashMap
+    // keys). A UCA collation such as `utf8mb4_0900_as_cs` is accent-/case-
+    // sensitive but still folds NFC/NFD equivalents, and the older
+    // `utf8mb4_bin` ignores trailing spaces under `PAD SPACE` semantics.
+    // MySQL 8.0.17+ floor (`utf8mb4_0900_bin` introduced then); hosted
+    // service-integration CI runs MySQL 8.4.
     // ------------------------------------------------------------------
 
     fn assert_columns_have_collation(sql: &str, table_label: &str, columns: &[&str]) {
         for col in columns {
             let needles = [
-                format!("{col} VARCHAR(255) COLLATE utf8mb4_0900_as_cs"),
-                format!("{col} VARCHAR(50) COLLATE utf8mb4_0900_as_cs"),
-                format!("{col} VARCHAR(64) COLLATE utf8mb4_0900_as_cs"),
-                format!("{col} VARCHAR(36) COLLATE utf8mb4_0900_as_cs"),
+                format!("{col} VARCHAR(255) COLLATE utf8mb4_0900_bin"),
+                format!("{col} VARCHAR(50) COLLATE utf8mb4_0900_bin"),
+                format!("{col} VARCHAR(64) COLLATE utf8mb4_0900_bin"),
+                format!("{col} VARCHAR(36) COLLATE utf8mb4_0900_bin"),
             ];
             assert!(
                 needles.iter().any(|n| sql.contains(n)),
-                "{table_label}.{col} must have an explicit COLLATE utf8mb4_0900_as_cs clause"
+                "{table_label}.{col} must have an explicit COLLATE utf8mb4_0900_bin clause"
             );
         }
     }
@@ -1507,10 +1515,39 @@ mod tests {
                 builder.create_api_specs_sql(),
             ] {
                 assert!(
-                    !sql.contains("utf8mb4_0900_as_cs"),
+                    !sql.contains("utf8mb4_0900_bin") && !sql.contains("utf8mb4_0900_as_cs"),
                     "{dialect} dialect must not carry MySQL-specific COLLATE clauses"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_mysql_identity_columns_reject_uca_collation() {
+        // Regression for #2994: UCA `utf8mb4_0900_as_cs` folds NFC/NFD and
+        // diverges from PostgreSQL/SQLite/runtime byte keys.
+        let builder = V001SqlBuilder::new("mysql");
+        for (label, sql) in [
+            ("consumers", builder.create_consumers_sql()),
+            (
+                "consumer_identity_index",
+                builder.create_consumer_identity_index_sql(),
+            ),
+            ("proxies", builder.create_proxies_sql()),
+            ("upstreams", builder.create_upstreams_sql()),
+        ] {
+            assert!(
+                sql.contains("utf8mb4_0900_bin"),
+                "{label} must use the NO PAD binary collation for byte-exact identity"
+            );
+            assert!(
+                !sql.contains("utf8mb4_0900_as_cs"),
+                "{label} must not use UCA utf8mb4_0900_as_cs (NFC/NFD fold)"
+            );
+            assert!(
+                !sql.contains("COLLATE utf8mb4_bin"),
+                "{label} must not use PAD SPACE utf8mb4_bin (trailing-space fold)"
+            );
         }
     }
 
@@ -1656,7 +1693,7 @@ mod tests {
             );
             assert!(
                 !sql.contains("id TEXT PRIMARY KEY")
-                    && !sql.contains("COLLATE utf8mb4_0900_as_cs PRIMARY KEY"),
+                    && !sql.contains("COLLATE utf8mb4_0900_bin PRIMARY KEY"),
                 "{dialect} consumers table must not keep a single-column id PRIMARY KEY"
             );
         }

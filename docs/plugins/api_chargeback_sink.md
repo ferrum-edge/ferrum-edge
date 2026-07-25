@@ -353,9 +353,9 @@ split, or skip a file:
 | Outcome | Status / cause | Replay behavior |
 | --- | --- | --- |
 | Delivered | HTTP 200 / 204 with a complete empty acknowledgement body and no exception header/markers | Remove the spool file after the accepted insert |
-| Retryable | network / timeout / TLS transport errors, incomplete acknowledgement drains, ambiguous non-empty 2xx bodies, HTTP 408, 429, 5xx, and other non-4xx failures | Keep the file, stop the current replay tick (newer files wait so order is preserved across transient outages) |
+| Retryable | network / timeout / TLS transport errors, incomplete acknowledgement drains, ambiguous non-empty 2xx bodies, HTTP 401, 403, 408, 429, 5xx, and other non-4xx failures | Keep the file, stop the current replay tick (newer files wait so order is preserved across transient outages) |
 | Payload too large | HTTP 413 | Deterministically split the JSONEachRow body (preferring `batch.size`, otherwise halving) and retry each part without rewriting row bytes, so each event keeps its stable `event_id` idempotency identity. A single row that still returns 413 is dead-lettered |
-| Permanent | other HTTP 4xx (for example 400, 401, 403), or HTTP 200/204 whose body/`X-ClickHouse-Exception-Code` carries a ClickHouse exception | Replace the rejected payload with safe dead-letter metadata and continue with newer spool files so one poison batch cannot head-of-line block the spool |
+| Permanent | other HTTP 4xx (for example 400, 404, 409, 418, 422), or HTTP 200/204 whose body/`X-ClickHouse-Exception-Code` carries a ClickHouse exception | Replace the rejected payload with safe dead-letter metadata and continue with newer spool files so one poison batch cannot head-of-line block the spool |
 
 Logs and error strings for these outcomes carry only safe metadata (plugin name,
 HTTP status code, reason class, row count, acknowledgement byte length class,

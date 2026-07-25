@@ -638,3 +638,24 @@ fn mongodb_doc_pins_exactly_one_tls_source_contract() {
         "docs/mongodb.md must document the exactly-one-source TLS contract"
     );
 }
+
+/// MongoDB identity uniqueness is BSON string equality on
+/// `"{namespace}:{identity_value}"` — already byte-exact. Issue #2994's MySQL
+/// collation change must not invent Unicode normalization on this path.
+#[test]
+fn mongo_consumer_identity_keys_remain_raw_byte_strings() {
+    let helper = MONGO_STORE_SOURCE
+        .find("fn consumer_identity_doc_id(namespace: &str, value: &str) -> String")
+        .expect("consumer_identity_doc_id helper");
+    let body = &MONGO_STORE_SOURCE[helper..helper + 240];
+    assert!(
+        body.contains("format!(\"{namespace}:{value}\")"),
+        "Mongo identity _id must stay a raw namespace:value concatenation"
+    );
+    assert!(
+        !body.to_ascii_lowercase().contains("nfc")
+            && !body.to_ascii_lowercase().contains("nfd")
+            && !body.to_ascii_lowercase().contains("normali"),
+        "Mongo identity keys must not Unicode-normalize (already byte-exact)"
+    );
+}

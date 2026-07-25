@@ -945,17 +945,59 @@ fn target_is_cross_cluster(target: &UpstreamTarget) -> bool {
 /// Warm-up bias subtracted from `min_known_ewma` for unsampled (late-joiner)
 /// targets during the mixed warm-up phase.
 ///
+/// Used only when comparing among **unwarmed** candidates (bounded
+/// exploration). Warmed targets are never displaced by an unconditional
+/// biased-best preference for an unsampled peer — see
+/// `LATENCY_WARMUP_EXPLORE_PERMILLE`.
+///
 /// **Behavioral note:** any nonzero bias value (including `1`) produces the
-/// same selection outcome because `saturating_sub(N)` for any `N >= 1` makes
-/// the unsampled target strictly less than the minimum warmed EWMA when
-/// `min_known_ewma > 0`, and saturates to `0` (a tie broken by iteration
-/// order) when `min_known_ewma == 0`.
+/// same selection outcome among unwarmed peers because `saturating_sub(N)`
+/// for any `N >= 1` makes the unsampled target strictly less than the
+/// minimum warmed EWMA when `min_known_ewma > 0`, and saturates to `0` (a tie
+/// broken by iteration order) when `min_known_ewma == 0`.
 ///
 /// The constant exists as a named policy anchor: 1 ms (1 000 us) documents
 /// the intended preference gap in human-readable latency units and makes the
 /// warm-up strategy greppable and self-documenting, replacing a bare magic
 /// literal.
+#[allow(dead_code)] // policy-anchor constant; mixed warm-up now uses bounded exploration
 const LATENCY_WARMUP_BIAS_US: u64 = 1_000;
+
+/// Permille (‰) of mixed-warm-up selections that explore sub-threshold
+/// (unwarmed) targets via round-robin among them.
+///
+/// Bounds late-joiner / never-sampled exploration so a persistently failing
+/// unsampled target cannot pin 100% of traffic. Healthy late joiners still
+/// receive a fair share of exploration traffic to establish a baseline.
+const LATENCY_WARMUP_EXPLORE_PERMILLE: u64 = 100; // 10%
+
+/// Select an unwarmed peer slot for a mixed-warm-up ticket.
+///
+/// Uses a golden-ratio scramble of `ticket` so short observation windows
+/// still see ~`LATENCY_WARMUP_EXPLORE_PERMILLE` rate and distribute those
+/// selections across every unwarmed peer. A contiguous
+/// `ticket % 1000 < permille` test fails that contract: the first 200
+/// selections after a zeroed counter would explore 50% of the time, while
+/// deriving the peer slot from `ticket / 1000` would send that whole window to
+/// one late joiner.
+#[inline]
+fn unwarmed_explore_slot(ticket: u64, unwarmed_count: usize) -> Option<usize> {
+    if unwarmed_count == 0 {
+        return None;
+    }
+    let scrambled = golden_ratio_hash(ticket);
+    if (scrambled % 1000) >= LATENCY_WARMUP_EXPLORE_PERMILLE {
+        return None;
+    }
+    Some(((scrambled / 1000) % unwarmed_count as u64) as usize)
+}
+
+/// Synthetic EWMA sample (microseconds) recorded for a failed dispatch
+/// attempt. Counts toward the warm-up threshold and penalizes the target so
+/// a target that fails every request exits warm-up with a poor score instead
+/// of remaining biased-best forever. 1 second is deliberately worse than
+/// typical healthy TTFB while still finite for EWMA math.
+const LATENCY_FAILURE_PENALTY_US: u64 = 1_000_000;
 
 /// Result of a target selection, indicating whether the selection was from
 /// healthy targets or a degraded-mode fallback (all targets were unhealthy).
@@ -1651,6 +1693,15 @@ impl LoadBalancerCache {
         let inner = self.inner.load();
         if let Some(balancer) = inner.balancers.get(upstream_id) {
             balancer.record_latency(target, latency_us);
+        }
+    }
+
+    /// Record a failed dispatch attempt for least-latency warm-up (see
+    /// [`LoadBalancer::record_failed_attempt`]).
+    pub fn record_failed_attempt(&self, upstream_id: &str, target: &UpstreamTarget) {
+        let inner = self.inner.load();
+        if let Some(balancer) = inner.balancers.get(upstream_id) {
+            balancer.record_failed_attempt(target);
         }
     }
 
@@ -2531,6 +2582,16 @@ impl LoadBalancer {
         }
     }
 
+    /// Record a failed dispatch attempt for least-latency warm-up accounting.
+    ///
+    /// Failed attempts (connection errors / 5xx) never previously counted toward
+    /// `latency_sample_count`, so a persistently failing target stayed forever
+    /// in the biased warm-up state. A synthetic penalty sample both exits
+    /// warm-up and keeps the EWMA from looking artificially fast.
+    pub fn record_failed_attempt(&self, target: &UpstreamTarget) {
+        self.record_latency(target, LATENCY_FAILURE_PENALTY_US);
+    }
+
     pub fn record_connection_start(&self, target: &UpstreamTarget) {
         let key = self.find_target_key(target).unwrap_or("");
         if key.is_empty() {
@@ -2669,8 +2730,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                let ejected_at_ms = *entry;
-                passive_ejected.push((i, ejected_at_ms));
+                passive_ejected.push((i, entry.ejected_at_ms));
                 continue;
             }
             bitset.set(i);
@@ -2721,7 +2781,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, *entry));
+                passive_ejected.push((i, entry.ejected_at_ms));
                 continue;
             }
             bitset.set(i);
@@ -2779,7 +2839,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, *entry));
+                passive_ejected.push((i, entry.ejected_at_ms));
                 return;
             }
             bitset.set(i);
@@ -2822,7 +2882,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, *entry));
+                passive_ejected.push((i, entry.ejected_at_ms));
                 continue;
             }
             healthy.push((i, target));
@@ -2873,7 +2933,7 @@ impl LoadBalancer {
             if let Some(ref ps) = h.proxy_passive
                 && let Some(entry) = ps.unhealthy.get(&self.host_port_keys[i])
             {
-                passive_ejected.push((i, *entry));
+                passive_ejected.push((i, entry.ejected_at_ms));
                 continue;
             }
             healthy.push((i, target));
@@ -4962,6 +5022,7 @@ impl LoadBalancer {
 
         let mut warmed_count = 0usize;
         let mut any_has_data = false;
+        let mut unwarmed_count = 0usize;
 
         for i in 0..self.targets.len() {
             if !healthy.contains(i) {
@@ -4975,6 +5036,8 @@ impl LoadBalancer {
                 .unwrap_or(0);
             if samples >= LATENCY_WARMUP_THRESHOLD {
                 warmed_count += 1;
+            } else {
+                unwarmed_count += 1;
             }
             if samples > 0 {
                 any_has_data = true;
@@ -4988,28 +5051,73 @@ impl LoadBalancer {
             return Some(Arc::clone(&self.targets[target_idx]));
         }
 
-        let all_warmed_up = warmed_count == hcount;
+        let all_warmed_up = unwarmed_count == 0;
 
-        // Find minimum EWMA among warmed candidates (for optimistic fallback).
-        let min_known_ewma = if !all_warmed_up {
-            let mut min_val = LATENCY_UNSET;
+        // Mixed warm-up: bound exploration of sub-threshold targets so a
+        // never-sampled / persistently failing peer cannot pin all traffic.
+        // Explore with a fixed permille of selections via RR among unwarmed;
+        // otherwise pick the best warmed EWMA.
+        if !all_warmed_up {
+            let ticket = rr_counter.fetch_add(1, Ordering::Relaxed);
+            if let Some(mut skip) = unwarmed_explore_slot(ticket, unwarmed_count) {
+                // Round-robin among unwarmed healthy targets only.
+                for i in 0..self.targets.len() {
+                    if !healthy.contains(i) {
+                        continue;
+                    }
+                    let samples = self
+                        .latency_sample_count
+                        .get(&self.host_port_keys[i])
+                        .map(|v| v.load(Ordering::Relaxed))
+                        .unwrap_or(0);
+                    if samples >= LATENCY_WARMUP_THRESHOLD {
+                        continue;
+                    }
+                    if skip == 0 {
+                        return Some(Arc::clone(&self.targets[i]));
+                    }
+                    skip -= 1;
+                }
+                // Fall through to warmed selection if unwarmed set raced empty.
+            }
+
+            let mut best_latency = u64::MAX;
+            let mut best_idx = 0;
+            let mut found = false;
             for i in 0..self.targets.len() {
                 if !healthy.contains(i) {
                     continue;
                 }
-                if let Some(v) = self.latency_ewma.get(&self.host_port_keys[i]) {
-                    let val = v.load(Ordering::Relaxed);
-                    if val != LATENCY_UNSET && val < min_val {
-                        min_val = val;
-                    }
+                let key = &self.host_port_keys[i];
+                let samples = self
+                    .latency_sample_count
+                    .get(key)
+                    .map(|v| v.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                if samples < LATENCY_WARMUP_THRESHOLD {
+                    continue;
+                }
+                let latency = self
+                    .latency_ewma
+                    .get(key)
+                    .map(|v| v.load(Ordering::Relaxed))
+                    .unwrap_or(LATENCY_UNSET);
+                if !found || latency < best_latency {
+                    best_latency = latency;
+                    best_idx = i;
+                    found = true;
                 }
             }
-            min_val
-        } else {
-            0 // unused when all warmed up
-        };
+            if found && best_latency != LATENCY_UNSET {
+                return Some(Arc::clone(&self.targets[best_idx]));
+            }
+            // No usable warmed EWMA — fall back to RR across healthy set.
+            let idx = ticket as usize;
+            let target_idx = healthy.nth_set_bit(idx);
+            return Some(Arc::clone(&self.targets[target_idx]));
+        }
 
-        // Select the candidate with the lowest EWMA.
+        // Steady-state: all healthy candidates are warmed — pick lowest EWMA.
         let mut best_latency = u64::MAX;
         let mut best_idx = 0;
         let mut found = false;
@@ -5019,21 +5127,11 @@ impl LoadBalancer {
                 continue;
             }
             let key = &self.host_port_keys[i];
-            let samples = self
-                .latency_sample_count
+            let latency = self
+                .latency_ewma
                 .get(key)
                 .map(|v| v.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            let latency = if samples >= LATENCY_WARMUP_THRESHOLD {
-                self.latency_ewma
-                    .get(key)
-                    .map(|v| v.load(Ordering::Relaxed))
-                    .unwrap_or(LATENCY_UNSET)
-            } else if !all_warmed_up && min_known_ewma != LATENCY_UNSET {
-                min_known_ewma.saturating_sub(LATENCY_WARMUP_BIAS_US)
-            } else {
-                LATENCY_UNSET
-            };
+                .unwrap_or(LATENCY_UNSET);
             if !found || latency < best_latency {
                 best_latency = latency;
                 best_idx = i;
@@ -5129,8 +5227,11 @@ impl LoadBalancer {
     /// **Warm-up phase**: At initial startup, round-robin is used until every
     /// healthy candidate has at least `LATENCY_WARMUP_THRESHOLD` samples.
     ///
-    /// **Late joiners / recovery**: Targets without data are treated as having
-    /// the current minimum EWMA (optimistic assumption).
+    /// **Late joiners / recovery**: Sub-threshold targets receive a bounded
+    /// fraction of selections (see `LATENCY_WARMUP_EXPLORE_PERMILLE`) via
+    /// round-robin among unwarmed peers — never an unconditional preference
+    /// over warmed targets. Failed attempts count toward the warm-up threshold
+    /// with a penalty EWMA sample.
     ///
     /// **Steady-state**: Selects the candidate with the lowest EWMA value.
     ///
@@ -5146,6 +5247,7 @@ impl LoadBalancer {
 
         let mut warmed_count = 0usize;
         let mut any_has_data = false;
+        let mut unwarmed_count = 0usize;
         for (idx, _) in candidates {
             let key = &self.host_port_keys[*idx];
             let samples = self
@@ -5155,6 +5257,8 @@ impl LoadBalancer {
                 .unwrap_or(0);
             if samples >= LATENCY_WARMUP_THRESHOLD {
                 warmed_count += 1;
+            } else {
+                unwarmed_count += 1;
             }
             if samples > 0 {
                 any_has_data = true;
@@ -5166,47 +5270,71 @@ impl LoadBalancer {
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
-        let all_warmed_up = warmed_count == candidates.len();
+        let all_warmed_up = unwarmed_count == 0;
 
-        let min_known_ewma = if !all_warmed_up {
-            candidates
-                .iter()
-                .filter_map(|(idx, _)| {
-                    let key = &self.host_port_keys[*idx];
-                    self.latency_ewma
-                        .get(key)
+        if !all_warmed_up {
+            let ticket = rr_counter.fetch_add(1, Ordering::Relaxed);
+            if let Some(mut skip) = unwarmed_explore_slot(ticket, unwarmed_count) {
+                for candidate in candidates {
+                    let samples = self
+                        .latency_sample_count
+                        .get(&self.host_port_keys[candidate.0])
                         .map(|v| v.load(Ordering::Relaxed))
-                        .filter(|&v| v != LATENCY_UNSET)
-                })
-                .min()
-                .unwrap_or(LATENCY_UNSET)
-        } else {
-            0
-        };
+                        .unwrap_or(0);
+                    if samples >= LATENCY_WARMUP_THRESHOLD {
+                        continue;
+                    }
+                    if skip == 0 {
+                        return Some(Arc::clone(candidate.1));
+                    }
+                    skip -= 1;
+                }
+            }
+
+            let mut best_latency = u64::MAX;
+            let mut best = candidates[0];
+            let mut found = false;
+            for candidate in candidates {
+                let key = &self.host_port_keys[candidate.0];
+                let samples = self
+                    .latency_sample_count
+                    .get(key)
+                    .map(|v| v.load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                if samples < LATENCY_WARMUP_THRESHOLD {
+                    continue;
+                }
+                let latency = self
+                    .latency_ewma
+                    .get(key)
+                    .map(|v| v.load(Ordering::Relaxed))
+                    .unwrap_or(LATENCY_UNSET);
+                if !found || latency < best_latency {
+                    best_latency = latency;
+                    best = *candidate;
+                    found = true;
+                }
+            }
+            if found && best_latency != LATENCY_UNSET {
+                return Some(Arc::clone(best.1));
+            }
+            let idx = ticket as usize;
+            return Some(Arc::clone(candidates[idx % candidates.len()].1));
+        }
 
         let mut best_latency = u64::MAX;
-        let mut best = &candidates[0];
+        let mut best = candidates[0];
 
         for candidate in candidates {
             let key = &self.host_port_keys[candidate.0];
-            let samples = self
-                .latency_sample_count
+            let latency = self
+                .latency_ewma
                 .get(key)
                 .map(|v| v.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            let latency = if samples >= LATENCY_WARMUP_THRESHOLD {
-                self.latency_ewma
-                    .get(key)
-                    .map(|v| v.load(Ordering::Relaxed))
-                    .unwrap_or(LATENCY_UNSET)
-            } else if !all_warmed_up && min_known_ewma != LATENCY_UNSET {
-                min_known_ewma.saturating_sub(LATENCY_WARMUP_BIAS_US)
-            } else {
-                LATENCY_UNSET
-            };
+                .unwrap_or(LATENCY_UNSET);
             if latency < best_latency {
                 best_latency = latency;
-                best = candidate;
+                best = *candidate;
             }
         }
 

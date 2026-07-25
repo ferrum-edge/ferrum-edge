@@ -63,6 +63,12 @@ When `response_body_mode: stream` is configured (the default), the gateway can f
 
 See [Response Body Streaming — Interaction with Response Size Limits](response_body_streaming.md#interaction-with-response-size-limits) for the streaming decision table and adapter constructors.
 
+### Direct HTTP/2 pool preference vs body limits
+
+Ordinary plain-HTTPS traffic prefers the multiplexed direct HTTP/2 pool only when **both** `FERRUM_MAX_REQUEST_BODY_SIZE_BYTES` and `FERRUM_MAX_RESPONSE_BODY_SIZE_BYTES` are `0` (and retries / request-body-buffering plugins are absent). Under the default nonzero body caps the gateway stays on the reqwest path for those ordinary routes — a silent **performance** cliff away from multiplexed H2 (logged at `debug!` only). Set both limits to `0` when you need direct-H2 preference and can accept unlimited body sizes at the gateway layer.
+
+Backend TLS SNI overrides are the exception: they cannot use reqwest, so they dispatch on direct-H2 even with nonzero body limits and enforce 413/502 in-path. Combinations that still cannot dispatch (retry body replay, request-body-buffering plugins, `pool_enable_http2: false`) are rejected at config admission — see [DestinationRule TLS SNI](mesh.md).
+
 ## HTTP/3 (QUIC) Enforcement
 
 The same size-limit knobs apply to HTTP/3, but client-visible outcomes are **not** identical on every path:

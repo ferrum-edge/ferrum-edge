@@ -147,13 +147,22 @@ function textFromContent(content) {
   return parts.join("");
 }
 
+// Assistant events arrive as deltas. Write them verbatim and terminate the
+// line only once the stream ends, otherwise every token lands on its own line.
+let assistantStreamOpen = false;
+
 function emitAssistantText(text) {
   if (!text) {
     return;
   }
   process.stdout.write(text);
-  if (!text.endsWith("\n")) {
+  assistantStreamOpen = !text.endsWith("\n");
+}
+
+function closeAssistantStream() {
+  if (assistantStreamOpen) {
     process.stdout.write("\n");
+    assistantStreamOpen = false;
   }
 }
 
@@ -246,6 +255,8 @@ async function main() {
         process.stderr.write(`[grok-agents] status error: ${streamErrorMessage}\n`);
       }
     }
+
+    closeAssistantStream();
 
     const result = await run.wait();
     const status = result?.status ?? run.status;

@@ -328,6 +328,127 @@ pub(crate) fn client_send_output_drain_needs_another_round_for_test(
     )
 }
 
+/// Regression harness for issue #2959: prove both demux removal sites are
+/// identity-aware without spinning a live DTLS accept loop.
+///
+/// Inserts a generation-2 map entry for a peer, then runs generation-1 cleanup
+/// through `SessionGuard::drop` and the Closed-arm `remove_session` helper.
+/// Returns `Ok(())` only when the generation-2 entry and active counter both
+/// survive, and matching generation-2 cleanup then removes the entry once.
+#[allow(dead_code)] // used through library `_test_support`
+pub(crate) fn dtls_stale_session_removal_preserves_newer_generation_for_test() -> Result<(), String>
+{
+    let peer_addr: SocketAddr = "127.0.0.1:2959"
+        .parse()
+        .map_err(|e| format!("parse peer addr: {e}"))?;
+    let sessions: Arc<DashMap<SocketAddr, DtlsSessionState>> = Arc::new(DashMap::new());
+    let active_sessions = Arc::new(AtomicUsize::new(0));
+    let mirror = Arc::new(AtomicU64::new(0));
+
+    let (gen2_tx, _gen2_rx) = mpsc::channel::<Vec<u8>>(1);
+    let (gen2_shutdown_tx, _gen2_shutdown_rx) = mpsc::channel::<()>(1);
+    sessions.insert(
+        peer_addr,
+        DtlsSessionState {
+            incoming_tx: gen2_tx,
+            shutdown_tx: gen2_shutdown_tx,
+            generation: 2,
+        },
+    );
+    active_sessions.fetch_add(1, Ordering::Relaxed);
+    mirror.fetch_add(1, Ordering::Relaxed);
+
+    // Stale SessionGuard from generation 1 (the bug: remove-by-addr alone).
+    {
+        let _stale_guard = SessionGuard {
+            sessions: sessions.clone(),
+            active_sessions: active_sessions.clone(),
+            active_session_mirror: Some(mirror.clone()),
+            peer_addr,
+            generation: 1,
+        };
+    }
+
+    if !sessions.contains_key(&peer_addr) {
+        return Err("generation-1 SessionGuard drop evicted generation-2 entry".into());
+    }
+    let surviving = sessions
+        .get(&peer_addr)
+        .map(|s| s.generation)
+        .ok_or_else(|| "generation-2 entry missing after stale guard drop".to_string())?;
+    if surviving != 2 {
+        return Err(format!(
+            "expected generation 2 after stale guard drop, found {surviving}"
+        ));
+    }
+    if active_sessions.load(Ordering::Relaxed) != 1 {
+        return Err(format!(
+            "active_sessions unbalanced after stale guard drop: {}",
+            active_sessions.load(Ordering::Relaxed)
+        ));
+    }
+    if mirror.load(Ordering::Relaxed) != 1 {
+        return Err(format!(
+            "active_session_mirror unbalanced after stale guard drop: {}",
+            mirror.load(Ordering::Relaxed)
+        ));
+    }
+
+    // Closed-arm path with a stale generation must also be a no-op.
+    remove_session(
+        &sessions,
+        &active_sessions,
+        Some(mirror.as_ref()),
+        &peer_addr,
+        1,
+    );
+    if !sessions.contains_key(&peer_addr) {
+        return Err("stale Closed-arm remove_session evicted generation-2 entry".into());
+    }
+    if active_sessions.load(Ordering::Relaxed) != 1 || mirror.load(Ordering::Relaxed) != 1 {
+        return Err("counters changed on stale Closed-arm remove_session".into());
+    }
+
+    // Matching generation-2 cleanup must remove exactly once and balance counters.
+    remove_session(
+        &sessions,
+        &active_sessions,
+        Some(mirror.as_ref()),
+        &peer_addr,
+        2,
+    );
+    if sessions.contains_key(&peer_addr) {
+        return Err("matching generation-2 remove_session left the entry in place".into());
+    }
+    if active_sessions.load(Ordering::Relaxed) != 0 {
+        return Err(format!(
+            "active_sessions not cleared after matching remove: {}",
+            active_sessions.load(Ordering::Relaxed)
+        ));
+    }
+    if mirror.load(Ordering::Relaxed) != 0 {
+        return Err(format!(
+            "mirror not cleared after matching remove: {}",
+            mirror.load(Ordering::Relaxed)
+        ));
+    }
+
+    // A second matching remove (e.g. SessionGuard after Closed already won) is
+    // a no-op and must not underflow counters.
+    remove_session(
+        &sessions,
+        &active_sessions,
+        Some(mirror.as_ref()),
+        &peer_addr,
+        2,
+    );
+    if active_sessions.load(Ordering::Relaxed) != 0 || mirror.load(Ordering::Relaxed) != 0 {
+        return Err("duplicate matching remove underflowed counters".into());
+    }
+
+    Ok(())
+}
+
 impl DtlsConnection {
     /// Perform a DTLS client handshake over the given connected socket and return
     /// an established `DtlsConnection`.
@@ -693,6 +814,13 @@ pub struct DtlsServer {
     active_config: ArcSwap<DtlsServerActiveConfig>,
     sessions: Arc<DashMap<SocketAddr, DtlsSessionState>>,
     active_sessions: Arc<AtomicUsize>,
+    /// Monotonic opaque identity assigned to each spawned demux session.
+    ///
+    /// Removals compare this token so a stale driver/`SessionGuard` for peer P
+    /// cannot evict a newer live session inserted at the same address after the
+    /// older channel closed (issue #2959). Not a semantic generation counter for
+    /// operators — just demux map identity.
+    next_session_generation: AtomicU64,
     limits: DtlsServerLimits,
     /// Channel to deliver accepted (post-handshake) connections.
     accept_tx: mpsc::Sender<(DtlsServerConn, SocketAddr)>,
@@ -706,15 +834,30 @@ struct DtlsSessionState {
     incoming_tx: mpsc::Sender<Vec<u8>>,
     /// Signal this session's driver task to shut down.
     shutdown_tx: mpsc::Sender<()>,
+    /// Opaque demux identity for this peer entry (see
+    /// [`DtlsServer::next_session_generation`]). Both removal sites must match
+    /// this token before deleting the map entry.
+    generation: u64,
 }
 
+/// Remove the demux entry for `peer_addr` only when it still belongs to
+/// `generation`.
+///
+/// Counter/mirror decrements happen only when this call actually wins the
+/// removal. A Closed-arm cleanup and a later `SessionGuard::drop` for the same
+/// stale driver therefore cannot double-decrement, and neither can evict a
+/// replacement session that reused the peer address.
 fn remove_session(
     sessions: &DashMap<SocketAddr, DtlsSessionState>,
     active_sessions: &AtomicUsize,
     active_session_mirror: Option<&AtomicU64>,
     peer_addr: &SocketAddr,
+    generation: u64,
 ) {
-    if sessions.remove(peer_addr).is_some() {
+    if sessions
+        .remove_if(peer_addr, |_, session| session.generation == generation)
+        .is_some()
+    {
         active_sessions.fetch_sub(1, Ordering::Relaxed);
         if let Some(mirror) = active_session_mirror {
             mirror.fetch_sub(1, Ordering::Relaxed);
@@ -727,6 +870,8 @@ struct SessionGuard {
     active_sessions: Arc<AtomicUsize>,
     active_session_mirror: Option<Arc<AtomicU64>>,
     peer_addr: SocketAddr,
+    /// Demux identity captured when this driver was spawned.
+    generation: u64,
 }
 
 impl Drop for SessionGuard {
@@ -736,6 +881,7 @@ impl Drop for SessionGuard {
             &self.active_sessions,
             self.active_session_mirror.as_deref(),
             &self.peer_addr,
+            self.generation,
         );
     }
 }
@@ -884,6 +1030,7 @@ impl DtlsServer {
             active_config,
             sessions: Arc::new(DashMap::new()),
             active_sessions: Arc::new(AtomicUsize::new(0)),
+            next_session_generation: AtomicU64::new(1),
             limits,
             accept_tx,
             accept_rx: tokio::sync::Mutex::new(accept_rx),
@@ -991,12 +1138,17 @@ impl DtlsServer {
 
             let data = buf[..len].to_vec();
 
-            // Clone the sender out of the DashMap guard before sending.
-            // The `Ref` from `sessions.get()` holds a read lock on the shard;
-            // holding it while a `SessionGuard::Drop` on the same shard needs
-            // a write lock to call `sessions.remove()` would deadlock.
-            let incoming_tx = self.sessions.get(&peer_addr).map(|s| s.incoming_tx.clone());
-            if let Some(tx) = incoming_tx {
+            // Clone the sender (and demux identity) out of the DashMap guard
+            // before sending. The `Ref` from `sessions.get()` holds a read lock
+            // on the shard; holding it while a `SessionGuard::Drop` on the same
+            // shard needs a write lock to call `sessions.remove_if()` would
+            // deadlock. Capture `generation` with the sender so a Closed cleanup
+            // cannot race-evict a newer session inserted for the same peer.
+            let session = self
+                .sessions
+                .get(&peer_addr)
+                .map(|s| (s.incoming_tx.clone(), s.generation));
+            if let Some((tx, generation)) = session {
                 // Existing session — forward packet to its driver. Never
                 // `.send().await`: one session whose driver has stalled (its
                 // proxy-side consumer stopped draining `app_out`) would fill
@@ -1013,12 +1165,14 @@ impl DtlsServer {
                         );
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
-                        // Driver task exited — remove stale session
+                        // Driver task exited — remove this generation only.
+                        // A replacement may already occupy the peer address.
                         remove_session(
                             &self.sessions,
                             &self.active_sessions,
                             self.limits.active_session_mirror.as_deref(),
                             &peer_addr,
+                            generation,
                         );
                     }
                 }
@@ -1092,6 +1246,7 @@ impl DtlsServer {
         let mut app_out_rx = Some(app_out_rx);
         let (app_in_tx, mut app_in_rx) = mpsc::channel::<Vec<u8>>(256);
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+        let generation = self.next_session_generation.fetch_add(1, Ordering::Relaxed);
         // Terminating DTLS: this is best-effort SNI for the session's identity /
         // logging field only — dimpl runs the real handshake and rejects malformed
         // input itself, so a continuation fragment or no-SNI ClientHello both map
@@ -1108,6 +1263,7 @@ impl DtlsServer {
             DtlsSessionState {
                 incoming_tx: incoming_tx.clone(),
                 shutdown_tx: shutdown_tx.clone(),
+                generation,
             },
         );
 
@@ -1133,6 +1289,7 @@ impl DtlsServer {
                 active_sessions: active_sessions.clone(),
                 active_session_mirror: active_session_mirror.clone(),
                 peer_addr,
+                generation,
             };
 
             let mut dtls = Dtls::new_auto(config, certificate, Instant::now());

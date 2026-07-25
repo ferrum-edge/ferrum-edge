@@ -613,13 +613,12 @@ pub struct UpstreamPortOverride {
     /// per-target effective proxy's `pool_idle_timeout_seconds` (whole
     /// seconds, with sub-second values rejected at translate time).
     ///
-    /// Pool keys intentionally exclude policy fields, so when two proxies
-    /// share the same pool entry but configure different per-port idle
-    /// timeouts the first proxy to materialise the entry wins for that
-    /// shared `reqwest::Client`. Identical to the existing `connect_timeout_ms`
-    /// per-port + cross-proxy sharing tradeoff documented in CLAUDE.md's
-    /// "Policy cross-proxy sharing" note — operators who need strict
-    /// per-proxy isolation fragment via `dns_override`.
+    /// On the reqwest pool this value is part of the client-behavior (`rcfg`)
+    /// pool-key segment, so divergent per-port idle timeouts isolate distinct
+    /// shared clients rather than first-creator-wins leaking. Direct-H2 / gRPC
+    /// pool keys still exclude several builder-only knobs (see those pools'
+    /// first-materializer notes). Request-only connect timeouts remain
+    /// per-request and do not fragment any pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_idle_timeout_ms: Option<u64>,
     /// Per-port HTTP/2 concurrent-streams cap mapped from DestinationRule
@@ -3083,6 +3082,190 @@ pub(crate) fn mesh_transport_retry_conflict_message(
     )
 }
 
+/// Whether a plugin config is known to force request-body buffering for at
+/// least some requests when enabled.
+///
+/// Used by backend-TLS SNI admission: plain HTTPS SNI overrides require the
+/// direct-H2 pool, which cannot dispatch when request bodies are pre-buffered.
+/// Config-dependent plugins are screened from their JSON config; unknown /
+/// custom plugins are left to the runtime fail-closed 502 path.
+fn plugin_config_forces_request_body_buffering(pc: &PluginConfig) -> bool {
+    if !pc.enabled {
+        return false;
+    }
+    match pc.plugin_name.as_str() {
+        "grpc_web"
+        | "ai_prompt_compressor"
+        | "ai_stream_router"
+        | "ai_federation"
+        | "ai_transcript_audit"
+        | "ai_tool_governor"
+        | "ai_rate_limiter"
+        | "openapi_validator"
+        | "opa"
+        | "mcp_gateway" => true,
+        "request_transformer" => {
+            pc.config
+                .get("body")
+                .is_some_and(|body| !body.is_null() && body != &serde_json::Value::Null)
+                || pc
+                    .config
+                    .get("body_rules")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|rules| !rules.is_empty())
+                || pc
+                    .config
+                    .get("request")
+                    .and_then(|v| v.get("body"))
+                    .is_some_and(|body| !body.is_null())
+        }
+        "compression" => pc
+            .config
+            .get("decompress_request")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "waf" => pc
+            .config
+            .get("request_body_inspection")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        "body_validator" => {
+            // Any non-empty request schema / validation config forces buffering.
+            pc.config.get("request").is_some()
+                || pc.config.get("json_schema").is_some()
+                || pc.config.get("xml_schema").is_some()
+                || pc
+                    .config
+                    .get("content_types")
+                    .and_then(|v| v.as_object())
+                    .is_some_and(|m| !m.is_empty())
+        }
+        "ai_request_guard" | "ai_prompt_shield" => {
+            // These buffer when body transforms are configured; treat any
+            // non-empty config beyond enable flags as potentially buffering.
+            pc.config
+                .as_object()
+                .is_some_and(|obj| obj.keys().any(|k| k != "enabled"))
+        }
+        _ => false,
+    }
+}
+
+/// Source description for a backend TLS SNI override that forces direct-H2.
+fn proxy_plain_https_sni_sources<'a>(
+    proxy: &'a Proxy,
+    upstream: Option<&'a Upstream>,
+) -> Vec<(&'a str, String)> {
+    let mut sources = Vec::new();
+    if let Some(sni) = proxy.resolved_tls.sni.as_deref() {
+        sources.push((sni, "resolved backend TLS SNI".to_string()));
+    }
+    if let Some(overrides) = proxy.dispatch_port_overrides.as_ref() {
+        for (port, ovr) in overrides {
+            if let Some(sni) = ovr.tls.as_ref().and_then(|tls| tls.sni.as_deref()) {
+                sources.push((
+                    sni,
+                    format!("DestinationRule per-port TLS SNI on port {port}"),
+                ));
+            }
+        }
+    } else if let Some(upstream) = upstream {
+        // Admin/single-resource paths may not have projected
+        // `dispatch_port_overrides` yet; still catch Upstream.port_overrides.
+        for (port, ovr) in &upstream.port_overrides {
+            if let Some(sni) = ovr.tls.as_ref().and_then(|tls| tls.sni.as_deref()) {
+                sources.push((
+                    sni,
+                    format!("DestinationRule per-port TLS SNI on port {port}"),
+                ));
+            }
+        }
+        if let Some(sni) = upstream.backend_tls_sni.as_deref()
+            && proxy.resolved_tls.sni.is_none()
+        {
+            sources.push((sni, "upstream backend_tls_sni".to_string()));
+        }
+    }
+    sources
+}
+
+/// Reject plain-HTTPS proxies whose backend TLS SNI override cannot dispatch
+/// on the direct-H2 pool (retry body replay, request-body buffering plugins,
+/// or `pool_enable_http2: false`). Covers proxy-level and DestinationRule
+/// per-port TLS overlays so `validate` catches guaranteed total outages.
+pub(crate) fn backend_tls_sni_direct_h2_conflict_messages(
+    proxy: &Proxy,
+    upstream: Option<&Upstream>,
+    plugin_configs: &[PluginConfig],
+) -> Vec<String> {
+    // gRPC / native H3 own the TLS handshake and support SNI on their pools;
+    // the reqwest incompatibility is specific to plain HTTPS (HttpsPool).
+    if proxy.dispatch_kind != DispatchKind::HttpsPool {
+        return Vec::new();
+    }
+    let sources = proxy_plain_https_sni_sources(proxy, upstream);
+    if sources.is_empty() {
+        return Vec::new();
+    }
+    let sni_desc = sources
+        .iter()
+        .map(|(sni, source)| format!("'{sni}' ({source})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut errors = Vec::new();
+    if proxy.pool_enable_http2 == Some(false) {
+        errors.push(format!(
+            "Proxy '{}' sets backend TLS SNI override ({sni_desc}) but pool_enable_http2 is false; \
+             plain HTTPS SNI overrides require the direct HTTP/2 backend pool",
+            proxy.id
+        ));
+    }
+    if proxy_retry_is_effective(proxy.retry.as_ref(), proxy.allowed_methods.as_deref()) {
+        errors.push(format!(
+            "Proxy '{}' enables retry with backend TLS SNI override ({sni_desc}); \
+             request-body replay for retries is incompatible with direct HTTP/2 SNI dispatch",
+            proxy.id
+        ));
+    }
+
+    // Effective plugins for this proxy: associations + globals (unless a
+    // local instance shadows that plugin name — mirror PluginCache merging
+    // for the buffering screen only).
+    let mut local_names: HashSet<&str> = HashSet::new();
+    for assoc in &proxy.plugins {
+        if let Some(pc) = plugin_configs
+            .iter()
+            .find(|pc| pc.id == assoc.plugin_config_id)
+        {
+            local_names.insert(pc.plugin_name.as_str());
+            if plugin_config_forces_request_body_buffering(pc) {
+                errors.push(format!(
+                    "Proxy '{}' attaches request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
+                     request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
+                    proxy.id, pc.id
+                ));
+            }
+        }
+    }
+    for pc in plugin_configs {
+        if pc.scope != PluginScope::Global {
+            continue;
+        }
+        if local_names.contains(pc.plugin_name.as_str()) {
+            continue;
+        }
+        if plugin_config_forces_request_body_buffering(pc) {
+            errors.push(format!(
+                "Proxy '{}' inherits global request-body-buffering plugin '{}' with backend TLS SNI override ({sni_desc}); \
+                 request-body buffering is incompatible with direct HTTP/2 SNI dispatch",
+                proxy.id, pc.id
+            ));
+        }
+    }
+    errors
+}
+
 impl GatewayConfig {
     /// Validate that all proxy (host, listen_path) combinations are unique.
     ///
@@ -4066,6 +4249,11 @@ impl GatewayConfig {
     /// dispatch path forces those transports off whenever retry is effective and
     /// then fails closed with a 502 (see issue #1669), so the combination is a
     /// silent reachability gap that we reject at admission instead.
+    ///
+    /// Plain-HTTPS proxies with a backend TLS SNI override are likewise screened
+    /// for combinations that cannot use the direct-H2 pool (effective retry,
+    /// request-body-buffering plugins, `pool_enable_http2: false`), including
+    /// DestinationRule per-port TLS overlays (issue #2954).
     pub fn validate_upstream_references(&self) -> Result<(), Vec<String>> {
         let upstreams_by_id: HashMap<&str, &Upstream> =
             self.upstreams.iter().map(|u| (u.id.as_str(), u)).collect();
@@ -4139,6 +4327,20 @@ impl GatewayConfig {
                     ));
                 }
             }
+
+            // Backend TLS SNI on plain HTTPS requires direct-H2; reject
+            // combinations that cannot dispatch (retry / body-buffering /
+            // pool_enable_http2=false), including DestinationRule per-port
+            // TLS overlays projected onto this proxy.
+            let upstream = proxy
+                .upstream_id
+                .as_deref()
+                .and_then(|uid| upstreams_by_id.get(uid).copied());
+            errors.extend(backend_tls_sni_direct_h2_conflict_messages(
+                proxy,
+                upstream,
+                &self.plugin_configs,
+            ));
         }
 
         if errors.is_empty() {

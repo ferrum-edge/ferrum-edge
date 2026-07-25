@@ -12,7 +12,7 @@
 //! Runs at priority `AI_TRANSCRIPT_AUDIT` (2740): after authentication and
 //! authorization, but before `request_deduplication` (2750) and reject-capable
 //! AI guardrails, so cached replays and blocked prompts can still be audited.
-//! It also remains before `ai_semantic_cache` (2980) / `ai_federation` (4060).
+//! It also remains before `ai_semantic_cache` (2996) / `ai_federation` (4060).
 //! The audit candidate is staged in `before_proxy` over the
 //! prebuffered request body (so terminate-and-respond plugins downstream cannot
 //! consume the transaction unaudited, and so the proxy's response buffering /

@@ -6,33 +6,214 @@
 //! complete, [`shutdown`] closes external task admission, waits for already
 //! admitted terminal work (including internally spawned mirror work), then
 //! closes and awaits every registered queue worker under one absolute budget.
+//!
+//! # Generations
+//!
+//! A drained lifecycle is terminal: its task and worker admission stay closed
+//! and its bounded drain report stays cached, so late producers on a shutting
+//! down process cannot re-open delivery work behind the drain. In-process
+//! callers (embedders, harnesses, supervisors) that start, stop, and start the
+//! gateway again in one process therefore need a *fresh* lifecycle rather than
+//! a reset of the drained one.
+//!
+//! [`DeliverySlot`] owns that state machine. It holds the current generation in
+//! an [`ArcSwap`] and hands producers a snapshot of it:
+//!
+//! - [`DeliverySlot::begin_cycle`] reuses the current generation while it is
+//!   still open, and installs a fresh generation when the current one is
+//!   draining or closed. The install is a compare-and-swap against the exact
+//!   observed generation, so two concurrent serving cycles cannot both replace
+//!   the same generation and lose one of them.
+//! - Producers (`spawn_*`, `register_worker`) always snapshot the *current*
+//!   generation, so nothing is admitted into an old draining generation once a
+//!   new one is installed.
+//! - [`DeliverySlot::shutdown`] captures its generation up front and never
+//!   re-reads the slot, so a stale generation's cleanup can never close a newer
+//!   generation. Each generation keeps its own bounded queues, worker set,
+//!   counters, and cached drain report.
+//!
+//! Producers are process-global by construction (request paths carry no
+//! lifecycle handle), so concurrently *overlapping* in-process serving cycles
+//! still share one generation and the first drain closes it for both. The
+//! supported in-process model is sequential: start, drain, start again.
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use tokio::sync::{Notify, watch};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
-use tracing::warn;
+use tracing::{debug, warn};
 
-static LIFECYCLE: OnceLock<Arc<DeliveryLifecycle>> = OnceLock::new();
+/// One delivery generation is open for new tasks and workers.
+const GENERATION_OPEN: u8 = 0;
+/// Shutdown has started on this generation; admission is closing down.
+const GENERATION_DRAINING: u8 = 1;
+/// Shutdown finished; admission is permanently closed and the report cached.
+const GENERATION_CLOSED: u8 = 2;
 
-fn global() -> &'static Arc<DeliveryLifecycle> {
-    LIFECYCLE.get_or_init(|| Arc::new(DeliveryLifecycle::new()))
+static LIFECYCLE: OnceLock<DeliverySlot> = OnceLock::new();
+
+fn global() -> &'static DeliverySlot {
+    LIFECYCLE.get_or_init(|| DeliverySlot::new(0))
 }
 
 /// Configure the hot task registry before serving-mode plugin activation.
 ///
+/// Called once per process from `main` before mode dispatch. First use creates
+/// the open generation with the configured sharding. If an earlier non-serving
+/// caller already touched the registry, the override is recorded for the next
+/// generation without replacing an open lifecycle that may own live workers.
+///
 /// Tests and non-serving callers that reach the registry first use the same
 /// auto-sized fallback as other concurrent runtime maps.
 pub fn initialize(pool_shard_override: usize) {
-    let _ = LIFECYCLE.set(Arc::new(DeliveryLifecycle::with_pool_shard_amount(
-        pool_shard_override,
-    )));
+    LIFECYCLE
+        .get_or_init(|| DeliverySlot::new(pool_shard_override))
+        .initialize(pool_shard_override);
+}
+
+/// Open the delivery generation for a serving cycle.
+///
+/// Serving modes call this before plugin activation registers queue workers.
+/// It reuses the currently open generation and installs a fresh one when the
+/// previous cycle already drained, which is what makes an in-process
+/// start -> shutdown -> start sequence deliver again.
+pub fn begin_serving_cycle() -> u64 {
+    let generation = global().begin_cycle();
+    debug!(
+        generation,
+        "observability delivery lifecycle open for this serving cycle"
+    );
+    generation
+}
+
+/// Process-global holder for the current delivery generation.
+///
+/// Tests construct their own slot so lifecycle coverage never closes the
+/// process-global registry out from under concurrently running suites.
+pub struct DeliverySlot {
+    current: ArcSwap<DeliveryLifecycle>,
+    pool_shard_override: AtomicUsize,
+    next_generation: AtomicU64,
+}
+
+impl DeliverySlot {
+    pub fn new(pool_shard_override: usize) -> Self {
+        Self {
+            current: ArcSwap::from_pointee(DeliveryLifecycle::with_pool_shard_amount(
+                pool_shard_override,
+                1,
+            )),
+            pool_shard_override: AtomicUsize::new(pool_shard_override),
+            next_generation: AtomicU64::new(2),
+        }
+    }
+
+    /// Record the shard override and make sure an open generation is current.
+    ///
+    /// A generation that is already open is never replaced, so a caller that
+    /// re-initializes mid-serve cannot orphan queue workers that are still
+    /// registered against it. The new override applies to the next generation.
+    /// A drained generation is replaced immediately, which is what lets a
+    /// second in-process serve deliver again.
+    pub fn initialize(&self, pool_shard_override: usize) {
+        self.pool_shard_override
+            .store(pool_shard_override, Ordering::Release);
+        // Reuse the same state-aware CAS loop as serving-cycle admission.
+        // Re-checking after every failed CAS is essential: another caller may
+        // have installed an open generation after we first observed a drained
+        // one, and replacing that generation would orphan its live workers.
+        self.begin_cycle();
+    }
+
+    /// Swap a fresh generation in for `observed`, or fail if it already moved.
+    fn try_install_generation(&self, observed: &Arc<DeliveryLifecycle>) -> Option<u64> {
+        let next = self.new_generation();
+        let generation = next.generation;
+        let previous = self.current.compare_and_swap(observed, next);
+        Arc::ptr_eq(observed, &*previous).then_some(generation)
+    }
+
+    fn new_generation(&self) -> Arc<DeliveryLifecycle> {
+        Arc::new(DeliveryLifecycle::with_pool_shard_amount(
+            self.pool_shard_override.load(Ordering::Acquire),
+            self.next_generation.fetch_add(1, Ordering::Relaxed),
+        ))
+    }
+
+    /// Reuse the open generation, or install a fresh one after a drain.
+    ///
+    /// Returns the generation id serving work will be admitted into.
+    pub fn begin_cycle(&self) -> u64 {
+        loop {
+            let current = self.current.load_full();
+            if current.state() == GENERATION_OPEN {
+                return current.generation;
+            }
+            if let Some(generation) = self.try_install_generation(&current) {
+                return generation;
+            }
+        }
+    }
+
+    /// Generation id currently admitting delivery work.
+    #[allow(dead_code)] // Used by external lifecycle tests; the bin reads the field directly.
+    pub fn current_generation(&self) -> u64 {
+        self.current.load().generation
+    }
+
+    fn snapshot(&self) -> Arc<DeliveryLifecycle> {
+        self.current.load_full()
+    }
+
+    /// Register request/body-originated terminal cleanup.
+    pub fn spawn_terminal<F>(&self, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.snapshot()
+            .spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, future)
+    }
+
+    /// Register mirror work spawned by an already admitted delivery task.
+    pub fn spawn_mirror<F>(&self, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.snapshot()
+            .spawn(TaskAdmission::Internal, DeliveryTaskKind::Mirror, future)
+    }
+
+    /// Register deadline-detached buffered response cleanup.
+    pub fn spawn_deadline_cleanup<F>(&self, future: F) -> bool
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.snapshot().spawn(
+            TaskAdmission::External,
+            DeliveryTaskKind::DeadlineCleanup,
+            future,
+        )
+    }
+
+    pub fn register_worker(&self, worker: Arc<DeliveryWorkerControl>) -> u64 {
+        self.snapshot().register_worker(worker)
+    }
+
+    /// Drain the generation that is current when the drain starts.
+    ///
+    /// The generation is captured before the first await, so a later cycle
+    /// installed while this drain runs is never closed by it.
+    pub async fn shutdown(&self, timeout: Duration) -> DeliveryDrainReport {
+        let lifecycle = self.snapshot();
+        lifecycle.shutdown(timeout).await
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -98,6 +279,8 @@ impl DeliveryCounters {
 }
 
 struct DeliveryLifecycle {
+    generation: u64,
+    state: AtomicU8,
     accepting_external_tasks: AtomicBool,
     accepting_internal_tasks: AtomicBool,
     accepting_workers: AtomicBool,
@@ -114,12 +297,19 @@ struct DeliveryLifecycle {
 }
 
 impl DeliveryLifecycle {
+    #[cfg(test)]
     fn new() -> Self {
-        Self::with_pool_shard_amount(0)
+        Self::with_pool_shard_amount(0, 1)
     }
 
-    fn with_pool_shard_amount(pool_shard_override: usize) -> Self {
+    fn state(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+
+    fn with_pool_shard_amount(pool_shard_override: usize, generation: u64) -> Self {
         Self {
+            generation,
+            state: AtomicU8::new(GENERATION_OPEN),
             accepting_external_tasks: AtomicBool::new(true),
             accepting_internal_tasks: AtomicBool::new(true),
             accepting_workers: AtomicBool::new(true),
@@ -333,6 +523,10 @@ impl DeliveryLifecycle {
             return report;
         }
 
+        // Publish the draining state before closing admission so a serving
+        // cycle that starts during this drain installs a fresh generation
+        // instead of enqueueing into the one being closed here.
+        self.state.store(GENERATION_DRAINING, Ordering::Release);
         self.accepting_external_tasks
             .store(false, Ordering::Release);
         let deadline = Instant::now() + timeout;
@@ -360,6 +554,7 @@ impl DeliveryLifecycle {
             );
         }
         *cached_report = Some(report);
+        self.state.store(GENERATION_CLOSED, Ordering::Release);
         report
     }
 
@@ -641,7 +836,7 @@ pub fn spawn_terminal<F>(future: F) -> bool
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    global().spawn(TaskAdmission::External, DeliveryTaskKind::Terminal, future)
+    global().spawn_terminal(future)
 }
 
 /// Register mirror work spawned by an already admitted delivery task.
@@ -653,7 +848,7 @@ pub fn spawn_mirror<F>(future: F) -> bool
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    global().spawn(TaskAdmission::Internal, DeliveryTaskKind::Mirror, future)
+    global().spawn_mirror(future)
 }
 
 /// Register deadline-detached buffered response cleanup.
@@ -661,11 +856,7 @@ pub fn spawn_deadline_cleanup<F>(future: F) -> bool
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    global().spawn(
-        TaskAdmission::External,
-        DeliveryTaskKind::DeadlineCleanup,
-        future,
-    )
+    global().spawn_deadline_cleanup(future)
 }
 
 pub fn register_worker(worker: Arc<DeliveryWorkerControl>) -> u64 {
@@ -677,7 +868,8 @@ pub async fn shutdown(timeout: Duration) -> DeliveryDrainReport {
 }
 
 pub fn render_prometheus() -> String {
-    let lifecycle = global();
+    let lifecycle = global().snapshot();
+    let generation = lifecycle.generation;
     let report = lifecycle.report(true, true);
     let active_tasks = lifecycle.tasks.len();
     let active_workers = match lifecycle.workers.lock() {
@@ -692,7 +884,10 @@ pub fn render_prometheus() -> String {
             .count(),
     };
     format!(
-        "# HELP ferrum_observability_delivery_active_tasks Deferred observability tasks currently owned by the shutdown lifecycle.\n\
+        "# HELP ferrum_observability_delivery_generation Current delivery lifecycle generation; increments when a serving cycle reopens delivery after a drain.\n\
+         # TYPE ferrum_observability_delivery_generation gauge\n\
+         ferrum_observability_delivery_generation {generation}\n\
+         # HELP ferrum_observability_delivery_active_tasks Deferred observability tasks currently owned by the shutdown lifecycle.\n\
          # TYPE ferrum_observability_delivery_active_tasks gauge\n\
          ferrum_observability_delivery_active_tasks {active_tasks}\n\
          # HELP ferrum_observability_delivery_active_workers Queue workers currently owned by the shutdown lifecycle.\n\

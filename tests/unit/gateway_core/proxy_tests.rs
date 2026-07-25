@@ -3147,6 +3147,20 @@ fn test_direct_http2_pool_dispatch_disabled_by_body_limits() {
 }
 
 #[test]
+fn test_direct_http2_sni_uses_body_compat_gate_not_body_limit_gate() {
+    // Issue #2954: SNI cannot fall back to reqwest, so nonzero body limits
+    // must not disqualify direct-H2 when retries/buffering are absent.
+    // Callers use can_use_direct_http2_pool for the SNI path.
+    assert!(can_use_direct_http2_pool(true, false, false));
+    assert!(!can_use_direct_http2_pool(true, true, false));
+    assert!(!can_use_direct_http2_pool(true, false, true));
+    // Ordinary preference still requires both body limits at 0.
+    assert!(!can_dispatch_direct_http2_pool(
+        true, false, false, 10_485_760, 10_485_760
+    ));
+}
+
+#[test]
 fn test_request_may_have_body_uses_method_and_body_headers() {
     let no_headers = HashMap::new();
     for method in ["GET", "HEAD", "OPTIONS"] {

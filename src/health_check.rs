@@ -108,14 +108,68 @@ impl TargetHealth {
     }
 }
 
+/// Passive-ejection record stored per `(proxy_id, host:port)`.
+///
+/// Captures the **effective** recovery deadline from the per-port / subset /
+/// upstream policy that caused the ejection, so automatic recovery honors that
+/// cooldown even across config reloads and never cross-applies another proxy's
+/// timer to this entry.
+#[derive(Debug, Clone)]
+pub struct PassiveEjection {
+    /// Epoch ms when the target was marked unhealthy (used by max-ejection
+    /// readmit ordering and admin metrics).
+    pub ejected_at_ms: u64,
+    /// Epoch ms when the automatic recovery timer may clear this entry.
+    /// Equal to `ejected_at_ms` when `auto_recover` is false (unused).
+    pub recover_at_ms: u64,
+    /// Whether the automatic recovery scanner should clear this entry once
+    /// `recover_at_ms` is reached. `false` when the ejecting policy had
+    /// `healthy_after_seconds == 0` (timer recovery disabled; success-based
+    /// recovery still applies).
+    pub auto_recover: bool,
+    /// Upstream that owned the dispatch when this target was ejected — used to
+    /// reset least-latency warm-up state on timer/success recovery without a
+    /// global host:port scan across unrelated balancers.
+    pub upstream_id: String,
+    /// Target host at ejection time (for least-latency reset on timer recovery).
+    pub host: String,
+    /// Target port at ejection time (for least-latency reset on timer recovery).
+    pub port: u16,
+}
+
+impl PassiveEjection {
+    /// Build an ejection record from the effective passive policy that caused it.
+    pub fn from_policy(
+        upstream_id: &str,
+        target: &UpstreamTarget,
+        healthy_after_seconds: u64,
+        now_ms: u64,
+    ) -> Self {
+        let auto_recover = healthy_after_seconds > 0;
+        let recover_at_ms = if auto_recover {
+            now_ms.saturating_add(healthy_after_seconds.saturating_mul(1000))
+        } else {
+            now_ms
+        };
+        Self {
+            ejected_at_ms: now_ms,
+            recover_at_ms,
+            auto_recover,
+            upstream_id: upstream_id.to_owned(),
+            host: target.host.clone(),
+            port: target.port,
+        }
+    }
+}
+
 /// Per-proxy passive health state for a set of targets.
 ///
 /// Wraps `unhealthy` and `states` DashMaps keyed by `host:port`. One instance
 /// exists per proxy that has passive health checks configured, stored in the
 /// outer `DashMap<proxy_id, Arc<ProxyHealthState>>`.
 pub struct ProxyHealthState {
-    /// host:port → epoch_ms when marked unhealthy.
-    pub unhealthy: DashMap<String, u64>,
+    /// host:port → ejection record (deadline + owning upstream).
+    pub unhealthy: DashMap<String, PassiveEjection>,
     /// host:port → failure/success tracking state.
     states: DashMap<String, Arc<TargetHealth>>,
 }
@@ -170,6 +224,15 @@ pub struct HealthChecker {
     /// at startup, config reload, and drop — never on the proxy hot path,
     /// so the lock is uncontested.
     active_check_handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Monotonic generation for the gateway-scoped passive recovery scanner.
+    ///
+    /// Bumped on every [`Self::start_with_shutdown`] /
+    /// [`Self::restart_with_shutdown`]. Modes often
+    /// [`Self::take_active_check_handles`] at startup, so a later reload cannot
+    /// abort the previously taken scanner JoinHandle — the generation fence
+    /// makes that stale scanner exit on its next tick instead of continuing
+    /// alongside a replacement (or after passive recovery has been disabled).
+    passive_recovery_generation: Arc<AtomicU64>,
     /// Optional reference to the load balancer cache for recording active
     /// probe latencies (used by least-latency algorithm). Set via
     /// `set_load_balancer_cache()` after construction.
@@ -219,6 +282,7 @@ impl HealthChecker {
             passive_health: Arc::new(DashMap::new()),
             default_http_client: Arc::new(client),
             active_check_handles: Mutex::new(Vec::new()),
+            passive_recovery_generation: Arc::new(AtomicU64::new(0)),
             lb_cache: None,
             pool_config: pool_config.clone(),
             dns_cache: Some(dns_cache),
@@ -265,6 +329,7 @@ impl HealthChecker {
             passive_health: Arc::new(DashMap::new()),
             default_http_client: Arc::new(client),
             active_check_handles: Mutex::new(Vec::new()),
+            passive_recovery_generation: Arc::new(AtomicU64::new(0)),
             lb_cache: None,
             pool_config: pool_config.clone(),
             dns_cache: None,
@@ -347,6 +412,13 @@ impl HealthChecker {
             handle.abort();
         }
 
+        // Fence any previously taken scanners that abort() cannot reach
+        // (modes drain JoinHandles at startup via take_active_check_handles).
+        let recovery_generation = self
+            .passive_recovery_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+
         let mut new_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         for upstream in &config.upstreams {
             if let Some(hc_config) = &upstream.health_checks {
@@ -368,20 +440,24 @@ impl HealthChecker {
                         new_handles.push(handle);
                     }
                 }
-
-                // Start passive recovery timer if passive health checks are
-                // configured with a non-zero healthy_after_seconds.
-                if let Some(passive) = &hc_config.passive
-                    && passive.healthy_after_seconds > 0
-                {
-                    let handle = self.start_passive_recovery_timer(
-                        &upstream.targets,
-                        passive.healthy_after_seconds,
-                        shutdown_rx.clone(),
-                    );
-                    new_handles.push(handle);
-                }
             }
+        }
+
+        // One gateway-scoped passive recovery scanner recovers each ejection
+        // from its own stored deadline. Per-upstream timers keyed on static
+        // host:port sets cannot honor per-port/subset-only policies, SD-only
+        // targets, or independent cooldowns for proxies sharing an endpoint.
+        let pending_passive_recovery = self.passive_health.iter().any(|proxy| {
+            proxy
+                .value()
+                .unhealthy
+                .iter()
+                .any(|entry| entry.value().auto_recover)
+        });
+        if config_needs_passive_recovery(config) || pending_passive_recovery {
+            new_handles.push(
+                self.start_passive_recovery_scanner(shutdown_rx.clone(), recovery_generation),
+            );
         }
 
         match self.active_check_handles.lock() {
@@ -459,9 +535,14 @@ impl HealthChecker {
     /// `proxy_id → ProxyHealthState → host:port`. This ensures proxy A's
     /// failures cannot affect proxy B's health view, even when both proxies
     /// share the same upstream.
+    ///
+    /// `upstream_id` is recorded on new ejections so automatic / success-based
+    /// recovery can reset least-latency state for the owning balancer without
+    /// scanning unrelated proxies by host:port.
     pub fn report_response(
         &self,
         proxy_id: &str,
+        upstream_id: &str,
         target: &UpstreamTarget,
         status_code: u16,
         connection_error: bool,
@@ -540,7 +621,17 @@ impl HealthChecker {
                         buf.as_str(), proxy_id, failures_in_window, config.unhealthy_window_seconds
                     );
                     // Cold path: threshold breach — allocate key for insert.
-                    proxy_state.unhealthy.insert(buf.clone(), now_epoch_ms());
+                    // Capture the effective policy's recovery deadline on the
+                    // entry itself so reloads / other proxies cannot change it.
+                    proxy_state.unhealthy.insert(
+                        buf.clone(),
+                        PassiveEjection::from_policy(
+                            upstream_id,
+                            target,
+                            config.healthy_after_seconds,
+                            now_epoch_ms(),
+                        ),
+                    );
                 }
             } else {
                 let failures = state.consecutive_failures.load(Ordering::Relaxed);
@@ -556,8 +647,13 @@ impl HealthChecker {
                             "Passive health check: marking target {} as healthy again for proxy {}",
                             buf.as_str(), proxy_id
                         );
-                        proxy_state.unhealthy.remove(buf.as_str());
-                        state.recent_failures.clear();
+                        if let Some((_, ejection)) = proxy_state.unhealthy.remove(buf.as_str()) {
+                            state.recent_failures.clear();
+                            self.reset_latency_after_passive_recovery(
+                                &ejection.upstream_id,
+                                target,
+                            );
+                        }
                     }
                 }
             }
@@ -644,9 +740,10 @@ impl HealthChecker {
     /// Return the number of currently-spawned probe / passive-recovery tasks.
     ///
     /// This counts both active probe tasks (one per upstream target with an
-    /// `active` health check configured) and passive recovery timers (one
-    /// per upstream with a non-zero `healthy_after_seconds`). Intended for
-    /// tests asserting that [`Self::start_with_shutdown`] /
+    /// `active` health check configured) and the optional gateway-scoped
+    /// passive recovery scanner (at most one, when any effective passive
+    /// policy has a non-zero `healthy_after_seconds`). Intended for tests
+    /// asserting that [`Self::start_with_shutdown`] /
     /// [`Self::restart_with_shutdown`] correctly aborts old handles and
     /// spawns new ones on config reload. The runtime crate itself doesn't
     /// call it (the gateway uses operator metrics like `active_unhealthy_targets`
@@ -660,24 +757,54 @@ impl HealthChecker {
         }
     }
 
-    /// Start a background timer that automatically restores passively-marked
-    /// unhealthy targets after `healthy_after_seconds`.
-    fn start_passive_recovery_timer(
+    /// Run one passive-recovery pass: clear every auto-recoverable ejection
+    /// whose stored deadline has elapsed, scoped to that proxy entry only.
+    ///
+    /// Deterministic external unit tests backdate `recover_at_ms` and call this
+    /// without sleeping the background scanner. The scanner itself invokes
+    /// [`recover_due_passive_ejections_inner`] on cloned `Arc`s because the
+    /// spawned task cannot hold `&self`. The binary target still treats unused
+    /// `pub` methods as dead code, hence the narrow allow (same pattern as
+    /// [`Self::active_task_count`]).
+    #[doc(hidden)]
+    #[allow(dead_code)]
+    pub fn recover_due_passive_ejections(&self) {
+        recover_due_passive_ejections_inner(&self.passive_health, self.lb_cache.as_ref());
+    }
+
+    fn reset_latency_after_passive_recovery(&self, upstream_id: &str, target: &UpstreamTarget) {
+        reset_latency_after_passive_recovery_inner(self.lb_cache.as_ref(), upstream_id, target);
+    }
+
+    /// Start a background scanner that restores passively-ejected targets
+    /// once each entry's stored recovery deadline elapses.
+    fn start_passive_recovery_scanner(
         &self,
-        targets: &[UpstreamTarget],
-        healthy_after_seconds: u64,
         shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+        generation: u64,
     ) -> tokio::task::JoinHandle<()> {
         let passive_health = self.passive_health.clone();
-        let hp_keys: std::collections::HashSet<String> =
-            targets.iter().map(target_host_port_key).collect();
-        let check_interval = Duration::from_secs(std::cmp::max(healthy_after_seconds / 4, 1));
-        let recovery_ms = healthy_after_seconds * 1000;
+        let lb_cache = self.lb_cache.clone();
+        let recovery_generation = Arc::clone(&self.passive_recovery_generation);
+        // Fixed 1s tick: per-entry deadlines already encode the effective
+        // healthy_after_seconds, so the scanner does not need a per-upstream
+        // interval and must not outlive reload/shutdown ownership.
+        let check_interval = Duration::from_secs(1);
 
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(check_interval);
+            // Skip the immediate first tick so a brand-new ejection is not
+            // scanned before its deadline can possibly be due.
+            timer.tick().await;
 
             loop {
+                if recovery_generation.load(Ordering::Acquire) != generation {
+                    info!(
+                        "Passive recovery scanner exiting after reload generation fence (was {generation})"
+                    );
+                    return;
+                }
+
                 if let Some(ref rx) = shutdown_rx {
                     tokio::select! {
                         _ = timer.tick() => {}
@@ -690,54 +817,14 @@ impl HealthChecker {
                     timer.tick().await;
                 }
 
-                // Fast path: skip the scan when no proxy has any unhealthy
-                // targets.  DashMap::is_empty() is O(shards) — effectively free
-                // compared to iterating every proxy × every unhealthy entry.
-                let any_unhealthy = passive_health
-                    .iter()
-                    .any(|entry| !entry.value().unhealthy.is_empty());
-                if !any_unhealthy {
-                    continue;
+                if recovery_generation.load(Ordering::Acquire) != generation {
+                    info!(
+                        "Passive recovery scanner exiting after reload generation fence (was {generation})"
+                    );
+                    return;
                 }
 
-                let now = now_epoch_ms();
-
-                // Read-scan (read locks only) to collect expired keys, then
-                // remove each one individually.  This avoids retain() which
-                // takes shard WRITE locks across the entire map — blocking
-                // hot-path passive health lookups/updates during the failure
-                // scenario where recovery scans are most active.
-                for entry in passive_health.iter() {
-                    let proxy_id = entry.key();
-                    let proxy_state = entry.value();
-
-                    // Collect keys to recover within this proxy's map
-                    let to_recover: Vec<String> = proxy_state
-                        .unhealthy
-                        .iter()
-                        .filter(|e| {
-                            hp_keys.contains(e.key().as_str())
-                                && now.saturating_sub(*e.value()) >= recovery_ms
-                        })
-                        .map(|e| e.key().clone())
-                        .collect();
-
-                    // Remove + log + reset outside the iteration (no shard
-                    // locks held during logging or failure-state cleanup).
-                    for hp in &to_recover {
-                        if proxy_state.unhealthy.remove(hp).is_some() {
-                            info!(
-                                "Passive recovery timer: restoring target {} for proxy {} after {}s cooldown",
-                                hp, proxy_id, healthy_after_seconds
-                            );
-                            if let Some(state) = proxy_state.states.get(hp) {
-                                state.consecutive_failures.store(0, Ordering::Relaxed);
-                                state.consecutive_successes.store(0, Ordering::Relaxed);
-                                state.recent_failures.clear();
-                            }
-                        }
-                    }
-                }
+                recover_due_passive_ejections_inner(&passive_health, lb_cache.as_ref());
             }
         })
     }
@@ -1693,6 +1780,132 @@ fn build_health_check_client_with_tls(
                 e
             );
             build_dns_cached_fallback_client(dns_cache, "TLS health check")
+        }
+    }
+}
+
+/// True when any effective passive policy in `config` enables automatic
+/// recovery (`healthy_after_seconds > 0`), including per-port and subset-only
+/// overlays that are not present on the base upstream health_checks block.
+fn config_needs_passive_recovery(config: &GatewayConfig) -> bool {
+    fn passive_recovers(passive: Option<&PassiveHealthCheck>) -> bool {
+        passive.is_some_and(|p| p.healthy_after_seconds > 0)
+    }
+
+    for upstream in &config.upstreams {
+        if passive_recovers(
+            upstream
+                .health_checks
+                .as_ref()
+                .and_then(|hc| hc.passive.as_ref()),
+        ) {
+            return true;
+        }
+        for override_config in upstream.port_overrides.values() {
+            if passive_recovers(override_config.passive_health_check.as_ref()) {
+                return true;
+            }
+        }
+        for subset in upstream.resolved_subset_tls.values() {
+            if passive_recovers(subset.passive_health_check.as_ref()) {
+                return true;
+            }
+        }
+    }
+    for proxy in &config.proxies {
+        if let Some(overrides) = proxy.dispatch_port_overrides.as_ref() {
+            for override_config in overrides.values() {
+                if passive_recovers(override_config.passive_health_check.as_ref()) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn reset_latency_after_passive_recovery_inner(
+    lb_cache: Option<&Arc<LoadBalancerCache>>,
+    upstream_id: &str,
+    target: &UpstreamTarget,
+) {
+    if upstream_id.is_empty() {
+        return;
+    }
+    if let Some(cache) = lb_cache {
+        cache.reset_recovered_target_latency(upstream_id, target);
+    }
+}
+
+fn recover_due_passive_ejections_inner(
+    passive_health: &DashMap<String, Arc<ProxyHealthState>>,
+    lb_cache: Option<&Arc<LoadBalancerCache>>,
+) {
+    let now = now_epoch_ms();
+
+    let any_unhealthy = passive_health
+        .iter()
+        .any(|entry| !entry.value().unhealthy.is_empty());
+    if !any_unhealthy {
+        return;
+    }
+
+    for entry in passive_health.iter() {
+        let proxy_id = entry.key();
+        let proxy_state = entry.value();
+
+        let to_recover: Vec<(String, PassiveEjection)> = proxy_state
+            .unhealthy
+            .iter()
+            .filter(|e| {
+                let ejection = e.value();
+                ejection.auto_recover && now >= ejection.recover_at_ms
+            })
+            .map(|e| (e.key().clone(), e.value().clone()))
+            .collect();
+
+        for (hp, ejection) in &to_recover {
+            let removed = match proxy_state.unhealthy.remove(hp) {
+                Some((_, current))
+                    if current.auto_recover
+                        && now >= current.recover_at_ms
+                        && current.recover_at_ms == ejection.recover_at_ms =>
+                {
+                    Some(current)
+                }
+                Some((key, current)) => {
+                    // Newer re-ejection won the race — keep its own deadline.
+                    proxy_state.unhealthy.insert(key, current);
+                    None
+                }
+                None => None,
+            };
+            let Some(current) = removed else {
+                continue;
+            };
+
+            info!(
+                "Passive recovery timer: restoring target {} for proxy {} after cooldown (upstream {})",
+                hp, proxy_id, current.upstream_id
+            );
+            if let Some(state) = proxy_state.states.get(hp) {
+                state.consecutive_failures.store(0, Ordering::Relaxed);
+                state.consecutive_successes.store(0, Ordering::Relaxed);
+                state.recent_failures.clear();
+            }
+
+            // Seed least-latency sample count past warm-up so passive recovery
+            // cannot restore an unconditional biased-best state.
+            let recovered = UpstreamTarget {
+                host: current.host.clone(),
+                port: current.port,
+                service_port_policy_key: None,
+                weight: 1,
+                tags: Default::default(),
+                locality: None,
+                path: None,
+            };
+            reset_latency_after_passive_recovery_inner(lb_cache, &current.upstream_id, &recovered);
         }
     }
 }

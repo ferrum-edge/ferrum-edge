@@ -8,7 +8,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use std::cell::{Cell, RefCell};
@@ -23,6 +22,7 @@ use crate::config::PoolConfig;
 use crate::config::types::Proxy;
 use crate::dns::{DnsCache, DnsConfig};
 use crate::pool::{GenericPool, PoolManager};
+use crate::proxy::body::SizeLimitedIncoming;
 use crate::tls::TlsPolicy;
 use crate::tls::backend::{
     BackendSvidGeneration, BackendTlsConfigBuilder, BackendTlsConfigCache, SvidGenerationMatcher,
@@ -47,6 +47,14 @@ thread_local! {
     /// inside a synchronous block.
     static HTTP2_POOL_KEY_BUF: RefCell<String> = RefCell::new(String::with_capacity(128));
 }
+
+/// Multiplexed hyper H2 sender for the plain-HTTPS direct pool.
+///
+/// Body type is [`SizeLimitedIncoming`] so SNI-required (and any other)
+/// direct-H2 dispatches can enforce `max_request_body_size_bytes` while
+/// streaming the client upload — mirroring the mesh-mTLS / HBONE pools.
+/// Callers wrap with `usize::MAX` when the operator limit is disabled (`0`).
+pub type Http2Sender = http2::SendRequest<SizeLimitedIncoming>;
 
 /// Run `f` against a thread-local buffer pre-populated with the direct H2
 /// pool key for `proxy` (no shard suffix). Callers can append `#<shard>`
@@ -150,7 +158,7 @@ impl Http2PoolManager {
         &self,
         proxy: &Proxy,
         svid_generation: Option<u64>,
-    ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
+    ) -> Result<Http2Sender, Http2PoolError> {
         let host = &proxy.backend_host;
         let port = proxy.backend_port;
 
@@ -347,7 +355,7 @@ impl Http2PoolManager {
         svid_generation: Option<u64>,
         connect_started: Instant,
         connect_timeout: Duration,
-    ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
+    ) -> Result<Http2Sender, Http2PoolError> {
         use tokio_rustls::TlsConnector;
 
         let tls_config = self.get_tls_config(proxy, svid_generation)?;
@@ -419,7 +427,7 @@ impl Http2PoolManager {
 
 #[async_trait]
 impl PoolManager for Http2PoolManager {
-    type Connection = http2::SendRequest<Incoming>;
+    type Connection = Http2Sender;
 
     fn build_key(&self, proxy: &Proxy, host: &str, port: u16, shard: usize, buf: &mut String) {
         self.write_pool_key(
@@ -433,7 +441,7 @@ impl PoolManager for Http2PoolManager {
         write_http2_shard_key_inplace(buf, base_len, shard);
     }
 
-    async fn create(&self, _key: &str, proxy: &Proxy) -> Result<http2::SendRequest<Incoming>> {
+    async fn create(&self, _key: &str, proxy: &Proxy) -> Result<Http2Sender> {
         self.create_connection(proxy, self.svid_generation_for_proxy(proxy))
             .await
             .map_err(anyhow::Error::from)
@@ -658,10 +666,7 @@ impl Http2ConnectionPool {
         )
     }
 
-    pub async fn get_sender(
-        &self,
-        proxy: &Proxy,
-    ) -> Result<http2::SendRequest<Incoming>, Http2PoolError> {
+    pub async fn get_sender(&self, proxy: &Proxy) -> Result<Http2Sender, Http2PoolError> {
         let pool_config = self.pool.manager().global_pool_config.for_proxy(proxy);
         let shard_count = pool_config.http2_connections_per_host.max(1);
 
@@ -788,7 +793,7 @@ impl Http2ConnectionPool {
 enum Phase1 {
     /// A cached sender was immediately ready — short-circuit to the caller
     /// without cloning the pool key or hitting `create_or_get_existing_owned`.
-    Hit(http2::SendRequest<Incoming>),
+    Hit(Http2Sender),
     /// No shard was immediately ready. Carry the cloned shard key (with
     /// `#<start_shard>` appended) plus the unsharded `base_len` and
     /// `start` so the post-await error fallback can reconstruct shard

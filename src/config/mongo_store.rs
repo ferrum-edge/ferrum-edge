@@ -29,15 +29,15 @@
 //! deployments force full reloads for every change because resource writes and
 //! change records are not transactionally coupled.
 //!
-//! **Index creation**: The `run_migrations()` method creates indexes instead of
-//! running SQL migrations. `createIndex` is idempotent **only when the full
-//! index spec (keys + options) matches**; if the keys match but options differ
-//! (e.g. a new `partialFilterExpression`), MongoDB raises
-//! `IndexOptionsConflict` (server error 85). Where this baseline ships a
-//! changed-option index over a previously-shipped one, `run_migrations()`
-//! detects the conflict, drops the legacy index, and recreates with the new
-//! options. See the api_specs `(namespace, proxy_id)` unique index for the
-//! pattern.
+//! **Index creation**: The `run_migrations()` method creates indexes from the
+//! canonical plan in [`crate::config::mongo_index_plan`] instead of running SQL
+//! migrations. `createIndex` is idempotent **only when the full index spec
+//! (keys + options) matches**; if the keys match but options differ (e.g. a
+//! new `partialFilterExpression`), MongoDB raises `IndexOptionsConflict`
+//! (server error 85). Where this baseline ships a changed-option index over a
+//! previously-shipped one, `run_migrations()` detects the conflict, drops the
+//! legacy index, and recreates with the new options. Migrate dry-run and status
+//! consume the same plan so operator output cannot drift from `up`.
 
 #[allow(dead_code)] // MongoStore is wired up in mode dispatch (database.rs, control_plane.rs)
 mod inner {
@@ -68,8 +68,8 @@ mod inner {
         Binary, Bson, DateTime as BsonDateTime, Document, doc, spec::BinarySubtype,
     };
     use mongodb::options::{
-        ClientOptions, FindOptions, IndexOptions, ReadConcern, ReadPreference, ReturnDocument,
-        SelectionCriteria, Tls, TlsOptions, WriteConcern,
+        ClientOptions, FindOptions, ReadConcern, ReadPreference, ReturnDocument, SelectionCriteria,
+        Tls, TlsOptions, WriteConcern,
     };
     use mongodb::{Client, ClientSession, Collection, Database, IndexModel};
     use std::collections::HashSet;
@@ -84,11 +84,17 @@ mod inner {
     use uuid::Uuid;
     use zeroize::Zeroizing;
     // regex::escape is used for safe MongoDB $regex pattern construction in list filters.
+    use crate::config::mongo_index_plan::{
+        HMAC_SECRET_HASHES_FIELD, MongoMigrationStatus, REQUIRED_GUARD_COLLECTIONS,
+        RequiredMongoIndex, classify_guard_collections, classify_plan_against_live,
+        default_index_name, required_mongo_indexes,
+    };
     use regex::escape as regex_escape;
 
     // MongoDB server error codes used by the index-upgrade logic in
     // `run_migrations`. Source: src/mongo/db/operation_exit_code.idl (server)
     // and https://www.mongodb.com/docs/manual/reference/error-codes/.
+    const MONGO_ERR_NAMESPACE_NOT_FOUND: i32 = 26;
     const MONGO_ERR_INDEX_NOT_FOUND: i32 = 27;
     const MONGO_ERR_NAMESPACE_EXISTS: i32 = 48;
     const MONGO_ERR_INDEX_ALREADY_EXISTS: i32 = 68;
@@ -105,7 +111,6 @@ mod inner {
     const MONGO_MIGRATION_LEASE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
     const CONFIG_ADMISSION_LEASE_DURATION_MILLIS: i64 = 120_000;
     const MONGO_ADMISSION_LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
-    const HMAC_SECRET_HASHES_FIELD: &str = "_ferrum_hmac_secret_hashes";
     // Dedicated migration-lease pool size. Lease upkeep only issues tiny
     // update_one/delete_one operations, so a couple of connections is ample
     // while keeping the lease client fully isolated from the migration-work
@@ -198,6 +203,10 @@ mod inner {
 
     fn is_namespace_exists(err: &mongodb::error::Error) -> bool {
         is_mongo_command_error_with_code(err, MONGO_ERR_NAMESPACE_EXISTS)
+    }
+
+    fn is_namespace_not_found(err: &mongodb::error::Error) -> bool {
+        is_mongo_command_error_with_code(err, MONGO_ERR_NAMESPACE_NOT_FOUND)
     }
 
     fn is_index_already_exists(err: &mongodb::error::Error) -> bool {
@@ -1510,6 +1519,109 @@ mod inner {
         /// assert the classic acquire/renew builders stamp `now + duration`).
         pub(crate) fn migration_lease_duration_millis() -> i64 {
             MONGO_MIGRATION_LEASE_DURATION_MILLIS
+        }
+
+        /// Non-mutating comparison of live indexes against the canonical plan.
+        ///
+        /// Connects/authenticates were already proven by [`Self::connect`]'s
+        /// ping. This issues only `listIndexes` and `listCollections`, treating
+        /// missing index-owning collections as empty. Never creates, drops, or
+        /// alters indexes or collections.
+        pub async fn migration_status(&self) -> Result<MongoMigrationStatus, anyhow::Error> {
+            use std::collections::{HashMap, HashSet};
+
+            let plan = required_mongo_indexes();
+            let collections: HashSet<&str> = plan.iter().map(|e| e.collection).collect();
+            let mut live_by_collection: HashMap<String, Vec<IndexModel>> = HashMap::new();
+
+            for collection_name in collections {
+                match self.list_collection_indexes(collection_name).await {
+                    Ok(indexes) => {
+                        live_by_collection.insert(collection_name.to_string(), indexes);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+
+            let live_collection_names: HashSet<String> = self
+                .db()
+                .list_collection_names()
+                .await
+                .map_err(|err| anyhow::anyhow!("Failed to list MongoDB collections: {err}"))?
+                .into_iter()
+                .collect();
+
+            Ok(MongoMigrationStatus {
+                indexes: classify_plan_against_live(&live_by_collection),
+                guard_collections: classify_guard_collections(&live_collection_names),
+            })
+        }
+
+        async fn list_collection_indexes(
+            &self,
+            collection_name: &str,
+        ) -> Result<Vec<IndexModel>, anyhow::Error> {
+            let collection = self.collection(collection_name);
+            let mut cursor = match collection.list_indexes().await {
+                Ok(cursor) => cursor,
+                Err(err) if is_namespace_not_found(&err) => return Ok(Vec::new()),
+                Err(err) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to list indexes on MongoDB collection '{collection_name}': {err}"
+                    ));
+                }
+            };
+            let mut indexes = Vec::new();
+            while cursor.advance().await? {
+                let model = cursor.deserialize_current().map_err(|err| {
+                    anyhow::anyhow!(
+                        "Failed to decode index on MongoDB collection '{collection_name}': {err}"
+                    )
+                })?;
+                indexes.push(model);
+            }
+            Ok(indexes)
+        }
+
+        async fn ensure_planned_index(
+            &self,
+            entry: &RequiredMongoIndex,
+        ) -> Result<(), anyhow::Error> {
+            let collection = self.collection(entry.collection);
+            match collection.create_index(entry.model.clone()).await {
+                Ok(_) => Ok(()),
+                Err(err)
+                    if entry.recreate_on_options_conflict && is_index_options_conflict(&err) =>
+                {
+                    let index_name = default_index_name(&entry.model.keys);
+                    warn!(
+                        collection = entry.collection,
+                        index_keys = %entry.model.keys,
+                        index_name = %index_name,
+                        "MongoDB index exists with conflicting options; dropping legacy \
+                         index and recreating with canonical options (one-time upgrade)"
+                    );
+                    match collection.drop_index(&index_name).await {
+                        Ok(_) => {}
+                        Err(drop_err) if is_index_not_found(&drop_err) => {}
+                        Err(drop_err) => {
+                            return Err(anyhow::anyhow!(
+                                "Failed to drop legacy {} index `{index_name}` during upgrade: \
+                                 {drop_err}. Run `db.{}.dropIndex(\"{index_name}\")` manually \
+                                 and restart.",
+                                entry.collection,
+                                entry.collection,
+                            ));
+                        }
+                    }
+                    match collection.create_index(entry.model.clone()).await {
+                        Ok(_) => Ok(()),
+                        Err(create_err) if is_index_already_exists(&create_err) => Ok(()),
+                        Err(create_err) => Err(create_err.into()),
+                    }
+                }
+                Err(err) => Err(err.into()),
+            }
         }
 
         pub(crate) fn pipeline_update_unsupported_for_test(error: &mongodb::error::Error) -> bool {
@@ -9058,195 +9170,10 @@ mod inner {
             // spawns a best-effort async cleanup that may never run when the
             // runtime is torn down in startup/migrate mode.
             let migration_result: Result<(), anyhow::Error> = async {
-                // MongoDB doesn't use SQL migrations. Instead, ensure indexes exist.
-                // createIndex is idempotent — no-op if the index already exists.
-
-                // proxies indexes — uniqueness scoped to namespace
-                self.proxies()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "name": 1 })
-                            .options(
-                                IndexOptions::builder()
-                                    .unique(true)
-                                    .partial_filter_expression(doc! {
-                                        "name": { "$type": "string" }
-                                    })
-                                    .build(),
-                            )
-                            .build(),
-                    )
-                    .await?;
-                self.proxies()
-                    .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
-                    .await?;
-                self.proxies()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "upstream_id": 1 })
-                            .build(),
-                    )
-                    .await?;
-                self.proxies()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "plugins.plugin_config_id": 1 })
-                            .build(),
-                    )
-                    .await?;
-                self.proxies()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "listen_port": 1 })
-                            .options(
-                                IndexOptions::builder()
-                                    .unique(true)
-                                    .partial_filter_expression(doc! {
-                                        "listen_port": { "$type": "number" }
-                                    })
-                                    .build(),
-                            )
-                            .build(),
-                    )
-                    .await?;
-                // Intentionally NO unique index on (namespace, listen_path). Path
-                // uniqueness is host-scoped: two HTTP proxies may share a
-                // listen_path if their `hosts` lists do not overlap. A plain
-                // unique index would reject valid host-partitioned routes before
-                // the host-overlap check in `check_listen_path_unique` runs.
-                // Uniqueness is enforced at the application layer instead.
-                //
-                // No standalone {namespace} index: the {namespace, updated_at}
-                // compound below covers namespace-only lookups via the
-                // leading-column rule.
-                self.proxies()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "updated_at": 1 })
-                            .build(),
-                    )
-                    .await?;
-                // Supports incremental point-loads by namespace and changed IDs.
-                // Deletions come from `config_changes`; normal polls no longer scan
-                // full collection ID sets.
-                self.proxies()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "_id": 1 })
-                            .build(),
-                    )
-                    .await?;
-
-                // consumers indexes — uniqueness scoped to namespace.
-                //
-                // NOTE: the consumers collection's `_id` is the composite
-                // "{namespace}:{id}" (see `consumer_doc_id`), so consumer *id*
-                // uniqueness is per-namespace via `_id` itself — no extra index
-                // needed. The username/custom_id unique indexes below stay as
-                // secondary guards for their individual fields.
-                self.consumers()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "username": 1 })
-                            .options(IndexOptions::builder().unique(true).build())
-                            .build(),
-                    )
-                    .await?;
-                self.consumers()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "custom_id": 1 })
-                            .options(
-                                IndexOptions::builder()
-                                    .unique(true)
-                                    .partial_filter_expression(doc! {
-                                        "custom_id": { "$type": "string" }
-                                    })
-                                    .build(),
-                            )
-                            .build(),
-                    )
-                    .await?;
-                self.consumers()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "credentials.keyauth.key": 1 })
-                            .options(
-                                IndexOptions::builder()
-                                    .unique(true)
-                                    .partial_filter_expression(doc! {
-                                        "credentials.keyauth.key": { "$type": "string" }
-                                    })
-                                    .build(),
-                            )
-                            .build(),
-                    )
-                    .await?;
-                self.consumers()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "credentials.mtls_auth.identity": 1 })
-                            .options(
-                                IndexOptions::builder()
-                                    .unique(true)
-                                    .partial_filter_expression(doc! {
-                                        "credentials.mtls_auth.identity": { "$type": "string" }
-                                    })
-                                    .build(),
-                            )
-                            .build(),
-                    )
-                    .await?;
-                // Namespace-scoped unique multikey index over the derived
-                // secret-hash projection. One key is emitted per distinct
-                // rotation entry, so another consumer cannot claim it while
-                // repeated values within one document remain legal. Legacy
-                // documents without the projection stay repairable instead of
-                // making index creation fail on pre-existing duplicates.
-                self.consumers()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, HMAC_SECRET_HASHES_FIELD: 1 })
-                            .options(
-                                IndexOptions::builder()
-                                    .unique(true)
-                                    .partial_filter_expression(doc! {
-                                        HMAC_SECRET_HASHES_FIELD: { "$type": "string" }
-                                    })
-                                    .build(),
-                            )
-                            .build(),
-                    )
-                    .await?;
-                self.consumers()
-                    .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
-                    .await?;
-                // No standalone {namespace} index — covered by {namespace, updated_at} below.
-                self.consumers()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "updated_at": 1 })
-                            .build(),
-                    )
-                    .await?;
-                // Supports incremental point-loads by namespace and changed IDs.
-                self.consumers()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "_id": 1 })
-                            .build(),
-                    )
-                    .await?;
-
-                // consumer_identity_index — merged identity keyspace
-                // (id ∪ username ∪ custom_id) per namespace. Documents are keyed
-                // by `_id = "{namespace}:{identity_value}"`, so uniqueness needs
-                // no extra index; the non-unique {namespace} index supports
-                // namespace wipes (`delete_all_resources`) and per-consumer
-                // cleanup filters.
-                self.consumer_identity_index()
-                    .create_index(IndexModel::builder().keys(doc! { "namespace": 1 }).build())
-                    .await?;
+                // MongoDB doesn't use SQL migrations. Instead, ensure indexes
+                // from the canonical plan in `mongo_index_plan`. createIndex is
+                // idempotent when keys+options match; entries marked
+                // `recreate_on_options_conflict` drop+recreate on code 85/86.
 
                 // Intentionally no automatic orphan reconcile of
                 // `consumer_identity_index` against `consumers`. Point-read
@@ -9257,290 +9184,23 @@ mod inner {
                 // adoption heals a retry of the same consumer id, or an
                 // operator removes the reservation manually.
 
-                // The guard collections are keyed purely by `_id`
-                // (`{namespace}:{route_key_hash}`, `{namespace}:{upstream_id}`,
-                // or the namespace itself) and need no secondary indexes. Some
-                // are written from inside transactions, and MongoDB < 4.4 cannot
-                // implicitly create a collection there, so create every guard
-                // collection explicitly. NamespaceExists (code 48) is tolerated
-                // for idempotent multi-instance startup.
-                for lock_collection in [
-                    "proxy_route_locks",
-                    "upstream_ref_guards",
-                    "mtls_dns_admission_locks",
-                ] {
-                    match self.db().create_collection(lock_collection).await {
+                // Guard collections are keyed purely by `_id` and need no
+                // secondary indexes. Some are written from inside transactions,
+                // and MongoDB < 4.4 cannot implicitly create a collection
+                // there, so create every guard collection explicitly.
+                // NamespaceExists (code 48) is tolerated for idempotent
+                // multi-instance startup.
+                for lock_collection in REQUIRED_GUARD_COLLECTIONS {
+                    match self.db().create_collection(*lock_collection).await {
                         Ok(()) => {}
                         Err(e) if is_namespace_exists(&e) => {}
                         Err(e) => return Err(e.into()),
                     }
                 }
 
-                // plugin_configs indexes
-                self.plugin_configs()
-                    .create_index(IndexModel::builder().keys(doc! { "proxy_id": 1 }).build())
-                    .await?;
-                self.plugin_configs()
-                    .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
-                    .await?;
-                // No standalone {namespace} index — covered by {namespace, updated_at} below.
-                self.plugin_configs()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "updated_at": 1 })
-                            .build(),
-                    )
-                    .await?;
-                // Supports incremental point-loads by namespace and changed IDs.
-                self.plugin_configs()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "_id": 1 })
-                            .build(),
-                    )
-                    .await?;
-                // Compound indexes for common admin API query patterns (V003)
-                self.plugin_configs()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "scope": 1 })
-                            .build(),
-                    )
-                    .await?;
-                self.plugin_configs()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "scope": 1, "_id": 1 })
-                            .build(),
-                    )
-                    .await?;
-                self.plugin_configs()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "plugin_name": 1 })
-                            .build(),
-                    )
-                    .await?;
-                // Cold-path index for cross-namespace mesh_route_dispatch lookups in
-                // `find_mesh_route_dispatch_upstream_ref_opt_session` and
-                // `ensure_no_external_spec_upstream_refs_opt_session`. Both query
-                // `{plugin_name: "mesh_route_dispatch", enabled: true}` across all
-                // namespaces (upstream IDs are globally unique, so a cross-namespace
-                // reference is real and must be caught). The partial filter halves
-                // index size and write amplification in deployments with many
-                // disabled plugin_configs.
-                self.plugin_configs()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "plugin_name": 1, "enabled": 1 })
-                            .options(
-                                IndexOptions::builder()
-                                    .partial_filter_expression(doc! { "enabled": true })
-                                    .build(),
-                            )
-                            .build(),
-                    )
-                    .await?;
-
-                // Sparse index on api_spec_id for cascade queries (delete/replace by
-                // spec ownership).  Most plugin_configs have api_spec_id: null, so
-                // sparse avoids indexing the majority of documents.
-                self.plugin_configs()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "api_spec_id": 1 })
-                            .options(IndexOptions::builder().sparse(true).build())
-                            .build(),
-                    )
-                    .await?;
-
-                // upstreams indexes — uniqueness scoped to namespace
-                self.upstreams()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "name": 1 })
-                            .options(
-                                IndexOptions::builder()
-                                    .unique(true)
-                                    .partial_filter_expression(doc! {
-                                        "name": { "$type": "string" }
-                                    })
-                                    .build(),
-                            )
-                            .build(),
-                    )
-                    .await?;
-                self.upstreams()
-                    .create_index(IndexModel::builder().keys(doc! { "updated_at": 1 }).build())
-                    .await?;
-                // No standalone {namespace} index — covered by {namespace, updated_at} below.
-                // Sparse index on api_spec_id — mirrors plugin_configs above.
-                self.upstreams()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "api_spec_id": 1 })
-                            .options(IndexOptions::builder().sparse(true).build())
-                            .build(),
-                    )
-                    .await?;
-                self.upstreams()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "updated_at": 1 })
-                            .build(),
-                    )
-                    .await?;
-                // Supports incremental point-loads by namespace and changed IDs.
-                self.upstreams()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "_id": 1 })
-                            .build(),
-                    )
-                    .await?;
-
-                // api_specs indexes (admin-only; runtime never reads this collection).
-                // Unique (namespace, proxy_id) mirrors the SQL unique index and prevents
-                // a second spec from claiming ownership of an already-spec-owned proxy.
-                // Partial filter mirrors the sparse-unique pattern used for
-                // (namespace, name), (namespace, custom_id), and (namespace, listen_port)
-                // elsewhere — guards against the null-collision case if a future doc
-                // is ever inserted without a proxy_id. SQL is safe via NOT NULL.
-                //
-                // Upgrade path: the previous V001 baseline created the same-keyed
-                // index with `unique(true)` only. MongoDB raises
-                // IndexOptionsConflict (code 85) when keys match but options
-                // differ, so a plain `create_index` fails on upgrade. Drop the
-                // legacy index on conflict and recreate — fresh DBs skip the
-                // branch, upgraded DBs take it exactly once. IndexNotFound on
-                // drop and IndexAlreadyExists on recreate are both tolerated to
-                // make the path safe under concurrent multi-instance startup.
-                let api_specs_unique = IndexModel::builder()
-                    .keys(doc! { "namespace": 1, "proxy_id": 1 })
-                    .options(
-                        IndexOptions::builder()
-                            .unique(true)
-                            .partial_filter_expression(doc! {
-                                "proxy_id": { "$type": "string" }
-                            })
-                            .build(),
-                    )
-                    .build();
-                match self
-                    .api_specs()
-                    .create_index(api_specs_unique.clone())
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(e) if is_index_options_conflict(&e) => {
-                        warn!(
-                            "MongoDB api_specs (namespace, proxy_id) unique index exists \
-                         without partialFilterExpression. Dropping the legacy index and \
-                         recreating with the new options — one-time upgrade step."
-                        );
-                        match self.api_specs().drop_index("namespace_1_proxy_id_1").await {
-                            Ok(_) => {}
-                            Err(drop_err) if is_index_not_found(&drop_err) => {}
-                            Err(drop_err) => {
-                                return Err(anyhow::anyhow!(
-                                    "Failed to drop legacy api_specs (namespace, proxy_id) index \
-                                 during upgrade: {drop_err}. Run \
-                                 `db.api_specs.dropIndex(\"namespace_1_proxy_id_1\")` \
-                                 manually and restart."
-                                ));
-                            }
-                        }
-                        match self.api_specs().create_index(api_specs_unique).await {
-                            Ok(_) => {}
-                            Err(create_err) if is_index_already_exists(&create_err) => {}
-                            Err(create_err) => return Err(create_err.into()),
-                        }
-                    }
-                    Err(e) => return Err(e.into()),
+                for entry in required_mongo_indexes() {
+                    self.ensure_planned_index(&entry).await?;
                 }
-                self.api_specs()
-                    .create_index(IndexModel::builder().keys(doc! { "proxy_id": 1 }).build())
-                    .await?;
-                self.api_specs()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "updated_at": 1 })
-                            .build(),
-                    )
-                    .await?;
-                // Wave 5 indexes — spec_version filter, operation_count/created_at sorting,
-                // and tags multikey index for has_tag membership filter.
-                self.api_specs()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "spec_version": 1 })
-                            .build(),
-                    )
-                    .await?;
-                self.api_specs()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "operation_count": 1 })
-                            .build(),
-                    )
-                    .await?;
-                self.api_specs()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "created_at": -1 })
-                            .build(),
-                    )
-                    .await?;
-                self.api_specs()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "tags": 1 })
-                            .build(),
-                    )
-                    .await?;
-
-                // audit_events indexes (admin-only mutation log).
-                self.audit_events()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "ts": -1 })
-                            .build(),
-                    )
-                    .await?;
-                self.audit_events()
-                    .create_index(IndexModel::builder().keys(doc! { "actor": 1 }).build())
-                    .await?;
-                self.audit_events()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "action": 1 })
-                            .build(),
-                    )
-                    .await?;
-                self.audit_events()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "resource_type": 1 })
-                            .build(),
-                    )
-                    .await?;
-                self.audit_events()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "resource_id": 1 })
-                            .build(),
-                    )
-                    .await?;
-                self.config_changes()
-                    .create_index(
-                        IndexModel::builder()
-                            .keys(doc! { "namespace": 1, "sequence": 1 })
-                            .build(),
-                    )
-                    .await?;
-                self.config_changes()
-                    .create_index(IndexModel::builder().keys(doc! { "sequence": 1 }).build())
-                    .await?;
 
                 info!("MongoDB indexes ensured");
                 Ok(())

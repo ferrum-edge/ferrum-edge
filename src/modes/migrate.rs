@@ -65,11 +65,9 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
     // MongoDB: index creation via MongoStore::run_migrations()
     if db_type == "mongodb" {
         if dry_run {
-            println!("MongoDB dry run: indexes would be created/verified on collections");
-            println!("  proxies: name (unique), updated_at, upstream_id, listen_port");
-            println!("  consumers: username (unique), custom_id (unique sparse), updated_at");
-            println!("  plugin_configs: proxy_id, updated_at");
-            println!("  upstreams: name (unique), updated_at");
+            for line in crate::config::mongo_index_plan::dry_run_lines() {
+                println!("{line}");
+            }
             return Ok(());
         }
         let store = crate::config::mongo_store::MongoStore::connect(
@@ -97,9 +95,13 @@ async fn run_db_migrations(env_config: &EnvConfig, dry_run: bool) -> Result<(), 
     // Connect without running migrations automatically
     sqlx::any::install_default_drivers();
 
-    let pool = sql_migration_pool_options(db_type)
-        .connect(&effective_url)
-        .await?;
+    let pool = crate::config::db_loader::connect_any_pool_with_timeout(
+        sql_migration_pool_options(db_type),
+        &effective_url,
+        db_type,
+        env_config.db_pool_connect_timeout_seconds,
+    )
+    .await?;
 
     let runner = MigrationRunner::new(pool, db_type.to_string());
 
@@ -177,19 +179,95 @@ async fn show_db_status(env_config: &EnvConfig) -> Result<(), anyhow::Error> {
 
     info!("Connecting to database (type={})...", db_type);
 
-    // MongoDB: no SQL migration tracking — indexes are idempotent
+    // MongoDB: connect and non-mutatingly compare live indexes to the
+    // canonical plan. Connectivity/authentication failures return Err.
     if db_type == "mongodb" {
+        let store = crate::config::mongo_store::MongoStore::connect(
+            &effective_url,
+            &env_config.mongo_database,
+            env_config.mongo_app_name.as_deref(),
+            env_config.mongo_replica_set.as_deref(),
+            env_config.mongo_auth_mechanism.as_deref(),
+            env_config.mongo_server_selection_timeout_seconds,
+            env_config.mongo_connect_timeout_seconds,
+            env_config.db_tls_enabled(),
+            env_config.db_tls_ca_cert_path.as_deref(),
+            env_config.db_tls_client_cert_path.as_deref(),
+            env_config.db_tls_client_key_path.as_deref(),
+            env_config.mongodb_tls_allows_invalid_certs(),
+        )
+        .await?;
+
+        let status = store.migration_status().await?;
+        use crate::config::mongo_index_plan::IndexPresence;
+
         println!("=== Ferrum Edge Migration Status (MongoDB) ===\n");
         println!("MongoDB uses idempotent index creation instead of versioned migrations.");
-        println!("Run 'FERRUM_MIGRATE_ACTION=up' to ensure all indexes exist.");
+        println!(
+            "Compared live indexes and guard collections to the canonical plan \
+             (listIndexes/listCollections only; no mutations).\n"
+        );
+
+        let mut present = 0usize;
+        let mut missing = 0usize;
+        let mut mismatched = 0usize;
+        for entry in &status.indexes {
+            match &entry.presence {
+                IndexPresence::Present => {
+                    present += 1;
+                    println!("  [present]    {}.{}", entry.collection, entry.summary);
+                }
+                IndexPresence::Missing => {
+                    missing += 1;
+                    println!("  [missing]    {}.{}", entry.collection, entry.summary);
+                }
+                IndexPresence::Mismatched { detail } => {
+                    mismatched += 1;
+                    println!(
+                        "  [mismatched] {}.{} ({detail})",
+                        entry.collection, entry.summary
+                    );
+                }
+            }
+        }
+
+        let mut guard_collections_present = 0usize;
+        let mut guard_collections_missing = 0usize;
+        println!("\nRequired guard collections:");
+        for entry in &status.guard_collections {
+            if entry.present {
+                guard_collections_present += 1;
+                println!("  [present]    {}", entry.collection);
+            } else {
+                guard_collections_missing += 1;
+                println!("  [missing]    {}", entry.collection);
+            }
+        }
+
+        println!(
+            "\nSummary: indexes: {present} present, {missing} missing, {mismatched} mismatched \
+             (of {} required); guard collections: {guard_collections_present} present, \
+             {guard_collections_missing} missing (of {} required).",
+            status.indexes.len(),
+            status.guard_collections.len()
+        );
+        if missing > 0 || mismatched > 0 || guard_collections_missing > 0 {
+            println!("Run 'FERRUM_MIGRATE_ACTION=up' to ensure the full plan exists.");
+        } else {
+            println!("All required indexes and guard collections are present.");
+        }
         return Ok(());
     }
 
     sqlx::any::install_default_drivers();
 
-    let pool = sql_migration_pool_options(db_type)
-        .connect(&effective_url)
-        .await?;
+    let pool = crate::config::db_loader::connect_any_pool_with_timeout(
+        sql_migration_pool_options(db_type),
+        &effective_url,
+        db_type,
+        env_config.db_pool_connect_timeout_seconds,
+    )
+    .await?;
 
     let runner = MigrationRunner::new(pool, db_type.to_string());
     let status = runner.status().await?;
@@ -301,10 +379,14 @@ mod tests {
     #[tokio::test]
     async fn sqlite_migration_pool_enables_foreign_keys_per_connection() {
         sqlx::any::install_default_drivers();
-        let pool = sql_migration_pool_options("sqlite")
-            .connect("sqlite::memory:")
-            .await
-            .expect("connect sqlite migration pool");
+        let pool = crate::config::db_loader::connect_any_pool_with_timeout(
+            sql_migration_pool_options("sqlite"),
+            "sqlite::memory:",
+            "sqlite",
+            10,
+        )
+        .await
+        .expect("connect sqlite migration pool");
 
         let row = sqlx::query("PRAGMA foreign_keys")
             .fetch_one(&pool)

@@ -377,7 +377,7 @@ Using `--test-threads=1` prevents port conflicts when multiple functional tests 
 
 - **Config file permissions**: The gateway warns at startup if the config file is world-readable (Unix only). Since config files may contain consumer credentials (API keys, passwords, JWT secrets), restrict file permissions (e.g., `chmod 600`).
 
-- **Admin API JWT in file mode**: When `FERRUM_ADMIN_JWT_SECRET` is not configured, the admin API uses a randomly generated secret per process start. This means the admin API is effectively inaccessible (no one can forge valid tokens), but it is still recommended to either set an explicit JWT secret or restrict network access to the admin port.
+- **Admin API JWT in file mode**: When `FERRUM_ADMIN_JWT_SECRET` is not configured, the admin API uses a randomly generated secret per process start. This means the admin API is effectively inaccessible (no one can forge valid tokens), but it is still recommended to either set an explicit JWT secret or restrict network access to the admin port. If the secret or a related setting such as `FERRUM_ADMIN_JWT_MAX_TTL` is explicitly present but invalid, file-mode startup fails closed instead of silently generating a random secret.
 
 - **ferrum.conf precedence**: Environment variables take precedence over values in `ferrum.conf`. The conf file provides defaults; if both are set for the same key with different values, an info-level message is logged. A stale `ferrum.conf` in the working directory will not override explicit env vars.
 

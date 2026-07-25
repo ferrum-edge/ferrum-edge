@@ -14,6 +14,19 @@
 //! 4. Ask the [`CertificateAuthority`] to mint an SVID for the resulting
 //!    SPIFFE ID and stream it back to the workload.
 //!
+//! Entitlement on long-lived streams (SPIFFE Workload API Appendix A §6):
+//!
+//! - `FetchX509SVID` retains the authenticated [`PeerInfo`] and re-runs the
+//!   attestor chain before every rotated issuance. A revoked/changed
+//!   entitlement yields a terminal `PermissionDenied` on the stream
+//!   (fail-closed); a changed authorized identity is reflected in the next
+//!   complete response.
+//! - `FetchX509Bundles` returns only public CA trust material (no private
+//!   keys). It requires the mandatory Workload API metadata header but does
+//!   **not** run attestor/entitlement checks — bundle-only callers need trust
+//!   roots to validate peers without holding an SVID. Private-key issuance
+//!   remains gated exclusively on `FetchX509SVID`.
+//!
 //! Phase A wires up the gRPC service handlers and a `serve` entry point.
 //! Listener bind / shutdown integration with the rest of the binary lands
 //! in Phase C — Phase A keeps everything additive.
@@ -143,7 +156,17 @@ impl WorkloadApiService {
         &self,
         peer: &PeerInfo,
     ) -> Result<crate::identity::attestation::WorkloadIdentity, Status> {
-        match attest_chain(&self.attestors, peer).await {
+        Self::attest_with(&self.attestors, peer).await
+    }
+
+    /// Authoritative attestor-chain check used both at stream open and before
+    /// every rotated `FetchX509SVID` issuance. Failures map to
+    /// `PermissionDenied` (SPIFFE Workload API entitlement denial).
+    async fn attest_with(
+        attestors: &[Arc<dyn Attestor>],
+        peer: &PeerInfo,
+    ) -> Result<crate::identity::attestation::WorkloadIdentity, Status> {
+        match attest_chain(attestors, peer).await {
             Ok(id) => {
                 debug!(
                     spiffe_id = %id.spiffe_id,
@@ -328,6 +351,9 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         request: Request<X509svidRequest>,
     ) -> Result<Response<Self::FetchX509SVIDStream>, Status> {
         Self::validate_workload_metadata(&request)?;
+        // Retain PeerInfo for the lifetime of the stream so each rotation
+        // re-runs the authoritative attestor/entitlement checks rather than
+        // treating the initial SPIFFE ID as an indefinite renewal capability.
         let peer = Self::peer_info_from_request(&request);
         let identity = self.attest(&peer).await?;
         let initial = self.build_x509_svid_response(&identity).await?;
@@ -335,7 +361,7 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         let ca = Arc::clone(&self.ca);
         let td = self.trust_domain.clone();
         let ttl = self.svid_ttl_secs;
-        let id = identity.spiffe_id.clone();
+        let attestors = self.attestors.clone();
         let federated_trust_domains = self.federated_trust_domains.clone();
         let mut rx = self.rotation_signal.subscribe();
 
@@ -347,10 +373,19 @@ impl SpiffeWorkloadApi for WorkloadApiService {
                 if !Self::wait_for_rotation_or_stream_close(&mut rx, &tx).await {
                     return;
                 }
+                // Appendix A §6: validate the pending response — ensure the
+                // client is still entitled before minting a replacement SVID.
+                let identity = match Self::attest_with(&attestors, &peer).await {
+                    Ok(id) => id,
+                    Err(status) => {
+                        let _ = tx.send(Err(status));
+                        return;
+                    }
+                };
                 match Self::build_x509_svid_response_static(
                     &ca,
                     &td,
-                    &id,
+                    &identity.spiffe_id,
                     ttl,
                     &federated_trust_domains,
                 )
@@ -362,6 +397,8 @@ impl SpiffeWorkloadApi for WorkloadApiService {
                         }
                     }
                     Err(e) => {
+                        // Transient CA failures are not entitlement denials;
+                        // keep the stream open and retry on the next epoch.
                         warn!(error = %e, "rotation push failed for FetchX509SVID stream");
                     }
                 }
@@ -380,6 +417,11 @@ impl SpiffeWorkloadApi for WorkloadApiService {
         &self,
         request: Request<X509BundlesRequest>,
     ) -> Result<Response<Self::FetchX509BundlesStream>, Status> {
+        // Bundle-only entitlement policy (explicit): this RPC returns public
+        // CA trust material only — never private keys — so it does not run
+        // the attestor chain. Callers still must present the mandatory
+        // `workload.spiffe.io` metadata. Private-key SVID issuance and
+        // rotation revalidation live exclusively on `FetchX509SVID`.
         Self::validate_workload_metadata(&request)?;
         let initial = Self::build_x509_bundles_response_static(
             &self.ca,

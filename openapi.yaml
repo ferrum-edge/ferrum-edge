@@ -169,12 +169,14 @@ paths:
         complete it returns `200 OK` with `status` set to `"ok"` or
         `"degraded"` (DB disconnected / admin writes blocked / database
         incremental polling repeatedly rejecting the same delta while serving
-        last known-good config; or, in database or control-plane mode, a full
-        config load rejected by the runtime-config validation contract while the
-        backend is reachable — `config_rejected: true`, admin stays writable as
-        the in-band repair path, gated on any deferred schema migration applying
-        first). `config_rejected` is a sticky flag cleared only by an accepted
-        authoritative full reload; while the backend is unreachable
+        last known-good config; or, in database, control-plane, or file mode, a
+        full config load/reload rejected while the previous generation keeps
+        serving — `config_rejected: true`. In database/CP the admin API stays
+        writable as the in-band repair path, gated on any deferred schema
+        migration applying first; in file mode the admin API stays read-only and
+        operators repair by fixing the file and reloading). `config_rejected` is
+        a sticky flag cleared only by an accepted authoritative full reload
+        (Applied or Unchanged); while the backend is unreachable
         (`db_available` false / `admin_writes_enabled` false) the detail is
         suppressed so it never advertises the writable repair path during an
         outage. In CP/DP/mesh modes, if a supervised serving
@@ -228,6 +230,11 @@ paths:
         non-secret provenance, load state, parsed certificate metadata, and the
         runtime/config surfaces using each source. Inline PEM and private key
         bytes are never returned.
+
+        This endpoint collects live: every configured source is loaded on each
+        request (private keys are parse-checked and dropped immediately). The
+        Prometheus `/metrics` scrape path does not share that behavior — it reads
+        a cached, non-secret snapshot that never materializes private keys.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/PaginationLimit"
@@ -653,7 +660,11 @@ paths:
     post:
       operationId: createManagedTlsCertificate
       summary: Upload an admin-managed TLS certificate and private key
-      description: Private key bytes are persisted in the managed store but are never returned in responses.
+      description: |
+        Private key bytes are persisted in the managed store but are never returned
+        in responses. Managed TLS record IDs are globally unique across certificates,
+        CA bundles, CRLs, OCSP responses, and JWKS. Create with `allow_overwrite=true`
+        rejects a cross-kind ID collision with `409 Conflict`.
       tags: [TLS]
       requestBody:
         required: true
@@ -691,6 +702,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -700,6 +713,12 @@ paths:
     put:
       operationId: updateManagedTlsCertificate
       summary: Rotate an admin-managed TLS certificate and private key
+      description: |
+        Same-kind replacement only. Because managed TLS IDs are globally unique,
+        updating an ID that already stores a different material kind returns
+        `409 Conflict` with a stable kind-collision error. Admission validates
+        the new PEM before persistence; watchers atomically activate or retain
+        the previous runtime config.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -724,6 +743,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsCertificate
       summary: Delete an unreferenced admin-managed TLS certificate
@@ -733,6 +754,8 @@ paths:
       responses:
         "200":
           description: Managed certificate deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -766,6 +789,10 @@ paths:
     post:
       operationId: createManagedTlsCaBundle
       summary: Upload an admin-managed TLS CA bundle
+      description: |
+        Managed TLS record IDs are globally unique across material kinds. Create
+        with `allow_overwrite=true` rejects a cross-kind ID collision with
+        `409 Conflict`.
       tags: [TLS]
       requestBody:
         required: true
@@ -803,6 +830,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -812,6 +841,10 @@ paths:
     put:
       operationId: updateManagedTlsCaBundle
       summary: Rotate an admin-managed TLS CA bundle
+      description: |
+        Same-kind replacement only. Cross-kind ID collisions return `409 Conflict`.
+        Admission validates the CA PEM before persistence; watchers atomically
+        activate or retain the previous runtime config.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -836,6 +869,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsCaBundle
       summary: Delete an unreferenced admin-managed TLS CA bundle
@@ -845,6 +880,8 @@ paths:
       responses:
         "200":
           description: Managed CA bundle deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -878,6 +915,10 @@ paths:
     post:
       operationId: createManagedTlsCrl
       summary: Upload an admin-managed TLS CRL bundle
+      description: |
+        Managed TLS record IDs are globally unique across material kinds. Create
+        with `allow_overwrite=true` rejects a cross-kind ID collision with
+        `409 Conflict`.
       tags: [TLS]
       requestBody:
         required: true
@@ -915,6 +956,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -924,6 +967,8 @@ paths:
     put:
       operationId: updateManagedTlsCrl
       summary: Rotate an admin-managed TLS CRL bundle
+      description: |
+        Same-kind replacement only. Cross-kind ID collisions return `409 Conflict`.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -948,6 +993,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsCrl
       summary: Delete an unreferenced admin-managed TLS CRL bundle
@@ -957,6 +1004,8 @@ paths:
       responses:
         "200":
           description: Managed CRL deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -990,6 +1039,10 @@ paths:
     post:
       operationId: createManagedTlsOcspResponse
       summary: Upload an admin-managed DER OCSP response
+      description: |
+        Managed TLS record IDs are globally unique across material kinds. Create
+        with `allow_overwrite=true` rejects a cross-kind ID collision with
+        `409 Conflict`.
       tags: [TLS]
       requestBody:
         required: true
@@ -1027,6 +1080,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1036,6 +1091,8 @@ paths:
     put:
       operationId: updateManagedTlsOcspResponse
       summary: Rotate an admin-managed DER OCSP response
+      description: |
+        Same-kind replacement only. Cross-kind ID collisions return `409 Conflict`.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1060,6 +1117,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsOcspResponse
       summary: Delete an unreferenced admin-managed OCSP response
@@ -1069,6 +1128,8 @@ paths:
       responses:
         "200":
           description: Managed OCSP response deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1102,6 +1163,10 @@ paths:
     post:
       operationId: createManagedTlsJwks
       summary: Upload an admin-managed JWKS document
+      description: |
+        Managed TLS record IDs are globally unique across material kinds. Create
+        with `allow_overwrite=true` rejects a cross-kind ID collision with
+        `409 Conflict`.
       tags: [TLS]
       requestBody:
         required: true
@@ -1139,6 +1204,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagedTlsRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1148,6 +1215,8 @@ paths:
     put:
       operationId: updateManagedTlsJwks
       summary: Rotate an admin-managed JWKS document
+      description: |
+        Same-kind replacement only. Cross-kind ID collisions return `409 Conflict`.
       tags: [TLS]
       parameters:
         - $ref: "#/components/parameters/ResourceId"
@@ -1172,6 +1241,8 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
     delete:
       operationId: deleteManagedTlsJwks
       summary: Delete an unreferenced admin-managed JWKS document
@@ -1181,6 +1252,8 @@ paths:
       responses:
         "200":
           description: Managed JWKS document deleted
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
@@ -1351,6 +1424,16 @@ paths:
         certificate rotation counters, source refresh outcomes, source fetch
         duration histograms, and bounded source fetch failure counters when
         those source watchers are active.
+        Certificate expiry/validity gauges are rendered from a cached,
+        non-secret TLS inventory snapshot: a scrape performs no filesystem,
+        Kubernetes, HSM, or cloud-secret I/O, never materializes private-key
+        bytes, and never blocks on a secret provider. The snapshot is produced
+        by a bounded single-flight background refresh governed by
+        `FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS` (default 300 seconds, `0`
+        disables it), and its freshness is exported explicitly as
+        `ferrum_tls_inventory_snapshot_timestamp_seconds` alongside the
+        configured bound `ferrum_tls_inventory_snapshot_max_age_seconds`.
+        Certificate gauges are absent until the first snapshot is published.
         Database mode adds bounded rejected-delta polling counters and gauges
         for validation rejections, retry backoff buckets, forced full reloads,
         and recoveries. These labels never include raw resource IDs.
@@ -5337,7 +5420,11 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     Conflict:
-      description: Resource already exists, conflicts with an existing resource, or the mutation would make mTLS DNS identities ambiguous
+      description: >
+        Resource already exists, conflicts with an existing resource, a managed TLS
+        ID collides across material kinds, the mutation would invalidate an active
+        managed TLS reference on delete, or the mutation would make mTLS DNS
+        identities ambiguous
       content:
         application/json:
           schema:
@@ -5841,6 +5928,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            Replace an existing record with the same globally unique ID only when
+            the existing material kind matches this collection. Cross-kind
+            collisions return 409 Conflict.
         allow_expired:
           type: boolean
           default: false
@@ -5864,6 +5955,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            Replace an existing record with the same globally unique ID only when
+            the existing material kind matches this collection. Cross-kind
+            collisions return 409 Conflict.
         allow_expired:
           type: boolean
           default: false
@@ -5887,6 +5982,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            Replace an existing record with the same globally unique ID only when
+            the existing material kind matches this collection. Cross-kind
+            collisions return 409 Conflict.
 
     ManagedTlsOcspResponseRequest:
       type: object
@@ -5904,6 +6003,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            Replace an existing record with the same globally unique ID only when
+            the existing material kind matches this collection. Cross-kind
+            collisions return 409 Conflict.
 
     ManagedTlsJwksRequest:
       type: object
@@ -5921,6 +6024,10 @@ components:
         allow_overwrite:
           type: boolean
           default: false
+          description: >
+            Replace an existing record with the same globally unique ID only when
+            the existing material kind matches this collection. Cross-kind
+            collisions return 409 Conflict.
 
     TlsInventoryListResponse:
       type: object
@@ -6422,6 +6529,9 @@ components:
           description: |
             HTTP/2 initial per-stream flow-control window size in bytes (overrides global).
             Larger values improve single-stream throughput. Range: 65535–134217728 (128 MiB). Default: 8388608 (8 MiB).
+            While adaptive windowing remains enabled, hyper/reqwest BDP probing overrides this fixed size.
+            Setting this (or the connection window) without also setting pool_http2_adaptive_window
+            explicitly auto-disables adaptive at this proxy so the fixed window takes effect.
         pool_http2_initial_connection_window_size:
           type: [integer, "null"]
           format: uint32
@@ -6430,11 +6540,15 @@ components:
           description: |
             HTTP/2 initial connection-level flow-control window size in bytes (overrides global).
             Aggregate budget shared across all concurrent streams. Range: 65535–134217728 (128 MiB). Default: 33554432 (32 MiB).
+            Same adaptive-vs-fixed precedence as pool_http2_initial_stream_window_size.
         pool_http2_adaptive_window:
           type: [boolean, "null"]
           description: |
             Enable adaptive flow-control (BDP probing) for HTTP/2 connections (overrides global).
             Enabled by default — BDP probing dynamically sizes flow-control windows for optimal throughput. Default: true.
+            While enabled, adaptive windowing overrides fixed initial stream/connection window sizes.
+            An explicit adaptive choice remains authoritative even alongside window overrides; omit this
+            field when setting explicit windows to auto-disable adaptive so fixed sizes apply.
         pool_http2_max_frame_size:
           type: [integer, "null"]
           format: uint32
@@ -8596,8 +8710,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -8670,8 +8785,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -9913,24 +10029,27 @@ components:
         config_rejected:
           type: boolean
           description: |
-            Database and control-plane modes only, authenticated detail only.
-            Present and `true` when the latest **full** config load was rejected
-            by the runtime-config validation contract (a reachable backend served
-            a semantically-invalid snapshot). The gateway keeps serving the last
-            known-good config and, because the backend is reachable, keeps the
-            admin API writable (`admin_writes_enabled` stays `true`) so the
-            offending resource can be repaired in-band; `status` is forced to
-            `degraded`. Re-enabling writes is gated on any deferred schema
-            migration applying first, so a reachable backend with a still-pending
-            schema keeps writes blocked while this flag stays set. The flag is
-            sticky and clears only when an accepted authoritative **full** reload
-            proves the offending resource is gone (an accepted incremental poll
-            does not clear it). While the backend is unreachable
-            (`admin_writes_enabled` false) this detail is suppressed so it never
-            advertises the writable repair path during an outage, even though the
-            underlying flag remains set. A genuine connectivity failure is
-            reported via `admin_writes_enabled`/`status` instead and does not set
-            this flag.
+            Database, control-plane, and file modes, authenticated detail only.
+            Present and `true` when the latest **full** config load/reload was
+            rejected: in database/CP, by the runtime-config validation contract
+            (a reachable backend served a semantically-invalid snapshot); in file
+            mode, when a SIGHUP candidate fails read, parse, validation, or apply.
+            The gateway keeps serving the last known-good config. In database/CP,
+            because the backend is reachable, the admin API stays writable
+            (`admin_writes_enabled` stays `true`) so the offending resource can be
+            repaired in-band; `status` is forced to `degraded`. Re-enabling writes
+            is gated on any deferred schema migration applying first, so a
+            reachable backend with a still-pending schema keeps writes blocked
+            while this flag stays set. In file mode the admin API remains
+            read-only; operators repair by fixing the config file and reloading.
+            The flag is sticky and clears only when an accepted authoritative
+            **full** reload proves the candidate is valid again (Applied or
+            Unchanged; an accepted incremental poll in database/CP does not clear
+            it). While the backend is unreachable (`admin_writes_enabled` false)
+            this detail is suppressed so it never advertises the writable repair
+            path during an outage, even though the underlying flag remains set. A
+            genuine connectivity failure is reported via
+            `admin_writes_enabled`/`status` instead and does not set this flag.
         mesh:
           $ref: "#/components/schemas/MeshHealthResponse"
         listener_failures:
@@ -16278,8 +16397,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL-based authentication (Redis 6+)
@@ -18120,8 +18240,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -18235,8 +18356,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -18871,15 +18993,18 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        Plugin: ai_semantic_cache — Caches LLM responses keyed by normalized
+        Plugin: ai_semantic_cache — Caches LLM responses keyed by family-correct
         prompts across Ferrum's recognized request families (OpenAI Chat
         messages, Anthropic messages/system, OpenAI Responses
         input/instructions, Gemini/Vertex contents/systemInstruction, Cohere
         chat_history/message, legacy prompt, TGI inputs, and Titan inputText).
-        Unknown or ambiguous JSON shapes bypass caching. Exact-match
-        normalization is enabled by default; optional semantic similarity uses
-        a configured embedding provider and a local HNSW vector index.
-        Supports local DashMap and Redis exact-response storage. Multiple
+        Unknown or ambiguous JSON shapes bypass caching. Exact keys preserve
+        LLM-significant prompt case and whitespace while applying structurally
+        safe canonicalization; optional semantic similarity uses a configured
+        embedding provider and a local HNSW vector index.
+        Supports local DashMap and Redis exact-response storage. Redis mode
+        requires redis_integrity_key and treats Redis as an untrusted,
+        authenticated trust boundary. Multiple
         instances on one proxy namespace request staging metadata under
         ai_semantic_cache.<instance_id>.* and keep embedding/scope vectors in
         per-instance RequestContext maps so differing key policies and
@@ -18898,26 +19023,30 @@ components:
           type: integer
           format: uint64
           default: 10000
-          description: Maximum number of cached entries (local mode). In semantic mode, HNSW snapshot memory also scales with this count outside max_total_size_bytes.
+          description: Maximum number of cached entries (local mode). In semantic mode, HNSW snapshot memory scales with this count and is charged against max_total_size_bytes.
         max_entry_size_bytes:
           type: integer
           format: uint64
           default: 1048576
-          description: Maximum size of a single cached response body in bytes (1 MiB)
+          maximum: 16777216
+          description: >-
+            Maximum size of a single cached response body in bytes (1 MiB).
+            Hard maximum 16 MiB; larger values are rejected at admission so Redis
+            transfer caps cannot saturate platform integers.
         max_total_size_bytes:
           type: integer
           format: uint64
           default: 104857600
+          maximum: 1073741824
           description: >-
-            Maximum total response-entry cache size in bytes (100 MiB, local
-            mode). Includes response bodies, cached headers, semantic scope
-            keys, and retained embedding vectors; excludes the separate HNSW
-            snapshot copy and transient rebuild buffers. Concurrent stores of
-            distinct keys may briefly overshoot this soft ceiling (bounded by
-            concurrency × max_entry_size_bytes) until TTL/max-entries cleanup
-            reclaims space. Same-key replacement accounts for the displaced
-            DashMap entry so the retained-size counter never accumulates
-            phantom bytes for overwritten values.
+            Maximum retained local cache memory in bytes (100 MiB, local mode;
+            hard maximum 1 GiB). Includes response bodies, cached headers,
+            semantic scope keys, retained embedding vectors, published HNSW
+            snapshot generations, and in-flight rebuild workspace reservations.
+            Concurrent stores and rebuilds use lock-free byte leases so
+            overlapping old/candidate generations are charged at peak and
+            failed/superseded rebuilds release promptly. A store or rebuild that
+            cannot reserve is skipped.
         include_model_in_key:
           type: boolean
           default: true
@@ -18979,7 +19108,13 @@ components:
           type: integer
           format: uint64
           default: 16
-          description: Number of nearest HNSW candidates to inspect during semantic lookup.
+          minimum: 1
+          maximum: 1024
+          description: >-
+            Number of nearest HNSW candidates to inspect during semantic lookup
+            (`ef_search` / `ef_construction`). Hard maximum 1024; larger values
+            are rejected at admission so semantic search cannot be configured
+            into an unbounded graph walk.
         semantic_embedding_timeout_ms:
           type: integer
           format: uint64
@@ -19008,8 +19143,9 @@ components:
           type: integer
           format: uint64
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_connect_timeout_seconds:
           type: integer
           format: uint64
@@ -19026,6 +19162,16 @@ components:
         redis_password:
           type: string
           description: Redis password
+        redis_integrity_key:
+          type: string
+          minLength: 32
+          description: >-
+            Narrowly scoped HMAC-SHA256 secret that authenticates Redis cache
+            envelopes. Required when sync_mode is redis (fail closed if omitted).
+            Minimum 32 bytes. Bound to the full status/header/body envelope and
+            the Redis namespace/key context. Compared in constant time; never
+            logged. Rolling the key quarantines prior entries — there is no
+            legacy unauthenticated read path during build-out.
 
     AiTokenMetricsConfig:
       type: object
@@ -19251,8 +19397,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_username:
           type: string
           description: Redis username for ACL authentication
@@ -20048,7 +20195,7 @@ components:
     AiStreamRouterConfig:
       type: object
       additionalProperties: false
-      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (after ai_semantic_cache at 2980, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Fallback across providers after the first downstream byte is out of scope (ai_stream_router.fallback_attempts is always 0). Configuration is strict: unknown root, provider, and fallback fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
+      description: "Plugin: ai_stream_router — streaming counterpart to ai_federation. Claims ONLY OpenAI Chat Completions requests with `stream: true` and preserves true end-to-end SSE streaming. Runs at priority 2984 (before ai_semantic_cache at 2996, before ai_federation at 4060). Instead of an internal terminate-and-respond HTTP call, it rewrites the routing decision via RequestContext.route_override_* so the normal proxy dispatch streams the provider response straight back to the client. Strips client credential headers (Authorization, Proxy-Authorization, Cookie, and API-key headers) and injects the provider's credential; gateway-asserted x-consumer-* identity headers are also suppressed toward the provider. openai/openai_compatible providers pass through unchanged except optional stream_options.include_usage injection; anthropic requests are translated to the Anthropic Messages API streaming request and Anthropic SSE events are normalized to OpenAI chat.completion.chunk SSE. google_gemini config is accepted for forward-compatibility but rejected at construction until implemented. When it claims a request it sets ctx.metadata ai_stream_router_claimed=true so ai_federation defers. Fails closed by default when a streaming request lacks a top-level string `model` or matches no provider. Non-streaming requests Continue to ai_federation. Fallback across providers after the first downstream byte is out of scope (ai_stream_router.fallback_attempts is always 0). Configuration is strict: unknown root, provider, and fallback fields are rejected with path-qualified diagnostics (and spelling suggestions when useful), so typos such as `enabeld` cannot silently leave the router enabled. The same constructor contract admits file validate/startup, Admin/database writes, and CP/DP snapshot or reload publication; invalid enabled configs reject publication and retain the last-known-good instance under the plugin's FailClosed policy. NOTE: this plugin is HTTP-only and routes over the normal dispatch path, so per-proxy backend TLS/DNS egress policy applies to provider endpoints."
       required: [providers]
       properties:
         enabled:
@@ -21539,8 +21686,9 @@ components:
         redis_pool_size:
           type: integer
           minimum: 1
+          maximum: 128
           default: 4
-          description: Number of multiplexed Redis connections. Must be greater than zero.
+          description: Number of multiplexed Redis connections. Must be between 1 and 128.
         redis_connect_timeout_seconds:
           type: integer
           minimum: 1

@@ -374,7 +374,7 @@ FERRUM_MODE=dp \
 
 ## File Mode (`FERRUM_MODE=file`)
 
-File mode is the simplest to upgrade because there's no database. The config file is read at startup and on SIGHUP reload (Unix). The risk is that a new Ferrum version might interpret existing config fields differently or require new fields.
+File mode is the simplest to upgrade because there's no database. The config file is read at startup and on SIGHUP reload (Unix). Both reads require a stable regular-file snapshot (byte-identical consecutive probes with matching path identity) and fail closed on torn in-place writes; SIGHUP keeps the last known-good generation. Publish config updates with atomic rename (or ConfigMap symlink swap), not save-in-place / shell redirection onto the live path — see [configuration.md](configuration.md#file-mode). The risk on version upgrades is that a new Ferrum version might interpret existing config fields differently or require new fields.
 
 ### Step-by-Step
 

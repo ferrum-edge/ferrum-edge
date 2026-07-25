@@ -1675,10 +1675,24 @@ plugin_configs: []
         w2,
         w1
     );
-    // Expected exact: 30, 20, 10
-    assert_eq!(w3, 30, "weight-3 should get 30 requests");
-    assert_eq!(w2, 20, "weight-2 should get 20 requests");
-    assert_eq!(w1, 10, "weight-1 should get 10 requests");
+    // Production advances independent per-worker WRR schedules to avoid a
+    // globally contended counter. A finite batch can therefore end with a few
+    // partial schedule periods even though every worker preserves 3:2:1.
+    // Unit tests cover the exact single-schedule sequence; this end-to-end
+    // assertion allows one request of drift per typical hosted worker.
+    const SHARDED_PERIOD_TOLERANCE: u32 = 4;
+    assert!(
+        w3.abs_diff(30) <= SHARDED_PERIOD_TOLERANCE,
+        "weight-3 count {w3} should remain near 30"
+    );
+    assert!(
+        w2.abs_diff(20) <= SHARDED_PERIOD_TOLERANCE,
+        "weight-2 count {w2} should remain near 20"
+    );
+    assert!(
+        w1.abs_diff(10) <= SHARDED_PERIOD_TOLERANCE,
+        "weight-1 count {w1} should remain near 10"
+    );
 
     let _ = gateway.kill();
     s1.abort();

@@ -1,8 +1,10 @@
 //! Connection pool manager for HTTP/HTTPS/WebSocket backend clients.
 //!
 //! Provides `reqwest::Client` reuse keyed by connection identity (destination,
-//! protocol, DNS override, TLS trust, mTLS credentials). Each unique key gets
-//! one `reqwest::Client` which internally manages its own TCP connection pool.
+//! protocol, DNS override, TLS trust, mTLS credentials) plus the inspectable
+//! `rcfg=…` client-behavior suffix for every setting baked into the shared
+//! client. Each unique key gets one `reqwest::Client` which internally manages
+//! its own TCP connection pool.
 //!
 //! All clients use the gateway's shared `DnsCache` as their resolver, keeping
 //! DNS lookups off the hot request path. A shared pool shell in `src/pool/`
@@ -41,7 +43,9 @@ struct ReqwestPoolManager {
 
 impl ReqwestPoolManager {
     fn pool_key_owned(&self, proxy: &Proxy) -> String {
-        let mut key = String::with_capacity(128);
+        // Capacity covers identity fields plus the inspectable `rcfg=…`
+        // client-behavior suffix without a mid-build realloc on the common path.
+        let mut key = String::with_capacity(192);
         self.build_key(proxy, &proxy.backend_host, proxy.backend_port, 0, &mut key);
         key
     }
@@ -87,20 +91,17 @@ impl ReqwestPoolManager {
             // must only touch configured backend targets (no redirected egress).
             .redirect(reqwest::redirect::Policy::none());
 
-        // NOTE: Neither `backend_connect_timeout_ms` nor `backend_read_timeout_ms`
-        // is baked into the client here. The `reqwest::Client` is shared across
-        // all proxies whose pool key resolves to the same identity (same
-        // backend, TLS, DNS override). Baking a timeout into the shared client
-        // means the first proxy to create the client would dictate the timeout
-        // for every other proxy reusing it — cross-route policy leakage.
+        // Request-only policy (connect/read timeouts) is NOT baked into this
+        // shared client — those are applied per-request on the dispatch side via
+        // `RequestBuilder::connect_timeout()` / `RequestBuilder::timeout()` (see
+        // `docs/upstream-reqwest-patches/001-per-request-connect-timeout/`).
         //
-        // Both timeouts are applied per-request on the dispatch side via
-        // `RequestBuilder::connect_timeout()` and `RequestBuilder::timeout()`
-        // which override the (absent) client defaults. The connect-timeout
-        // override is provided by a vendored copy of reqwest 0.13.2 with
-        // PR seanmonstar/reqwest#3017 applied (see
-        // `docs/upstream-reqwest-patches/001-per-request-connect-timeout/`
-        // for the lifecycle and retirement plan).
+        // Client-level settings below (idle timeout, TCP keepalive, H2 keepalive /
+        // windows / adaptive / max frame) *are* baked into the Client and cannot
+        // be overridden per request. They therefore enter the pool key via
+        // `PoolConfig::append_reqwest_client_behavior_pool_key` so two proxies
+        // with divergent values do not share a first-creator-wins client.
+        // `max_idle_per_host` remains global-only by deliberate tradeoff.
 
         if config.enable_http_keep_alive {
             client_builder =
@@ -181,7 +182,7 @@ impl PoolManager for ReqwestPoolManager {
             || (proxy
                 .backend_scheme
                 .is_some_and(|scheme| scheme.is_tls_backend())
-                && !self.global_config.for_proxy(proxy).enable_http2);
+                && !self.global_config.effective_enable_http2(proxy));
         if force_reqwest_http1 {
             buf.push_str("h1");
         }
@@ -216,6 +217,11 @@ impl PoolManager for ReqwestPoolManager {
             verify,
             svid_generation,
         );
+        // Client-baked pool settings (idle timeout, keepalive, H2 windows, …)
+        // that `create_client` installs on the shared reqwest::Client. Request-
+        // only timeouts stay out; `max_idle_per_host` stays global-only.
+        self.global_config
+            .append_reqwest_client_behavior_pool_key(proxy, buf);
     }
 
     async fn create(&self, _key: &str, proxy: &Proxy) -> Result<reqwest::Client> {

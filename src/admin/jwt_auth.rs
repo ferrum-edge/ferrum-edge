@@ -7,10 +7,13 @@
 //!
 //! [`create_jwt_manager_from_env`] requires `FERRUM_ADMIN_JWT_SECRET` to be set
 //! and non-empty, with a minimum length of
-//! [`crate::config::types::MIN_JWT_SECRET_LENGTH`]; otherwise it returns
-//! [`JwtError::VerificationFailed`]. The random-secret fallback used by
-//! read-only file mode (so externally-crafted tokens can never validate) is
-//! handled at the call site that constructs the admin state, not here.
+//! [`crate::config::types::MIN_JWT_SECRET_LENGTH`]. When the secret is unset
+//! it returns [`JwtError::NotConfigured`]; when the secret or a
+//! related setting (for example `FERRUM_ADMIN_JWT_MAX_TTL`) is present but
+//! invalid it returns [`JwtError::VerificationFailed`]. Read-only file/mesh/
+//! node_agent modes may generate a random secret only on `NotConfigured`; any
+//! other error must fail startup. That fallback lives at the admin-state call
+//! site, not here.
 
 use jsonwebtoken::{
     Algorithm, DecodingKey, TokenData, Validation, decode, errors::Error as JwtEncodeError,
@@ -316,6 +319,9 @@ impl JwtManager {
 
 /// JWT Error types
 pub enum JwtError {
+    /// `FERRUM_ADMIN_JWT_SECRET` is unset. Read-only modes may
+    /// generate a random secret on this variant only.
+    NotConfigured,
     MissingHeader,
     InvalidHeaderFormat,
     VerificationFailed(String),
@@ -324,6 +330,7 @@ pub enum JwtError {
 impl std::fmt::Debug for JwtError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            JwtError::NotConfigured => write!(f, "NotConfigured"),
             JwtError::MissingHeader => write!(f, "MissingHeader"),
             JwtError::InvalidHeaderFormat => write!(f, "InvalidHeaderFormat"),
             JwtError::VerificationFailed(msg) => write!(f, "VerificationFailed({})", msg),
@@ -334,6 +341,7 @@ impl std::fmt::Debug for JwtError {
 impl std::fmt::Display for JwtError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let msg = match self {
+            JwtError::NotConfigured => "FERRUM_ADMIN_JWT_SECRET is not set",
             JwtError::MissingHeader => "Missing Authorization header",
             JwtError::InvalidHeaderFormat => "Invalid Authorization header format",
             JwtError::VerificationFailed(msg) => msg.as_str(),
@@ -344,20 +352,60 @@ impl std::fmt::Display for JwtError {
 
 impl std::error::Error for JwtError {}
 
+/// Parse `FERRUM_ADMIN_JWT_MAX_TTL` from env/`ferrum.conf`.
+///
+/// A present-but-invalid value is a misconfiguration of a security control, so
+/// it fails instead of silently falling back to the default or to an
+/// effectively unlimited cap. `0` remains the documented disable sentinel;
+/// values above `i64::MAX` are not representable as a JWT `NumericDate` bound
+/// and are rejected the same way `EnvConfig::validate()` rejects them.
+fn admin_jwt_max_ttl_from_env() -> Result<u64, JwtError> {
+    use crate::config::conf_file::resolve_ferrum_var;
+
+    match resolve_ferrum_var("FERRUM_ADMIN_JWT_MAX_TTL") {
+        Some(raw) => {
+            let parsed: u64 = raw.trim().parse().map_err(|_| {
+                JwtError::VerificationFailed(
+                    "FERRUM_ADMIN_JWT_MAX_TTL must be a non-negative integer number of seconds; \
+                     use 0 to disable the lifetime cap"
+                        .to_string(),
+                )
+            })?;
+            if i64::try_from(parsed).is_err() {
+                return Err(JwtError::VerificationFailed(format!(
+                    "FERRUM_ADMIN_JWT_MAX_TTL ({parsed}) exceeds the maximum supported value \
+                     ({}); use 0 to disable the lifetime cap",
+                    i64::MAX
+                )));
+            }
+            Ok(parsed)
+        }
+        None => Ok(3600),
+    }
+}
+
 /// Create JWT manager from environment variables and `ferrum.conf`.
 ///
 /// Uses `resolve_ferrum_var()` so that `ferrum.conf` values are respected
 /// when the corresponding environment variable is not set.
+///
+/// Returns [`JwtError::NotConfigured`] only when the secret is unset
+/// and any explicitly supplied related JWT settings are valid. Present-but-
+/// invalid settings (short secret, malformed max TTL) return
+/// [`JwtError::VerificationFailed`] so call sites cannot treat operator
+/// intent as "unset".
 pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
     use crate::config::conf_file::resolve_ferrum_var;
 
-    let secret = resolve_ferrum_var("FERRUM_ADMIN_JWT_SECRET")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            JwtError::VerificationFailed(
-                "FERRUM_ADMIN_JWT_SECRET must be set and non-empty".to_string(),
-            )
-        })?;
+    // Validate related settings before classifying the secret as unset so a
+    // present-but-invalid `FERRUM_ADMIN_JWT_MAX_TTL` cannot be downgraded to
+    // the read-only random-secret fallback.
+    let max_ttl = admin_jwt_max_ttl_from_env()?;
+
+    let secret = match resolve_ferrum_var("FERRUM_ADMIN_JWT_SECRET") {
+        Some(secret) => secret,
+        None => return Err(JwtError::NotConfigured),
+    };
 
     if secret.len() < crate::config::types::MIN_JWT_SECRET_LENGTH {
         return Err(JwtError::VerificationFailed(format!(
@@ -373,32 +421,6 @@ pub fn create_jwt_manager_from_env() -> Result<JwtManager, JwtError> {
     // Optional: when set (and non-empty), Admin API tokens must carry a
     // matching `aud` claim. Unset ⇒ audience is not validated.
     let audience = resolve_ferrum_var("FERRUM_ADMIN_JWT_AUDIENCE").filter(|s| !s.is_empty());
-
-    // A present-but-invalid value is a misconfiguration of a security
-    // control, so it fails startup instead of silently falling back to the
-    // default or to an effectively unlimited cap. `0` remains the documented
-    // disable sentinel; values above `i64::MAX` are not representable as a
-    // JWT `NumericDate` bound and are rejected the same way
-    // `EnvConfig::validate()` rejects them.
-    let max_ttl = match resolve_ferrum_var("FERRUM_ADMIN_JWT_MAX_TTL").filter(|s| !s.is_empty()) {
-        Some(raw) => {
-            let parsed: u64 = raw.trim().parse().map_err(|_| {
-                JwtError::VerificationFailed(format!(
-                    "FERRUM_ADMIN_JWT_MAX_TTL must be a non-negative integer number of seconds \
-                     (got '{raw}'); use 0 to disable the lifetime cap"
-                ))
-            })?;
-            if i64::try_from(parsed).is_err() {
-                return Err(JwtError::VerificationFailed(format!(
-                    "FERRUM_ADMIN_JWT_MAX_TTL ({parsed}) exceeds the maximum supported value \
-                     ({}); use 0 to disable the lifetime cap",
-                    i64::MAX
-                )));
-            }
-            parsed
-        }
-        None => 3600,
-    };
 
     let config = JwtConfig {
         secret,

@@ -2591,6 +2591,123 @@ fn retry_proxy_rejects_required_mesh_transport_upstream_targets() {
 }
 
 #[test]
+fn backend_tls_sni_with_retry_fails_validate_upstream_references() {
+    let mut upstream = make_upstream("sni-upstream");
+    upstream.backend_tls_sni = Some("backend.mesh.internal".into());
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-upstream".into());
+    proxy.retry = Some(RetryConfig::default());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.normalize_fields();
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| {
+            msg.contains("enables retry")
+                && msg.contains("backend TLS SNI")
+                && msg.contains("direct HTTP/2")
+        }),
+        "expected SNI+retry admission rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn backend_tls_sni_with_grpc_web_buffering_fails_validate() {
+    let mut upstream = make_upstream("sni-upstream");
+    upstream.backend_tls_sni = Some("backend.mesh.internal".into());
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-upstream".into());
+    proxy.plugins = vec![PluginAssociation {
+        plugin_config_id: "grpc-web-1".into(),
+    }];
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.plugin_configs = vec![PluginConfig {
+        id: "grpc-web-1".into(),
+        namespace: ferrum_edge::config::types::default_namespace(),
+        plugin_name: "grpc_web".into(),
+        scope: PluginScope::Proxy,
+        proxy_id: Some("p1".into()),
+        enabled: true,
+        config: serde_json::json!({}),
+        priority_override: None,
+        api_spec_id: None,
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    }];
+    config.normalize_fields();
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| {
+            msg.contains("request-body-buffering")
+                && msg.contains("backend TLS SNI")
+                && msg.contains("grpc-web-1")
+        }),
+        "expected SNI+buffering admission rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn backend_tls_sni_per_port_overlay_with_http2_disabled_fails_validate() {
+    let mut upstream = make_upstream("sni-upstream");
+    let mut per_port_tls = BackendTlsConfig::default_verify();
+    per_port_tls.sni = Some("reviews.mesh.internal".into());
+    upstream.port_overrides.insert(
+        8443,
+        UpstreamPortOverride {
+            tls: Some(per_port_tls),
+            ..UpstreamPortOverride::default()
+        },
+    );
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-upstream".into());
+    proxy.pool_enable_http2 = Some(false);
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.normalize_fields();
+
+    let err = config.validate_upstream_references().unwrap_err();
+    assert!(
+        err.iter().any(|msg| {
+            msg.contains("pool_enable_http2 is false")
+                && msg.contains("per-port TLS SNI")
+                && msg.contains("reviews.mesh.internal")
+        }),
+        "expected per-port SNI + http2-disabled rejection, got {err:?}"
+    );
+}
+
+#[test]
+fn backend_tls_sni_without_retry_or_buffering_passes_validate() {
+    let mut upstream = make_upstream("sni-upstream");
+    upstream.backend_tls_sni = Some("backend.mesh.internal".into());
+    let mut proxy = make_proxy("p1", "/api");
+    proxy.backend_scheme = Some(BackendScheme::Https);
+    proxy.dispatch_kind = DispatchKind::HttpsPool;
+    proxy.upstream_id = Some("sni-upstream".into());
+    let mut config = empty_config();
+    config.upstreams = vec![upstream];
+    config.proxies = vec![proxy];
+    config.normalize_fields();
+
+    assert!(
+        config.validate_upstream_references().is_ok(),
+        "SNI alone must pass admission under default body limits"
+    );
+}
+
+#[test]
 fn retry_proxy_allows_mesh_transport_target_outside_selected_subset() {
     let mut upstream = make_upstream("mixed-upstream");
     upstream.targets = vec![

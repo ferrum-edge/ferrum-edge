@@ -10,12 +10,328 @@
 //!
 //! Validation is strict in file mode (errors fail startup) vs. warn-only in
 //! database mode (stale config is better than no config).
+//!
+//! # Atomicity / stability contract
+//!
+//! File-mode startup and SIGHUP reload refuse to admit a candidate whose bytes
+//! were observed mid-update. The loader:
+//!
+//! 1. Opens only regular files (rejecting FIFOs/devices/directories; Unix opens
+//!    are non-blocking so a raced special file cannot wedge the worker).
+//! 2. Reads the opened handle, then re-fstats that handle and re-stats the
+//!    configured path so symlink/rename swaps mid-read fail closed.
+//! 3. Performs a second independent open/read and requires **byte-identical**
+//!    content plus matching file identity. Size/metadata agreement alone is
+//!    not treated as proof of content stability (same-size in-place rewrites
+//!    and paused torn truncations can keep metadata unchanged).
+//! 4. Retries a bounded number of times on instability, then fails closed.
+//!    Reload keeps the last known-good live generation; startup aborts.
+//!
+//! Operators should publish updates with write-temp → fsync → `rename(2)` (or
+//! an equivalent atomic replace such as a Kubernetes ConfigMap symlink swap).
+//! Optional top-level `resource_counts` seals trailing list sections against
+//! settled truncations that survive the stability window.
 
 use crate::config::config_migration::ConfigMigrator;
 use crate::config::types::{CURRENT_CONFIG_VERSION, GatewayConfig};
 use crate::config::validation_pipeline::{ValidationAction, ValidationPipeline};
+use serde::Deserialize;
+use std::io::Read;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 use tracing::{info, warn};
+
+/// Hard ceiling on a single file-mode config document. Bounds allocation before
+/// YAML/JSON parse of a hostile or accidentally enormous path target.
+const MAX_CONFIG_FILE_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
+/// How many open/read/compare cycles to attempt before failing closed.
+const STABLE_READ_MAX_ATTEMPTS: usize = 5;
+
+/// Settle delay between unstable attempts. Gives in-place writers a chance to
+/// finish (or expose a metadata/content change) without busy-spinning.
+const STABLE_READ_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+/// Optional file-mode integrity seal stripped before `GatewayConfig`
+/// deserialization (`deny_unknown_fields`). Validated against pre-namespace-
+/// filter resource lengths so a trailing `plugin_configs` truncation that still
+/// parses cannot silently drop auth/ACL plugins when the operator declares
+/// expected counts near the top of the document.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ResourceCounts {
+    proxies: usize,
+    consumers: usize,
+    plugin_configs: usize,
+    #[serde(default)]
+    upstreams: usize,
+}
+
+/// Filesystem identity captured around a stable read. Unix includes device,
+/// inode, and ctime so rename/symlink swaps are visible even when size and
+/// mtime are unchanged; portable platforms lean on the mandatory second
+/// content-equal read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigFileIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+impl ConfigFileIdentity {
+    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: std::os::unix::fs::MetadataExt::dev(metadata),
+            #[cfg(unix)]
+            inode: std::os::unix::fs::MetadataExt::ino(metadata),
+            #[cfg(unix)]
+            changed_seconds: std::os::unix::fs::MetadataExt::ctime(metadata),
+            #[cfg(unix)]
+            changed_nanoseconds: std::os::unix::fs::MetadataExt::ctime_nsec(metadata),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StableReadError {
+    Io(std::io::Error),
+    NotRegularFile,
+    TooLarge { len: u64 },
+    Unstable(&'static str),
+    NotUtf8(std::string::FromUtf8Error),
+}
+
+impl std::fmt::Display for StableReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::NotRegularFile => {
+                write!(f, "path exists but is not a regular file")
+            }
+            Self::TooLarge { len } => write!(
+                f,
+                "file is {len} bytes; maximum supported size is {MAX_CONFIG_FILE_BYTES} bytes"
+            ),
+            Self::Unstable(reason) => write!(f, "{reason}"),
+            Self::NotUtf8(error) => write!(f, "file is not valid UTF-8: {error}"),
+        }
+    }
+}
+
+impl From<std::io::Error> for StableReadError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+#[cfg(unix)]
+fn open_config_path(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        // A regular-file path can be replaced with a FIFO/device after the
+        // pre-open metadata check. Non-blocking open makes that race safe; the
+        // opened-handle file-type/identity checks below still reject it.
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn open_config_path(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+fn require_regular_file(metadata: &std::fs::Metadata) -> Result<(), StableReadError> {
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(StableReadError::NotRegularFile)
+    }
+}
+
+fn read_opened_config_file(
+    path: &Path,
+    file: &mut std::fs::File,
+    identity: &ConfigFileIdentity,
+) -> Result<Vec<u8>, StableReadError> {
+    if identity.len > MAX_CONFIG_FILE_BYTES {
+        return Err(StableReadError::TooLarge { len: identity.len });
+    }
+
+    let mut bytes = Vec::new();
+    {
+        let mut bounded = file.take(identity.len.saturating_add(1));
+        bounded.read_to_end(&mut bytes)?;
+    }
+    if bytes.len() as u64 != identity.len {
+        return Err(StableReadError::Unstable(
+            "byte length diverged from metadata while reading",
+        ));
+    }
+
+    let after = file.metadata()?;
+    require_regular_file(&after)?;
+    let after_identity = ConfigFileIdentity::from_metadata(&after);
+    if &after_identity != identity {
+        return Err(StableReadError::Unstable(
+            "opened file identity changed while reading",
+        ));
+    }
+
+    let path_metadata = std::fs::metadata(path)?;
+    require_regular_file(&path_metadata)?;
+    let path_identity = ConfigFileIdentity::from_metadata(&path_metadata);
+    if path_identity != *identity {
+        return Err(StableReadError::Unstable(
+            "configured path target changed while reading (symlink or rename swap)",
+        ));
+    }
+
+    Ok(bytes)
+}
+
+fn read_config_snapshot(path: &Path) -> Result<(ConfigFileIdentity, Vec<u8>), StableReadError> {
+    let path_metadata_before = std::fs::metadata(path)?;
+    require_regular_file(&path_metadata_before)?;
+    let path_identity_before = ConfigFileIdentity::from_metadata(&path_metadata_before);
+
+    let mut file = open_config_path(path)?;
+    let opened_metadata = file.metadata()?;
+    require_regular_file(&opened_metadata)?;
+    let opened_identity = ConfigFileIdentity::from_metadata(&opened_metadata);
+    if opened_identity != path_identity_before {
+        return Err(StableReadError::Unstable(
+            "path target changed before the file handle was opened",
+        ));
+    }
+
+    let bytes = read_opened_config_file(path, &mut file, &opened_identity)?;
+    Ok((opened_identity, bytes))
+}
+
+/// Read the config path with a deterministic stability/atomicity contract.
+///
+/// Two independent open/read cycles must observe the same file identity and
+/// byte-identical contents. Metadata/size agreement without content equality
+/// is insufficient and is not treated as success.
+fn read_stable_config_file(path: &Path) -> Result<String, anyhow::Error> {
+    let display_path = path.display();
+    let mut last_reason = String::from("unknown instability");
+
+    for attempt in 1..=STABLE_READ_MAX_ATTEMPTS {
+        match (|| -> Result<String, StableReadError> {
+            let (first_identity, first_bytes) = read_config_snapshot(path)?;
+            let (second_identity, second_bytes) = read_config_snapshot(path)?;
+            if second_identity != first_identity {
+                return Err(StableReadError::Unstable(
+                    "file identity changed between consecutive stable-read probes",
+                ));
+            }
+            if second_bytes != first_bytes {
+                return Err(StableReadError::Unstable(
+                    "file content changed between consecutive stable-read probes",
+                ));
+            }
+            String::from_utf8(first_bytes).map_err(StableReadError::NotUtf8)
+        })() {
+            Ok(content) => {
+                if attempt > 1 {
+                    info!(
+                        attempt,
+                        path = %display_path,
+                        "Configuration file stabilized after retry"
+                    );
+                }
+                return Ok(content);
+            }
+            Err(StableReadError::Unstable(reason)) => {
+                last_reason = reason.to_string();
+                warn!(
+                    attempt,
+                    max_attempts = STABLE_READ_MAX_ATTEMPTS,
+                    path = %display_path,
+                    reason,
+                    "Configuration file read was unstable; retrying"
+                );
+                if attempt < STABLE_READ_MAX_ATTEMPTS {
+                    std::thread::sleep(STABLE_READ_RETRY_DELAY);
+                }
+            }
+            Err(other) => {
+                return Err(anyhow::anyhow!(
+                    "Failed to read configuration file {display_path}: {other}"
+                ));
+            }
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "Configuration file {display_path} remained unstable after {STABLE_READ_MAX_ATTEMPTS} read \
+         attempts ({last_reason}). Publish updates with an atomic replace (write a temp file, \
+         fsync, rename over the path) or equivalent; file-mode reload keeps the last \
+         known-good live generation when this guard fails closed."
+    ))
+}
+
+fn take_resource_counts_from_json(
+    value: &mut serde_json::Value,
+) -> Result<Option<ResourceCounts>, anyhow::Error> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(None);
+    };
+    let Some(raw) = object.remove("resource_counts") else {
+        return Ok(None);
+    };
+    serde_json::from_value(raw)
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("invalid resource_counts: {error}"))
+}
+
+fn strip_resource_counts_from_yaml(yaml_value: &mut Option<serde_yaml::Value>) {
+    if let Some(serde_yaml::Value::Mapping(mapping)) = yaml_value.as_mut() {
+        mapping.remove(serde_yaml::Value::String("resource_counts".to_string()));
+    }
+}
+
+fn validate_resource_counts(
+    config: &GatewayConfig,
+    expected: &ResourceCounts,
+) -> Result<(), anyhow::Error> {
+    let observed = ResourceCounts {
+        proxies: config.proxies.len(),
+        consumers: config.consumers.len(),
+        plugin_configs: config.plugin_configs.len(),
+        upstreams: config.upstreams.len(),
+    };
+    if &observed == expected {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "resource_counts mismatch: declared proxies={}, consumers={}, plugin_configs={}, \
+         upstreams={} but file contains proxies={}, consumers={}, plugin_configs={}, \
+         upstreams={}. A torn or truncated trailing section (commonly plugin_configs) \
+         can parse as valid YAML while silently dropping resources; refuse the candidate.",
+        expected.proxies,
+        expected.consumers,
+        expected.plugin_configs,
+        expected.upstreams,
+        observed.proxies,
+        observed.consumers,
+        observed.plugin_configs,
+        observed.upstreams
+    );
+}
 
 /// Load configuration from a YAML or JSON file.
 ///
@@ -50,7 +366,7 @@ pub fn load_config_from_file(
         }
     }
 
-    let content = std::fs::read_to_string(file_path)?;
+    let content = read_stable_config_file(file_path)?;
     let ext = file_path
         .extension()
         .and_then(|e| e.to_str())
@@ -83,6 +399,12 @@ pub fn load_config_from_file(
     } else {
         (serde_json::from_str(&content)?, None)
     };
+
+    // Optional file-mode integrity seal. Strip before GatewayConfig
+    // deserialization so deny_unknown_fields stays authoritative for the
+    // runtime domain model; validate against observed lengths below.
+    let resource_counts = take_resource_counts_from_json(&mut value)?;
+    strip_resource_counts_from_yaml(&mut yaml_value);
 
     // Detect config version and migrate in memory if needed.
     //
@@ -136,9 +458,9 @@ pub fn load_config_from_file(
 
     // Deserialize current YAML from its retained value tree to preserve
     // YAML-specific features (including tagged enum variants). The only
-    // mutation is the accepted integer-to-string version rewrite above.
-    // Migrations still operate on serde_json::Value, which remains
-    // authoritative for older versions.
+    // mutations are the accepted integer-to-string version rewrite and the
+    // optional resource_counts strip above. Migrations still operate on
+    // serde_json::Value, which remains authoritative for older versions.
     let mut config: GatewayConfig = if is_yaml && file_version == CURRENT_CONFIG_VERSION {
         serde_yaml::from_value(yaml_value.ok_or_else(|| {
             anyhow::anyhow!("internal error: parsed YAML value was not retained")
@@ -146,6 +468,10 @@ pub fn load_config_from_file(
     } else {
         serde_json::from_value(value)?
     };
+
+    if let Some(ref expected) = resource_counts {
+        validate_resource_counts(&config, expected)?;
+    }
 
     ValidationPipeline::new(&mut config)
         .validate_resource_ids(ValidationAction::FatalCount(
@@ -195,7 +521,7 @@ pub fn load_config_from_file(
         );
     }
 
-    // Reject mesh-PROJECTED upstream fields on this operator-provided file load.
+    // Reject mesh-projected upstream fields on this operator-provided file load.
     // File config is operator-authored, so (like the admin write path) it must not
     // carry `Upstream.{port_overrides, source_locality, locality_lb_strict,
     // locality_lb_setting}` — those are owned by the mesh slice-apply layer and are

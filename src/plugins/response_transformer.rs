@@ -41,6 +41,18 @@
 //! entry falls back to `default_enabled` (defaults to `true` —
 //! fail-open).
 //!
+//! Because that gate can flip without a config reload, a cached
+//! representation could otherwise outlive the policy that produced it. This
+//! plugin does not try to detect that from the replay path: a finalized replay
+//! carries no evidence of which policy shaped it, and re-running rules on a
+//! guess would double-apply non-idempotent `add` sequences. Instead
+//! `response_caching` stamps every stored entry with the opaque identity paired
+//! atomically with the response-side gate map (pinned by
+//! `RequestContext::pin_response_policy_stamp`) and refetches from the origin
+//! when that identity no longer matches, so newly enabled redaction applies
+//! exactly once. The unconditional `finalized_response_replay` skip below
+//! therefore stays intact.
+//!
 //! ## Representation metadata after a body rewrite
 //!
 //! When a body rule actually changes the client-visible JSON bytes, the shared

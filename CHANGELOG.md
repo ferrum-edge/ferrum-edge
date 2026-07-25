@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Authenticated `/metrics` now renders TLS certificate gauges from a cached,
+  non-secret TLS inventory snapshot and performs no certificate, private-key,
+  Kubernetes, HSM, or cloud-secret I/O on the scrape path. The snapshot is
+  refreshed by a bounded single-flight background task governed by the new
+  `FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS` (default 300, `0` disables it), its
+  freshness is exported as `ferrum_tls_inventory_snapshot_timestamp_seconds` /
+  `ferrum_tls_inventory_snapshot_max_age_seconds`, and certificate gauges are
+  absent until the first snapshot is published. `GET /admin/tls/inventory` still
+  collects live.
 - Added release governance requiring version tags to match the package version and
   requiring build-out breaking changes to be recorded here.
 - Hardened `tcp_connection_throttle` config loading to fail closed for

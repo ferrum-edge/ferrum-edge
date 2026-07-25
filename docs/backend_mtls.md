@@ -248,7 +248,7 @@ Recommended practice:
 - Update the Secret or mounted files as usual.
 - Keep backend TLS live reload enabled for file/provider/Kubernetes/managed-backed sources, or trigger a **rolling restart** of the Deployment/StatefulSet after rotation if you intentionally disable it.
 
-Admin-managed backend certificate resources can be referenced with `managed://` source URIs. Updating those records through the admin API requests active TLS source reload watchers immediately.
+Admin-managed backend certificate resources can be referenced with `managed://` source URIs. Managed TLS IDs are globally unique across material kinds; typed admin create-with-overwrite and PUT reject cross-kind collisions with `409 Conflict`. Same-kind updates request active TLS source reload watchers immediately and keep existing `managed://` references valid.
 
 ## Implementation Details
 

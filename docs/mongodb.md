@@ -391,7 +391,9 @@ For MongoDB itself, consider using the [MongoDB Community Kubernetes Operator](h
 
 ## Schema and Migrations
 
-MongoDB uses **indexes** instead of SQL table migrations. Indexes are created automatically at startup or via `FERRUM_MODE=migrate`:
+MongoDB uses **indexes** instead of SQL table migrations. Indexes are created
+automatically at startup or via `FERRUM_MODE=migrate` from the canonical plan
+in `src/config/mongo_index_plan.rs` (shared by `up`, dry-run, and status):
 
 ```bash
 FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up \
@@ -401,7 +403,14 @@ FERRUM_MODE=migrate FERRUM_MIGRATE_ACTION=up \
   ferrum-edge
 ```
 
-Index creation is idempotent (`createIndex` is a no-op if the index already exists). See [docs/migrations.md](migrations.md#mongodb-migrations) for the full index reference.
+`FERRUM_MIGRATE_ACTION=status` connects and compares live indexes with that
+plan via `listIndexes` (present / missing / mismatched) without mutating;
+it also reports required guard-collection shells. Unreachable or unauthorized
+MongoDB fails the status command.
+`FERRUM_MIGRATE_DRY_RUN=true` prints the same plan without connecting.
+
+Index creation is idempotent (`createIndex` is a no-op if the full index spec
+already matches). See [docs/migrations.md](migrations.md#mongodb-migrations).
 
 ### Adding New Fields
 

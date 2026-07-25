@@ -13,12 +13,14 @@ build time.
 
 ## Why ferrum-edge needs it
 
-Ferrum's connection-pool keys intentionally exclude policy fields like
-`backend_connect_timeout_ms` (see CLAUDE.md > "Connection Pool Keys"
-> "Pool-key contract"). Two proxies that target the same backend share
-one `reqwest::Client`. Before this patch, the first proxy to populate a
-pool entry baked its connect timeout into the shared client and dictated
-the timeout for every other proxy reusing it — cross-proxy policy leakage.
+Ferrum's connection-pool keys exclude **request-only** policy fields like
+`backend_connect_timeout_ms` (see `.claude/rules/proxy-protocols.md` pool-key
+rules and the reqwest `rcfg` client-behavior suffix for settings that *are*
+baked into the shared client). Two proxies that target the same backend and
+share the same client-baked `rcfg` share one `reqwest::Client`. Before this
+patch, the first proxy to populate a pool entry baked its connect timeout into
+the shared client and dictated the timeout for every other proxy reusing it —
+cross-proxy policy leakage.
 
 The shipped fix moves both `backend_connect_timeout_ms` and
 `backend_read_timeout_ms` to the dispatch-site `RequestBuilder`, where

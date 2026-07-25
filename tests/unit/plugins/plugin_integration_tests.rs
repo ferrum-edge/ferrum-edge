@@ -1,6 +1,11 @@
 //! Integration tests for the plugin system
 //! Tests plugin creation, scope configuration, and error handling
 
+// Cache replay tests intentionally serialize complete async lifecycles against
+// process-global RTDS publications. The guard is test-only and no task in the
+// guarded lifecycle reacquires it.
+#![allow(clippy::await_holding_lock)]
+
 use ferrum_edge::config::types::{PluginConfig, PluginScope};
 use ferrum_edge::plugins::{
     Plugin, PluginResult, RequestContext, available_plugins, create_plugin,
@@ -171,6 +176,18 @@ async fn run_buffered_request_lifecycle(
     }
 
     PluginResult::Continue
+}
+
+/// Serialize against RTDS runtime-overlay publications.
+///
+/// `response_caching` stamps every stored entry with the live response-side
+/// runtime-overlay gate publication and retires entries whose stamp no longer
+/// matches, so an overlay publication in a concurrently running test would
+/// legitimately turn a HIT into a MISS. Every test that stores an entry and
+/// then asserts a HIT/REVALIDATED replay takes this process-wide lock, which
+/// is the same lock every overlay publisher holds.
+fn response_cache_replay_policy_guard() -> std::sync::MutexGuard<'static, ()> {
+    ferrum_edge::modes::mesh::runtime_overlay_consumers::test_lock()
 }
 
 #[tokio::test]
@@ -556,6 +573,7 @@ async fn test_plugin_complex_configurations() {
 
 #[tokio::test]
 async fn test_response_caching_stores_transformed_body() {
+    let _policy_guard = response_cache_replay_policy_guard();
     // `create_test_context` populates an authenticated consumer. After the
     // PR d34d3508 fix (shared cache leak across authenticated users), the
     // plugin refuses to store cache entries for authenticated requests
@@ -640,10 +658,587 @@ async fn test_response_caching_stores_transformed_body() {
     );
 }
 
+/// Shared harness for the runtime-overlay cache-provenance tests.
+///
+/// `response_caching` stamps every stored entry with the response-side gate
+/// map that produced it, so these tests drive real overlay publications rather
+/// than poking at plugin internals.
+mod runtime_overlay_cache_provenance {
+    use super::*;
+    use ferrum_edge::_test_support::{
+        finalize_plugin_rejection_for_test, finalized_response_replay_for_test,
+    };
+    use ferrum_edge::modes::mesh::config::{MeshRuntimeOverlay, RuntimeValue};
+    use ferrum_edge::plugins::response_transformer::runtime_overlay as response_gate;
+
+    /// Publish one `response_transformer` scope gate through the real RTDS
+    /// overlay entry point.
+    pub(super) fn publish_gate(scope: &str, enabled: bool) {
+        let mut fields = HashMap::new();
+        fields.insert(
+            format!("ferrum.response_transformer.{scope}.enabled"),
+            RuntimeValue::Bool(enabled),
+        );
+        response_gate::apply_overlay(&MeshRuntimeOverlay { fields });
+    }
+
+    pub(super) fn reset_gates() {
+        response_gate::reset_for_test();
+    }
+
+    /// `response_caching` + one overlay-gated `response_transformer`, in
+    /// priority order.
+    pub(super) fn plugins_with_gated_transformer(
+        scope: &str,
+        rules: serde_json::Value,
+    ) -> Vec<Arc<dyn Plugin>> {
+        sort_plugins(vec![
+            create_plugin(
+                "response_caching",
+                &json!({
+                    "ttl_seconds": 60,
+                    "add_cache_status_header": true,
+                    // `create_test_context` authenticates a consumer; keying by
+                    // consumer keeps storage eligible under the shared-cache
+                    // policy (same reason as the sibling cache tests).
+                    "cache_key_include_consumer": true,
+                }),
+            )
+            .unwrap()
+            .unwrap(),
+            create_plugin(
+                "response_transformer",
+                &json!({
+                    "runtime_overlay_scope": scope,
+                    "default_enabled": false,
+                    "rules": rules,
+                }),
+            )
+            .unwrap()
+            .unwrap(),
+        ])
+    }
+
+    /// Run only the `before_proxy` lookup phase and return the short-circuit,
+    /// if any. Mirrors the production dispatch, which hands `before_proxy` a
+    /// copy of the live request header map.
+    pub(super) async fn lookup(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut RequestContext,
+    ) -> Option<PluginResult> {
+        let mut proxy_headers = ctx.headers.clone();
+        for plugin in plugins {
+            match plugin.before_proxy(ctx, &mut proxy_headers).await {
+                PluginResult::Continue => {}
+                result @ PluginResult::Reject { .. }
+                | result @ PluginResult::RejectBinary { .. } => {
+                    return Some(result);
+                }
+            }
+        }
+        None
+    }
+
+    /// Serve a HIT through the production synthetic-rejection finalizer
+    /// (inspection + transform gate + final hooks + reject-path `after_proxy`).
+    pub(super) async fn finalize_hit(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut RequestContext,
+        hit: PluginResult,
+    ) -> (u16, HashMap<String, String>, Vec<u8>) {
+        assert!(
+            finalized_response_replay_for_test(ctx),
+            "a cache HIT must mark the private finalized-replay capability"
+        );
+        reject_parts(finalize_plugin_rejection_for_test(plugins, ctx, hit).await)
+            .map(|(status, body, headers)| (status, headers, body))
+            .expect("expected a finalized rejection")
+    }
+
+    /// Complete the buffered response phases after [`lookup`] already ran.
+    ///
+    /// Used to place a real RTDS publication between request-side cache lookup
+    /// and response-side transforms/store without invoking `before_proxy`
+    /// twice.
+    pub(super) async fn finish_origin_after_lookup(
+        plugins: &[Arc<dyn Plugin>],
+        ctx: &mut RequestContext,
+        response_status: u16,
+        mut response_headers: HashMap<String, String>,
+        mut response_body: Vec<u8>,
+    ) -> (HashMap<String, String>, Vec<u8>) {
+        for plugin in plugins {
+            assert!(matches!(
+                plugin
+                    .after_proxy(ctx, response_status, &mut response_headers)
+                    .await,
+                PluginResult::Continue
+            ));
+        }
+        for plugin in plugins {
+            assert!(matches!(
+                plugin
+                    .on_response_body(ctx, response_status, &mut response_headers, &response_body,)
+                    .await,
+                PluginResult::Continue
+            ));
+        }
+        let content_type = response_headers.get("content-type").cloned();
+        for plugin in plugins {
+            if let Some(transformed) = plugin
+                .transform_response_body_with_context(
+                    ctx,
+                    &response_body,
+                    content_type.as_deref(),
+                    &response_headers,
+                )
+                .await
+            {
+                response_headers
+                    .insert("content-length".to_string(), transformed.len().to_string());
+                response_body = transformed;
+            }
+        }
+        for plugin in plugins {
+            assert!(matches!(
+                plugin
+                    .on_final_response_body(
+                        ctx,
+                        response_status,
+                        &response_headers,
+                        &response_body,
+                    )
+                    .await,
+                PluginResult::Continue
+            ));
+        }
+        (response_headers, response_body)
+    }
+
+    pub(super) fn origin_headers(extra: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        headers.insert("cache-control".to_string(), "max-age=60".to_string());
+        for (key, value) in extra {
+            headers.insert(key.to_string(), value.to_string());
+        }
+        headers
+    }
+}
+
+/// A cache entry stored while the runtime-overlay gate was disabled must not be
+/// replayed after an operator enables redaction: the entry's policy stamp no
+/// longer matches, so the gateway refetches and the newly enabled header/body
+/// rules apply — exactly once — before delivery.
+#[tokio::test]
+async fn test_response_cache_applies_response_transformer_enabled_after_store() {
+    use self::runtime_overlay_cache_provenance as harness;
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    harness::reset_gates();
+
+    let scope = "cache_provenance_enable";
+    let plugins = harness::plugins_with_gated_transformer(
+        scope,
+        json!([
+            {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"},
+            {"target": "header", "operation": "update", "key": "x-secret", "value": "[redacted]"}
+        ]),
+    );
+    let path = "/cache-provenance-enable";
+
+    // 1. Gate disabled (no publication, `default_enabled: false`): the origin
+    //    representation is stored verbatim.
+    let mut miss_ctx = create_response_context(path);
+    let (status, headers, body) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut miss_ctx,
+        200,
+        harness::origin_headers(&[("x-secret", "TOPSECRET")]),
+        br#"{"secret":"TOPSECRET"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS")
+    );
+    assert_eq!(
+        headers.get("x-secret").map(String::as_str),
+        Some("TOPSECRET")
+    );
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"secret":"TOPSECRET"}"#
+    );
+
+    // 2. Operator tightens policy at runtime.
+    harness::publish_gate(scope, true);
+
+    // 3. The stored representation predates the live policy, so it is retired
+    //    rather than replayed: a fresh origin fetch is redacted once.
+    let mut tightened_ctx = create_response_context(path);
+    let (status, headers, body) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut tightened_ctx,
+        200,
+        harness::origin_headers(&[("x-secret", "TOPSECRET")]),
+        br#"{"secret":"TOPSECRET"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS"),
+        "an entry stored under a superseded policy must not be served"
+    );
+    assert_eq!(
+        headers.get("x-secret").map(String::as_str),
+        Some("[redacted]")
+    );
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"secret":"[redacted]"}"#
+    );
+
+    // 4. With policy unchanged, the redacted representation is now replayable.
+    let mut hit_ctx = create_response_context(path);
+    let hit = harness::lookup(&plugins, &mut hit_ctx)
+        .await
+        .expect("expected a response_caching HIT under the unchanged policy");
+    let (status, headers, body) = harness::finalize_hit(&plugins, &mut hit_ctx, hit).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("HIT")
+    );
+    assert_eq!(
+        headers.get("x-secret").map(String::as_str),
+        Some("[redacted]")
+    );
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"secret":"[redacted]"}"#
+    );
+
+    harness::reset_gates();
+}
+
+/// The other half of the contract: while the gate map is unchanged, a HIT
+/// replays the stored representation untouched. Non-idempotent `rename` + `add`
+/// sequences (header and body) would be visible if the replay re-ran them.
+#[tokio::test]
+async fn test_response_cache_hit_under_unchanged_gate_skips_non_idempotent_transforms() {
+    use self::runtime_overlay_cache_provenance as harness;
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    harness::reset_gates();
+
+    let scope = "cache_provenance_stable";
+    let plugins = harness::plugins_with_gated_transformer(
+        scope,
+        json!([
+            {"target": "body", "operation": "rename", "key": "a", "new_key": "b"},
+            {"target": "body", "operation": "add", "key": "a", "value": "second"},
+            {"target": "header", "operation": "rename", "key": "x-a", "new_key": "x-b"},
+            {"target": "header", "operation": "add", "key": "x-a", "value": "second"}
+        ]),
+    );
+    let path = "/cache-provenance-stable";
+
+    harness::publish_gate(scope, true);
+
+    let mut miss_ctx = create_response_context(path);
+    let (status, headers, body) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut miss_ctx,
+        200,
+        harness::origin_headers(&[("x-a", "origin")]),
+        br#"{"a":"origin"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS")
+    );
+    assert_eq!(headers.get("x-b").map(String::as_str), Some("origin"));
+    assert_eq!(headers.get("x-a").map(String::as_str), Some("second"));
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"b":"origin","a":"second"}"#
+    );
+
+    // Reapplying the identical live map is a publication no-op: the gated rules
+    // must NOT run a second time over the finalized representation.
+    harness::publish_gate(scope, true);
+    let mut hit_ctx = create_response_context(path);
+    let hit = harness::lookup(&plugins, &mut hit_ctx)
+        .await
+        .expect("expected a response_caching HIT");
+    let (status, headers, body) = harness::finalize_hit(&plugins, &mut hit_ctx, hit).await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("HIT")
+    );
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"b":"origin","a":"second"}"#,
+        "an enabled gate must not re-apply rename+add over the stored body"
+    );
+    assert_eq!(
+        headers.get("x-b").map(String::as_str),
+        Some("origin"),
+        "a second rename pass would have moved `x-b` to `x-a`"
+    );
+    assert_eq!(
+        headers.get("x-a").map(String::as_str),
+        Some("second"),
+        "a second `add` pass would have appended another `x-a` value"
+    );
+
+    harness::reset_gates();
+}
+
+/// A request that crosses a real gate publication can be transformed under a
+/// different policy than the one pinned at lookup. Those bytes have no stable
+/// replay provenance and must not be inserted into the cache.
+#[tokio::test]
+async fn test_response_cache_drops_store_when_gate_changes_mid_request() {
+    use self::runtime_overlay_cache_provenance as harness;
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    harness::reset_gates();
+
+    let scope = "cache_provenance_mid_request";
+    let plugins = harness::plugins_with_gated_transformer(
+        scope,
+        json!([
+            {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"}
+        ]),
+    );
+    let path = "/cache-provenance-mid-request";
+
+    let mut request_ctx = create_response_context(path);
+    assert!(
+        harness::lookup(&plugins, &mut request_ctx).await.is_none(),
+        "initial request must miss and pin the disabled gate publication"
+    );
+
+    harness::publish_gate(scope, true);
+    let (_, body) = harness::finish_origin_after_lookup(
+        &plugins,
+        &mut request_ctx,
+        200,
+        harness::origin_headers(&[]),
+        br#"{"secret":"TOPSECRET"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"secret":"[redacted]"}"#,
+        "the in-flight response should still obey the newly live gate"
+    );
+
+    let mut next_ctx = create_response_context(path);
+    assert!(
+        harness::lookup(&plugins, &mut next_ctx).await.is_none(),
+        "a response that straddled a gate publication must not be cached"
+    );
+
+    harness::reset_gates();
+}
+
+/// Gate cycling is deterministic in both directions. An entry transformed while
+/// the gate was enabled is retired when the gate is disabled (no stale
+/// gateway-authored representation under a relaxed policy), and re-enabling
+/// retires the untransformed entry stored in between.
+#[tokio::test]
+async fn test_response_cache_provenance_survives_gate_cycles() {
+    use self::runtime_overlay_cache_provenance as harness;
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    harness::reset_gates();
+
+    let scope = "cache_provenance_cycle";
+    let plugins = harness::plugins_with_gated_transformer(
+        scope,
+        json!([
+            {"target": "body", "operation": "update", "key": "secret", "value": "[redacted]"},
+            {"target": "header", "operation": "update", "key": "x-secret", "value": "[redacted]"}
+        ]),
+    );
+    let path = "/cache-provenance-cycle";
+
+    let origin_body = br#"{"secret":"TOPSECRET"}"#.to_vec();
+
+    // Enabled: store a redacted representation.
+    harness::publish_gate(scope, true);
+    let mut ctx = create_response_context(path);
+    let (_, headers, body) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut ctx,
+        200,
+        harness::origin_headers(&[("x-secret", "TOPSECRET")]),
+        origin_body.clone(),
+    )
+    .await;
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS")
+    );
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"secret":"[redacted]"}"#
+    );
+
+    // Disabled: the redacted entry belongs to a policy that is no longer live,
+    // so it is refetched instead of replayed.
+    harness::publish_gate(scope, false);
+    let mut ctx = create_response_context(path);
+    let (_, headers, body) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut ctx,
+        200,
+        harness::origin_headers(&[("x-secret", "TOPSECRET")]),
+        origin_body.clone(),
+    )
+    .await;
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS"),
+        "a transformed entry must not survive into a different policy"
+    );
+    assert_eq!(
+        headers.get("x-secret").map(String::as_str),
+        Some("TOPSECRET")
+    );
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"secret":"TOPSECRET"}"#
+    );
+
+    // Enabled again: the untransformed entry stored under the disabled gate is
+    // retired in turn, and redaction applies once to the refetched response.
+    harness::publish_gate(scope, true);
+    let mut ctx = create_response_context(path);
+    let (_, headers, body) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut ctx,
+        200,
+        harness::origin_headers(&[("x-secret", "TOPSECRET")]),
+        origin_body,
+    )
+    .await;
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS"),
+        "an unredacted entry must not survive re-enabling the gate"
+    );
+    assert_eq!(
+        headers.get("x-secret").map(String::as_str),
+        Some("[redacted]")
+    );
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        r#"{"secret":"[redacted]"}"#
+    );
+
+    harness::reset_gates();
+}
+
+/// REVALIDATED parity: conditional requests take the same provenance gate as
+/// HIT, so a `304` can never certify a representation produced under a
+/// superseded policy. Header-only rules keep the origin `ETag` intact (a body
+/// rewrite deliberately drops content-bound validators).
+#[tokio::test]
+async fn test_response_cache_revalidation_respects_gate_change() {
+    use self::runtime_overlay_cache_provenance as harness;
+
+    let _policy_guard = response_cache_replay_policy_guard();
+    harness::reset_gates();
+
+    let scope = "cache_provenance_revalidate";
+    let plugins = harness::plugins_with_gated_transformer(
+        scope,
+        json!([
+            {"target": "header", "operation": "update", "key": "x-secret", "value": "[redacted]"}
+        ]),
+    );
+    let path = "/cache-provenance-revalidate";
+
+    let mut miss_ctx = create_response_context(path);
+    let (status, headers, _) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut miss_ctx,
+        200,
+        harness::origin_headers(&[("x-secret", "TOPSECRET"), ("etag", "\"v1\"")]),
+        br#"{"secret":"TOPSECRET"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS")
+    );
+    assert_eq!(
+        headers.get("x-secret").map(String::as_str),
+        Some("TOPSECRET")
+    );
+
+    // Unchanged policy: the conditional request revalidates against the stored
+    // entry.
+    let mut revalidate_ctx = create_response_context(path);
+    revalidate_ctx
+        .headers
+        .insert("if-none-match".to_string(), "\"v1\"".to_string());
+    let revalidated = harness::lookup(&plugins, &mut revalidate_ctx)
+        .await
+        .expect("expected a response_caching REVALIDATED short-circuit");
+    let (status, _, headers) = reject_parts(revalidated).expect("expected a rejection");
+    assert_eq!(status, 304);
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("REVALIDATED")
+    );
+
+    // Policy tightens: the same conditional request must not be answered from
+    // the superseded entry.
+    harness::publish_gate(scope, true);
+    let mut tightened_ctx = create_response_context(path);
+    tightened_ctx
+        .headers
+        .insert("if-none-match".to_string(), "\"v1\"".to_string());
+    let (status, headers, _) = run_buffered_response_lifecycle(
+        &plugins,
+        &mut tightened_ctx,
+        200,
+        harness::origin_headers(&[("x-secret", "TOPSECRET"), ("etag", "\"v1\"")]),
+        br#"{"secret":"TOPSECRET"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a superseded entry must not certify a 304 revalidation"
+    );
+    assert_eq!(
+        headers.get("x-cache-status").map(String::as_str),
+        Some("MISS")
+    );
+    assert_eq!(
+        headers.get("x-secret").map(String::as_str),
+        Some("[redacted]")
+    );
+
+    harness::reset_gates();
+}
+
 /// #2381: store final post-transform representation; full synthetic HIT
 /// finalizer must not re-apply non-idempotent body or header sequences.
 #[tokio::test]
 async fn test_response_cache_hit_lifecycle_skips_non_idempotent_transforms() {
+    let _policy_guard = response_cache_replay_policy_guard();
     use ferrum_edge::_test_support::{
         finalize_plugin_rejection_for_test, finalized_response_replay_for_test,
     };
@@ -817,6 +1412,7 @@ async fn test_response_cache_hit_lifecycle_skips_non_idempotent_transforms() {
 /// header-focused).
 #[tokio::test]
 async fn test_response_cache_revalidated_lifecycle_skips_header_transforms() {
+    let _policy_guard = response_cache_replay_policy_guard();
     use ferrum_edge::_test_support::{
         finalize_plugin_rejection_for_test, finalized_response_replay_for_test,
     };
@@ -1026,6 +1622,7 @@ async fn test_finalized_response_replay_is_not_spoofable_via_metadata() {
 
 #[test]
 fn test_h1_h2_and_h3_early_reject_paths_share_finalized_replay_chokepoint() {
+    let _policy_guard = response_cache_replay_policy_guard();
     // Behavioral coverage above exercises
     // `apply_reject_after_proxy_and_synthetic_body_hooks`. Pin that every
     // frontend's early plugin-reject surface reaches that shared helper so

@@ -9130,6 +9130,12 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("invalid mesh runtime configuration: {e}"))?;
     ensure_runtime_config_protocol_supported(&runtime)?;
 
+    // Open the observability delivery lifecycle for this serving cycle before
+    // any plugin activation registers a queue worker. Re-running this mode in
+    // one process after a completed drain otherwise targets the closed
+    // generation of the previous cycle.
+    crate::observability_delivery::begin_serving_cycle();
+
     info!(
         node_id = %runtime.node_id,
         namespace = %runtime.namespace,
@@ -10443,16 +10449,19 @@ fn start_mesh_admin_listeners(
     );
     let jwt_manager = match create_jwt_manager_from_env() {
         Ok(manager) => manager,
-        Err(err) => {
+        Err(crate::admin::jwt_auth::JwtError::NotConfigured) => {
             warn!(
-                "Admin JWT not configured for mesh mode ({}), admin endpoints will reject operator tokens",
-                err
+                "Admin JWT not configured for mesh mode, generating a random read-only secret; \
+                 admin endpoints will reject operator tokens"
             );
             let random_secret = format!("{}{}", uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
             crate::admin::jwt_auth::JwtManager::new(crate::admin::jwt_auth::JwtConfig {
                 secret: random_secret,
                 ..Default::default()
             })
+        }
+        Err(err) => {
+            return Err(anyhow::anyhow!("Invalid admin JWT configuration: {}", err));
         }
     };
     let admin_state = AdminState {

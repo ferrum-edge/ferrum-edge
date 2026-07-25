@@ -19,6 +19,7 @@ pub mod env_config;
 pub mod file_loader;
 pub(crate) mod incremental_apply;
 pub mod migrations;
+pub mod mongo_index_plan;
 pub mod mongo_store;
 pub mod pool_config;
 #[allow(dead_code)] // Public DOC-03 inventory is consumed by external tests, not the binary crate.

@@ -1,11 +1,18 @@
+use super::plugin_utils::create_test_proxy;
 use ferrum_edge::_test_support::{
+    ai_semantic_cache_cache_budget_used_for_test,
     ai_semantic_cache_clear_vector_index_dirty_for_test, ai_semantic_cache_embedding,
     ai_semantic_cache_expire_all_entries_for_test, ai_semantic_cache_force_cleanup_for_test,
-    ai_semantic_cache_instance_id_for_test, ai_semantic_cache_scope_key,
+    ai_semantic_cache_force_vector_rebuild_budget_failure_for_test,
+    ai_semantic_cache_instance_id_for_test, ai_semantic_cache_maintenance_committed_for_test,
+    ai_semantic_cache_maintenance_handle_count_for_test,
+    ai_semantic_cache_maintenance_staged_for_test, ai_semantic_cache_notify_cleanup_for_test,
+    ai_semantic_cache_scope_key, ai_semantic_cache_set_singleflight_wait_override_for_test,
     ai_semantic_cache_set_store_post_admit_hook_for_test,
     ai_semantic_cache_set_vector_index_rebuild_blocked_for_test,
     ai_semantic_cache_size_accounting_snapshot_for_test,
     ai_semantic_cache_staging_metadata_key_for_test, ai_semantic_cache_vector_index_dirty_for_test,
+    ai_semantic_cache_vector_snapshot_accounted_bytes_for_test,
     apply_buffered_request_body_normalization_before_before_proxy_for_test,
     rebuild_ai_semantic_cache_vector_index, set_ai_semantic_cache_embedding,
     set_ai_semantic_cache_scope_key,
@@ -20,15 +27,61 @@ use ferrum_edge::plugins::{
 };
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
+use std::time::Duration;
 use wiremock::matchers::{body_string_contains, header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 // Marker set by the proxy on `ctx.metadata` while the response-body hooks run
 // over a synthetic 2xx plugin short-circuit body (mirrors
 // `crate::proxy::SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY`, which is `pub(crate)` and
 // therefore not reachable from this external test crate).
 const SYNTHETIC_SHORT_CIRCUIT_METADATA_KEY: &str = "ferrum:synthetic_short_circuit";
+
+struct SingleflightWaitOverrideGuard<'a> {
+    plugin: &'a AiSemanticCache,
+}
+
+impl<'a> SingleflightWaitOverrideGuard<'a> {
+    fn install(plugin: &'a AiSemanticCache, wait: Duration) -> Self {
+        ai_semantic_cache_set_singleflight_wait_override_for_test(plugin, Some(wait));
+        Self { plugin }
+    }
+}
+
+impl Drop for SingleflightWaitOverrideGuard<'_> {
+    fn drop(&mut self) {
+        ai_semantic_cache_set_singleflight_wait_override_for_test(self.plugin, None);
+    }
+}
+
+struct ConcurrencyTrackingEmbeddingResponder {
+    active: Arc<AtomicUsize>,
+    peak: Arc<AtomicUsize>,
+    tracking_duration: Duration,
+    response_delay: Duration,
+}
+
+impl Respond for ConcurrencyTrackingEmbeddingResponder {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak.fetch_max(active, Ordering::AcqRel);
+
+        let active_counter = Arc::clone(&self.active);
+        let tracking_duration = self.tracking_duration;
+        tokio::spawn(async move {
+            tokio::time::sleep(tracking_duration).await;
+            active_counter.fetch_sub(1, Ordering::AcqRel);
+        });
+
+        ResponseTemplate::new(200)
+            .set_delay(self.response_delay)
+            .set_body_json(json!({
+                "data": [{"embedding": [1.0, 0.0, 0.0]}]
+            }))
+    }
+}
 
 fn plugin_http_client_with_ip_policy(policy: BackendAllowIps) -> PluginHttpClient {
     let policy = ferrum_edge::config::BackendEgressPolicy::from_allow_ips(policy);
@@ -146,6 +199,8 @@ async fn store_response(
         .await;
     rebuild_ai_semantic_cache_vector_index(plugin).await;
 }
+
+const REDIS_INTEGRITY_KEY_FOR_TESTS: &str = "0123456789abcdef0123456789abcdef";
 
 fn make_plugin(config: serde_json::Value) -> AiSemanticCache {
     AiSemanticCache::new(&config, PluginHttpClient::default()).unwrap()
@@ -409,6 +464,7 @@ fn test_new_invalid_config_shapes_fail() {
         json!({"semantic_similarity_threshold": 0.0}),
         json!({"semantic_similarity_threshold": 1.1}),
         json!({"semantic_vector_max_candidates": 0}),
+        json!({"semantic_vector_max_candidates": 1025}),
         json!({"semantic_embedding_timeout_ms": 0}),
         json!({"semantic_embedding_auth_header": "bad header"}),
         json!({"semantic_embedding_provider": "bogus"}),
@@ -480,6 +536,7 @@ fn semantic_and_redis_hostnames_participate_in_dns_warmup() {
     let redis_only = make_plugin(json!({
         "sync_mode": "redis",
         "redis_url": "redis://Cache.Example.COM:6379/0",
+        "redis_integrity_key": REDIS_INTEGRITY_KEY_FOR_TESTS,
     }));
     assert_eq!(
         redis_only.warmup_hostnames(),
@@ -491,6 +548,7 @@ fn semantic_and_redis_hostnames_participate_in_dns_warmup() {
         "semantic_embedding_endpoint": "https://Embeddings.Example.COM/v1/embeddings",
         "sync_mode": "redis",
         "redis_url": "redis://Cache.Example.COM:6379/0",
+        "redis_integrity_key": REDIS_INTEGRITY_KEY_FOR_TESTS,
     }));
     assert_eq!(
         both.warmup_hostnames(),
@@ -505,6 +563,7 @@ fn semantic_and_redis_hostnames_participate_in_dns_warmup() {
         "semantic_embedding_endpoint": "https://Shared.Example.COM/v1/embeddings",
         "sync_mode": "redis",
         "redis_url": "redis://shared.example.com:6379/0",
+        "redis_integrity_key": REDIS_INTEGRITY_KEY_FOR_TESTS,
     }));
     assert_eq!(
         duplicate.warmup_hostnames(),
@@ -541,7 +600,8 @@ fn test_semantic_config_is_optional_and_valid_when_enabled() {
 fn test_new_with_redis_config() {
     let config = json!({
         "sync_mode": "redis",
-        "redis_url": "redis://localhost:6379/0"
+        "redis_url": "redis://localhost:6379/0",
+        "redis_integrity_key": REDIS_INTEGRITY_KEY_FOR_TESTS,
     });
     let plugin = make_plugin(config);
     assert_eq!(plugin.name(), "ai_semantic_cache");
@@ -562,7 +622,8 @@ fn validate_plugin_config_with_policy_screens_denied_redis_endpoint() {
 
     let denied = json!({
         "sync_mode": "redis",
-        "redis_url": "redis://169.254.169.254:6379/0"
+        "redis_url": "redis://169.254.169.254:6379/0",
+        "redis_integrity_key": REDIS_INTEGRITY_KEY_FOR_TESTS,
     });
     assert!(
         validate_plugin_config_with_policy("ai_semantic_cache", &denied, &default_policy).is_err(),
@@ -572,7 +633,8 @@ fn validate_plugin_config_with_policy_screens_denied_redis_endpoint() {
     // A loopback Redis (local cache) still validates by default.
     let loopback = json!({
         "sync_mode": "redis",
-        "redis_url": "redis://127.0.0.1:6379/0"
+        "redis_url": "redis://127.0.0.1:6379/0",
+        "redis_integrity_key": REDIS_INTEGRITY_KEY_FOR_TESTS,
     });
     assert!(
         validate_plugin_config_with_policy("ai_semantic_cache", &loopback, &default_policy).is_ok(),
@@ -1664,6 +1726,7 @@ async fn test_semantic_embedding_size_counts_against_total_cache_limit() {
         "semantic_similarity_enabled": true,
         "semantic_embedding_endpoint": format!("{}/embeddings", mock_server.uri()),
         "semantic_embedding_api_key": "test-key",
+        "max_entry_size_bytes": 512,
         "max_total_size_bytes": 512
     }));
 
@@ -1785,7 +1848,7 @@ async fn test_different_prompts_no_cache_hit() {
 }
 
 #[tokio::test]
-async fn test_whitespace_normalization_cache_hit() {
+async fn test_exact_key_preserves_case_and_whitespace() {
     let config = json!({"ttl_seconds": 300});
     let plugin = make_plugin(config);
 
@@ -1813,7 +1876,7 @@ async fn test_whitespace_normalization_cache_hit() {
         .on_final_response_body(&mut ctx1, 200, &response_headers, br#""Paris""#)
         .await;
 
-    // Same prompt with extra whitespace and case differences — should HIT
+    // Same words with extra whitespace and case differences — must MISS.
     let body2 = json!({
         "model": "gpt-4o",
         "messages": [{"role": "user", "content": "  What  is  the  Capital  of  France?  "}]
@@ -1831,12 +1894,147 @@ async fn test_whitespace_normalization_cache_hit() {
     headers2.insert("content-type".to_string(), "application/json".to_string());
 
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
-    match result {
-        PluginResult::RejectBinary { status_code, .. } => {
-            assert_eq!(status_code, 200);
-        }
-        _ => panic!("Expected cache HIT after whitespace normalization"),
-    }
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "exact keys must preserve LLM-significant case and whitespace"
+    );
+    assert_eq!(staged_status(&plugin, &ctx2).unwrap(), "MISS");
+}
+
+#[tokio::test]
+async fn exact_key_length_frames_user_controlled_instruction_fields() {
+    let embedded_separator = json!({
+        "model": "claude-3-5-sonnet",
+        "system": "guard\npreamble:evil",
+        "messages": [{"role": "user", "content": "Say hi."}]
+    });
+    let separate_field = json!({
+        "model": "claude-3-5-sonnet",
+        "system": "guard",
+        "preamble": "evil",
+        "messages": [{"role": "user", "content": "Say hi."}]
+    });
+    assert_exact_miss_for_variant(embedded_separator, separate_field, br#""safe""#).await;
+
+    let model_with_separator = json!({
+        "model": "model\nt:0",
+        "messages": [{"role": "user", "content": "Say hi."}]
+    });
+    let model_and_temperature = json!({
+        "model": "model",
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "Say hi."}]
+    });
+    assert_exact_miss_for_variant(model_with_separator, model_and_temperature, br#""safe""#).await;
+
+    let two_text_parts = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hello"},
+                {"type": "text", "text": "world"}
+            ]
+        }]
+    });
+    let one_text_part = json!({
+        "model": "gpt-4o",
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "hello world"}]
+        }]
+    });
+    assert_exact_miss_for_variant(two_text_parts, one_text_part, br#""safe""#).await;
+}
+
+#[tokio::test]
+async fn exact_key_recursively_canonicalizes_json_object_order() {
+    let plugin = make_plugin(json!({"ttl_seconds": 300, "scope_by_consumer": false}));
+    let first = r#"{
+        "model":"gpt-4o",
+        "messages":[{
+            "role":"user",
+            "content":[{"type":"text","text":"same","metadata":{"z":2,"a":1}}]
+        }],
+        "response_format":{"type":"json_schema","json_schema":{"schema":{
+            "type":"object","properties":{"z":{"type":"string"},"a":{"type":"number"}}
+        }}}
+    }"#;
+    let reordered = r#"{
+        "response_format":{"json_schema":{"schema":{
+            "properties":{"a":{"type":"number"},"z":{"type":"string"}},"type":"object"
+        }},"type":"json_schema"},
+        "messages":[{
+            "content":[{"metadata":{"a":1,"z":2},"text":"same","type":"text"}],
+            "role":"user"
+        }],
+        "model":"gpt-4o"
+    }"#;
+
+    store_response(&plugin, first, None, br#""canonical""#).await;
+    let hit = run_before_proxy_get_status(&plugin, reordered, None).await;
+    assert!(
+        hit,
+        "object insertion order at every nesting level must not change the exact key"
+    );
+}
+
+#[tokio::test]
+async fn test_exact_key_distinguishes_code_case_and_indentation() {
+    let plugin = make_plugin(json!({"ttl_seconds": 300, "scope_by_consumer": false}));
+
+    let body_print_a = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "print(\"A\")"}]
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body_print_a).unwrap(),
+        None,
+        br#""uppercase-A""#,
+    )
+    .await;
+
+    let body_print_a_lower = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "print(\"a\")"}]
+    });
+    let miss = run_before_proxy_get_status(
+        &plugin,
+        &serde_json::to_string(&body_print_a_lower).unwrap(),
+        None,
+    )
+    .await;
+    assert!(
+        !miss,
+        "case-sensitive string literals must not collide on exact keys"
+    );
+
+    let body_indent_two = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "def f():\n  return 1"}]
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body_indent_two).unwrap(),
+        None,
+        br#""indent-2""#,
+    )
+    .await;
+    let body_indent_four = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "def f():\n    return 1"}]
+    });
+    let miss_indent = run_before_proxy_get_status(
+        &plugin,
+        &serde_json::to_string(&body_indent_four).unwrap(),
+        None,
+    )
+    .await;
+    assert!(
+        !miss_indent,
+        "Python/Markdown indentation must not collapse on exact keys"
+    );
 }
 
 #[tokio::test]
@@ -1887,6 +2085,29 @@ async fn test_different_model_no_cache_hit() {
 
     let result = plugin.before_proxy(&mut ctx2, &mut headers2).await;
     assert!(matches!(result, PluginResult::Continue));
+
+    // Provider model identifiers may differ only by case.
+    let body3 = json!({
+        "model": "GPT-4O",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let mut ctx3 = RequestContext::new(
+        "127.0.0.1".to_string(),
+        "POST".to_string(),
+        "/chat".to_string(),
+    );
+    ctx3.metadata.insert(
+        "request_body".to_string(),
+        serde_json::to_string(&body3).unwrap(),
+    );
+    let mut headers3 = HashMap::new();
+    headers3.insert("content-type".to_string(), "application/json".to_string());
+
+    let result = plugin.before_proxy(&mut ctx3, &mut headers3).await;
+    assert!(
+        matches!(result, PluginResult::Continue),
+        "case-distinct model identifiers must not share exact cache entries"
+    );
 }
 
 #[tokio::test]
@@ -2679,6 +2900,7 @@ fn every_documented_config_key_is_accepted_together() {
             "redis_health_check_interval_seconds": 4,
             "redis_username": "cache-user",
             "redis_password": "cache-pass",
+            "redis_integrity_key": REDIS_INTEGRITY_KEY_FOR_TESTS,
         }),
         PluginHttpClient::default(),
     )
@@ -2719,7 +2941,8 @@ fn assert_size_accounting_exact(plugin: &AiSemanticCache) -> usize {
     assert_eq!(
         tracked,
         actual,
-        "tracked total_size must equal the sum of retained entry approx_size values \
+        "tracked cache_budget.used() must equal retained entry approx_size \
+         + published HNSW generation + in-flight rebuild reservation \
          (tracked={tracked}, actual={actual}, keys={:?})",
         plugin.tracked_keys_count()
     );
@@ -2926,19 +3149,19 @@ async fn test_expiry_after_same_key_race_reconciles_to_zero() {
     assert_eq!(assert_size_accounting_exact(&plugin), 0);
 }
 
-/// Different-key soft-cap overshoot remains allowed and stays reconcilable:
-/// concurrent distinct keys may briefly exceed `max_total_size_bytes`, but the
-/// counter still equals the retained-entry size sum.
+/// Different-key admits that cannot both fit under `max_total_size_bytes` are
+/// hard-capped by lock-free byte leases: at most one of two concurrent stores
+/// retains when each alone fits but together they would exceed the budget.
 #[tokio::test]
-async fn test_concurrent_different_key_soft_cap_overshoot_reconciles() {
+async fn test_concurrent_different_key_budget_rejects_overshoot() {
     // Each ~4 KiB body plus structural overhead fits under 6 KiB alone; two
-    // concurrent admits both observe an empty total and overshoot together.
+    // concurrent admits cannot both reserve against the shared budget.
     let max_total = 6_000usize;
     let plugin = Arc::new(make_plugin(json!({
         "ttl_seconds": 600,
         "scope_by_consumer": false,
         "max_total_size_bytes": max_total,
-        "max_entry_size_bytes": 8_192
+        "max_entry_size_bytes": max_total
     })));
 
     let request_a = json!({
@@ -2955,7 +3178,8 @@ async fn test_concurrent_different_key_soft_cap_overshoot_reconciles() {
 
     let body_a = json_pad_body("soft-a", 4_096);
     let body_b = json_pad_body("soft-b", 4_096);
-    let _barrier = install_post_admit_barrier(&plugin, 2);
+    // Do not use the post-admit barrier here: the losing admit fails inside
+    // try_acquire before the hook and would otherwise leave the winner parked.
     let mut tasks = Vec::with_capacity(2);
     for (cache_key, response_body) in [(key_a, body_a), (key_b, body_b)] {
         let plugin = Arc::clone(&plugin);
@@ -2970,19 +3194,18 @@ async fn test_concurrent_different_key_soft_cap_overshoot_reconciles() {
         }));
     }
     for task in tasks {
-        task.await.expect("soft-cap overshoot task panicked");
+        task.await.expect("budget race task panicked");
     }
-    clear_post_admit_hook(&plugin);
 
     assert_eq!(
         plugin.tracked_keys_count(),
-        Some(2),
-        "both different-key admits should land under the documented soft-cap race"
+        Some(1),
+        "hard byte budget must admit only one of two concurrent oversize-together stores"
     );
     let total = assert_size_accounting_exact(&plugin);
     assert!(
-        total > max_total,
-        "expected transient different-key soft-cap overshoot (total={total}, max={max_total})"
+        total <= max_total,
+        "retained bytes must stay within max_total_size_bytes (total={total}, max={max_total})"
     );
 }
 
@@ -4212,4 +4435,932 @@ async fn reject_bypass_clears_only_current_instance_staging() {
         "reject bypass must not clear a sibling instance's staged cache key"
     );
     assert_eq!(staged_status(&text_cache, &ctx), Some("MISS"));
+}
+
+// === Semantic cache byte-budget / embedding bounds (#3061/#3062/#3063) ===
+
+#[tokio::test]
+async fn test_hnsw_rebuild_peak_charges_old_and_candidate_generations() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false,
+        "max_total_size_bytes": 1_048_576,
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",
+        "semantic_embedding_api_key": "test-key",
+        "semantic_similarity_threshold": 0.95
+    }));
+
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "vector seed for budget peak"}]
+    });
+    let cache_key = miss_cache_key(&plugin, &serde_json::to_string(&request).unwrap()).await;
+    store_with_cache_key(
+        &plugin,
+        &cache_key,
+        br#""seed""#,
+        Some(vec![1.0, 0.0, 0.0, 0.0]),
+        Some("scope-peak".to_string()),
+    )
+    .await;
+
+    let first_peak = rebuild_ai_semantic_cache_vector_index(&plugin).await;
+    let after_first = assert_size_accounting_exact(&plugin);
+    let first_snapshot = ai_semantic_cache_vector_snapshot_accounted_bytes_for_test(&plugin);
+    assert!(
+        first_snapshot > 0,
+        "first rebuild must publish an HNSW generation"
+    );
+    assert!(
+        after_first >= first_snapshot,
+        "published HNSW bytes must be charged against the shared budget"
+    );
+
+    // Second rebuild overlaps the published generation with a candidate lease.
+    let second_peak = rebuild_ai_semantic_cache_vector_index(&plugin).await;
+    let after_second = assert_size_accounting_exact(&plugin);
+    assert!(
+        second_peak >= after_second.saturating_add(first_snapshot),
+        "peak retained bytes during rebuild must cover old + candidate generations \
+         (peak={second_peak}, after={after_second}, prior_snapshot={first_snapshot}, first_peak={first_peak})"
+    );
+    assert_eq!(
+        ai_semantic_cache_cache_budget_used_for_test(&plugin),
+        after_second
+    );
+}
+
+#[tokio::test]
+async fn test_hnsw_rebuild_budget_failure_releases_candidate_lease() {
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false,
+        "max_entry_size_bytes": 65_536,
+        "max_total_size_bytes": 65_536,
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",
+        "semantic_embedding_api_key": "test-key",
+        "semantic_similarity_threshold": 0.95
+    }));
+
+    let request = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "vector seed for budget failure"}]
+    });
+    let cache_key = miss_cache_key(&plugin, &serde_json::to_string(&request).unwrap()).await;
+    store_with_cache_key(
+        &plugin,
+        &cache_key,
+        br#""seed""#,
+        Some(vec![1.0, 0.0, 0.0]),
+        Some("scope-fail".to_string()),
+    )
+    .await;
+    let _ = rebuild_ai_semantic_cache_vector_index(&plugin).await;
+    let before = assert_size_accounting_exact(&plugin);
+    assert!(ai_semantic_cache_vector_snapshot_accounted_bytes_for_test(&plugin) > 0);
+
+    let rejected = ai_semantic_cache_force_vector_rebuild_budget_failure_for_test(&plugin).await;
+    assert!(
+        rejected,
+        "saturated budget must reject the candidate rebuild reservation"
+    );
+    assert_eq!(assert_size_accounting_exact(&plugin), before);
+    assert!(
+        ai_semantic_cache_vector_index_dirty_for_test(&plugin),
+        "failed rebuild must leave the index dirty for retry"
+    );
+}
+
+#[tokio::test]
+async fn test_embedding_response_rejects_oversize_body() {
+    let mock_server = MockServer::start().await;
+    let huge = format!(r#"{{"embedding":[{}]}}"#, "0.0,".repeat(300_000) + "1.0");
+    assert!(
+        huge.len() > 1024 * 1024,
+        "fixture must exceed the embedding response byte cap"
+    );
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(huge))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": format!("{}/embeddings", mock_server.uri()),
+        "semantic_embedding_api_key": "test-key",
+        "scope_by_consumer": false
+    }));
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "oversize embedding body"}]
+    });
+    let (ctx, result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(staged_status(&plugin, &ctx).unwrap(), "MISS");
+    assert!(
+        ai_semantic_cache_embedding(&ctx, instance_id(&plugin)).is_none(),
+        "oversize embedding bodies must not stage a vector"
+    );
+}
+
+#[tokio::test]
+async fn test_embedding_response_rejects_oversize_dimension() {
+    let mock_server = MockServer::start().await;
+    let mut embedding = vec![0.0; 16_385];
+    embedding[0] = 1.0;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"embedding": embedding}]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": format!("{}/embeddings", mock_server.uri()),
+        "semantic_embedding_api_key": "test-key",
+        "scope_by_consumer": false
+    }));
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "oversize embedding dimension"}]
+    });
+    let (ctx, result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(staged_status(&plugin, &ctx).unwrap(), "MISS");
+    assert!(
+        ai_semantic_cache_embedding(&ctx, instance_id(&plugin)).is_none(),
+        "adversarial embedding dimensions must not stage a vector"
+    );
+}
+
+#[tokio::test]
+async fn large_finite_embedding_components_normalize_without_zero_collapse() {
+    // Squaring ~3e38 in f32 overflows the norm to +inf and previously normalized
+    // every component to 0, admitting an invalid zero vector. f64 reduction must
+    // keep large finite provider values on a unit-length vector.
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [{"embedding": [3.0e38_f32, f32::from_bits(1), 0.0]}]
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": format!("{}/embeddings", mock_server.uri()),
+        "semantic_embedding_api_key": "test-key",
+        "scope_by_consumer": false
+    }));
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "large finite embedding components"}]
+    });
+    let (ctx, result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&body).unwrap(), None).await;
+    assert!(matches!(result, PluginResult::Continue));
+    assert_eq!(staged_status(&plugin, &ctx).unwrap(), "MISS");
+    let embedding = ai_semantic_cache_embedding(&ctx, instance_id(&plugin))
+        .expect("large finite embeddings must stage a normalized vector");
+    assert_eq!(embedding.len(), 3);
+    assert!(
+        embedding.iter().all(|value| value.is_finite()),
+        "normalized embedding must remain finite: {embedding:?}"
+    );
+    assert!(
+        embedding.iter().any(|value| *value != 0.0),
+        "large finite overflow must not collapse to an all-zero vector: {embedding:?}"
+    );
+    let unit_norm = embedding
+        .iter()
+        .fold(0.0_f64, |acc, value| {
+            acc + f64::from(*value) * f64::from(*value)
+        })
+        .sqrt();
+    assert!(
+        (unit_norm - 1.0).abs() < 1.0e-4,
+        "normalized embedding must have unit length, got {unit_norm}"
+    );
+}
+
+#[tokio::test]
+async fn invalid_first_embedding_does_not_pin_learned_dimension() {
+    // An invalid first provider response must fail closed without initializing
+    // embedding_dimension, so a later valid vector of a different length is
+    // still admitted.
+    let mock_server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_calls = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(move |_request: &Request| {
+            let call = responder_calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if call == 1 {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [{"embedding": [0.0, 0.0, 0.0]}]
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "data": [{"embedding": [0.0, 1.0, 0.0, 0.0]}]
+                }))
+            }
+        })
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = make_plugin(json!({
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": format!("{}/embeddings", mock_server.uri()),
+        "semantic_embedding_api_key": "test-key",
+        "scope_by_consumer": false
+    }));
+
+    let first_body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "invalid first embedding"}]
+    });
+    let (first_ctx, first_result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&first_body).unwrap(), None).await;
+    assert!(matches!(first_result, PluginResult::Continue));
+    assert_eq!(staged_status(&plugin, &first_ctx).unwrap(), "MISS");
+    assert!(
+        ai_semantic_cache_embedding(&first_ctx, instance_id(&plugin)).is_none(),
+        "zero-length first embedding must not stage or pin a dimension"
+    );
+
+    let second_body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "valid second embedding different dim"}]
+    });
+    let (second_ctx, second_result) =
+        run_before_proxy(&plugin, &serde_json::to_string(&second_body).unwrap(), None).await;
+    assert!(matches!(second_result, PluginResult::Continue));
+    assert_eq!(staged_status(&plugin, &second_ctx).unwrap(), "MISS");
+    let embedding = ai_semantic_cache_embedding(&second_ctx, instance_id(&plugin))
+        .expect("valid later embedding must be admitted after an invalid first response");
+    assert_eq!(
+        embedding.len(),
+        4,
+        "learned dimension must come from the first successfully admitted vector"
+    );
+    assert_eq!(calls.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn semantic_vector_max_candidates_rejects_above_deployment_hard_cap() {
+    let at_cap = AiSemanticCache::new(
+        &json!({
+            "semantic_similarity_enabled": true,
+            "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",
+            "semantic_vector_max_candidates": 1024,
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        at_cap.is_ok(),
+        "hard-cap boundary must be accepted: {:?}",
+        at_cap.err()
+    );
+
+    let above = AiSemanticCache::new(
+        &json!({
+            "semantic_similarity_enabled": true,
+            "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",
+            "semantic_vector_max_candidates": 1025,
+        }),
+        PluginHttpClient::default(),
+    );
+    let Err(error) = above else {
+        panic!("semantic_vector_max_candidates above hard cap must be rejected");
+    };
+    assert!(
+        error.contains("semantic_vector_max_candidates") && error.contains("1024"),
+        "unexpected admission error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn test_canonical_numeric_params_still_collapse_for_exact_keys() {
+    // Intentionally preserved structural canonicalization: 1 / 1.0 / 1e0 must
+    // still share an exact key when sampling params are included.
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 300,
+        "scope_by_consumer": false,
+        "include_params_in_key": true
+    }));
+    let body_int = json!({
+        "model": "gpt-4o",
+        "temperature": 1,
+        "messages": [{"role": "user", "content": "canonical params"}]
+    });
+    store_response(
+        &plugin,
+        &serde_json::to_string(&body_int).unwrap(),
+        None,
+        br#""ok""#,
+    )
+    .await;
+
+    let body_float = json!({
+        "model": "gpt-4o",
+        "temperature": 1.0,
+        "messages": [{"role": "user", "content": "canonical params"}]
+    });
+    let hit =
+        run_before_proxy_get_status(&plugin, &serde_json::to_string(&body_float).unwrap(), None)
+            .await;
+    assert!(
+        hit,
+        "canonical numeric sampling-parameter forms remain exact-key equivalent"
+    );
+}
+
+/// #3076: within one proxy, a cached response for request path A must not be
+/// replayed to a distinct request path B carrying an identical body. The same
+/// path + body must still hit.
+#[tokio::test]
+async fn distinct_request_paths_do_not_collide_within_one_proxy() {
+    async fn drive(
+        plugin: &AiSemanticCache,
+        proxy: &Arc<ferrum_edge::config::types::Proxy>,
+        path: &str,
+        body_str: &str,
+    ) -> (RequestContext, PluginResult) {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            path.to_string(),
+        );
+        ctx.matched_proxy = Some(Arc::clone(proxy));
+        ctx.metadata
+            .insert("request_body".to_string(), body_str.to_string());
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        (ctx, result)
+    }
+
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false
+    }));
+    let proxy = Arc::new(create_test_proxy());
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "same body, different route"}]
+    });
+    let body_str = serde_json::to_string(&body).unwrap();
+
+    // Populate the cache under path A.
+    let (mut ctx_a, miss_a) = drive(&plugin, &proxy, "/v1/chat/completions", &body_str).await;
+    assert!(
+        matches!(miss_a, PluginResult::Continue),
+        "path A first request must miss"
+    );
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx_a, 200, &resp_headers, br#"{"route":"A"}"#)
+        .await;
+
+    // Same proxy + path + body must now hit.
+    let (_ctx_a2, hit_a) = drive(&plugin, &proxy, "/v1/chat/completions", &body_str).await;
+    assert!(
+        matches!(hit_a, PluginResult::RejectBinary { .. }),
+        "identical path + body must hit the entry we just stored"
+    );
+
+    // A distinct path with the identical body/proxy must not replay A's response.
+    let (_ctx_b, miss_b) = drive(&plugin, &proxy, "/v2/responses", &body_str).await;
+    assert!(
+        matches!(miss_b, PluginResult::Continue),
+        "a distinct route within the same proxy must not receive another route's cached response"
+    );
+}
+
+// === Correction-round coverage for #3073–#3076 / #3074 hard caps ===
+
+#[test]
+fn redis_mode_requires_integrity_key_and_rejects_over_hard_caps() {
+    let missing = AiSemanticCache::new(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0",
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(
+        missing.is_err(),
+        "redis mode without redis_integrity_key must fail closed"
+    );
+
+    let short = AiSemanticCache::new(
+        &json!({
+            "sync_mode": "redis",
+            "redis_url": "redis://127.0.0.1:6379/0",
+            "redis_integrity_key": "too-short",
+        }),
+        PluginHttpClient::default(),
+    );
+    assert!(short.is_err(), "short integrity keys must be rejected");
+
+    assert!(
+        AiSemanticCache::new(
+            &json!({"max_entry_size_bytes": 16 * 1024 * 1024 + 1}),
+            PluginHttpClient::default(),
+        )
+        .is_err(),
+        "max_entry_size_bytes above the deployment hard cap must be rejected"
+    );
+    assert!(
+        AiSemanticCache::new(
+            &json!({
+                "max_entry_size_bytes": 2 * 1024 * 1024,
+                "max_total_size_bytes": 1024 * 1024,
+            }),
+            PluginHttpClient::default(),
+        )
+        .is_err(),
+        "max_entry_size_bytes > max_total_size_bytes must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn maintenance_workers_stage_commit_and_abort_on_drop() {
+    let plugin = make_plugin(json!({"ttl_seconds": 600, "max_entries": 3}));
+    assert!(
+        !ai_semantic_cache_maintenance_staged_for_test(&plugin),
+        "constructors must not start maintenance without a runtime activation"
+    );
+
+    plugin
+        .start_background_tasks()
+        .expect("start_background_tasks must succeed on a Tokio runtime");
+    assert!(ai_semantic_cache_maintenance_staged_for_test(&plugin));
+    assert!(!ai_semantic_cache_maintenance_committed_for_test(&plugin));
+    assert_eq!(
+        ai_semantic_cache_maintenance_handle_count_for_test(&plugin),
+        1
+    );
+
+    // Activation rollback: drop before commit must abort staged workers.
+    drop(plugin);
+
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 600,
+        "max_entries": 3,
+        "semantic_similarity_enabled": true,
+        "semantic_embedding_endpoint": "http://127.0.0.1:9/embeddings",
+    }));
+    plugin
+        .start_background_tasks()
+        .expect("semantic mode stages cleanup + rebuild workers");
+    assert_eq!(
+        ai_semantic_cache_maintenance_handle_count_for_test(&plugin),
+        2
+    );
+    plugin.commit_background_tasks();
+    assert!(ai_semantic_cache_maintenance_committed_for_test(&plugin));
+
+    // Hot-path notification and the synchronous external test seam both remain
+    // available while production cleanup runs only on the lifecycle worker.
+    ai_semantic_cache_notify_cleanup_for_test(&plugin);
+    ai_semantic_cache_force_cleanup_for_test(&plugin);
+    drop(plugin);
+}
+
+#[tokio::test]
+async fn identical_semantic_misses_coalesce_to_one_embedding_call() {
+    let mock_server = MockServer::start().await;
+    // Delayed so all waiters attach before the leader publishes.
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(150))
+                .set_body_json(json!({
+                    "data": [{"embedding": [1.0, 0.0, 0.0]}]
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = Arc::new(make_plugin(semantic_config(&mock_server)));
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "coalesce me"}]
+    });
+    let body_str = serde_json::to_string(&body).unwrap();
+    let proxy = Arc::new(create_test_proxy());
+    let start = Arc::new(tokio::sync::Barrier::new(13));
+
+    let mut tasks = Vec::new();
+    for _ in 0..12 {
+        let plugin = Arc::clone(&plugin);
+        let body_str = body_str.clone();
+        let proxy = Arc::clone(&proxy);
+        let start = Arc::clone(&start);
+        tasks.push(tokio::spawn(async move {
+            start.wait().await;
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/v1/chat/completions".to_string(),
+            );
+            ctx.matched_proxy = Some(proxy);
+            ctx.metadata.insert("request_body".to_string(), body_str);
+            let mut headers = HashMap::new();
+            headers.insert("content-type".to_string(), "application/json".to_string());
+            plugin.before_proxy(&mut ctx, &mut headers).await
+        }));
+    }
+    start.wait().await;
+    for task in tasks {
+        let result = task.await.expect("join");
+        assert!(
+            matches!(result, PluginResult::Continue),
+            "identical misses must continue after a shared embedding"
+        );
+    }
+}
+
+#[tokio::test]
+async fn leader_cancel_reelects_one_replacement_without_stampede() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(300))
+                .set_body_json(json!({
+                    "data": [{"embedding": [1.0, 0.0, 0.0]}]
+                })),
+        )
+        .expect(1..=2)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = Arc::new(make_plugin(semantic_config(&mock_server)));
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "cancel leader"}]
+    });
+    let body_str = serde_json::to_string(&body).unwrap();
+    let proxy = Arc::new(create_test_proxy());
+
+    let plugin_leader = Arc::clone(&plugin);
+    let body_leader = body_str.clone();
+    let proxy_leader = Arc::clone(&proxy);
+    let leader = tokio::spawn(async move {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            "/v1/chat/completions".to_string(),
+        );
+        ctx.matched_proxy = Some(proxy_leader);
+        ctx.metadata.insert("request_body".to_string(), body_leader);
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        plugin_leader.before_proxy(&mut ctx, &mut headers).await
+    });
+    // Let the leader claim the slot, then cancel before it publishes.
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    leader.abort();
+    let _ = leader.await;
+
+    let mut followers = Vec::new();
+    for _ in 0..8 {
+        let plugin = Arc::clone(&plugin);
+        let body_str = body_str.clone();
+        let proxy = Arc::clone(&proxy);
+        followers.push(tokio::spawn(async move {
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/v1/chat/completions".to_string(),
+            );
+            ctx.matched_proxy = Some(proxy);
+            ctx.metadata.insert("request_body".to_string(), body_str);
+            let mut headers = HashMap::new();
+            headers.insert("content-type".to_string(), "application/json".to_string());
+            plugin.before_proxy(&mut ctx, &mut headers).await
+        }));
+    }
+    for task in followers {
+        let result = task.await.expect("follower join");
+        assert!(matches!(result, PluginResult::Continue));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial(ai_semantic_cache_singleflight_wait)]
+async fn singleflight_timeout_bypasses_without_duplicating_live_leader() {
+    let mock_server = MockServer::start().await;
+    // The live leader runs past the follower wait bound. Followers must bypass
+    // semantic lookup rather than evicting it and issuing a duplicate request.
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(500))
+                .set_body_json(json!({
+                    "data": [{"embedding": [1.0, 0.0, 0.0]}]
+                })),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = Arc::new(make_plugin(semantic_config(&mock_server)));
+    let _wait_override =
+        SingleflightWaitOverrideGuard::install(plugin.as_ref(), Duration::from_millis(80));
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "timeout reelect"}]
+    });
+    let body_str = serde_json::to_string(&body).unwrap();
+    let proxy = Arc::new(create_test_proxy());
+
+    let mut tasks = Vec::new();
+    for _ in 0..4 {
+        let plugin = Arc::clone(&plugin);
+        let body_str = body_str.clone();
+        let proxy = Arc::clone(&proxy);
+        tasks.push(tokio::spawn(async move {
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/v1/chat/completions".to_string(),
+            );
+            ctx.matched_proxy = Some(proxy);
+            ctx.metadata.insert("request_body".to_string(), body_str);
+            let mut headers = HashMap::new();
+            headers.insert("content-type".to_string(), "application/json".to_string());
+            plugin.before_proxy(&mut ctx, &mut headers).await
+        }));
+    }
+    for task in tasks {
+        let result = task.await.expect("join");
+        assert!(matches!(result, PluginResult::Continue));
+    }
+}
+
+#[tokio::test]
+async fn high_cardinality_distinct_misses_are_semaphore_bounded() {
+    let mock_server = MockServer::start().await;
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ConcurrencyTrackingEmbeddingResponder {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+            tracking_duration: Duration::from_millis(400),
+            response_delay: Duration::from_millis(500),
+        })
+        .expect(16)
+        .mount(&mock_server)
+        .await;
+    let plugin = Arc::new(make_plugin(semantic_config(&mock_server)));
+    let proxy = Arc::new(create_test_proxy());
+
+    let mut tasks = Vec::new();
+    for i in 0..16 {
+        let plugin = Arc::clone(&plugin);
+        let proxy = Arc::clone(&proxy);
+        tasks.push(tokio::spawn(async move {
+            let body = json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": format!("distinct prompt {i}")}]
+            });
+            let body_str = serde_json::to_string(&body).unwrap();
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/v1/chat/completions".to_string(),
+            );
+            ctx.matched_proxy = Some(proxy);
+            ctx.metadata.insert("request_body".to_string(), body_str);
+            let mut headers = HashMap::new();
+            headers.insert("content-type".to_string(), "application/json".to_string());
+            plugin.before_proxy(&mut ctx, &mut headers).await
+        }));
+    }
+    for task in tasks {
+        assert!(matches!(task.await.expect("join"), PluginResult::Continue));
+    }
+    let observed_peak = peak.load(Ordering::Acquire);
+    assert!(
+        (2..=8).contains(&observed_peak),
+        "embedding concurrency peak {observed_peak} must show overlap without exceeding the semaphore"
+    );
+}
+
+#[tokio::test]
+async fn embedding_semaphore_admission_wait_is_bounded() {
+    let mock_server = MockServer::start().await;
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/embeddings"))
+        .and(header("authorization", "Bearer test-key"))
+        .respond_with(ConcurrencyTrackingEmbeddingResponder {
+            active: Arc::clone(&active),
+            peak: Arc::clone(&peak),
+            tracking_duration: Duration::from_millis(400),
+            response_delay: Duration::from_millis(500),
+        })
+        .expect(8)
+        .mount(&mock_server)
+        .await;
+
+    let plugin = Arc::new(make_plugin(semantic_config(&mock_server)));
+    let _wait_override =
+        SingleflightWaitOverrideGuard::install(plugin.as_ref(), Duration::from_millis(80));
+    let proxy = Arc::new(create_test_proxy());
+
+    let mut tasks = Vec::new();
+    for index in 0..9 {
+        let plugin = Arc::clone(&plugin);
+        let proxy = Arc::clone(&proxy);
+        tasks.push(tokio::spawn(async move {
+            let body = json!({
+                "model": "gpt-4o",
+                "messages": [{
+                    "role": "user",
+                    "content": format!("saturated prompt {index}")
+                }]
+            });
+            let mut ctx = RequestContext::new(
+                "127.0.0.1".to_string(),
+                "POST".to_string(),
+                "/v1/chat/completions".to_string(),
+            );
+            ctx.matched_proxy = Some(proxy);
+            ctx.metadata.insert(
+                "request_body".to_string(),
+                serde_json::to_string(&body).unwrap(),
+            );
+            let mut headers = HashMap::new();
+            headers.insert("content-type".to_string(), "application/json".to_string());
+            plugin.before_proxy(&mut ctx, &mut headers).await
+        }));
+    }
+
+    for task in tasks {
+        assert!(matches!(task.await.expect("join"), PluginResult::Continue));
+    }
+    assert!(
+        (2..=8).contains(&peak.load(Ordering::Acquire)),
+        "saturated embedding requests must overlap without exceeding the semaphore"
+    );
+}
+
+#[tokio::test]
+async fn route_rewrite_and_effective_upstream_isolate_cache_entries() {
+    async fn drive(
+        plugin: &AiSemanticCache,
+        proxy: &Arc<ferrum_edge::config::types::Proxy>,
+        path: &str,
+        body_str: &str,
+        upstream: Option<&str>,
+        rewrite: Option<&str>,
+    ) -> (RequestContext, PluginResult) {
+        let mut ctx = RequestContext::new(
+            "127.0.0.1".to_string(),
+            "POST".to_string(),
+            path.to_string(),
+        );
+        ctx.matched_proxy = Some(Arc::clone(proxy));
+        if let Some(upstream) = upstream {
+            ctx.route_override_upstream_id = Some(upstream.to_string());
+        }
+        if let Some(rewrite) = rewrite {
+            ctx.route_override_path = Some(rewrite.to_string());
+            ctx.route_override_path_is_absolute = true;
+        }
+        ctx.metadata
+            .insert("request_body".to_string(), body_str.to_string());
+        let mut headers = HashMap::new();
+        headers.insert("content-type".to_string(), "application/json".to_string());
+        let result = plugin.before_proxy(&mut ctx, &mut headers).await;
+        (ctx, result)
+    }
+
+    let plugin = make_plugin(json!({
+        "ttl_seconds": 600,
+        "scope_by_consumer": false
+    }));
+    let proxy = Arc::new(create_test_proxy());
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "same body"}]
+    });
+    let body_str = serde_json::to_string(&body).unwrap();
+
+    let (mut ctx_a, miss_a) = drive(
+        &plugin,
+        &proxy,
+        "/v1/chat/completions",
+        &body_str,
+        Some("upstream-a"),
+        None,
+    )
+    .await;
+    assert!(matches!(miss_a, PluginResult::Continue));
+    let mut resp_headers = HashMap::new();
+    resp_headers.insert("content-type".to_string(), "application/json".to_string());
+    let _ = plugin
+        .on_final_response_body(&mut ctx_a, 200, &resp_headers, br#"{"up":"A"}"#)
+        .await;
+
+    // Same path/body but different effective upstream must miss.
+    let (_ctx_b, miss_b) = drive(
+        &plugin,
+        &proxy,
+        "/v1/chat/completions",
+        &body_str,
+        Some("upstream-b"),
+        None,
+    )
+    .await;
+    assert!(
+        matches!(miss_b, PluginResult::Continue),
+        "different effective upstream/provider must not share a cache entry"
+    );
+
+    // Same upstream + path hit.
+    let (_ctx_a2, hit_a) = drive(
+        &plugin,
+        &proxy,
+        "/v1/chat/completions",
+        &body_str,
+        Some("upstream-a"),
+        None,
+    )
+    .await;
+    assert!(matches!(hit_a, PluginResult::RejectBinary { .. }));
+
+    // Rewritten backend path under the same public path / upstream isolates.
+    let (mut ctx_rw, miss_rw) = drive(
+        &plugin,
+        &proxy,
+        "/v1/chat/completions",
+        &body_str,
+        Some("upstream-a"),
+        Some("/provider/v1/chat"),
+    )
+    .await;
+    assert!(
+        matches!(miss_rw, PluginResult::Continue),
+        "a post-routing rewrite path must not receive the unre rewritten entry"
+    );
+    let _ = plugin
+        .on_final_response_body(&mut ctx_rw, 200, &resp_headers, br#"{"up":"RW"}"#)
+        .await;
+    let (_ctx_rw2, hit_rw) = drive(
+        &plugin,
+        &proxy,
+        "/v1/chat/completions",
+        &body_str,
+        Some("upstream-a"),
+        Some("/provider/v1/chat"),
+    )
+    .await;
+    assert!(matches!(hit_rw, PluginResult::RejectBinary { .. }));
+}
+
+#[test]
+fn priority_is_after_route_dispatch_plugins() {
+    let plugin = make_plugin(json!({}));
+    assert_eq!(plugin.priority(), priority::AI_SEMANTIC_CACHE);
+    const {
+        assert!(
+            priority::AI_SEMANTIC_CACHE > priority::MESH_ROUTE_DISPATCH,
+            "cache lookup must observe mesh_route_dispatch overrides"
+        );
+        assert!(
+            priority::AI_SEMANTIC_CACHE > priority::AI_STREAM_ROUTER,
+            "cache lookup must observe ai_stream_router destination overrides"
+        );
+    }
 }

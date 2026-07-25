@@ -49,6 +49,10 @@ harness = false
 name = "wrr_selection"
 harness = false
 
+[[bench]]
+name = "ai_semantic_cache_cleanup"
+harness = false
+
 [profile.dev]
 opt-level = 0
 debug = true

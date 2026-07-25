@@ -37,7 +37,6 @@ fn h1_h2_route_miss_and_method_rejection_precede_request_hooks() {
             "\"allowed_methods\"",
             "// gRPC spec mandates POST method.",
             "StatusCode::BAD_REQUEST",
-            "let plugin_cache_view = epoch.plugin_cache.request_view(&proxy.id, request_protocol);",
             "// Execute on_request_received hooks",
             "await_request_plugin_deadline_with_provenance(",
             "plugin.on_request_received(&mut ctx),",

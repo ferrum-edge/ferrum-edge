@@ -3595,7 +3595,7 @@ fn classify_clickhouse_delivery(
             .record_failure(FailureReason::Http4xx, message.clone());
         return DeliveryOutcome::PayloadTooLarge { message };
     }
-    if code == 408 || code == 429 || status.is_server_error() {
+    if code == 401 || code == 403 || code == 408 || code == 429 || status.is_server_error() {
         let reason = if status.is_server_error() {
             FailureReason::Http5xx
         } else {
@@ -4725,7 +4725,7 @@ pub fn classify_clickhouse_http_status_for_tests(status: u16) -> &'static str {
     match status {
         200 | 204 => "delivered",
         413 => "payload_too_large",
-        408 | 429 => "retryable",
+        401 | 403 | 408 | 429 => "retryable",
         code if (500..600).contains(&code) => "retryable",
         code if (400..500).contains(&code) => "permanent",
         _ => "retryable",

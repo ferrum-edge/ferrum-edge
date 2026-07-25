@@ -41,7 +41,7 @@ File-backed and external frontend/admin cert-key, client-CA, OCSP response, and 
 | `FERRUM_ACME_RENEW_POLL_TIMEOUT_SECONDS` | No | `60` | Maximum ACME readiness/certificate polling time per automatic renewal |
 | `FERRUM_ACME_DNS01_HOOK_COMMAND` | No | — | Executable provider hook for DNS-01 automation. Ferrum invokes it without a shell and passes `FERRUM_ACME_DNS01_ACTION`, `FERRUM_ACME_DNS01_IDENTIFIER`, `FERRUM_ACME_DNS01_TOKEN`, `FERRUM_ACME_DNS01_TXT_RECORD_NAME`, and `FERRUM_ACME_DNS01_TXT_VALUE` |
 | `FERRUM_ACME_DNS01_PROPAGATION_SECONDS` | No | `60` | Wait time after DNS-01 hook publication before Ferrum asks the ACME directory to validate the challenge |
-| `FERRUM_TLS_MANAGED_STORE_PATH` | No | `./ferrum-managed-tls` | Directory for file-backed admin-managed TLS records and recent TLS rotation events. The store persists uploaded certificates, private keys, CA bundles, and CRLs in `managed-tls.json` and bounded rotation history in `tls-events.json`; private keys are written with owner-only permissions on Unix |
+| `FERRUM_TLS_MANAGED_STORE_PATH` | No | `./ferrum-managed-tls` | Directory for file-backed admin-managed TLS records and recent TLS rotation events. The store persists uploaded certificates, private keys, CA bundles, CRLs, OCSP responses, and JWKS in `managed-tls.json` and bounded rotation history in `tls-events.json` under globally unique record IDs across material kinds; private keys are written with owner-only permissions on Unix |
 | `FERRUM_PKCS11_MODULE_PATH` | No | — | Default PKCS#11 module path used by frontend/admin/backend mTLS `pkcs11://` key sources when the URI omits `?module=` and `?module_env=`. Requires the `pkcs11` Cargo feature |
 | `FERRUM_PKCS11_PIN` | No | — | Optional example token user PIN variable for `pkcs11://...?pin_env=FERRUM_PKCS11_PIN`. Ferrum only reads it when a PKCS#11 key source references it, and never logs the value |
 | `FERRUM_CLICKHOUSE_PASSWORD` | No | — | Optional materialized password used by the `api_chargeback_sink` plugin when its `clickhouse.password_ref` is set to `FERRUM_CLICKHOUSE_PASSWORD`. The plugin only accepts `FERRUM_*` password references. Populate this value directly or through existing secret suffixes such as `FERRUM_CLICKHOUSE_PASSWORD_FILE` / `_VAULT` / `_AWS` / `_AZURE` / `_GCP` |
@@ -102,7 +102,9 @@ value.
 > (`file`/`dp`/`mesh`) emit a high-severity warning instead of failing. (Note:
 > `file`/`mesh` fall back to a random, unguessable admin JWT secret when
 > `FERRUM_ADMIN_JWT_SECRET` is unset, so externally-minted tokens cannot validate
-> there; `dp` requires the secret and aborts startup if it is missing. Either way,
+> there; an explicitly supplied but invalid admin JWT setting — short secret or
+> malformed `FERRUM_ADMIN_JWT_MAX_TTL` — fails startup instead of replacing that
+> intent. `dp` requires the secret and aborts startup if it is missing. Either way,
 > if you bind a plaintext admin listener beyond loopback, prefer an allowlist or
 > TLS.) The `node_agent` admin listener also defaults to loopback.
 
@@ -122,7 +124,7 @@ value.
 | `FERRUM_ADMIN_TLS_KEY_PATH` | If HTTPS | — | Path to admin TLS private key |
 | `FERRUM_ADMIN_TLS_KEY_SOURCE` | If HTTPS and set | — | Source override for `FERRUM_ADMIN_TLS_KEY_PATH`; accepts path, `file://`, inline PEM, provider URI, or `pkcs11://` RSA signer URI when built with the `pkcs11` feature |
 | `FERRUM_ADMIN_TLS_OCSP_RESPONSE_SOURCE` | No | — | Source for DER OCSP response bytes to staple on admin TLS handshakes. File/provider-backed sources are watched when frontend/admin TLS live reload is enabled |
-| `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth. Must be at least 32 characters. Tokens must include `role: viewer`, `role: operator`, or `role: admin`; tokens without a `role` claim fail closed |
+| `FERRUM_ADMIN_JWT_SECRET` | DB/CP modes | — | HS256 secret for Admin API JWT auth. Must be at least 32 characters. Tokens must include `role: viewer`, `role: operator`, or `role: admin`; tokens without a `role` claim fail closed. In `file`/`mesh`/`node_agent`, omitting the secret generates a random read-only secret at startup; setting a short or otherwise invalid value fails startup |
 | `FERRUM_ADMIN_JWT_ISSUER` | No | `ferrum-edge` | Required `iss` claim for Admin API JWT tokens |
 | `FERRUM_ADMIN_JWT_AUDIENCE` | No | — | Optional expected `aud` (audience) claim for Admin API JWT tokens. When set, tokens must carry a matching `aud`. When unset (default), tokens without `aud` pass but tokens carrying `aud` are rejected (RFC 7519 strict audience handling) |
 | `FERRUM_ADMIN_JWT_MAX_TTL` | No | `3600` | Maximum accepted token lifetime (seconds) for externally minted Admin API JWTs, enforced against verifier time so future-shifted timestamps cannot extend real validity. The nominal lifetime (`exp - iat`) must be positive and within this value; `iat` must not be later than verifier time plus the 60-second clock-skew leeway; the remaining lifetime (`exp - now`) must be within this value **plus that same 60-second leeway** (one skew window, so an issuer whose clock runs fast can still mint full-length tokens); and `exp` must still be in the future at verifier time, with no additional expiry grace. Effective maximum real validity is therefore `FERRUM_ADMIN_JWT_MAX_TTL + 60s`. `0` intentionally disables the lifetime cap; a value above `9223372036854775807` is rejected at startup as invalid rather than treated as unlimited |
@@ -223,19 +225,26 @@ bundle that may need them is alive.
 
 #### MySQL minimum version
 
-MySQL backends require **MySQL 8.0+**. The V001 schema applies an explicit
-`COLLATE utf8mb4_0900_as_cs` on identifier columns (`id`, `namespace`, `name`,
+MySQL backends require **MySQL 8.0.17+**. The V001 schema applies an explicit
+`COLLATE utf8mb4_0900_bin` on identifier columns (`id`, `namespace`, `name`,
 `username`, `custom_id`, `plugin_name`, `proxy_id`, `upstream_id`,
 `upstream_subset`, `api_spec_id`, `content_hash`, `spec_version`,
-`backend_host`, `backend_tls_sni`), which is only available on MySQL 8.0 and
-later. This makes uniqueness on `(namespace, name)`, `(namespace, username)`,
-etc. **byte-exact** rather than the case-insensitive default — so `Alpha` and
-`alpha` are distinct identifiers on MySQL just as they are on PostgreSQL and
-SQLite. Operators upgrading a populated 5.x MySQL deployment must run the
-matching `ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE
-utf8mb4_0900_as_cs` themselves; this is consistent with the build-out
-compatibility policy of folding schema changes into the V001 baseline rather
-than shipping incremental migrations.
+`backend_host`, `backend_tls_sni`). This binary, `NO PAD` collation — introduced
+in MySQL 8.0.17 — makes uniqueness on `(namespace, name)`,
+`(namespace, username)`, etc. **byte-exact** — matching PostgreSQL and SQLite —
+so case variants (`Alpha` vs `alpha`), Unicode canonical equivalents (NFC
+`café` vs NFD `cafe\u{0301}`), and values that differ only by trailing spaces
+remain distinct. Servers older than 8.0.17 reject the baseline schema DDL
+because the required collation is unavailable. The older `utf8mb4_bin` binary
+collation uses `PAD SPACE` semantics, while a UCA collation such as
+`utf8mb4_0900_as_cs` still folds canonically equivalent sequences; either
+would diverge from the runtime's byte-keyed identity indexes. Operators
+upgrading a populated deployment that still uses one of those collations (or
+an older case-insensitive default) must run the matching
+`ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin`
+themselves; this is consistent with the build-out compatibility policy of
+folding schema changes into the V001 baseline rather than shipping
+incremental migrations.
 
 MySQL full runtime loads require `REPEATABLE READ` transaction isolation. If the
 server or session default is weaker, Ferrum rejects the candidate full load and
@@ -276,7 +285,7 @@ SQL pool settings apply to PostgreSQL, MySQL, and SQLite. MongoDB uses driver co
 | `FERRUM_DB_POOL_ACQUIRE_TIMEOUT_SECONDS` | No | `30` | Max wait for a pool connection |
 | `FERRUM_DB_POOL_IDLE_TIMEOUT_SECONDS` | No | `600` | Max idle age before a SQL connection is closed |
 | `FERRUM_DB_POOL_MAX_LIFETIME_SECONDS` | No | `300` | Max SQL connection lifetime |
-| `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS` | No | `10` | Max TCP connect time for new database connections; `0` disables |
+| `FERRUM_DB_POOL_CONNECT_TIMEOUT_SECONDS` | No | `10` | Max time for each PostgreSQL/MySQL pool connect attempt (initial, failover, replica, reconnect, migrate); `0` disables. Enforced around sqlx pool creation — not a DSN query parameter |
 | `FERRUM_DB_POOL_STATEMENT_TIMEOUT_SECONDS` | No | `30` | Per-statement SQL timeout; `0` disables |
 
 ### MongoDB
@@ -299,6 +308,23 @@ See [mongodb.md](mongodb.md) for the full deployment guide including read prefer
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `FERRUM_FILE_CONFIG_PATH` | File mode | — | Path to YAML/JSON config file |
+
+File mode loads that path at startup and again on SIGHUP (Unix). Both paths use the same fail-closed stability/atomicity contract: the loader opens only regular files, brackets each read with handle and path identity checks (so symlink/rename swaps mid-read are rejected), then requires a second independent open/read to observe **byte-identical** content with matching identity. Size or metadata agreement alone is not treated as proof of content stability, because same-size in-place rewrites and paused torn truncations can leave metadata unchanged while dropping trailing resources. Instability retries a bounded number of times and then fails closed — startup aborts; SIGHUP keeps the last known-good live generation. A rejected SIGHUP candidate (read/parse/validation/apply failure) raises the shared `config_rejected` admin-health signal so authenticated `/health` reports `degraded` until a later Applied or Unchanged reload clears it; unauthenticated probes see only the coarse `status`/`ready` fields.
+
+File-mode configuration documents are limited to 64 MiB; larger files fail before allocation and parsing.
+
+**Publish updates with an atomic replace.** Write a temporary file beside the target, `fsync` it, then `rename(2)` over `FERRUM_FILE_CONFIG_PATH` (Kubernetes ConfigMap symlink swaps are equivalent). Avoid editor save-in-place, shell `>` redirection, or `cp` onto the live path: those create a torn-write window where a truncated-but-still-valid YAML document (commonly cutting a trailing `plugin_configs` list after item N-1) can parse and pass validators while silently dropping auth/ACL plugins.
+
+Optional top-level `resource_counts` is a defense-in-depth seal for that trailing-section hazard. Place it near the top of the document (before the resource lists). When present it is validated against the file's pre-namespace-filter lengths and is stripped before `GatewayConfig` deserialization:
+
+```yaml
+version: "1"
+resource_counts:
+  proxies: 1
+  consumers: 0
+  plugin_configs: 2
+  upstreams: 0
+```
 
 ### Control Plane / Data Plane
 
@@ -641,6 +667,7 @@ See [dns_resolver.md](dns_resolver.md) for full configuration reference.
 | `FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER` | No | `true` | Prefer server cipher order during TLS 1.2 negotiation (inbound only) |
 | `FERRUM_TLS_SESSION_CACHE_SIZE` | No | `4096` | TLS session resumption cache size (inbound only, TLS 1.2 stateful session IDs) |
 | `FERRUM_TLS_CERT_EXPIRY_WARNING_DAYS` | No | `30` | Warn when configured certificates expire within this many days; `0` disables warnings |
+| `FERRUM_TLS_INVENTORY_SNAPSHOT_TTL_SECONDS` | No | `300` | Maximum age of the cached, non-secret TLS inventory snapshot behind the `/metrics` certificate gauges. Scrapes read the snapshot only (no certificate/key/Kubernetes/secret-manager I/O) and schedule a single-flight background refresh once it is older than this bound; `0` disables the refresh and leaves the gauges absent |
 | `FERRUM_TLS_EARLY_DATA_METHODS` | No | — | Comma-separated methods allowed as TLS 1.3 0-RTT early data |
 
 These TLS policy settings apply uniformly to both inbound (frontend) and outbound (backend) connections across all TLS-capable protocols (HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP-TLS). DTLS uses a separate library and is not affected. See [frontend_tls.md](frontend_tls.md) and [backend_mtls.md](backend_mtls.md) for detailed TLS configuration guides.
@@ -779,9 +806,9 @@ See [infrastructure_sizing.md](infrastructure_sizing.md) for detailed tuning gui
 | `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | No | `60` | TCP keep-alive interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | No | `30` | HTTP/2 keep-alive ping interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | No | `45` | HTTP/2 keep-alive ping timeout in seconds |
-| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | No | `8388608` | HTTP/2 per-stream flow-control window in bytes (8 MiB). Clamped to 65535..128 MiB |
-| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | No | `33554432` | HTTP/2 connection-level flow-control window in bytes (32 MiB). Clamped to 65535..128 MiB |
-| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | No | `true` | Enable adaptive flow-control window sizing based on observed throughput |
+| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | No | `8388608` | HTTP/2 per-stream flow-control window in bytes (8 MiB). Clamped to 65535..128 MiB. When adaptive windowing is on, hyper/reqwest override these fixed sizes via BDP probing |
+| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | No | `33554432` | HTTP/2 connection-level flow-control window in bytes (32 MiB). Clamped to 65535..128 MiB. When adaptive windowing is on, hyper/reqwest override these fixed sizes via BDP probing |
+| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | No | `true` | Enable adaptive flow-control (BDP probing). Overrides fixed initial window sizes while enabled. An explicit stream/connection window override (env, `ferrum.conf`, or per-proxy) auto-disables adaptive when this was not also set explicitly; an explicit adaptive choice remains authoritative |
 | `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | No | `1048576` | Maximum HTTP/2 frame payload in bytes (1 MiB). Clamped to 16384..1 MiB |
 | `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | No | `1000` | Max concurrent HTTP/2 streams per backend connection |
 
@@ -821,7 +848,7 @@ See [connection_pooling.md](connection_pooling.md) for the full configuration re
 | `FERRUM_TLS_OFFLOAD_THREADS` | No | `0` | Dedicated TLS handshake offload threads; `0` disables |
 | `FERRUM_TCP_FASTOPEN_ENABLED` | No | `auto` | TCP Fast Open toggle: `auto`, `true`, or `false` |
 | `FERRUM_TCP_FASTOPEN_QUEUE_LEN` | No | `256` | TCP Fast Open server queue length |
-| `FERRUM_KTLS_ENABLED` | No | `auto` | Linux kTLS splice acceleration toggle |
+| `FERRUM_KTLS_ENABLED` | No | `auto` | Linux kTLS probe/gating; buffered tokio-rustls handoff currently refuse-closed (issue #2955) |
 | `FERRUM_IO_URING_SPLICE_ENABLED` | No | `auto` | Linux io_uring splice toggle |
 | `FERRUM_UDP_GRO_ENABLED` | No | `auto` | Linux UDP GRO toggle; currently reserved/no-op |
 | `FERRUM_UDP_GSO_ENABLED` | No | `auto` | Linux UDP GSO send batching toggle |
@@ -900,7 +927,18 @@ A reference `ferrum.conf` with all available fields and descriptions is included
 
 Configuration files can be YAML or JSON. See `tests/config.yaml` for a complete example.
 
+Publish replacements atomically (temp file + `rename`, or an equivalent ConfigMap symlink swap). See [File Mode](#file-mode) for the loader's stability contract and optional `resource_counts` seal.
+
 ```yaml
+version: "1"
+# Optional integrity seal — validated before namespace filtering. Declaring
+# plugin_configs: 2 rejects a torn truncation that drops the trailing item.
+resource_counts:
+  proxies: 1
+  consumers: 1
+  plugin_configs: 2
+  upstreams: 0
+
 proxies:
   - id: "my-api"
     name: "My Backend API"
@@ -920,6 +958,7 @@ proxies:
     auth_mode: single
     plugins:
       - plugin_config_id: "log-plugin"
+      - plugin_config_id: "key-auth"
 
 consumers:
   - id: "user-1"
@@ -932,6 +971,11 @@ consumers:
 plugin_configs:
   - id: "log-plugin"
     plugin_name: "stdout_logging"
+    config: {}
+    scope: global
+    enabled: true
+  - id: "key-auth"
+    plugin_name: "key_auth"
     config: {}
     scope: global
     enabled: true

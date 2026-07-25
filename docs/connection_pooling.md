@@ -37,8 +37,12 @@ proxies:
     pool_http2_keep_alive_timeout_seconds: 5
     pool_http2_initial_stream_window_size: 16777216   # 16 MiB
     pool_http2_initial_connection_window_size: 67108864  # 64 MiB
+    # Keep adaptive on explicitly when also setting fixed windows; otherwise
+    # an explicit window override auto-disables adaptive so fixed sizes apply.
     pool_http2_adaptive_window: true
 ```
+
+**Adaptive vs fixed window precedence:** shipped default is adaptive on (`true`). Hyper/reqwest adaptive windowing overrides `initial_stream_window_size` / `initial_connection_window_size`. Setting an explicit stream or connection window (global env/`ferrum.conf` or per-proxy `pool_http2_initial_*_window_size`) without also setting adaptive explicitly auto-disables adaptive at that config layer so the fixed windows take effect. Setting adaptive explicitly (including `true` alongside window overrides) remains authoritative. Direct `PoolConfig` construction for tests/code paths is unchanged — precedence applies only during env and per-proxy resolution.
 
 `pool_max_requests_per_connection` is accepted on proxies for backward compatibility, but it is currently a no-op at runtime. The shared reqwest/hyper HTTP client pool does not expose a stable per-connection request cap, so Ferrum validates and persists the field without applying it. DestinationRule `connectionPool.http.maxRequestsPerConnection` no longer projects into this proxy field; it is reported as deferred in Istio status instead. Values must be between 0 and 2,147,483,647; `0` preserves Istio's explicit unlimited value, and omitting the field preserves Ferrum's current unlimited behavior.
 
@@ -53,9 +57,9 @@ proxies:
 | `FERRUM_POOL_TCP_KEEPALIVE_SECONDS` | `60` | TCP keep-alive interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_INTERVAL_SECONDS` | `30` | HTTP/2 keep-alive ping interval in seconds |
 | `FERRUM_POOL_HTTP2_KEEP_ALIVE_TIMEOUT_SECONDS` | `45` | HTTP/2 keep-alive timeout in seconds |
-| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | Backend HTTP/2 per-stream flow-control window (bytes). Default: 8 MiB |
-| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | Backend HTTP/2 connection-level flow-control window (bytes). Default: 32 MiB |
-| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `true` | Enable adaptive flow-control (BDP probing) |
+| `FERRUM_POOL_HTTP2_INITIAL_STREAM_WINDOW_SIZE` | `8388608` | Backend HTTP/2 per-stream flow-control window (bytes). Default: 8 MiB. Inert while adaptive windowing remains enabled |
+| `FERRUM_POOL_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE` | `33554432` | Backend HTTP/2 connection-level flow-control window (bytes). Default: 32 MiB. Inert while adaptive windowing remains enabled |
+| `FERRUM_POOL_HTTP2_ADAPTIVE_WINDOW` | `true` | Enable adaptive flow-control (BDP probing). Overrides fixed initial windows while enabled. Explicit window overrides auto-disable adaptive unless adaptive is also set explicitly |
 | `FERRUM_POOL_HTTP2_MAX_FRAME_SIZE` | `1048576` | Maximum backend HTTP/2 frame payload (bytes). Range: 16384–1048576. Default: 1 MiB |
 | `FERRUM_POOL_HTTP2_MAX_CONCURRENT_STREAMS` | `1000` | Max concurrent HTTP/2 streams per backend connection |
 | `FERRUM_GRPC_POOL_READY_WAIT_MS` | `1` | Milliseconds the dedicated gRPC pool waits for a free H2 stream before opening another backend connection |
@@ -109,16 +113,18 @@ This is the single most important pool setting for performance and reliability. 
 
 ### Policy Fields and Cross-Proxy Sharing
 
-The pool is keyed on **connection identity** (backend host/port, protocol, DNS override, TLS trust, mTLS credentials) and intentionally excludes policy fields like timeouts, pool sizes, and keep-alive intervals. This keeps memory and connection count bounded — proxies that all point at the same backend share one underlying client.
+The reqwest pool is keyed on **connection identity** (backend host/port, protocol, DNS override, TLS trust, mTLS credentials) **plus** an inspectable `rcfg=…` suffix for every client-level setting that `create_client` bakes into the shared `reqwest::Client` (idle timeout, TCP keepalive, H2 keepalive interval/timeout, adaptive-window flag, fixed initial windows when adaptive is off, max frame size). Those client-baked knobs cannot be applied per request; partitioning the key prevents silent first-creator-wins leakage across proxies that share an upstream.
 
-Per-request policy fields are applied at dispatch time on the `RequestBuilder`, so they're independent per proxy even when the underlying client is shared:
+Request-only policy fields stay out of the key and are applied at dispatch time on the `RequestBuilder`, so they're independent per proxy even when the underlying client is shared:
 
 | Field | Per-proxy override respected? | Why |
 |---|---|---|
 | `backend_read_timeout_ms` | **Yes** — always the requesting proxy's value | Applied per-request via `RequestBuilder::timeout()` at dispatch time. |
 | `backend_connect_timeout_ms` | **Yes** — always the requesting proxy's value | Applied per-request via `RequestBuilder::connect_timeout()` at dispatch time. The per-request `connect_timeout` API ships in a vendored copy of reqwest 0.13.3 with [seanmonstar/reqwest#3017](https://github.com/seanmonstar/reqwest/pull/3017) applied — see [`docs/upstream-reqwest-patches/001-per-request-connect-timeout/`](upstream-reqwest-patches/001-per-request-connect-timeout/README.md) for the lifecycle. Once the upstream PR merges in a release we consume, the vendored crate is dropped; the call sites already use the upstream API shape. |
 
-Both timeouts can therefore be set independently per proxy without forcing distinct `dns_override` values to fragment the pool. Earlier versions of ferrum-edge documented a `dns_override` work-around for `backend_connect_timeout_ms` — that work-around is no longer needed.
+**Client-baked settings (reqwest `rcfg` key segment).** Divergent per-proxy values of `pool_idle_timeout_seconds`, TCP keepalive, and the H2 client knobs listed above produce distinct pool entries. Identical endpoint + identical effective `rcfg` values continue to share one client. Adaptive window (`aw=1`) overrides fixed initial windows in reqwest/hyper, so `sw`/`cw` are omitted from the key whenever adaptive is enabled (divergent fixed windows with adaptive on do not fragment). `pool_max_idle_per_host` remains global-only by deliberate tradeoff — per-proxy values would over-fragment without a per-request escape hatch. Secrets never appear in pool keys.
+
+Both request timeouts can therefore be set independently per proxy without forcing distinct `dns_override` values to fragment the pool. Earlier versions of ferrum-edge documented a `dns_override` work-around for `backend_connect_timeout_ms` — that work-around is no longer needed.
 
 **One nuance for cold pools.** When two simultaneous requests from different proxies arrive at the same shared client and the pool entry is cold (or saturated), only one of them actually performs the TCP/TLS handshake — the others coalesce onto that pending connect via hyper's connection pool. The whole coalesced group resolves when the in-flight handshake finishes (or fails), so a sibling proxy with a tighter `backend_connect_timeout_ms` will not abort the connect early; it observes whatever the first poller's connect timeout governed. This is intrinsic to how hyper deduplicates concurrent connect attempts and was true under the old client-level connect timeout as well. In steady state, almost all dispatches reuse a warm idle connection and skip the coalescing window entirely, so this edge case rarely matters in practice. Paths that can hit it: the very first request to a backend after process start, demand spikes that exceed `pool_max_idle_per_host`, eviction (idle timeout, RST/FIN, keepalive failure), and DNS re-resolution after `pool_max_lifetime`. If you need strictly independent connect timeouts including the cold-pool race, fragment the pool with a distinct `dns_override` per proxy — the same fragmentation lever the docs previously prescribed for the steady-state case.
 
