@@ -25,7 +25,7 @@
 //! `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in
 //! `ai_semantic_firewall` for enforcement.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -2285,7 +2285,6 @@ struct ReassembledChoice {
 fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(raw).ok()?;
     let mut per_choice: BTreeMap<u64, ReassembledChoice> = BTreeMap::new();
-    let mut tool_call_choices_seen = BTreeSet::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("data:") else {
             continue;
@@ -2323,17 +2322,6 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
             }
             if let Some(tool_calls) = delta.get("tool_calls") {
                 let tool_calls = tool_calls.as_array()?;
-                let has_indexless_call = tool_calls
-                    .iter()
-                    .any(|tool_call| tool_call.get("index").is_none());
-                if has_indexless_call && tool_call_choices_seen.contains(&index) {
-                    // Position is only an unambiguous fallback within one
-                    // frame. A later indexless frame could continue any prior
-                    // call, so keep the raw-frame redaction path rather than
-                    // joining potentially unrelated tool calls.
-                    return None;
-                }
-                tool_call_choices_seen.insert(index);
                 for (position, tool_call) in tool_calls.iter().enumerate() {
                     let tool_call = tool_call.as_object()?;
                     let tool_index = match tool_call.get("index") {

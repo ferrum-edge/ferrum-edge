@@ -4708,7 +4708,7 @@ async fn tool_call_only_sse_uses_reassembled_shape() {
 }
 
 #[tokio::test]
-async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
+async fn repeated_indexless_tool_call_frames_reassemble_before_redaction() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
@@ -4728,7 +4728,7 @@ async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
-    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"42}\"}}]}}]}\n\ndata: [DONE]\n\n";
+    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"token\\\":\\\"abc\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"def\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
     let _ = inspector.on_chunk(stream).await;
     let _ = inspector.on_end().await;
     plugin
@@ -4739,14 +4739,13 @@ async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
     let excerpt = records[0]["response_body"]
         .as_str()
         .expect("response excerpt");
+    assert!(excerpt.contains("sse_reassembled"), "{excerpt}");
+    assert!(!excerpt.contains("abcdef"), "{excerpt}");
     assert!(
-        !excerpt.contains("sse_reassembled"),
-        "ambiguous indexless continuations must not be guessed: {excerpt}"
+        !excerpt.contains("abc") && !excerpt.contains("def"),
+        "{excerpt}"
     );
-    assert!(
-        excerpt.contains("chat.completion.chunk"),
-        "raw-frame fallback must retain the captured OpenAI frames: {excerpt}"
-    );
+    assert!(excerpt.contains(r#"\"token\":\"[REDACTED]\""#), "{excerpt}");
 }
 
 #[tokio::test]
