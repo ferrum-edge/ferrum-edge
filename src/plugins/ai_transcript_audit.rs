@@ -2285,7 +2285,7 @@ struct ReassembledChoice {
 fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(raw).ok()?;
     let mut per_choice: BTreeMap<u64, ReassembledChoice> = BTreeMap::new();
-    let mut tool_call_choices_seen = BTreeSet::new();
+    let mut indexless_tool_call_choices = BTreeSet::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("data:") else {
             continue;
@@ -2326,14 +2326,13 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
                 let has_indexless_call = tool_calls
                     .iter()
                     .any(|tool_call| tool_call.get("index").is_none());
-                if has_indexless_call && tool_call_choices_seen.contains(&index) {
+                if has_indexless_call && !indexless_tool_call_choices.insert(index) {
                     // Position is only an unambiguous fallback within one
                     // frame. A later indexless frame could continue any prior
                     // call, so keep the raw-frame redaction path rather than
                     // joining potentially unrelated tool calls.
                     return None;
                 }
-                tool_call_choices_seen.insert(index);
                 for (position, tool_call) in tool_calls.iter().enumerate() {
                     let tool_call = tool_call.as_object()?;
                     let tool_index = match tool_call.get("index") {

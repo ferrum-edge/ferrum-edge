@@ -4708,6 +4708,44 @@ async fn tool_call_only_sse_uses_reassembled_shape() {
 }
 
 #[tokio::test]
+async fn indexed_then_indexless_tool_call_fragments_are_reassembled_and_redacted() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"password\\\":\\\"secret-\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"value\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .await;
+
+    let records = wait_for_records(&server).await;
+    let excerpt = records[0]["response_body"]
+        .as_str()
+        .expect("response excerpt");
+    assert!(excerpt.contains("sse_reassembled"), "got: {excerpt}");
+    assert!(excerpt.contains("[REDACTED]"), "got: {excerpt}");
+    assert!(!excerpt.contains("secret-"), "got: {excerpt}");
+    assert!(!excerpt.contains("value"), "got: {excerpt}");
+}
+
+#[tokio::test]
 async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
@@ -4728,7 +4766,7 @@ async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
-    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"id\\\":\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"42}\"}}]}}]}\n\ndata: [DONE]\n\n";
+    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"first\",\"arguments\":\"{}\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"ambiguous\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n";
     let _ = inspector.on_chunk(stream).await;
     let _ = inspector.on_end().await;
     plugin
@@ -4739,14 +4777,8 @@ async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
     let excerpt = records[0]["response_body"]
         .as_str()
         .expect("response excerpt");
-    assert!(
-        !excerpt.contains("sse_reassembled"),
-        "ambiguous indexless continuations must not be guessed: {excerpt}"
-    );
-    assert!(
-        excerpt.contains("chat.completion.chunk"),
-        "raw-frame fallback must retain the captured OpenAI frames: {excerpt}"
-    );
+    assert!(!excerpt.contains("sse_reassembled"), "got: {excerpt}");
+    assert!(excerpt.contains("chat.completion.chunk"), "got: {excerpt}");
 }
 
 #[tokio::test]
