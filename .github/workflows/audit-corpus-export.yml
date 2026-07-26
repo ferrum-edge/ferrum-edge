@@ -1,0 +1,85 @@
+name: Audit duplicate corpus export
+
+on:
+  push:
+    branches:
+      - audit/corpus-export-2026-07-26
+    paths:
+      - '.github/workflows/audit-corpus-export.yml'
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: ferrum-audit-corpus-export
+  cancel-in-progress: true
+
+jobs:
+  export:
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    steps:
+      - name: Export all open issues and pull requests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p audit-corpus
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          repo = os.environ['GH_REPOSITORY']
+          token = os.environ['GH_TOKEN']
+
+          def get_all(path):
+              rows = []
+              page = 1
+              while True:
+                  url = f'https://api.github.com/repos/{repo}/{path}?state=open&per_page=100&page={page}'
+                  request = urllib.request.Request(
+                      url,
+                      headers={
+                          'Accept': 'application/vnd.github+json',
+                          'Authorization': f'Bearer {token}',
+                          'X-GitHub-Api-Version': '2022-11-28',
+                          'User-Agent': 'ferrum-launch-readiness-audit',
+                      },
+                  )
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      batch = json.load(response)
+                  rows.extend(batch)
+                  if len(batch) < 100:
+                      return rows
+                  page += 1
+
+          issue_api_rows = get_all('issues')
+          issues = [row for row in issue_api_rows if 'pull_request' not in row]
+          pulls = get_all('pulls')
+          fields = (
+              'number', 'title', 'body', 'html_url', 'created_at', 'updated_at',
+              'labels', 'user', 'draft', 'head', 'base'
+          )
+          for name, rows in (('open-issues.json', issues), ('open-pulls.json', pulls)):
+              projected = [{field: row.get(field) for field in fields} for row in rows]
+              with open(f'audit-corpus/{name}', 'w', encoding='utf-8') as handle:
+                  json.dump(projected, handle, indent=2, ensure_ascii=False)
+                  handle.write('\n')
+          with open('audit-corpus/summary.json', 'w', encoding='utf-8') as handle:
+              json.dump({'open_issues': len(issues), 'open_pulls': len(pulls)}, handle, indent=2)
+              handle.write('\n')
+          print(json.dumps({'open_issues': len(issues), 'open_pulls': len(pulls)}))
+          PY
+
+      - name: Upload duplicate corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrum-edge-open-backlog-${{ github.run_id }}
+          path: audit-corpus
+          if-no-files-found: error
+          retention-days: 1
