@@ -29,8 +29,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          base64 --decode tools/audit/publish_81/findings.json.gz.b64 \
-            | gzip --decompress > /tmp/ferrum-reviewed-findings.json
+          cat tools/audit/publish_81/findings.b64.* \
+            | base64 --decode \
+            | gzip --decompress \
+            > /tmp/ferrum-reviewed-findings.json
 
       - name: Validate and publish reviewed findings
         shell: bash
@@ -41,6 +43,7 @@ jobs:
           set -euo pipefail
           python3 tools/audit/publish_81/publish_findings.py \
             --manifest-file /tmp/ferrum-reviewed-findings.json \
+            --resolved-manifest tools/audit/publish_81/resolved_findings.json \
             --output tools/audit/publish_81/results.json
 
       - name: Upload publication manifest and verification results
@@ -49,7 +52,8 @@ jobs:
         with:
           name: ferrum-published-81-findings-${{ github.run_id }}
           path: |
-            tools/audit/publish_81/findings.json.gz.b64
+            tools/audit/publish_81/findings.b64.*
+            tools/audit/publish_81/resolved_findings.json
             tools/audit/publish_81/results.json
           if-no-files-found: warn
           retention-days: 7
