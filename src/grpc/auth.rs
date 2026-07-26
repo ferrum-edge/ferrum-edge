@@ -48,6 +48,11 @@ pub const MESH_REMOTE_DISCOVERY_AUDIENCE_PREFIX: &str = "ferrum-mesh-discovery:"
 /// deliberately independent of `control_plane_url`: the endpoint is mutable
 /// (DNS, ports, migration between load balancers) and must never be the thing a
 /// credential is bound to.
+///
+/// Mesh validation rejects leading/trailing whitespace on `RemoteCluster.name`
+/// (and `local_cluster`) so the configured identity matches this audience
+/// one-to-one. `trim()` here remains defense in depth for the already-canonical
+/// `FERRUM_MESH_CLUSTER_AUDIENCE` env path.
 pub fn remote_discovery_audience(cluster_id: &str) -> String {
     format!(
         "{MESH_REMOTE_DISCOVERY_AUDIENCE_PREFIX}{}",

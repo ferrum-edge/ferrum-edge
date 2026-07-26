@@ -937,6 +937,101 @@ fn multi_cluster_rejects_blank_discovery_credential_ref() {
     );
 }
 
+fn remote_cluster(name: &str) -> RemoteCluster {
+    RemoteCluster {
+        name: name.to_string(),
+        trust_domain: TrustDomain::new("remote.test").unwrap(),
+        network: None,
+        control_plane_url: None,
+        federation_endpoint: None,
+        discovery_credential_ref: None,
+    }
+}
+
+#[test]
+fn multi_cluster_rejects_remote_cluster_name_with_surrounding_whitespace() {
+    // `remote_discovery_audience` trims the cluster id into the JWT `aud`, so a
+    // padded `RemoteCluster.name` would mint the same audience as its trimmed
+    // form while still keying discovery state under the raw spelling. Reject
+    // the padded spelling at validation (no silent rewrite) before any poller
+    // is spawned.
+    for padded in [" cluster-b", "cluster-b ", "\tcluster-b\n"] {
+        let mesh = MeshConfig {
+            multi_cluster: Some(MultiClusterConfig {
+                remote_clusters: vec![remote_cluster(padded)],
+                ..MultiClusterConfig::default()
+            }),
+            ..MeshConfig::default()
+        };
+        let errors = mesh.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.contains("leading/trailing whitespace")),
+            "padded RemoteCluster.name `{padded:?}` must be rejected, got: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn multi_cluster_rejects_whitespace_aliased_remote_cluster_names() {
+    // `"cluster-b"` and `" cluster-b "` are distinct raw strings but collapse to
+    // the same JWT audience after trim. Uniqueness must run in that canonical
+    // identity domain so the pair cannot be admitted as two destinations.
+    let mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            remote_clusters: vec![remote_cluster("cluster-b"), remote_cluster(" cluster-b ")],
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+    let errors = mesh.validate();
+    assert!(
+        errors
+            .iter()
+            .any(|err| err.contains("leading/trailing whitespace")),
+        "whitespace alias must be rejected, got: {errors:?}"
+    );
+    assert!(
+        errors.iter().any(|err| err.contains("duplicate name")),
+        "whitespace alias must also collide in the canonical audience identity domain, got: {errors:?}"
+    );
+}
+
+#[test]
+fn multi_cluster_rejects_local_cluster_with_surrounding_whitespace() {
+    let mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            local_cluster: Some(" cluster-a ".to_string()),
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|err| {
+            err.contains("local_cluster") && err.contains("leading/trailing whitespace")
+        }),
+        "padded local_cluster must be rejected, got: {errors:?}"
+    );
+}
+
+#[test]
+fn multi_cluster_rejects_exact_duplicate_remote_cluster_names() {
+    let mesh = MeshConfig {
+        multi_cluster: Some(MultiClusterConfig {
+            remote_clusters: vec![remote_cluster("cluster-b"), remote_cluster("cluster-b")],
+            ..MultiClusterConfig::default()
+        }),
+        ..MeshConfig::default()
+    };
+    let errors = mesh.validate();
+    assert!(
+        errors.iter().any(|err| err.contains("duplicate name")),
+        "exact duplicate RemoteCluster.name must be rejected, got: {errors:?}"
+    );
+}
+
 #[test]
 fn multi_cluster_rejects_too_many_remote_clusters() {
     let remote_clusters: Vec<RemoteCluster> = (0..=MAX_MESH_REMOTE_CLUSTERS)

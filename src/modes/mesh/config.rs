@@ -1717,7 +1717,9 @@ pub const MAX_MESH_REMOTE_CLUSTERS: usize = 256;
 /// the same canonical shape instead of talking past Layer 2.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MultiClusterConfig {
-    /// Operator-facing name for the local cluster.
+    /// Operator-facing name for the local cluster. When set, must be a
+    /// canonical identifier with no leading/trailing whitespace (same identity
+    /// domain as `RemoteCluster.name`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_cluster: Option<String>,
     /// SPIFFE federation endpoint served by this control plane, when Ferrum
@@ -1735,6 +1737,10 @@ pub struct MultiClusterConfig {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteCluster {
+    /// Canonical peer-cluster identity. Doubles as the remote-discovery JWT
+    /// audience suffix (`ferrum-mesh-discovery:<name>`). Must not carry
+    /// leading/trailing whitespace; uniqueness is enforced in that same
+    /// identity domain so aliases cannot collapse onto one audience.
     pub name: String,
     pub trust_domain: TrustDomain,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3635,12 +3641,20 @@ fn validate_multi_cluster(
     trust_bundles: Option<&TrustBundleSet>,
     errors: &mut Vec<String>,
 ) {
-    if multi_cluster
-        .local_cluster
-        .as_deref()
-        .is_some_and(|value| value.trim().is_empty())
-    {
-        errors.push("MultiClusterConfig.local_cluster must not be empty when set".to_string());
+    // `local_cluster` participates in the same operator-visible cluster-identity
+    // domain as `RemoteCluster.name` (workload.cluster comparisons, remote
+    // provenance). Reject surrounding whitespace rather than silently rewriting
+    // so config identity stays byte-stable and cannot alias a trimmed peer.
+    if let Some(local_cluster) = multi_cluster.local_cluster.as_deref() {
+        let canonical = local_cluster.trim();
+        if canonical.is_empty() {
+            errors.push("MultiClusterConfig.local_cluster must not be empty when set".to_string());
+        } else if local_cluster != canonical {
+            errors.push(
+                "MultiClusterConfig.local_cluster must not have leading/trailing whitespace"
+                    .to_string(),
+            );
+        }
     }
     if multi_cluster
         .federation_endpoint
@@ -3658,12 +3672,27 @@ fn validate_multi_cluster(
         ));
     }
 
+    // Uniqueness is keyed on the SAME canonical identity `remote_discovery_audience`
+    // uses (trimmed `RemoteCluster.name` → JWT `aud`). Surrounding-whitespace
+    // aliases are rejected outright — never rewritten — because the raw name
+    // also keys remote discovery state and operator-visible config. Validation
+    // runs before any remote poller is spawned, so a colliding audience cannot
+    // reach minting.
     let mut seen_cluster_names = HashSet::new();
     for remote in &multi_cluster.remote_clusters {
-        if remote.name.trim().is_empty() {
+        let canonical_name = remote.name.trim();
+        if canonical_name.is_empty() {
             errors.push("RemoteCluster: name must not be empty".to_string());
-        } else if !seen_cluster_names.insert(remote.name.as_str()) {
-            errors.push(format!("RemoteCluster '{}': duplicate name", remote.name));
+        } else {
+            if remote.name.as_str() != canonical_name {
+                errors.push(format!(
+                    "RemoteCluster '{}': name must not have leading/trailing whitespace",
+                    remote.name
+                ));
+            }
+            if !seen_cluster_names.insert(canonical_name) {
+                errors.push(format!("RemoteCluster '{}': duplicate name", remote.name));
+            }
         }
         if remote
             .network
