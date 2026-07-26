@@ -42,6 +42,24 @@ jobs:
             --root audited-main \
             --sha 30dfc4aee3c16f5ea5ddcb7078a2b9da6f89564c \
             --out tools/audit/generated
+          printf '%s\n' "$GITHUB_RUN_ID" > tools/audit/generated/RUN_ID
+
+      - name: Package exact audited source
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C audited-main \
+            --exclude=.git \
+            --exclude=target \
+            -czf /tmp/ferrum-edge-audited-main.tar.gz .
+
+      - name: Upload exact audited source
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrum-edge-audited-main-${{ github.run_id }}
+          path: /tmp/ferrum-edge-audited-main.tar.gz
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Commit report to the isolated audit branch
         shell: bash
