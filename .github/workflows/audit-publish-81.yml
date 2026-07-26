@@ -1,0 +1,86 @@
+name: Publish reviewed launch-audit findings
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+    paths:
+      - '.github/workflows/audit-publish-81.yml'
+      - 'tools/audit/publish81/**'
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: ferrum-publish-reviewed-audit-81
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: >-
+      github.event.pull_request.head.ref == 'audit/publish-81-2026-07-26' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-slim
+    timeout-minutes: 45
+    steps:
+      - name: Check out temporary publication branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          persist-credentials: false
+
+      - name: Rehydrate and validate reviewed manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ferrum-audit
+          cat tools/audit/publish81/findings.part* \
+            | base64 -d \
+            | xz -d \
+            > /tmp/ferrum-audit/findings.json
+          base64 -d tools/audit/publish81/publisher.b64 \
+            | xz -d \
+            > /tmp/ferrum-audit/publish_findings.py
+          python3 -m py_compile /tmp/ferrum-audit/publish_findings.py
+          python3 - <<'PY'
+          import json
+
+          path = '/tmp/ferrum-audit/findings.json'
+          with open(path, encoding='utf-8') as handle:
+              payload = json.load(handle)
+          assert payload['repository'] == 'ferrum-edge/ferrum-edge'
+          assert payload['audited_sha'] == '04b523efcab7325e7665d1afa95ca6c281de76fd'
+          assert payload['verified_main_sha'] == '6ec13efa5068d3a0a67ded7f493e4fd5e48cd688'
+          assert len(payload['findings']) == 81
+          assert len({item['marker'] for item in payload['findings']}) == 81
+          print({
+              'findings': len(payload['findings']),
+              'audited_sha': payload['audited_sha'],
+              'verified_main_sha': payload['verified_main_sha'],
+          })
+          PY
+
+      - name: Publish idempotently and post-verify every marker
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 /tmp/ferrum-audit/publish_findings.py \
+            --manifest-file /tmp/ferrum-audit/findings.json \
+            --output /tmp/ferrum-audit/publication-results.json \
+            --resolved-manifest /tmp/ferrum-audit/resolved-findings.json \
+            --delay 1.6
+
+      - name: Upload publication checkpoint and resolved manifest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrum-reviewed-audit-publication-${{ github.run_id }}
+          path: |
+            /tmp/ferrum-audit/publication-results.json
+            /tmp/ferrum-audit/resolved-findings.json
+          if-no-files-found: warn
+          retention-days: 7
