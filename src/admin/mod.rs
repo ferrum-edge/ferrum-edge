@@ -1330,9 +1330,10 @@ pub async fn handle_admin_request(
             .as_ref()
             .is_none_or(|flag| flag.load(Ordering::Acquire));
         // Sticky serving-degradation overrides a readiness restore (issue
-        // #2117): once a CP/DP/mesh serving task dies after startup, `/health` stays
-        // not-ready even though the mode's main task (CP) or a CP reconnect (DP)
-        // later stores `startup_ready = true`. Only CP/DP populate this flag.
+        // #2117 / #2986): once a CP/DP/mesh serving task — or the CP database
+        // config poll task — dies after startup, `/health` stays not-ready even
+        // though the mode's main task (CP) or a CP reconnect (DP) later stores
+        // `startup_ready = true`. Only CP/DP/mesh populate this flag.
         let serving_degraded = state
             .serving_degraded
             .as_ref()
@@ -1362,13 +1363,13 @@ pub async fn handle_admin_request(
             });
         }
 
-        if state.mode == "database"
+        if (state.mode == "database" || state.mode == "cp")
             && let Some(snapshot) = crate::plugins::prometheus_metrics::global_registry()
                 .database_delta_poll_metrics_snapshot()
         {
             if let Some(degraded) = snapshot.degraded {
                 health_status["status"] = json!("degraded");
-                health_status["database_polling"] = json!({
+                let mut polling = json!({
                     "status": "degraded",
                     "reason": degraded.reason,
                     "resource_category": degraded.resource_category,
@@ -1378,13 +1379,21 @@ pub async fn handle_admin_request(
                     "current_backoff_seconds": degraded.current_backoff_seconds,
                     "escalated": degraded.escalated,
                 });
+                if let Some(at) = snapshot.last_poll_completed_at {
+                    polling["last_poll_completed_at"] = json!(at);
+                }
+                health_status["database_polling"] = polling;
             } else {
-                health_status["database_polling"] = json!({
+                let mut polling = json!({
                     "status": "ok",
                     "consecutive_identical_rejections": snapshot.consecutive_identical_rejections,
                     "current_backoff_bucket": snapshot.current_backoff_bucket,
                     "current_backoff_seconds": snapshot.current_backoff_seconds,
                 });
+                if let Some(at) = snapshot.last_poll_completed_at {
+                    polling["last_poll_completed_at"] = json!(at);
+                }
+                health_status["database_polling"] = polling;
             }
         }
 
@@ -1446,6 +1455,9 @@ pub async fn handle_admin_request(
                 serde_json::to_value(crate::logging::snapshot()).unwrap_or_default();
             health_status["kafka_logging"] =
                 serde_json::to_value(crate::plugins::kafka_logging::snapshots())
+                    .unwrap_or_default();
+            health_status["ai_transcript_audit"] =
+                serde_json::to_value(crate::plugins::ai_transcript_audit::snapshots())
                     .unwrap_or_default();
         }
 
@@ -5302,7 +5314,7 @@ async fn handle_metrics(state: &AdminState) -> Result<Response<Full<Bytes>>, hyp
 /// `gateway.config_source_status` is derived from a lock-free
 /// [`AdminState::db_available`] snapshot — never from a per-request DB probe.
 pub fn build_metrics(state: &AdminState) -> metrics::AdminMetrics {
-    let database_polling = if state.mode == "database" {
+    let database_polling = if state.mode == "database" || state.mode == "cp" {
         crate::plugins::prometheus_metrics::global_registry().database_delta_poll_metrics_snapshot()
     } else {
         None
@@ -6432,7 +6444,7 @@ async fn handle_restore(
     // Phase 1: Parse all resources directly into typed structs before deleting
     // anything. This avoids an intermediate serde_json::Value copy (~50% less
     // peak memory at scale).
-    let payload: RestorePayload = match serde_json::from_slice(body) {
+    let mut payload: RestorePayload = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => {
             return Ok(json_response(
@@ -6467,138 +6479,146 @@ async fn handle_restore(
         body.len()
     );
 
-    // Phase 2: Validate payload BEFORE deleting anything.
-    // Assemble a temporary GatewayConfig and run the same validations as file mode.
+    // Phase 2: Normalize the *actual* restore payload once, then validate that
+    // same canonical instance. SQL and Mongo batch writers persist the values
+    // they receive without repeating domain normalization, so discarding a
+    // temporary clone here would admit mixed-case hosts/SNI/SAN and blank
+    // optional identifiers that CRUD/file/database loaders never store.
+    let mut candidate = GatewayConfig {
+        version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
+        proxies: std::mem::take(&mut payload.proxies),
+        consumers: std::mem::take(&mut payload.consumers),
+        plugin_configs: std::mem::take(&mut payload.plugin_configs),
+        upstreams: std::mem::take(&mut payload.upstreams),
+        loaded_at: Utc::now(),
+        known_namespaces: Vec::new(),
+        mesh: state
+            .cached_gateway_config()
+            .and_then(|config| config.mesh.clone()),
+        ..Default::default()
+    };
+    candidate.normalize_fields();
+    // Namespace boundaries are part of the candidate under validation and the
+    // instance later prepared for snapshot-guarded persistence.
+    for proxy in &mut candidate.proxies {
+        proxy.namespace = namespace.to_string();
+    }
+    for consumer in &mut candidate.consumers {
+        consumer.namespace = namespace.to_string();
+    }
+    for plugin_config in &mut candidate.plugin_configs {
+        plugin_config.namespace = namespace.to_string();
+    }
+    for upstream in &mut candidate.upstreams {
+        upstream.namespace = namespace.to_string();
+    }
+    let cert_expiry_days = state
+        .proxy_state
+        .as_ref()
+        .map(|ps| ps.env_config.tls_cert_expiry_warning_days)
+        .unwrap_or(crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS);
+    let (candidate, mut validation_errors) = match validate_restore_candidate_on_blocking_pool(
+        candidate,
+        cert_expiry_days,
+        state.backend_allow_ips.clone(),
+    )
+    .await
     {
-        let mut temp_config = GatewayConfig {
-            version: crate::config::types::CURRENT_CONFIG_VERSION.to_string(),
-            proxies: payload.proxies.clone(),
-            consumers: payload.consumers.clone(),
-            plugin_configs: payload.plugin_configs.clone(),
-            upstreams: payload.upstreams.clone(),
-            loaded_at: Utc::now(),
-            known_namespaces: Vec::new(),
-            mesh: state
-                .cached_gateway_config()
-                .and_then(|config| config.mesh.clone()),
-            ..Default::default()
-        };
-        temp_config.normalize_fields();
-        // Set namespace on all resources
-        for p in &mut temp_config.proxies {
-            p.namespace = namespace.to_string();
-        }
-        for c in &mut temp_config.consumers {
-            c.namespace = namespace.to_string();
-        }
-        for pc in &mut temp_config.plugin_configs {
-            pc.namespace = namespace.to_string();
-        }
-        for u in &mut temp_config.upstreams {
-            u.namespace = namespace.to_string();
-        }
-        let cert_expiry_days = state
-            .proxy_state
-            .as_ref()
-            .map(|ps| ps.env_config.tls_cert_expiry_warning_days)
-            .unwrap_or(crate::tls::DEFAULT_CERT_EXPIRY_WARNING_DAYS);
-        let (temp_config, mut validation_errors) =
-            match validate_restore_candidate_on_blocking_pool(
-                temp_config,
-                cert_expiry_days,
-                state.backend_allow_ips.clone(),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_error) => {
-                    warn_persistence_failure_redacted("restore_payload_validation_task");
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &json!({
-                            "error": "Restore aborted: payload validation could not complete. Existing config was NOT deleted."
-                        }),
-                    ));
-                }
-            };
-        // Restore is an operator-provided admin write, so reject mesh-PROJECTED
-        // upstream fields the same way direct POST/PUT does. This check is
-        // intentionally NOT part of the shared `validate_all_fields` step (that
-        // step also runs on the mesh slice-apply path, where mesh-projected
-        // upstreams legitimately carry these fields); operator paths invoke it
-        // explicitly.
-        for u in &temp_config.upstreams {
-            if let Err(errs) = u.validate_operator_provided_fields() {
-                for e in errs {
-                    validation_errors.push(format!("Upstream '{}': {}", u.id, e));
-                }
-            }
-        }
-        if temp_config
-            .plugin_configs
-            .iter()
-            .any(|plugin| plugin.enabled && plugin.plugin_name == "prometheus_metrics")
-        {
-            match crud::enabled_prometheus_metrics_owner_exists_outside_namespace(
-                db.as_ref(),
-                namespace,
-            )
-            .await
-            {
-                Ok(true) => validation_errors.push(
-                    "prometheus_metrics permits at most one enabled global instance; another namespace already owns the process registry"
-                        .to_string(),
-                ),
-                Ok(false) => {}
-                Err(_error) => {
-                    warn_persistence_failure_redacted(
-                        "restore_prometheus_metrics_ownership_check",
-                    );
-                    return Ok(json_response(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        &json!({
-                            "error": "Restore aborted: prometheus_metrics ownership could not be validated because the database is unavailable. Existing config was NOT deleted."
-                        }),
-                    ));
-                }
-            }
-        }
-        match crud::validate_plugin_graph_restore_candidate(state, &temp_config) {
-            Ok(()) => {}
-            Err(
-                crud::AfterValidateError::BadRequest(errors)
-                | crud::AfterValidateError::Conflict(errors),
-            ) => {
-                validation_errors.extend(errors);
-            }
-            Err(crud::AfterValidateError::Db(_error)) => {
-                warn_persistence_failure_redacted("restore_plugin_security_composition_check");
-                return Ok(json_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &json!({
-                        "error": "Restore aborted: plugin security composition could not be validated because the database is unavailable. Existing config was NOT deleted."
-                    }),
-                ));
-            }
-            Err(crud::AfterValidateError::Response(_)) => validation_errors.push(
-                "Plugin-graph candidate validation returned an unexpected response".to_string(),
-            ),
-        }
-        if !validation_errors.is_empty() {
+        Ok(result) => result,
+        Err(_error) => {
+            warn_persistence_failure_redacted("restore_payload_validation_task");
             return Ok(json_response(
-                StatusCode::BAD_REQUEST,
+                StatusCode::SERVICE_UNAVAILABLE,
                 &json!({
-                    "error": "Restore payload validation failed — existing config was NOT deleted",
-                    "validation_errors": validation_errors
+                    "error": "Restore aborted: payload validation could not complete. Existing config was NOT deleted."
                 }),
             ));
         }
+    };
+    // Restore is an operator-provided admin write, so reject mesh-PROJECTED
+    // upstream fields the same way direct POST/PUT does. This check is
+    // intentionally NOT part of the shared `validate_all_fields` step (that
+    // step also runs on the mesh slice-apply path, where mesh-projected
+    // upstreams legitimately carry these fields); operator paths invoke it
+    // explicitly.
+    for upstream in &candidate.upstreams {
+        if let Err(errs) = upstream.validate_operator_provided_fields() {
+            for e in errs {
+                validation_errors.push(format!("Upstream '{}': {}", upstream.id, e));
+            }
+        }
+    }
+    if candidate
+        .plugin_configs
+        .iter()
+        .any(|plugin| plugin.enabled && plugin.plugin_name == "prometheus_metrics")
+    {
+        match crud::enabled_prometheus_metrics_owner_exists_outside_namespace(
+            db.as_ref(),
+            namespace,
+        )
+        .await
+        {
+            Ok(true) => validation_errors.push(
+                "prometheus_metrics permits at most one enabled global instance; another namespace already owns the process registry"
+                    .to_string(),
+            ),
+            Ok(false) => {}
+            Err(_error) => {
+                warn_persistence_failure_redacted("restore_prometheus_metrics_ownership_check");
+                return Ok(json_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &json!({
+                        "error": "Restore aborted: prometheus_metrics ownership could not be validated because the database is unavailable. Existing config was NOT deleted."
+                    }),
+                ));
+            }
+        }
+    }
+    match crud::validate_plugin_graph_restore_candidate(state, &candidate) {
+        Ok(()) => {}
+        Err(
+            crud::AfterValidateError::BadRequest(errors)
+            | crud::AfterValidateError::Conflict(errors),
+        ) => {
+            validation_errors.extend(errors);
+        }
+        Err(crud::AfterValidateError::Db(_error)) => {
+            warn_persistence_failure_redacted("restore_plugin_security_composition_check");
+            return Ok(json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &json!({
+                    "error": "Restore aborted: plugin security composition could not be validated because the database is unavailable. Existing config was NOT deleted."
+                }),
+            ));
+        }
+        Err(crud::AfterValidateError::Response(_)) => validation_errors
+            .push("Plugin-graph candidate validation returned an unexpected response".to_string()),
+    }
+    if !validation_errors.is_empty() {
+        return Ok(json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({
+                "error": "Restore payload validation failed — existing config was NOT deleted",
+                "validation_errors": validation_errors
+            }),
+        ));
     }
 
+    // Reassemble the restore payload from the validated canonical candidate so
+    // credential/timestamp preparation and persistence keep that exact
+    // instance. Do not reintroduce the discarded wire-form original.
+    payload.proxies = candidate.proxies;
+    payload.consumers = candidate.consumers;
+    payload.plugin_configs = candidate.plugin_configs;
+    payload.upstreams = candidate.upstreams;
+
     // Complete all fallible payload preparation before changing durable state.
-    let mut payload = payload;
     let mut preparation_errors = Vec::new();
     normalize_restore_payload_timestamps(&mut payload, Utc::now());
+    // Namespace was already stamped on the validated candidate; re-apply
+    // idempotently so preparation stays fail-closed if a resource somehow
+    // lost its boundary.
     apply_payload_namespace(&mut payload, namespace);
     hash_payload_consumers(&mut payload.consumers, &mut preparation_errors);
     if !preparation_errors.is_empty() {
@@ -7499,6 +7519,9 @@ async fn handle_cluster_status(state: &AdminState) -> Result<Response<Full<Bytes
                             "is_primary": snap.is_primary,
                             "connected_since": snap.connected_since.map(|t| t.to_rfc3339()),
                             "last_config_received_at": snap.last_config_received_at.map(|t| t.to_rfc3339()),
+                            "config_diverged": snap.config_diverged,
+                            "config_diverged_since": snap.config_diverged_since.map(|t| t.to_rfc3339()),
+                            "config_divergence_recoveries_total": snap.config_divergence_recoveries_total,
                         },
                     }),
                 ))

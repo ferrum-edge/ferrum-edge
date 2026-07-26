@@ -420,6 +420,118 @@ fn test_size_policy_rejections_use_explicit_error_classes() {
             branch.contains(expected_class),
             "{direction_marker} must record {expected_class}"
         );
+        assert!(
+            branch.contains("global_capacity_close_for_error"),
+            "{direction_marker} must fall back to a global capacity Close 1009"
+        );
+    }
+}
+
+/// Global capacity overflow Close is a bounded empty-reason 1009, never a
+/// peer/secret payload.
+#[test]
+fn test_global_capacity_close_frame_is_bounded_non_secret_1009() {
+    let close = ferrum_edge::_test_support::ws_global_capacity_close_frame_for_test();
+    assert_eq!(close.code, CloseCode::Size);
+    assert!(
+        close.reason.is_empty(),
+        "global fallback reason must stay empty/non-secret"
+    );
+    assert!(
+        close.reason.len() <= 123,
+        "close reason must fit the RFC 6455 control-frame budget"
+    );
+}
+
+/// Idle-timeout policy Close is the single defined 1001 both relay halves share.
+#[test]
+fn test_idle_timeout_policy_close_frame_is_defined_1001() {
+    let close = ferrum_edge::_test_support::ws_idle_timeout_policy_close_frame_for_test();
+    assert_eq!(close.code, CloseCode::Away);
+    assert_eq!(close.reason.as_str(), "idle timeout");
+    assert!(close.reason.len() <= 123);
+}
+
+/// Capacity errors without a binding plugin rule still select the global 1009.
+#[test]
+fn test_global_capacity_close_for_error_selects_1009() {
+    use tokio_tungstenite::tungstenite::Error as WsError;
+    use tokio_tungstenite::tungstenite::error::CapacityError;
+
+    let frame_err = WsError::Capacity(CapacityError::FrameTooLong {
+        size: 64,
+        max_size: 16,
+    });
+    let (close, kind, size, max_size) =
+        ferrum_edge::_test_support::global_ws_capacity_close_for_error_for_test(&frame_err)
+            .expect("frame capacity must map to global 1009");
+    assert_eq!(close.code, CloseCode::Size);
+    assert!(close.reason.is_empty());
+    assert_eq!(kind, "frame");
+    assert_eq!(size, 64);
+    assert_eq!(max_size, 16);
+
+    let message_err = WsError::Capacity(CapacityError::MessageTooLong {
+        size: 200,
+        max_size: 64,
+    });
+    let (close, kind, size, max_size) =
+        ferrum_edge::_test_support::global_ws_capacity_close_for_error_for_test(&message_err)
+            .expect("message capacity must map to global 1009");
+    assert_eq!(close.code, CloseCode::Size);
+    assert_eq!(kind, "message");
+    assert_eq!(size, 200);
+    assert_eq!(max_size, 64);
+
+    assert!(
+        ferrum_edge::_test_support::global_ws_capacity_close_for_error_for_test(
+            &WsError::ConnectionClosed
+        )
+        .is_none(),
+        "non-capacity errors must not synthesize a size Close"
+    );
+}
+
+/// Idle-timeout arms must publish the shared policy Close before cancelling so
+/// both halves attempt a meaningful teardown instead of Close(None)/1006.
+#[test]
+fn test_idle_timeout_arms_publish_policy_close_before_teardown() {
+    let source = include_str!("../../../src/proxy/mod.rs");
+
+    for (marker, end_marker) in [
+        (
+            "observed on client->backend half)",
+            "Client -> backend forwarding completed",
+        ),
+        (
+            "observed on backend->client half)",
+            "Backend -> client forwarding completed",
+        ),
+    ] {
+        let branch = source
+            .split_once(marker)
+            .unwrap_or_else(|| panic!("missing idle-timeout branch: {marker}"))
+            .1;
+        let branch = branch
+            .split_once(end_marker)
+            .unwrap_or_else(|| panic!("missing relay branch end: {end_marker}"))
+            .0;
+        let idle_arm = branch
+            .split("Ok(raw @")
+            .next()
+            .expect("idle arm should precede the next Ok match arm");
+        assert!(
+            idle_arm.contains("ws_idle_timeout_policy_close_frame()"),
+            "{marker} must publish the defined idle-timeout Close"
+        );
+        assert!(
+            idle_arm.contains("publish_ws_policy_close"),
+            "{marker} must publish through OnceLock arbitration"
+        );
+        assert!(
+            idle_arm.contains("send_bounded_ws_close"),
+            "{marker} must attempt a bounded polite Close write"
+        );
     }
 }
 

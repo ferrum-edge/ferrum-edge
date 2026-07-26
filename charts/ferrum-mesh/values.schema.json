@@ -1,17 +1,49 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
+  "title": "ferrum-mesh values",
+  "description": "Values for the ferrum-mesh chart (control plane, injector, ambient, east-west, CA, observability, node-agent). Core gateway database/file/cp/dp modes belong in the ferrum-gateway chart.",
   "type": "object",
-  "additionalProperties": true,
+  "additionalProperties": false,
   "properties": {
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": {
+          "type": "string",
+          "enum": ["Always", "IfNotPresent", "Never"]
+        }
+      }
+    },
+    "namespace": {
+      "type": "string",
+      "description": "Documented default release namespace hint. Templates render into .Release.Namespace; install with --namespace to select the target namespace."
+    },
     "controlPlane": {
       "type": "object",
-      "additionalProperties": true,
+      "description": "Mesh control-plane Deployment (Ferrum binary in cp mode). Distinct from ferrum-gateway mode=cp installs.",
+      "additionalProperties": false,
       "properties": {
         "enabled": { "type": "boolean" },
         "replicas": { "type": "integer", "minimum": 1 },
         "grpcPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "rbac": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "create": { "type": "boolean" },
+            "gatewayApi": { "type": "boolean" },
+            "istio": { "type": "boolean" },
+            "meshConfig": { "type": "boolean" },
+            "podDiscovery": { "type": "boolean" },
+            "nodeLocality": { "type": "boolean" }
+          }
+        },
         "env": {
           "type": "object",
+          "description": "Free-form control-plane env map. Reserved DB/JWT keys must use controlPlane.database or controlPlane.credentials.",
           "additionalProperties": {
             "type": ["string", "number", "integer", "boolean"]
           }
@@ -22,7 +54,11 @@
           "properties": {
             "type": { "type": "string", "enum": ["", "sqlite", "postgres", "mysql", "mongodb"] },
             "url": { "type": "string" },
-            "urlFrom": { "type": "object" },
+            "urlFrom": {
+              "type": "object",
+              "description": "Free-form Kubernetes EnvVarSource for FERRUM_DB_URL.",
+              "additionalProperties": true
+            },
             "existingSecret": {
               "type": "object",
               "additionalProperties": false,
@@ -43,11 +79,20 @@
             "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
             "name": { "type": "string" },
             "username": { "type": "string" },
-            "usernameFrom": { "type": "object" },
+            "usernameFrom": {
+              "type": "object",
+              "description": "Rejected at render: structured Secret-backed username cannot be safely percent-encoded. Use existingSecret or urlFrom with a fully encoded URL Secret.",
+              "additionalProperties": true
+            },
             "password": { "type": "string" },
-            "passwordFrom": { "type": "object" },
+            "passwordFrom": {
+              "type": "object",
+              "description": "Rejected at render: structured Secret-backed password cannot be safely percent-encoded. Use existingSecret or urlFrom with a fully encoded URL Secret.",
+              "additionalProperties": true
+            },
             "existingCredentialsSecret": {
               "type": "object",
+              "description": "Rejected at render: structured Secret-backed username/password cannot be safely percent-encoded. Use existingSecret or urlFrom with a fully encoded URL Secret.",
               "additionalProperties": false,
               "properties": {
                 "name": { "type": "string" },
@@ -57,6 +102,7 @@
             },
             "params": {
               "type": "object",
+              "description": "Free-form query-parameter map for structured database URLs.",
               "additionalProperties": {
                 "type": ["string", "number", "integer", "boolean"]
               }
@@ -75,16 +121,243 @@
     },
     "injector": {
       "type": "object",
-      "additionalProperties": true,
+      "description": "Sidecar injector webhook (Ferrum binary in injector mode). Not available in ferrum-gateway.",
+      "additionalProperties": false,
       "properties": {
-        "enabled": { "type": "boolean" }
+        "enabled": { "type": "boolean" },
+        "replicas": { "type": "integer", "minimum": 1 },
+        "listenPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "requireAnnotation": { "type": "boolean" },
+        "failurePolicy": { "type": "string", "enum": ["Fail", "Ignore"] },
+        "caBundle": { "type": "string" },
+        "namespaceSelector": {
+          "type": "object",
+          "description": "Free-form Kubernetes LabelSelector for the mutating webhook.",
+          "additionalProperties": true
+        },
+        "podSecurityContext": {
+          "type": "object",
+          "description": "Free-form Kubernetes PodSecurityContext.",
+          "additionalProperties": true
+        },
+        "securityContext": {
+          "type": "object",
+          "description": "Free-form Kubernetes SecurityContext.",
+          "additionalProperties": true
+        },
+        "resources": {
+          "type": "object",
+          "description": "Free-form Kubernetes ResourceRequirements.",
+          "additionalProperties": true
+        },
+        "tls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "secretName": { "type": "string" },
+            "certPath": { "type": "string" },
+            "keyPath": { "type": "string" }
+          }
+        },
+        "env": {
+          "type": "object",
+          "description": "Free-form injector env map.",
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean"]
+          }
+        }
+      }
+    },
+    "ambient": {
+      "type": "object",
+      "description": "Ambient mesh DaemonSet (Ferrum binary in mesh mode with ambient topology). Not available in ferrum-gateway.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "inboundPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "outboundPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "hbonePort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "captureMode": { "type": "string" },
+        "spire": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "socketHostPath": { "type": "string" },
+            "socketMountPath": { "type": "string" },
+            "socketFileName": { "type": "string" },
+            "workloadSpiffeId": { "type": "string" },
+            "productionMode": { "type": "boolean" }
+          }
+        },
+        "env": {
+          "type": "object",
+          "description": "Free-form ambient mesh env map.",
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean"]
+          }
+        }
+      }
+    },
+    "eastWest": {
+      "type": "object",
+      "description": "East-west gateway Deployment (Ferrum binary in mesh mode with east_west_gateway topology). Not available in ferrum-gateway.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "replicas": { "type": "integer", "minimum": 1 },
+        "listenPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "env": {
+          "type": "object",
+          "description": "Free-form east-west gateway env map.",
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean"]
+          }
+        }
       }
     },
     "ca": {
       "type": "object",
-      "additionalProperties": true,
+      "description": "Mesh CA Deployment (shares controlPlane database/JWT contract when enabled).",
+      "additionalProperties": false,
       "properties": {
-        "enabled": { "type": "boolean" }
+        "enabled": { "type": "boolean" },
+        "env": {
+          "type": "object",
+          "description": "Free-form CA env map.",
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean"]
+          }
+        }
+      }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "dashboards": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "sidecarLabel": { "type": "string" },
+            "sidecarLabelValue": { "type": "string" },
+            "labels": {
+              "type": "object",
+              "description": "Free-form extra labels on the dashboard ConfigMap.",
+              "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+            },
+            "annotations": {
+              "type": "object",
+              "description": "Free-form annotations on the dashboard ConfigMap.",
+              "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+            },
+            "configMapName": { "type": "string" }
+          }
+        },
+        "alerts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "certExpiringSeconds": { "type": "integer", "minimum": 0 },
+            "svidExpiringCriticalSeconds": { "type": "integer", "minimum": 0 },
+            "cpStaleConfigSeconds": { "type": "integer", "minimum": 0 },
+            "policyDenyRatePerSecond": { "type": "number", "minimum": 0 },
+            "mtlsHandshakeFailureRatePerSecond": { "type": "number", "minimum": 0 },
+            "injectorFailureRatePerSecond": { "type": "number", "minimum": 0 },
+            "federationBundleStaleSeconds": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "nodeAgent": {
+      "type": "object",
+      "description": "Node-agent DaemonSet (Ferrum binary in node_agent mode). Not available in ferrum-gateway.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "env": {
+          "type": "object",
+          "description": "Free-form node-agent env map.",
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean"]
+          }
+        },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": { "type": "string" },
+            "tag": { "type": "string" }
+          }
+        },
+        "captureMode": { "type": "string" },
+        "proxyMode": { "type": "string" },
+        "proxyUid": { "type": "integer", "minimum": 0 },
+        "trustedKubeletProbeSourceIps": { "type": "string" },
+        "podRegistryDir": { "type": "string" },
+        "cgroupRoot": { "type": "string" },
+        "bpfFsPath": { "type": "string" },
+        "admin": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "bindAddress": { "type": "string" },
+            "port": {
+              "description": "Admin HTTP listen port. Accepts integer or numeric string so Helm --set-string (used by Cross-frozen live automation) still validates; integer form keeps 0–65535 bounds.",
+              "oneOf": [
+                { "type": "integer", "minimum": 0, "maximum": 65535 },
+                { "type": "string", "pattern": "^[0-9]{1,5}$" }
+              ]
+            }
+          }
+        },
+        "fallbackMode": { "type": "string" },
+        "capture": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "includeCidrs": { "type": "string" },
+            "excludeCidrs": { "type": "string" },
+            "excludePorts": { "type": "string" }
+          }
+        },
+        "resources": {
+          "type": "object",
+          "description": "Free-form Kubernetes ResourceRequirements.",
+          "additionalProperties": true
+        },
+        "security": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "readOnlyRootFilesystem": { "type": "boolean" },
+            "allowPrivilegeEscalation": { "type": "boolean" },
+            "addCapPerfmon": { "type": "boolean" },
+            "dropCapSysAdmin": { "type": "boolean" },
+            "seccompProfile": {
+              "type": "object",
+              "description": "Free-form Kubernetes SeccompProfile passed through verbatim.",
+              "additionalProperties": true
+            }
+          }
+        },
+        "cni": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "chainedWith": { "type": "string" },
+            "hostBinDir": { "type": "string" },
+            "hostConfDir": { "type": "string" },
+            "confFileName": { "type": "string" },
+            "hostSocketDir": { "type": "string" },
+            "socketFileName": { "type": "string" }
+          }
+        }
       }
     }
   },
@@ -102,7 +375,11 @@
             "key": { "type": "string" }
           }
         },
-        "valueFrom": { "type": "object" }
+        "valueFrom": {
+          "type": "object",
+          "description": "Free-form Kubernetes EnvVarSource.",
+          "additionalProperties": true
+        }
       }
     }
   }

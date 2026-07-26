@@ -25,6 +25,13 @@ message SubscribeRequest {
   // field and rejects a mismatch before streaming configuration so plugin
   // ownership admission uses one enforced cluster-wide value.
   optional string real_ip_header = 4;
+  // Additive ConfigSync capability advertisement: this DP understands
+  // `ConfigUpdate.heartbeat` keepalive frames and will arm an application
+  // silence watchdog once the CP confirms it will send them. Absent/false on
+  // peers that predate heartbeats, so a CP must never send heartbeats to a DP
+  // that did not advertise support — an unnegotiated empty heartbeat envelope
+  // would read as an unusable FULL_SNAPSHOT to such a DP.
+  bool supports_heartbeat = 5;
 }
 
 message FullConfigRequest {
@@ -65,6 +72,18 @@ message ConfigUpdate {
   // incremental resource payload and FULL_SNAPSHOT config_json stays
   // compatible with older DPs.
   string trust_bundles_json = 6;
+  // Lightweight keepalive frame for ConfigSync Subscribe streams. Heartbeats
+  // refresh DP stream liveness without forcing a config apply, so healthy
+  // idle clusters are not mistaken for silent partitions. Only ever sent to a
+  // subscriber that advertised `SubscribeRequest.supports_heartbeat`.
+  bool heartbeat = 7;
+  // CP-side confirmation of the heartbeat capability, set on the initial
+  // FULL_SNAPSHOT of a Subscribe stream when the CP accepted the DP's
+  // `supports_heartbeat` advertisement and will emit heartbeat frames. A DP
+  // arms its application silence watchdog only after seeing this, so a new DP
+  // talking to a CP that predates heartbeats never reconnects on silence the
+  // CP was never asked to break. Absent/false on legacy CPs.
+  bool heartbeat_negotiated = 8;
 }
 
 message MeshSubscribeRequest {
@@ -86,15 +105,34 @@ message MeshSubscribeRequest {
   bool ambient_udp_source_scoping = 7;
 }
 
+// A MeshSubscribe response frame.
+//
+// CONSUMER CONTRACT (enforced fail-closed by every Ferrum mesh config consumer
+// before a slice is installed or its endpoints imported):
+//   * `ferrum_version` MUST be present and major/minor-compatible with the
+//     subscriber.
+//   * On a non-heartbeat frame, `version` MUST equal the embedded
+//     `MeshSlice.version` — the envelope stamp is a duplicate of the slice's own
+//     version, not an independent value.
+//   * The embedded slice's `node_id` and `namespace` MUST equal the ones in the
+//     MeshSubscribeRequest that opened the stream, and when the request pinned
+//     `workload_spiffe_id` / `waypoint_name` the slice MUST echo that same value
+//     (an omitted echo is a mismatch, not an exemption).
+// A frame that violates any of these is refused without mutating the
+// subscriber's last-good state.
 message MeshConfigUpdate {
+  // Transport version stamp. MUST equal the embedded MeshSlice.version on
+  // non-heartbeat frames.
   string version = 1;
   int64 timestamp = 2;
   // JSON-encoded modes::mesh::slice::MeshSlice. Kept JSON for native mesh
-  // config so the canonical model remains the stable contract.
+  // config so the canonical model remains the stable contract. Empty on
+  // heartbeat frames.
   string mesh_slice_json = 3;
   // Ferrum Edge binary version of the CP (e.g. "0.9.0")
   string ferrum_version = 4;
   // Lightweight keepalive frame for MeshSubscribe streams. Heartbeats keep
   // registry liveness fresh without forcing receivers to re-apply a slice.
+  // A heartbeat carries no slice and is never an install candidate.
   bool heartbeat = 5;
 }

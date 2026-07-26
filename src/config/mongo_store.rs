@@ -5413,6 +5413,19 @@ mod inner {
 
             self.check_slow_query("load_incremental_config", start);
 
+            let removed_proxy_ids = removed_proxy_ids
+                .into_iter()
+                .map(|id| NamespacedResourceId::new(namespace, id))
+                .collect();
+            let removed_plugin_config_ids = removed_plugin_config_ids
+                .into_iter()
+                .map(|id| NamespacedResourceId::new(namespace, id))
+                .collect();
+            let removed_upstream_ids = removed_upstream_ids
+                .into_iter()
+                .map(|id| NamespacedResourceId::new(namespace, id))
+                .collect();
+
             Ok(IncrementalResult {
                 added_or_modified_proxies,
                 removed_proxy_ids,

@@ -573,6 +573,144 @@ async fn upstream_backend_tls_identity_fields_round_trip_sql_store() {
     assert_eq!(loaded.backend_tls_san_allow_list, vec!["10.0.0.8"]);
 }
 
+/// SQL writers bind the payload they receive directly. Mixed-case hosts /
+/// SNI / SAN values and blank consumer `custom_id` therefore survive in the
+/// durable rows unless restore/CRUD admission normalizes before persistence
+/// (issue #2402). Assert against raw columns because `get_*` re-normalizes on
+/// read and would hide a write-path miss.
+///
+/// Blank plugin `proxy_id` is deliberately not part of the wire-form proof:
+/// `plugin_configs.proxy_id` has `REFERENCES proxies(id)`, so `Some("")` is a
+/// non-NULL FK value that cannot match any proxy row (SQLite 787). That is
+/// exactly why restore/CRUD must clear blank `proxy_id` → None before SQL
+/// insert — not evidence that SQL itself domain-normalizes identifiers.
+#[tokio::test]
+async fn sql_create_persists_wire_form_without_domain_normalization() {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("restore_normalization_sql.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let store = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .unwrap();
+
+    let mut proxy = make_http_proxy("mixed-proxy");
+    proxy.hosts = vec!["API.Example.COM".to_string()];
+    proxy.backend_host = "Backend.Example.COM".to_string();
+    proxy.listen_path = Some("/mixed".to_string());
+
+    let mut consumer = make_consumer("mixed-consumer", "mixed_user");
+    consumer.custom_id = Some("   ".to_string());
+
+    let mut upstream = make_upstream("mixed-upstream");
+    upstream.targets[0].host = "Reviews.Mesh.Internal".to_string();
+    upstream.backend_tls_sni = Some("Reviews.Mesh.Internal".to_string());
+    upstream.backend_tls_san_allow_list = vec![
+        "Reviews.Mesh.Internal".to_string(),
+        "spiffe://Cluster.Local/ns/Default/sa/Reviews".to_string(),
+    ];
+
+    // Global plugin with proxy_id omitted (None). Handing SQL Some("") would
+    // fail the proxies(id) FK before any domain-normalization question arises.
+    //
+    // `tcp_connection_throttle` admission requires at least one TCP/TCP+TLS
+    // proxy for a global instance to protect, so the fixture carries one
+    // alongside the HTTP proxy under test. Without it, admission rejects the
+    // plugin before SQL is reached and this test never exercises persistence.
+    // The TCP proxy is fixture scaffolding only — every assertion below targets
+    // `mixed-proxy`, `mixed-consumer`, `mixed-upstream`, and `mixed-plugin`.
+    let throttle_target = make_tcp_proxy("mixed-tcp-proxy", 19_432);
+    let plugin = make_global_tcp_throttle("mixed-plugin");
+
+    store.create_proxy(&proxy).await.expect("proxy create");
+    store
+        .create_proxy(&throttle_target)
+        .await
+        .expect("tcp proxy create");
+    store
+        .create_consumer(&consumer)
+        .await
+        .expect("consumer create");
+    store
+        .create_upstream(&upstream)
+        .await
+        .expect("upstream create");
+    store
+        .create_plugin_config(&plugin)
+        .await
+        .expect("plugin create");
+
+    let mut blank_proxy_id = make_global_tcp_throttle("blank-proxy-id-plugin");
+    blank_proxy_id.proxy_id = Some(String::new());
+    let blank_err = store
+        .create_plugin_config(&blank_proxy_id)
+        .await
+        .expect_err("blank proxy_id string must fail proxies(id) FK");
+    let blank_msg = blank_err.to_string();
+    assert!(
+        blank_msg.contains("FOREIGN KEY") || blank_msg.contains("787"),
+        "empty-string proxy_id must be an FK failure, not silent persist: {blank_msg}"
+    );
+
+    let hosts: String = sqlx::query_scalar("SELECT hosts FROM proxies WHERE id = 'mixed-proxy'")
+        .fetch_one(&store.pool())
+        .await
+        .unwrap();
+    let backend_host: String =
+        sqlx::query_scalar("SELECT backend_host FROM proxies WHERE id = 'mixed-proxy'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+    assert!(
+        hosts.contains("API.Example.COM"),
+        "SQL proxy insert must not lowercase hosts: {hosts}"
+    );
+    assert_eq!(backend_host, "Backend.Example.COM");
+
+    let custom_id: Option<String> =
+        sqlx::query_scalar("SELECT custom_id FROM consumers WHERE id = 'mixed-consumer'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+    assert_eq!(custom_id.as_deref(), Some("   "));
+
+    let targets: String =
+        sqlx::query_scalar("SELECT targets FROM upstreams WHERE id = 'mixed-upstream'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+    let sni: Option<String> =
+        sqlx::query_scalar("SELECT backend_tls_sni FROM upstreams WHERE id = 'mixed-upstream'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+    let sans: Option<String> = sqlx::query_scalar(
+        "SELECT backend_tls_san_allow_list FROM upstreams WHERE id = 'mixed-upstream'",
+    )
+    .fetch_one(&store.pool())
+    .await
+    .unwrap();
+    assert!(
+        targets.contains("Reviews.Mesh.Internal"),
+        "SQL upstream insert must not lowercase target hosts: {targets}"
+    );
+    assert_eq!(sni.as_deref(), Some("Reviews.Mesh.Internal"));
+    assert!(
+        sans.as_deref()
+            .is_some_and(|value| value.contains("Reviews.Mesh.Internal")),
+        "SQL upstream insert must not lowercase DNS SANs: {sans:?}"
+    );
+
+    let proxy_id: Option<String> =
+        sqlx::query_scalar("SELECT proxy_id FROM plugin_configs WHERE id = 'mixed-plugin'")
+            .fetch_one(&store.pool())
+            .await
+            .unwrap();
+    assert!(
+        proxy_id.is_none(),
+        "global plugin without proxy_id must persist NULL, not empty string: {proxy_id:?}"
+    );
+}
+
 #[tokio::test]
 async fn consumer_credential_index_enforces_keyauth_uniqueness() {
     let temp_dir = tempfile::TempDir::new().unwrap();

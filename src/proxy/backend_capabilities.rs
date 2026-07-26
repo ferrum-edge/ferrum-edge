@@ -35,6 +35,38 @@ impl ProtocolSupport {
     }
 }
 
+/// Merge a fresh protocol-probe classification with the previously cached
+/// value.
+///
+/// When `preserve_previous` is set (transient DNS/connect/refused/timeout
+/// failures), an existing classification is carried forward so a blip during
+/// periodic refresh cannot wipe a proven `Supported` entry for up to the full
+/// refresh interval.
+///
+/// A transient failure with **no** prior classification (or a prior `Unknown`)
+/// still takes `probed`: there is no verdict to protect, and the first probe is
+/// the only chance to record the definitive `Unsupported` that a backend which
+/// simply does not speak the protocol should carry. Since the H3/QUIC "port has
+/// no listener" case is indistinguishable from a connect timeout on the wire,
+/// preserving `Unknown` there would leave every non-QUIC HTTPS backend
+/// permanently unclassified.
+///
+/// Non-preserving probes (successful handshake, ALPN/protocol evidence that
+/// the target lacks the protocol) always take `probed` as authoritative.
+#[inline]
+pub fn merge_protocol_probe_classification(
+    previous: Option<ProtocolSupport>,
+    probed: ProtocolSupport,
+    preserve_previous: bool,
+) -> ProtocolSupport {
+    match previous {
+        Some(previous) if preserve_previous && !matches!(previous, ProtocolSupport::Unknown) => {
+            previous
+        }
+        _ => probed,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlainHttpCapabilities {
     pub h1: ProtocolSupport,
@@ -84,6 +116,85 @@ impl Default for BackendCapabilityRecord {
             hbone: ProtocolSupport::Unknown,
             last_probe_at_unix_secs: now_unix_secs(),
             last_probe_error: None,
+        }
+    }
+}
+
+/// Pre-probe view of one registry entry, taken by
+/// [`BackendCapabilityRegistry::snapshot_for_probe`].
+///
+/// The same snapshot serves two roles, and that is the point: it is the
+/// `previous` input to [`merge_protocol_probe_classification`] *and* the
+/// compare expectation handed back to
+/// [`BackendCapabilityRegistry::commit_probe`]. Reading the registry a second
+/// time before the write-back would reintroduce the race this type exists to
+/// close — the merge would reason about one version while the commit compared
+/// against another.
+///
+/// Holding the strong `Arc` for the whole probe window is load-bearing, not
+/// incidental: every registry mutation publishes a **freshly allocated** `Arc`
+/// (`upsert`, `mark_h3_unsupported`, `mark_h2_tls_unsupported`,
+/// `mark_hbone_unsupported` all build a new record and replace the slot), so
+/// pointer identity is a valid version token — and because this snapshot keeps
+/// the old allocation alive, the allocator cannot recycle its address for a
+/// newer record. That rules out ABA on the token.
+///
+/// A live-learning call that finds nothing to change (e.g. `mark_h3_unsupported`
+/// on an already-`Unsupported` entry) leaves the `Arc` in place and therefore
+/// does *not* invalidate an in-flight probe: no state changed, so there is
+/// nothing for the probe to clobber.
+#[derive(Debug, Clone, Default)]
+pub struct BackendCapabilitySnapshot {
+    previous: Option<Arc<BackendCapabilityRecord>>,
+}
+
+impl BackendCapabilitySnapshot {
+    /// The record observed before the probe started, or `None` when the key
+    /// was vacant (first classification of a newly configured target).
+    #[inline]
+    pub fn previous(&self) -> Option<&BackendCapabilityRecord> {
+        self.previous.as_deref()
+    }
+
+    /// Whether the key was vacant when the snapshot was taken.
+    #[allow(dead_code)] // Used by tests and external lib callers.
+    #[inline]
+    pub fn was_vacant(&self) -> bool {
+        self.previous.is_none()
+    }
+}
+
+/// Result of a [`BackendCapabilityRegistry::commit_probe`] write-back.
+#[derive(Debug)]
+pub enum CapabilityCommitOutcome {
+    /// The probe result replaced exactly the snapshot it was computed against
+    /// (or filled a key that was still vacant). Carries the record that is now
+    /// published, so callers log and count committed state rather than a
+    /// proposal.
+    Committed(Arc<BackendCapabilityRecord>),
+    /// A request-path live-learning downgrade — or a concurrent refresh —
+    /// replaced or inserted the entry while the probe was in flight. The newer
+    /// record wins and the probe result is discarded.
+    RejectedStale,
+    /// `retain_keys` pruned the key while the probe was in flight. The target
+    /// is no longer active, so the probe result must not resurrect it.
+    RejectedEvicted,
+}
+
+impl CapabilityCommitOutcome {
+    #[allow(dead_code)] // Used by tests and external lib callers.
+    #[inline]
+    pub fn is_committed(&self) -> bool {
+        matches!(self, Self::Committed(_))
+    }
+
+    /// Stable label for structured logs.
+    #[inline]
+    pub fn reason(&self) -> &'static str {
+        match self {
+            Self::Committed(_) => "committed",
+            Self::RejectedStale => "stale_snapshot",
+            Self::RejectedEvicted => "entry_evicted",
         }
     }
 }
@@ -241,6 +352,14 @@ impl BackendCapabilityRegistry {
         })
     }
 
+    /// Unconditional write. Used by tests and by callers that own the entry's
+    /// lifecycle outright.
+    ///
+    /// The periodic/startup capability refresh must **not** use this: its
+    /// read → probe → write sequence spans an await, so a blind write can
+    /// overwrite a request-path downgrade learned during the probe. Use
+    /// [`Self::snapshot_for_probe`] + [`Self::commit_probe`] there.
+    #[allow(dead_code)] // Used by tests and external lib callers; the refresh path commits.
     pub fn upsert(&self, key: String, record: BackendCapabilityRecord) {
         self.entries
             .entry(key)
@@ -248,6 +367,76 @@ impl BackendCapabilityRegistry {
             .or_insert_with(|| Arc::new(record));
     }
 
+    /// Take the pre-probe snapshot for `key`.
+    ///
+    /// Cold path (once per target per refresh cycle). The returned snapshot is
+    /// both the merge input and the compare expectation for
+    /// [`Self::commit_probe`] — see [`BackendCapabilitySnapshot`] for why those
+    /// must be the same observation.
+    pub fn snapshot_for_probe(&self, key: &str) -> BackendCapabilitySnapshot {
+        BackendCapabilitySnapshot {
+            previous: self.entries.get(key).map(|entry| entry.value().clone()),
+        }
+    }
+
+    /// Compare-and-commit a probe result against the snapshot it was computed
+    /// from.
+    ///
+    /// The write lands only while the entry is still the exact version the
+    /// probe merged against:
+    ///
+    /// - occupied, same `Arc` → replaced ([`CapabilityCommitOutcome::Committed`]);
+    /// - occupied, different `Arc`, or occupied when the probe expected a
+    ///   vacant key → the probe lost to a newer writer
+    ///   ([`CapabilityCommitOutcome::RejectedStale`]);
+    /// - vacant when the probe expected an entry → the key was pruned by
+    ///   `retain_keys` ([`CapabilityCommitOutcome::RejectedEvicted`]);
+    /// - vacant as expected → inserted.
+    ///
+    /// Losing is fail-closed by construction: any request-path live-learning
+    /// mutation (`mark_h3_unsupported`, `mark_h2_tls_unsupported`,
+    /// `mark_hbone_unsupported`) publishes a new `Arc`, so a stale probe cannot
+    /// resurrect a capability the data path just proved broken — regardless of
+    /// which field the live mutation touched. Rejected results are dropped, not
+    /// retried: the live observation is strictly more recent evidence than the
+    /// probe, and the next refresh cycle re-classifies from the new baseline.
+    ///
+    /// Cold path only — takes the key's `DashMap` shard entry lock. Never call
+    /// this from ordinary request lookup; `get()` stays lock-light and
+    /// allocation-free.
+    pub fn commit_probe(
+        &self,
+        key: String,
+        expected: &BackendCapabilitySnapshot,
+        record: BackendCapabilityRecord,
+    ) -> CapabilityCommitOutcome {
+        let expected = expected.previous.as_ref();
+        match self.entries.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(mut entry) => {
+                let unchanged = expected.is_some_and(|arc| Arc::ptr_eq(entry.get(), arc));
+                if !unchanged {
+                    // Either the observed version was replaced mid-probe, or
+                    // the probe expected a vacant key and lost the insert race.
+                    return CapabilityCommitOutcome::RejectedStale;
+                }
+                let committed = Arc::new(record);
+                entry.insert(committed.clone());
+                CapabilityCommitOutcome::Committed(committed)
+            }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                if expected.is_some() {
+                    // `retain_keys` pruned the key mid-probe. The target is no
+                    // longer configured, so the probe must not re-add it.
+                    return CapabilityCommitOutcome::RejectedEvicted;
+                }
+                let committed = Arc::new(record);
+                entry.insert(committed.clone());
+                CapabilityCommitOutcome::Committed(committed)
+            }
+        }
+    }
+
+    #[allow(dead_code)] // Used by tests and external lib callers; the refresh path snapshots.
     pub fn get_by_key(&self, key: &str) -> Option<Arc<BackendCapabilityRecord>> {
         self.entries.get(key).map(|entry| entry.value().clone())
     }

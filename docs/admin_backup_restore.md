@@ -67,19 +67,20 @@ cat ferrum-backup.json | jq '.counts'
 
 ## Restore — `POST /restore?confirm=true`
 
-Replaces the entire gateway configuration with the provided backup payload. This is a **destructive operation**, but the payload is validated before any data is deleted:
+Replaces the entire gateway configuration with the provided backup payload. This is a **destructive operation**, but the payload is normalized and validated before any data is deleted:
 
-1. **Validates** the payload for internal consistency (config version compatibility, resource ID uniqueness, consumer identity/credential uniqueness, regex listen_path compilation and length limits, listen_path+hosts uniqueness, stream proxy configuration including response_body_mode, upstream references). If validation fails, the request returns `400` with detailed errors and **existing config is NOT deleted**.
-2. **Snapshots** the current namespace configuration for recovery (fail-safe — see below)
-3. **Deletes** all existing proxies, consumers, plugin configs, upstreams, and junction table entries
-4. **Imports** the provided resources in dependency order
-5. **Rolls back** to the snapshot if the delete or any import persistence step fails
+1. **Normalizes** the restore payload once with the same `normalize_fields()` admission used by CRUD, batch, file mode, and database loaders (lowercase hosts/backend hosts/upstream targets, backend TLS SNI and DNS SAN allow-list entries, blank `custom_id` / plugin `proxy_id` → omitted). That exact canonical instance is what later preparation and persistence use — credential hashing and restore timestamps do not reintroduce the discarded wire-form original.
+2. **Validates** the normalized payload for internal consistency (config version compatibility, resource ID uniqueness, consumer identity/credential uniqueness, regex listen_path compilation and length limits, listen_path+hosts uniqueness, stream proxy configuration including response_body_mode, upstream references). If validation fails, the request returns `400` with detailed errors and **existing config is NOT deleted**.
+3. **Snapshots** the current namespace configuration for recovery (fail-safe — see below)
+4. **Deletes** all existing proxies, consumers, plugin configs, upstreams, and junction table entries
+5. **Imports** the provided resources in dependency order
+6. **Rolls back** to the snapshot if the delete or any import persistence step fails
 
 Build-out compatibility note: legacy backups whose `basicauth` entries contain fields other than exactly one `password` or `password_hash` no longer pass restore validation. Remove obsolete fields (for example an entry-local `username`) before restore. Ferrum intentionally does not add a legacy restore shim during active build-out.
 
 ### Recovery snapshot is authoritative and fail-safe
 
-The recovery snapshot in step 2 is captured with a **non-validating raw load from the primary** (`load_namespace_snapshot`), *not* the validating `load_full_config`. That distinction matters two ways:
+The recovery snapshot in step 3 is captured with a **non-validating raw load from the primary** (`load_namespace_snapshot`), *not* the validating `load_full_config`. That distinction matters two ways:
 
 - **Invalid-but-present config still snapshots.** An already-invalid namespace (dangling references, conflicting listen_paths, invalid regex) — precisely what an operator runs restore to *repair* — loads its raw rows without the fatal validation pipeline, so the snapshot succeeds and rollback stays available throughout the repair. A restore that imports cleanly succeeds and repairs the namespace; if a later step fails, rollback reapplies the (still invalid) prior config.
 - **One guard normally spans the entire restore.** Ferrum acquires a persistent namespace-scoped datastore guard before reading the rollback snapshot and keeps the same owner through the destructive clear, every successful-import batch, and any compensating replay. Other admin processes therefore cannot insert resources absent from the payload between phases or have a concurrent write erased by rollback. Cancellation before the first protected mutation starts bounded owner-qualified cleanup. Once clear/import/replay is dispatched, cancellation retains the fence until the outcome is definitively verified or replay settles; cancellation between a completed clear and import also retains it because the multi-phase restore is incomplete. On MongoDB, the owner pins the exact connection generation for these uncertain phases, so reconnect/failover cannot move a later phase to a different bundle. The guarded rollback replay bypasses normal mTLS DNS admission only for the captured snapshot; the guarded successful import still runs full admission. If the renewable namespace lease expires while a successful clear is still settling and another writer commits under the next lease generation, recovery releases and reacquires the guards in their normal order. It then treats the intervening writer's resources as authoritative for matching IDs, validates the combined transaction-log schema graph, and inserts only missing snapshot resources. Recovery never runs a second clear over the intervening write. An invalid combined graph fails closed without replaying any snapshot resources.

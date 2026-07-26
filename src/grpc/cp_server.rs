@@ -37,18 +37,22 @@
 use arc_swap::ArcSwap;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
+use futures_util::stream;
 use serde::Serialize;
 use std::collections::{BTreeSet, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::sync::broadcast;
+use tokio::time::{Instant, interval_at};
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 use super::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
+use super::configsync_lifecycle::CONFIGSYNC_HEARTBEAT_INTERVAL_SECS;
 use super::proto::config_sync_server::{ConfigSync, ConfigSyncServer};
 use super::proto::{ConfigUpdate, FullConfigRequest, FullConfigResponse, SubscribeRequest};
 use crate::FERRUM_VERSION;
@@ -58,6 +62,10 @@ use crate::modes::mesh::config::{
     SidecarHostPattern, WorkloadSelector, service_entry_exported_to_namespace,
 };
 use crate::modes::mesh::slice::{MeshSliceRequest, node_waypoint_assertors_from_workloads};
+
+/// Application-level ConfigSync heartbeat interval (matches DP silence budget).
+pub const CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL: Duration =
+    Duration::from_secs(CONFIGSYNC_HEARTBEAT_INTERVAL_SECS);
 
 fn filter_frontend_tls_sources_to_namespace(config: &mut GatewayConfig, namespace: &str) {
     if let Some(source) = config
@@ -681,43 +689,26 @@ impl CpGrpcServer {
 
     /// Check whether the DP's reported version is compatible with this CP.
     ///
-    /// Compatibility rule: major and minor versions must match. Patch-level
-    /// differences are always allowed (bug-fix releases don't change the
-    /// config schema or gRPC wire format).
+    /// Compatibility uses SemVer parsing. Major and minor versions must match.
+    /// Patch-level and prerelease/build differences are allowed (see
+    /// [`crate::grpc::configsync_lifecycle::check_peer_version_compatibility`]).
+    /// Empty and malformed versions are rejected with `FailedPrecondition`
+    /// (issue #2395).
     #[allow(clippy::result_large_err)]
     pub(crate) fn check_version_compatibility(dp_version: &str) -> Result<(), Status> {
-        // Empty version means old DP that predates the version field — reject.
-        if dp_version.is_empty() {
-            return Err(Status::failed_precondition(format!(
-                "DP did not report its version. CP is running Ferrum Edge v{}. \
-                 Upgrade the DP to a version that supports version negotiation.",
-                FERRUM_VERSION
-            )));
-        }
+        use crate::grpc::configsync_lifecycle::check_peer_version_compatibility;
 
-        let cp_parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
-        let dp_parts: Vec<&str> = dp_version.split('.').collect();
+        check_peer_version_compatibility(FERRUM_VERSION, dp_version)
+            .map_err(|err| Status::failed_precondition(err.message("CP", "DP", FERRUM_VERSION)))?;
 
-        if cp_parts.len() < 2 || dp_parts.len() < 2 {
-            warn!(
-                "Unable to parse version for compatibility check (CP={}, DP={}), allowing connection",
-                FERRUM_VERSION, dp_version
-            );
-            return Ok(());
-        }
-
-        if cp_parts[0] != dp_parts[0] || cp_parts[1] != dp_parts[1] {
-            return Err(Status::failed_precondition(format!(
-                "Version mismatch: CP is v{} but DP is v{}. \
-                 Major and minor versions must match. \
-                 Upgrade the CP first, then upgrade DPs to the same major.minor version.",
-                FERRUM_VERSION, dp_version
-            )));
-        }
-
-        if cp_parts.get(2) != dp_parts.get(2) {
+        // Log patch-only differences for operators (still compatible).
+        if let (Ok(local), Ok(peer)) = (
+            semver::Version::parse(FERRUM_VERSION),
+            semver::Version::parse(dp_version),
+        ) && (local.patch != peer.patch || local.pre != peer.pre || local.build != peer.build)
+        {
             info!(
-                "DP v{} connected to CP v{} (patch difference OK)",
+                "DP v{} connected to CP v{} (patch/prerelease difference OK)",
                 dp_version, FERRUM_VERSION
             );
         }
@@ -1293,6 +1284,22 @@ impl CpGrpcServer {
         registry.touch_all();
     }
 
+    /// Build a keepalive frame. Only ever emitted on a subscription whose DP
+    /// advertised `SubscribeRequest.supports_heartbeat`, so the frame always
+    /// restates the negotiated capability.
+    fn build_configsync_heartbeat(version: String) -> ConfigUpdate {
+        ConfigUpdate {
+            update_type: 0,
+            config_json: String::new(),
+            version,
+            timestamp: Utc::now().timestamp(),
+            ferrum_version: FERRUM_VERSION.to_string(),
+            trust_bundles_json: String::new(),
+            heartbeat: true,
+            heartbeat_negotiated: true,
+        }
+    }
+
     /// Broadcast a full config snapshot to all connected DPs.
     pub fn broadcast_update(tx: &broadcast::Sender<ConfigUpdate>, config: &GatewayConfig) {
         let config_json = match Self::config_json_for_dp(config) {
@@ -1319,6 +1326,8 @@ impl CpGrpcServer {
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
+            heartbeat: false,
+            heartbeat_negotiated: false,
         };
         let _ = tx.send(update);
     }
@@ -1389,6 +1398,8 @@ impl CpGrpcServer {
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
+            heartbeat: false,
+            heartbeat_negotiated: false,
         };
         let _ = tx.send(update);
     }
@@ -1562,6 +1573,11 @@ impl ConfigSync for CpGrpcServer {
         let node_id = inner.node_id;
         let dp_version = inner.ferrum_version;
         let dp_namespace = inner.namespace;
+        // Heartbeat capability is negotiated, not assumed. A DP that predates
+        // `ConfigUpdate.heartbeat` would read an empty heartbeat envelope as an
+        // unusable FULL_SNAPSHOT and churn through reconnects, so only
+        // advertising subscribers ever receive keepalive frames.
+        let heartbeats_negotiated = inner.supports_heartbeat;
 
         // Reject DPs with incompatible versions before streaming any config.
         Self::check_version_compatibility(&dp_version)?;
@@ -1649,6 +1665,12 @@ impl ConfigSync for CpGrpcServer {
             timestamp: chrono::Utc::now().timestamp(),
             ferrum_version: FERRUM_VERSION.to_string(),
             trust_bundles_json,
+            heartbeat: false,
+            // Confirm the capability on the first message of the stream so the
+            // DP arms its application silence watchdog only against a CP that
+            // actually committed to sending heartbeats. A CP that predates this
+            // field leaves it false and the DP never arms the watchdog.
+            heartbeat_negotiated: heartbeats_negotiated,
         };
 
         let config_for_recovery = self.config.clone();
@@ -1691,6 +1713,8 @@ impl ConfigSync for CpGrpcServer {
                             timestamp: chrono::Utc::now().timestamp(),
                             ferrum_version: FERRUM_VERSION.to_string(),
                             trust_bundles_json,
+                            heartbeat: false,
+                            heartbeat_negotiated: false,
                         }))
                     }
                     Err(e) => {
@@ -1701,10 +1725,30 @@ impl ConfigSync for CpGrpcServer {
             }
         });
 
-        // Prepend initial config, then wrap in TrackedStream so the DP is
+        // Prepend initial config, interleave application heartbeats for
+        // silent-partition detection, then wrap in TrackedStream so the DP is
         // automatically de-registered when the gRPC stream is dropped.
+        //
+        // The timer is built unconditionally to keep one concrete stream type;
+        // when the DP did not advertise heartbeat support every tick is dropped
+        // and no frame is ever written, so a legacy subscriber sees exactly the
+        // pre-heartbeat stream contents.
         let initial_stream = tokio_stream::once(Ok(initial));
-        let combined = initial_stream.chain(stream);
+        let heartbeat_config = self.config.clone();
+        let heartbeat_stream = IntervalStream::new(interval_at(
+            Instant::now() + CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL,
+            CONFIGSYNC_SUBSCRIBE_HEARTBEAT_INTERVAL,
+        ))
+        .filter_map(move |_| {
+            if !heartbeats_negotiated {
+                return None;
+            }
+            let current = heartbeat_config.load_full();
+            Some(Ok(Self::build_configsync_heartbeat(
+                current.loaded_at.to_rfc3339(),
+            )))
+        });
+        let combined = initial_stream.chain(stream::select(stream, heartbeat_stream));
         let tracked = TrackedStream {
             inner: Box::pin(combined),
             registry: self.registry.clone(),
@@ -1971,9 +2015,40 @@ mod tests {
     }
 
     #[test]
-    fn version_check_unparseable_version_allowed() {
-        // Single-component version is unparseable (< 2 parts), so it's allowed
-        assert!(CpGrpcServer::check_version_compatibility("1").is_ok());
+    fn version_check_unparseable_version_rejected() {
+        let result = CpGrpcServer::check_version_compatibility("1");
+        assert!(result.is_err());
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert!(status.message().contains("Unable to parse"));
+    }
+
+    #[test]
+    fn version_check_garbage_version_rejected() {
+        let result = CpGrpcServer::check_version_compatibility("garbage");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[test]
+    fn version_check_prerelease_same_major_minor_ok() {
+        let parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
+        if parts.len() >= 2 {
+            let peer = format!("{}.{}.0-rc.1", parts[0], parts[1]);
+            assert!(CpGrpcServer::check_version_compatibility(&peer).is_ok());
+        }
+    }
+
+    #[test]
+    fn version_check_different_major_rejected() {
+        let parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
+        if !parts.is_empty() {
+            let major: u64 = parts[0].parse().unwrap_or(0);
+            let modified = format!("{}.0.0", major + 1);
+            let result = CpGrpcServer::check_version_compatibility(&modified);
+            assert!(result.is_err());
+            assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+        }
     }
 
     fn cp_with_namespace(namespace: &str) -> CpGrpcServer {

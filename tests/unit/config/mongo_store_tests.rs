@@ -659,3 +659,61 @@ fn mongo_consumer_identity_keys_remain_raw_byte_strings() {
         "Mongo identity keys must not Unicode-normalize (already byte-exact)"
     );
 }
+
+/// Mongo batch writers serialize the documents they receive. Domain hostname /
+/// SNI / SAN / blank-ID canonicalization must happen in restore/CRUD admission
+/// before `proxy_to_doc` / `upstream_to_doc` / `consumer_to_doc` (issue #2402).
+#[test]
+fn mongo_batch_create_serializers_do_not_repeat_domain_normalization() {
+    for (helper_name, forbidden) in [
+        (
+            "fn proxy_to_doc(",
+            &["to_ascii_lowercase", "to_lowercase"][..],
+        ),
+        (
+            "fn upstream_to_doc(",
+            &["to_ascii_lowercase", "to_lowercase"][..],
+        ),
+        (
+            "fn consumer_to_doc(",
+            &["to_ascii_lowercase", "to_lowercase"][..],
+        ),
+        (
+            "fn plugin_config_to_doc(",
+            &["to_ascii_lowercase", "to_lowercase"][..],
+        ),
+    ] {
+        let start = MONGO_STORE_SOURCE
+            .find(helper_name)
+            .unwrap_or_else(|| panic!("missing {helper_name}"));
+        let tail = &MONGO_STORE_SOURCE[start..];
+        let end = tail
+            .find("\n    fn ")
+            .or_else(|| tail.find("\n    async fn "))
+            .unwrap_or(800);
+        let body = &tail[..end];
+        for needle in forbidden {
+            assert!(
+                !body.contains(needle),
+                "{helper_name} must not re-canonicalize host/SNI/SAN fields; found `{needle}`:\n{body}"
+            );
+        }
+        assert!(
+            body.contains("mongodb::bson::to_document(") || body.contains("to_document("),
+            "{helper_name} must serialize the provided resource document directly"
+        );
+    }
+
+    for method_name in [
+        "batch_create_proxies(",
+        "batch_create_upstreams(",
+        "batch_create_consumers(",
+        "batch_create_plugin_configs(",
+    ] {
+        let method = mongo_method(method_name);
+        assert!(
+            !method.contains("normalize_fields(") && !method.contains("to_ascii_lowercase("),
+            "{method_name} must persist the caller-provided canonical form without re-normalizing"
+        );
+    }
+}

@@ -458,7 +458,7 @@ pub fn build_admin_metrics(
             tracked_key_count: ps.plugin_cache.total_rate_limiter_keys(),
         },
         tcp_connection_throttle: AdminMetricsTcpConnectionThrottle::process_local(),
-        database_polling: if mode == "database" {
+        database_polling: if mode == "database" || mode == "cp" {
             database_polling
         } else {
             None
@@ -482,7 +482,7 @@ pub fn contract_fixtures() -> Vec<AdminMetrics> {
         if matches!(*mode, "database" | "file" | "dp" | "mesh") {
             base = proxy_serving_fixture(mode);
         }
-        if *mode == "database" {
+        if *mode == "database" || *mode == "cp" {
             base.database_polling = Some(sample_database_polling());
         }
         // CP holds a live database without proxy_state; healthy fixtures report
@@ -596,6 +596,8 @@ fn sample_database_polling() -> DatabaseDeltaPollMetricsSnapshot {
         forced_full_reloads_total: 0,
         recoveries_total: 0,
         last_resource_category: "none",
+        last_poll_completed_at: Some("2026-03-29T14:23:07.482Z".to_string()),
+        last_poll_completed_at_unix_ms: 1_711_720_987_482,
         degraded: None,
     }
 }

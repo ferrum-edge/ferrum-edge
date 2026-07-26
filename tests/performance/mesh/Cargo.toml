@@ -50,6 +50,10 @@ name = "wrr_selection"
 harness = false
 
 [[bench]]
+name = "rr_selection"
+harness = false
+
+[[bench]]
 name = "ai_semantic_cache_cleanup"
 harness = false
 

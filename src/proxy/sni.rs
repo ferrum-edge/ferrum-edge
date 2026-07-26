@@ -30,12 +30,41 @@ const INITIAL_CLIENT_HELLO_PEEK_LEN: usize = 4 * 1024;
 /// back-to-back peeks would busy-loop).
 const SNI_PEEK_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
+/// How many times the no-deadline peek may re-await readiness after a spurious
+/// readiness signal (the socket reported readable but the non-blocking peek
+/// returned `WouldBlock`).
+///
+/// The no-deadline path must never hold the hard-cap buffer across a
+/// suspension, so a spurious wakeup drops the buffer and waits again rather
+/// than parking with it allocated. Each retry costs one readiness event from
+/// the OS — not a busy loop — but the count is still bounded so a socket that
+/// somehow keeps reporting phantom readiness fails closed instead of spinning.
+const MAX_PEEK_READINESS_RETRIES: usize = 3;
+
 /// Initial capacity of the TCP ClientHello peek buffer.
 ///
 /// Pure sizing seam so external tests can lock the lazy-allocation floor
 /// without observing live buffer capacity through the async peek path.
 pub fn initial_peek_capacity() -> usize {
     INITIAL_CLIENT_HELLO_PEEK_LEN
+}
+
+/// Capacity of the buffer used by the no-deadline (single-peek) path.
+///
+/// The no-deadline path cannot loop on the wire, so its one peek must be able
+/// to see a standards-valid oversized ClientHello in full — it sizes straight
+/// to the hard cap rather than the lazy floor. Lazy growth exists to bound
+/// memory held ACROSS the deadline-driven peek loop while a slow peer dribbles
+/// bytes; it does not apply to a buffer that is allocated only after the socket
+/// is already readable and dropped before the next await. Capping this at the
+/// 4 KiB floor would silently truncate SNI extraction whenever the frontend
+/// handshake timeout is disabled (`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=0`),
+/// which is the oversized-ClientHello misrouting of issue #2962.
+///
+/// Pure sizing seam so external tests can lock this without observing live
+/// buffer capacity through the async peek path.
+pub fn no_deadline_peek_capacity() -> usize {
+    MAX_CLIENT_HELLO_LEN
 }
 
 /// Next peek-buffer capacity after `have` bytes have already been observed and
@@ -45,12 +74,69 @@ pub fn initial_peek_capacity() -> usize {
 /// once the initial buffer is full (`have >=` initial). While `have` is still
 /// below the initial size the capacity stays at the floor — the peer simply has
 /// not delivered more bytes yet, so growing would not help.
+///
+/// This applies to the deadline-driven peek loop only; the no-deadline path
+/// uses [`no_deadline_peek_capacity`].
 pub fn next_peek_capacity(have: usize) -> usize {
     if have >= INITIAL_CLIENT_HELLO_PEEK_LEN {
         MAX_CLIENT_HELLO_LEN
     } else {
         INITIAL_CLIENT_HELLO_PEEK_LEN
     }
+}
+
+/// One immediate, non-suspending poll of `TcpStream::poll_peek`.
+///
+/// The returned future is `Ready` on its first poll no matter what, so the
+/// caller's peek buffer is never held across a suspension point. The inner
+/// `Poll` reports whether bytes were actually peeked (`Ready`) or the readiness
+/// signal was spurious / the socket returned `WouldBlock` (`Pending`).
+async fn poll_peek_once(
+    stream: &tokio::net::TcpStream,
+    buf: &mut tokio::io::ReadBuf<'_>,
+) -> std::task::Poll<std::io::Result<usize>> {
+    std::future::poll_fn(|cx| std::task::Poll::Ready(stream.poll_peek(cx, buf))).await
+}
+
+/// Single bounded ClientHello peek for callers that pass no handshake deadline.
+///
+/// Takes one peek of the wire and never loops on it, so a stalled peer cannot
+/// park the task waiting for a record that never completes. Two invariants have
+/// to hold at once, so readiness and the buffer are deliberately separated:
+///
+/// 1. A silent peer must not pin a hard-cap allocation. `readable()` carries no
+///    buffer, so an idle connection suspends here holding nothing.
+/// 2. Once bytes are actually available, the single peek must still be able to
+///    inspect a standards-valid ClientHello up to [`MAX_CLIENT_HELLO_LEN`]
+///    (issue #2962) — so the buffer is allocated only *after* readiness, at the
+///    full cap.
+///
+/// The peek itself is one non-blocking `poll_peek` wrapped in an always-`Ready`
+/// future: it cannot suspend, so the hard-cap buffer is never live across an
+/// await. A spurious readiness signal yields `Pending`; the buffer is dropped
+/// and a fresh readiness event awaited, bounded by
+/// [`MAX_PEEK_READINESS_RETRIES`] so this can never spin. There is no unbounded
+/// read loop and no blocking wait.
+async fn peek_sni_without_deadline(stream: &tokio::net::TcpStream) -> Option<String> {
+    for _ in 0..=MAX_PEEK_READINESS_RETRIES {
+        // No buffer is alive across this await: an idle peer pins nothing.
+        stream.readable().await.ok()?;
+
+        let mut buf = vec![0u8; no_deadline_peek_capacity()];
+        let polled = {
+            let mut read_buf = tokio::io::ReadBuf::new(&mut buf);
+            poll_peek_once(stream, &mut read_buf).await
+        };
+        match polled {
+            std::task::Poll::Ready(Ok(n)) => return extract_sni_from_client_hello(&buf[..n]),
+            std::task::Poll::Ready(Err(_)) => return None,
+            // Spurious readiness / `WouldBlock`: drop the buffer, then wait for
+            // a fresh readiness event rather than holding it across the await.
+            std::task::Poll::Pending => continue,
+        }
+    }
+    // Readiness kept proving phantom: fail closed rather than spin.
+    None
 }
 
 /// Extract the SNI hostname from a TLS ClientHello by peeking at a TCP stream.
@@ -63,8 +149,11 @@ pub fn next_peek_capacity(have: usize) -> usize {
 /// internal callers that have already enforced a deadline elsewhere; passthrough
 /// listeners pass `Some(d)` (mapped from `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS`)
 /// so a peer that opens a TCP connection and sends nothing cannot park a
-/// connection-handler task indefinitely. The no-deadline path peeks once into
-/// the initial (4 KiB) buffer — enough for ordinary ClientHellos.
+/// connection-handler task indefinitely. The no-deadline path awaits socket
+/// readiness with no buffer allocated, then takes one non-blocking peek into a
+/// full [`no_deadline_peek_capacity`] buffer that is dropped before any further
+/// await — so an idle peer pins nothing, while a readable peer's oversized
+/// ClientHello is still inspected up to the hard cap.
 ///
 /// When a deadline is set, the peek LOOPS until the full ClientHello handshake
 /// (`5 + record_len` bytes across records, capped at [`MAX_CLIENT_HELLO_LEN`])
@@ -85,20 +174,7 @@ pub async fn extract_sni_from_tcp_stream(
     handshake_timeout: Option<std::time::Duration>,
 ) -> Option<String> {
     let Some(d) = handshake_timeout else {
-        // No deadline: take a single peek and never loop, so a stalled peer
-        // cannot park the task waiting for a record that never completes.
-        //
-        // This path sizes straight to the hard cap rather than the lazy floor.
-        // Lazy growth exists to bound memory held ACROSS the peek loop while a
-        // slow peer dribbles bytes; here the buffer is allocated, peeked once,
-        // and dropped on return, so it cannot accumulate across connections.
-        // Starting at the floor would instead silently cap SNI extraction at
-        // 4 KiB whenever the frontend handshake timeout is disabled
-        // (`FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=0`), which is exactly
-        // the oversized-ClientHello misrouting issue #2962 set out to fix.
-        let mut buf = vec![0u8; MAX_CLIENT_HELLO_LEN];
-        let n = stream.peek(&mut buf).await.ok()?;
-        return extract_sni_from_client_hello(&buf[..n]);
+        return peek_sni_without_deadline(stream).await;
     };
 
     let mut buf = vec![0u8; initial_peek_capacity()];

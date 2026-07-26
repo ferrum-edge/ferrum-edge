@@ -159,7 +159,9 @@ paths:
         **Unauthenticated** callers receive only `status` and `ready` (suitable
         for readiness probes). The **detailed** diagnostics — `mode`, `database`
         connectivity/pool stats, `cached_config` proxy/consumer counts,
-        `database_polling` degradation, `config_rejected`, and mesh state — are
+        `database_polling` degradation, `config_rejected`, mesh state,
+        `logging`, `kafka_logging`, and `ai_transcript_audit` admitted capture
+        ceilings — are
         returned only when the caller presents a valid admin JWT, a matching
         `FERRUM_METRICS_BEARER_TOKEN`, or originates from
         `FERRUM_METRICS_ALLOWED_CIDRS`.
@@ -1671,7 +1673,9 @@ paths:
 
         **DP mode**: Shows the connection to the Control Plane — `url`,
         `status` (online/offline), `is_primary` (primary vs fallback CP),
-        `connected_since`, and `last_config_received_at`.
+        `connected_since`, `last_config_received_at`, and sticky ConfigSync
+        divergence fields (`config_diverged`, `config_diverged_since`,
+        `config_divergence_recoveries_total`).
 
         **Database/File modes**: Returns an informational message indicating
         cluster status is only meaningful in CP/DP modes.
@@ -1725,6 +1729,9 @@ paths:
                       is_primary: true
                       connected_since: "2025-01-15T10:30:00Z"
                       last_config_received_at: "2025-01-15T10:35:00Z"
+                      config_diverged: false
+                      config_diverged_since: null
+                      config_divergence_recoveries_total: 0
                 dp_mode_offline:
                   summary: DP disconnected from CP
                   value:
@@ -1735,6 +1742,9 @@ paths:
                       is_primary: true
                       connected_since: null
                       last_config_received_at: "2025-01-15T10:30:00Z"
+                      config_diverged: false
+                      config_diverged_since: null
+                      config_divergence_recoveries_total: 0
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -3411,6 +3421,15 @@ paths:
         Accepts the same JSON format produced by `GET /backup`. Resources are
         imported in dependency order (consumers & upstreams first, then proxies,
         then plugin configs).
+
+        Restore normalizes the submitted payload once before validation — the
+        same `normalize_fields()` admission used by CRUD, batch, file mode, and
+        database loaders — and persists that exact canonical instance. Mixed-case
+        hosts/backend hosts/upstream targets, backend TLS SNI and DNS SAN allow-list
+        entries, and blank optional identifiers (`custom_id`, plugin `proxy_id`)
+        are rewritten before any durable write. Credential hashing and restore
+        timestamps mutate that same normalized instance; they do not reintroduce
+        the discarded wire-form original.
 
         To perform an additive (non-destructive) import, use `POST /batch`
         instead.
@@ -6371,7 +6390,7 @@ components:
             Optional list of hostnames this proxy matches. Empty means match all
             hosts. Supports exact hostnames (`api.example.com`) and wildcard
             prefixes (`*.example.com`). Entries are normalized to lowercase on
-            create/update. Must match the format `[a-z0-9]([a-z0-9.-]*[a-z0-9])?`
+            admission (CRUD create/update, batch, restore, and config loaders). Must match the format `[a-z0-9]([a-z0-9.-]*[a-z0-9])?`
             for exact hosts or `*.[a-z0-9]([a-z0-9.-]*[a-z0-9])?` for wildcards.
 
 
@@ -9905,7 +9924,8 @@ components:
         Tiered: unauthenticated callers receive only `status` and `ready`. The
         remaining detailed fields (`timestamp`, `mode`, `database`,
         `admin_writes_enabled`, `cached_config`, `database_polling`,
-        `config_rejected`, `mesh`, `listener_failures`, `logging`) are
+        `config_rejected`, `mesh`, `listener_failures`, `logging`,
+        `kafka_logging`, `ai_transcript_audit`) are
         present only when the caller is authenticated (admin JWT, metrics bearer
         token, or allowlisted CIDR).
       required: [status, ready]
@@ -9925,10 +9945,11 @@ components:
             `degraded`.
             `starting` — startup not yet complete (returned with 503 and
             `ready: false`).
-            `unavailable` — the gateway became ready but a serving listener
-            task later exited with an error (CP gRPC or admin HTTP/HTTPS
+            `unavailable` — the gateway became ready but a supervised serving
+            listener task later exited with an error (CP gRPC or admin HTTP/HTTPS
             server, a DP proxy/admin listener, or a mesh traffic/admin
-            listener). This is a sticky, monotonic
+            listener), or — in control-plane mode — the database config poll
+            task exited unexpectedly. This is a sticky, monotonic
             degradation: it stays set across a later readiness restore
             (returned with 503 and `ready: false`). CP, DP, and mesh modes
             report it.
@@ -9936,10 +9957,12 @@ components:
           type: boolean
           description: |
             `true` once the gateway has finished startup AND no supervised
-            serving listener has failed since. While `false`, the endpoint
+            serving listener (or, in control-plane mode, the database config
+            poll task) has failed unexpectedly since. While `false`, the endpoint
             returns `503 Service Unavailable`. In CP/DP/mesh modes a post-startup
             serving-listener failure sets `ready: false` durably (sticky) even
-            though internal startup completed.
+            though internal startup completed. In CP mode an unexpected database
+            poll-task exit uses the same sticky not-ready path.
         admin_writes_enabled:
           type: boolean
           description: |
@@ -10056,6 +10079,93 @@ components:
           $ref: "#/components/schemas/ServingListenerFailureSnapshot"
         logging:
           $ref: "#/components/schemas/LoggingSinkSnapshot"
+        ai_transcript_audit:
+          type: array
+          description: >-
+            Effective admitted AI transcript capture ceilings for each committed
+            plugin instance. Numeric limits only — never request/response
+            excerpts, model strings, or tool names.
+          items:
+            $ref: "#/components/schemas/AiTranscriptAuditStatusSnapshot"
+          example:
+            - instance_id: 1
+              max_request_bytes: 65536
+              max_response_bytes: 65536
+              max_stream_capture_bytes: 65536
+              hard_max_request_bytes: 1048576
+              hard_max_response_bytes: 1048576
+              hard_max_stream_capture_bytes: 1048576
+              hard_max_capture_bytes_aggregate: 2097152
+              max_model_bytes: 256
+              max_tool_names: 64
+              max_tool_name_bytes: 128
+              max_tool_names_aggregate_bytes: 4096
+              max_retained_record_bytes: 135424
+
+    AiTranscriptAuditStatusSnapshot:
+      type: object
+      description: >-
+        Authenticated status snapshot for one committed `ai_transcript_audit`
+        instance. Reports effective admitted capture and metadata ceilings
+        without leaking transcript content.
+      required:
+        - instance_id
+        - max_request_bytes
+        - max_response_bytes
+        - max_stream_capture_bytes
+        - hard_max_request_bytes
+        - hard_max_response_bytes
+        - hard_max_stream_capture_bytes
+        - hard_max_capture_bytes_aggregate
+        - max_model_bytes
+        - max_tool_names
+        - max_tool_name_bytes
+        - max_tool_names_aggregate_bytes
+        - max_retained_record_bytes
+      properties:
+        instance_id:
+          type: integer
+          format: uint64
+        max_request_bytes:
+          type: integer
+          format: uint64
+        max_response_bytes:
+          type: integer
+          format: uint64
+        max_stream_capture_bytes:
+          type: integer
+          format: uint64
+        hard_max_request_bytes:
+          type: integer
+          format: uint64
+        hard_max_response_bytes:
+          type: integer
+          format: uint64
+        hard_max_stream_capture_bytes:
+          type: integer
+          format: uint64
+        hard_max_capture_bytes_aggregate:
+          type: integer
+          format: uint64
+        max_model_bytes:
+          type: integer
+          format: uint64
+        max_tool_names:
+          type: integer
+          format: uint64
+        max_tool_name_bytes:
+          type: integer
+          format: uint64
+        max_tool_names_aggregate_bytes:
+          type: integer
+          format: uint64
+        max_retained_record_bytes:
+          type: integer
+          format: uint64
+          description: >-
+            Coherent per-record retained-memory contract:
+            max_request_bytes + max(max_response_bytes, max_stream_capture_bytes)
+            + max_model_bytes + max_tool_names_aggregate_bytes.
 
     ServingListenerFailureSnapshot:
       type: object
@@ -10613,10 +10723,13 @@ components:
     DatabaseDeltaPollingHealth:
       type: object
       description: |
-        Database-mode polling health for rejected incremental deltas. Present
-        only in database mode. When `status` is `degraded`, the gateway keeps
-        serving the last known-good runtime config and leaves the accepted poll
-        cursor unchanged.
+        Database/CP-mode polling health. Present in `database` and `cp` modes.
+        When `status` is `degraded` due to rejected incremental deltas, the
+        gateway keeps serving the last known-good runtime config and leaves the
+        accepted poll cursor unchanged. `last_poll_completed_at` advances on
+        every normally completed poll outcome (empty success, rejection, or
+        handled error — not panic/abort/cancel) so operators can alert when the
+        supervised poll task stops advancing.
       required: [status]
       properties:
         status:
@@ -10642,13 +10755,22 @@ components:
           format: int64
         escalated:
           type: boolean
+        last_poll_completed_at:
+          type: string
+          format: date-time
+          description: |
+            RFC3339 timestamp of the most recently normally completed poll
+            attempt, including empty-success, rejection, and handled-error
+            outcomes. Panic/abort/cancellation do not advance it. Absent until the
+            first poll tick finishes.
 
     DatabaseDeltaPollingMetrics:
       type: object
       description: |
-        Bounded metrics for database incremental-delta validation rejections.
-        Resource-category and backoff dimensions are fixed enum labels; raw
-        resource IDs are never exposed as metric labels.
+        Bounded metrics for database/CP config polling. Includes incremental-
+        delta validation rejections (resource-category and backoff dimensions
+        are fixed enum labels; raw resource IDs are never exposed as metric
+        labels) and poll-task freshness via `last_poll_completed_at`.
       required:
         - rejected_deltas_total
         - rejected_deltas_by_resource_category
@@ -10688,6 +10810,13 @@ components:
         last_resource_category:
           type: string
           enum: [none, proxy, consumer, plugin_config, upstream, mixed]
+        last_poll_completed_at:
+          type: string
+          format: date-time
+          description: |
+            RFC3339 timestamp of the most recently normally completed poll
+            attempt, including empty success. Panic/abort/cancellation do not
+            advance it. Absent until the first poll finishes.
         degraded:
           anyOf:
             - $ref: "#/components/schemas/DatabaseDeltaPollingDegraded"
@@ -18497,7 +18626,7 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and cache metadata, then exports them asynchronously to an HTTPS collector in batches. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and cache metadata, then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Authenticated /health exposes effective admitted ceilings without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
@@ -18594,20 +18723,40 @@ components:
         limits:
           type: [object, "null"]
           additionalProperties: false
-          description: "Capture size caps. Omit or null to keep defaults."
+          description: >-
+            Capture size caps for request/response/stream excerpts. Each field
+            has a deployment-safe hard maximum (1048576). The sum of all three
+            must be <= 2097152 so a valid combination cannot retain an unsafe
+            aggregate body budget. Request-derived model/tool metadata is
+            bounded independently of these excerpt settings
+            (model <= 256 bytes, <= 64 tool names, each name <= 128 bytes,
+            aggregate tool-name bytes <= 4096). Omit or null to keep defaults.
           properties:
             max_request_bytes:
               type: integer
               minimum: 1
+              maximum: 1048576
               default: 65536
+              description: >-
+                Maximum retained request-body excerpt bytes. Hard maximum
+                1048576. Counts toward the cross-field aggregate with
+                max_response_bytes and max_stream_capture_bytes.
             max_response_bytes:
               type: integer
               minimum: 1
+              maximum: 1048576
               default: 65536
+              description: >-
+                Maximum retained buffered response-body excerpt bytes. Hard
+                maximum 1048576. Counts toward the cross-field aggregate.
             max_stream_capture_bytes:
               type: integer
               minimum: 1
+              maximum: 1048576
               default: 65536
+              description: >-
+                Maximum retained SSE stream-capture bytes. Hard maximum
+                1048576. Counts toward the cross-field aggregate.
         sink:
           type: object
           required: [endpoint_url]
@@ -18630,7 +18779,7 @@ components:
               type: object
               additionalProperties:
                 type: string
-              description: "Extra headers sent on every batch. Values support ${ENV_VAR} expansion resolved lazily at send time, so secrets are not stored in config (e.g. Authorization: 'Bearer ${AUDIT_TOKEN}'). Arbitrary header names are accepted; this is the only intentional free-form map in the plugin config."
+              description: "Extra headers sent on every batch. Arbitrary header names are accepted (the only intentional free-form map in the plugin config). Values are literal text plus optional ${secret:NAME} references, which resolve ONLY the FERRUM_TRANSCRIPT_SINK_SECRET_<NAME> environment namespace (e.g. Authorization: 'Bearer ${secret:AUDIT_TOKEN}' reads FERRUM_TRANSCRIPT_SINK_SECRET_AUDIT_TOKEN, composing with the _VAULT/_AWS/_AZURE/_GCP/_FILE external-secret suffixes). There is no generic ${ENV_VAR} process-environment interpolation, so unrelated Ferrum/database/cloud/system secrets cannot be exfiltrated into an outbound header; any other ${...} form, or a NAME outside [A-Z_][A-Z0-9_]*, is rejected at config admission. Names/templates are validated at admission; secrets are materialized once when the background worker activates. A missing, empty, or invalid secret/header value fails activation (the generation is never published) rather than being silently omitted, so on_sink_error=reject is honored on the first request. Materialized secret values are marked sensitive and never logged."
             batch_size:
               type: integer
               minimum: 1
@@ -18670,7 +18819,7 @@ components:
         privacy:
           type: [object, "null"]
           additionalProperties: false
-          description: "Identity/header export controls. Omit or null to keep defaults."
+          description: "Identity/header/path export controls. Omit or null to keep defaults."
           properties:
             include_consumer_username:
               type: boolean
@@ -18681,6 +18830,10 @@ components:
             include_raw_headers:
               type: boolean
               default: false
+            path_mode:
+              type: string
+              enum: [omit, template, redact, hash, raw]
+              description: "How the request path is exported. Applications often embed emails/account-ids/document-names/tokens in path segments, so a privacy mode never exports the literal path by default. omit: no path. template: export the matched route identifier (proxy listen_path, else proxy name; omitted when unavailable) instead of the user-controlled path. redact: literal path with the configured PII redactor applied (requires at least one redaction.builtins/custom_patterns pattern). hash: keyed HMAC-SHA256 hex digest of the literal path (shares redaction.hash_secret; not brute-forceable offline). raw: literal path verbatim. Default is template for metadata_only/redacted_body/hash_only and raw for full_body (the deliberate raw-capture opt-in)."
 
     AiSemanticFirewallConfig:
       type: object
@@ -21934,7 +22087,7 @@ components:
           enum: [dp]
         control_plane:
           type: object
-          required: [url, status, is_primary]
+          required: [url, status, is_primary, config_diverged, config_divergence_recoveries_total]
           properties:
             url:
               type: string
@@ -21953,7 +22106,22 @@ components:
             last_config_received_at:
               type: [string, "null"]
               format: date-time
-              description: When the last config update was received (null if none yet)
+              description: When the last accepted config update was received (null if none yet). Rejected resource deltas do not advance this stamp.
+            config_diverged:
+              type: boolean
+              description: |
+                Sticky operator signal set when a non-empty ConfigSync DELTA is
+                rejected. Cleared only after an authoritative FULL_SNAPSHOT is
+                accepted. Last-known-good config continues to serve while true.
+            config_diverged_since:
+              type: [string, "null"]
+              format: date-time
+              description: When sticky divergence was first raised (null when not diverged)
+            config_divergence_recoveries_total:
+              type: integer
+              format: int64
+              minimum: 0
+              description: Count of divergence → FULL_SNAPSHOT recovery transitions
 
     ClusterStatusOther:
       type: object
@@ -22040,7 +22208,11 @@ components:
             plaintext, H3 on most HTTPS backends, untagged HBONE,
             per-request HBONE CONNECT rejection) do NOT populate this
             field — only real connection / TLS-config errors and
-            in-flight live downgrades.
+            in-flight live downgrades. An H3 probe failure against a
+            target already classified `h3: supported` always populates
+            it, including when a transient DNS/connect/refused/timeout
+            class preserves that classification instead of downgrading
+            it (the record is then intentionally stale).
 
     BackendCapabilitiesResponse:
       type: object

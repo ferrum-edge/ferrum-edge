@@ -148,6 +148,18 @@ fn test_plugin_graph_mutations_run_prospective_validation_before_persistence() {
         "restore must use the blocking candidate validator"
     );
     assert!(
+        batch_source[restore_handler..].contains("candidate.normalize_fields()"),
+        "restore must normalize the actual candidate before validation"
+    );
+    assert!(
+        !batch_source[restore_handler..].contains("payload.proxies.clone()"),
+        "restore must not validate a disposable clone of the wire payload"
+    );
+    assert!(
+        batch_source[restore_handler..].contains("payload.proxies = candidate.proxies"),
+        "restore must persist the validated canonical instance"
+    );
+    assert!(
         batch_source
             .matches("crud::lock_namespace_config_admission(")
             .count()

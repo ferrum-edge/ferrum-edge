@@ -11,8 +11,12 @@ use std::collections::BTreeSet;
 
 use ferrum_edge::config::public_env_inventory::{
     PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS, PUBLIC_FERRUM_ENV_SETTINGS,
-    is_public_ferrum_env_coverage_exempt,
+    TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV, is_public_ferrum_env_coverage_exempt,
 };
+
+/// Prefix of the dynamic `ai_transcript_audit` sink-secret namespace, mirrored
+/// from `src/plugins/ai_transcript_audit.rs::SINK_SECRET_ENV_PREFIX`.
+const TRANSCRIPT_SINK_SECRET_ENV_PREFIX: &str = "FERRUM_TRANSCRIPT_SINK_SECRET_";
 
 const ENV_CONFIG_SOURCE: &str = include_str!("../../../src/config/env_config.rs");
 const CONFIGURATION_MD: &str = include_str!("../../../docs/configuration.md");
@@ -143,6 +147,42 @@ fn public_inventory_and_exemptions_are_sorted_and_unique() {
             .windows(2)
             .all(|pair| pair[0] < pair[1]),
         "PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS must be strictly sorted unique keys"
+    );
+}
+
+/// The dynamic `ai_transcript_audit` sink-secret namespace has no fixed key
+/// set, so the generic docs/template sweep cannot discover it. Pin its
+/// representative key so removing the namespace from the inventory — or
+/// dropping its docs row / `ferrum.conf` assignment — fails closed here.
+#[test]
+fn transcript_sink_secret_namespace_has_canonical_inventory_surface() {
+    assert!(
+        TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV.starts_with(TRANSCRIPT_SINK_SECRET_ENV_PREFIX),
+        "`{TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV}` must live under the \
+         `{TRANSCRIPT_SINK_SECRET_ENV_PREFIX}` namespace resolved by ai_transcript_audit"
+    );
+    assert!(
+        is_ferrum_env_key(TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV),
+        "the documented example key must be an exact-key form (no `<NAME>` placeholder), \
+         otherwise the docs/ferrum.conf extractors silently skip it"
+    );
+    assert!(
+        public_inventory().contains(TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV),
+        "`{TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV}` must stay in PUBLIC_FERRUM_ENV_SETTINGS as the \
+         canonical representative of the `{TRANSCRIPT_SINK_SECRET_ENV_PREFIX}<NAME>` namespace"
+    );
+    assert!(
+        !is_public_ferrum_env_coverage_exempt(TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV),
+        "the transcript sink-secret namespace must keep real docs/template coverage, \
+         not a coverage exemption"
+    );
+    assert!(
+        docs_table_keys(CONFIGURATION_MD).contains(TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV),
+        "docs/configuration.md needs a canonical `{TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV}` table row"
+    );
+    assert!(
+        ferrum_conf_assignment_keys(FERRUM_CONF).contains(TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV),
+        "ferrum.conf needs a `{TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV} = ...` template assignment"
     );
 }
 

@@ -122,12 +122,25 @@ impl MeshConfigSync for StaticMeshControlPlane {
         verify_mesh_grpc_auth(request.metadata())?;
         let request = request.into_inner();
         self.subscribe_count.fetch_add(1, Ordering::Relaxed);
+        // Model a real control plane: the returned slice is scoped to the
+        // subscription (`MeshSlice::from_gateway_config` echoes node/namespace
+        // /workload/waypoint verbatim), and the DP fails a response closed when
+        // it is not bound to its own request (issue #2457).
+        let slice = MeshSlice {
+            node_id: request.node_id.clone(),
+            namespace: request.namespace.clone(),
+            workload_spiffe_id: Some(request.workload_spiffe_id.clone())
+                .filter(|value| !value.is_empty()),
+            waypoint_name: Some(request.waypoint_name.clone())
+                .filter(|value| !value.trim().is_empty()),
+            ..self.slice.as_ref().clone()
+        };
         let _ = self.request_tx.send(Some(request));
 
         let update = MeshConfigUpdate {
-            version: self.slice.version.clone(),
+            version: slice.version.clone(),
             timestamp: Utc::now().timestamp(),
-            mesh_slice_json: serde_json::to_string(self.slice.as_ref())
+            mesh_slice_json: serde_json::to_string(&slice)
                 .map_err(|e| Status::internal(format!("serialize mesh slice: {e}")))?,
             ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
             heartbeat: false,

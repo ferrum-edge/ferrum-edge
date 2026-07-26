@@ -10,9 +10,12 @@ use super::common::{
     next_backoff_secs, refresh_dp_grpc_tls_config_if_changed, tonic_tls_config, wait_for_shutdown,
     wait_optional_tls_reload,
 };
+use super::update_validation::{
+    MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejection, validate_mesh_config_update,
+    validate_update_ferrum_version,
+};
 use crate::grpc::dp_client::{
-    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, check_cp_version_compatibility,
-    generate_dp_jwt_with_issuer_and_namespace,
+    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_with_issuer_and_namespace,
 };
 use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
 use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
@@ -92,7 +95,6 @@ pub async fn start_native_mesh_client_with_shutdown(
         );
 
         let cp_url = &cp_urls[current_cp_index];
-        let consumer = NativeMeshConfigConsumer::new(state.clone());
         let mut stream_shutdown_rx = shutdown_rx.clone();
         let is_fallback = current_cp_index != 0 && cp_urls.len() > 1;
         let should_retry_primary = is_fallback && config.primary_retry_secs > 0;
@@ -106,7 +108,7 @@ pub async fn start_native_mesh_client_with_shutdown(
                     cp_url,
                     &jwt_secret,
                     &config,
-                    &consumer,
+                    &state,
                     tls_config.as_ref(),
                 ) => result,
                 _ = wait_for_first_slice_then_primary_retry(
@@ -138,7 +140,7 @@ pub async fn start_native_mesh_client_with_shutdown(
                     cp_url,
                     &jwt_secret,
                     &config,
-                    &consumer,
+                    &state,
                     tls_config.as_ref(),
                 ) => result,
                 _ = wait_for_shutdown(&mut stream_shutdown_rx) => {
@@ -195,7 +197,7 @@ async fn connect_mesh_subscribe(
     cp_url: &str,
     jwt_secret: &GrpcJwtSecret,
     config: &NativeMeshClientConfig,
-    consumer: &NativeMeshConfigConsumer,
+    state: &MeshRuntimeState,
     tls_config: Option<&DpGrpcTlsConfig>,
 ) -> Result<(), anyhow::Error> {
     let mut endpoint =
@@ -235,23 +237,30 @@ async fn connect_mesh_subscribe(
         "Connected to CP, subscribing for native mesh config"
     );
 
-    let request = tonic::Request::new(config.subscribe_request(crate::FERRUM_VERSION));
+    let subscribe_request = config.subscribe_request(crate::FERRUM_VERSION);
+    // Bind the consumer to the EXACT request this stream puts on the wire, so a
+    // response can never be validated against a different subscription than the
+    // one the CP was asked to serve.
+    let consumer = NativeMeshConfigConsumer::new(
+        state.clone(),
+        MeshUpdateExpectation::from_subscribe_request(&subscribe_request),
+    );
+    let request = tonic::Request::new(subscribe_request);
     let mut stream = client.mesh_subscribe(request).await?.into_inner();
 
     while let Some(update) = stream.message().await? {
-        validate_mesh_update_ferrum_version(&update.ferrum_version)?;
+        // Heartbeats are handled explicitly: they carry no slice, so they are
+        // bound only to the CP compatibility contract and never reach the
+        // install path.
+        let applied = if update.heartbeat {
+            validate_update_ferrum_version(&update.ferrum_version, MeshUpdateConsumer::Native)
+                .map(|()| None)
+        } else {
+            consumer.apply_update(&update).map(Some)
+        };
 
-        if update.heartbeat {
-            tracing::debug!(
-                version = %update.version,
-                "Received native MeshSubscribe heartbeat"
-            );
-            continue;
-        }
-
-        let version = update.version.clone();
-        match consumer.apply_update(update) {
-            Ok(slice) => {
+        match applied {
+            Ok(Some(slice)) => {
                 info!(
                     node_id = %slice.node_id,
                     namespace = %slice.namespace,
@@ -259,11 +268,23 @@ async fn connect_mesh_subscribe(
                     "Applied native MeshSubscribe update"
                 );
             }
-            Err(e) => {
+            Ok(None) => {
+                tracing::debug!("Received native MeshSubscribe heartbeat");
+            }
+            Err(rejection) => {
+                // The rejection site already emitted the reason-labelled metric
+                // and the sanitized diagnostic; last-good state is untouched
+                // either way. A response that is not bound to this subscription
+                // means the whole stream is wrong, so drop it and let multi-CP
+                // failover pick another control plane (the reconnect path logs
+                // the failure with this CP's URL).
+                if rejection.terminates_stream() {
+                    return Err(anyhow::Error::new(rejection));
+                }
                 warn!(
-                    version = %version,
-                    error = %e,
-                    "Ignoring invalid native MeshSubscribe update"
+                    cp_url = %cp_url,
+                    reason = rejection.reason().as_metric_label(),
+                    "Ignoring invalid native MeshSubscribe update; keeping last-good slice"
                 );
             }
         }
@@ -272,38 +293,42 @@ async fn connect_mesh_subscribe(
     Ok(())
 }
 
-fn validate_mesh_update_ferrum_version(ferrum_version: &str) -> Result<(), anyhow::Error> {
-    if ferrum_version.trim().is_empty() {
-        return Err(anyhow::anyhow!(
-            "native MeshSubscribe update is missing ferrum_version; refusing unversioned CP response"
-        ));
-    }
-    check_cp_version_compatibility(ferrum_version).map_err(anyhow::Error::msg)
-}
-
 async fn wait_for_first_slice_then_primary_retry(state: MeshRuntimeState, interval: Duration) {
     state.wait_for_first_slice().await;
     tokio::time::sleep(interval).await;
 }
 
 /// Applies native `MeshSubscribe` updates into the shared mesh runtime state.
+///
+/// The consumer carries the subscription context the CP was asked to serve, so
+/// every update is bound to that exact request before it can reach
+/// `install_slice`.
 #[derive(Clone)]
 pub struct NativeMeshConfigConsumer {
     state: MeshRuntimeState,
+    expected: MeshUpdateExpectation,
 }
 
 impl NativeMeshConfigConsumer {
-    pub fn new(state: MeshRuntimeState) -> Self {
-        Self { state }
+    pub fn new(state: MeshRuntimeState, expected: MeshUpdateExpectation) -> Self {
+        Self { state, expected }
     }
 
     pub fn state(&self) -> &MeshRuntimeState {
         &self.state
     }
 
-    pub fn apply_update(&self, update: MeshConfigUpdate) -> Result<MeshSlice, String> {
-        let slice = serde_json::from_str::<MeshSlice>(&update.mesh_slice_json)
-            .map_err(|e| format!("invalid MeshSubscribe slice JSON: {e}"))?;
+    /// Validate a non-heartbeat update against the subscription and install it.
+    ///
+    /// Validation is fail-closed and runs to completion **before** any mutation:
+    /// a rejected response leaves the previously installed slice serving
+    /// untouched.
+    pub fn apply_update(
+        &self,
+        update: &MeshConfigUpdate,
+    ) -> Result<MeshSlice, MeshUpdateRejection> {
+        let consumer = MeshUpdateConsumer::Native;
+        let slice = validate_mesh_config_update(update, &self.expected, consumer)?;
         self.state.install_slice(slice.clone());
         Ok(slice)
     }
@@ -312,25 +337,49 @@ impl NativeMeshConfigConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modes::mesh::config_consumer::update_validation::MeshUpdateRejectReason;
+
+    fn test_client_config() -> NativeMeshClientConfig {
+        NativeMeshClientConfig {
+            node_id: "node-a".to_string(),
+            namespace: "ferrum".to_string(),
+            workload_spiffe_id: None,
+            waypoint_name: None,
+            labels: HashMap::new(),
+            ambient_udp_source_scoping: false,
+            primary_retry_secs: 0,
+        }
+    }
+
+    /// A consumer bound to exactly what `test_client_config` subscribes with.
+    fn test_consumer(state: MeshRuntimeState) -> NativeMeshConfigConsumer {
+        let request = test_client_config().subscribe_request(crate::FERRUM_VERSION);
+        let expected = MeshUpdateExpectation::from_subscribe_request(&request);
+        NativeMeshConfigConsumer::new(state, expected)
+    }
+
+    fn update_for(slice: &MeshSlice) -> MeshConfigUpdate {
+        MeshConfigUpdate {
+            version: slice.version.clone(),
+            timestamp: 1,
+            mesh_slice_json: serde_json::to_string(slice).expect("mesh slice serializes"),
+            ferrum_version: crate::FERRUM_VERSION.to_string(),
+            heartbeat: false,
+        }
+    }
 
     #[test]
     fn apply_update_installs_mesh_slice() {
         let state = MeshRuntimeState::new();
-        let consumer = NativeMeshConfigConsumer::new(state.clone());
-        let update = MeshConfigUpdate {
+        let consumer = test_consumer(state.clone());
+        let update = update_for(&MeshSlice {
+            node_id: "node-a".to_string(),
+            namespace: "ferrum".to_string(),
             version: "v1".to_string(),
-            timestamp: 1,
-            mesh_slice_json: serde_json::to_string(&MeshSlice {
-                node_id: "node-a".to_string(),
-                version: "v1".to_string(),
-                ..MeshSlice::default()
-            })
-            .expect("mesh slice serializes"),
-            ferrum_version: crate::FERRUM_VERSION.to_string(),
-            heartbeat: false,
-        };
+            ..MeshSlice::default()
+        });
 
-        let slice = consumer.apply_update(update).expect("update applies");
+        let slice = consumer.apply_update(&update).expect("update applies");
 
         assert_eq!(slice.node_id, "node-a");
         assert!(state.has_first_slice());
@@ -344,20 +393,44 @@ mod tests {
         );
     }
 
+    /// The subscription binding is enforced by the consumer itself: a slice
+    /// built for another node never reaches `install_slice`, so a DP with no
+    /// slice yet stays sliceless rather than adopting foreign state.
+    #[test]
+    fn apply_update_rejects_wrong_node_before_install() {
+        let state = MeshRuntimeState::new();
+        let consumer = test_consumer(state.clone());
+        let update = update_for(&MeshSlice {
+            node_id: "node-b".to_string(),
+            namespace: "ferrum".to_string(),
+            version: "v1".to_string(),
+            ..MeshSlice::default()
+        });
+
+        let rejection = consumer
+            .apply_update(&update)
+            .expect_err("a slice for another node must be rejected");
+
+        assert_eq!(rejection.reason(), MeshUpdateRejectReason::NodeIdMismatch);
+        assert!(rejection.terminates_stream());
+        assert!(!state.has_first_slice());
+        assert!(state.snapshot().as_ref().is_none());
+    }
+
     #[test]
     fn native_update_rejects_empty_ferrum_version() {
-        let err = validate_mesh_update_ferrum_version("")
+        let rejection = validate_update_ferrum_version("", MeshUpdateConsumer::Native)
             .expect_err("empty ferrum_version must be rejected");
 
-        assert!(
-            err.to_string().contains("missing ferrum_version"),
-            "unexpected error: {err}"
+        assert_eq!(
+            rejection.reason(),
+            MeshUpdateRejectReason::MissingFerrumVersion
         );
     }
 
     #[test]
     fn native_update_accepts_current_ferrum_version() {
-        validate_mesh_update_ferrum_version(crate::FERRUM_VERSION)
+        validate_update_ferrum_version(crate::FERRUM_VERSION, MeshUpdateConsumer::Native)
             .expect("current ferrum_version should be compatible");
     }
 

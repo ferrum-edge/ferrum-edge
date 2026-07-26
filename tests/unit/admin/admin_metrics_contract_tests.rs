@@ -228,10 +228,16 @@ fn contract_fixtures_cover_modes_breakers_and_health_variants() {
         "node_agent fixture must use the empty-skeleton shape"
     );
     assert!(
-        values
-            .iter()
-            .any(|value| value.get("database_polling").is_some()),
+        values.iter().any(|value| {
+            value["gateway"]["mode"] == "database" && value.get("database_polling").is_some()
+        }),
         "database fixture must include database_polling"
+    );
+    assert!(
+        values.iter().any(|value| {
+            value["gateway"]["mode"] == "cp" && value.get("database_polling").is_some()
+        }),
+        "cp fixture must include database_polling freshness metrics"
     );
     assert!(
         values.iter().any(|value| {

@@ -643,6 +643,7 @@ jobs:
               integration::mesh_destination_rule_connection_pool_audit_tests
               integration::mesh_dr_service_entry_e2e_tests
               integration::mesh_sidecar_e2e_tests
+              integration::mesh_subscribe_validation_tests
               integration::cp_dp_grpc_tests
               integration::cp_multi_namespace_tests
               integration::connection_pool_tests
@@ -651,6 +652,7 @@ jobs:
               integration::grpc_proxy_tests
               integration::scripted_backend_smoke_tests
               integration::dtls_integration_tests
+              integration::dtls_accept_isolation_tests
               integration::backend_mtls_tests
               integration::backend_tls_san_allow_list_tests
               integration::frontend_tls_live_reload_tests
@@ -1343,7 +1345,47 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/ferrum-helm-results"
+          # Fail if any first-class values.yaml key is absent from values.schema.json.
+          # PyYAML is installed from a hash-pinned requirements file into a temp
+          # venv (PEP 668 / Cross-policy-safe; no unpinned pip fallback).
+          python3 -m venv "$RUNNER_TEMP/helm-schema-parity-venv"
+          PATH="$RUNNER_TEMP/helm-schema-parity-venv/bin:$PATH"
+          python3 -m pip install --require-hashes \
+            -r ./scripts/check_helm_values_schema_parity.requirements.txt
+          python3 ./scripts/check_helm_values_schema_parity.py
           helm lint ./charts/ferrum-mesh
+          # Unknown / misspelled keys must fail schema validation (additionalProperties: false).
+          if helm lint ./charts/ferrum-mesh --set ambient.enabld=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-misspelled-root.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-misspelled-root.err"; then
+            echo "::error title=Misspelled mesh root key accepted::ambient.enabld must fail schema validation"
+            exit 1
+          fi
+          grep -E 'enabld|additional properties|Additional property' "$RUNNER_TEMP/ferrum-helm-results/mesh-misspelled-root.err" \
+            "$RUNNER_TEMP/ferrum-helm-results/mesh-misspelled-root.out"
+          if helm lint ./charts/ferrum-mesh --set controlPlane.enabld=true \
+            > "$RUNNER_TEMP/ferrum-helm-results/mesh-misspelled-nested.out" \
+            2> "$RUNNER_TEMP/ferrum-helm-results/mesh-misspelled-nested.err"; then
+            echo "::error title=Misspelled mesh nested key accepted::controlPlane.enabld must fail schema validation"
+            exit 1
+          fi
+          grep -E 'enabld|additional properties|Additional property' "$RUNNER_TEMP/ferrum-helm-results/mesh-misspelled-nested.err" \
+            "$RUNNER_TEMP/ferrum-helm-results/mesh-misspelled-nested.out"
+          # Documented free-form extension maps remain open.
+          cat > "$RUNNER_TEMP/ferrum-helm-results/mesh-extension-maps-values.yaml" <<'EXTEOF'
+          ambient:
+            env:
+              FERRUM_LOG_LEVEL: debug
+          observability:
+            dashboards:
+              annotations:
+                grafana.com/folder: ferrum
+          EXTEOF
+          helm lint ./charts/ferrum-mesh \
+            -f "$RUNNER_TEMP/ferrum-helm-results/mesh-extension-maps-values.yaml"
+          # Development/example values must satisfy the exhaustive schema.
+          helm lint ./charts/ferrum-mesh -f ./charts/ferrum-mesh/examples/development-values.yaml
+          helm lint ./charts/ferrum-mesh -f ./charts/ferrum-mesh/examples/production-existing-secrets-values.yaml
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
             > "$RUNNER_TEMP/ferrum-helm-results/default-rendered.yaml"
           helm template ferrum ./charts/ferrum-mesh --namespace ferrum \
@@ -1445,6 +1487,41 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/ferrum-gateway-helm-results"
           helm lint ./charts/ferrum-gateway
+          # Unknown / misspelled keys must fail schema validation (additionalProperties: false).
+          if helm lint ./charts/ferrum-gateway --set replicaCoun=3 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/misspelled-root.out" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/misspelled-root.err"; then
+            echo "::error title=Misspelled gateway root key accepted::replicaCoun must fail schema validation"
+            exit 1
+          fi
+          grep -E 'replicaCoun|additional properties|Additional property' \
+            "$RUNNER_TEMP/ferrum-gateway-helm-results/misspelled-root.err" \
+            "$RUNNER_TEMP/ferrum-gateway-helm-results/misspelled-root.out"
+          if helm lint ./charts/ferrum-gateway --set admin.bindAddres=0.0.0.0 \
+            > "$RUNNER_TEMP/ferrum-gateway-helm-results/misspelled-nested.out" \
+            2> "$RUNNER_TEMP/ferrum-gateway-helm-results/misspelled-nested.err"; then
+            echo "::error title=Misspelled gateway nested key accepted::admin.bindAddres must fail schema validation"
+            exit 1
+          fi
+          grep -E 'bindAddres|additional properties|Additional property' \
+            "$RUNNER_TEMP/ferrum-gateway-helm-results/misspelled-nested.err" \
+            "$RUNNER_TEMP/ferrum-gateway-helm-results/misspelled-nested.out"
+          # Documented free-form extension maps remain open.
+          cat > "$RUNNER_TEMP/ferrum-gateway-helm-results/extension-maps-values.yaml" <<'EXTEOF'
+          env:
+            FERRUM_LOG_LEVEL: info
+          podAnnotations:
+            ci: "true"
+          serviceAccount:
+            annotations:
+              eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ferrum
+          EXTEOF
+          helm lint ./charts/ferrum-gateway \
+            -f "$RUNNER_TEMP/ferrum-gateway-helm-results/extension-maps-values.yaml"
+          # Development/example values must satisfy the exhaustive schema.
+          for example in file-values.yaml database-values.yaml cp-values.yaml dp-values.yaml; do
+            helm lint ./charts/ferrum-gateway -f "./charts/ferrum-gateway/examples/${example}"
+          done
           # Default (file mode) renders a runnable, Secret-free gateway.
           helm template ferrum ./charts/ferrum-gateway --namespace ferrum \
             > "$RUNNER_TEMP/ferrum-gateway-helm-results/file-rendered.yaml"
@@ -3179,6 +3256,7 @@ jobs:
           run_benchmark=true
           run_ip_restriction_benchmark=false
           run_wrr_benchmark=false
+          run_rr_benchmark=false
           run_ai_semantic_cache_benchmark=false
           reason="Performance regression checks always run for ${EVENT_NAME} events."
           changed_files=""
@@ -3238,6 +3316,10 @@ jobs:
             run_wrr_benchmark=true
           fi
 
+          if [ "${EVENT_NAME}" != "pull_request" ] || grep -Eq '^(src/load_balancer\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/rr_selection\.rs)|\.github/scripts/verify_rr_selection_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
+            run_rr_benchmark=true
+          fi
+
           if [ "${EVENT_NAME}" != "pull_request" ] || grep -Eq '^(src/plugins/ai_semantic_cache\.rs|tests/unit/plugins/ai_semantic_cache_tests\.rs|tests/performance/mesh/(Cargo\.(toml|lock)|benches/ai_semantic_cache_cleanup\.rs)|\.github/scripts/verify_ai_semantic_cache_cleanup_benchmark\.py|\.github/workflows/ci\.yml)$' <<<"${changed_files}"; then
             run_ai_semantic_cache_benchmark=true
           fi
@@ -3252,12 +3334,13 @@ jobs:
             echo "run=${run_benchmark}"
             echo "run_ip_restriction_benchmark=${run_ip_restriction_benchmark}"
             echo "run_wrr_benchmark=${run_wrr_benchmark}"
+            echo "run_rr_benchmark=${run_rr_benchmark}"
             echo "run_ai_semantic_cache_benchmark=${run_ai_semantic_cache_benchmark}"
             echo "reason=${reason}"
           } >> "${GITHUB_OUTPUT}"
 
       - uses: ./.github/actions/setup-rust-ci
-        if: steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
+        if: steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_rr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true'
         with:
           shared-key: "ci-perf"
 
@@ -3276,6 +3359,15 @@ jobs:
           cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench wrr_selection
           python3 .github/scripts/verify_wrr_selection_benchmark.py --self-test
           python3 .github/scripts/verify_wrr_selection_benchmark.py \
+            --criterion-root tests/performance/mesh/target/criterion \
+            --min-parallel-speedup 1.10
+
+      - name: Run RoundRobin selection contention microbenchmark
+        if: steps.perf_changes.outputs.run_rr_benchmark == 'true'
+        run: |
+          cargo bench --manifest-path tests/performance/mesh/Cargo.toml --bench rr_selection
+          python3 .github/scripts/verify_rr_selection_benchmark.py --self-test
+          python3 .github/scripts/verify_rr_selection_benchmark.py \
             --criterion-root tests/performance/mesh/target/criterion \
             --min-parallel-speedup 1.10
 
@@ -3362,7 +3454,7 @@ jobs:
           kill "${GATEWAY_PID:-}" 2>/dev/null || true
 
       - name: Upload performance results
-        if: always() && (steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true')
+        if: always() && (steps.perf_changes.outputs.run == 'true' || steps.perf_changes.outputs.run_ip_restriction_benchmark == 'true' || steps.perf_changes.outputs.run_wrr_benchmark == 'true' || steps.perf_changes.outputs.run_rr_benchmark == 'true' || steps.perf_changes.outputs.run_ai_semantic_cache_benchmark == 'true')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: performance-results
@@ -3370,6 +3462,7 @@ jobs:
             tests/performance/ci_results/
             tests/performance/mesh/target/criterion/ip_restriction_lookup/
             tests/performance/mesh/target/criterion/wrr_selection/
+            tests/performance/mesh/target/criterion/rr_selection/
             tests/performance/mesh/target/criterion/ai_semantic_cache_cleanup_hot_path/
           retention-days: 30
 
@@ -3379,6 +3472,7 @@ jobs:
           RUN: ${{ steps.perf_changes.outputs.run }}
           RUN_IP_RESTRICTION: ${{ steps.perf_changes.outputs.run_ip_restriction_benchmark }}
           RUN_WRR: ${{ steps.perf_changes.outputs.run_wrr_benchmark }}
+          RUN_RR: ${{ steps.perf_changes.outputs.run_rr_benchmark }}
           RUN_AI_SEMANTIC_CACHE: ${{ steps.perf_changes.outputs.run_ai_semantic_cache_benchmark }}
           REASON: ${{ steps.perf_changes.outputs.reason }}
         run: |
@@ -3395,6 +3489,12 @@ jobs:
           if [ "${RUN_WRR}" = "true" ]; then
             {
               echo "WRR selection contention guard executed: 4-thread/1-thread throughput speedup >= 1.10x across 4/32/129-target fixtures."
+              echo ""
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          if [ "${RUN_RR}" = "true" ]; then
+            {
+              echo "RoundRobin selection contention guard executed: 8-thread/1-thread throughput speedup >= 1.10x for the 2-target fixture."
               echo ""
             } >> "${GITHUB_STEP_SUMMARY}"
           fi

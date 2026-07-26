@@ -3344,3 +3344,488 @@ async fn h3_native_grpc_server_streaming_preserves_frames_and_trailers() {
          recorded: {received:#?}\n--- logs ---\n{logs}"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #2939 — plain native-H3 streaming mid-body non-graceful abort
+// downgrades capability so the next request bridges to TCP instead of
+// repeating the truncation.
+//
+// Fault injection uses `CloseConnectionWithCode(0x10c)` (H3_REQUEST_CANCELLED)
+// after a partial body rather than `SendStreamReset`. On Linux the scripted
+// backend's end-of-script drop can race ahead of RESET_STREAM and surface as
+// `ApplicationClose: H3_NO_ERROR` at `recv_data`; that trips
+// `is_h3_graceful_close` and correctly suppresses the downgrade — so a
+// SendStreamReset-only fixture can falsely fail this assertion even when
+// production behavior is right. The scaffolding still holds the connection
+// open after `SendStreamReset` to shrink that race for other tests; this
+// case uses the explicit non-graceful close that
+// `h3_frontend_to_h3_backend_failure_downgrades_from_server_path` and
+// `retry_attempts_within_same_request_stay_on_h3_pool` already rely on.
+// The companion `h3_frontend_mid_body_graceful_goaway_keeps_capability_supported`
+// pins the negative side of the same guard.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_frontend_mid_body_stream_reset_downgrades_and_bridges() {
+    let ca = TestCa::new("h3-midbody-downgrade").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .repeat_each_connection()
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nbridged".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    let prefix = bytes::Bytes::from_static(b"partial-");
+    let h3_backend = ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "200".to_string()),
+            ("content-length", "64".to_string()),
+            ("content-type", "text/plain".to_string()),
+        ]))
+        .step(H3Step::RespondData(prefix))
+        .step(H3Step::StallFor(Duration::from_millis(50)))
+        .step(H3Step::CloseConnectionWithCode(0x10c))
+        .spawn()
+        .expect("spawn h3");
+
+    let (harness, _ca_pem, https_port) =
+        spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
+
+    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("pre-entry")
+        .expect("registry populated");
+    assert_eq!(
+        pre["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "precondition: h3=supported; entry: {pre:#?}"
+    );
+
+    let _first = h3_get(&harness, "/api/midbody").await;
+
+    let downgraded = wait_for_h3_class(&harness, "unsupported", Duration::from_secs(10))
+        .await
+        .expect("capability lookup");
+    if downgraded.is_none() {
+        let logs = harness.captured_combined().unwrap_or_default();
+        panic!(
+            "mid-body non-graceful H3 abort on the plain streaming path must \
+             mark h3=unsupported; entry: {:?}\n--- logs ---\n{logs}",
+            fetch_capability_entry(&harness).await
+        );
+    }
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/bridged");
+    let second = client
+        .get(&url)
+        .await
+        .expect("post-downgrade bridged response");
+    assert_eq!(second.status.as_u16(), 200, "body={:?}", second.body_text());
+    assert_eq!(second.body_text(), "bridged");
+
+    let h3_paths: Vec<_> = h3_backend
+        .received_requests()
+        .await
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    assert!(
+        h3_paths.iter().any(|p| p == "/midbody"),
+        "first request must have hit the H3 backend; paths={h3_paths:?}"
+    );
+    assert!(
+        !h3_paths.iter().any(|p| p == "/bridged"),
+        "second request must not re-dial the H3 backend after downgrade; paths={h3_paths:?}"
+    );
+    assert!(
+        tcp_backend.accepted_connections() >= 1,
+        "bridge must have accepted at least one TCP connection"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #2939 (negative case) — a graceful `H3_NO_ERROR` / GOAWAY teardown
+// mid-body still fails the request but must NEVER downgrade H3 capability.
+// The raw stream classifier maps that teardown to `ConnectionClosed`, which is
+// inside `is_h3_transport_error_class`, so only the explicit
+// `is_h3_graceful_close` exclusion keeps the classification intact.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_frontend_mid_body_graceful_goaway_keeps_capability_supported() {
+    let ca = TestCa::new("h3-midbody-goaway-keep").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .repeat_each_connection()
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    // Declares 64 bytes, sends 8, then tears the connection down gracefully —
+    // an incomplete body, so the streaming recovery gate cannot treat it as a
+    // success, and the downgrade guard is the only thing under test.
+    let _h3_backend =
+        ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+            .step(H3Step::AcceptStream)
+            .step(H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-length", "64".to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]))
+            .step(H3Step::RespondData(bytes::Bytes::from_static(b"partial-")))
+            .step(H3Step::StallFor(Duration::from_millis(50)))
+            .step(H3Step::SendGoaway(0))
+            .spawn()
+            .expect("spawn h3");
+
+    let (harness, _ca_pem, _https_port) =
+        spawn_h3_harness_with_explicit_https_port(backend_port, true, None).await;
+
+    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("pre-entry")
+        .expect("registry populated");
+    assert_eq!(
+        pre["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "precondition: h3=supported; entry: {pre:#?}"
+    );
+
+    let _first = h3_get(&harness, "/api/goaway").await;
+
+    // Give any (incorrect) downgrade time to land before asserting it did not.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let post = fetch_capability_entry(&harness)
+        .await
+        .expect("post-entry")
+        .expect("registry entry still present");
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        post["plain_http"]["h3"].as_str(),
+        Some("supported"),
+        "a graceful mid-body teardown must not downgrade H3 capability; \
+         entry: {post:#?}\n--- gateway logs ---\n{logs}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #2937 — H3 frontend buffered retry recomputes native-H3 eligibility
+// when LB rotation moves onto an H2-only target.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_frontend_retry_rotation_bridges_to_h2_only_target() {
+    let ca = TestCa::new("h3-retry-mixed-cap").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_a, udp_a) = reserve_colocated_tcp_udp().await.expect("target A ports");
+    let target_a_port = tcp_a.port;
+    let _tcp_a = ScriptedTlsBackend::builder(
+        tcp_a.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .repeat_each_connection()
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn A tls");
+
+    let h3_a_tls = H3TlsConfig::new(cert.clone(), key.clone());
+    let h3_a = ScriptedH3Backend::builder(udp_a.into_socket(), h3_a_tls)
+        .step(H3Step::AcceptStream)
+        .step(H3Step::RespondHeaders(vec![
+            (":status", "503".to_string()),
+            ("content-length", "5".to_string()),
+            ("content-type", "text/plain".to_string()),
+        ]))
+        .step(H3Step::RespondData(bytes::Bytes::from_static(b"retry")))
+        .step(H3Step::StallFor(Duration::from_millis(50)))
+        .spawn()
+        .expect("spawn A h3");
+
+    let tcp_b = reserve_port().await.expect("target B port");
+    let target_b_port = tcp_b.port;
+    let tcp_b_backend = ScriptedTlsBackend::builder(
+        tcp_b.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .repeat_each_connection()
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nfrom-b!".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn B tls");
+
+    let yaml = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "h3-retry-mixed",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": target_a_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 1500,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "upstream_id": "mixed-h3-upstream",
+            "retry": {
+                "max_retries": 1,
+                "retryable_status_codes": [503],
+                "retryable_methods": ["GET"],
+            },
+        }],
+        "consumers": [],
+        "upstreams": [{
+            "id": "mixed-h3-upstream",
+            "name": "mixed-h3-upstream",
+            "algorithm": "round_robin",
+            "targets": [
+                { "host": "127.0.0.1", "port": target_a_port, "weight": 1 },
+                { "host": "127.0.0.1", "port": target_b_port, "weight": 1 },
+            ],
+        }],
+        "plugin_configs": [],
+    });
+    let yaml = serde_yaml::to_string(&yaml).expect("yaml");
+
+    let (harness, _ca_pem, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut ready = false;
+    while std::time::Instant::now() < deadline {
+        if let Ok(body) = harness.get_admin_json("/backend-capabilities").await {
+            let entries = body["entries"].as_array().cloned().unwrap_or_default();
+            let mut a_ok = false;
+            let mut b_not = false;
+            for e in &entries {
+                let port: u16 = e["key"]
+                    .as_str()
+                    .unwrap_or("")
+                    .split('|')
+                    .nth(2)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let h3 = e["plain_http"]["h3"].as_str();
+                if port == target_a_port && h3 == Some("supported") {
+                    a_ok = true;
+                }
+                if port == target_b_port && matches!(h3, Some("unsupported") | Some("unknown")) {
+                    b_not = true;
+                }
+            }
+            if a_ok && b_not {
+                ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(
+        ready,
+        "warmup must classify A=h3-supported and B=h3-(unsupported|unknown) before the request"
+    );
+
+    let b_baseline = tcp_b_backend.accepted_connections();
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/mixed");
+    let resp = client.get(&url).await.expect("mixed-capability response");
+    let logs = harness.captured_combined().unwrap_or_default();
+
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "rotation onto H2-only B must bridge and return 200; body={:?}\n--- logs ---\n{logs}",
+        resp.body_text()
+    );
+    assert_eq!(resp.body_text(), "from-b!");
+    assert!(
+        tcp_b_backend.accepted_connections() > b_baseline,
+        "retry must have reached B over TCP; baseline={b_baseline} now={}",
+        tcp_b_backend.accepted_connections()
+    );
+    let a_paths: Vec<_> = h3_a
+        .received_requests()
+        .await
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    assert!(
+        a_paths.iter().any(|p| p == "/mixed"),
+        "first attempt must have hit H3 target A; paths={a_paths:?}"
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Issue #2941 — auth/logging-only plugins must not drop buffered H3 trailers.
+// ────────────────────────────────────────────────────────────────────────────
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn h3_buffered_auth_logging_plugins_preserve_backend_trailers() {
+    let ca = TestCa::new("h3-buffered-trailers-auth").expect("ca");
+    let (cert, key) = ca.valid().expect("leaf");
+
+    let (tcp_res, udp_res) = reserve_colocated_tcp_udp()
+        .await
+        .expect("colocated tcp/udp");
+    let backend_port = tcp_res.port;
+
+    let _tcp_backend = ScriptedTlsBackend::builder(
+        tcp_res.into_listener(),
+        TlsConfig::new(cert.clone(), key.clone())
+            .with_alpn(vec![b"h2".to_vec(), b"http/1.1".to_vec()]),
+    )
+    .repeat_each_connection()
+    .step(TcpStep::ReadUntil(b"\r\n\r\n".to_vec()))
+    .step(TcpStep::Write(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_vec(),
+    ))
+    .step(TcpStep::Drop)
+    .spawn()
+    .expect("spawn tls");
+
+    let body = bytes::Bytes::from_static(b"trailer-body");
+    let _h3_backend =
+        ScriptedH3Backend::builder(udp_res.into_socket(), H3TlsConfig::new(cert, key))
+            .step(H3Step::AcceptStream)
+            .step(H3Step::RespondHeaders(vec![
+                (":status", "200".to_string()),
+                ("content-length", body.len().to_string()),
+                ("content-type", "text/plain".to_string()),
+            ]))
+            .step(H3Step::RespondData(body.clone()))
+            .step(H3Step::RespondTrailers(vec![
+                ("x-backend-finished", "true".to_string()),
+                ("x-request-id", "trail-auth-1".to_string()),
+            ]))
+            .step(H3Step::StallFor(Duration::from_millis(100)))
+            .spawn()
+            .expect("spawn h3");
+
+    let yaml = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "scripted-h3",
+            "listen_path": "/api",
+            "backend_scheme": "https",
+            "backend_host": "127.0.0.1",
+            "backend_port": backend_port,
+            "strip_listen_path": true,
+            "backend_connect_timeout_ms": 2000,
+            "backend_read_timeout_ms": 5000,
+            "backend_write_timeout_ms": 5000,
+            "backend_tls_verify_server_cert": false,
+            "response_body_mode": "buffer",
+            "auth_mode": "single",
+            "plugins": [
+                {"plugin_config_id": "trail-key-auth"},
+                {"plugin_config_id": "trail-stdout-logging"},
+            ],
+        }],
+        "consumers": [{
+            "id": "trail-consumer",
+            "username": "trail-user",
+            "credentials": {
+                "keyauth": [{"key": "trail-key-11223344"}]
+            }
+        }],
+        "upstreams": [],
+        "plugin_configs": [
+            {
+                "id": "trail-key-auth",
+                "plugin_name": "key_auth",
+                "scope": "proxy",
+                "proxy_id": "scripted-h3",
+                "enabled": true,
+                "config": {"key_location": "header:x-api-key"},
+            },
+            {
+                "id": "trail-stdout-logging",
+                "plugin_name": "stdout_logging",
+                "scope": "proxy",
+                "proxy_id": "scripted-h3",
+                "enabled": true,
+                "config": {},
+            },
+        ],
+    });
+    let yaml = serde_yaml::to_string(&yaml).expect("yaml");
+
+    let (harness, _ca_pem, https_port) =
+        spawn_h3_harness_with_explicit_https_port_and_config(yaml, true, None).await;
+
+    let pre = wait_for_capability_entry(&harness, Duration::from_secs(15))
+        .await
+        .expect("pre-entry")
+        .expect("registry populated");
+    assert_eq!(pre["plain_http"]["h3"].as_str(), Some("supported"));
+
+    let client = Http3Client::insecure().expect("h3 client");
+    let url = format!("https://127.0.0.1:{https_port}/api/trailers");
+    let resp = client
+        .get_with_options(
+            &url,
+            GetOptions::default().header("x-api-key", "trail-key-11223344"),
+        )
+        .await
+        .unwrap_or_else(|e| {
+            let logs = harness.captured_combined().unwrap_or_default();
+            panic!("h3 buffered trailer request failed: {e}\n--- logs ---\n{logs}");
+        });
+
+    let logs = harness.captured_combined().unwrap_or_default();
+    assert_eq!(
+        resp.status.as_u16(),
+        200,
+        "buffered auth/logging path must succeed; body={:?}\n--- logs ---\n{logs}",
+        resp.body_text()
+    );
+    assert_eq!(resp.body_text(), "trailer-body");
+    assert_eq!(
+        resp.trailer("x-backend-finished"),
+        Some("true"),
+        "auth/logging-only plugins must preserve backend trailers on the buffered H3 path; \
+         trailers={:?}\n--- logs ---\n{logs}",
+        resp.trailers
+    );
+    assert_eq!(resp.trailer("x-request-id"), Some("trail-auth-1"));
+}

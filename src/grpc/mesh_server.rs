@@ -635,7 +635,7 @@ impl MeshConfigSync for MeshGrpcServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::db_loader::IncrementalResult;
+    use crate::config::db_loader::{IncrementalResult, NamespacedResourceId};
     use crate::identity::spiffe::{SpiffeId, TrustDomain};
     use crate::modes::mesh::config::{
         AppProtocol, MeshConfig, MeshService, NodeWaypointEndpoint, ServicePort, Workload,
@@ -795,7 +795,7 @@ mod tests {
             added_or_modified_plugin_configs: Vec::new(),
             removed_plugin_config_ids: Vec::new(),
             added_or_modified_upstreams: Vec::new(),
-            removed_upstream_ids: vec!["stale-upstream".to_string()],
+            removed_upstream_ids: vec![NamespacedResourceId::new("ferrum", "stale-upstream")],
             sequence_cursor: 0,
             poll_timestamp,
         };
@@ -875,7 +875,7 @@ mod tests {
             added_or_modified_plugin_configs: Vec::new(),
             removed_plugin_config_ids: Vec::new(),
             added_or_modified_upstreams: Vec::new(),
-            removed_upstream_ids: vec!["unrelated-upstream".to_string()],
+            removed_upstream_ids: vec![NamespacedResourceId::new("ferrum", "unrelated-upstream")],
             sequence_cursor: 0,
             poll_timestamp,
         };

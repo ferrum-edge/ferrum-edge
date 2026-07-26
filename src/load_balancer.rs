@@ -363,6 +363,47 @@ fn wrr_counter_shard() -> usize {
     })
 }
 
+/// RoundRobin / Random / LeastLatency warm-up / locality-distribute selection
+/// counters. Reuses [`WRR_COUNTER_SHARDS`] and [`wrr_counter_shard`] so every
+/// hot-path ticket advance stays on a per-worker [`CachePadded`] line instead of
+/// bouncing a single shared `AtomicU64` that sat adjacent to read-per-selection
+/// neighbors (`algorithm`, `target_indices`, `distribute_groups`, …).
+type SelectionCounterShards = [CachePadded<AtomicU64>; WRR_COUNTER_SHARDS];
+
+/// Odd multiplicative stride (golden-ratio fraction of 2^64) giving each
+/// selection-counter shard a distinct starting phase at construction.
+///
+/// Matches the non-zero WRR schedule seed stride in [`WrrSchedule::with_seed`]:
+/// an all-zero init would remove cache-line contention but leave every shard
+/// lockstep on the same first-wave target / random sequence / distribute bucket.
+/// The constant is odd (invertible mod 2^64); under wrapping multiplication the
+/// per-shard phases do not collapse onto one residue for the small target counts
+/// and weighted bucket totals exercised on these paths (e.g. mod 2 they alternate).
+const SELECTION_COUNTER_PHASE_STRIDE: u64 = 0x9E3779B97F4A7C15;
+
+/// Fresh selection-counter shards for a parent, port, or locality-distribute lane.
+///
+/// Each shard starts at `i × SELECTION_COUNTER_PHASE_STRIDE` so concurrent
+/// workers that begin a wave together do not all pick the same RR offset,
+/// Random hash seed, or locality-distribute bucket. Contention avoidance still
+/// comes from per-shard [`CachePadded`] ownership; long-run ratios stay even
+/// because each shard is itself a full RR / random / weighted-bucket walk.
+/// Within one shard the ticket stream remains deterministic.
+#[inline]
+fn new_selection_counters() -> SelectionCounterShards {
+    std::array::from_fn(|i| {
+        CachePadded::new(AtomicU64::new(
+            (i as u64).wrapping_mul(SELECTION_COUNTER_PHASE_STRIDE),
+        ))
+    })
+}
+
+/// Advance the calling thread's selection-counter shard and return the ticket.
+#[inline]
+fn selection_counter_ticket(counters: &SelectionCounterShards) -> u64 {
+    counters[wrr_counter_shard()].fetch_add(1, Ordering::Relaxed)
+}
+
 /// Per-lane smooth-WRR state shared by parent, subset, and port selectors.
 ///
 /// # Concurrency / distribution tradeoff
@@ -1778,7 +1819,7 @@ fn build_locality_lb_state(
             enabled: false,
             distribute_weights: None,
             distribute_groups: None,
-            distribute_counter: AtomicU64::new(0),
+            distribute_counter: new_selection_counters(),
             failover_target_matches: None,
         });
     }
@@ -1792,7 +1833,7 @@ fn build_locality_lb_state(
             enabled: true,
             distribute_weights: None,
             distribute_groups: None,
-            distribute_counter: AtomicU64::new(0),
+            distribute_counter: new_selection_counters(),
             failover_target_matches: None,
         });
     };
@@ -1955,7 +1996,7 @@ fn build_locality_lb_state(
         enabled: true,
         distribute_weights,
         distribute_groups,
-        distribute_counter: AtomicU64::new(0),
+        distribute_counter: new_selection_counters(),
         failover_target_matches,
     })
 }
@@ -2061,8 +2102,9 @@ pub struct LoadBalancer {
     /// via `write!()` into a thread-local buffer.
     target_index: HashMap<String, usize>,
     algorithm: LoadBalancerAlgorithm,
-    /// Round-robin counter.
-    rr_counter: AtomicU64,
+    /// Round-robin / random / least-latency warm-up selection counters.
+    /// Sharded and cache-line padded; see [`SelectionCounterShards`].
+    rr_counter: SelectionCounterShards,
     /// Weighted round-robin lane state (smooth weighted round-robin).
     /// See [`WrrLaneState`] for the wait-free hot path and rebuild tradeoff.
     wrr_state: WrrLaneState,
@@ -2166,9 +2208,10 @@ struct LocalityLbState {
     /// picks one bucket by the configured locality share, then runs the
     /// upstream / port / subset algorithm inside that bucket.
     distribute_groups: Option<Vec<LocalityDistributeGroup>>,
-    /// Independent counter for weighted locality-bucket selection. This keeps
-    /// the endpoint algorithm's own counter cadence unchanged.
-    distribute_counter: AtomicU64,
+    /// Independent counters for weighted locality-bucket selection. This keeps
+    /// the endpoint algorithm's own counter cadence unchanged. Sharded and
+    /// cache-line padded; see [`SelectionCounterShards`].
+    distribute_counter: SelectionCounterShards,
     /// Per-target failover-region match, index-aligned with `LoadBalancer.targets`.
     /// `true` when the target's locality region matches the failover `to`
     /// region for this source. `None` when no `failover[]` entry matched
@@ -2188,7 +2231,7 @@ struct PortLbState {
     target_indices: Vec<usize>,
     algorithm: LoadBalancerAlgorithm,
     algorithm_overridden: bool,
-    rr_counter: AtomicU64,
+    rr_counter: SelectionCounterShards,
     wrr_state: WrrLaneState,
     hash_ring: Vec<(u64, usize)>,
     hash_on_strategy: HashOnStrategy,
@@ -2432,7 +2475,7 @@ impl LoadBalancer {
                         target_indices,
                         algorithm: effective_algorithm,
                         algorithm_overridden: override_config.algorithm.is_some(),
-                        rr_counter: AtomicU64::new(0),
+                        rr_counter: new_selection_counters(),
                         wrr_state,
                         hash_ring,
                         hash_on_strategy: HashOnStrategy::parse(effective_hash_on),
@@ -2495,7 +2538,7 @@ impl LoadBalancer {
             target_locality_ranks,
             target_index,
             algorithm,
-            rr_counter: AtomicU64::new(0),
+            rr_counter: new_selection_counters(),
             wrr_state: if algorithm == LoadBalancerAlgorithm::WeightedRoundRobin {
                 WrrLaneState::new(targets.len())
             } else {
@@ -2669,6 +2712,83 @@ impl LoadBalancer {
     /// amortization. Neither counter is touched on the steady-state cache-hit path.
     pub fn wrr_parent_schedule_counters(&self) -> (u64, u64) {
         self.wrr_state.schedule_counters()
+    }
+
+    /// Snapshot parent selection-counter shard phases (init offsets + any advances).
+    ///
+    /// Crate-private test seam (routed through `_test_support`): lets coverage
+    /// assert distinct construction-time phases without depending on OS thread →
+    /// shard assignment. The library target exposes this through `_test_support`;
+    /// the binary target compiles this module without that bridge, so the helper
+    /// is intentionally unused there.
+    #[allow(dead_code)]
+    pub(crate) fn selection_counter_phases_for_test(&self) -> [u64; 16] {
+        std::array::from_fn(|i| self.rr_counter[i].load(Ordering::Relaxed))
+    }
+
+    /// One RoundRobin pick driven by an explicit counter shard.
+    ///
+    /// Crate-private test seam (routed through `_test_support`): bypasses
+    /// [`wrr_counter_shard`] so first-wave correlation across shards is asserted
+    /// without barriers or scheduling. See
+    /// [`Self::selection_counter_phases_for_test`] for the bin-target dead-code note.
+    #[allow(dead_code)]
+    pub(crate) fn select_round_robin_from_shard_for_test(
+        &self,
+        shard: usize,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if self.targets.is_empty() {
+            return None;
+        }
+        let ticket =
+            self.rr_counter[shard & (WRR_COUNTER_SHARDS - 1)].fetch_add(1, Ordering::Relaxed);
+        Some(Arc::clone(
+            &self.targets[(ticket as usize) % self.targets.len()],
+        ))
+    }
+
+    /// One Random pick driven by an explicit counter shard (same golden-ratio
+    /// mapping as the production Random path).
+    ///
+    /// Crate-private test seam: see [`Self::select_round_robin_from_shard_for_test`].
+    #[allow(dead_code)]
+    pub(crate) fn select_random_from_shard_for_test(
+        &self,
+        shard: usize,
+    ) -> Option<Arc<UpstreamTarget>> {
+        if self.targets.is_empty() {
+            return None;
+        }
+        let ticket =
+            self.rr_counter[shard & (WRR_COUNTER_SHARDS - 1)].fetch_add(1, Ordering::Relaxed);
+        let hash = golden_ratio_hash(ticket) as usize;
+        Some(Arc::clone(&self.targets[hash % self.targets.len()]))
+    }
+
+    /// First-wave locality-distribute bucket moduli across shards for `total`.
+    ///
+    /// Crate-private test seam (routed through `_test_support`): peeks each
+    /// distribute-counter phase and applies the same
+    /// `golden_ratio_hash(raw) % total` mapping as [`Self::distribute_pick`].
+    /// See [`Self::selection_counter_phases_for_test`] for the bin-target
+    /// dead-code note.
+    #[allow(dead_code)]
+    pub(crate) fn distribute_first_wave_bucket_mods_for_test(
+        &self,
+        total: u64,
+    ) -> Option<Vec<u64>> {
+        if total == 0 {
+            return None;
+        }
+        let state = self.locality_lb.as_ref()?;
+        Some(
+            (0..WRR_COUNTER_SHARDS)
+                .map(|i| {
+                    let raw = state.distribute_counter[i].load(Ordering::Relaxed);
+                    golden_ratio_hash(raw) % total
+                })
+                .collect(),
+        )
     }
 
     /// Find the pre-computed host:port key for a target via O(1) HashMap lookup.
@@ -3314,11 +3434,11 @@ impl LoadBalancer {
         ctx_key: &str,
         total: u64,
         algorithm: LoadBalancerAlgorithm,
-        distribute_counter: &AtomicU64,
+        distribute_counter: &SelectionCounterShards,
     ) -> u64 {
         let raw = match algorithm {
             LoadBalancerAlgorithm::ConsistentHashing => fx_hash_str(ctx_key),
-            _ => distribute_counter.fetch_add(1, Ordering::Relaxed),
+            _ => selection_counter_ticket(distribute_counter),
         };
         golden_ratio_hash(raw) % total
     }
@@ -3893,7 +4013,10 @@ impl LoadBalancer {
     }
 
     #[inline]
-    fn port_subset_rr_counter<'a>(&'a self, port_state: &'a PortLbState) -> &'a AtomicU64 {
+    fn port_subset_rr_counter<'a>(
+        &'a self,
+        port_state: &'a PortLbState,
+    ) -> &'a SelectionCounterShards {
         if port_state.algorithm_overridden {
             &port_state.rr_counter
         } else {
@@ -3979,7 +4102,7 @@ impl LoadBalancer {
         ctx_key: &str,
         healthy: &HealthBitset,
         algorithm: LoadBalancerAlgorithm,
-        rr_counter: &AtomicU64,
+        rr_counter: &SelectionCounterShards,
         wrr_state: &WrrLaneState,
         hash_ring: &[(u64, usize)],
         locality_lb: Option<&LocalityLbState>,
@@ -4001,7 +4124,7 @@ impl LoadBalancer {
             // `Passthrough` reaches the balancer only as the fallback after the
             // request path's orig-dst match missed; behave as round-robin.
             LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Passthrough => {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                let idx = selection_counter_ticket(rr_counter) as usize;
                 let target_idx = if all {
                     idx % self.targets.len()
                 } else {
@@ -4010,7 +4133,7 @@ impl LoadBalancer {
                 Some(Arc::clone(&self.targets[target_idx]))
             }
             LoadBalancerAlgorithm::Random => {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed);
+                let idx = selection_counter_ticket(rr_counter);
                 let hash = golden_ratio_hash(idx) as usize;
                 let target_idx = if all {
                     hash % self.targets.len()
@@ -4083,7 +4206,7 @@ impl LoadBalancer {
         ctx_key: &str,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
         algorithm: LoadBalancerAlgorithm,
-        rr_counter: &AtomicU64,
+        rr_counter: &SelectionCounterShards,
         wrr_state: &WrrLaneState,
         hash_ring: &[(u64, usize)],
         locality_lb: Option<&LocalityLbState>,
@@ -4104,11 +4227,11 @@ impl LoadBalancer {
             // `Passthrough` reaches the balancer only as the round-robin
             // fallback after the request path's orig-dst match missed.
             LoadBalancerAlgorithm::RoundRobin | LoadBalancerAlgorithm::Passthrough => {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+                let idx = selection_counter_ticket(rr_counter) as usize;
                 Some(Arc::clone(candidates[idx % candidates.len()].1))
             }
             LoadBalancerAlgorithm::Random => {
-                let idx = rr_counter.fetch_add(1, Ordering::Relaxed);
+                let idx = selection_counter_ticket(rr_counter);
                 let hash = golden_ratio_hash(idx) as usize;
                 Some(Arc::clone(candidates[hash % candidates.len()].1))
             }
@@ -5013,7 +5136,7 @@ impl LoadBalancer {
     fn select_least_latency_bitset(
         &self,
         healthy: &HealthBitset,
-        rr_counter: &AtomicU64,
+        rr_counter: &SelectionCounterShards,
     ) -> Option<Arc<UpstreamTarget>> {
         let hcount = healthy.count();
         if hcount == 0 {
@@ -5046,7 +5169,7 @@ impl LoadBalancer {
 
         // Initial warm-up: round-robin so all targets get baseline measurements.
         if warmed_count == 0 || !any_has_data {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = selection_counter_ticket(rr_counter) as usize;
             let target_idx = healthy.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
@@ -5058,7 +5181,7 @@ impl LoadBalancer {
         // Explore with a fixed permille of selections via RR among unwarmed;
         // otherwise pick the best warmed EWMA.
         if !all_warmed_up {
-            let ticket = rr_counter.fetch_add(1, Ordering::Relaxed);
+            let ticket = selection_counter_ticket(rr_counter);
             if let Some(mut skip) = unwarmed_explore_slot(ticket, unwarmed_count) {
                 // Round-robin among unwarmed healthy targets only.
                 for i in 0..self.targets.len() {
@@ -5140,7 +5263,7 @@ impl LoadBalancer {
         }
 
         if best_latency == LATENCY_UNSET {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = selection_counter_ticket(rr_counter) as usize;
             let target_idx = healthy.nth_set_bit(idx);
             return Some(Arc::clone(&self.targets[target_idx]));
         }
@@ -5239,7 +5362,7 @@ impl LoadBalancer {
     fn select_least_latency_vec(
         &self,
         candidates: &[(usize, &Arc<UpstreamTarget>)],
-        rr_counter: &AtomicU64,
+        rr_counter: &SelectionCounterShards,
     ) -> Option<Arc<UpstreamTarget>> {
         if candidates.is_empty() {
             return None;
@@ -5266,14 +5389,14 @@ impl LoadBalancer {
         }
 
         if warmed_count == 0 || !any_has_data {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = selection_counter_ticket(rr_counter) as usize;
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
         let all_warmed_up = unwarmed_count == 0;
 
         if !all_warmed_up {
-            let ticket = rr_counter.fetch_add(1, Ordering::Relaxed);
+            let ticket = selection_counter_ticket(rr_counter);
             if let Some(mut skip) = unwarmed_explore_slot(ticket, unwarmed_count) {
                 for candidate in candidates {
                     let samples = self
@@ -5339,7 +5462,7 @@ impl LoadBalancer {
         }
 
         if best_latency == LATENCY_UNSET {
-            let idx = rr_counter.fetch_add(1, Ordering::Relaxed) as usize;
+            let idx = selection_counter_ticket(rr_counter) as usize;
             return Some(Arc::clone(candidates[idx % candidates.len()].1));
         }
 
@@ -5475,6 +5598,52 @@ mod tests {
                 .any(|c| c.load(Ordering::Relaxed) != first),
             "zero-weight shards must be phase-distributed"
         );
+    }
+
+    #[test]
+    fn selection_counter_shards_use_golden_phase_stride() {
+        let counters = new_selection_counters();
+        for (i, counter) in counters.iter().enumerate() {
+            assert_eq!(
+                counter.load(Ordering::Relaxed),
+                (i as u64).wrapping_mul(SELECTION_COUNTER_PHASE_STRIDE),
+                "shard {i} phase"
+            );
+        }
+        let first = counters[0].load(Ordering::Relaxed);
+        assert!(
+            counters.iter().any(|c| c.load(Ordering::Relaxed) != first),
+            "selection counter shards must be phase-distributed"
+        );
+    }
+
+    #[test]
+    fn selection_counter_phase_stride_avoids_small_modulo_lockstep() {
+        // Independently check RR target counts and weighted-bucket totals used
+        // on the hot path: an all-zero init collapses every shard onto residue 0.
+        let counters = new_selection_counters();
+        for modulus in [2u64, 3, 5, 7, 100] {
+            let residues: Vec<u64> = (0..WRR_COUNTER_SHARDS)
+                .map(|i| counters[i].load(Ordering::Relaxed) % modulus)
+                .collect();
+            assert!(
+                residues.iter().any(|&r| r != residues[0]),
+                "phase stride must not lockstep mod {modulus}; got {residues:?}"
+            );
+        }
+        // Random / distribute consume golden_ratio_hash(ticket) before modulo.
+        for modulus in [2u64, 3, 5, 7, 100] {
+            let residues: Vec<u64> = (0..WRR_COUNTER_SHARDS)
+                .map(|i| {
+                    let ticket = counters[i].load(Ordering::Relaxed);
+                    golden_ratio_hash(ticket) % modulus
+                })
+                .collect();
+            assert!(
+                residues.iter().any(|&r| r != residues[0]),
+                "hashed phase stride must not lockstep mod {modulus}; got {residues:?}"
+            );
+        }
     }
 
     #[test]

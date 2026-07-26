@@ -96,7 +96,10 @@ pub enum H3Step {
     /// are delivered but the backend delays FIN past the read timeout.
     RespondTrailersWithoutFin(Vec<(&'static str, String)>),
     /// Send `RESET_STREAM` with the given application error code, then
-    /// end the script.
+    /// hold the connection open briefly so the peer can observe
+    /// `RemoteTerminate` before the end-of-script drop, and end the script.
+    /// Prefer `CloseConnectionWithCode` for downgrade tests that must not
+    /// race with a graceful `H3_NO_ERROR` teardown on Linux.
     SendStreamReset(u64),
     /// Send an H3 GOAWAY with the given max-stream-id, then end the
     /// script. GOAWAY / H3_NO_ERROR is a graceful shutdown signal; use
@@ -669,10 +672,28 @@ async fn run_h3_script(
                     .as_mut()
                     .ok_or_else(|| "SendStreamReset without preceding stream".to_string())?;
                 let code = h3::error::Code::from(code);
-                // h3's stop_sending resets the send side; to actually
-                // abort the response we use the underlying BidiStream.
+                // `stop_stream` queues RESET_STREAM on the send half (the
+                // response direction). Flush any pending DATA first so the
+                // peer observes the partial body and the abort as distinct
+                // events.
                 stream.send_data(Bytes::new()).await.ok();
                 stream.stop_stream(code);
+                // Pull the stream out of the active slot so end-of-script
+                // `finish()` is never attempted on a reset stream.
+                if let Some(stream) = response_stream.take() {
+                    finished_response_streams.push(stream);
+                }
+                // Keep the QUIC connection alive long enough for RESET_STREAM
+                // to flush and for the peer to observe `RemoteTerminate`
+                // before the end-of-script drop races ahead as
+                // `ApplicationClose(H3_NO_ERROR)`. That race is a known
+                // Linux flake — see
+                // `retry_attempts_within_same_request_stay_on_h3_pool`,
+                // which switched to `CloseConnectionWithCode` for the same
+                // reason. A premature H3_NO_ERROR would falsely trip
+                // `is_h3_graceful_close` and suppress a legitimate mid-body
+                // downgrade under test.
+                tokio::time::sleep(Duration::from_millis(250)).await;
                 return Ok(());
             }
             H3Step::SendGoaway(max_requests) => {

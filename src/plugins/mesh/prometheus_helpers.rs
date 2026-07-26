@@ -44,6 +44,8 @@ static MESH_REMOTE_DISCOVERY_POLL_SUCCESSES: LazyLock<
 static MESH_REMOTE_DISCOVERY_LAST_SUCCESS: LazyLock<
     DashMap<MeshRemoteDiscoveryPollSuccessKey, AtomicU64>,
 > = LazyLock::new(DashMap::new);
+static MESH_CONFIG_UPDATE_REJECTIONS: LazyLock<DashMap<MeshConfigUpdateRejectKey, AtomicU64>> =
+    LazyLock::new(DashMap::new);
 static XDS_STREAMS_REJECTED: AtomicU64 = AtomicU64::new(0);
 static MESH_INBOUND_PLAINTEXT_ALLOWED: AtomicU64 = AtomicU64::new(0);
 static XDS_WARMING_PARTIAL_APPLIES: LazyLock<DashMap<Arc<str>, AtomicU64>> =
@@ -233,6 +235,17 @@ struct MeshRemoteDiscoveryPollFailureKey {
 struct MeshRemoteDiscoveryPollSuccessKey {
     cluster: Arc<str>,
     trust_domain: Arc<str>,
+}
+
+/// Key for the MeshSubscribe response-validation counter. Both fields are
+/// `&'static str` values from closed enums in
+/// `modes::mesh::config_consumer::update_validation`, so this series' label
+/// space is fixed at compile time — no control-plane-supplied value ever
+/// becomes a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MeshConfigUpdateRejectKey {
+    consumer: &'static str,
+    reason: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -523,6 +536,24 @@ pub fn withdraw_mesh_remote_discovery_freshness(
     MESH_REMOTE_DISCOVERY_LAST_SUCCESS.remove(&key);
 }
 
+/// Count a `MeshConfigUpdate` a mesh config consumer refused before applying
+/// it (issue #2457): a response that is not bound to the subscription that
+/// opened the stream, carries an inconsistent version envelope, or fails the
+/// CP compatibility contract.
+///
+/// `consumer` and `reason` are compile-time constants
+/// (`MeshUpdateConsumer::as_metric_label` / `MeshUpdateRejectReason::as_metric_label`),
+/// so the series' cardinality is fixed and no control-plane-supplied value can
+/// reach `/metrics`. The mismatching values themselves stay in the structured
+/// `warn!` diagnostic at the rejection site — security detail goes to logs, not
+/// metrics.
+pub fn increment_mesh_config_update_rejection(consumer: &'static str, reason: &'static str) {
+    MESH_CONFIG_UPDATE_REJECTIONS
+        .entry(MeshConfigUpdateRejectKey { consumer, reason })
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
     let key = MeshMtlsHandshakeFailureKey {
         reason: Arc::from(reason.as_ref()),
@@ -714,6 +745,22 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
         MESH_INBOUND_PLAINTEXT_ALLOWED.load(Ordering::Relaxed),
         gateway_ns_label,
     );
+
+    if !MESH_CONFIG_UPDATE_REJECTIONS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_config_update_rejections_total MeshSubscribe responses refused before apply, by consumer and reason.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_config_update_rejections_total counter\n");
+        for entry in MESH_CONFIG_UPDATE_REJECTIONS.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_config_update_rejections_total{{consumer=\"{}\",reason=\"{}\"{}}} {}\n",
+                escape_label_value(entry.key().consumer),
+                escape_label_value(entry.key().reason),
+                gateway_ns_label,
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
 
     if !MESH_FEDERATION_POLL_FAILURES.is_empty() {
         output.push_str(

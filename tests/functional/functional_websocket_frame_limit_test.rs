@@ -81,6 +81,66 @@ async fn functional_ws_message_size_limit_h1_preserves_close_and_rejects_oversiz
     backend_task.abort();
 }
 
+/// Global `FERRUM_MAX_WEBSOCKET_FRAME_SIZE_BYTES` overflow (no size plugin) must
+/// still emit RFC 6455 Close 1009 to both peers rather than an abrupt 1006.
+#[ignore]
+#[tokio::test]
+async fn functional_websocket_global_frame_limit_sends_1009_to_both_peers() {
+    let (backend_port, backend_messages, mut backend_closes, backend_task) =
+        spawn_counting_ws_backend().await;
+    let mut gateway = frame_limit_gateway_builder(backend_port)
+        .spawn()
+        .await
+        .expect("start H1 global frame-limit gateway");
+    gateway
+        .wait_for_proxy_port(Duration::from_secs(5))
+        .await
+        .expect("proxy port ready");
+
+    let url = format!("ws://127.0.0.1:{}/ws", gateway.proxy_port);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("H1 websocket connect");
+
+    ws.send(Message::Text("ok".into()))
+        .await
+        .expect("send small frame");
+    assert_eq!(
+        ws.next().await.expect("small reply").expect("small reply"),
+        Message::Text("Echo: ok".into())
+    );
+    assert_backend_messages(&backend_messages, 1).await;
+
+    ws.send(Message::Text("x".repeat(17).into()))
+        .await
+        .expect("send oversized global-cap frame");
+    let client_close = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(Some(close)))) => break close,
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                Some(Ok(Message::Close(None))) => {
+                    panic!("global frame-cap overflow closed with 1005/no status")
+                }
+                other => panic!("unexpected reply before global 1009 Close: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("client close timed out");
+    assert_eq!(client_close.code, CloseCode::Size);
+    assert!(
+        client_close.reason.is_empty(),
+        "global fallback reason must stay bounded/non-secret, got {:?}",
+        client_close.reason
+    );
+    assert_backend_close(&mut backend_closes, CloseCode::Size, "").await;
+    assert_backend_messages(&backend_messages, 1).await;
+
+    gateway.shutdown();
+    backend_task.abort();
+}
+
 #[ignore]
 #[tokio::test]
 async fn functional_websocket_frame_limit_h3_rejects_oversized_client_frame() {

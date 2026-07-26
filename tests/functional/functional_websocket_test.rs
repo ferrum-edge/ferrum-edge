@@ -30,6 +30,7 @@ use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::Message;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 
 use crate::scaffolding::{H3WebSocketFrame, Http3Client, WebSocketOptions};
 
@@ -3160,6 +3161,107 @@ async fn test_websocket_idle_timeout_tunnel_mode_closes_idle_session() {
         ws_session_closed_within(&mut ws, Duration::from_secs(10)).await,
         "tunnel-mode idle WebSocket session should be closed within the idle window"
     );
+
+    let _ = gateway.kill();
+    let _ = gateway.wait();
+    echo_handle.abort();
+}
+
+/// Idle-timeout teardown must publish one defined policy Close (1001) so both
+/// peers observe a meaningful status instead of asymmetric 1005/1006.
+#[ignore]
+#[tokio::test]
+async fn test_websocket_idle_timeout_sends_symmetric_1001_close() {
+    use tokio::sync::mpsc;
+
+    let reservation = crate::scaffolding::reserve_port()
+        .await
+        .expect("reserve idle-timeout backend port");
+    let backend_port = reservation.port;
+    let (close_tx, mut backend_closes) = mpsc::unbounded_channel::<(CloseCode, String)>();
+    let echo_handle = tokio::spawn(async move {
+        let listener = reservation.into_listener();
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let close_tx = close_tx.clone();
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(msg)) = ws.next().await {
+                    match msg {
+                        Message::Text(text) => {
+                            let echo = format!("Echo: {text}");
+                            if ws.send(Message::Text(echo.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Message::Close(Some(close)) => {
+                            let _ = close_tx.send((close.code, close.reason.to_string()));
+                            let _ = ws.send(Message::Close(Some(close))).await;
+                            break;
+                        }
+                        Message::Close(None) => {
+                            let _ = close_tx.send((CloseCode::Status, String::new()));
+                            let _ = ws.send(Message::Close(None)).await;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let config_path = temp_dir.path().join("config.yaml");
+    write_ws_config(&config_path, backend_port);
+
+    build_gateway().expect("Failed to build gateway");
+    let (mut gateway, gateway_port) = start_gateway_plain_with_retry_extra_env(
+        config_path.to_str().unwrap(),
+        &[("FERRUM_WEBSOCKET_IDLE_TIMEOUT_SECONDS", "2")],
+    )
+    .await;
+
+    let url = format!("ws://127.0.0.1:{}/ws-echo", gateway_port);
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    ws.send(Message::Text("hello".into()))
+        .await
+        .expect("Failed to send text");
+    let reply = ws.next().await.expect("No reply").expect("Error reading");
+    assert_eq!(reply, Message::Text("Echo: hello".into()));
+
+    let client_close = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(Some(close)))) => break close,
+                Some(Ok(Message::Close(None))) => {
+                    panic!("idle timeout closed client with 1005/no status")
+                }
+                Some(Ok(_)) => continue,
+                Some(Err(err)) => panic!("idle timeout reset client transport: {err}"),
+                None => panic!("idle timeout ended client stream without Close"),
+            }
+        }
+    })
+    .await
+    .expect("client idle-timeout Close timed out");
+    assert_eq!(client_close.code, CloseCode::Away);
+    assert_eq!(client_close.reason.as_str(), "idle timeout");
+
+    let (backend_code, backend_reason) =
+        tokio::time::timeout(Duration::from_secs(2), backend_closes.recv())
+            .await
+            .expect("backend idle-timeout Close timed out")
+            .expect("backend close channel ended");
+    assert_eq!(backend_code, CloseCode::Away);
+    assert_eq!(backend_reason, "idle timeout");
 
     let _ = gateway.kill();
     let _ = gateway.wait();

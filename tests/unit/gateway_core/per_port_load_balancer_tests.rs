@@ -16,6 +16,41 @@ fn target(host: &str, port: u16) -> UpstreamTarget {
     weighted_target(host, port, 1)
 }
 
+/// Assert `sequence` is a contiguous RoundRobin walk over `ordered_targets`.
+///
+/// Selection-counter shards start at distinct golden-ratio phase offsets, so
+/// the absolute first bucket depends on the calling thread's shard assignment.
+/// Within one shard the walk remains deterministic: each pick advances one step
+/// through the configured target order (wrapping).
+fn assert_contiguous_round_robin(sequence: &[String], ordered_targets: &[&str]) {
+    assert!(
+        !sequence.is_empty(),
+        "round-robin sequence must not be empty"
+    );
+    let n = ordered_targets.len();
+    assert!(n > 0, "ordered target list must not be empty");
+    let start = ordered_targets
+        .iter()
+        .position(|host| *host == sequence[0].as_str())
+        .unwrap_or_else(|| {
+            panic!("sequence {sequence:?} must start on one of {ordered_targets:?}")
+        });
+    for (offset, host) in sequence.iter().enumerate() {
+        let expected = ordered_targets[(start + offset) % n];
+        assert_eq!(
+            host.as_str(),
+            expected,
+            "expected contiguous RR over {ordered_targets:?} starting at index {start}, got {sequence:?}"
+        );
+    }
+    if sequence.len() > 1 && n > 1 {
+        assert_ne!(
+            sequence[0], sequence[1],
+            "round-robin must advance within a shard; got {sequence:?}"
+        );
+    }
+}
+
 fn weighted_target(host: &str, port: u16, weight: u32) -> UpstreamTarget {
     UpstreamTarget {
         host: host.to_string(),
@@ -209,7 +244,9 @@ fn port_least_latency_warmup_fallback_uses_port_counter() {
         ..GatewayConfig::default()
     };
     let cache = LoadBalancerCache::new(&config);
+    let control_cache = LoadBalancerCache::new(&config);
     let snapshot = cache.load();
+    let control_snapshot = control_cache.load();
 
     for _ in 0..2 {
         LoadBalancerCache::select_target_from(&snapshot, "u1", "parent", None)
@@ -226,7 +263,27 @@ fn port_least_latency_warmup_fallback_uses_port_counter() {
         })
         .collect();
 
-    assert_eq!(port_sequence, vec!["a", "b"]);
+    let control_sequence: Vec<String> = (0..2)
+        .map(|_| {
+            LoadBalancerCache::select_target_for_port_from(
+                &control_snapshot,
+                "u1",
+                "port",
+                8080,
+                None,
+            )
+            .expect("control port selection")
+            .target
+            .host
+            .clone()
+        })
+        .collect();
+
+    assert_eq!(
+        port_sequence, control_sequence,
+        "parent selections must not advance the independent per-port LeastLatency warm-up lane"
+    );
+    assert_contiguous_round_robin(&port_sequence, &["a", "b", "c"]);
 }
 
 #[test]
@@ -557,7 +614,7 @@ fn upstream_round_robin_port_override_random_uses_port_specific_algorithm() {
     );
     let upstream = upstream_with_overrides(
         LoadBalancerAlgorithm::RoundRobin,
-        vec![target("a", 8080), target("b", 8080), target("c", 8080)],
+        vec![target("a", 8080), target("b", 8080), target("c", 9090)],
         port_overrides,
     );
     let config = GatewayConfig {
@@ -592,7 +649,9 @@ fn upstream_round_robin_port_override_random_uses_port_specific_algorithm() {
                 .clone()
         })
         .collect();
-    assert_eq!(parent_sequence, vec!["a", "b", "c"]);
+    // Parent RoundRobin walks a→b→c from the calling shard's phase offset; do
+    // not assert an absolute starting bucket.
+    assert_contiguous_round_robin(&parent_sequence, &["a", "b", "c"]);
 }
 
 #[test]
@@ -1782,8 +1841,9 @@ fn stream_path_engages_per_port_algorithm_when_all_targets_on_one_port() {
         .collect();
 
     // RoundRobin counter is independent of the parent (Random) counter, so
-    // three consecutive calls cycle {a, b, c} in order.
-    assert_eq!(results, vec!["a", "b", "c"]);
+    // three consecutive calls walk {a, b, c} contiguously from the calling
+    // shard's phase offset (absolute start is not stable across threads).
+    assert_contiguous_round_robin(&results, &["a", "b", "c"]);
 }
 
 /// A stream upstream whose targets span multiple ports must NOT engage
@@ -2126,7 +2186,8 @@ fn per_port_consistent_hash_overrides_upstream_round_robin() {
     }
 
     // The upstream-level lane uses RoundRobin and MUST rotate across targets,
-    // proving the two lanes are independent.
+    // proving the two lanes are independent. Absolute starting bucket depends
+    // on the calling thread's selection-counter shard phase.
     let rr: Vec<String> = (0..3)
         .map(|_| {
             LoadBalancerCache::select_target_from(&snapshot, "u1", "rr-key", None)
@@ -2136,8 +2197,7 @@ fn per_port_consistent_hash_overrides_upstream_round_robin() {
                 .clone()
         })
         .collect();
-    // RoundRobin rotates a, b, c in order.
-    assert_eq!(rr, vec!["a", "b", "c"]);
+    assert_contiguous_round_robin(&rr, &["a", "b", "c"]);
 }
 
 #[test]
