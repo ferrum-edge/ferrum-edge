@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   scan:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Check out isolated audit branch
