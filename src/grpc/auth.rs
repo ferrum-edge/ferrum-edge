@@ -128,9 +128,7 @@ impl AudienceRejectReason {
             Self::ReservedAudience => {
                 "Invalid token: audience claim is reserved for another subscription purpose"
             }
-            Self::UnexpectedAudience => {
-                "Invalid token: this surface accepts no audience claim"
-            }
+            Self::UnexpectedAudience => "Invalid token: this surface accepts no audience claim",
         }
     }
 }
@@ -330,8 +328,12 @@ pub(crate) fn verify_grpc_jwt_metadata_with_audience(
     // closed instead of matching on any element.
     validation.validate_aud = false;
 
-    let token_data = decode::<Value>(token, &key, &validation)
-        .map_err(|err| (Status::unauthenticated(format!("Invalid token: {err}")), None))?;
+    let token_data = decode::<Value>(token, &key, &validation).map_err(|err| {
+        (
+            Status::unauthenticated(format!("Invalid token: {err}")),
+            None,
+        )
+    })?;
 
     if let Err(reason) = enforce_audience(&token_data.claims, audience_policy) {
         return Err((
@@ -485,7 +487,10 @@ mod tests {
             parse_audience_claim(&json!({ "aud": ["cluster-b", "cluster-b"] })).expect("dup aud"),
             Some("cluster-b".to_string())
         );
-        assert_eq!(parse_audience_claim(&json!({ "sub": "n" })).expect("absent"), None);
+        assert_eq!(
+            parse_audience_claim(&json!({ "sub": "n" })).expect("absent"),
+            None
+        );
     }
 
     #[test]
@@ -517,9 +522,10 @@ mod tests {
         assert!(enforce_audience(&json!({ "aud": CLUSTER_B_AUD }), policy).is_ok());
         // Cluster C's verifier refuses B's token even with the same secret+issuer.
         assert_eq!(
-            enforce_audience(&json!({ "aud": CLUSTER_B_AUD }), GrpcAudiencePolicy::Required(
-                "ferrum-mesh-discovery:cluster-c"
-            )),
+            enforce_audience(
+                &json!({ "aud": CLUSTER_B_AUD }),
+                GrpcAudiencePolicy::Required("ferrum-mesh-discovery:cluster-c")
+            ),
             Err(AudienceRejectReason::Mismatch)
         );
         assert_eq!(
@@ -527,7 +533,10 @@ mod tests {
             Err(AudienceRejectReason::Missing)
         );
         assert_eq!(
-            enforce_audience(&json!({ "aud": [CLUSTER_B_AUD, "ferrum-mesh-discovery:cluster-c"] }), policy),
+            enforce_audience(
+                &json!({ "aud": [CLUSTER_B_AUD, "ferrum-mesh-discovery:cluster-c"] }),
+                policy
+            ),
             Err(AudienceRejectReason::Ambiguous)
         );
         assert_eq!(
@@ -539,7 +548,10 @@ mod tests {
     #[test]
     fn unconfigured_policy_always_fails_closed() {
         assert_eq!(
-            enforce_audience(&json!({ "aud": CLUSTER_B_AUD }), GrpcAudiencePolicy::Unconfigured),
+            enforce_audience(
+                &json!({ "aud": CLUSTER_B_AUD }),
+                GrpcAudiencePolicy::Unconfigured
+            ),
             Err(AudienceRejectReason::Unconfigured)
         );
         assert_eq!(
@@ -574,6 +586,9 @@ mod tests {
     #[test]
     fn remote_discovery_audience_is_prefixed_and_trimmed() {
         assert_eq!(remote_discovery_audience(" cluster-b "), CLUSTER_B_AUD);
-        assert!(remote_discovery_audience("cluster-b").starts_with(MESH_REMOTE_DISCOVERY_AUDIENCE_PREFIX));
+        assert!(
+            remote_discovery_audience("cluster-b")
+                .starts_with(MESH_REMOTE_DISCOVERY_AUDIENCE_PREFIX)
+        );
     }
 }

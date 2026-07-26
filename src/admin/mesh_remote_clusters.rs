@@ -395,9 +395,8 @@ pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteCluster
                         network: remote.network.clone(),
                         control_plane_configured,
                         federation_endpoint_configured,
-                        discovery_audience: control_plane_configured.then(|| {
-                            crate::grpc::auth::remote_discovery_audience(&remote.name)
-                        }),
+                        discovery_audience: control_plane_configured
+                            .then(|| crate::grpc::auth::remote_discovery_audience(&remote.name)),
                         discovered: discovered_names.contains(remote.name.as_str()),
                         outbound_trust_active: trust_status.outbound_trust_active,
                         inbound_trust_active: trust_status.inbound_trust_active,

@@ -559,8 +559,14 @@ mod audience_binding {
             ("unprefixed", token_with_audience(Some(CLUSTER_B))),
         ];
         let raw_cases: Vec<(&str, String)> = vec![
-            ("empty string", token_with_raw_audience(serde_json::json!(""))),
-            ("empty array", token_with_raw_audience(serde_json::json!([]))),
+            (
+                "empty string",
+                token_with_raw_audience(serde_json::json!("")),
+            ),
+            (
+                "empty array",
+                token_with_raw_audience(serde_json::json!([])),
+            ),
             ("non-string", token_with_raw_audience(serde_json::json!(42))),
             (
                 "non-string array",
