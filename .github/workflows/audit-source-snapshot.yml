@@ -44,6 +44,20 @@ jobs:
             --out tools/audit/generated
           printf '%s\n' "$GITHUB_RUN_ID" > tools/audit/generated/RUN_ID
 
+      - name: Commit report and run ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tools/audit/generated
+          if git diff --cached --quiet; then
+            echo 'Candidate report is unchanged.'
+          else
+            git commit -m 'chore(audit): refresh generated candidate report [skip ci]'
+            git push origin HEAD:audit/launch-readiness-2026-07-26
+          fi
+
       - name: Package exact audited source
         shell: bash
         run: |
@@ -60,17 +74,3 @@ jobs:
           path: /tmp/ferrum-edge-audited-main.tar.gz
           if-no-files-found: error
           retention-days: 1
-
-      - name: Commit report to the isolated audit branch
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add tools/audit/generated
-          if git diff --cached --quiet; then
-            echo 'Candidate report is unchanged.'
-            exit 0
-          fi
-          git commit -m 'chore(audit): refresh generated candidate report [skip ci]'
-          git push origin HEAD:audit/launch-readiness-2026-07-26
