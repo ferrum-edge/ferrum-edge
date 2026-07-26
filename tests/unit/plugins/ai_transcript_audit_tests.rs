@@ -4739,14 +4739,25 @@ async fn indexed_then_indexless_tool_call_fragments_are_reassembled_and_redacted
     let excerpt = records[0]["response_body"]
         .as_str()
         .expect("response excerpt");
-    assert!(excerpt.contains("sse_reassembled"), "got: {excerpt}");
+    assert!(
+        excerpt.contains("sse_reassembled"),
+        "an argument-only indexless continuation of the choice's single tool call is unambiguous: {excerpt}"
+    );
     assert!(excerpt.contains("[REDACTED]"), "got: {excerpt}");
     assert!(!excerpt.contains("secret-"), "got: {excerpt}");
     assert!(!excerpt.contains("value"), "got: {excerpt}");
+    assert!(
+        !excerpt.contains("ambiguous_tool_calls"),
+        "an unambiguous stream must not be flagged: {excerpt}"
+    );
 }
 
+/// A second indexless frame that *opens* a call cannot be positioned, and the
+/// stream must not fall back to raw frames: per-frame redaction would export
+/// `"arguments":"{\"password\":\"HEADFRAG"` verbatim because the fragment
+/// matches no pattern and its sensitive key is in a different frame.
 #[tokio::test]
-async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
+async fn repeated_indexless_tool_call_frames_fail_closed_without_raw_fragments() {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
@@ -4766,7 +4777,7 @@ async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
-    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"first\",\"arguments\":\"{}\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"ambiguous\",\"arguments\":\"{}\"}}]}}]}\n\ndata: [DONE]\n\n";
+    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"password\\\":\\\"HEADFRAG\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_2\",\"type\":\"function\",\"function\":{\"name\":\"other\",\"arguments\":\"TAILFRAG\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
     let _ = inspector.on_chunk(stream).await;
     let _ = inspector.on_end().await;
     plugin
@@ -4777,8 +4788,114 @@ async fn repeated_indexless_tool_call_frames_keep_raw_frame_fallback() {
     let excerpt = records[0]["response_body"]
         .as_str()
         .expect("response excerpt");
-    assert!(!excerpt.contains("sse_reassembled"), "got: {excerpt}");
-    assert!(excerpt.contains("chat.completion.chunk"), "got: {excerpt}");
+    assert!(
+        excerpt.contains("sse_reassembled"),
+        "ambiguity must fail closed inside the reassembled excerpt, not drop to raw frames: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("ambiguous_tool_calls"),
+        "the degraded choice must be visible to the audit consumer: {excerpt}"
+    );
+    assert!(!excerpt.contains("HEADFRAG"), "got: {excerpt}");
+    assert!(!excerpt.contains("TAILFRAG"), "got: {excerpt}");
+    assert!(
+        !excerpt.contains("call_2"),
+        "the unattributable frame must be dropped, not guessed onto a call: {excerpt}"
+    );
+    assert!(
+        excerpt.contains("call_1"),
+        "call structure accumulated before the ambiguity is still useful audit evidence: {excerpt}"
+    );
+}
+
+/// Position cannot pick between two known calls, so an indexless continuation
+/// arriving after them must not be appended to whichever one happens to sit at
+/// slot 0 — that splices two `arguments` documents together and leaves both
+/// unparseable, which disables the sensitive-key policy in
+/// `redact_json_value_strings` for the split credential.
+#[tokio::test]
+async fn indexless_continuation_after_two_indexed_calls_fails_closed() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_0\",\"type\":\"function\",\"function\":{\"name\":\"safe\",\"arguments\":\"{}\"}},{\"index\":1,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"password\\\":\\\"HEADFRAG\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"TAILFRAG\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .await;
+
+    let records = wait_for_records(&server).await;
+    let excerpt = records[0]["response_body"]
+        .as_str()
+        .expect("response excerpt");
+    assert!(excerpt.contains("sse_reassembled"), "got: {excerpt}");
+    assert!(
+        excerpt.contains("ambiguous_tool_calls"),
+        "two known calls make a positional continuation a guess: {excerpt}"
+    );
+    assert!(!excerpt.contains("HEADFRAG"), "got: {excerpt}");
+    assert!(!excerpt.contains("TAILFRAG"), "got: {excerpt}");
+}
+
+/// An index-less entry sharing a frame with an indexed one would take the
+/// positional index of its slot, which can collide with an unrelated call.
+#[tokio::test]
+async fn frame_mixing_indexed_and_indexless_tool_calls_fails_closed() {
+    let server = mock_sink().await;
+    let endpoint = format!("{}/ingest", server.uri());
+    let plugin = AiTranscriptAudit::new(
+        &config_with_sink(
+            &endpoint,
+            json!({ "capture": { "streaming_response": true } }),
+        ),
+        loopback_http_client(),
+    )
+    .unwrap();
+    plugin.start_background_tasks().expect("live start");
+    plugin.commit_background_tasks();
+    let mut ctx = make_ctx();
+    plugin
+        .on_final_request_body_with_context(&mut ctx, &json_headers(), ai_request_body())
+        .await;
+    let mut inspector = plugin
+        .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
+        .expect("inspector");
+    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"password\\\":\\\"HEADFRAG\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":1,\"function\":{\"arguments\":\"MIDFRAG\"}},{\"function\":{\"arguments\":\"TAILFRAG\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
+    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_end().await;
+    plugin
+        .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
+        .await;
+
+    let records = wait_for_records(&server).await;
+    let excerpt = records[0]["response_body"]
+        .as_str()
+        .expect("response excerpt");
+    assert!(excerpt.contains("sse_reassembled"), "got: {excerpt}");
+    assert!(
+        excerpt.contains("ambiguous_tool_calls"),
+        "a mixed indexed/indexless frame is not positionally sound: {excerpt}"
+    );
+    assert!(!excerpt.contains("HEADFRAG"), "got: {excerpt}");
+    assert!(!excerpt.contains("MIDFRAG"), "got: {excerpt}");
+    assert!(!excerpt.contains("TAILFRAG"), "got: {excerpt}");
 }
 
 #[tokio::test]

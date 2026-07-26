@@ -25,7 +25,7 @@
 //! `ai_semantic_firewall`, `ai_response_guard`, and the tool governance in
 //! `ai_semantic_firewall` for enforcement.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -2276,16 +2276,102 @@ struct ReassembledChoice {
     content: String,
     tool_calls: BTreeMap<u64, ReassembledToolCall>,
     finish_reason: Option<String>,
+    /// Set once a `tool_calls` frame for this choice could not be attributed
+    /// without guessing. Attribution never resumes: every later tool-call
+    /// fragment for the choice is dropped and the accumulated arguments are
+    /// exported as `[REDACTED]` (see `reassemble_openai_sse_deltas`).
+    tool_calls_ambiguous: bool,
+}
+
+/// Where a frame's index-less `tool_calls` entries belong.
+///
+/// An explicit `index` is authoritative. Without one, position is the only
+/// signal, and position is unambiguous *within* a frame but not *across* them:
+/// a later frame's slot 0 need not be the same call as an earlier frame's slot
+/// 0. Only two cross-frame placements are forced rather than guessed.
+enum IndexlessPlacement {
+    /// Every entry in this frame carries an explicit `index`.
+    NotNeeded,
+    /// The frame's single index-less entry can only mean this tool index.
+    Target(u64),
+    /// Position cannot identify the call; fail closed for this choice.
+    Ambiguous,
+}
+
+/// Classify a frame's `tool_calls` array for an accumulated choice.
+///
+/// Sound cases:
+/// * a lone entry carrying only `function.arguments` continues the choice's
+///   single known call (it can belong to nothing else), and
+/// * a lone entry that announces a call (`id`/`type`/`function.name`) when the
+///   choice has no known calls yet — it is the first one, index `0`.
+///
+/// Everything else — an index-less continuation with two or more known calls,
+/// an unindexed *new* call alongside existing ones, or a frame mixing indexed
+/// and index-less entries — is ambiguous. Guessing there splices one call's
+/// fragment onto another, which both misattributes the audit record and breaks
+/// the JSON of both `arguments` strings, so the decoded-argument redaction in
+/// `redact_json_value_strings` can no longer apply the sensitive-key policy and
+/// a split credential survives as an unmatched fragment.
+fn classify_indexless_tool_calls(
+    accumulated: &ReassembledChoice,
+    tool_calls: &[Value],
+) -> IndexlessPlacement {
+    let all_indexed = tool_calls
+        .iter()
+        .all(|tool_call| tool_call.get("index").is_some());
+    if all_indexed {
+        return IndexlessPlacement::NotNeeded;
+    }
+    if tool_calls.len() != 1 {
+        return IndexlessPlacement::Ambiguous;
+    }
+    let mut known = accumulated.tool_calls.keys();
+    match (known.next().copied(), known.next()) {
+        // First call of the choice, however it is shaped.
+        (None, _) => IndexlessPlacement::Target(0),
+        // Argument-only continuation of the one call we know about.
+        (Some(only), None) if !announces_new_tool_call(&tool_calls[0]) => {
+            IndexlessPlacement::Target(only)
+        }
+        _ => IndexlessPlacement::Ambiguous,
+    }
+}
+
+fn tool_call_field_present(tool_call: &Value, field: &str) -> bool {
+    tool_call.get(field).is_some_and(|value| !value.is_null())
+}
+
+/// A `tool_calls` entry that opens a new call carries identity fields (`id`,
+/// `type`, or `function.name`); a pure continuation carries only
+/// `function.arguments`.
+fn announces_new_tool_call(tool_call: &Value) -> bool {
+    if tool_call_field_present(tool_call, "id") || tool_call_field_present(tool_call, "type") {
+        return true;
+    }
+    match tool_call.get("function") {
+        Some(function) => tool_call_field_present(function, "name"),
+        None => false,
+    }
 }
 
 /// Reassemble captured OpenAI `chat.completion.chunk` SSE frames by choice.
 /// Text and tool-call fragments are concatenated in frame order, including
 /// fragmented arguments, before the caller applies sensitive-field and pattern
 /// redaction. Uniformly parseable tool-call-only streams use this path too.
+///
+/// A choice whose index-less tool-call frames cannot be attributed
+/// ([`classify_indexless_tool_calls`]) does **not** drop back to the raw-frame
+/// fallback: that fallback redacts each frame in isolation, so a credential
+/// split across two frames survives as two unmatched fragments, and one
+/// throwaway index-less frame would be enough for a provider to force it. The
+/// choice instead fails closed inside the reassembled excerpt — its tool-call
+/// `arguments` become `[REDACTED]` and its key is listed under
+/// `ambiguous_tool_calls` — so the audit record keeps the call structure
+/// (choice, index, id, type, name, finish reason) without exporting fragments.
 fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(raw).ok()?;
     let mut per_choice: BTreeMap<u64, ReassembledChoice> = BTreeMap::new();
-    let mut indexless_tool_call_choices = BTreeSet::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("data:") else {
             continue;
@@ -2323,21 +2409,32 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
             }
             if let Some(tool_calls) = delta.get("tool_calls") {
                 let tool_calls = tool_calls.as_array()?;
-                let has_indexless_call = tool_calls
-                    .iter()
-                    .any(|tool_call| tool_call.get("index").is_none());
-                if has_indexless_call && !indexless_tool_call_choices.insert(index) {
-                    // Position is only an unambiguous fallback within one
-                    // frame. A later indexless frame could continue any prior
-                    // call, so keep the raw-frame redaction path rather than
-                    // joining potentially unrelated tool calls.
-                    return None;
+                if accumulated.tool_calls_ambiguous {
+                    // Attribution for this choice is already unknown, so every
+                    // later fragment is dropped rather than appended somewhere
+                    // plausible.
+                    continue;
                 }
-                for (position, tool_call) in tool_calls.iter().enumerate() {
+                let placement = classify_indexless_tool_calls(accumulated, tool_calls);
+                let indexless_target = match placement {
+                    IndexlessPlacement::NotNeeded => None,
+                    IndexlessPlacement::Target(tool_index) => Some(tool_index),
+                    IndexlessPlacement::Ambiguous => {
+                        accumulated.tool_calls_ambiguous = true;
+                        continue;
+                    }
+                };
+                for tool_call in tool_calls {
                     let tool_call = tool_call.as_object()?;
-                    let tool_index = match tool_call.get("index") {
-                        Some(index) => index.as_u64()?,
-                        None => position as u64,
+                    let tool_index = match (tool_call.get("index"), indexless_target) {
+                        (Some(index), _) => index.as_u64()?,
+                        (None, Some(target)) => target,
+                        // Unreachable: `NotNeeded` means every entry is
+                        // indexed. Fail closed anyway rather than guessing.
+                        (None, None) => {
+                            accumulated.tool_calls_ambiguous = true;
+                            break;
+                        }
                     };
                     let call = accumulated.tool_calls.entry(tool_index).or_default();
                     if let Some(id) = tool_call.get("id")
@@ -2369,17 +2466,20 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
             }
         }
     }
-    if !per_choice
-        .values()
-        .any(|choice| !choice.content.is_empty() || !choice.tool_calls.is_empty())
-    {
+    if !per_choice.values().any(|choice| {
+        !choice.content.is_empty() || !choice.tool_calls.is_empty() || choice.tool_calls_ambiguous
+    }) {
         return None;
     }
     let mut completion_text = serde_json::Map::new();
     let mut response_tool_calls = serde_json::Map::new();
     let mut finish_reasons = serde_json::Map::new();
+    let mut ambiguous_choices = Vec::new();
     for (choice_index, choice) in per_choice {
         let choice_key = choice_index.to_string();
+        if choice.tool_calls_ambiguous {
+            ambiguous_choices.push(Value::String(choice_key.clone()));
+        }
         if !choice.content.is_empty() {
             completion_text.insert(choice_key.clone(), Value::String(choice.content));
         }
@@ -2394,13 +2494,21 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
                 if !call.call_type.is_empty() {
                     call_json.insert("type".to_string(), Value::String(call.call_type));
                 }
-                if !call.name.is_empty() || !call.arguments.is_empty() {
+                // Once attribution is ambiguous the accumulated arguments may
+                // hold the head of a value whose tail was dropped, so the whole
+                // choice's arguments are replaced instead of exported as
+                // fragments no pattern can match.
+                let mut arguments = call.arguments;
+                if choice.tool_calls_ambiguous && !arguments.is_empty() {
+                    arguments = REDACTED_PLACEHOLDER.to_string();
+                }
+                if !call.name.is_empty() || !arguments.is_empty() {
                     let mut function = serde_json::Map::new();
                     if !call.name.is_empty() {
                         function.insert("name".to_string(), Value::String(call.name));
                     }
-                    if !call.arguments.is_empty() {
-                        function.insert("arguments".to_string(), Value::String(call.arguments));
+                    if !arguments.is_empty() {
+                        function.insert("arguments".to_string(), Value::String(arguments));
                     }
                     call_json.insert("function".to_string(), Value::Object(function));
                 }
@@ -2429,6 +2537,12 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     }
     if !finish_reasons.is_empty() {
         annotated.insert("finish_reason".to_string(), Value::Object(finish_reasons));
+    }
+    if !ambiguous_choices.is_empty() {
+        annotated.insert(
+            "ambiguous_tool_calls".to_string(),
+            Value::Array(ambiguous_choices),
+        );
     }
     Some(Value::Object(annotated))
 }
