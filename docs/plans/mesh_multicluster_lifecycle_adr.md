@@ -114,9 +114,11 @@ trust decision. Non-discovery surfaces accept **no** audience at all, preserving
 (`reserved_audience`) distinctly from an unrelated one (`unexpected_audience`).
 
 Every other check is unchanged and still applies first: HS256 signature against
-the per-remote or shared secret, `exp`/`iat`, pinned issuer, `role`, the `ns`
-namespace claim, TLS/production transport posture, and fail-closed per-remote
-credential resolution. A refused subscription fails the whole poll, so the data
+the per-remote or shared secret, required `exp`/`iat`/`sub`/`iss`, pinned
+issuer, the `ns` namespace claim, TLS/production transport posture, and
+fail-closed per-remote credential resolution. (DP tokens still *mint* a
+`role: data_plane` claim for operator/tooling conventions; the CP gRPC
+verifier does not authorize on it.) A refused subscription fails the whole poll, so the data
 plane keeps that cluster's last-good endpoints under the existing
 `FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS` window. Refusals are counted
 as `ferrum_mesh_subscribe_audience_rejections_total{subscription,reason}` with
