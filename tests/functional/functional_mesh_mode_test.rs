@@ -39,6 +39,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 
 use ferrum_edge::config::types::GatewayConfig;
+use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
 use ferrum_edge::grpc::cp_server::DEFAULT_CP_DP_JWT_ISSUER;
 use ferrum_edge::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
 use ferrum_edge::grpc::proto::{ConfigUpdate, MeshConfigUpdate, MeshSubscribeRequest};
@@ -106,6 +107,7 @@ fn verify_mesh_grpc_auth(metadata: &tonic::metadata::MetadataMap) -> Result<(), 
         .map(str::to_string)
         .collect();
     validation.set_issuer(&[DEFAULT_CP_DP_JWT_ISSUER]);
+    validation.set_audience(&[MESH_LOCAL_SUBSCRIBE_AUDIENCE]);
     decode::<Value>(token, &key, &validation)
         .map(|_| ())
         .map_err(|err| Status::unauthenticated(format!("invalid authorization token: {err}")))
