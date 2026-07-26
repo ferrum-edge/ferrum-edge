@@ -1,12 +1,6 @@
 name: Audit source snapshot
 
 on:
-  push:
-    branches:
-      - audit/launch-readiness-2026-07-26
-    paths:
-      - '.github/workflows/audit-source-snapshot.yml'
-      - 'tools/audit/**'
   pull_request:
     branches: [main]
     paths:
@@ -18,7 +12,7 @@ permissions:
 
 jobs:
   snapshot:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 10
     steps:
       - name: Check out exact audited main revision
