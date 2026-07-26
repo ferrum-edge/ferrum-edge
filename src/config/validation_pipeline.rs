@@ -698,13 +698,13 @@ mod tests {
     }
 
     #[test]
-    fn rejecting_runtime_contract_includes_encoded_slashes() {
+    fn rejecting_runtime_contract_includes_non_canonical_listen_paths() {
         let config = GatewayConfig {
             proxies: vec![runtime_proxy("encoded-slash", Some("/api%2Fadmin"), "http")],
             ..Default::default()
         };
 
-        assert_single_rejecting_error(config, "encoded slashes");
+        assert_single_rejecting_error(config, "canonical policy path");
     }
 
     #[test]

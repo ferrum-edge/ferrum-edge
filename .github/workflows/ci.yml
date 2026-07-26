@@ -653,6 +653,7 @@ jobs:
               integration::http2_pool_tests
               integration::http3_integration_tests
               integration::grpc_proxy_tests
+              integration::policy_path_canonicalization_tests
               integration::scripted_backend_smoke_tests
               integration::dtls_integration_tests
               integration::dtls_accept_isolation_tests
@@ -993,6 +994,7 @@ jobs:
               functional_h3_grpc_web_test
               functional_h3_grpc_streaming_test
               functional_request_termination_h3_test
+              functional_policy_path_canonicalization_test
               functional_response_mock_grpc_exclusion_test
               functional_response_mock_semantics_test
               functional_websocket_limits_test

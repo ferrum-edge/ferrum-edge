@@ -84,6 +84,7 @@ mod mesh_telemetry_k8s_provider_lookup_tests;
 mod mesh_telemetry_tracing_tests;
 mod mesh_test_support;
 mod mesh_topology_hbone_tests;
+mod policy_path_canonicalization_tests;
 mod scripted_backend_smoke_tests;
 mod spec_expose_integration_tests;
 mod tcp_fast_path_l4_plugins_tests;

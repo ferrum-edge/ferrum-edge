@@ -1290,6 +1290,46 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // Canonical policy path (advisory GHSA-69xf-42xm-4w4f). Placed at exactly
+    // the same point in the ordering as the HTTP/1.1 + HTTP/2 handler — after
+    // the transport-level checks, before routing, plugins, and backend
+    // dispatch — so all three frontend protocols accept and reject the same
+    // set of request targets. Both the local `path` and `ctx.path` are
+    // rebound: the H3 backend URL builders read the local value while plugins
+    // read the context.
+    // `None` means the target was already canonical, so nothing is rebound and
+    // nothing is allocated — the case for the overwhelming majority of traffic.
+    let canonicalized_path = match crate::policy_path::canonicalize_policy_path(&path) {
+        Ok(std::borrow::Cow::Borrowed(_)) => None,
+        Ok(std::borrow::Cow::Owned(canonical)) => Some(canonical),
+        Err(rejection) => {
+            warn!(
+                reason = rejection.reason(),
+                "Rejected HTTP/3 request: ambiguous percent-encoded request path"
+            );
+            record_h3_flavor_aware_reject(&state, http_flavor, 400);
+            send_h3_error_flavor_aware(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type,
+                StatusCode::BAD_REQUEST,
+                rejection.client_error_body(),
+                crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                rejection.grpc_message(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let path = match canonicalized_path {
+        Some(canonical) => {
+            let raw_path = std::mem::replace(&mut ctx.path, canonical.clone());
+            ctx.set_raw_path_for_hmac(raw_path);
+            canonical
+        }
+        None => path,
+    };
+
     // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
     if method == "TRACE" {
         warn!("Rejected HTTP/3 TRACE request");

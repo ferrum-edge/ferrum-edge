@@ -6560,6 +6560,30 @@ components:
 
             The combination of `(hosts, listen_path)` must be unique across all
             HTTP proxies in the same namespace.
+
+
+            **Must already be a canonical policy path.** Request paths are
+            canonicalized at the frontend boundary before route lookup:
+            percent-escapes of characters that are legal literally in a path are
+            decoded (`/%61dmin` becomes `/admin`) and every other escape is
+            rejected with `400`: encoded separators (`%2F`, `%3F`, `%23`),
+            double encodings (`%25…`), encoded control characters, invalid
+            escapes, and escapes of bytes outside that decode set (`%20`,
+            `%7B`, and any percent-encoded non-ASCII byte). Dot
+            segments and backslashes are rejected in both spellings — literal
+            (`/a/../b`, `/a/./b`, `/a\b`) and encoded (`%2e%2e`, `%5C`) —
+            because the URL parser that builds the backend request line removes
+            dot segments and reads `\` as a separator. A `.` inside a segment
+            (`/v1.0/users`) is an ordinary path character.
+
+
+            A literal `listen_path` containing any of the above is unreachable,
+            and admission rejects it on every create, update, batch, restore,
+            and config-load path. A `~regex` `listen_path` is a pattern rather
+            than a literal path, so only the percent-escape rules apply to it:
+            `\` and `.` are regex syntax there, and `~^/v1\.0/.*` matching the
+            reachable canonical path `/v1.0/x` stays valid. See
+            `docs/request_path_canonicalization.md`.
           examples:
             - /api/v1
             - =/healthz
@@ -17824,11 +17848,25 @@ components:
             path_prefix:
               type: string
               description: >-
-                Only terminate when the request path starts with this prefix.
-                Must start with `/`, or be exactly `*` to match the
+                Only terminate when the canonical request path starts with this
+                prefix. Must start with `/`, or be exactly `*` to match the
                 asterisk-form target of a server-wide `OPTIONS *` request, and
                 contain no control characters; any other value can never match
-                a request path. Mutually exclusive with `header`.
+                a request path. The prefix must also already be a canonical
+                policy path: request paths are canonicalized at the frontend
+                boundary (percent-escapes of characters that are legal
+                literally in a path are decoded, and every other escape —
+                separators, double encodings, control characters, invalid
+                escapes, and escapes of bytes outside that decode set such as
+                `%20` or `%7B` — is rejected with `400`,
+                as are dot segments and backslashes in either spelling). No
+                percent escape, literal `\`, or literal `.`/`..` segment can
+                appear in a canonical path, so a prefix such as `/%61dmin`,
+                `/api%2Fadmin`, `/api%20name`, `/api/../admin`, or
+                `/api\admin` is rejected at admission rather than silently
+                never matching. A `.` inside a segment is fine. See
+                `docs/request_path_canonicalization.md`. Mutually exclusive
+                with `header`.
             header:
               type: string
               description: >-
@@ -18870,7 +18908,7 @@ components:
       type: object
       required: [sink]
       additionalProperties: false
-      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Authenticated /health exposes effective admitted ceilings without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries and orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
+      description: "Plugin: ai_transcript_audit — Controlled AI payload capture for compliance/audit. Priority 2740 runs after authentication/authorization and before request_deduplication (2750); local/Redis replays emit one record with cache.request_deduplication.replayed=true, and priority overrides that reverse the order are rejected. Captures AI request/response bodies (after redaction), keyed HMAC-SHA256 body hashes (keyed with redaction.hash_secret when set, else a per-process random key), model/provider, token metadata, guardrail decisions (including bounded ai_tool_governor.* fields), tool names, and allow-listed cache telemetry (namespaced `ai_semantic_cache.<id>.{cache_status,cache_match,cache_similarity}`, legacy `ai_cache_status` / `ai_cache_match` / `ai_cache_similarity`, and `request_deduplication.replayed`; never `cache_key`), then exports them asynchronously to an HTTPS collector in batches. Capture excerpt limits each have a deployment-safe hard maximum of 1048576 bytes and a cross-field aggregate maximum of 2097152; request-derived model/tool metadata is independently bounded (256/64/128/4096) before staging. Authenticated /health exposes effective admitted ceilings without transcript content. Never blocks or rejects the proxy hot path unless an operator opts into a fail-closed policy (sink.on_buffer_full=reject or sink.on_sink_error=reject); those policies also apply to request-only capture. In-flight staging is hard-bounded at 4096 entries per plugin instance while candidate/record_id markers remain shared across co-located instances: a saturated instance neither erases a peer's live candidate nor borrows it for response buffering, response hooks, sampling/admission, or record emission. The local staging entry is the instance's commit capability and is consumed by atomic removal at buffered or stream-terminal commit. Orphan sweeps are time-gated. Not a security boundary on its own — pair with ai_prompt_shield, ai_semantic_firewall, ai_response_guard, and ai_tool_governor for enforcement. HTTP-only; gRPC capture is future work. Unknown keys are rejected at the root and every fixed nested object (capture, sampling, redaction, custom_patterns items, limits, privacy, sink); sink.custom_headers remains the only intentional free-form string map. Outbound sink header values are literal text plus optional ${secret:NAME} references scoped to the FERRUM_TRANSCRIPT_SINK_SECRET_* env namespace (no generic process-environment interpolation), fully materialized and validated when the background worker activates so a missing/empty/invalid secret fails activation instead of sending unauthenticated. privacy.path_mode governs request-path export; a privacy mode never exports the literal path by default. Nested objects may be omitted or null to keep defaults."
       properties:
         mode:
           type: string
@@ -19054,7 +19092,7 @@ components:
               type: string
               enum: [drop, reject]
               default: drop
-              description: "drop: silently drop when the queue or 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Streaming admission honors sampling plus configured error/guardrail overrides."
+              description: "drop: silently drop when the queue or per-instance 4096-entry staging bound is full (never block). reject: fail selected request-only, buffered, streaming, synthetic, or final-body-fallback audit records with 503 before dispatch/response commit when staging or a queue slot cannot be reserved. Shared candidate markers from co-located peers do not bypass this bound. Streaming admission honors sampling plus configured error/guardrail overrides."
             on_sink_error:
               type: string
               enum: [warn, reject]

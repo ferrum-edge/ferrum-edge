@@ -3081,10 +3081,24 @@ fn make_cache_key(host: Option<&str>, path: &str) -> String {
 /// matching and auth policies. Returns the input unchanged (zero allocation)
 /// when no encoded slashes are present.
 ///
-/// Paired with `contains_encoded_slash` in `src/config/types.rs`, which
-/// rejects the same encodings in configured `listen_path` values so that
-/// admission and runtime lookup share the same canonical alphabet. The two
-/// functions must be extended together if additional encodings are added.
+/// # Superseded at the frontend boundary
+///
+/// Since the canonical-policy-path fix for advisory `GHSA-69xf-42xm-4w4f`,
+/// every HTTP/1.1, HTTP/2, and HTTP/3 request target is run through
+/// [`crate::policy_path::canonicalize_policy_path`] before it reaches routing,
+/// and an encoded separator is *rejected* there rather than folded here.
+/// Folding changes a path's segment structure, so a folded route decision
+/// could still disagree with a backend that does not decode; rejecting cannot.
+/// This function is therefore the identity on any request path the router now
+/// sees, and is retained only as a defense-in-depth residual for callers that
+/// do not enter through that boundary (mesh authz normalization, listen-path
+/// stripping in the backend-URL builders). It is not a second normalization
+/// model — do not extend it, extend `src/policy_path.rs`.
+///
+/// Configured `listen_path` values are admitted by
+/// `non_canonical_listen_path_reason` in `src/config/types.rs`, which
+/// delegates to the same canonicalizer so admission and runtime lookup share
+/// one alphabet.
 ///
 /// Also used by the backend-URL builders (`build_backend_url_with_target` /
 /// `build_websocket_backend_url_with_target`) to strip the listen-path prefix

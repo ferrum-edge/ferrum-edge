@@ -175,7 +175,7 @@ Any plugin can short-circuit the pipeline by returning a `Reject` result. For ex
 route/header-shaping `before_proxy` hooks and load balancing, but before
 circuit-breaker or backend dispatch. The gateway assembles the same path
 segments used by the backend URL builder, including regex/exact/prefix match
-length, encoded-slash normalization, `strip_listen_path`, `backend_path`, and
+length, the canonical policy path, `strip_listen_path`, `backend_path`, and
 the selected target's path. `grpc_method_router` uses this phase so
 allow/deny/rate policy and `grpc_*` metadata describe the method placed on the
 backend wire. The selected target remains pinned across deferred external hooks,

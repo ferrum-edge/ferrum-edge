@@ -64,6 +64,38 @@ type HmacSha512 = Hmac<Sha512>;
 const HMAC_REQUEST_BODY_LIMIT_BYTES: usize = 10 * 1024 * 1024;
 const HMAC_SIGNING_VERSION: &str = "ferrum-hmac-v1";
 
+#[derive(Clone)]
+pub(super) struct HmacWirePath(String);
+
+impl HmacWirePath {
+    pub(super) fn new(path: String) -> Self {
+        Self(path)
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl fmt::Debug for HmacWirePath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("HmacWirePath([REDACTED])")
+    }
+}
+
+/// The request-target spelling covered by the client's HMAC.
+///
+/// The wrapper's contents and this accessor are private to `hmac_auth`, making
+/// this the only place that can recover a pre-canonicalization spelling. Every
+/// policy and routing consumer remains confined to `RequestContext::path`.
+#[inline]
+fn hmac_wire_path(ctx: &RequestContext) -> &str {
+    ctx.raw_path
+        .as_ref()
+        .map(HmacWirePath::as_str)
+        .unwrap_or(ctx.path.as_str())
+}
+
 struct ParsedHmacAuthorization {
     username: String,
     algorithm: String,
@@ -524,7 +556,7 @@ impl HmacAuth {
                 .map(|proxy| proxy.namespace.as_str())
                 != Some(cached.namespace.as_str())
             || ctx.method != cached.method
-            || ctx.path != cached.path
+            || hmac_wire_path(ctx) != cached.path
             || ctx.raw_query_string().unwrap_or_default() != cached.query
             || ctx.headers.get("date").map_or("", String::as_str) != cached.date
             || Self::digest_header_ref(ctx) != Some(cached.digest_header.as_str())
@@ -708,10 +740,16 @@ impl AuthMechanism for HmacAuth {
             signature,
             date: ctx.headers.get("date").cloned().unwrap_or_default(),
             method: ctx.method.clone(),
-            path: ctx.path.clone(),
+            // The client signs the request target it put on the wire, so the
+            // signing string must use the raw path, not the canonical policy
+            // path: a canonicalized `/%61dmin` -> `/admin` would never verify.
+            // Raw bytes are an input to signature verification only and never
+            // reach routing or any policy surface, both of which already ran
+            // on the canonical path (advisory GHSA-69xf-42xm-4w4f).
+            path: hmac_wire_path(ctx).to_string(),
             // Bind the raw query string (verbatim, as received) so query
-            // parameters are covered by the HMAC. `ctx.path` is the path
-            // component only, so without this an attacker could replay a
+            // parameters are covered by the HMAC. The path field above is the
+            // path component only, so without this an attacker could replay a
             // captured signed request with altered/added query parameters.
             query: ctx.raw_query_string().unwrap_or_default().to_string(),
             digest_header,

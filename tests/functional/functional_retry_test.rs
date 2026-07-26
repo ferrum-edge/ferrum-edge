@@ -18,6 +18,8 @@
 //!   enabled.
 //! * A retriable HTTP status can recover within one request (`503 -> 200`)
 //!   and the backend observes exactly two attempts.
+//! * A streamed response (`text/event-stream`) that succeeds on a NON-final
+//!   retry attempt is still streamed rather than collected (issue #2949).
 //!
 //! Run with:
 //!
@@ -1269,4 +1271,194 @@ async fn retry_rotation_across_mixed_capability_targets_recomputes_dispatch() {
          got {a_tcp_hits}. Without this, the initial dispatch never actually went \
          to A — the test is meaningless because the recompute path wasn't exercised."
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Test 8 — A streamed response that succeeds on a NON-FINAL retry attempt is
+// still streamed (issue #2949).
+// ────────────────────────────────────────────────────────────────────────────
+//
+// Before the fix the retry loop passed `should_stream && is_last_attempt`, so
+// only the last possible attempt preserved the caller's streaming decision.
+// A backend that answers 503 once (deploy blip) and then serves a healthy
+// `text/event-stream` on attempt 1 of `max_retries: 2` was routed through the
+// buffered arm, which has no SSE exemption: the gateway collected the whole
+// event stream before releasing a byte, so the client saw nothing until the
+// backend closed (or, in production, until `backend_read_timeout_ms` or the
+// response cap turned a healthy stream into a 502).
+//
+// Fixture: connection 0 → 503, connection 1 → SSE that emits one event
+// immediately, holds the stream open for `MID_STREAM_PAUSE`, then emits a
+// second event and closes. `max_retries: 2` keeps the successful attempt
+// strictly before the last possible one.
+//
+// Assertions:
+//   * the first SSE event reaches the client well before the backend's
+//     mid-stream pause elapses (proving header-time release, not collection),
+//   * the terminal event is NOT already present in that first chunk,
+//   * the backend saw exactly two attempts.
+
+/// File-mode YAML for one plain HTTP proxy that streams responses and never
+/// times out mid-stream. No plugins: the buffer→stream refinement cannot
+/// rescue this shape (`retry_ctx` is `None` with no buffering plugin), so the
+/// attempt-positional streaming decision is the only thing under test.
+fn sse_retry_stream_config(port: u16, max_retries: u32) -> String {
+    let config = json!({
+        "version": "1",
+        "proxies": [{
+            "id": "retry-sse-stream",
+            "listen_path": "/api",
+            "backend_scheme": "http",
+            "backend_host": "127.0.0.1",
+            "backend_port": port,
+            "strip_listen_path": true,
+            "response_body_mode": "stream",
+            "backend_connect_timeout_ms": 2000,
+            // The SSE fixture deliberately holds the response open between
+            // events. Zero disables the backend read timeout for this test.
+            "backend_read_timeout_ms": 0,
+            "backend_write_timeout_ms": 5000,
+            "retry": {
+                "max_retries": max_retries,
+                "retryable_status_codes": [503],
+                "retryable_methods": ["GET"],
+                "retry_on_connect_failure": false,
+            },
+        }],
+        "consumers": [],
+        "upstreams": [],
+        "plugin_configs": [],
+    });
+    serde_yaml::to_string(&config).expect("yaml serialize")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn retry_streams_sse_that_succeeds_before_the_final_attempt() {
+    const EVENT_ONE: &str = "data: {\"part\":1}\n\n";
+    const EVENT_TWO: &str = "data: {\"part\":2}\n\n";
+    const MID_STREAM_PAUSE: Duration = Duration::from_secs(5);
+    const FIRST_EVENT_DEADLINE: Duration = Duration::from_millis(2500);
+
+    let reservation = reserve_port().await.expect("reserve backend port");
+    let backend_port = reservation.port;
+
+    let backend = ScriptedHttp1Backend::builder(reservation.into_listener())
+        .connection_scripts([
+            // Attempt 0 — retryable 503.
+            vec![
+                HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/events")),
+                HttpStep::RespondStatus {
+                    status: 503,
+                    reason: "Service Unavailable".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Content-Length".into(),
+                    value: "5".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Connection".into(),
+                    value: "close".into(),
+                },
+                HttpStep::RespondBodyChunk(b"retry".to_vec()),
+                HttpStep::RespondBodyEnd,
+            ],
+            // Attempt 1 — healthy SSE, and NOT the last possible attempt
+            // (`max_retries: 2`).
+            vec![
+                HttpStep::ExpectRequest(RequestMatcher::method_path("GET", "/events")),
+                HttpStep::RespondStatus {
+                    status: 200,
+                    reason: "OK".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Content-Type".into(),
+                    value: "text/event-stream".into(),
+                },
+                HttpStep::RespondHeader {
+                    name: "Connection".into(),
+                    value: "close".into(),
+                },
+                HttpStep::RespondBodyChunk(EVENT_ONE.as_bytes().to_vec()),
+                HttpStep::Sleep(MID_STREAM_PAUSE),
+                HttpStep::RespondBodyChunk(EVENT_TWO.as_bytes().to_vec()),
+                HttpStep::RespondBodyEnd,
+            ],
+        ])
+        .spawn()
+        .expect("spawn backend");
+
+    let harness = GatewayHarness::builder()
+        // Keep the scripted backend cold: binary-mode startup performs an
+        // independent capability probe that would be counted as a request.
+        .mode_in_process()
+        .file_config(sse_retry_stream_config(backend_port, 2))
+        .pool_warmup_enabled(false)
+        .spawn()
+        .await
+        .expect("spawn gateway");
+    let client = harness.http_client().expect("client");
+
+    let started = std::time::Instant::now();
+    let (mut sse_response, first_chunk) = tokio::time::timeout(FIRST_EVENT_DEADLINE, async {
+        let mut response = client
+            .request(reqwest::Method::GET, &harness.proxy_url("/api/events"))
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .expect("gateway returns SSE response headers");
+        let first_chunk = response
+            .chunk()
+            .await
+            .expect("read first SSE chunk")
+            .expect("stream must not end before the first event");
+        (response, first_chunk)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "first SSE event did not arrive within {FIRST_EVENT_DEADLINE:?} \
+             (elapsed {:?}) — the retry loop buffered a stream that succeeded \
+             before the final attempt (issue #2949)",
+            started.elapsed()
+        )
+    });
+
+    assert_eq!(sse_response.status().as_u16(), 200);
+    assert_eq!(
+        sse_response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+
+    let mut sse_body = String::from_utf8_lossy(&first_chunk).into_owned();
+    assert!(
+        sse_body.contains("\"part\":1"),
+        "first chunk must carry the first event; body={sse_body:?}"
+    );
+    assert!(
+        !sse_body.contains("\"part\":2"),
+        "terminal event arrived with the first chunk, indicating the retry \
+         attempt collected the whole stream"
+    );
+
+    tokio::time::timeout(MID_STREAM_PAUSE + Duration::from_secs(5), async {
+        while let Some(chunk) = sse_response.chunk().await.expect("read SSE chunk") {
+            sse_body.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await
+    .expect("SSE stream finishes after the backend closes");
+    assert!(sse_body.contains("\"part\":2"));
+
+    let requests = backend.received_requests().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "503 -> SSE recovery must make exactly two backend attempts; requests={requests:?}"
+    );
+    backend.assert_no_matcher_mismatches().await;
+    backend.assert_no_step_errors().await;
 }

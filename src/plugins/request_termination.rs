@@ -242,6 +242,19 @@ fn parse_trigger(config: &Map<String, Value>) -> Result<Trigger, String> {
                     .to_string(),
             );
         }
+        // `ctx.path` is the canonical policy path, so the prefix must be
+        // written in that same alphabet or it can never fire. `/%61dmin` is
+        // not a stricter spelling of `/admin` — it is a rule that matches
+        // nothing, which is the silent-bypass shape this canonicalization
+        // exists to remove (advisory GHSA-69xf-42xm-4w4f). The asterisk-form
+        // target has no escapes and passes through unchanged.
+        if let Some(reason) = crate::policy_path::non_canonical_policy_path_reason(path) {
+            return Err(format!(
+                "request_termination: 'trigger.path_prefix' must already be a canonical policy \
+                 path ({reason}); request paths are canonicalized before plugins run, so a \
+                 non-canonical prefix can never match"
+            ));
+        }
         return Ok(Trigger::PathPrefix(path.to_string()));
     }
 

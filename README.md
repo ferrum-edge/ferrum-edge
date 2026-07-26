@@ -508,6 +508,7 @@ Ferrum also **won the E2E TLS /api/users test outright** — 29,808 req/s, the h
 | Database TLS | [docs/database_tls.md](docs/database_tls.md) |
 | DNS resolver | [docs/dns_resolver.md](docs/dns_resolver.md) |
 | Routing | [docs/routing.md](docs/routing.md) |
+| Request path canonicalization | [docs/request_path_canonicalization.md](docs/request_path_canonicalization.md) |
 | Retry logic | [docs/retry.md](docs/retry.md) |
 | Response streaming | [docs/response_body_streaming.md](docs/response_body_streaming.md) |
 | Plugin execution order | [docs/plugin_execution_order.md](docs/plugin_execution_order.md) |
