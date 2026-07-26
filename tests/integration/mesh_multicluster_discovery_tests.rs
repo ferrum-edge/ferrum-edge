@@ -331,9 +331,7 @@ mod audience_binding {
 
     use arc_swap::ArcSwap;
     use ferrum_edge::config::types::GatewayConfig;
-    use ferrum_edge::grpc::auth::{
-        MESH_LOCAL_SUBSCRIBE_AUDIENCE, remote_discovery_audience,
-    };
+    use ferrum_edge::grpc::auth::{MESH_LOCAL_SUBSCRIBE_AUDIENCE, remote_discovery_audience};
     use ferrum_edge::grpc::dp_client::{GrpcJwtSecret, generate_dp_jwt_full};
     use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
     use ferrum_edge::grpc::proto::MeshSubscribeRequest;

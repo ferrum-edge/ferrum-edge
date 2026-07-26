@@ -617,10 +617,7 @@ mod tests {
             Err(AudienceRejectReason::ReservedAudience)
         );
         assert_eq!(
-            enforce_audience(
-                &json!({ "aud": MESH_LOCAL_SUBSCRIBE_AUDIENCE }),
-                policy
-            ),
+            enforce_audience(&json!({ "aud": MESH_LOCAL_SUBSCRIBE_AUDIENCE }), policy),
             Err(AudienceRejectReason::ReservedAudience)
         );
         // Malformed shapes still fail closed on this policy.
