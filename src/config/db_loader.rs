@@ -3232,6 +3232,9 @@ impl DatabaseStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Any>,
         namespace: &str,
     ) -> Result<(), anyhow::Error> {
+        // Every selected orphan must decode. Silently dropping a row on
+        // try_get failure would commit the parent mutation while retaining the
+        // orphan and omitting its delete change record (issue #3221).
         let orphaned_configs: Vec<(String, String)> = sqlx::query(&self.q(
             "SELECT pc.id, pc.namespace FROM plugin_configs pc \
                  WHERE pc.scope = 'proxy_group' AND pc.namespace = ? \
@@ -3241,13 +3244,20 @@ impl DatabaseStore {
         .fetch_all(&mut **tx)
         .await?
         .iter()
-        .filter_map(|row| {
-            Some((
-                row.try_get::<String, _>("id").ok()?,
-                row.try_get::<String, _>("namespace").ok()?,
-            ))
+        .map(|row| {
+            let id = row.try_get::<String, _>("id").map_err(|e| {
+                anyhow::Error::from(e).context(
+                    "operation=cleanup_orphaned_proxy_group_plugins resource=plugin_configs column=id: failed to decode orphaned proxy_group plugin row",
+                )
+            })?;
+            let namespace = row.try_get::<String, _>("namespace").map_err(|e| {
+                anyhow::Error::from(e).context(
+                    "operation=cleanup_orphaned_proxy_group_plugins resource=plugin_configs column=namespace: failed to decode orphaned proxy_group plugin row",
+                )
+            })?;
+            Ok::<_, anyhow::Error>((id, namespace))
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
         for (id, namespace) in &orphaned_configs {
             info!("Cascade-deleting orphaned proxy_group plugin config {}", id);
@@ -3713,6 +3723,10 @@ impl DatabaseStore {
             return Ok(false);
         }
 
+        // Every association row required for proxy invalidation must decode
+        // before destructive mutation. Silently dropping a row on try_get
+        // failure would delete the plugin while omitting proxies.updated_at
+        // bumps and proxy config_change upserts (issue #3209).
         let affected_proxy_rows: Vec<AnyRow> =
             sqlx::query(&self.q("SELECT proxy_id FROM proxy_plugins WHERE plugin_config_id = ?"))
                 .bind(id)
@@ -3720,8 +3734,14 @@ impl DatabaseStore {
                 .await?;
         let affected_proxy_ids: Vec<String> = affected_proxy_rows
             .iter()
-            .filter_map(|row| row.try_get::<String, _>("proxy_id").ok())
-            .collect();
+            .map(|row| {
+                row.try_get::<String, _>("proxy_id").map_err(|e| {
+                    anyhow::Error::from(e).context(
+                        "operation=delete_plugin_config resource=proxy_plugins column=proxy_id: failed to decode association row required for proxy invalidation",
+                    )
+                })
+            })
+            .collect::<Result<_, _>>()?;
 
         // Clean up junction table (defense in depth alongside ON DELETE CASCADE)
         sqlx::query(&self.q("DELETE FROM proxy_plugins WHERE plugin_config_id = ?"))

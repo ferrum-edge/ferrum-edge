@@ -31,6 +31,7 @@ mod cp_grpc_handshake_admission_tests;
 mod cp_multi_namespace_tests;
 mod db_full_load_snapshot_tests;
 mod db_incremental_poll_tests;
+mod db_mutation_decode_fail_closed_tests;
 mod db_offline_bootstrap_tests;
 mod db_proxy_plugin_association_fail_closed_tests;
 mod db_row_decode_rejection_tests;
