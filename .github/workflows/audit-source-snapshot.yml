@@ -1,6 +1,12 @@
 name: Audit launch-readiness candidates
 
 on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize]
+    paths:
+      - '.github/workflows/audit-source-snapshot.yml'
+      - 'tools/audit/scan_repo.py'
   push:
     branches:
       - audit/launch-readiness-2026-07-26
@@ -45,6 +51,7 @@ jobs:
           printf '%s\n' "$GITHUB_RUN_ID" > tools/audit/generated/RUN_ID
 
       - name: Commit report and run ID
+        if: github.event_name == 'push'
         shell: bash
         run: |
           set -euo pipefail
