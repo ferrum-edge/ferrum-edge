@@ -9,6 +9,7 @@
 //! at compile time (see `build.rs`).
 
 pub mod auth;
+pub mod configsync_lifecycle;
 pub mod cp_server;
 pub mod dp_client;
 pub mod mesh_registry;

@@ -1,20 +1,23 @@
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use ferrum_edge::plugins::api_chargeback_sink::{
     ApiChargebackSink, ApiChargebackSinkConfig, ChargeEvent, SnapshotAccumulator, SpoolCompression,
-    SpoolManager, SpoolSettings, classify_clickhouse_acknowledgement_for_tests,
-    classify_clickhouse_http_status_for_tests, clickhouse_insert_url_for_tests,
-    decode_spool_file_for_tests, encode_spool_bytes_for_tests, new_ulid, render_prometheus,
-    render_status_json, replay_spool_once_for_tests, replay_spool_once_with_batch_size_for_tests,
-    serialize_json_each_row, write_private_file_atomically_for_tests,
+    SpoolManager, SpoolSettings, SpoolWriteHookPoint,
+    classify_clickhouse_acknowledgement_for_tests, classify_clickhouse_http_status_for_tests,
+    clickhouse_insert_url_for_tests, decode_spool_file_for_tests, encode_spool_bytes_for_tests,
+    new_ulid, render_prometheus, render_status_json, replay_spool_once_for_tests,
+    replay_spool_once_with_batch_size_for_tests, serialize_json_each_row,
+    set_spool_write_hook_for_tests, write_private_file_atomically_for_tests,
 };
 use ferrum_edge::plugins::chargeback::pricing::{ChargeComputation, MAX_UNIT_PRICE, PricingConfig};
-use ferrum_edge::plugins::{Plugin, PluginHttpClient, TransactionSummary, WsDisconnectContext};
+use ferrum_edge::plugins::{
+    Plugin, PluginHttpClient, REQUEST_ID_METADATA_KEY, TransactionSummary, WsDisconnectContext,
+};
 use serde_json::{Value, json};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -2755,6 +2758,317 @@ async fn config_validation_rejects_buffer_max_bytes_and_spool_delivery_queue() {
     ok["spool"]["delivery_queue_capacity"] = json!(128);
     ApiChargebackSink::new(&ok, PluginHttpClient::default(), "ferrum")
         .expect("valid byte-budget and delivery queue knobs must admit");
+}
+
+fn billable_summary(request_id: &str) -> TransactionSummary {
+    let mut summary = TransactionSummary {
+        namespace: "ferrum".to_string(),
+        consumer_username: Some("alice".to_string()),
+        proxy_id: Some("proxy-a".to_string()),
+        proxy_name: Some("Payments".to_string()),
+        response_status_code: 200,
+        bytes_sent: 100,
+        bytes_received: 200,
+        ..TransactionSummary::default()
+    };
+    summary
+        .metadata
+        .insert(REQUEST_ID_METADATA_KEY.to_string(), request_id.to_string());
+    summary
+}
+
+fn spool_delivery_totals() -> (u64, u64, u64) {
+    let prom = render_prometheus();
+    (
+        prometheus_counter(&prom, "chargeback_sink_spool_jobs_enqueued_total"),
+        prometheus_counter(&prom, "chargeback_sink_spool_jobs_written_total"),
+        prometheus_counter(&prom, "chargeback_sink_spool_jobs_lost_total"),
+    )
+}
+
+fn prometheus_counter(prom: &str, name: &str) -> u64 {
+    let prefix = format!("{name} ");
+    prom.lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix(&prefix)?;
+            if rest.starts_with('{') {
+                return None;
+            }
+            rest.split_whitespace().next()?.parse().ok()
+        })
+        .unwrap_or(0)
+}
+
+async fn wait_condvar_flag(flag: Arc<(Mutex<bool>, Condvar)>) {
+    tokio::task::spawn_blocking(move || {
+        let (lock, cv) = &*flag;
+        let mut guard = lock.lock().expect("condvar flag lock");
+        while !*guard {
+            guard = cv.wait(guard).expect("condvar flag wait");
+        }
+    })
+    .await
+    .expect("condvar flag wait task");
+}
+
+/// Accepts ClickHouse export connections and holds them open so the batching
+/// flush worker stays inside `send_batch` (and therefore cannot drain the
+/// capacity-1 mpsc). Dropping/releasing closes the sockets so in-flight HTTP
+/// fails promptly instead of waiting out a mock delay or client timeout.
+struct HeldClickHouseExport {
+    url: String,
+    first_accept: Arc<(Mutex<bool>, Condvar)>,
+    release: Option<tokio::sync::oneshot::Sender<()>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl HeldClickHouseExport {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind held clickhouse listener");
+        let addr = listener
+            .local_addr()
+            .expect("held clickhouse listener addr");
+        let first_accept = Arc::new((Mutex::new(false), Condvar::new()));
+        let first_accept_for_task = Arc::clone(&first_accept);
+        let (release_tx, mut release_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = &mut release_rx => break,
+                    accepted = listener.accept() => {
+                        match accepted {
+                            Ok((stream, _)) => {
+                                {
+                                    let (lock, cv) = &*first_accept_for_task;
+                                    if let Ok(mut guard) = lock.lock() {
+                                        *guard = true;
+                                        cv.notify_all();
+                                    }
+                                }
+                                held.push(stream);
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+            }
+            drop(held);
+        });
+        Self {
+            url: format!("http://{addr}"),
+            first_accept,
+            release: Some(release_tx),
+            _task: task,
+        }
+    }
+
+    fn release_held_connections(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+impl Drop for HeldClickHouseExport {
+    fn drop(&mut self) {
+        self.release_held_connections();
+    }
+}
+
+/// Clears the process-global spool write hook and opens any held release gate
+/// even if the test panics mid-block.
+struct ClearSpoolWriteHookOnDrop {
+    release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Drop for ClearSpoolWriteHookOnDrop {
+    fn drop(&mut self) {
+        {
+            let (lock, cv) = &*self.release;
+            if let Ok(mut guard) = lock.lock() {
+                *guard = true;
+                cv.notify_all();
+            }
+        }
+        set_spool_write_hook_for_tests(None);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial_test::serial(api_chargeback_sink_active_sink)]
+async fn logging_hook_returns_while_spool_write_is_deliberately_blocked() {
+    // A long flush interval alone does not keep the capacity-1 mpsc occupied:
+    // the flush worker drains into its local buffer immediately. Occupy the
+    // worker instead by holding the export TCP connection open (batch size 1),
+    // then release those sockets on teardown so HTTP fails promptly.
+    let mut held_export = HeldClickHouseExport::start().await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = valid_config(temp.path());
+    config["clickhouse"]["url"] = json!(held_export.url);
+    // Bound any stranded request, but teardown releases sockets so we do not
+    // wait this out on the success path.
+    config["clickhouse"]["timeout_ms"] = json!(60_000);
+    config["batch"]["size"] = json!(1);
+    // Use the maximum admitted interval; the held export socket, not this
+    // timer, is what deterministically occupies the flush worker.
+    config["batch"]["flush_interval_ms"] = json!(600_000);
+    config["batch"]["buffer_capacity"] = json!(1);
+    config["retry"]["max_attempts"] = json!(1);
+    config["spool"]["delivery_queue_capacity"] = json!(8);
+    config["spool"]["replay_interval_secs"] = json!(3600);
+
+    let entered = Arc::new((Mutex::new(false), Condvar::new()));
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let finished = Arc::new((Mutex::new(false), Condvar::new()));
+    let _clear_hook = ClearSpoolWriteHookOnDrop {
+        release: Arc::clone(&release),
+    };
+    let block_first = Arc::new(AtomicBool::new(true));
+
+    let entered_for_hook = Arc::clone(&entered);
+    let release_for_hook = Arc::clone(&release);
+    let finished_for_hook = Arc::clone(&finished);
+    set_spool_write_hook_for_tests(Some(Arc::new(move |point| match point {
+        SpoolWriteHookPoint::BeforeWrite => {
+            if block_first.swap(false, Ordering::SeqCst) {
+                {
+                    let (lock, cv) = &*entered_for_hook;
+                    let mut guard = lock.lock().expect("entered gate lock");
+                    *guard = true;
+                    cv.notify_all();
+                }
+                let (lock, cv) = &*release_for_hook;
+                let mut guard = lock.lock().expect("release gate lock");
+                while !*guard {
+                    guard = cv.wait(guard).expect("release gate wait");
+                }
+            }
+        }
+        SpoolWriteHookPoint::AfterWrite => {
+            let (lock, cv) = &*finished_for_hook;
+            let mut guard = lock.lock().expect("finished gate lock");
+            *guard = true;
+            cv.notify_all();
+        }
+    })));
+
+    let (enqueued_baseline, written_baseline, lost_baseline) = spool_delivery_totals();
+
+    let plugin =
+        Arc::new(ApiChargebackSink::new(&config, PluginHttpClient::default(), "ferrum").unwrap());
+    plugin.start_background_tasks().expect("chargeback start");
+    plugin.commit_background_tasks();
+
+    // batch.size=1: the first log starts an export that parks on the held TCP
+    // socket, so the flush worker cannot recv from the capacity-1 channel.
+    plugin.log(&billable_summary("block-flush")).await;
+    wait_condvar_flag(Arc::clone(&held_export.first_accept)).await;
+
+    // Occupy the only channel slot while the flush worker remains inside HTTP.
+    plugin.log(&billable_summary("fill-queue")).await;
+    // High-water overflow (depth=1, capacity=1, watermark=80%) hands the event
+    // to the bounded spool delivery worker, which blocks in write_events.
+    plugin.log(&billable_summary("overflow-blocked")).await;
+
+    wait_condvar_flag(Arc::clone(&entered)).await;
+
+    let (enqueued_while_blocked, written_while_blocked, lost_while_blocked) =
+        spool_delivery_totals();
+    assert!(
+        enqueued_while_blocked > enqueued_baseline,
+        "overflow must enqueue a spool job before the blocking write finishes; baseline={enqueued_baseline} observed={enqueued_while_blocked}"
+    );
+    assert_eq!(
+        written_while_blocked, written_baseline,
+        "no spool write may complete while the injected gate is held"
+    );
+    assert_eq!(
+        lost_while_blocked, lost_baseline,
+        "a blocked write must not be counted as a spool loss"
+    );
+
+    // While spool I/O remains blocked, another logging overflow must return
+    // after a non-blocking try_enqueue (second job waits behind the first).
+    let plugin_for_bounded_log = Arc::clone(&plugin);
+    let bounded_log = tokio::spawn(async move {
+        plugin_for_bounded_log
+            .log(&billable_summary("overflow-while-blocked"))
+            .await;
+    });
+    tokio::time::timeout(Duration::from_secs(1), bounded_log)
+        .await
+        .expect("logging hook must return without waiting for blocked spool I/O")
+        .expect("bounded logging task must not panic");
+
+    let (enqueued_after_hook, written_after_hook, lost_after_hook) = spool_delivery_totals();
+    assert!(
+        enqueued_after_hook > enqueued_while_blocked,
+        "logging hook must enqueue while the prior spool write is still blocked"
+    );
+    assert_eq!(
+        written_after_hook, written_baseline,
+        "logging hook return must not wait for the blocked spool write"
+    );
+    assert_eq!(
+        lost_after_hook, lost_baseline,
+        "bounded overflow enqueue must not drop while the delivery queue has capacity"
+    );
+    assert!(
+        !*finished.0.lock().expect("finished gate lock"),
+        "blocked spool write must not finish before release"
+    );
+
+    let enqueued_during_gate = enqueued_after_hook - enqueued_baseline;
+
+    {
+        let (lock, cv) = &*release;
+        let mut guard = lock.lock().expect("release gate lock");
+        *guard = true;
+        cv.notify_all();
+    }
+
+    wait_condvar_flag(Arc::clone(&finished)).await;
+
+    // AfterWrite runs inside write_events; the delivery worker publishes
+    // jobs_written only after spawn_blocking joins. Yield until our gated
+    // jobs land without sleeping on the wall clock.
+    let (enqueued_final, written_final, lost_final) = {
+        let mut observed = spool_delivery_totals();
+        for _ in 0..100_000 {
+            if observed.1 >= written_baseline + enqueued_during_gate {
+                break;
+            }
+            assert_eq!(
+                observed.2, lost_baseline,
+                "successful gated writes must not increment spool loss counters"
+            );
+            tokio::task::yield_now().await;
+            observed = spool_delivery_totals();
+        }
+        observed
+    };
+    assert!(
+        written_final >= written_baseline + enqueued_during_gate,
+        "released spool writes must complete cleanly; enqueued_delta={enqueued_during_gate} written_baseline={written_baseline} written_final={written_final} lost_final={lost_final} enqueued_final={enqueued_final}"
+    );
+    assert_eq!(
+        lost_final, lost_baseline,
+        "successful gated writes must not increment spool loss counters"
+    );
+    assert!(
+        disk_owned_bytes(temp.path()) > 0,
+        "released spool write must leave durable owned spool bytes"
+    );
+
+    // Unblock the stranded export before dropping the plugin so teardown cannot
+    // sit on the client timeout.
+    held_export.release_held_connections();
+    set_spool_write_hook_for_tests(None);
+    drop(plugin);
 }
 
 #[test]

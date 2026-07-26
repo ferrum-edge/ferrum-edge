@@ -1985,6 +1985,14 @@ impl RemoteServiceSource for MissingSecretSource {
 
 /// One-shot remote MeshSubscribe: connect, read the first non-heartbeat slice,
 /// return its workloads/services. Bounded by `request_timeout`.
+///
+/// The response is validated against the exact subscription request through the
+/// SAME centralized rules the local native consumer applies
+/// (`config_consumer::update_validation`) — present + compatible
+/// `ferrum_version`, envelope/slice version agreement, and node/namespace/scope
+/// binding — before any endpoint is imported. Any rejection fails the whole
+/// poll, so `remote_discovery_loop` keeps the cluster's last-good endpoints,
+/// backs off, and never installs wrong-cluster or wrong-namespace endpoints.
 async fn fetch_remote_slice_endpoints(
     control_plane_url: &str,
     node_id: &str,
@@ -1997,7 +2005,10 @@ async fn fetch_remote_slice_endpoints(
     use crate::grpc::proto::MeshSubscribeRequest;
     use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
     use crate::modes::mesh::config_consumer::common::tonic_tls_config;
-    use crate::modes::mesh::slice::MeshSlice;
+    use crate::modes::mesh::config_consumer::update_validation::{
+        MeshUpdateConsumer, MeshUpdateExpectation, validate_mesh_config_update,
+        validate_update_ferrum_version,
+    };
     use tonic::metadata::MetadataValue;
     use tonic::transport::Channel;
 
@@ -2037,7 +2048,7 @@ async fn fetch_remote_slice_endpoints(
                 Ok(req)
             })
             .max_decoding_message_size(MESH_CONFIG_GRPC_MAX_DECODING_MESSAGE_SIZE);
-        let request = tonic::Request::new(MeshSubscribeRequest {
+        let subscribe_request = MeshSubscribeRequest {
             node_id: node_id.to_string(),
             ferrum_version: crate::FERRUM_VERSION.to_string(),
             namespace: namespace.to_string(),
@@ -2045,7 +2056,12 @@ async fn fetch_remote_slice_endpoints(
             labels: HashMap::new(),
             waypoint_name: String::new(),
             ambient_udp_source_scoping: false,
-        });
+        };
+        // Derive the expectation from the request actually sent, so the two can
+        // never drift apart.
+        let expected = MeshUpdateExpectation::from_subscribe_request(&subscribe_request);
+        let consumer = MeshUpdateConsumer::RemoteDiscovery;
+        let request = tonic::Request::new(subscribe_request);
         let mut stream = client
             .mesh_subscribe(request)
             .await
@@ -2057,10 +2073,15 @@ async fn fetch_remote_slice_endpoints(
             .map_err(|e| format!("remote MeshSubscribe stream error: {e}"))?
         {
             if update.heartbeat {
+                // Heartbeats carry no slice, but they still ride the CP
+                // compatibility contract — the same gate the local native
+                // consumer applies to every frame.
+                validate_update_ferrum_version(&update.ferrum_version, consumer)
+                    .map_err(|rejection| format!("remote MeshSubscribe rejected: {rejection}"))?;
                 continue;
             }
-            let slice = serde_json::from_str::<MeshSlice>(&update.mesh_slice_json)
-                .map_err(|e| format!("invalid remote MeshSubscribe slice JSON: {e}"))?;
+            let slice = validate_mesh_config_update(&update, &expected, consumer)
+                .map_err(|rejection| format!("remote MeshSubscribe rejected: {rejection}"))?;
             return Ok(RemoteClusterEndpoints {
                 workloads: slice.workloads,
                 services: slice.services,
@@ -4259,6 +4280,12 @@ mod tests {
         HeartbeatThenClose,
         /// Never emit anything: the dialer must hit its request timeout.
         Stall,
+        /// A slice whose envelope `version` is desynced from the embedded
+        /// slice version (issue #2457).
+        SliceWithEnvelopeVersion(&'static str),
+        /// A slice whose response `ferrum_version` is overridden; `""` models a
+        /// control plane that sends none at all (issue #2457).
+        SliceWithFerrumVersion(&'static str),
     }
 
     #[derive(Clone)]
@@ -4303,6 +4330,20 @@ mod tests {
                 StubBehavior::SliceOnly => vec![Ok(slice_update)],
                 StubBehavior::HeartbeatThenSlice => vec![Ok(heartbeat), Ok(slice_update)],
                 StubBehavior::HeartbeatThenClose => vec![Ok(heartbeat)],
+                StubBehavior::SliceWithEnvelopeVersion(version) => {
+                    let update = MeshConfigUpdate {
+                        version: version.to_string(),
+                        ..slice_update
+                    };
+                    vec![Ok(update)]
+                }
+                StubBehavior::SliceWithFerrumVersion(version) => {
+                    let update = MeshConfigUpdate {
+                        ferrum_version: version.to_string(),
+                        ..slice_update
+                    };
+                    vec![Ok(update)]
+                }
                 StubBehavior::Stall => {
                     let stream: Self::MeshSubscribeStream = Box::pin(tokio_stream::pending());
                     return Ok(Response::new(stream));
@@ -4352,9 +4393,13 @@ mod tests {
 
     /// A remote slice carrying two `reviews` workloads and one `reviews`
     /// service, so the dialer has real endpoints to extract.
+    ///
+    /// `node_id` / `namespace` echo the subscription [`remote_ctx`] builds: a
+    /// real CP derives the returned slice from the request, and the dialer now
+    /// rejects any response that is not bound to it (issue #2457).
     fn remote_slice_with_endpoints() -> MeshSlice {
         MeshSlice {
-            node_id: "remote-cp".to_string(),
+            node_id: "dp-1".to_string(),
             namespace: "default".to_string(),
             version: "v-remote-1".to_string(),
             workloads: vec![
@@ -4528,6 +4573,210 @@ mod tests {
             "expected a timeout error, got: {err}"
         );
 
+        handle.shutdown().await;
+    }
+
+    /// Issue #2457: a remote CP answering with a slice scoped to a DIFFERENT
+    /// node than the subscription is refused before its endpoints are imported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_source_rejects_wrong_node_response() {
+        let secret = GrpcJwtSecret::new("multicluster-wrongnode-secret-000".to_string());
+        let slice = MeshSlice {
+            node_id: "some-other-dp".to_string(),
+            ..remote_slice_with_endpoints()
+        };
+        let handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(slice),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::SliceOnly,
+        })
+        .await;
+
+        let ctx = remote_ctx(&handle.url, Some(secret.clone()), Duration::from_secs(5));
+        let err = NativeRemoteSource::new(&ctx, secret)
+            .fetch()
+            .await
+            .expect_err("a slice bound to another node must not be imported");
+        assert!(
+            err.contains("node_id_mismatch"),
+            "expected a node-binding rejection, got: {err}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// Issue #2457: a remote CP answering for another namespace is refused, so
+    /// wrong-tenant endpoints never land under this cluster's entry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_source_rejects_wrong_namespace_response() {
+        let secret = GrpcJwtSecret::new("multicluster-wrongns-secret-00000".to_string());
+        let slice = MeshSlice {
+            namespace: "beta".to_string(),
+            ..remote_slice_with_endpoints()
+        };
+        let handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(slice),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::SliceOnly,
+        })
+        .await;
+
+        let ctx = remote_ctx(&handle.url, Some(secret.clone()), Duration::from_secs(5));
+        let err = NativeRemoteSource::new(&ctx, secret)
+            .fetch()
+            .await
+            .expect_err("a slice for another namespace must not be imported");
+        assert!(
+            err.contains("namespace_mismatch"),
+            "expected a namespace-binding rejection, got: {err}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// Issue #2457: the envelope version must equal the embedded slice version.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_source_rejects_envelope_version_mismatch() {
+        let secret = GrpcJwtSecret::new("multicluster-envversion-secret-00".to_string());
+        let handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(remote_slice_with_endpoints()),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::SliceWithEnvelopeVersion("v-desynced"),
+        })
+        .await;
+
+        let ctx = remote_ctx(&handle.url, Some(secret.clone()), Duration::from_secs(5));
+        let err = NativeRemoteSource::new(&ctx, secret)
+            .fetch()
+            .await
+            .expect_err("a desynced version envelope must not be imported");
+        assert!(
+            err.contains("envelope_version_mismatch"),
+            "expected an envelope-version rejection, got: {err}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// Issue #2457: remote discovery now requires a present `ferrum_version`,
+    /// matching the local native client's long-standing gate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_source_rejects_missing_ferrum_version() {
+        let secret = GrpcJwtSecret::new("multicluster-noversion-secret-000".to_string());
+        let handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(remote_slice_with_endpoints()),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::SliceWithFerrumVersion(""),
+        })
+        .await;
+
+        let ctx = remote_ctx(&handle.url, Some(secret.clone()), Duration::from_secs(5));
+        let err = NativeRemoteSource::new(&ctx, secret)
+            .fetch()
+            .await
+            .expect_err("an unversioned remote response must not be imported");
+        assert!(
+            err.contains("missing_ferrum_version"),
+            "expected a missing-version rejection, got: {err}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// Issue #2457: an incompatible CP version is refused with the same
+    /// major/minor contract the local native consumer applies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_source_rejects_incompatible_ferrum_version() {
+        let secret = GrpcJwtSecret::new("multicluster-badversion-secret-00".to_string());
+        let handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(remote_slice_with_endpoints()),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::SliceWithFerrumVersion("999.999.0"),
+        })
+        .await;
+
+        let ctx = remote_ctx(&handle.url, Some(secret.clone()), Duration::from_secs(5));
+        let err = NativeRemoteSource::new(&ctx, secret)
+            .fetch()
+            .await
+            .expect_err("an incompatible remote CP must not be imported from");
+        assert!(
+            err.contains("incompatible_ferrum_version"),
+            "expected an incompatible-version rejection, got: {err}"
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// Issue #2457: a rejected response leaves the cluster's last-good
+    /// endpoints in place — the poll fails and backs off exactly like any other
+    /// transport failure, rather than clobbering the store with foreign
+    /// endpoints or emptying it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discovery_loop_keeps_last_good_endpoints_when_response_is_unbound() {
+        let secret = GrpcJwtSecret::new("multicluster-lastgood-secret-0000".to_string());
+        let slice = MeshSlice {
+            node_id: "some-other-dp".to_string(),
+            ..remote_slice_with_endpoints()
+        };
+        let handle = start_stub_cp(StubRemoteCp {
+            slice: Arc::new(slice),
+            verify_secret: Some(secret.clone()),
+            behavior: StubBehavior::SliceOnly,
+        })
+        .await;
+
+        let ctx = remote_ctx(&handle.url, Some(secret), Duration::from_secs(5));
+        let source = native_source_factory(&ctx);
+
+        let store = RemoteEndpointStore::new();
+        let task_gen = store.register_cluster("west");
+        // Seed a last-good snapshot the way a previous successful poll would.
+        let last_good = RemoteClusterEntry::new(
+            "west".to_string(),
+            td("remote.local"),
+            None,
+            Some(ctx.control_plane_url.clone()),
+            None,
+            RemoteClusterEndpoints {
+                workloads: vec![workload(
+                    "spiffe://remote.local/ns/default/sa/reviews-1",
+                    "reviews",
+                    "10.2.0.1",
+                    None,
+                )],
+                services: vec![],
+            },
+            1_700_000_000,
+        );
+        store.install(last_good, task_gen);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task_store = store.clone();
+        let loop_ctx = ctx;
+        let loop_handle = tokio::spawn(async move {
+            remote_discovery_loop(loop_ctx, source, task_store, shutdown_rx, task_gen).await
+        });
+
+        // The first poll runs immediately; give it room to complete and be
+        // rejected before inspecting the store.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let snap = store.snapshot();
+        let entry = snap.clusters.get("west").expect("west entry retained");
+        assert_eq!(
+            entry.endpoints.workloads.len(),
+            1,
+            "a rejected response must not replace last-good endpoints"
+        );
+        assert_eq!(
+            entry.endpoints.workloads[0].addresses,
+            vec!["10.2.0.1".to_string()],
+            "the retained endpoints must be the last-good ones"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
         handle.shutdown().await;
     }
 

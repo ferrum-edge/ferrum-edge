@@ -552,7 +552,7 @@ fn incremental_result_not_empty_with_added_proxy() {
 fn incremental_result_not_empty_with_removed_proxy_id() {
     let result = IncrementalResult {
         added_or_modified_proxies: vec![],
-        removed_proxy_ids: vec!["p1".to_string()],
+        removed_proxy_ids: vec![NamespacedResourceId::new("ferrum", "p1")],
         added_or_modified_consumers: vec![],
         removed_consumer_ids: vec![],
         added_or_modified_plugin_configs: vec![],
@@ -583,7 +583,10 @@ fn incremental_result_not_empty_with_removed_consumer() {
 }
 
 #[test]
-fn incremental_result_rejects_legacy_removed_consumer_ids() {
+fn incremental_result_decodes_legacy_removed_consumer_ids() {
+    // Same-major.minor rolling upgrade: a legacy peer may send bare removal IDs.
+    // Decode must accept them (unqualified) and qualification must scope them to
+    // the already-authorized subscription namespace — not reject at serde time.
     let result = IncrementalResult {
         added_or_modified_proxies: vec![],
         removed_proxy_ids: vec![],
@@ -599,7 +602,34 @@ fn incremental_result_rejects_legacy_removed_consumer_ids() {
     let mut value = serde_json::to_value(result).unwrap();
     value["removed_consumer_ids"] = serde_json::json!(["c1"]);
 
-    assert!(serde_json::from_value::<IncrementalResult>(value).is_err());
+    let mut decoded: IncrementalResult = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        decoded.removed_consumer_ids,
+        vec![NamespacedResourceId::new("", "c1")]
+    );
+    assert_eq!(decoded.qualify_unqualified_removals("ferrum"), 1);
+    assert_eq!(
+        decoded.removed_consumer_ids,
+        vec![NamespacedResourceId::new("ferrum", "c1")]
+    );
+
+    // Entries that are neither a bare string nor a namespace-qualified object
+    // remain unclassifiable and must fail closed at decode.
+    let mut malformed = serde_json::to_value(IncrementalResult {
+        added_or_modified_proxies: vec![],
+        removed_proxy_ids: vec![],
+        added_or_modified_consumers: vec![],
+        removed_consumer_ids: vec![],
+        added_or_modified_plugin_configs: vec![],
+        removed_plugin_config_ids: vec![],
+        added_or_modified_upstreams: vec![],
+        removed_upstream_ids: vec![],
+        sequence_cursor: 1,
+        poll_timestamp: Utc::now(),
+    })
+    .unwrap();
+    malformed["removed_consumer_ids"] = serde_json::json!([{"unexpected_key": 1}]);
+    assert!(serde_json::from_value::<IncrementalResult>(malformed).is_err());
 }
 
 #[test]
@@ -610,7 +640,7 @@ fn incremental_result_not_empty_with_removed_plugin_config() {
         added_or_modified_consumers: vec![],
         removed_consumer_ids: vec![],
         added_or_modified_plugin_configs: vec![],
-        removed_plugin_config_ids: vec!["pc1".to_string()],
+        removed_plugin_config_ids: vec![NamespacedResourceId::new("ferrum", "pc1")],
         added_or_modified_upstreams: vec![],
         removed_upstream_ids: vec![],
         sequence_cursor: 0,
@@ -629,7 +659,7 @@ fn incremental_result_not_empty_with_removed_upstream() {
         added_or_modified_plugin_configs: vec![],
         removed_plugin_config_ids: vec![],
         added_or_modified_upstreams: vec![],
-        removed_upstream_ids: vec!["u1".to_string()],
+        removed_upstream_ids: vec![NamespacedResourceId::new("ferrum", "u1")],
         sequence_cursor: 0,
         poll_timestamp: Utc::now(),
     };

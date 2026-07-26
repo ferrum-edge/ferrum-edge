@@ -667,6 +667,9 @@ pub struct MetricsRegistry {
     /// Database-mode incremental polling rejection/backoff metrics.
     database_delta_poll_metrics:
         ArcSwap<Option<Arc<crate::modes::database::DatabaseDeltaPollMetrics>>>,
+    /// DP ConfigSync delta-rejection divergence metrics (issue #2394).
+    configsync_divergence_metrics:
+        ArcSwap<Option<Arc<crate::grpc::configsync_lifecycle::ConfigSyncDivergenceMetrics>>>,
     /// Cached render output with generation timestamp
     render_cache: ArcSwap<Option<(Instant, String)>>,
     /// Configurable render cache TTL in seconds
@@ -740,6 +743,7 @@ impl MetricsRegistry {
             node_agent_metrics: ArcSwap::from_pointee(None),
             admin_conn_metrics: ArcSwap::from_pointee(None),
             database_delta_poll_metrics: ArcSwap::from_pointee(None),
+            configsync_divergence_metrics: ArcSwap::from_pointee(None),
             render_cache: ArcSwap::from_pointee(None),
             render_cache_ttl_secs: AtomicU64::new(DEFAULT_RENDER_CACHE_TTL_SECS),
             stale_entry_ttl_nanos: AtomicU64::new(DEFAULT_STALE_TTL_NANOS),
@@ -1048,6 +1052,26 @@ impl MetricsRegistry {
         &self,
     ) -> Option<crate::modes::database::DatabaseDeltaPollMetricsSnapshot> {
         let metrics = self.database_delta_poll_metrics.load_full();
+        metrics.as_ref().as_ref().map(|metrics| metrics.snapshot())
+    }
+
+    pub fn set_configsync_divergence_metrics(
+        &self,
+        metrics: Arc<crate::grpc::configsync_lifecycle::ConfigSyncDivergenceMetrics>,
+    ) {
+        self.configsync_divergence_metrics
+            .store(Arc::new(Some(metrics)));
+        self.render_cache.store(Arc::new(None));
+    }
+
+    pub fn invalidate_configsync_divergence_metrics_cache(&self) {
+        self.render_cache.store(Arc::new(None));
+    }
+
+    pub fn configsync_divergence_metrics_snapshot(
+        &self,
+    ) -> Option<crate::grpc::configsync_lifecycle::ConfigSyncDivergenceMetricsSnapshot> {
+        let metrics = self.configsync_divergence_metrics.load_full();
         metrics.as_ref().as_ref().map(|metrics| metrics.snapshot())
     }
 
@@ -1687,7 +1711,12 @@ impl MetricsRegistry {
             + self.tls_source_fetch_failure_counter.len() * 220
             + self.tls_cert_rotation_counter.len() * 220
             + if self.database_delta_poll_metrics.load().is_some() {
-                1400
+                1700
+            } else {
+                0
+            }
+            + if self.configsync_divergence_metrics.load().is_some() {
+                400
             } else {
                 0
             }
@@ -2457,6 +2486,64 @@ impl MetricsRegistry {
                 &mut output,
                 "ferrum_database_delta_recoveries_total",
                 snapshot.recoveries_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_database_poll_last_completed_timestamp_seconds Unix timestamp of the most recently completed database/CP config poll attempt (including empty success).\n",
+            );
+            output.push_str("# TYPE ferrum_database_poll_last_completed_timestamp_seconds gauge\n");
+            let last_poll_secs = snapshot.last_poll_completed_at_unix_ms / 1000;
+            render_process_counter(
+                &mut output,
+                "ferrum_database_poll_last_completed_timestamp_seconds",
+                last_poll_secs,
+                &ns_label,
+            );
+        }
+
+        if let Some(snapshot) = self.configsync_divergence_metrics_snapshot() {
+            output.push_str(
+                "# HELP ferrum_configsync_delta_rejections_total Non-empty ConfigSync deltas rejected by the DP, forcing an authoritative FULL_SNAPSHOT resync.\n",
+            );
+            output.push_str("# TYPE ferrum_configsync_delta_rejections_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_configsync_delta_rejections_total",
+                snapshot.rejected_nonempty_deltas_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_configsync_divergence_recoveries_total ConfigSync divergence recoveries after an accepted authoritative FULL_SNAPSHOT.\n",
+            );
+            output.push_str("# TYPE ferrum_configsync_divergence_recoveries_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_configsync_divergence_recoveries_total",
+                snapshot.recoveries_total,
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_configsync_diverged Whether the DP is currently sticky-diverged after a rejected ConfigSync delta (1) or converged (0).\n",
+            );
+            output.push_str("# TYPE ferrum_configsync_diverged gauge\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_configsync_diverged",
+                u64::from(snapshot.diverged),
+                &ns_label,
+            );
+
+            output.push_str(
+                "# HELP ferrum_configsync_fenced_full_snapshots_total ConfigSync FULL_SNAPSHOTs the DP fenced without applying (stale/older, unorderable/inconsistent, or an implausibly-future CP clock stamp); last-known-good config keeps serving.\n",
+            );
+            output.push_str("# TYPE ferrum_configsync_fenced_full_snapshots_total counter\n");
+            render_process_counter(
+                &mut output,
+                "ferrum_configsync_fenced_full_snapshots_total",
+                snapshot.fenced_full_snapshots_total,
                 &ns_label,
             );
         }

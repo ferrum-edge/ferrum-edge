@@ -4209,6 +4209,11 @@ impl SpoolManager {
             .write_lock
             .lock()
             .map_err(|_| format!("{PLUGIN_NAME}: spool writer lock is poisoned"))?;
+        // Optional test seam: runs under the writer lock so injected stalls
+        // model real compression/write/fsync latency without changing the
+        // request-path enqueue contract.
+        run_spool_write_hook_for_tests(SpoolWriteHookPoint::BeforeWrite);
+        let _after_hook = SpoolWriteHookAfterGuard;
         self.prepare_live_storage_locked()?;
         // Size the pending encoded file before admission so max_bytes is a hard
         // ceiling over existing owned bytes plus this write.
@@ -4636,6 +4641,55 @@ fn encode_spool_bytes(bytes: &[u8], compression: SpoolCompression) -> Result<Vec
         SpoolCompression::Zstd => zstd::stream::encode_all(bytes, 0)
             .map_err(|error| format!("{PLUGIN_NAME}: zstd compression failed: {error}")),
         SpoolCompression::None => Ok(bytes.to_vec()),
+    }
+}
+
+/// Observation points for the optional spool-write test seam.
+///
+/// Used by external unit tests to inject deliberate stalls around
+/// [`SpoolManager::write_events`] without relying on wall-clock sleeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpoolWriteHookPoint {
+    BeforeWrite,
+    AfterWrite,
+}
+
+type SpoolWriteHookForTests = Arc<dyn Fn(SpoolWriteHookPoint) + Send + Sync + 'static>;
+
+fn spool_write_hook_slot() -> &'static Mutex<Option<SpoolWriteHookForTests>> {
+    static HOOK: OnceLock<Mutex<Option<SpoolWriteHookForTests>>> = OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+/// Install or clear a process-global hook around spool filesystem writes.
+///
+/// Tests must clear the hook before finishing (including panic paths) and
+/// serialize against other chargeback-sink tests that publish ACTIVE_SINKS.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn set_spool_write_hook_for_tests(hook: Option<SpoolWriteHookForTests>) {
+    if let Ok(mut slot) = spool_write_hook_slot().lock() {
+        *slot = hook;
+    }
+}
+
+fn run_spool_write_hook_for_tests(point: SpoolWriteHookPoint) {
+    let hook = spool_write_hook_slot()
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone());
+    if let Some(hook) = hook {
+        hook(point);
+    }
+}
+
+/// Ensures [`SpoolWriteHookPoint::AfterWrite`] runs on every `write_events`
+/// exit path after [`SpoolWriteHookPoint::BeforeWrite`] has been observed.
+struct SpoolWriteHookAfterGuard;
+
+impl Drop for SpoolWriteHookAfterGuard {
+    fn drop(&mut self) {
+        run_spool_write_hook_for_tests(SpoolWriteHookPoint::AfterWrite);
     }
 }
 
@@ -6503,14 +6557,15 @@ fn spool_snapshot_overflow_event(lifecycle: &SnapshotLifecycle, event: ChargeEve
                         lifecycle.generation,
                     ) {
                         Ok(()) => {
-                            // Durable-success/overflow counters advance on the
-                            // delivery worker after the write genuinely lands.
+                            // Either the delivery worker owns the job (durable
+                            // counters advance after write) or a full/closed
+                            // queue already restaged under delivery ownership.
                             invalidate_status_cache();
                             return;
                         }
-                        // Queue full/closed: recover the event (the lease drops
-                        // here, releasing its export-queue byte reservation) and
-                        // fall through to bounded in-memory staging.
+                        // Admission refused (worker closing): recover the event
+                        // (the lease drops here, releasing its export-queue byte
+                        // reservation) and fall through to bounded staging.
                         Err(mut returned) => match returned.pop() {
                             Some(queued) => queued.event,
                             None => return,

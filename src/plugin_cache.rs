@@ -3000,6 +3000,7 @@ struct ProtocolEntry {
 }
 
 /// All per-proxy protocol data, swapped atomically as one unit.
+#[derive(Clone)]
 struct ProtocolSnapshot {
     /// proxy_id → (protocol → ProtocolEntry)
     proxy: HashMap<String, HashMap<ProxyProtocol, ProtocolEntry>>,
@@ -3937,6 +3938,65 @@ impl PluginCache {
 
     pub(crate) fn load_inner(&self) -> Arc<PluginCacheInner> {
         self.inner.load_full()
+    }
+
+    /// Prepend `plugin` onto one proxy's resolved list and rebuild that proxy's
+    /// protocol snapshots.
+    ///
+    /// External tests use this to inject a gated `on_stream_connect` admission
+    /// seam without widening the production plugin catalog. Callers must build
+    /// the request epoch *after* this mutation so the published snapshot sees
+    /// the injected plugin.
+    #[allow(dead_code)] // Bin target omits lib::_test_support; integration tests call via that seam.
+    pub(crate) fn prepend_proxy_plugin_for_test(
+        &self,
+        proxy_id: &str,
+        plugin: Arc<dyn Plugin>,
+    ) -> Result<(), String> {
+        let current = self.load_inner();
+        let mut proxy_plugins = current.proxy_plugins.clone();
+        let base = proxy_plugins
+            .get(proxy_id)
+            .map(|list| list.as_slice())
+            .unwrap_or(current.global_plugins.as_slice());
+        let mut merged = Vec::with_capacity(base.len().saturating_add(1));
+        merged.push(plugin);
+        merged.extend(base.iter().cloned());
+        proxy_plugins.insert(proxy_id.to_string(), Arc::new(merged));
+
+        let mut protocol_snapshot = current.protocol_snapshot.clone();
+        let mut grpc_web_proxy = current.protocol_snapshot.grpc_web_proxy.clone();
+        if let Some(plugins) = proxy_plugins.get(proxy_id) {
+            let mut inner = HashMap::with_capacity(ALL_PROXY_PROTOCOLS.len());
+            for &proto in &ALL_PROXY_PROTOCOLS {
+                inner.insert(proto, build_protocol_entry(plugins, proto));
+            }
+            protocol_snapshot.proxy.insert(proxy_id.to_string(), inner);
+            grpc_web_proxy.insert(proxy_id.to_string(), build_grpc_web_protocol_entry(plugins));
+        }
+        protocol_snapshot.grpc_web_proxy = grpc_web_proxy;
+
+        let next = Arc::new(PluginCacheInner::new(
+            proxy_plugins,
+            Arc::clone(&current.global_plugins),
+            current.requires_buffering.clone(),
+            current.global_requires_buffering,
+            current.requires_request_buffering.clone(),
+            current.global_requires_request_buffering,
+            protocol_snapshot,
+            current.requires_ws_frame.clone(),
+            current.global_requires_ws_frame,
+            current.proxy_group_plugins.clone(),
+            current.adaptive_concurrency_instances.clone(),
+            current.country_mmdb_instances.clone(),
+            current.country_mmdb_snapshot_bytes,
+            current.tcp_connection_throttle_instances.clone(),
+            current.proxy_lifecycle_generations.clone(),
+            current.proxy_lifecycle_generation_high_water,
+            current.mesh_bpf_metrics_exporter.clone(),
+        ));
+        self.store_inner(next);
+        Ok(())
     }
 
     /// Current-generation `__mesh_bpf_metrics` scrape exporter, if the plugin

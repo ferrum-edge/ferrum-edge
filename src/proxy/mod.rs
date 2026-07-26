@@ -130,7 +130,8 @@ use crate::util::http_headers::{
 
 use self::backend_capabilities::{
     BackendCapabilityProbeTarget, BackendCapabilityRecord, BackendCapabilityRegistry,
-    ProtocolSupport, RefreshCoalescer, SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
+    BackendCapabilitySnapshot, CapabilityCommitOutcome, ProtocolSupport, RefreshCoalescer,
+    SharedBackendCapabilityRegistry, SharedRefreshCoalescer,
 };
 pub use self::body::ProxyBody;
 use self::grpc_proxy::{
@@ -721,6 +722,16 @@ struct H3ProbeOutcome {
     error: Option<String>,
 }
 
+struct H2TlsProbeTarget<'a> {
+    probe_proxy: &'a Proxy,
+    probe_timeout: Duration,
+    host: &'a str,
+    port: u16,
+    previous_h2_tls: Option<ProtocolSupport>,
+    previous_grpc_h2_tls: Option<ProtocolSupport>,
+    previous_h1: Option<ProtocolSupport>,
+}
+
 struct HboneProbeTarget<'a> {
     host: &'a str,
     dial_host: &'a str,
@@ -942,9 +953,13 @@ fn hbone_inner_headers_with_stripped_baggage(
 
 impl H3ProbeOutcome {
     fn apply(self, record: &mut BackendCapabilityRecord, errors: &mut Vec<String>) {
-        if !matches!(self.h3, ProtocolSupport::Unknown) {
-            record.plain_http.h3 = self.h3;
-        }
+        // `probe_h3` returns the fully merged classification (including a
+        // timeout-preserved prior Unsupported/Supported, or Unknown when there
+        // was no prior record). Always write it: the refresh path builds a
+        // fresh default record, so skipping Unknown would be fine there, but
+        // skipping a preserved non-Unknown value would wipe the prior state.
+        // Writing Unknown is also intentional when the merge decided that.
+        record.plain_http.h3 = self.h3;
         if let Some(err) = self.error {
             errors.push(err);
         }
@@ -2287,6 +2302,37 @@ pub(crate) fn is_h3_transport_error_class(class: retry::ErrorClass) -> bool {
             | retry::ErrorClass::DnsLookupError
             | retry::ErrorClass::PortExhaustion
     )
+}
+
+/// Reachability-class probe failures that must not wipe a previously
+/// `Supported` H2/H3 classification during periodic refresh.
+///
+/// Mirrors the HBONE probe's preserve-on-non-capability-failure contract:
+/// DNS blips, connect timeouts, refused-during-restart, and port exhaustion
+/// are transient — stamp `last_probe_error` for operators, but carry the prior
+/// classification forward. Genuine protocol/ALPN evidence still downgrades.
+pub(crate) fn is_transient_capability_probe_failure(class: retry::ErrorClass) -> bool {
+    matches!(
+        class,
+        retry::ErrorClass::DnsLookupError
+            | retry::ErrorClass::ConnectionTimeout
+            | retry::ErrorClass::ConnectionRefused
+            | retry::ErrorClass::PortExhaustion
+    )
+}
+
+/// Decide whether an H3 probe failure is worth surfacing in
+/// `last_probe_error`.
+///
+/// A failure against a target previously classified `Supported` is always
+/// operator-relevant: either the classification was just downgraded, or it was
+/// preserved across a transient fault and the cached record is now stale. Every
+/// other outcome is the expected "this HTTPS backend has no QUIC listener"
+/// case, which must stay silent so `GET /backend-capabilities` does not report
+/// a phantom error for every healthy non-QUIC backend on every refresh
+/// (documented in `openapi.yaml` / `docs/admin_api.md`).
+fn h3_probe_failure_error(previous: Option<ProtocolSupport>, message: String) -> Option<String> {
+    matches!(previous, Some(ProtocolSupport::Supported)).then_some(message)
 }
 
 pub fn websocket_origin_allowed(allowed_origins: &[String], origin: &str) -> bool {
@@ -6426,27 +6472,38 @@ impl ProxyState {
         probe_proxy
     }
 
+    /// Probe one target and build its fresh record.
+    ///
+    /// `previous` is the caller's pre-probe snapshot, taken once via
+    /// `BackendCapabilityRegistry::snapshot_for_probe` and reused as the
+    /// compare expectation when the result is committed. Re-reading the
+    /// registry here would split the merge input from the commit expectation
+    /// and reopen the window this design closes.
     async fn probe_backend_capabilities(
         &self,
         target: &BackendCapabilityProbeTarget,
+        previous: &BackendCapabilitySnapshot,
     ) -> BackendCapabilityRecord {
         let scheme = target.scheme();
         let mut record = BackendCapabilityRecord::default();
         // Accumulates *unexpected* probe failures only — connection errors on
-        // TLS backends and TLS-config setup errors. Expected "backend doesn't
-        // speak protocol X" outcomes (e.g., h2c not deployed on a plaintext
-        // backend, QUIC not deployed on a TLS backend) drop to debug and
-        // record a definitive `Unsupported`, which keeps operators from
-        // chasing phantom errors on every refresh cycle.
+        // TLS backends, TLS-config setup errors, and any probe failure against
+        // a protocol this target was already proven to support. Expected
+        // "backend doesn't speak protocol X" outcomes (e.g., h2c not deployed
+        // on a plaintext backend, QUIC not deployed on a TLS backend) drop to
+        // debug and record a definitive `Unsupported`, which keeps operators
+        // from chasing phantom errors on every refresh cycle.
         let mut errors = Vec::new();
         let probe_proxy = Self::build_backend_capability_probe_proxy(&target.proxy);
         let probe_timeout = Duration::from_millis(probe_proxy.backend_connect_timeout_ms);
         let host = target.host();
         let port = target.port();
-        let previous_hbone = self
-            .backend_capabilities
-            .get_by_key(&target.key)
-            .map(|record| record.hbone);
+        let previous = previous.previous();
+        let previous_hbone = previous.map(|record| record.hbone);
+        let previous_h2_tls = previous.map(|record| record.plain_http.h2_tls);
+        let previous_grpc_h2_tls = previous.map(|record| record.grpc_transport.h2_tls);
+        let previous_h1 = previous.map(|record| record.plain_http.h1);
+        let previous_h3 = previous.map(|record| record.plain_http.h3);
 
         match scheme {
             BackendScheme::Http => {
@@ -6465,8 +6522,18 @@ impl ProxyState {
                 let tls_config_result = self
                     .connection_pool
                     .get_tls_config_for_backend(&probe_proxy);
-                let h2_fut =
-                    self.probe_h2_tls(&probe_proxy, probe_timeout, host, port, &mut record);
+                let h2_fut = self.probe_h2_tls(
+                    H2TlsProbeTarget {
+                        probe_proxy: &probe_proxy,
+                        probe_timeout,
+                        host,
+                        port,
+                        previous_h2_tls,
+                        previous_grpc_h2_tls,
+                        previous_h1,
+                    },
+                    &mut record,
+                );
                 let h3_fut = Self::probe_h3(
                     &self.h3_pool,
                     &probe_proxy,
@@ -6474,6 +6541,7 @@ impl ProxyState {
                     tls_config_result,
                     host,
                     port,
+                    previous_h3,
                 );
                 let (_, h3_outcome) = tokio::join!(h2_fut, h3_fut);
                 h3_outcome.apply(&mut record, &mut errors);
@@ -6569,14 +6637,26 @@ impl ProxyState {
     /// written directly; unexpected connection failures are surfaced to the
     /// caller via `errors` (this is the genuine "can't reach an HTTPS
     /// backend" signal the operator should see).
+    ///
+    /// Transient reachability failures (DNS/connect/refused/timeout) preserve
+    /// any previously cached H2/H1 classification — matching the HBONE merge
+    /// contract — and always stamp `last_probe_error` for operator visibility.
+    /// Only ALPN-negotiated HTTP/1.1 is treated as definitive H2-capability
+    /// evidence that may downgrade a prior `Supported` entry.
     async fn probe_h2_tls(
         &self,
-        probe_proxy: &Proxy,
-        probe_timeout: Duration,
-        host: &str,
-        port: u16,
+        target: H2TlsProbeTarget<'_>,
         record: &mut BackendCapabilityRecord,
     ) {
+        let H2TlsProbeTarget {
+            probe_proxy,
+            probe_timeout,
+            host,
+            port,
+            previous_h2_tls,
+            previous_grpc_h2_tls,
+            previous_h1,
+        } = target;
         match tokio::time::timeout(probe_timeout, self.http2_pool.get_sender(probe_proxy)).await {
             Ok(Ok(_)) => {
                 record.plain_http.h2_tls = ProtocolSupport::Supported;
@@ -6593,12 +6673,51 @@ impl ProxyState {
                 // through the join! Thread the message via
                 // `record.last_probe_error` directly instead — the outer
                 // function merges this into the combined error string.
+                let class = http2_pool::classify_http2_pool_error(&err);
+                let preserve = is_transient_capability_probe_failure(class);
+                record.plain_http.h2_tls =
+                    backend_capabilities::merge_protocol_probe_classification(
+                        previous_h2_tls,
+                        ProtocolSupport::Unknown,
+                        preserve,
+                    );
+                record.grpc_transport.h2_tls =
+                    backend_capabilities::merge_protocol_probe_classification(
+                        previous_grpc_h2_tls,
+                        ProtocolSupport::Unknown,
+                        preserve,
+                    );
+                record.plain_http.h1 = backend_capabilities::merge_protocol_probe_classification(
+                    previous_h1,
+                    ProtocolSupport::Unknown,
+                    preserve,
+                );
                 append_probe_error(
                     record,
                     format!("HTTP/2 probe failed for {host}:{port}: {err}"),
                 );
             }
             Err(_) => {
+                // Timeout is always a transient reachability fault — carry any
+                // prior Supported/Unsupported verdict forward instead of
+                // resetting this target to Unknown for a whole refresh cycle.
+                record.plain_http.h2_tls =
+                    backend_capabilities::merge_protocol_probe_classification(
+                        previous_h2_tls,
+                        ProtocolSupport::Unknown,
+                        true,
+                    );
+                record.grpc_transport.h2_tls =
+                    backend_capabilities::merge_protocol_probe_classification(
+                        previous_grpc_h2_tls,
+                        ProtocolSupport::Unknown,
+                        true,
+                    );
+                record.plain_http.h1 = backend_capabilities::merge_protocol_probe_classification(
+                    previous_h1,
+                    ProtocolSupport::Unknown,
+                    true,
+                );
                 append_probe_error(
                     record,
                     format!(
@@ -6710,6 +6829,19 @@ impl ProxyState {
     /// handling. Written as an associated fn so it can be polled via
     /// `tokio::join!` alongside `probe_h2_tls` (which borrows `&mut record`)
     /// without aliasing `self`.
+    ///
+    /// Transient DNS/connect/refused/timeout failures preserve an existing
+    /// `previous_h3` classification (HBONE merge contract); only non-transient
+    /// transport/protocol evidence downgrades a cached verdict to
+    /// `Unsupported`. A first probe with no prior verdict still classifies
+    /// definitively, so a plain HTTPS backend that never speaks QUIC keeps
+    /// recording `Unsupported` instead of an unclassifiable `Unknown`.
+    ///
+    /// A probe failure against a target previously classified `Supported`
+    /// stamps an operator-visible `last_probe_error` — that is either a real
+    /// downgrade or a preserved-but-stale record, and both are worth seeing in
+    /// `GET /backend-capabilities`. Expected "this backend has no QUIC
+    /// listener" outcomes stay silent (see `probe_backend_capabilities`).
     async fn probe_h3(
         h3_pool: &Arc<Http3ConnectionPool>,
         probe_proxy: &Proxy,
@@ -6717,12 +6849,20 @@ impl ProxyState {
         tls_config_result: Result<Arc<rustls::ClientConfig>, anyhow::Error>,
         host: &str,
         port: u16,
+        previous_h3: Option<ProtocolSupport>,
     ) -> H3ProbeOutcome {
         let tls_config = match tls_config_result {
             Ok(cfg) => cfg,
             Err(err) => {
+                // TLS config build failures are local/config faults, not
+                // evidence the backend lost QUIC — preserve any prior
+                // classification and surface the error.
                 return H3ProbeOutcome {
-                    h3: ProtocolSupport::Unknown,
+                    h3: backend_capabilities::merge_protocol_probe_classification(
+                        previous_h3,
+                        ProtocolSupport::Unknown,
+                        true,
+                    ),
                     error: Some(format!("HTTP/3 TLS config failed for {host}:{port}: {err}")),
                 };
             }
@@ -6739,23 +6879,51 @@ impl ProxyState {
                 error: None,
             },
             Ok(Err(err)) => {
-                debug!(
-                    "HTTP/3 probe for {}:{} classified unsupported: {}",
-                    host, port, err
+                let class = crate::http3::client::classify_http3_error(err.as_ref());
+                let preserve = is_transient_capability_probe_failure(class);
+                let h3 = backend_capabilities::merge_protocol_probe_classification(
+                    previous_h3,
+                    ProtocolSupport::Unsupported,
+                    preserve,
                 );
+                if preserve && matches!(h3, ProtocolSupport::Supported) {
+                    debug!(
+                        "HTTP/3 probe for {}:{} transient failure ({:?}); preserving {:?}: {}",
+                        host, port, class, h3, err
+                    );
+                } else {
+                    debug!(
+                        "HTTP/3 probe for {}:{} classified {:?}: {}",
+                        host, port, h3, err
+                    );
+                }
                 H3ProbeOutcome {
-                    h3: ProtocolSupport::Unsupported,
-                    error: None,
+                    h3,
+                    error: h3_probe_failure_error(
+                        previous_h3,
+                        format!("HTTP/3 probe failed for {host}:{port}: {err}"),
+                    ),
                 }
             }
             Err(_) => {
+                let h3 = backend_capabilities::merge_protocol_probe_classification(
+                    previous_h3,
+                    ProtocolSupport::Unknown,
+                    true,
+                );
                 debug!(
-                    "HTTP/3 probe for {}:{} timed out after {}ms; leaving unknown",
-                    host, port, probe_proxy.backend_connect_timeout_ms
+                    "HTTP/3 probe for {}:{} timed out after {}ms; classified {:?}",
+                    host, port, probe_proxy.backend_connect_timeout_ms, h3
                 );
                 H3ProbeOutcome {
-                    h3: ProtocolSupport::Unknown,
-                    error: None,
+                    h3,
+                    error: h3_probe_failure_error(
+                        previous_h3,
+                        format!(
+                            "HTTP/3 probe timed out for {}:{} after {}ms",
+                            host, port, probe_proxy.backend_connect_timeout_ms
+                        ),
+                    ),
                 }
             }
         }
@@ -6805,6 +6973,9 @@ impl ProxyState {
         let h3_supported = Arc::new(AtomicU64::new(0));
         let h2c_supported = Arc::new(AtomicU64::new(0));
         let hbone_supported = Arc::new(AtomicU64::new(0));
+        // Probes whose write-back lost to newer registry state (a request-path
+        // downgrade, or a `retain_keys` eviction) during the probe window.
+        let conflicts = Arc::new(AtomicU64::new(0));
 
         stream::iter(targets)
             .for_each_concurrent(buffer, |target| {
@@ -6814,6 +6985,7 @@ impl ProxyState {
                 let h3_supported = h3_supported.clone();
                 let h2c_supported = h2c_supported.clone();
                 let hbone_supported = hbone_supported.clone();
+                let conflicts = conflicts.clone();
                 let semaphore = semaphore.clone();
                 async move {
                     // Same rule as `run_warmup_task_batch`: prefer
@@ -6832,36 +7004,71 @@ impl ProxyState {
                             return;
                         }
                     };
-                    let previous_record = state.backend_capabilities.get_by_key(&target.key);
-                    let record = state.probe_backend_capabilities(&target).await;
-                    if let Some(previous) = previous_record.as_deref() {
-                        warn_capability_supported_regression(&target, previous, &record);
+                    // ONE pre-probe observation, used both as the merge input
+                    // (`previous_*` classifications inside the probe) and as
+                    // the compare expectation for the write-back below. A
+                    // second independent read would leave exactly the window
+                    // this protocol closes.
+                    let registry = &state.backend_capabilities;
+                    let snapshot = registry.snapshot_for_probe(&target.key);
+                    let record = state.probe_backend_capabilities(&target, &snapshot).await;
+                    // Compare-and-commit: the probe may replace only the
+                    // version it was computed against. A request-path
+                    // downgrade (`mark_h3_unsupported` /
+                    // `mark_h2_tls_unsupported` / `mark_hbone_unsupported`)
+                    // landing during the probe window publishes a new `Arc`,
+                    // so this write loses and the newer live record survives.
+                    let outcome = registry.commit_probe(target.key.clone(), &snapshot, record);
+                    let committed = match outcome {
+                        CapabilityCommitOutcome::Committed(committed) => committed,
+                        rejected => {
+                            // Counters and the summary line describe committed
+                            // registry state only — a discarded probe must not
+                            // be reported as this target's classification.
+                            conflicts.fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                proxy_id = %target.proxy.id,
+                                backend_host = %target.host(),
+                                backend_port = target.port(),
+                                reason = rejected.reason(),
+                                "Backend capability probe result discarded; live registry state is newer"
+                            );
+                            return;
+                        }
+                    };
+                    if let Some(previous) = snapshot.previous() {
+                        warn_capability_supported_regression(&target, previous, &committed);
                     }
-                    if record.plain_http.h2_tls.is_supported() {
+                    if committed.plain_http.h2_tls.is_supported() {
                         h2_supported.fetch_add(1, Ordering::Relaxed);
                     }
-                    if record.plain_http.h3.is_supported() {
+                    if committed.plain_http.h3.is_supported() {
                         h3_supported.fetch_add(1, Ordering::Relaxed);
                     }
-                    if record.grpc_transport.h2c.is_supported() {
+                    if committed.grpc_transport.h2c.is_supported() {
                         h2c_supported.fetch_add(1, Ordering::Relaxed);
                     }
-                    if record.hbone.is_supported() {
+                    if committed.hbone.is_supported() {
                         hbone_supported.fetch_add(1, Ordering::Relaxed);
                     }
-                    state.backend_capabilities.upsert(target.key, record);
                     refreshed.fetch_add(1, Ordering::Relaxed);
                 }
             })
             .await;
 
+        // Every tally below is drawn from records this refresh actually
+        // committed. Targets whose probe lost the compare-and-commit are
+        // reported separately as `discarded` — they keep the newer live
+        // classification, so folding them into the protocol counts would
+        // misreport the registry.
         info!(
-            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={}, hbone={})",
+            "Backend capability refresh complete: {} backends classified (h2_tls={}, h3={}, h2c={}, hbone={}), {} probe results discarded in favor of newer live state",
             refreshed.load(Ordering::Relaxed),
             h2_supported.load(Ordering::Relaxed),
             h3_supported.load(Ordering::Relaxed),
             h2c_supported.load(Ordering::Relaxed),
             hbone_supported.load(Ordering::Relaxed),
+            conflicts.load(Ordering::Relaxed),
         );
     }
 
@@ -8329,16 +8536,17 @@ impl ProxyState {
         let old_config = self.config.load_full();
         let mut new_config = (*old_config).clone();
 
-        // Remove deleted resources
+        // Remove deleted resources by (namespace, id) so a misrouted removal
+        // cannot delete a same-id object belonging to another namespace.
         if !result.removed_proxy_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_proxy_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
             new_config
                 .proxies
-                .retain(|p| !removed.contains(p.id.as_str()));
+                .retain(|p| !removed.contains(&(p.namespace.as_str(), p.id.as_str())));
         }
         if !result.removed_consumer_ids.is_empty() {
             let removed: std::collections::HashSet<(&str, &str)> = result
@@ -8351,46 +8559,47 @@ impl ProxyState {
             });
         }
         if !result.removed_plugin_config_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_plugin_config_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
             new_config
                 .plugin_configs
-                .retain(|pc| !removed.contains(pc.id.as_str()));
+                .retain(|pc| !removed.contains(&(pc.namespace.as_str(), pc.id.as_str())));
             for proxy in &mut new_config.proxies {
-                proxy
-                    .plugins
-                    .retain(|assoc| !removed.contains(assoc.plugin_config_id.as_str()));
+                proxy.plugins.retain(|assoc| {
+                    !removed.contains(&(proxy.namespace.as_str(), assoc.plugin_config_id.as_str()))
+                });
             }
         }
         if !result.removed_upstream_ids.is_empty() {
-            let removed: std::collections::HashSet<&str> = result
+            let removed: std::collections::HashSet<(&str, &str)> = result
                 .removed_upstream_ids
                 .iter()
-                .map(|s| s.as_str())
+                .map(|key| (key.namespace.as_str(), key.id.as_str()))
                 .collect();
             new_config
                 .upstreams
-                .retain(|u| !removed.contains(u.id.as_str()));
+                .retain(|u| !removed.contains(&(u.namespace.as_str(), u.id.as_str())));
         }
 
         // Upsert added/modified resources using HashMap index for O(1) lookups
         // instead of O(n) linear scan per resource. Move values to avoid cloning.
 
         if !result.added_or_modified_proxies.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .proxies
                 .iter()
                 .enumerate()
-                .map(|(i, p)| (p.id.clone(), i))
+                .map(|(i, p)| ((p.namespace.clone(), p.id.clone()), i))
                 .collect();
             for proxy in result.added_or_modified_proxies {
-                if let Some(&pos) = idx.get(&proxy.id) {
+                let key = (proxy.namespace.clone(), proxy.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.proxies[pos] = proxy;
                 } else {
-                    idx.insert(proxy.id.clone(), new_config.proxies.len());
+                    idx.insert(key, new_config.proxies.len());
                     new_config.proxies.push(proxy);
                 }
             }
@@ -8415,34 +8624,36 @@ impl ProxyState {
         }
 
         if !result.added_or_modified_plugin_configs.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .plugin_configs
                 .iter()
                 .enumerate()
-                .map(|(i, pc)| (pc.id.clone(), i))
+                .map(|(i, pc)| ((pc.namespace.clone(), pc.id.clone()), i))
                 .collect();
             for pc in result.added_or_modified_plugin_configs {
-                if let Some(&pos) = idx.get(&pc.id) {
+                let key = (pc.namespace.clone(), pc.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.plugin_configs[pos] = pc;
                 } else {
-                    idx.insert(pc.id.clone(), new_config.plugin_configs.len());
+                    idx.insert(key, new_config.plugin_configs.len());
                     new_config.plugin_configs.push(pc);
                 }
             }
         }
 
         if !result.added_or_modified_upstreams.is_empty() {
-            let mut idx: std::collections::HashMap<String, usize> = new_config
+            let mut idx: std::collections::HashMap<(String, String), usize> = new_config
                 .upstreams
                 .iter()
                 .enumerate()
-                .map(|(i, u)| (u.id.clone(), i))
+                .map(|(i, u)| ((u.namespace.clone(), u.id.clone()), i))
                 .collect();
             for upstream in result.added_or_modified_upstreams {
-                if let Some(&pos) = idx.get(&upstream.id) {
+                let key = (upstream.namespace.clone(), upstream.id.clone());
+                if let Some(&pos) = idx.get(&key) {
                     new_config.upstreams[pos] = upstream;
                 } else {
-                    idx.insert(upstream.id.clone(), new_config.upstreams.len());
+                    idx.insert(key, new_config.upstreams.len());
                     new_config.upstreams.push(upstream);
                 }
             }
@@ -8756,6 +8967,40 @@ impl ProxyState {
 
     pub fn current_config(&self) -> Arc<GatewayConfig> {
         self.config.load_full()
+    }
+
+    /// Canonicalize a candidate snapshot exactly as [`Self::update_config`]
+    /// does before it swaps, so the result is content-comparable against
+    /// [`Self::current_config`].
+    ///
+    /// `update_config` normalizes fields, resolves upstream TLS, quarantines
+    /// invalid HMAC credentials, and injects gateway workload-metrics identity
+    /// **before** storing the snapshot. A raw CP-delivered candidate has not
+    /// been through those node-local steps, so comparing it directly against
+    /// the applied config reports a spurious mismatch on any node whose
+    /// identity or credential state triggers one of them — most visibly a DP
+    /// with a gateway SVID, where the injected `__gateway_workload_metrics`
+    /// plugin config exists only on the applied side.
+    ///
+    /// The ConfigSync older-cross-source identical-payload exception
+    /// (`configsync_lifecycle::authoritative_snapshot_payload_matches`) depends
+    /// on that comparison, so it must canonicalize first or the exception is
+    /// silently inert and every equivalent failover snapshot is fenced.
+    ///
+    /// Quarantine diagnostics are intentionally discarded: this is a read-only
+    /// comparison helper on a clone, and `update_config` logs them on the real
+    /// apply path.
+    pub fn canonicalize_snapshot_for_comparison(&self, config: &GatewayConfig) -> GatewayConfig {
+        let mut candidate = config.clone();
+        candidate.normalize_fields();
+        candidate.resolve_upstream_tls();
+        let _ = candidate.quarantine_invalid_hmac_credentials();
+        inject_gateway_workload_metrics_if_svid(
+            &mut candidate,
+            &self.gateway_svid_bundle,
+            &self.env_config.namespace,
+        );
+        candidate
     }
 }
 
@@ -11673,6 +11918,44 @@ impl EffectiveWsSizeLimits {
             max_size,
         ))
     }
+
+    /// Global frame/message capacity overflow Close when no plugin rule supplied
+    /// the binding ceiling. Bounded, non-secret empty reason (RFC 6455 1009).
+    pub(crate) fn global_capacity_close_for_error(
+        error: &tokio_tungstenite::tungstenite::Error,
+    ) -> Option<(CloseFrame, &'static str, usize, usize)> {
+        use tokio_tungstenite::tungstenite::Error;
+        use tokio_tungstenite::tungstenite::error::CapacityError;
+
+        let (size, max_size, kind) = match error {
+            Error::Capacity(CapacityError::FrameTooLong { size, max_size }) => {
+                (*size, *max_size, "frame")
+            }
+            Error::Capacity(CapacityError::MessageTooLong { size, max_size }) => {
+                (*size, *max_size, "message")
+            }
+            _ => return None,
+        };
+        Some((ws_global_capacity_close_frame(), kind, size, max_size))
+    }
+}
+
+/// Bounded, non-secret RFC 6455 Close 1009 for global parser capacity overflow.
+pub(crate) fn ws_global_capacity_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Size,
+        // Empty reason stays within the 123-byte control-frame budget and never
+        // echoes peer-controlled or secret material.
+        reason: "".into(),
+    }
+}
+
+/// Defined idle-timeout policy Close published once for both relay halves.
+pub(crate) fn ws_idle_timeout_policy_close_frame() -> CloseFrame {
+    CloseFrame {
+        code: CloseCode::Away,
+        reason: "idle timeout".into(),
+    }
 }
 
 fn ws_close_write_error_kind(error: &tokio_tungstenite::tungstenite::Error) -> &'static str {
@@ -12429,6 +12712,15 @@ where
                                 retry::ErrorClass::ReadWriteTimeout,
                                 None,
                             ));
+                            // Publish one defined policy Close before cancel so
+                            // both halves attempt the same meaningful teardown
+                            // (1001) instead of asymmetric 1005/1006.
+                            let close = publish_ws_policy_close(
+                                &policy_close_ctb,
+                                &cancel_ctb,
+                                Some(ws_idle_timeout_policy_close_frame()),
+                            );
+                            send_bounded_ws_close(&mut backend_sink, close).await;
                             break;
                         }
                     };
@@ -12596,6 +12888,25 @@ where
                                 );
                                 send_bounded_ws_close(&mut backend_sink, close).await;
                                 retry::ErrorClass::RequestBodyTooLarge
+                            } else if let Some((close, limit_kind, size, max_size)) =
+                                EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
+                            {
+                                warn!(
+                                    proxy_id = %proxy_id_ctb,
+                                    connection_id,
+                                    direction = "client->backend",
+                                    limit_kind,
+                                    size,
+                                    max_size,
+                                    "WebSocket global size limit rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_ctb,
+                                    &cancel_ctb,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut backend_sink, close).await;
+                                retry::ErrorClass::RequestBodyTooLarge
                             } else {
                                 error!("Error receiving from client: {}", e);
                                 retry::classify_boxed_error(&e)
@@ -12665,6 +12976,14 @@ where
                                 retry::ErrorClass::ReadWriteTimeout,
                                 None,
                             ));
+                            // Mirror of c2b: publish once, then bounded polite
+                            // write so the client observes the same 1001 Close.
+                            let close = publish_ws_policy_close(
+                                &policy_close_btc,
+                                &cancel_btc,
+                                Some(ws_idle_timeout_policy_close_frame()),
+                            );
+                            send_bounded_ws_close(&mut ws_sink, close).await;
                             break;
                         }
                     };
@@ -12805,6 +13124,25 @@ where
                                     size,
                                     max_size,
                                     "WebSocket size policy rejected input before forwarding"
+                                );
+                                let close = publish_ws_policy_close(
+                                    &policy_close_btc,
+                                    &cancel_btc,
+                                    Some(close),
+                                );
+                                send_bounded_ws_close(&mut ws_sink, close).await;
+                                retry::ErrorClass::ResponseBodyTooLarge
+                            } else if let Some((close, limit_kind, size, max_size)) =
+                                EffectiveWsSizeLimits::global_capacity_close_for_error(&e)
+                            {
+                                warn!(
+                                    proxy_id = %proxy_id_btc,
+                                    connection_id,
+                                    direction = "backend->client",
+                                    limit_kind,
+                                    size,
+                                    max_size,
+                                    "WebSocket global size limit rejected input before forwarding"
                                 );
                                 let close = publish_ws_policy_close(
                                     &policy_close_btc,
@@ -15119,9 +15457,31 @@ fn should_apply_synthetic_response_body_hooks(
         && governed_synthetic_status
         && !crate::plugins::utils::synthetic_response::status_forbids_response_body(status_code)
         && !response_body.is_empty()
-        && plugins.iter().any(|plugin| {
-            plugin.requires_response_body_buffering() && plugin.should_buffer_response_body(ctx)
-        })
+        && response_body_plugins_process_body(plugins, ctx)
+}
+
+/// Whether a response-body-capable plugin phase actually processes THIS
+/// response.
+///
+/// The two-tier gate every buffered response path uses: a plugin's per-request
+/// `should_buffer_response_body(ctx)` refinement is consulted only when that
+/// plugin advertised the config-time `requires_response_body_buffering()`
+/// upper bound (the documented precondition on
+/// [`Plugin::should_buffer_response_body`]).
+///
+/// Callers use this to answer "did the response-body pipeline see these
+/// bytes?" — notably the buffered native-H3 path, which must drop backend
+/// trailers a body-inspecting plugin could not see, while an auth/logging-only
+/// chain keeps them (issue #2941).
+///
+/// [`Plugin::should_buffer_response_body`]: crate::plugins::Plugin::should_buffer_response_body
+pub(crate) fn response_body_plugins_process_body(
+    plugins: &[Arc<dyn Plugin>],
+    ctx: &RequestContext,
+) -> bool {
+    plugins.iter().any(|plugin| {
+        plugin.requires_response_body_buffering() && plugin.should_buffer_response_body(ctx)
+    })
 }
 
 /// Run the governed synthetic short-circuit response-body hook pipeline
@@ -33792,6 +34152,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::config::db_loader::NamespacedResourceId;
     use crate::config::types::{LoadBalancerAlgorithm, PluginAssociation};
     use crate::plugins::PluginHttpClient;
     use crate::plugins::ai_federation::AiFederation;
@@ -42663,7 +43024,7 @@ mod tests {
                 added_or_modified_consumers: Vec::new(),
                 removed_consumer_ids: Vec::new(),
                 added_or_modified_plugin_configs: Vec::new(),
-                removed_plugin_config_ids: vec!["pc1".to_string()],
+                removed_plugin_config_ids: vec![NamespacedResourceId::new("ferrum", "pc1")],
                 added_or_modified_upstreams: Vec::new(),
                 removed_upstream_ids: Vec::new(),
                 sequence_cursor: 0,

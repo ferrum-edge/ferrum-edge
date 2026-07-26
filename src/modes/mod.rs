@@ -20,6 +20,7 @@
 pub mod control_plane;
 pub mod data_plane;
 pub mod database;
+pub mod db_poll_supervision;
 pub mod db_tls_reload;
 pub mod file;
 pub mod grpc_tls_reload;

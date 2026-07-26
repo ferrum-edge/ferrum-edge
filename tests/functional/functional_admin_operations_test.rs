@@ -735,3 +735,137 @@ async fn test_admin_requires_authentication() {
         "Health endpoint should not require auth"
     );
 }
+
+#[tokio::test]
+#[ignore]
+async fn test_admin_restore_persists_normalized_canonical_fields_sqlite() {
+    // Hosted-CI functional coverage for issue #2402 on the SQL path.
+    let harness = TestGateway::builder()
+        .mode_database_sqlite()
+        .log_level("warn")
+        .spawn()
+        .await
+        .expect("Failed to create sqlite harness");
+
+    let client = reqwest::Client::new();
+    let auth = harness.auth_header();
+    let noncanonical = json!({
+        "consumers": [{
+            "id": "func-norm-consumer",
+            "username": "func_norm_user",
+            "custom_id": "   ",
+            "credentials": {}
+        }],
+        "upstreams": [{
+            "id": "func-norm-upstream",
+            "name": "func_norm_upstream",
+            "targets": [{"host": "Reviews.Mesh.Internal", "port": 8080, "weight": 100}],
+            "backend_tls_sni": "Reviews.Mesh.Internal",
+            "backend_tls_san_allow_list": [
+                "Reviews.Mesh.Internal",
+                "spiffe://Cluster.Local/ns/Default/sa/Reviews"
+            ]
+        }],
+        "proxies": [{
+            "id": "func-norm-proxy",
+            "hosts": ["API.Example.COM"],
+            "listen_path": "/func-norm",
+            "backend_scheme": "http",
+            "backend_host": "Backend.Example.COM",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "upstream_id": "func-norm-upstream"
+        }],
+        "plugin_configs": [{
+            "id": "func-norm-plugin",
+            "plugin_name": "rate_limiting",
+            "scope": "global",
+            "proxy_id": "",
+            "enabled": true,
+            "config": {
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+            }
+        }]
+    });
+
+    let resp = client
+        .post(format!("{}/restore?confirm=true", harness.admin_base_url))
+        .header("Authorization", &auth)
+        .json(&noncanonical)
+        .send()
+        .await
+        .expect("restore request failed");
+    assert!(
+        resp.status().is_success(),
+        "restore must admit mixed-case/blank-id payload: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    let proxy: serde_json::Value = client
+        .get(format!(
+            "{}/proxies/func-norm-proxy",
+            harness.admin_base_url
+        ))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .expect("proxy get failed")
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(proxy["hosts"][0], "api.example.com");
+    assert_eq!(proxy["backend_host"], "backend.example.com");
+
+    let consumer: serde_json::Value = client
+        .get(format!(
+            "{}/consumers/func-norm-consumer",
+            harness.admin_base_url
+        ))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .expect("consumer get failed")
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        consumer.get("custom_id").is_none() || consumer["custom_id"].is_null(),
+        "blank custom_id must normalize away: {consumer}"
+    );
+
+    let upstream: serde_json::Value = client
+        .get(format!(
+            "{}/upstreams/func-norm-upstream",
+            harness.admin_base_url
+        ))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .expect("upstream get failed")
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(upstream["targets"][0]["host"], "reviews.mesh.internal");
+    assert_eq!(upstream["backend_tls_sni"], "reviews.mesh.internal");
+    assert_eq!(
+        upstream["backend_tls_san_allow_list"][0],
+        "reviews.mesh.internal"
+    );
+
+    let plugin: serde_json::Value = client
+        .get(format!(
+            "{}/plugins/config/func-norm-plugin",
+            harness.admin_base_url
+        ))
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .expect("plugin get failed")
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        plugin.get("proxy_id").is_none() || plugin["proxy_id"].is_null(),
+        "blank proxy_id must normalize away: {plugin}"
+    );
+}

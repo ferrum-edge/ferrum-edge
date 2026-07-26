@@ -6424,7 +6424,7 @@ async fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
                 "sink": {
                     "type": "http",
                     "endpoint_url": "https://audit.example.com/ingest",
-                    "custom_headers": {"Authorization": "Bearer ${AUDIT_TOKEN}"},
+                    "custom_headers": {"Authorization": "Bearer ${secret:AUDIT_TOKEN}"},
                     "flush_interval_ms": 600000,
                     "retry_delay_ms": 250
                 },
@@ -6479,6 +6479,26 @@ async fn ai_transcript_audit_schema_matches_runtime_unknown_key_contract() {
                     "type": "http",
                     "endpoint_url": "https://audit.example.com/ingest",
                     "on_buffer_ful": "reject"
+                }
+            }),
+            false,
+        ),
+        (
+            json!({
+                "limits": { "max_request_bytes": 1048576 },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest"
+                }
+            }),
+            true,
+        ),
+        (
+            json!({
+                "limits": { "max_request_bytes": 1048577 },
+                "sink": {
+                    "type": "http",
+                    "endpoint_url": "https://audit.example.com/ingest"
                 }
             }),
             false,

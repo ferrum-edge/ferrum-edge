@@ -588,7 +588,10 @@ impl Default for ApiSpecListFilter {
     }
 }
 
-/// Namespace-qualified key for resources whose IDs are not globally unique.
+/// Namespace-qualified key for resources whose IDs are only unique per namespace.
+///
+/// Used for incremental removals across every resource type so a misrouted or
+/// adversarial delta cannot delete a same-id object in another namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NamespacedResourceId {
     pub namespace: String,
@@ -604,6 +607,12 @@ impl NamespacedResourceId {
     }
 }
 
+impl std::fmt::Display for NamespacedResourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.namespace, self.id)
+    }
+}
+
 /// Result of an incremental config poll.
 ///
 /// Contains only resources referenced by durable change-log records newer than
@@ -614,25 +623,216 @@ impl NamespacedResourceId {
 /// after the delta validates and applies, so rejected deltas are retried from
 /// the same durable point.
 ///
-/// Serializable for CP-to-DP gRPC delta broadcasts.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+/// Serializable for CP-to-DP gRPC delta broadcasts. Removal keys are
+/// namespace-qualified for every resource type in memory. The JSON encoding is
+/// deliberately backward/forward compatible across same-major.minor CP/DP peers
+/// (additive `removed_*_keys` alongside the historical bare-ID arrays); see the
+/// wire-compatibility note above the serde impls below.
+#[derive(Clone)]
 pub struct IncrementalResult {
     pub added_or_modified_proxies: Vec<Proxy>,
-    pub removed_proxy_ids: Vec<String>,
+    pub removed_proxy_ids: Vec<NamespacedResourceId>,
     pub added_or_modified_consumers: Vec<Consumer>,
     pub removed_consumer_ids: Vec<NamespacedResourceId>,
     pub added_or_modified_plugin_configs: Vec<PluginConfig>,
-    pub removed_plugin_config_ids: Vec<String>,
+    pub removed_plugin_config_ids: Vec<NamespacedResourceId>,
     pub added_or_modified_upstreams: Vec<Upstream>,
-    pub removed_upstream_ids: Vec<String>,
+    pub removed_upstream_ids: Vec<NamespacedResourceId>,
     /// Highest durable config change sequence included in this poll.
-    #[serde(default)]
+    ///
+    /// Optional on the wire (`#[serde(default)]` on the decode struct) so a
+    /// peer that predates the cursor still produces a parseable delta.
     pub sequence_cursor: u64,
     /// Timestamp to use as the in-memory/gRPC config version for this delta.
     pub poll_timestamp: DateTime<Utc>,
 }
 
+// Rolling-upgrade JSON encoding of `IncrementalResult`.
+//
+// The delta body travels as `ConfigUpdate.config_json`, so its JSON shape is a
+// same-major.minor compatibility contract (`docs/upgrade_guide.md` promises a
+// CP-first rollout with patch-mixed CP/DP fleets). Namespace-qualified removal
+// keys are therefore ADDITIVE: `removed_*_keys` carry `(namespace, id)` objects
+// for peers that understand them, while the historical `removed_proxy_ids` /
+// `removed_plugin_config_ids` / `removed_upstream_ids` arrays keep their
+// bare-string shape so a peer that predates qualified removals still parses the
+// body and ignores the additive arrays. `removed_consumer_ids` keeps the object
+// shape it already had on this major.minor.
+//
+// Decoding accepts either shape in every removal array. A bare string carries no
+// namespace, so it decodes with an empty namespace and must be qualified with
+// the already-authorized subscription namespace through
+// `IncrementalResult::qualify_unqualified_removals` before apply. Anything still
+// unqualified is dropped by the DP namespace filter, so a legacy-shaped delta
+// can never reach another tenant's resources.
+
+/// One removal entry as it may appear on the wire: a namespace-qualified object
+/// from a current peer, or a bare ID string from a peer that predates them.
+#[derive(serde::Deserialize)]
+#[serde(untagged)]
+enum RemovalKeyWire {
+    Qualified(NamespacedResourceId),
+    LegacyBareId(String),
+}
+
+impl RemovalKeyWire {
+    fn into_key(self) -> NamespacedResourceId {
+        match self {
+            RemovalKeyWire::Qualified(key) => key,
+            // Empty namespace marks "unqualified"; the DP replaces it with its
+            // own authorized subscription namespace before applying.
+            RemovalKeyWire::LegacyBareId(id) => NamespacedResourceId {
+                namespace: String::new(),
+                id,
+            },
+        }
+    }
+}
+
+fn merge_removal_keys(
+    qualified: Vec<NamespacedResourceId>,
+    legacy: Vec<RemovalKeyWire>,
+) -> Vec<NamespacedResourceId> {
+    if qualified.is_empty() {
+        legacy.into_iter().map(RemovalKeyWire::into_key).collect()
+    } else {
+        qualified
+    }
+}
+
+fn legacy_removal_ids(keys: &[NamespacedResourceId]) -> Vec<&str> {
+    keys.iter().map(|key| key.id.as_str()).collect()
+}
+
+#[derive(serde::Serialize)]
+struct IncrementalResultSer<'a> {
+    added_or_modified_proxies: &'a [Proxy],
+    removed_proxy_ids: Vec<&'a str>,
+    removed_proxy_keys: &'a [NamespacedResourceId],
+    added_or_modified_consumers: &'a [Consumer],
+    removed_consumer_ids: &'a [NamespacedResourceId],
+    added_or_modified_plugin_configs: &'a [PluginConfig],
+    removed_plugin_config_ids: Vec<&'a str>,
+    removed_plugin_config_keys: &'a [NamespacedResourceId],
+    added_or_modified_upstreams: &'a [Upstream],
+    removed_upstream_ids: Vec<&'a str>,
+    removed_upstream_keys: &'a [NamespacedResourceId],
+    sequence_cursor: u64,
+    poll_timestamp: DateTime<Utc>,
+}
+
+#[derive(serde::Deserialize)]
+struct IncrementalResultDe {
+    added_or_modified_proxies: Vec<Proxy>,
+    removed_proxy_ids: Vec<RemovalKeyWire>,
+    #[serde(default)]
+    removed_proxy_keys: Vec<NamespacedResourceId>,
+    added_or_modified_consumers: Vec<Consumer>,
+    removed_consumer_ids: Vec<RemovalKeyWire>,
+    added_or_modified_plugin_configs: Vec<PluginConfig>,
+    removed_plugin_config_ids: Vec<RemovalKeyWire>,
+    #[serde(default)]
+    removed_plugin_config_keys: Vec<NamespacedResourceId>,
+    added_or_modified_upstreams: Vec<Upstream>,
+    removed_upstream_ids: Vec<RemovalKeyWire>,
+    #[serde(default)]
+    removed_upstream_keys: Vec<NamespacedResourceId>,
+    #[serde(default)]
+    sequence_cursor: u64,
+    poll_timestamp: DateTime<Utc>,
+}
+
+impl serde::Serialize for IncrementalResult {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde::Serialize::serialize(
+            &IncrementalResultSer {
+                added_or_modified_proxies: &self.added_or_modified_proxies,
+                removed_proxy_ids: legacy_removal_ids(&self.removed_proxy_ids),
+                removed_proxy_keys: &self.removed_proxy_ids,
+                added_or_modified_consumers: &self.added_or_modified_consumers,
+                removed_consumer_ids: &self.removed_consumer_ids,
+                added_or_modified_plugin_configs: &self.added_or_modified_plugin_configs,
+                removed_plugin_config_ids: legacy_removal_ids(&self.removed_plugin_config_ids),
+                removed_plugin_config_keys: &self.removed_plugin_config_ids,
+                added_or_modified_upstreams: &self.added_or_modified_upstreams,
+                removed_upstream_ids: legacy_removal_ids(&self.removed_upstream_ids),
+                removed_upstream_keys: &self.removed_upstream_ids,
+                sequence_cursor: self.sequence_cursor,
+                poll_timestamp: self.poll_timestamp,
+            },
+            serializer,
+        )
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for IncrementalResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = IncrementalResultDe::deserialize(deserializer)?;
+        Ok(IncrementalResult {
+            added_or_modified_proxies: wire.added_or_modified_proxies,
+            removed_proxy_ids: merge_removal_keys(wire.removed_proxy_keys, wire.removed_proxy_ids),
+            added_or_modified_consumers: wire.added_or_modified_consumers,
+            // Consumers have no additive `*_keys` array: their canonical wire
+            // shape on this major.minor is already the qualified object, and
+            // decoding still tolerates an older peer's bare-ID strings.
+            removed_consumer_ids: wire
+                .removed_consumer_ids
+                .into_iter()
+                .map(RemovalKeyWire::into_key)
+                .collect(),
+            added_or_modified_plugin_configs: wire.added_or_modified_plugin_configs,
+            removed_plugin_config_ids: merge_removal_keys(
+                wire.removed_plugin_config_keys,
+                wire.removed_plugin_config_ids,
+            ),
+            added_or_modified_upstreams: wire.added_or_modified_upstreams,
+            removed_upstream_ids: merge_removal_keys(
+                wire.removed_upstream_keys,
+                wire.removed_upstream_ids,
+            ),
+            sequence_cursor: wire.sequence_cursor,
+            poll_timestamp: wire.poll_timestamp,
+        })
+    }
+}
+
 impl IncrementalResult {
+    /// Adopt the authorized subscription namespace for removal keys that a peer
+    /// sent as bare IDs (see the wire-compatibility note above the serde impls).
+    ///
+    /// A CP that predates namespace-qualified removals sends bare resource IDs,
+    /// which decode with an empty namespace. The subscribing DP is authorized
+    /// for exactly one namespace, so adopting that namespace reproduces the
+    /// legacy semantics without widening reach — the DP's namespace filter still
+    /// drops every key outside it, so the cross-namespace deletion guarantee is
+    /// unaffected.
+    ///
+    /// Returns how many keys were qualified; a peer that sent qualified keys
+    /// yields `0`.
+    pub fn qualify_unqualified_removals(&mut self, namespace: &str) -> usize {
+        fn qualify(keys: &mut [NamespacedResourceId], namespace: &str) -> usize {
+            let mut qualified = 0;
+            for key in keys {
+                if key.namespace.is_empty() {
+                    key.namespace = namespace.to_string();
+                    qualified += 1;
+                }
+            }
+            qualified
+        }
+
+        qualify(&mut self.removed_proxy_ids, namespace)
+            + qualify(&mut self.removed_consumer_ids, namespace)
+            + qualify(&mut self.removed_plugin_config_ids, namespace)
+            + qualify(&mut self.removed_upstream_ids, namespace)
+    }
+
     /// True when nothing changed — skip all cache work.
     pub fn is_empty(&self) -> bool {
         self.added_or_modified_proxies.is_empty()

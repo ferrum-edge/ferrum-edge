@@ -14,11 +14,14 @@
 //! 2. Update dedupe: the server suppresses no-op pushes via
 //!    `MeshSlice::content_eq`, which ignores the transport version stamp
 //!    (`GatewayConfig.loaded_at`) but detects real workload/service changes.
-//! 3. Slice apply on the DP: `NativeMeshConfigConsumer::apply_update` parses
-//!    the wire `mesh_slice_json` and installs it into `MeshRuntimeState`;
-//!    a malformed or empty (heartbeat-shaped) payload errors WITHOUT
-//!    clobbering the last accepted slice — the fail-closed contract that
-//!    keeps a bad CP push from blanking a serving mesh.
+//! 3. Slice apply on the DP: `NativeMeshConfigConsumer::apply_update` binds
+//!    the wire `MeshConfigUpdate` to the subscription that opened the stream
+//!    (node id, namespace, pinned workload/waypoint scope, envelope-vs-slice
+//!    version, present + compatible `ferrum_version`) and only then installs
+//!    the parsed slice into `MeshRuntimeState`; a malformed, empty
+//!    (heartbeat-shaped), or unbound payload errors WITHOUT clobbering the
+//!    last accepted slice — the fail-closed contract that keeps a bad or
+//!    cross-wired CP push from blanking or hijacking a serving mesh.
 //!
 //! The *runtime* half of this row (a real CP in a kind cluster serving the
 //! K8s-built mesh model over MeshSubscribe to a sidecar DP whose captured
@@ -29,9 +32,10 @@
 use std::collections::HashMap;
 
 use ferrum_edge::config::types::GatewayConfig;
-use ferrum_edge::grpc::proto::MeshConfigUpdate;
+use ferrum_edge::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
 use ferrum_edge::modes::mesh::config::MeshConfig;
 use ferrum_edge::modes::mesh::config_consumer::native_client::NativeMeshConfigConsumer;
+use ferrum_edge::modes::mesh::config_consumer::update_validation::MeshUpdateExpectation;
 use ferrum_edge::modes::mesh::runtime::MeshRuntimeState;
 use ferrum_edge::modes::mesh::slice::{MeshSlice, MeshSliceRequest};
 
@@ -237,11 +241,45 @@ fn subscribe_update_dedupe_ignores_version_stamp() {
     );
 }
 
-/// The DP-side apply path: `apply_update` parses the wire `mesh_slice_json`
-/// and installs it into the shared `MeshRuntimeState` (the same
-/// `install_slice` the file source uses, so materialization downstream is
-/// protocol-agnostic). Malformed JSON and empty heartbeat-shaped payloads
-/// error and MUST NOT clobber the last accepted slice.
+/// The subscription this transport's DP-side fixtures speak for: the same
+/// node/namespace/workload identity `capp_request` builds the CP-side slice
+/// from, so a faithful CP response is bound to it.
+fn capp_subscribe_request(namespace: &str) -> MeshSubscribeRequest {
+    MeshSubscribeRequest {
+        node_id: "capp-node".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        namespace: namespace.to_string(),
+        workload_spiffe_id: capp_spiffe(namespace),
+        labels: HashMap::new(),
+        waypoint_name: String::new(),
+        ambient_udp_source_scoping: false,
+    }
+}
+
+fn capp_consumer(namespace: &str) -> NativeMeshConfigConsumer {
+    let request = capp_subscribe_request(namespace);
+    NativeMeshConfigConsumer::new(
+        MeshRuntimeState::new(),
+        MeshUpdateExpectation::from_subscribe_request(&request),
+    )
+}
+
+fn wire_update(slice: &MeshSlice) -> MeshConfigUpdate {
+    MeshConfigUpdate {
+        version: slice.version.clone(),
+        mesh_slice_json: serde_json::to_string(slice).expect("slice serializes"),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
+        ..MeshConfigUpdate::default()
+    }
+}
+
+/// The DP-side apply path: `apply_update` validates the wire `MeshConfigUpdate`
+/// against the exact subscription and installs the parsed slice into the shared
+/// `MeshRuntimeState` (the same `install_slice` the file source uses, so
+/// materialization downstream is protocol-agnostic). Malformed JSON, empty
+/// heartbeat-shaped payloads, and responses that are not bound to this
+/// subscription (wrong node/namespace, desynced version envelope, missing
+/// `ferrum_version`) error and MUST NOT clobber the last accepted slice.
 #[test]
 fn native_slice_apply_and_malformed_update_fail_closed() {
     register_feature!(
@@ -249,13 +287,16 @@ fn native_slice_apply_and_malformed_update_fail_closed() {
         feature = "native slice apply + malformed-update fail-closed",
         status = Status::Supported,
         maturity = Maturity::Ga,
-        notes = "NativeMeshConfigConsumer::apply_update installs a parsed MeshSlice into \
-                 MeshRuntimeState (same install_slice as the file source); malformed or \
-                 empty payloads return Err and retain the last accepted slice. Live-gated \
-                 via sidecar.config.native_subscribe_delivered in mesh-e2e-sidecar.",
+        notes = "NativeMeshConfigConsumer::apply_update validates a MeshConfigUpdate against \
+                 the subscription that opened the stream (node id, namespace, pinned workload \
+                 SPIFFE/waypoint scope, envelope-vs-slice version, present + compatible \
+                 ferrum_version) and only then installs the parsed MeshSlice into \
+                 MeshRuntimeState (same install_slice as the file source); malformed, empty, \
+                 or unbound payloads return Err and retain the last accepted slice. \
+                 Live-gated via sidecar.config.native_subscribe_delivered in mesh-e2e-sidecar.",
     );
 
-    let consumer = NativeMeshConfigConsumer::new(MeshRuntimeState::new());
+    let consumer = capp_consumer("ferrum");
     assert!(
         consumer.state().snapshot().as_ref().is_none(),
         "no slice before the first update"
@@ -263,13 +304,9 @@ fn native_slice_apply_and_malformed_update_fail_closed() {
 
     let config = gateway_config_with_mesh(two_namespace_mesh("ferrum", "other"));
     let slice = build_slice(&config, "ferrum");
-    let update = MeshConfigUpdate {
-        version: slice.version.clone(),
-        mesh_slice_json: serde_json::to_string(&slice).expect("slice serializes"),
-        ..MeshConfigUpdate::default()
-    };
+    let update = wire_update(&slice);
     let applied = consumer
-        .apply_update(update)
+        .apply_update(&update)
         .expect("a valid MeshSubscribe update applies");
     assert!(
         applied.content_eq(&slice),
@@ -287,23 +324,64 @@ fn native_slice_apply_and_malformed_update_fail_closed() {
     // Malformed CP payload: rejected, last good slice retained.
     let malformed = MeshConfigUpdate {
         mesh_slice_json: "{not json".to_string(),
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         ..MeshConfigUpdate::default()
     };
     assert!(
-        consumer.apply_update(malformed).is_err(),
+        consumer.apply_update(&malformed).is_err(),
         "malformed slice JSON must be rejected"
     );
 
-    // Heartbeat-shaped payload (empty mesh_slice_json): the stream loop skips
-    // heartbeats before apply; if one ever reached apply it must also fail
-    // closed rather than install an empty slice.
+    // Heartbeat-shaped payload (empty mesh_slice_json): the stream loop routes
+    // heartbeats to the version gate instead of apply; if one ever reached
+    // apply it must also fail closed rather than install an empty slice.
     let heartbeat_shaped = MeshConfigUpdate {
         heartbeat: true,
+        ferrum_version: ferrum_edge::FERRUM_VERSION.to_string(),
         ..MeshConfigUpdate::default()
     };
     assert!(
-        consumer.apply_update(heartbeat_shaped).is_err(),
+        consumer.apply_update(&heartbeat_shaped).is_err(),
         "an empty heartbeat-shaped payload must never install"
+    );
+
+    // Unversioned CP response: refused by the compatibility gate.
+    let unversioned = MeshConfigUpdate {
+        ferrum_version: String::new(),
+        ..wire_update(&slice)
+    };
+    assert!(
+        consumer.apply_update(&unversioned).is_err(),
+        "an unversioned response must never install"
+    );
+
+    // Response bound to another node: refused before install.
+    let other_node = MeshSlice {
+        node_id: "other-node".to_string(),
+        ..slice.clone()
+    };
+    assert!(
+        consumer.apply_update(&wire_update(&other_node)).is_err(),
+        "a slice scoped to another node must never install"
+    );
+
+    // Response bound to another namespace: refused before install.
+    let other_namespace_slice = build_slice(&config, "other");
+    assert!(
+        consumer
+            .apply_update(&wire_update(&other_namespace_slice))
+            .is_err(),
+        "a slice scoped to another namespace must never install"
+    );
+
+    // Envelope version desynced from the embedded slice version.
+    let desynced = MeshConfigUpdate {
+        version: "v-desynced".to_string(),
+        ..wire_update(&slice)
+    };
+    assert!(
+        consumer.apply_update(&desynced).is_err(),
+        "a desynced version envelope must never install"
     );
 
     let retained = consumer.state().snapshot();

@@ -1,20 +1,26 @@
 {
   "$schema": "https://json-schema.org/draft-07/schema#",
   "title": "ferrum-gateway values",
+  "description": "Values for the ferrum-gateway chart (database/file/cp/dp modes only). Mesh, injector, and node_agent modes belong in the ferrum-mesh chart; migrate is an external Job workflow, not a chart-deployed mode.",
   "type": "object",
+  "additionalProperties": false,
   "required": ["mode", "image"],
   "properties": {
     "mode": {
       "type": "string",
-      "description": "Known Ferrum binary mode. The chart renders database/file/cp/dp; template validation directs mesh/injector/node_agent to ferrum-mesh and migrate to the external pre-deploy Job workflow.",
+      "description": "Ferrum binary mode rendered by this chart: database, file, cp, or dp. The enum also lists mesh/injector/node_agent/migrate so schema validation can emit an explicit chart-separation error instead of a silent unknown-key drop; template validation then rejects those modes with pointers to ferrum-mesh or the external migrate Job examples.",
       "enum": ["database", "file", "cp", "dp", "mesh", "injector", "node_agent", "migrate"]
     },
-    "replicaCount": {
-      "type": "integer",
-      "minimum": 0
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "commonLabels": {
+      "type": "object",
+      "description": "Free-form label map merged into every rendered object.",
+      "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
     },
     "image": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "repository": { "type": "string", "minLength": 1 },
         "tag": { "type": "string" },
@@ -22,31 +28,56 @@
           "type": "string",
           "enum": ["Always", "IfNotPresent", "Never"]
         },
-        "pullSecrets": { "type": "array" }
+        "pullSecrets": {
+          "type": "array",
+          "items": { "type": "object" }
+        }
       }
+    },
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ferrumNamespace": {
+      "type": "string",
+      "description": "Logical Ferrum namespace selector (FERRUM_NAMESPACE)."
     },
     "shutdownDrainSeconds": { "type": ["integer", "null"], "minimum": 0 },
     "terminationGracePeriodSeconds": { "type": "integer", "minimum": 0 },
-    "secretVolumeDefaultMode": {
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 511,
-      "description": "Kubernetes Secret projection mode in decimal. Defaults to 288 (octal 0440) so fsGroup can read TLS and _FILE material."
+    "serviceAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "create": { "type": "boolean" },
+        "name": { "type": "string" },
+        "annotations": {
+          "type": "object",
+          "description": "Free-form ServiceAccount annotation map.",
+          "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+        }
+      }
     },
     "ports": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "proxyHttp": { "type": "integer", "minimum": 0, "maximum": 65535 },
         "proxyHttps": { "type": "integer", "minimum": 0, "maximum": 65535 },
         "adminHttp": { "type": "integer", "minimum": 0, "maximum": 65535 },
         "adminHttps": { "type": "integer", "minimum": 0, "maximum": 65535 },
-        "cpGrpc": { "type": "integer", "minimum": 0, "maximum": 65535, "description": "Control-plane gRPC port (cp mode). 0 disables the listener; the container/Service gRPC ports are then omitted." }
+        "cpGrpc": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Control-plane gRPC port (cp mode). 0 disables the listener; the container/Service gRPC ports are then omitted."
+        }
       }
     },
     "streamPorts": {
       "type": "array",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["name", "containerPort"],
         "properties": {
           "name": { "type": "string" },
@@ -59,6 +90,7 @@
     },
     "admin": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "bindAddress": { "type": "string" },
         "allowedCidrs": {
@@ -69,44 +101,62 @@
         "jwtSecret": {
           "type": "object",
           "description": "Required in database/cp/dp unless supplied by secretFileMounts name=FERRUM_ADMIN_JWT_SECRET.",
+          "additionalProperties": false,
           "properties": {
             "value": { "type": "string", "minLength": 32 },
             "existingSecret": {
               "type": "object",
+              "additionalProperties": false,
               "properties": {
                 "name": { "type": "string" },
                 "key": { "type": "string" }
               }
             },
-            "valueFrom": { "type": "object" }
+            "valueFrom": {
+              "type": "object",
+              "description": "Free-form Kubernetes EnvVarSource for FERRUM_ADMIN_JWT_SECRET.",
+              "additionalProperties": true
+            }
           }
         },
         "service": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "enabled": { "type": "boolean" },
             "type": { "type": "string" },
-            "annotations": { "type": "object" }
+            "annotations": {
+              "type": "object",
+              "description": "Free-form admin Service annotation map.",
+              "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+            }
           }
         }
       }
     },
     "grpc": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "jwtSecret": {
           "type": "object",
           "description": "Required in cp/dp unless supplied by secretFileMounts name=FERRUM_CP_DP_GRPC_JWT_SECRET.",
+          "additionalProperties": false,
           "properties": {
             "value": { "type": "string", "minLength": 32 },
             "existingSecret": {
               "type": "object",
+              "additionalProperties": false,
               "properties": {
                 "name": { "type": "string" },
                 "key": { "type": "string" }
               }
             },
-            "valueFrom": { "type": "object" }
+            "valueFrom": {
+              "type": "object",
+              "description": "Free-form Kubernetes EnvVarSource for FERRUM_CP_DP_GRPC_JWT_SECRET.",
+              "additionalProperties": true
+            }
           }
         },
         "allowPlaintext": {
@@ -117,16 +167,117 @@
     },
     "database": {
       "type": "object",
+      "description": "Database settings for database and cp modes only.",
+      "additionalProperties": false,
       "properties": {
-        "type": { "type": "string", "enum": ["", "sqlite", "postgres", "mysql", "mongodb"] }
+        "type": { "type": "string", "enum": ["", "sqlite", "postgres", "mysql", "mongodb"] },
+        "url": { "type": "string" },
+        "urlFrom": {
+          "type": "object",
+          "description": "Free-form Kubernetes EnvVarSource for FERRUM_DB_URL.",
+          "additionalProperties": true
+        },
+        "existingSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": { "type": "string" },
+            "urlKey": { "type": "string" }
+          }
+        },
+        "sqlite": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "path": { "type": "string" },
+            "mode": { "type": "string", "enum": ["", "ro", "rw", "rwc", "memory"] }
+          }
+        },
+        "host": { "type": "string" },
+        "port": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "name": { "type": "string" },
+        "username": { "type": "string" },
+        "password": { "type": "string" },
+        "params": {
+          "type": "object",
+          "description": "Free-form query-parameter map for structured database URLs.",
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean"]
+          }
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "description": "File-mode config (mode=file only).",
+      "additionalProperties": false,
+      "properties": {
+        "mountPath": { "type": "string" },
+        "fileName": { "type": "string" },
+        "inlineConfig": { "type": "string" },
+        "existingConfigMap": { "type": "string" }
+      }
+    },
+    "cp": {
+      "type": "object",
+      "description": "Control-plane settings (mode=cp only). Not used by ferrum-mesh.",
+      "additionalProperties": false,
+      "properties": {
+        "grpcBindAddress": { "type": "string" },
+        "namespaces": { "type": "string" },
+        "requireNamespaceClaim": { "type": "boolean" },
+        "service": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "type": { "type": "string" },
+            "annotations": {
+              "type": "object",
+              "description": "Free-form CP gRPC Service annotation map.",
+              "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+            }
+          }
+        }
+      }
+    },
+    "dp": {
+      "type": "object",
+      "description": "Data-plane settings (mode=dp only). Not used by ferrum-mesh.",
+      "additionalProperties": false,
+      "properties": {
+        "cpGrpcUrls": { "type": "string" },
+        "failoverPrimaryRetrySeconds": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "string" },
+            { "type": "null" }
+          ]
+        }
       }
     },
     "tls": {
       "type": "object",
-      "description": "TLS Secret mounts. Equivalent complete cert/key SOURCE pairs supplied through env/extraEnv are also recognized for frontend, admin, and CP gRPC listener gating. The DP proxy HTTPS listener may also use CP-delivered TLS.",
+      "description": "TLS Secret mounts. Equivalent complete cert/key SOURCE pairs supplied through env/extraEnv are also recognized for frontend, admin, and CP gRPC listener gating. cpGrpc applies only in cp mode; dpGrpc only in dp mode.",
+      "additionalProperties": false,
       "properties": {
-        "frontend": {
+        "frontend": { "$ref": "#/definitions/tlsServerSurface" },
+        "admin": { "$ref": "#/definitions/tlsServerSurface" },
+        "backend": {
           "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "secretName": { "type": "string" },
+            "mountPath": { "type": "string" },
+            "clientCertKey": { "type": "string" },
+            "clientKeyKey": { "type": "string" }
+          }
+        },
+        "cpGrpc": {
+          "type": "object",
+          "description": "CP gRPC TLS (mode=cp only).",
+          "additionalProperties": false,
           "properties": {
             "enabled": { "type": "boolean" },
             "secretName": { "type": "string" },
@@ -136,17 +287,33 @@
             "clientCaKey": { "type": "string" }
           }
         },
-        "admin": { "type": "object" },
-        "backend": { "type": "object" },
-        "cpGrpc": { "type": "object" },
-        "dpGrpc": { "type": "object" }
+        "dpGrpc": {
+          "type": "object",
+          "description": "DP gRPC trust material (mode=dp only).",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "secretName": { "type": "string" },
+            "mountPath": { "type": "string" },
+            "caKey": { "type": "string" },
+            "clientCertKey": { "type": "string" },
+            "clientKeyKey": { "type": "string" }
+          }
+        }
       }
+    },
+    "secretVolumeDefaultMode": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 511,
+      "description": "Kubernetes Secret projection mode in decimal. Defaults to 288 (octal 0440) so fsGroup can read TLS and _FILE material."
     },
     "secretFileMounts": {
       "type": "array",
       "description": "Secret keys exposed through <name>_FILE. Matching entries satisfy required DB/JWT source guards. FERRUM_DB_URL, FERRUM_ADMIN_JWT_SECRET, and FERRUM_CP_DP_GRPC_JWT_SECRET are the only chart-managed bases replaceable this way; other managed env names are rejected to prevent duplicate providers.",
       "items": {
         "type": "object",
+        "additionalProperties": false,
         "required": ["name", "secretName"],
         "properties": {
           "name": { "type": "string", "pattern": "^FERRUM_[A-Z0-9_]+$" },
@@ -156,12 +323,194 @@
         }
       }
     },
+    "env": {
+      "type": "object",
+      "description": "Free-form simple string env map. Reserved chart-managed FERRUM_* keys are rejected at render.",
+      "additionalProperties": {
+        "type": ["string", "number", "integer", "boolean"]
+      }
+    },
+    "extraEnv": {
+      "type": "array",
+      "description": "Free-form raw env entries (list form) for valueFrom / fieldRef cases. Reserved chart-managed names are rejected at render.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "extraVolumes": {
+      "type": "array",
+      "description": "Free-form extra pod volumes (Kubernetes Volume objects).",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "extraVolumeMounts": {
+      "type": "array",
+      "description": "Free-form extra container volume mounts (Kubernetes VolumeMount objects).",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "probes": {
+      "type": "object",
+      "description": "Health probes. Liveness/startup use `ferrum-edge health --live` (GET /live); readiness uses `ferrum-edge health` (GET /health). Overrides are per-probe so liveness and readiness cannot be silently coupled. A shared top-level probes.override is rejected.",
+      "additionalProperties": false,
+      "properties": {
+        "startup": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "failureThreshold": { "type": "integer", "minimum": 1 },
+            "periodSeconds": { "type": "integer", "minimum": 1 }
+          }
+        },
+        "liveness": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+            "periodSeconds": { "type": "integer", "minimum": 1 },
+            "override": {
+              "type": "object",
+              "description": "Free-form custom liveness handler (exec/httpGet/tcpSocket) replacing the computed /live check; also used by the startup probe.",
+              "additionalProperties": true
+            }
+          }
+        },
+        "readiness": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+            "periodSeconds": { "type": "integer", "minimum": 1 },
+            "override": {
+              "type": "object",
+              "description": "Free-form custom readiness handler (exec/httpGet/tcpSocket) replacing the computed /health check.",
+              "additionalProperties": true
+            }
+          }
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "description": "Free-form Kubernetes ResourceRequirements passed through to the container.",
+      "additionalProperties": true
+    },
+    "updateStrategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "type": "string" },
+        "rollingUpdate": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "maxUnavailable": {
+              "oneOf": [
+                { "type": "integer", "minimum": 0 },
+                { "type": "string" }
+              ]
+            },
+            "maxSurge": {
+              "oneOf": [
+                { "type": "integer", "minimum": 0 },
+                { "type": "string" }
+              ]
+            }
+          }
+        }
+      }
+    },
     "podSecurityContext": {
       "type": "object",
-      "description": "Pod security context. Defaults pin UID/GID/fsGroup 65532 so the distroless nonroot runtime can read group-readable Secret projections."
+      "description": "Free-form Kubernetes PodSecurityContext. Defaults pin UID/GID/fsGroup 65532 so the distroless nonroot runtime can read group-readable Secret projections.",
+      "additionalProperties": true
+    },
+    "securityContext": {
+      "type": "object",
+      "description": "Free-form Kubernetes SecurityContext for the gateway container.",
+      "additionalProperties": true
+    },
+    "podAnnotations": {
+      "type": "object",
+      "description": "Free-form pod annotation map.",
+      "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+    },
+    "podLabels": {
+      "type": "object",
+      "description": "Free-form pod label map.",
+      "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+    },
+    "nodeSelector": {
+      "type": "object",
+      "description": "Free-form nodeSelector map.",
+      "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+    },
+    "tolerations": {
+      "type": "array",
+      "description": "Free-form Kubernetes Toleration list.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "affinity": {
+      "type": "object",
+      "description": "Free-form Kubernetes Affinity object.",
+      "additionalProperties": true
+    },
+    "topologySpreadConstraints": {
+      "type": "array",
+      "description": "Free-form Kubernetes TopologySpreadConstraint list.",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "type": { "type": "string" },
+        "annotations": {
+          "type": "object",
+          "description": "Free-form proxy Service annotation map.",
+          "additionalProperties": { "type": ["string", "number", "integer", "boolean"] }
+        },
+        "httpPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "httpsPort": { "type": "integer", "minimum": 1, "maximum": 65535 }
+      }
+    },
+    "autoscaling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minReplicas": { "type": "integer", "minimum": 0 },
+        "maxReplicas": { "type": "integer", "minimum": 1 },
+        "targetCPUUtilizationPercentage": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 100
+        },
+        "targetMemoryUtilizationPercentage": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "maximum": 100
+        }
+      }
     },
     "podDisruptionBudget": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "enabled": { "type": "boolean" },
         "minAvailable": {
@@ -180,44 +529,19 @@
           ]
         }
       }
-    },
-    "probes": {
+    }
+  },
+  "definitions": {
+    "tlsServerSurface": {
       "type": "object",
-      "description": "Health probes. Liveness/startup use `ferrum-edge health --live` (GET /live); readiness uses `ferrum-edge health` (GET /health). Overrides are per-probe so liveness and readiness cannot be silently coupled.",
       "additionalProperties": false,
       "properties": {
-        "startup": {
-          "type": "object",
-          "properties": {
-            "enabled": { "type": "boolean" },
-            "failureThreshold": { "type": "integer", "minimum": 1 },
-            "periodSeconds": { "type": "integer", "minimum": 1 }
-          }
-        },
-        "liveness": {
-          "type": "object",
-          "properties": {
-            "enabled": { "type": "boolean" },
-            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
-            "periodSeconds": { "type": "integer", "minimum": 1 },
-            "override": {
-              "type": "object",
-              "description": "Custom liveness handler (exec/httpGet/tcpSocket) replacing the computed /live check; also used by the startup probe."
-            }
-          }
-        },
-        "readiness": {
-          "type": "object",
-          "properties": {
-            "enabled": { "type": "boolean" },
-            "initialDelaySeconds": { "type": "integer", "minimum": 0 },
-            "periodSeconds": { "type": "integer", "minimum": 1 },
-            "override": {
-              "type": "object",
-              "description": "Custom readiness handler (exec/httpGet/tcpSocket) replacing the computed /health check."
-            }
-          }
-        }
+        "enabled": { "type": "boolean" },
+        "secretName": { "type": "string" },
+        "mountPath": { "type": "string" },
+        "certKey": { "type": "string" },
+        "keyKey": { "type": "string" },
+        "clientCaKey": { "type": "string" }
       }
     }
   }

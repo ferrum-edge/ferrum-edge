@@ -4940,6 +4940,240 @@ async fn test_batch_create_upstreams_persists_service_discovery() {
 }
 
 #[tokio::test]
+async fn test_restore_persists_normalized_canonical_fields() {
+    // Issue #2402: restore must normalize the actual payload before validation
+    // and persist that same canonical instance. Raw SQL assertions are required
+    // because get_* helpers re-normalize on read and would hide a write miss.
+    let tc = TestConfig::default();
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("test_restore_normalization.db");
+    let db_url = format!("sqlite:{}?mode=rwc", db_path.to_string_lossy());
+    let db = DatabaseStore::connect_with_pool_config("sqlite", &db_url, DbPoolConfig::default())
+        .await
+        .expect("Failed to connect to test database");
+    let pool = db.pool();
+    let state = db_admin_state(&tc, db, None);
+    let (base_url, _shutdown) = start_test_admin(state).await;
+    let token = generate_test_token(&tc);
+
+    let noncanonical = json!({
+        "consumers": [{
+            "id": "norm-consumer",
+            "username": "norm_user",
+            "custom_id": "   ",
+            "credentials": {}
+        }],
+        "upstreams": [{
+            "id": "norm-upstream",
+            "name": "norm_upstream",
+            "targets": [{"host": "Reviews.Mesh.Internal", "port": 8080, "weight": 100}],
+            "backend_tls_sni": "Reviews.Mesh.Internal",
+            "backend_tls_san_allow_list": [
+                "Reviews.Mesh.Internal",
+                "spiffe://Cluster.Local/ns/Default/sa/Reviews"
+            ]
+        }],
+        "proxies": [{
+            "id": "norm-proxy",
+            "hosts": ["API.Example.COM"],
+            "listen_path": "/norm",
+            "backend_scheme": "http",
+            "backend_host": "Backend.Example.COM",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "upstream_id": "norm-upstream"
+        }],
+        "plugin_configs": [{
+            "id": "norm-plugin",
+            "plugin_name": "rate_limiting",
+            "scope": "global",
+            "proxy_id": "",
+            "enabled": true,
+            "config": {
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+            }
+        }]
+    });
+
+    // CRUD/batch admission canonical form for parity assertions.
+    let (status, body) = admin_post(&base_url, "/batch", &token, &noncanonical).await;
+    assert_eq!(status, 201, "CRUD/batch seed failed: {body:?}");
+
+    let crud_hosts: String =
+        sqlx::query_scalar("SELECT hosts FROM proxies WHERE id = 'norm-proxy'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let crud_backend_host: String =
+        sqlx::query_scalar("SELECT backend_host FROM proxies WHERE id = 'norm-proxy'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let crud_custom_id: Option<String> =
+        sqlx::query_scalar("SELECT custom_id FROM consumers WHERE id = 'norm-consumer'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let crud_targets: String =
+        sqlx::query_scalar("SELECT targets FROM upstreams WHERE id = 'norm-upstream'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let crud_sni: Option<String> =
+        sqlx::query_scalar("SELECT backend_tls_sni FROM upstreams WHERE id = 'norm-upstream'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let crud_sans: Option<String> = sqlx::query_scalar(
+        "SELECT backend_tls_san_allow_list FROM upstreams WHERE id = 'norm-upstream'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let crud_proxy_id: Option<String> =
+        sqlx::query_scalar("SELECT proxy_id FROM plugin_configs WHERE id = 'norm-plugin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert!(
+        crud_hosts.contains("api.example.com") && !crud_hosts.contains("API.Example.COM"),
+        "batch must persist lowercase hosts: {crud_hosts}"
+    );
+    assert_eq!(crud_backend_host, "backend.example.com");
+    assert!(
+        crud_custom_id.is_none(),
+        "batch must normalize blank custom_id to NULL: {crud_custom_id:?}"
+    );
+    assert!(
+        crud_targets.contains("reviews.mesh.internal")
+            && !crud_targets.contains("Reviews.Mesh.Internal"),
+        "batch must persist lowercase upstream hosts: {crud_targets}"
+    );
+    assert_eq!(crud_sni.as_deref(), Some("reviews.mesh.internal"));
+    assert!(
+        crud_sans
+            .as_deref()
+            .is_some_and(|value| value.contains("reviews.mesh.internal")
+                && value.contains("spiffe://Cluster.Local/ns/Default/sa/Reviews")),
+        "batch must lowercase DNS SANs only: {crud_sans:?}"
+    );
+    assert!(
+        crud_proxy_id.is_none(),
+        "batch must normalize blank plugin proxy_id to NULL: {crud_proxy_id:?}"
+    );
+
+    let (status, backup, _) = admin_get(&base_url, "/backup", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    // Wipe, then restore the original non-canonical wire form (not the backup).
+    let (status, body) = admin_post(&base_url, "/restore?confirm=true", &token, &json!({})).await;
+    assert_eq!(status, 200, "wipe restore failed: {body:?}");
+
+    let (status, body) =
+        admin_post(&base_url, "/restore?confirm=true", &token, &noncanonical).await;
+    assert_eq!(status, 200, "canonicalizing restore failed: {body:?}");
+
+    let restore_hosts: String =
+        sqlx::query_scalar("SELECT hosts FROM proxies WHERE id = 'norm-proxy'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let restore_backend_host: String =
+        sqlx::query_scalar("SELECT backend_host FROM proxies WHERE id = 'norm-proxy'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let restore_custom_id: Option<String> =
+        sqlx::query_scalar("SELECT custom_id FROM consumers WHERE id = 'norm-consumer'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let restore_targets: String =
+        sqlx::query_scalar("SELECT targets FROM upstreams WHERE id = 'norm-upstream'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let restore_sni: Option<String> =
+        sqlx::query_scalar("SELECT backend_tls_sni FROM upstreams WHERE id = 'norm-upstream'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let restore_sans: Option<String> = sqlx::query_scalar(
+        "SELECT backend_tls_san_allow_list FROM upstreams WHERE id = 'norm-upstream'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let restore_proxy_id: Option<String> =
+        sqlx::query_scalar("SELECT proxy_id FROM plugin_configs WHERE id = 'norm-plugin'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    assert_eq!(restore_hosts, crud_hosts);
+    assert_eq!(restore_backend_host, crud_backend_host);
+    assert_eq!(restore_custom_id, crud_custom_id);
+    assert_eq!(restore_targets, crud_targets);
+    assert_eq!(restore_sni, crud_sni);
+    assert_eq!(restore_sans, crud_sans);
+    assert_eq!(restore_proxy_id, crud_proxy_id);
+
+    // Admin GET / backup surfaces match the durable canonical form.
+    let (status, proxy_body, _) = admin_get(&base_url, "/proxies/norm-proxy", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(proxy_body["hosts"][0], "api.example.com");
+    assert_eq!(proxy_body["backend_host"], "backend.example.com");
+
+    let (status, consumer_body, _) = admin_get(&base_url, "/consumers/norm-consumer", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        consumer_body.get("custom_id").is_none() || consumer_body["custom_id"].is_null(),
+        "blank custom_id must be omitted after restore: {consumer_body:?}"
+    );
+
+    let (status, upstream_body, _) = admin_get(&base_url, "/upstreams/norm-upstream", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(upstream_body["targets"][0]["host"], "reviews.mesh.internal");
+    assert_eq!(upstream_body["backend_tls_sni"], "reviews.mesh.internal");
+    assert_eq!(
+        upstream_body["backend_tls_san_allow_list"][0],
+        "reviews.mesh.internal"
+    );
+    assert_eq!(
+        upstream_body["backend_tls_san_allow_list"][1],
+        "spiffe://Cluster.Local/ns/Default/sa/Reviews"
+    );
+
+    let (status, plugin_body, _) =
+        admin_get(&base_url, "/plugins/config/norm-plugin", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert!(
+        plugin_body.get("proxy_id").is_none() || plugin_body["proxy_id"].is_null(),
+        "blank proxy_id must be omitted after restore: {plugin_body:?}"
+    );
+
+    let (status, restored_backup, _) = admin_get(&base_url, "/backup", &token).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    assert_eq!(
+        restored_backup["proxies"][0]["hosts"],
+        backup["proxies"][0]["hosts"]
+    );
+    assert_eq!(
+        restored_backup["proxies"][0]["backend_host"],
+        backup["proxies"][0]["backend_host"]
+    );
+    assert_eq!(
+        restored_backup["upstreams"][0]["backend_tls_sni"],
+        backup["upstreams"][0]["backend_tls_sni"]
+    );
+    assert_eq!(
+        restored_backup["upstreams"][0]["backend_tls_san_allow_list"],
+        backup["upstreams"][0]["backend_tls_san_allow_list"]
+    );
+}
+
+#[tokio::test]
 async fn test_restore_hashes_consumer_secrets() {
     // `hash_basic_auth_password` (in `src/config/types.rs`) reads
     // `FERRUM_BASIC_AUTH_HMAC_SECRET` from the environment via
@@ -6985,6 +7219,9 @@ async fn test_cluster_endpoint_dp_mode_connected() {
             is_primary: true,
             last_config_received_at: Some(now),
             connected_since: Some(now),
+            config_diverged: false,
+            config_diverged_since: None,
+            config_divergence_recoveries_total: 0,
         },
     )));
     let state = AdminState {
@@ -7029,6 +7266,12 @@ async fn test_cluster_endpoint_dp_mode_connected() {
     assert_eq!(body["control_plane"]["url"], "http://cp:50051");
     assert!(body["control_plane"]["connected_since"].is_string());
     assert!(body["control_plane"]["last_config_received_at"].is_string());
+    assert_eq!(body["control_plane"]["config_diverged"], false);
+    assert!(body["control_plane"]["config_diverged_since"].is_null());
+    assert_eq!(
+        body["control_plane"]["config_divergence_recoveries_total"],
+        0
+    );
 }
 
 #[tokio::test]
@@ -7078,6 +7321,11 @@ async fn test_cluster_endpoint_dp_mode_disconnected() {
     assert_eq!(body["control_plane"]["status"], "offline");
     assert!(body["control_plane"]["connected_since"].is_null());
     assert!(body["control_plane"]["last_config_received_at"].is_null());
+    assert_eq!(body["control_plane"]["config_diverged"], false);
+    assert_eq!(
+        body["control_plane"]["config_divergence_recoveries_total"],
+        0
+    );
 }
 
 #[tokio::test]

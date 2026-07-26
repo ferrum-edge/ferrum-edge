@@ -7,7 +7,9 @@
 //!   free helpers such as `tls_managed_store_path_from_env`)
 //! - public controls resolved outside `EnvConfig` (conf-file bootstrap,
 //!   secret-fetch timeout, mesh/injector/node-agent/pool helpers, PKCS#11,
-//!   and dynamically constructed injector resource quantities)
+//!   dynamically constructed injector resource quantities, and the dynamic
+//!   `ai_transcript_audit` sink-secret namespace
+//!   [`TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV`])
 //!
 //! [`PUBLIC_FERRUM_ENV_COVERAGE_EXEMPTIONS`] is a small allowlist for accepted
 //! compatibility aliases that intentionally share the canonical setting's
@@ -20,6 +22,17 @@
 //! `docs/configuration.md` table row or a `ferrum.conf` template assignment,
 //! and when production `EnvConfig` acceptance sites omit a key from this
 //! inventory.
+
+/// Canonical documented example key for the dynamic
+/// `FERRUM_TRANSCRIPT_SINK_SECRET_<NAME>` namespace.
+///
+/// `ai_transcript_audit` resolves a `sink.custom_headers` value of
+/// `${secret:NAME}` against `FERRUM_TRANSCRIPT_SINK_SECRET_<NAME>` only, where
+/// `<NAME>` is any uppercase `[A-Z_][A-Z0-9_]*` suffix. The namespace therefore
+/// has no fixed key set; this representative key is its machine-checkable
+/// inventory member and owns the matching `docs/configuration.md` row and
+/// `ferrum.conf` template assignment for the whole namespace.
+pub const TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV: &str = "FERRUM_TRANSCRIPT_SINK_SECRET_AUDIT_TOKEN";
 
 /// Complete sorted inventory of public operator `FERRUM_*` settings.
 ///
@@ -430,6 +443,12 @@ pub const PUBLIC_FERRUM_ENV_SETTINGS: &[&str] = &[
     "FERRUM_TLS_OFFLOAD_THREADS",
     "FERRUM_TLS_PREFER_SERVER_CIPHER_ORDER",
     "FERRUM_TLS_SESSION_CACHE_SIZE",
+    // Representative documented member of the dynamic
+    // `FERRUM_TRANSCRIPT_SINK_SECRET_<NAME>` namespace read by
+    // `ai_transcript_audit` for `${secret:NAME}` sink headers. Arbitrary valid
+    // uppercase `<NAME>` suffixes are accepted at runtime; this example key is
+    // the canonical inventory/docs/`ferrum.conf` surface for the namespace.
+    TRANSCRIPT_SINK_SECRET_EXAMPLE_ENV,
     "FERRUM_TRUSTED_PROXIES",
     "FERRUM_UDP_CLEANUP_INTERVAL_SECONDS",
     "FERRUM_UDP_GRO_ENABLED",

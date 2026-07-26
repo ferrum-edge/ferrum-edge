@@ -25,12 +25,14 @@ fn cp_db_poll_interval_uses_missed_tick_delay() {
     );
 
     // Parity pin: database mode is the reference behavior for this setting.
+    // Polling runs under a supervised outer task (`db_poll_supervisor`) whose
+    // child interval still sets MissedTickBehavior::Delay (issue #2986).
     let database = include_str!("../../../src/modes/database.rs");
     let db_poll_start = database
-        .find("let db_poll_handle = tokio::spawn(async move {")
+        .find("let db_poll_supervisor = tokio::spawn(async move {")
         .expect("database poll task must exist");
     let db_poll_end = database[db_poll_start..]
-        .find("background_handles.push(db_poll_handle)")
+        .find("background_handles.push(db_poll_supervisor)")
         .expect("database poll task must be pushed onto background handles");
     let db_poll_section = &database[db_poll_start..db_poll_start + db_poll_end];
     assert!(

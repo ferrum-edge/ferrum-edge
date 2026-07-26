@@ -3,9 +3,18 @@
 //! The outer reconnect loop (`start_dp_client_with_shutdown`) uses exponential
 //! backoff with jitter (1s → 2s → 4s → … → 30s cap, ±25% jitter) to avoid
 //! thundering-herd reconnection storms when many DPs restart simultaneously.
+//! Backoff follows the failure sequence across multi-CP failover and is not
+//! reset merely because the selected CP index changed; a clean close that
+//! delivered no config message counts as a failure for backoff purposes.
+//! A transport/RPC failure after this attempt already accepted config also
+//! resets backoff (healthy progress). Intentional disconnect (primary retry /
+//! TLS reload) resets without sleeping as a failure.
+//!
 //! Inside the stream handler, two message types:
 //! - `update_type=0` (FULL_SNAPSHOT): replaces the entire `GatewayConfig`
 //! - `update_type=1` (DELTA): applies incremental changes via `apply_incremental()`
+//!
+//! Heartbeat frames (`ConfigUpdate.heartbeat`) refresh liveness without apply.
 //!
 //! Multi-CP failover: `cp_urls` is a priority-ordered list. The DP connects to
 //! the first (primary) URL and fails over to subsequent URLs when unreachable.
@@ -21,13 +30,28 @@ use serde::Serialize;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::sync::watch;
+use std::time::{Duration, Instant};
+use tokio::sync::{Notify, watch};
 use tonic::metadata::MetadataValue;
 use tonic::transport::channel::ClientTlsConfig;
-use tonic::transport::{Certificate, Channel, Identity};
+use tonic::transport::{Certificate, Channel, Endpoint, Identity};
 use tracing::{debug, error, info, warn};
 
+use super::configsync_lifecycle::{
+    AppliedSnapshotAuthority, CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
+    CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS, CONFIGSYNC_TCP_KEEPALIVE_SECS,
+    ConfigSyncAttemptOutcome, ConfigSyncDivergenceMetrics, ConfigSyncStreamTimings,
+    DeltaRejectionKind, FullSnapshotStreamDisposition, GatewayTrustEquivalenceState,
+    MultiCpBackoffState, SubscriptionApplyState, advance_authority_from_committed,
+    advance_multi_cp_backoff, authoritative_snapshot_payload_matches,
+    check_peer_version_compatibility, connection_error_outcome, delta_rejection_stream_disposition,
+    evaluate_delta_against_subscription_base, evaluate_snapshot_clock_skew,
+    full_snapshot_stream_disposition, gateway_trust_equivalence_state,
+    grow_backoff_after_failure_sleep, heartbeat_frame_admissible, reconcile_snapshot_version,
+    record_applied_gateway_trust, resolve_authority_trust_after_snapshot,
+    resource_delta_advances_authority, silence_watchdog_armed, snapshot_failure_stream_disposition,
+    snapshot_requires_older_payload_exception, stale_reject_from_reconcile,
+};
 use super::proto::SubscribeRequest;
 use super::proto::config_sync_client::ConfigSyncClient;
 use crate::FERRUM_VERSION;
@@ -38,7 +62,7 @@ use crate::identity::TrustBundleSet as RuntimeTrustBundleSet;
 use crate::modes::mesh::config::TrustBundleSet as ConfigTrustBundleSet;
 use crate::proxy::{ConfigApplyOutcome, ProxyState};
 use crate::tls::source::{CertSource, MaterialKind, load_material_blocking};
-use crate::util::backoff::{BACKOFF_INITIAL_SECS, jittered_backoff, next_backoff_secs};
+use crate::util::backoff::jittered_backoff;
 
 /// Tracks the DP's connection status to its Control Plane.
 /// Shared between the DP gRPC client and the admin API (`GET /cluster`).
@@ -50,10 +74,19 @@ pub struct DpCpConnectionState {
     pub cp_url: String,
     /// Whether the current CP is the primary (index 0) or a fallback.
     pub is_primary: bool,
-    /// Timestamp of the last config update received from CP.
+    /// Timestamp of the last *accepted* config update received from CP.
+    /// Rejected resource deltas must not advance this stamp.
     pub last_config_received_at: Option<DateTime<Utc>>,
     /// When the current connection was established (None if disconnected).
     pub connected_since: Option<DateTime<Utc>>,
+    /// Sticky operator signal: a non-empty ConfigSync DELTA was rejected and
+    /// the DP has not yet accepted an authoritative FULL_SNAPSHOT recovery
+    /// (issue #2394). Last-known-good config continues to serve.
+    pub config_diverged: bool,
+    /// When sticky divergence was first raised (cleared on FULL_SNAPSHOT recovery).
+    pub config_diverged_since: Option<DateTime<Utc>>,
+    /// Count of divergence → FULL_SNAPSHOT recovery transitions.
+    pub config_divergence_recoveries_total: u64,
 }
 
 impl DpCpConnectionState {
@@ -64,6 +97,36 @@ impl DpCpConnectionState {
             is_primary: true,
             last_config_received_at: None,
             connected_since: None,
+            config_diverged: false,
+            config_diverged_since: None,
+            config_divergence_recoveries_total: 0,
+        }
+    }
+
+    /// Build the connected-state view a reconnect must publish, preserving the
+    /// applied-config age and sticky ConfigSync divergence carried across the
+    /// disconnect while marking the new stream connected.
+    ///
+    /// A reconnect (including CP failover) must not reset `last_config_received_at`
+    /// or clear `config_diverged` / `config_diverged_since` /
+    /// `config_divergence_recoveries_total`: last-known-good config keeps serving
+    /// and sticky divergence clears only after an accepted authoritative
+    /// FULL_SNAPSHOT, not merely because the transport reconnected.
+    pub fn reconnected(
+        &self,
+        cp_url: &str,
+        is_primary: bool,
+        connected_since: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            connected: true,
+            cp_url: cp_url.to_string(),
+            is_primary,
+            last_config_received_at: self.last_config_received_at,
+            connected_since: Some(connected_since),
+            config_diverged: self.config_diverged,
+            config_diverged_since: self.config_diverged_since,
+            config_divergence_recoveries_total: self.config_divergence_recoveries_total,
         }
     }
 }
@@ -139,6 +202,7 @@ pub struct DpFrontendTlsRuntime {
 }
 
 impl DpFrontendTlsRuntime {
+    #[allow(dead_code)] // compatibility wrapper and external unit-test construction
     pub fn new(listener_slot: crate::tls::SharedFrontendTls) -> Self {
         Self {
             listener_slot,
@@ -325,6 +389,45 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     jwt_secret: GrpcJwtSecret,
     proxy_state: ProxyState,
     shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    tls_config: Option<DpGrpcTlsConfig>,
+    tls_reload: Option<DpGrpcTlsReload>,
+    startup_ready: Option<Arc<AtomicBool>>,
+    namespace: String,
+    primary_retry_secs: u64,
+    connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
+    frontend_tls_runtime: Option<DpFrontendTlsRuntime>,
+) {
+    start_dp_client_with_stream_timings(
+        cp_urls,
+        jwt_secret,
+        proxy_state,
+        shutdown_rx,
+        tls_config,
+        tls_reload,
+        startup_ready,
+        namespace,
+        primary_retry_secs,
+        connection_state,
+        frontend_tls_runtime,
+        ConfigSyncStreamTimings::production(),
+    )
+    .await
+}
+
+/// Same as [`start_dp_client_with_shutdown_and_startup_ready`] with an explicit
+/// per-invocation ConfigSync stream timing policy.
+///
+/// Production callers use the wrapper above, which always passes
+/// [`ConfigSyncStreamTimings::production`]. Tests use this entry point to
+/// compress the silent-partition bound so blackhole→failover is provable in
+/// bounded hosted CI. The policy is a plain stack argument, so a test value has
+/// no path into a production DP.
+#[allow(clippy::too_many_arguments)]
+pub async fn start_dp_client_with_stream_timings(
+    cp_urls: Vec<String>,
+    jwt_secret: GrpcJwtSecret,
+    proxy_state: ProxyState,
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     mut tls_config: Option<DpGrpcTlsConfig>,
     tls_reload: Option<DpGrpcTlsReload>,
     startup_ready: Option<Arc<AtomicBool>>,
@@ -332,6 +435,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
     primary_retry_secs: u64,
     connection_state: Option<Arc<ArcSwap<DpCpConnectionState>>>,
     frontend_tls_runtime: Option<DpFrontendTlsRuntime>,
+    timings: ConfigSyncStreamTimings,
 ) {
     if cp_urls.is_empty() {
         error!("No CP URLs configured — cannot start DP client");
@@ -363,9 +467,7 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
         );
     }
 
-    let mut current_cp_index: usize = 0;
-    let mut backoff_secs = BACKOFF_INITIAL_SECS;
-    let mut full_cycle_count: u32 = 0;
+    let mut backoff = MultiCpBackoffState::new();
     let mut last_tls_revision = tls_reload
         .as_ref()
         .map(|reload| *reload.revision_rx.borrow())
@@ -383,6 +485,14 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                 .as_ref()
                 .and_then(|slot| slot.load_full().as_ref().clone()),
         )));
+    let mut snapshot_authority: Option<AppliedSnapshotAuthority> = None;
+    let divergence_metrics = Arc::new(ConfigSyncDivergenceMetrics::default());
+    crate::plugins::prometheus_metrics::global_registry()
+        .set_configsync_divergence_metrics(divergence_metrics.clone());
+    // Event-driven startup-readiness wakeup shared across subscription attempts.
+    // Paired with `startup_ready` (the source-of-truth flag) so the fallback
+    // primary-retry timer waits for readiness without a busy-poll (nit N2).
+    let readiness_signal = Arc::new(Notify::new());
 
     loop {
         if let Some(ref rx) = shutdown_rx
@@ -417,14 +527,14 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             }
         }
 
-        let cp_url = &cp_urls[current_cp_index];
-        let is_primary = current_cp_index == 0;
+        let cp_url = &cp_urls[backoff.current_cp_index];
+        let is_primary = backoff.current_cp_index == 0;
         let is_fallback = !is_primary && cp_count > 1;
 
         if is_fallback {
             info!(
                 "Connecting to fallback CP [{}/{}] at {}",
-                current_cp_index + 1,
+                backoff.current_cp_index + 1,
                 cp_count,
                 cp_url
             );
@@ -432,146 +542,184 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             info!("Connecting to primary CP at {}", cp_url);
         }
 
-        // When connected to a fallback CP and primary_retry_secs > 0,
-        // race the stream against a timer to periodically retry the primary.
-        // The timer is only armed after startup readiness (initial snapshot applied)
-        // to avoid disconnecting from the fallback before the DP has any config.
-        //
-        // Acquire pairs with the Release store in connect_and_subscribe_with_startup_ready
-        // (and the admin /health endpoint reads with Acquire too). On x86 all loads are
-        // acquire-fenced by the hardware, but on ARM/AArch64 Relaxed could theoretically
-        // delay visibility of the store, so we use Acquire/Release consistently.
-        let should_race_primary = is_fallback
-            && primary_retry_secs > 0
-            && startup_ready
-                .as_ref()
-                .is_none_or(|r| r.load(Ordering::Acquire));
-        let result = if should_race_primary {
-            tokio::select! {
-                res = connect_and_subscribe_with_startup_ready_inner(
-                    cp_url,
-                    &jwt_secret,
-                    &node_id,
-                    &proxy_state,
-                    tls_config.as_ref(),
-                    startup_ready.clone(),
-                    &namespace,
-                    connection_state.as_ref(),
-                    is_primary,
-                    frontend_tls_slot.as_ref(),
-                    frontend_tls_runtime.as_ref(),
-                    cp_frontend_tls_materialized.clone(),
-                    frontend_tls_restore_slot.clone(),
-                ) => res,
-                _ = tokio::time::sleep(Duration::from_secs(primary_retry_secs)) => {
-                    info!(
-                        "Primary CP retry interval ({}s) elapsed; disconnecting from \
-                         fallback CP [{}/{}] to retry primary",
-                        primary_retry_secs,
-                        current_cp_index + 1,
-                        cp_count,
-                    );
-                    // Mark disconnected before switching — record fallback CP as last attempted
-                    update_state_disconnected(&connection_state, cp_url, is_primary);
-                    current_cp_index = 0;
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
-                }
-                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                    info!("{} gRPC TLS source changed; reconnecting CP stream", tls_reload.as_ref().map(|reload| reload.label).unwrap_or("DP"));
-                    update_state_disconnected(&connection_state, cp_url, is_primary);
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
-                }
-            }
-        } else {
-            tokio::select! {
-                res = connect_and_subscribe_with_startup_ready_inner(
-                    cp_url,
-                    &jwt_secret,
-                    &node_id,
-                    &proxy_state,
-                    tls_config.as_ref(),
-                    startup_ready.clone(),
-                    &namespace,
-                    connection_state.as_ref(),
-                    is_primary,
-                    frontend_tls_slot.as_ref(),
-                    frontend_tls_runtime.as_ref(),
-                    cp_frontend_tls_materialized.clone(),
-                    frontend_tls_restore_slot.clone(),
-                ) => res,
-                _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                    info!("{} gRPC TLS source changed; reconnecting CP stream", tls_reload.as_ref().map(|reload| reload.label).unwrap_or("DP"));
-                    update_state_disconnected(&connection_state, cp_url, is_primary);
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
-                }
-                _ = wait_for_readiness_then_primary_retry(
-                    startup_ready.clone(),
-                    primary_retry_secs,
-                ), if is_fallback && primary_retry_secs > 0 => {
-                    info!(
-                        "Primary CP retry interval ({}s) elapsed after startup readiness; disconnecting from fallback CP [{}/{}] to retry primary",
-                        primary_retry_secs,
-                        current_cp_index + 1,
-                        cp_count,
-                    );
-                    update_state_disconnected(&connection_state, cp_url, is_primary);
-                    current_cp_index = 0;
-                    backoff_secs = BACKOFF_INITIAL_SECS;
-                    continue;
-                }
-            }
-        };
+        let result = connect_and_subscribe_with_startup_ready_inner(
+            cp_url,
+            &jwt_secret,
+            &node_id,
+            &proxy_state,
+            tls_config.as_ref(),
+            startup_ready.clone(),
+            &namespace,
+            connection_state.as_ref(),
+            is_primary,
+            frontend_tls_slot.as_ref(),
+            frontend_tls_runtime.as_ref(),
+            cp_frontend_tls_materialized.clone(),
+            frontend_tls_restore_slot.clone(),
+            shutdown_rx.clone(),
+            tls_reload.as_ref().map(|reload| reload.revision_rx.clone()),
+            if is_fallback { primary_retry_secs } else { 0 },
+            &mut snapshot_authority,
+            divergence_metrics.as_ref(),
+            readiness_signal.clone(),
+            timings,
+        )
+        .await;
 
-        let mut increase_backoff = true;
-        match result {
-            Ok(_) => {
+        let attempt_outcome = match result {
+            Ok(DpStreamEnd::Shutdown) => {
+                info!("DP client shutting down");
+                return;
+            }
+            Ok(DpStreamEnd::PrimaryRetry) => {
+                info!(
+                    "Primary CP retry interval ({}s) elapsed; disconnecting from \
+                     fallback CP [{}/{}] to retry primary",
+                    primary_retry_secs,
+                    backoff.current_cp_index + 1,
+                    cp_count,
+                );
+                update_state_disconnected(&connection_state, cp_url, is_primary);
+                backoff.current_cp_index = 0;
+                ConfigSyncAttemptOutcome::IntentionalDisconnect
+            }
+            Ok(DpStreamEnd::TlsReload) => {
+                info!(
+                    "{} gRPC TLS source changed; reconnecting CP stream",
+                    tls_reload
+                        .as_ref()
+                        .map(|reload| reload.label)
+                        .unwrap_or("DP")
+                );
+                update_state_disconnected(&connection_state, cp_url, is_primary);
+                ConfigSyncAttemptOutcome::IntentionalDisconnect
+            }
+            Ok(DpStreamEnd::Clean { received_config }) => {
                 warn!(
                     "CP [{}/{}] connection stream ended ({}), will reconnect...",
-                    current_cp_index + 1,
+                    backoff.current_cp_index + 1,
                     cp_count,
                     cp_url
                 );
                 update_state_disconnected(&connection_state, cp_url, is_primary);
-                // On clean disconnect, try primary first if we were on a fallback
-                if is_fallback {
-                    info!("Stream ended on fallback CP; will retry primary CP first");
-                    current_cp_index = 0;
+                if received_config {
+                    if is_fallback {
+                        info!("Stream ended on fallback CP; will retry primary CP first");
+                        backoff.current_cp_index = 0;
+                    }
+                    ConfigSyncAttemptOutcome::CleanCloseAfterConfig
+                } else {
+                    ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
                 }
-                backoff_secs = BACKOFF_INITIAL_SECS;
-                increase_backoff = false;
+            }
+            Ok(DpStreamEnd::StaleSnapshotFenced) => {
+                // The stream delivered a stale cross-source FULL_SNAPSHOT that we
+                // refused; the applied config is unchanged and still served. Fail
+                // over to the next CP with accumulating backoff — never reset it,
+                // and never mark config as received — so a stale fallback cache
+                // can neither roll config back nor masquerade as healthy progress.
+                warn!(
+                    "Refused stale FULL_SNAPSHOT from CP [{}/{}] ({}); failing over without \
+                     applying so a stale fallback cache cannot roll config back",
+                    backoff.current_cp_index + 1,
+                    cp_count,
+                    cp_url
+                );
+                update_state_disconnected(&connection_state, cp_url, is_primary);
+                ConfigSyncAttemptOutcome::StaleSnapshotFenced
+            }
+            Ok(DpStreamEnd::InvalidDeltaFreshness) => {
+                // The CP supplied a DELTA whose envelope timestamp did not
+                // describe its body, or whose committed timestamp was
+                // implausibly far in the future. The delta was refused before
+                // apply, so fail over with accumulating backoff rather than
+                // letting that source poison the cross-CP freshness watermark.
+                warn!(
+                    "Refused invalid DELTA freshness from CP [{}/{}] ({}); failing over \
+                     without applying while keeping last-known-good config",
+                    backoff.current_cp_index + 1,
+                    cp_count,
+                    cp_url
+                );
+                update_state_disconnected(&connection_state, cp_url, is_primary);
+                ConfigSyncAttemptOutcome::InvalidDeltaFreshness
+            }
+            Ok(DpStreamEnd::InvalidSubscriptionBase) => {
+                // No valid FULL_SNAPSHOT base was established (or a pre-snapshot
+                // DELTA arrived first). Fail over with accumulating backoff so a
+                // later delta cannot apply against an unrelated old base.
+                warn!(
+                    "ConfigSync subscription from CP [{}/{}] ({}) failed to establish a valid \
+                     FULL_SNAPSHOT base; failing over without applying",
+                    backoff.current_cp_index + 1,
+                    cp_count,
+                    cp_url
+                );
+                update_state_disconnected(&connection_state, cp_url, is_primary);
+                ConfigSyncAttemptOutcome::InvalidSubscriptionBase
+            }
+            Ok(DpStreamEnd::ResyncAfterAcceptedConfig) => {
+                // Mid-stream unusable FULL_SNAPSHOT or rejected non-empty DELTA
+                // after a base was accepted. Keep serving last-known-good config,
+                // reset backoff, and reconnect to the same CP for a fresh
+                // authoritative FULL_SNAPSHOT (issues #2394 / snapshot failure).
+                warn!(
+                    "ConfigSync subscription from CP [{}/{}] ({}) requires an authoritative \
+                     FULL_SNAPSHOT resync; reconnecting while keeping last-known-good config",
+                    backoff.current_cp_index + 1,
+                    cp_count,
+                    cp_url
+                );
+                update_state_disconnected(&connection_state, cp_url, is_primary);
+                ConfigSyncAttemptOutcome::ResyncAfterAcceptedConfig
+            }
+            Ok(DpStreamEnd::TransportFailure { received_config }) => {
+                update_state_disconnected(&connection_state, cp_url, is_primary);
+                if received_config && is_fallback {
+                    info!(
+                        "Transport failure on fallback CP after accepted config; will retry primary CP first"
+                    );
+                    backoff.current_cp_index = 0;
+                }
+                connection_error_outcome(received_config)
             }
             Err(e) => {
                 error!(
                     "CP [{}/{}] connection error ({}): {}",
-                    current_cp_index + 1,
+                    backoff.current_cp_index + 1,
                     cp_count,
                     cp_url,
                     e
                 );
                 update_state_disconnected(&connection_state, cp_url, is_primary);
-
-                if cp_count > 1 {
-                    let next_index = (current_cp_index + 1) % cp_count;
-                    if next_index == 0 {
-                        full_cycle_count += 1;
-                        warn!(
-                            "All {} CP URLs exhausted (cycle {}), restarting from primary",
-                            cp_count, full_cycle_count
-                        );
-                        // Keep accumulated backoff when cycling back
-                    } else {
-                        // Fresh start on next CP
-                        backoff_secs = BACKOFF_INITIAL_SECS;
-                    }
-                    current_cp_index = next_index;
-                }
+                // Pre-stream connect/subscribe failures never delivered config.
+                ConfigSyncAttemptOutcome::ConnectionError
             }
+        };
+
+        let should_sleep = advance_multi_cp_backoff(&mut backoff, cp_count, attempt_outcome);
+        if !should_sleep {
+            continue;
         }
 
-        let sleep_duration = jittered_backoff(backoff_secs);
+        if matches!(
+            attempt_outcome,
+            ConfigSyncAttemptOutcome::ConnectionError
+                | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
+                | ConfigSyncAttemptOutcome::StaleSnapshotFenced
+                | ConfigSyncAttemptOutcome::InvalidSubscriptionBase
+                | ConfigSyncAttemptOutcome::InvalidDeltaFreshness
+        ) && backoff.current_cp_index == 0
+            && backoff.full_cycle_count > 0
+            && cp_count > 1
+        {
+            warn!(
+                "All {} CP URLs exhausted (cycle {}), restarting from primary",
+                cp_count, backoff.full_cycle_count
+            );
+        }
+
+        let sleep_duration = jittered_backoff(backoff.backoff_secs);
 
         if let Some(ref rx) = shutdown_rx {
             let mut rx_clone = rx.clone();
@@ -587,7 +735,13 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
                         return;
                     }
                     _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                        backoff_secs = BACKOFF_INITIAL_SECS;
+                        // TLS material rotated mid-backoff: reconnect immediately
+                        // with the new material (rebuilt at the top of the loop),
+                        // but PRESERVE accumulated failure backoff. No connection
+                        // has succeeded, so resetting to the initial delay would
+                        // let a flapping TLS source defeat backoff against a
+                        // still-failing CP (L2). Only real healthy progress or an
+                        // intentional connected disconnect resets backoff.
                         continue;
                     }
                 }
@@ -608,26 +762,84 @@ pub async fn start_dp_client_with_shutdown_and_startup_ready(
             tokio::select! {
                 _ = tokio::time::sleep(sleep_duration) => {}
                 _ = wait_optional_tls_reload(tls_reload.as_ref().map(|reload| reload.revision_rx.clone())) => {
-                    backoff_secs = BACKOFF_INITIAL_SECS;
+                    // Same as the shutdown-aware arm above: reconnect immediately
+                    // with rotated TLS material while preserving accumulated
+                    // failure backoff. A TLS source flap is not healthy progress
+                    // and must not reset the delay against a still-failing CP (L2).
                     continue;
                 }
             }
         }
 
-        backoff_secs = next_backoff_secs(backoff_secs, increase_backoff);
+        if matches!(
+            attempt_outcome,
+            ConfigSyncAttemptOutcome::ConnectionError
+                | ConfigSyncAttemptOutcome::CleanCloseWithoutConfig
+                | ConfigSyncAttemptOutcome::StaleSnapshotFenced
+                | ConfigSyncAttemptOutcome::InvalidSubscriptionBase
+                | ConfigSyncAttemptOutcome::InvalidDeltaFreshness
+        ) {
+            grow_backoff_after_failure_sleep(&mut backoff);
+        }
     }
+}
+
+/// How a ConfigSync stream session ended when the connection itself succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DpStreamEnd {
+    /// Stream closed cleanly (EOF).
+    Clean { received_config: bool },
+    /// Fallback primary-retry timer fired between messages.
+    PrimaryRetry,
+    /// CP/DP TLS material changed; reconnect with rotated material.
+    TlsReload,
+    /// Process shutdown observed while connected.
+    Shutdown,
+    /// A cross-source FULL_SNAPSHOT was fenced as stale/unorderable, so the DP
+    /// refused this stream before any later delta from it could apply against
+    /// the newer active config. The outer loop treats this as a
+    /// failover-with-backoff failure — never as delivered config (issue #2970).
+    StaleSnapshotFenced,
+    /// A DELTA envelope/body timestamp was inconsistent or implausibly far in
+    /// the future. The update is refused before apply and the outer loop fails
+    /// over with accumulating backoff so freshness authority cannot be poisoned.
+    InvalidDeltaFreshness,
+    /// This subscription never committed a valid FULL_SNAPSHOT base (invalid /
+    /// unparseable / rejected initial snapshot, or a pre-snapshot DELTA). Fail
+    /// over with accumulating backoff.
+    InvalidSubscriptionBase,
+    /// Mid-stream unusable FULL_SNAPSHOT or rejected non-empty DELTA after a
+    /// base was accepted. Keep serving last-known-good and reconnect for a
+    /// fresh authoritative snapshot (issue #2394).
+    ResyncAfterAcceptedConfig,
+    /// Transport/RPC failure after Subscribe succeeded. `received_config`
+    /// distinguishes backoff reset (issue #2968) from accumulating failure.
+    TransportFailure { received_config: bool },
 }
 
 async fn wait_for_readiness_then_primary_retry(
     startup_ready: Option<Arc<AtomicBool>>,
+    readiness_signal: Arc<Notify>,
     primary_retry_secs: u64,
 ) {
-    let Some(startup_ready) = startup_ready else {
-        std::future::pending::<()>().await;
-        return;
-    };
-    while !startup_ready.load(Ordering::Acquire) {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    // A startup-readiness gate only DELAYS the first primary retry so the DP does
+    // not flap back to the primary before it is serving; it must never disable the
+    // retry entirely. When no gate is supplied (`None`) there is nothing to wait
+    // for, so fire on the plain `primary_retry_secs` cadence — matching the
+    // pre-refactor `startup_ready.is_none_or(..)` race semantics. Returning a
+    // never-ready future here would strand the DP on a fallback CP forever.
+    if let Some(startup_ready) = startup_ready {
+        // Event-driven wait (no 100ms busy-poll, nit N2). `startup_ready` is the
+        // source of truth; the paired `Notify` only delivers the wakeup. The
+        // apply path stores `true` then calls `notify_one`, which stores a permit
+        // even if no waiter is currently parked — so a store that races the flag
+        // check below is never a lost wakeup: the subsequent `notified().await`
+        // consumes the stored permit immediately and the loop re-observes the
+        // flag. Cancellation-safe: dropping this future (when another select! arm
+        // wins) leaves no state behind.
+        while !startup_ready.load(Ordering::Acquire) {
+            readiness_signal.notified().await;
+        }
     }
     tokio::time::sleep(Duration::from_secs(primary_retry_secs)).await;
 }
@@ -657,6 +869,9 @@ fn update_state_disconnected(
             is_primary,
             last_config_received_at: prev.last_config_received_at,
             connected_since: None,
+            config_diverged: prev.config_diverged,
+            config_diverged_since: prev.config_diverged_since,
+            config_divergence_recoveries_total: prev.config_divergence_recoveries_total,
         }));
     }
 }
@@ -671,6 +886,77 @@ fn update_state_config_received(connection_state: Option<&Arc<ArcSwap<DpCpConnec
             is_primary: prev.is_primary,
             last_config_received_at: Some(Utc::now()),
             connected_since: prev.connected_since,
+            config_diverged: prev.config_diverged,
+            config_diverged_since: prev.config_diverged_since,
+            config_divergence_recoveries_total: prev.config_divergence_recoveries_total,
+        }));
+    }
+}
+
+/// Raise sticky config divergence without advancing last_config_received_at.
+fn update_state_config_diverged(
+    connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
+    metrics: &ConfigSyncDivergenceMetrics,
+) {
+    metrics.record_rejection();
+    crate::plugins::prometheus_metrics::global_registry()
+        .invalidate_configsync_divergence_metrics_cache();
+    if let Some(cs) = connection_state {
+        let prev = cs.load();
+        let since = prev.config_diverged_since.unwrap_or_else(Utc::now);
+        cs.store(Arc::new(DpCpConnectionState {
+            connected: prev.connected,
+            cp_url: prev.cp_url.clone(),
+            is_primary: prev.is_primary,
+            last_config_received_at: prev.last_config_received_at,
+            connected_since: prev.connected_since,
+            config_diverged: true,
+            config_diverged_since: Some(since),
+            config_divergence_recoveries_total: prev.config_divergence_recoveries_total,
+        }));
+    }
+}
+
+/// Record a fenced (refused-without-applying) FULL_SNAPSHOT and
+/// invalidate the cached `/metrics` render so the fixed-cardinality fenced
+/// counter surfaces promptly. Fencing keeps last-known-good config and does not
+/// raise sticky `config_diverged` — it is a failover/skew signal, not a
+/// delta-rejection divergence.
+fn record_fenced_full_snapshot(metrics: &ConfigSyncDivergenceMetrics) {
+    metrics.record_fenced_snapshot();
+    crate::plugins::prometheus_metrics::global_registry()
+        .invalidate_configsync_divergence_metrics_cache();
+}
+
+/// Clear sticky divergence after an accepted authoritative FULL_SNAPSHOT.
+fn update_state_clear_divergence_after_snapshot(
+    connection_state: Option<&Arc<ArcSwap<DpCpConnectionState>>>,
+    metrics: &ConfigSyncDivergenceMetrics,
+) {
+    let recovered = metrics.record_recovery_after_full_snapshot();
+    if recovered {
+        crate::plugins::prometheus_metrics::global_registry()
+            .invalidate_configsync_divergence_metrics_cache();
+    }
+    if let Some(cs) = connection_state {
+        let prev = cs.load();
+        if !prev.config_diverged && !recovered {
+            return;
+        }
+        let recoveries = if prev.config_diverged {
+            prev.config_divergence_recoveries_total.saturating_add(1)
+        } else {
+            prev.config_divergence_recoveries_total
+        };
+        cs.store(Arc::new(DpCpConnectionState {
+            connected: prev.connected,
+            cp_url: prev.cp_url.clone(),
+            is_primary: prev.is_primary,
+            last_config_received_at: prev.last_config_received_at,
+            connected_since: prev.connected_since,
+            config_diverged: false,
+            config_diverged_since: None,
+            config_divergence_recoveries_total: recoveries,
         }));
     }
 }
@@ -730,6 +1016,25 @@ fn parse_gateway_trust_bundle_update(
     }
 
     Ok(GatewayTrustBundleUpdate::Unchanged)
+}
+
+/// Map an accepted trust side-channel update onto the bounded equivalence view.
+///
+/// `Unchanged` returns `None` so callers leave remembered trust state alone
+/// (and so older-cross-source complete-payload matching fails closed when a
+/// FULL_SNAPSHOT cannot establish comparable trust state). `Clear` /
+/// `Replace` always produce a comparable Absent/Present state. Callers must
+/// never invent Absent from `None`.
+fn gateway_trust_equivalence_after_update(
+    update: &GatewayTrustBundleUpdate,
+) -> Option<GatewayTrustEquivalenceState> {
+    match update {
+        GatewayTrustBundleUpdate::Unchanged => None,
+        GatewayTrustBundleUpdate::Clear => Some(GatewayTrustEquivalenceState::Absent),
+        GatewayTrustBundleUpdate::Replace(trust_bundles) => {
+            Some(gateway_trust_equivalence_state(Some(trust_bundles)))
+        }
+    }
 }
 
 fn apply_gateway_trust_bundle_update(
@@ -914,7 +1219,8 @@ pub async fn connect_and_subscribe(
     tls_config: Option<&DpGrpcTlsConfig>,
     namespace: &str,
 ) -> Result<(), anyhow::Error> {
-    connect_and_subscribe_with_startup_ready(
+    let mut authority = None;
+    match connect_and_subscribe_with_startup_ready_inner(
         cp_url,
         jwt_secret,
         node_id,
@@ -925,12 +1231,32 @@ pub async fn connect_and_subscribe(
         None,
         true,
         None,
+        None,
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(ArcSwap::new(Arc::new(None))),
+        None,
+        None,
+        0,
+        &mut authority,
+        &ConfigSyncDivergenceMetrics::default(),
+        Arc::new(Notify::new()),
+        ConfigSyncStreamTimings::production(),
     )
-    .await
+    .await?
+    {
+        DpStreamEnd::Shutdown | DpStreamEnd::Clean { .. } => Ok(()),
+        DpStreamEnd::PrimaryRetry | DpStreamEnd::TlsReload => Ok(()),
+        DpStreamEnd::StaleSnapshotFenced
+        | DpStreamEnd::InvalidDeltaFreshness
+        | DpStreamEnd::InvalidSubscriptionBase
+        | DpStreamEnd::ResyncAfterAcceptedConfig
+        | DpStreamEnd::TransportFailure { .. } => Ok(()),
+    }
 }
 
 /// Connect to CP and optionally flip startup readiness after the first applied snapshot.
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // compatibility wrapper; production uses the lifecycle-aware inner entry point
 pub async fn connect_and_subscribe_with_startup_ready(
     cp_url: &str,
     jwt_secret: &GrpcJwtSecret,
@@ -945,7 +1271,8 @@ pub async fn connect_and_subscribe_with_startup_ready(
 ) -> Result<(), anyhow::Error> {
     let frontend_tls_runtime =
         frontend_tls_slot.map(|slot| DpFrontendTlsRuntime::new(slot.clone()));
-    connect_and_subscribe_with_startup_ready_inner(
+    let mut authority = None;
+    match connect_and_subscribe_with_startup_ready_inner(
         cp_url,
         jwt_secret,
         node_id,
@@ -963,8 +1290,37 @@ pub async fn connect_and_subscribe_with_startup_ready(
                 .map(|slot| slot.load_full().as_ref().clone())
                 .unwrap_or(None),
         ))),
+        None,
+        None,
+        0,
+        &mut authority,
+        &ConfigSyncDivergenceMetrics::default(),
+        Arc::new(Notify::new()),
+        ConfigSyncStreamTimings::production(),
     )
-    .await
+    .await?
+    {
+        DpStreamEnd::Shutdown | DpStreamEnd::Clean { .. } => Ok(()),
+        DpStreamEnd::PrimaryRetry | DpStreamEnd::TlsReload => Ok(()),
+        DpStreamEnd::StaleSnapshotFenced
+        | DpStreamEnd::InvalidDeltaFreshness
+        | DpStreamEnd::InvalidSubscriptionBase
+        | DpStreamEnd::ResyncAfterAcceptedConfig
+        | DpStreamEnd::TransportFailure { .. } => Ok(()),
+    }
+}
+
+/// Build a ConfigSync client endpoint with bounded transport keepalive so
+/// silent partitions fail the stream instead of hanging forever on idle reads.
+pub fn configure_configsync_endpoint(endpoint: Endpoint) -> Endpoint {
+    endpoint
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(
+            CONFIGSYNC_HTTP2_KEEPALIVE_INTERVAL_SECS,
+        ))
+        .keep_alive_timeout(Duration::from_secs(CONFIGSYNC_HTTP2_KEEPALIVE_TIMEOUT_SECS))
+        .keep_alive_while_idle(true)
+        .tcp_keepalive(Some(Duration::from_secs(CONFIGSYNC_TCP_KEEPALIVE_SECS)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -982,9 +1338,15 @@ async fn connect_and_subscribe_with_startup_ready_inner(
     frontend_tls_runtime: Option<&DpFrontendTlsRuntime>,
     cp_frontend_tls_materialized: Arc<AtomicBool>,
     frontend_tls_restore_slot: Arc<ArcSwap<Option<Arc<rustls::ServerConfig>>>>,
-) -> Result<(), anyhow::Error> {
-    let mut endpoint =
-        Channel::from_shared(cp_url.to_string())?.connect_timeout(Duration::from_secs(10));
+    shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    tls_revision_rx: Option<watch::Receiver<u64>>,
+    primary_retry_secs: u64,
+    snapshot_authority: &mut Option<AppliedSnapshotAuthority>,
+    divergence_metrics: &ConfigSyncDivergenceMetrics,
+    readiness_signal: Arc<Notify>,
+    timings: ConfigSyncStreamTimings,
+) -> Result<DpStreamEnd, anyhow::Error> {
+    let mut endpoint = configure_configsync_endpoint(Channel::from_shared(cp_url.to_string())?);
 
     // Apply TLS configuration if the URL uses https:// or TLS config is provided
     if let Some(tls) = tls_config {
@@ -1054,221 +1416,498 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                 .clone()
                 .unwrap_or_default(),
         ),
+        // Advertise the heartbeat capability. The CP only emits keepalive frames
+        // to advertising subscribers, and only confirms the capability back on
+        // the initial update — so this DP arms its silence watchdog against a CP
+        // that actually committed to heartbeats, never against one that predates
+        // them.
+        supports_heartbeat: true,
     });
 
     let mut stream = client.subscribe(request).await?.into_inner();
-    let mut initial_snapshot_applied = startup_ready.is_none();
+    // Startup readiness is independent of subscription base gating: callers with
+    // `startup_ready = None` may skip startup-only wait/capability work, but every
+    // new subscription still requires an accepted FULL_SNAPSHOT before any DELTA.
+    let mut subscription = SubscriptionApplyState::new();
+    let skip_startup_readiness_work = startup_ready.is_none();
+    let mut received_config = false;
+    // Application silence is only a liveness signal once the CP has confirmed it
+    // will send heartbeats. Against a CP that predates the capability the stream
+    // is legitimately silent while idle, and arming the watchdog would force a
+    // reconnect the CP was never asked to prevent. Transport keepalive (HTTP/2
+    // PING + TCP) still covers those streams. Set true and never cleared: only
+    // the initial update carries the confirmation.
+    let mut heartbeats_negotiated = false;
+    // Silence before the *first* message is anomalous at any peer version, so
+    // the watchdog stays armed until one arrives (see `silence_watchdog_armed`).
+    let mut received_any_message = false;
+    let mut last_stream_activity = Instant::now();
+    let primary_retry_fut = wait_for_readiness_then_primary_retry(
+        startup_ready.clone(),
+        readiness_signal.clone(),
+        primary_retry_secs,
+    );
+    tokio::pin!(primary_retry_fut);
+    let enable_primary_retry = primary_retry_secs > 0;
+    let shutdown_fut = wait_optional_shutdown(shutdown_rx.clone());
+    tokio::pin!(shutdown_fut);
+    let tls_reload_fut = wait_optional_tls_reload(tls_revision_rx.clone());
+    tokio::pin!(tls_reload_fut);
 
-    // Mark connected
+    // Mark connected while preserving last applied-config age and sticky
+    // divergence across reconnects (see `DpCpConnectionState::reconnected`).
     if let Some(cs) = connection_state {
-        let now = Utc::now();
-        cs.store(Arc::new(DpCpConnectionState {
-            connected: true,
-            cp_url: cp_url.to_string(),
-            is_primary,
-            last_config_received_at: None,
-            connected_since: Some(now),
-        }));
+        let prev = cs.load();
+        cs.store(Arc::new(prev.reconnected(cp_url, is_primary, Utc::now())));
     }
 
-    while let Some(update) = stream.message().await? {
+    loop {
+        let silence_remaining = timings
+            .max_silence
+            .saturating_sub(last_stream_activity.elapsed());
+        let silence_armed = silence_watchdog_armed(heartbeats_negotiated, received_any_message);
+
+        // Poll lifecycle signals (shutdown / TLS reload / primary retry) before
+        // the message arm so a sustained stream cannot starve them, but keep the
+        // message arm ahead of the silence timer so real traffic always wins the
+        // liveness tie-break. These lifecycle futures are pending in steady
+        // state, so ordering them first never starves stream work. The config
+        // apply happens after this select returns — never inside an arm — so no
+        // arm can cancel an in-flight `spawn_blocking` apply.
+        let update = tokio::select! {
+            biased;
+            _ = &mut shutdown_fut => {
+                return Ok(DpStreamEnd::Shutdown);
+            }
+            _ = &mut tls_reload_fut => {
+                return Ok(DpStreamEnd::TlsReload);
+            }
+            _ = &mut primary_retry_fut, if enable_primary_retry => {
+                return Ok(DpStreamEnd::PrimaryRetry);
+            }
+            msg = stream.message() => {
+                match msg {
+                    Ok(Some(update)) => update,
+                    Ok(None) => {
+                        return Ok(DpStreamEnd::Clean { received_config });
+                    }
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            received_config,
+                            "ConfigSync stream RPC error; reconnecting"
+                        );
+                        return Ok(DpStreamEnd::TransportFailure { received_config });
+                    }
+                }
+            }
+            _ = tokio::time::sleep(silence_remaining), if silence_armed => {
+                error!(
+                    received_config,
+                    "ConfigSync stream silent for {}s (no message/heartbeat); reconnecting",
+                    timings.max_silence.as_secs()
+                );
+                return Ok(DpStreamEnd::TransportFailure { received_config });
+            }
+        };
+
+        last_stream_activity = Instant::now();
+        received_any_message = true;
+
+        // Every envelope, including a heartbeat, must come from a compatible
+        // peer. Otherwise an incompatible or malformed-version CP could keep a
+        // stream alive indefinitely while bypassing the config-update gate.
+        if let Err(err) = check_cp_version_compatibility(&update.ferrum_version) {
+            error!("{}", err);
+            return Ok(DpStreamEnd::TransportFailure { received_config });
+        }
+
+        if update.heartbeat {
+            // Heartbeats are valid only after this subscription accepted its
+            // authoritative base and the initial FULL_SNAPSHOT negotiated the
+            // capability. A heartbeat cannot bootstrap either state: accepting
+            // it would let a buggy/adversarial CP keep an unready DP connected
+            // forever without ever supplying usable configuration.
+            if !heartbeat_frame_admissible(subscription.base_applied, heartbeats_negotiated) {
+                warn!(
+                    base_applied = subscription.base_applied,
+                    heartbeats_negotiated,
+                    cp_url,
+                    "Refusing ConfigSync heartbeat before an accepted, negotiated \
+                     FULL_SNAPSHOT base; terminating stream"
+                );
+                return Ok(react_to_unusable_snapshot(subscription.base_applied));
+            }
+            debug!(
+                version = %update.version,
+                "Received ConfigSync heartbeat"
+            );
+            continue;
+        }
+
+        // The CP confirms heartbeat support only on a real FULL_SNAPSHOT.
+        // Rejecting a confirmation on DELTA prevents a partial update from
+        // changing lifecycle policy before establishing an authoritative base.
+        if update.heartbeat_negotiated && update.update_type != 0 {
+            warn!(
+                update_type = update.update_type,
+                cp_url, "Refusing heartbeat capability confirmation outside a FULL_SNAPSHOT"
+            );
+            return Ok(react_to_unusable_snapshot(subscription.base_applied));
+        }
+        if update.heartbeat_negotiated && !heartbeats_negotiated {
+            heartbeats_negotiated = true;
+            debug!(
+                max_silence_secs = timings.max_silence.as_secs(),
+                "CP confirmed ConfigSync heartbeat support; arming stream silence watchdog"
+            );
+        }
+
         info!(
             "Received config update (type={}, version={}, cp_version={})",
             update.update_type, update.version, update.ferrum_version
         );
 
-        // Validate CP version compatibility before applying any config.
-        if !update.ferrum_version.is_empty()
-            && let Err(msg) = check_cp_version_compatibility(&update.ferrum_version)
-        {
-            error!("{}", msg);
-            return Err(anyhow::anyhow!(msg));
-        }
-
         match update.update_type {
             0 => {
-                // FULL_SNAPSHOT — replace entire config
-                match serde_json::from_str::<GatewayConfig>(&update.config_json) {
-                    Ok(mut config) => {
-                        let gateway_trust_bundle_update =
-                            match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
-                                Ok(update) => update,
-                                Err(msg) => {
-                                    error!("CP config rejected — {}", msg);
-                                    error!(
-                                        "Ignoring config update with invalid gateway trust bundles"
-                                    );
-                                    continue;
-                                }
-                            };
-                        // Gateway trust material is delivered via the ConfigUpdate
-                        // side-channel. Do not retain any legacy/config-file copy in
-                        // the DP's regular GatewayConfig snapshot.
-                        config.trust_bundles = None;
-                        // Defense in depth: even though the CP-side
-                        // namespace check should prevent any
-                        // cross-namespace resources from reaching this
-                        // DP, filter again locally so a CP regression or
-                        // buggy/malicious snapshot can't leak resources
-                        // from another tenant into this DP's
-                        // GatewayConfig. See `filter_config_to_namespace`.
-                        let filtered = filter_config_to_namespace(&mut config, namespace);
-                        if filtered > 0 {
-                            warn!(
-                                "DP namespace filter '{}' excluded {} cross-namespace resources from CP snapshot — \
-                                 the CP should have filtered these (verify CP namespace matches DP)",
-                                namespace, filtered
-                            );
+                // FULL_SNAPSHOT — parse and validate the body first so freshness
+                // describes the committed GatewayConfig (`loaded_at`), not an
+                // inconsistent envelope string. Cross-CP fencing then runs on
+                // the reconciled committed stamp. A fenced or inconsistent
+                // snapshot must TERMINATE this stream (issue #2970). An invalid
+                // initial snapshot must also terminate so a later DELTA cannot
+                // apply against an unrelated old base.
+                let mut config = match serde_json::from_str::<GatewayConfig>(&update.config_json) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        error!("Failed to parse full config update: {}", e);
+                        return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    }
+                };
+                let gateway_trust_bundle_update =
+                    match parse_gateway_trust_bundle_update(&update.trust_bundles_json) {
+                        Ok(update) => update,
+                        Err(msg) => {
+                            error!("CP config rejected — {}", msg);
+                            error!("Ignoring config update with invalid gateway trust bundles");
+                            return Ok(react_to_unusable_snapshot(subscription.base_applied));
                         }
-                        if frontend_tls_slot.is_none() && clear_frontend_tls_material(&mut config) {
-                            warn!(
-                                "Ignoring CP-delivered frontend TLS material because this DP has no HTTPS listener"
-                            );
-                        }
-                        config.normalize_fields();
-                        config.resolve_upstream_tls();
-                        if let Err(errors) = config.validate_all_fields_with_ip_policy(
-                            proxy_state.env_config.tls_cert_expiry_warning_days,
-                            &proxy_state.env_config.backend_allow_ips,
-                        ) {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with invalid field values");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_hosts() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with invalid hosts");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_regex_listen_paths() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with invalid regex listen_paths");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_listen_path_encodings() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with encoded-slash listen_paths");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_unique_listen_paths() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with conflicting listen paths");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_stream_proxies() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with invalid stream proxy config");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_upstream_references() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with invalid upstream references");
-                            continue;
-                        }
-                        if let Err(errors) = config.validate_plugin_references() {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!("Ignoring config update with invalid plugin references");
-                            continue;
-                        }
-                        if let Err(errors) =
-                            crate::proxy::validate_mesh_route_dispatch_upstream_references(&config)
-                        {
-                            for msg in &errors {
-                                error!("CP config rejected — {}", msg);
-                            }
-                            error!(
-                                "Ignoring config update with invalid mesh_route_dispatch upstream references"
-                            );
-                            continue;
-                        }
-                        let frontend_tls_update = match stage_frontend_tls_snapshot(
-                            &config,
+                    };
+                // Gateway trust material is delivered via the ConfigUpdate
+                // side-channel. Do not retain any legacy/config-file copy in
+                // the DP's regular GatewayConfig snapshot.
+                config.trust_bundles = None;
+                // Defense in depth: even though the CP-side
+                // namespace check should prevent any
+                // cross-namespace resources from reaching this
+                // DP, filter again locally so a CP regression or
+                // buggy/malicious snapshot can't leak resources
+                // from another tenant into this DP's
+                // GatewayConfig. See `filter_config_to_namespace`.
+                let filtered = filter_config_to_namespace(&mut config, namespace);
+                if filtered > 0 {
+                    warn!(
+                        "DP namespace filter '{}' excluded {} cross-namespace resources from CP snapshot — \
+                         the CP should have filtered these (verify CP namespace matches DP)",
+                        namespace, filtered
+                    );
+                }
+                if frontend_tls_slot.is_none() && clear_frontend_tls_material(&mut config) {
+                    warn!(
+                        "Ignoring CP-delivered frontend TLS material because this DP has no HTTPS listener"
+                    );
+                }
+                config.normalize_fields();
+                config.resolve_upstream_tls();
+                if let Err(errors) = config.validate_all_fields_with_ip_policy(
+                    proxy_state.env_config.tls_cert_expiry_warning_days,
+                    &proxy_state.env_config.backend_allow_ips,
+                ) {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid field values");
+                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                }
+                if let Err(errors) = config.validate_hosts() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid hosts");
+                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                }
+                if let Err(errors) = config.validate_regex_listen_paths() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid regex listen_paths");
+                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                }
+                if let Err(errors) = config.validate_listen_path_encodings() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with encoded-slash listen_paths");
+                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                }
+                if let Err(errors) = config.validate_unique_listen_paths() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with conflicting listen paths");
+                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                }
+                if let Err(errors) = config.validate_stream_proxies() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid stream proxy config");
+                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                }
+                if let Err(errors) = config.validate_upstream_references() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid upstream references");
+                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                }
+                if let Err(errors) = config.validate_plugin_references() {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!("Ignoring config update with invalid plugin references");
+                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                }
+                if let Err(errors) =
+                    crate::proxy::validate_mesh_route_dispatch_upstream_references(&config)
+                {
+                    for msg in &errors {
+                        error!("CP config rejected — {}", msg);
+                    }
+                    error!(
+                        "Ignoring config update with invalid mesh_route_dispatch upstream references"
+                    );
+                    return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                }
+                // Freshness describes the committed body: envelope version must
+                // agree with GatewayConfig.loaded_at. Fail closed otherwise —
+                // never fabricate a timestamp.
+                let committed = match reconcile_snapshot_version(&update.version, config.loaded_at)
+                {
+                    Ok(committed) => committed,
+                    Err(err) => {
+                        let reason = stale_reject_from_reconcile(err);
+                        record_fenced_full_snapshot(divergence_metrics);
+                        warn!(
+                            ?reason,
+                            cp_url,
+                            version = %update.version,
+                            loaded_at = %config.loaded_at,
+                            "Refusing FULL_SNAPSHOT with inconsistent or unorderable version \
+                             and terminating this ConfigSync stream"
+                        );
+                        return Ok(DpStreamEnd::StaleSnapshotFenced);
+                    }
+                };
+                // Bounded clock-skew guard: a committed stamp implausibly far in
+                // this DP's future indicates a skewed or hostile CP clock. Admit
+                // it and the monotonic watermark is poisoned — every correct-clock
+                // failover CP with genuinely newer config is fenced until wall
+                // time catches up. Fail closed: refuse, alarm, and fail over while
+                // last-known-good config keeps serving. Never clamp the untrusted
+                // stamp into authority (issue M1).
+                if let Err(reason) = evaluate_snapshot_clock_skew(committed, Utc::now()) {
+                    record_fenced_full_snapshot(divergence_metrics);
+                    warn!(
+                        ?reason,
+                        cp_url,
+                        version = %update.version,
+                        loaded_at = %config.loaded_at,
+                        "Refusing FULL_SNAPSHOT with an implausibly-future committed timestamp \
+                         (CP clock skew beyond tolerance) and terminating this ConfigSync stream \
+                         so a skewed clock cannot poison the freshness watermark"
+                    );
+                    return Ok(DpStreamEnd::StaleSnapshotFenced);
+                }
+                // Older-cross-source identical-fallback must compare the complete
+                // authoritative payload: GatewayConfig content plus effective CP
+                // gateway-trust side-channel state. Empty/unchanged trust side
+                // channels fail closed (cannot establish equivalence). The two
+                // canonical JSON conversions are expensive, so only run them when
+                // the disposition actually depends on the exception — a cross-
+                // source candidate strictly older than a parseable applied
+                // watermark. Routine same-source/fresh snapshots skip it (nit N1).
+                let incoming_matches_applied = if snapshot_requires_older_payload_exception(
+                    snapshot_authority.as_ref(),
+                    committed,
+                    cp_url,
+                ) {
+                    let incoming_trust_equiv =
+                        gateway_trust_equivalence_after_update(&gateway_trust_bundle_update);
+                    // Compare like against like: the applied config has already
+                    // been through `update_config`'s pre-swap canonicalization
+                    // (HMAC quarantine, gateway workload-metrics identity
+                    // injection), which this candidate has not. Without that the
+                    // exception is silently inert on any node those steps touch —
+                    // notably a DP with a gateway SVID — and every equivalent
+                    // failover snapshot is fenced.
+                    let comparable = proxy_state.canonicalize_snapshot_for_comparison(&config);
+                    match snapshot_authority.as_ref() {
+                        Some(authority) => authoritative_snapshot_payload_matches(
+                            proxy_state.current_config().as_ref(),
+                            &authority.gateway_trust,
+                            &comparable,
+                            incoming_trust_equiv.as_ref(),
+                        ),
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                let watermark = match full_snapshot_stream_disposition(
+                    snapshot_authority.as_ref(),
+                    committed,
+                    cp_url,
+                    incoming_matches_applied,
+                ) {
+                    FullSnapshotStreamDisposition::Apply { version } => version,
+                    FullSnapshotStreamDisposition::RefuseAndTerminate(reason) => {
+                        record_fenced_full_snapshot(divergence_metrics);
+                        warn!(
+                            ?reason,
+                            cp_url,
+                            version = %update.version,
+                            "Refusing stale cross-source FULL_SNAPSHOT and terminating this \
+                             ConfigSync stream so no later delta from it can apply against newer \
+                             config; keeping applied config and failing over"
+                        );
+                        return Ok(DpStreamEnd::StaleSnapshotFenced);
+                    }
+                };
+
+                // Materialize external/file-backed TLS sources only after the
+                // snapshot passes freshness authorization. A stale/fenced CP
+                // must not trigger secret-provider access or mutate the local
+                // operator-TLS restore slot before the snapshot is refused.
+                let frontend_tls_update = match stage_frontend_tls_snapshot(
+                    &config,
+                    proxy_state,
+                    frontend_tls_slot,
+                    frontend_tls_runtime,
+                    cp_frontend_tls_materialized.as_ref(),
+                    frontend_tls_restore_slot.as_ref(),
+                ) {
+                    Ok(update) => update,
+                    Err(error) => {
+                        error!("CP config rejected — {}", error);
+                        error!("Ignoring config update with unusable frontend TLS material");
+                        return Ok(react_to_unusable_snapshot(subscription.base_applied));
+                    }
+                };
+
+                // Await apply to completion before returning to the
+                // select! above so primary-retry / TLS / shutdown arms
+                // cannot cancel a detached spawn_blocking mid-apply.
+                match proxy_state.update_config_off_thread(config).await {
+                    ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
+                        commit_frontend_tls_snapshot(
+                            frontend_tls_update,
                             proxy_state,
                             frontend_tls_slot,
                             frontend_tls_runtime,
                             cp_frontend_tls_materialized.as_ref(),
-                            frontend_tls_restore_slot.as_ref(),
-                        ) {
-                            Ok(update) => update,
-                            Err(error) => {
-                                error!("CP config rejected — {}", error);
-                                error!(
-                                    "Ignoring config update with unusable frontend TLS material"
-                                );
-                                continue;
-                            }
-                        };
-                        match proxy_state.update_config_off_thread(config).await {
-                            ConfigApplyOutcome::Applied | ConfigApplyOutcome::Unchanged => {
-                                commit_frontend_tls_snapshot(
-                                    frontend_tls_update,
-                                    proxy_state,
-                                    frontend_tls_slot,
-                                    frontend_tls_runtime,
-                                    cp_frontend_tls_materialized.as_ref(),
-                                )
-                                .await;
-                                apply_gateway_trust_bundle_update(
-                                    proxy_state,
-                                    gateway_trust_bundle_update,
-                                );
-                                update_state_config_received(connection_state);
-                                if !initial_snapshot_applied {
-                                    proxy_state
-                                        .stream_listener_manager
-                                        .wait_until_started(Duration::from_secs(10))
-                                        .await?;
-                                    // Block DP readiness on the first capability
-                                    // classification. Without this the `/health`
-                                    // endpoint would flip to ready while the
-                                    // registry is still empty, so an L4 LB could
-                                    // route traffic to an H3-only HTTPS backend
-                                    // and the cross-protocol bridge would 502
-                                    // until the background refresh landed.
-                                    // Subsequent CP snapshots don't take this
-                                    // path — `update_config` already spawns a
-                                    // coalesced background refresh for them.
-                                    proxy_state.refresh_backend_capabilities().await;
-                                    if let Some(ref startup_ready) = startup_ready {
-                                        startup_ready.store(true, Ordering::Release);
-                                    }
-                                    initial_snapshot_applied = true;
-                                    info!(
-                                        "DP startup complete; backend capabilities classified; /health now reports ready"
-                                    );
-                                }
-                                info!("Full configuration snapshot accepted from CP");
-                            }
-                            ConfigApplyOutcome::Rejected { .. } => {
-                                error!(
-                                    "Full configuration snapshot rejected during apply; keeping previous config"
+                        )
+                        .await;
+                        let next_trust =
+                            gateway_trust_equivalence_after_update(&gateway_trust_bundle_update);
+                        apply_gateway_trust_bundle_update(proxy_state, gateway_trust_bundle_update);
+                        update_state_config_received(connection_state);
+                        received_config = true;
+                        // Watermark is the monotonic value from fencing policy
+                        // (max of prior authority and committed loaded_at).
+                        // Explicit Clear/Replace establish comparable trust;
+                        // empty/Unchanged preserves prior state or remains
+                        // Unknown — never invent Absent from an unestablished
+                        // side channel.
+                        let gateway_trust = resolve_authority_trust_after_snapshot(
+                            snapshot_authority.as_ref(),
+                            next_trust,
+                        );
+                        *snapshot_authority = Some(AppliedSnapshotAuthority {
+                            version: Some(watermark),
+                            source_cp_url: cp_url.to_string(),
+                            gateway_trust,
+                        });
+                        // Authoritative FULL_SNAPSHOT clears sticky divergence
+                        // from a prior rejected delta (issue #2394).
+                        update_state_clear_divergence_after_snapshot(
+                            connection_state,
+                            divergence_metrics,
+                        );
+                        let first_base_on_subscription = !subscription.base_applied;
+                        subscription.note_full_snapshot_accepted();
+                        if first_base_on_subscription && !skip_startup_readiness_work {
+                            // Bind failures are non-fatal in DP mode —
+                            // do not tear down a healthy ConfigSync
+                            // stream or misclassify this as a CP error.
+                            if let Err(error) = proxy_state
+                                .stream_listener_manager
+                                .wait_until_started(Duration::from_secs(10))
+                                .await
+                            {
+                                warn!(
+                                    error = %error,
+                                    "Stream listener startup wait timed out after CP snapshot; continuing (bind failures are non-fatal in DP mode)"
                                 );
                             }
+                            // Block DP readiness on the first capability
+                            // classification. Without this the `/health`
+                            // endpoint would flip to ready while the
+                            // registry is still empty, so an L4 LB could
+                            // route traffic to an H3-only HTTPS backend
+                            // and the cross-protocol bridge would 502
+                            // until the background refresh landed.
+                            // Subsequent CP snapshots don't take this
+                            // path — `update_config` already spawns a
+                            // coalesced background refresh for them.
+                            proxy_state.refresh_backend_capabilities().await;
+                            if let Some(ref startup_ready) = startup_ready {
+                                startup_ready.store(true, Ordering::Release);
+                                // Wake a fallback subscription's primary-retry
+                                // timer waiting on readiness (event-driven, nit
+                                // N2). `notify_one` stores a permit so the wakeup
+                                // is never lost even if the waiter is mid-check.
+                                readiness_signal.notify_one();
+                            }
+                            info!(
+                                "DP startup complete; backend capabilities classified; /health now reports ready"
+                            );
                         }
+                        info!("Full configuration snapshot accepted from CP");
                     }
-                    Err(e) => {
-                        error!("Failed to parse full config update: {}", e);
+                    ConfigApplyOutcome::Rejected { .. } => {
+                        error!(
+                            "Full configuration snapshot rejected during apply; keeping previous config"
+                        );
+                        return Ok(react_to_unusable_snapshot(subscription.base_applied));
                     }
                 }
             }
             1 => {
-                // DELTA — apply incremental changes only
+                // DELTA — require a valid FULL_SNAPSHOT base on this subscription
+                // first. A buggy/adversarial CP that sends DELTA first must not
+                // apply against an unrelated old base.
+                if let Err(reason) =
+                    evaluate_delta_against_subscription_base(subscription.base_applied)
+                {
+                    warn!(
+                        ?reason,
+                        cp_url,
+                        "Refusing DELTA before a valid FULL_SNAPSHOT base on this \
+                         subscription; terminating stream without applying"
+                    );
+                    return Ok(DpStreamEnd::InvalidSubscriptionBase);
+                }
                 match serde_json::from_str::<IncrementalResult>(&update.config_json) {
                     Ok(mut result) => {
                         let gateway_trust_bundle_update =
@@ -1276,10 +1915,37 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 Ok(update) => update,
                                 Err(msg) => {
                                     error!("CP delta rejected — {}", msg);
-                                    error!("Ignoring delta with invalid gateway trust bundles");
-                                    continue;
+                                    error!(
+                                        "Terminating ConfigSync stream after invalid gateway trust \
+                                         side-channel so later resource deltas cannot apply"
+                                    );
+                                    let _ = delta_rejection_stream_disposition(
+                                        DeltaRejectionKind::InvalidTrustSideChannel,
+                                    );
+                                    update_state_config_diverged(
+                                        connection_state,
+                                        divergence_metrics,
+                                    );
+                                    return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
                                 }
                             };
+                        // Rolling-upgrade compatibility: a same-major.minor CP
+                        // that predates namespace-qualified removals sends bare
+                        // resource IDs, which decode without a namespace. Adopt
+                        // this subscription's already-authorized namespace — the
+                        // only one this DP may act on — so the legacy semantics
+                        // are reproduced without widening reach. Keys that stay
+                        // unqualified (empty namespace) are dropped by the
+                        // namespace filter immediately below.
+                        let unqualified = result.qualify_unqualified_removals(namespace);
+                        if unqualified > 0 {
+                            debug!(
+                                unqualified,
+                                namespace,
+                                "CP delta carried legacy unqualified removal keys; scoping them to \
+                                 this subscription's authorized namespace"
+                            );
+                        }
                         // Defense in depth: filter cross-namespace
                         // additions/modifications before applying. See
                         // `filter_incremental_to_namespace`.
@@ -1296,56 +1962,134 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                         // but a custom CP or test could still emit one. Treat as
                         // benign so we don't trip the divergence log below.
                         let was_empty = result.is_empty();
+                        let poll_timestamp = result.poll_timestamp;
 
-                        // Capture summary BEFORE moving `result` into apply_incremental
-                        // so the rejection log can identify the divergent CP push.
-                        let added_proxy_ids: Vec<String> = result
-                            .added_or_modified_proxies
-                            .iter()
-                            .map(|p| p.id.clone())
-                            .collect();
-                        let added_upstream_ids: Vec<String> = result
-                            .added_or_modified_upstreams
-                            .iter()
-                            .map(|u| u.id.clone())
-                            .collect();
-                        let added_consumer_ids: Vec<String> = result
-                            .added_or_modified_consumers
-                            .iter()
-                            .map(|c| c.id.clone())
-                            .collect();
-                        let added_plugin_config_ids: Vec<String> = result
-                            .added_or_modified_plugin_configs
-                            .iter()
-                            .map(|pc| pc.id.clone())
-                            .collect();
-                        let removed_proxy_ids = result.removed_proxy_ids.clone();
-                        let removed_upstream_ids = result.removed_upstream_ids.clone();
-                        let removed_consumer_ids = result.removed_consumer_ids.clone();
-                        let removed_plugin_config_ids = result.removed_plugin_config_ids.clone();
+                        // DELTA freshness is the body poll timestamp, not an
+                        // arbitrary envelope string. Refuse an inconsistency or
+                        // implausibly-future stamp before apply; otherwise a
+                        // skewed/hostile CP could commit a far-future
+                        // `loaded_at` and poison cross-CP freshness fencing.
+                        let committed_delta =
+                            match reconcile_snapshot_version(&update.version, poll_timestamp) {
+                                Ok(committed) => committed,
+                                Err(reason) => {
+                                    warn!(
+                                        ?reason,
+                                        cp_url,
+                                        version = %update.version,
+                                        poll_timestamp = %poll_timestamp,
+                                        "Refusing DELTA with inconsistent or unorderable freshness"
+                                    );
+                                    if !was_empty {
+                                        update_state_config_diverged(
+                                            connection_state,
+                                            divergence_metrics,
+                                        );
+                                    }
+                                    return Ok(DpStreamEnd::InvalidDeltaFreshness);
+                                }
+                            };
+                        if let Err(reason) =
+                            evaluate_snapshot_clock_skew(committed_delta, Utc::now())
+                        {
+                            warn!(
+                                ?reason,
+                                cp_url,
+                                version = %update.version,
+                                poll_timestamp = %poll_timestamp,
+                                "Refusing DELTA with an implausibly-future committed timestamp \
+                                 before it can poison the freshness watermark"
+                            );
+                            if !was_empty {
+                                update_state_config_diverged(connection_state, divergence_metrics);
+                            }
+                            return Ok(DpStreamEnd::InvalidDeltaFreshness);
+                        }
+
+                        // Capture a bounded summary BEFORE moving `result` into
+                        // apply_incremental. Logging every user-controlled ID
+                        // would allocate and amplify one rejection into an
+                        // unbounded log record; fixed counts retain useful
+                        // diagnostics without exposing resource names.
+                        let added_proxy_count = result.added_or_modified_proxies.len();
+                        let added_upstream_count = result.added_or_modified_upstreams.len();
+                        let added_consumer_count = result.added_or_modified_consumers.len();
+                        let added_plugin_config_count =
+                            result.added_or_modified_plugin_configs.len();
+                        let removed_proxy_count = result.removed_proxy_ids.len();
+                        let removed_upstream_count = result.removed_upstream_ids.len();
+                        let removed_consumer_count = result.removed_consumer_ids.len();
+                        let removed_plugin_config_count = result.removed_plugin_config_ids.len();
                         let cp_version = update.ferrum_version.clone();
                         let update_version = update.version;
 
                         match proxy_state.apply_incremental(result).await {
                             ConfigApplyOutcome::Applied => {
+                                let next_trust = gateway_trust_equivalence_after_update(
+                                    &gateway_trust_bundle_update,
+                                );
                                 apply_gateway_trust_bundle_update(
                                     proxy_state,
                                     gateway_trust_bundle_update,
                                 );
+                                if let Some(trust) = next_trust {
+                                    record_applied_gateway_trust(snapshot_authority, trust);
+                                }
                                 update_state_config_received(connection_state);
+                                received_config = true;
+                                // Advance freshness from the committed delta
+                                // timestamp so a later cross-source snapshot
+                                // cannot roll back past accepted deltas.
+                                if resource_delta_advances_authority(true, was_empty) {
+                                    let committed = proxy_state.config.load().loaded_at;
+                                    advance_authority_from_committed(
+                                        snapshot_authority,
+                                        cp_url,
+                                        committed,
+                                    );
+                                }
                                 info!("Incremental config delta applied from CP");
                             }
                             ConfigApplyOutcome::Unchanged => {
+                                let next_trust = gateway_trust_equivalence_after_update(
+                                    &gateway_trust_bundle_update,
+                                );
                                 if apply_gateway_trust_bundle_update(
                                     proxy_state,
                                     gateway_trust_bundle_update,
                                 ) {
+                                    if let Some(trust) = next_trust {
+                                        // Keep identical-fallback equivalence in
+                                        // sync after accepted trust-only updates.
+                                        record_applied_gateway_trust(snapshot_authority, trust);
+                                    }
                                     update_state_config_received(connection_state);
+                                    // An accepted trust-only update is authoritative
+                                    // config delivery even though the gateway object
+                                    // is unchanged — keep `received_config` in step
+                                    // with the connection-state timestamp.
+                                    // Do NOT advance snapshot authority watermark:
+                                    // trust-only side-channels are not resource-config
+                                    // freshness. Trust equivalence state is updated
+                                    // above so later complete-payload comparisons
+                                    // cannot see a stale trust view.
+                                    received_config = true;
                                     info!("Gateway trust bundle update applied from CP");
                                     continue;
                                 }
                                 if !was_empty {
                                     update_state_config_received(connection_state);
+                                    received_config = true;
+                                    // Valid unchanged resource candidate still
+                                    // advances freshness (poll_timestamp) so the
+                                    // watermark tracks accepted resource deltas.
+                                    if resource_delta_advances_authority(true, was_empty) {
+                                        advance_authority_from_committed(
+                                            snapshot_authority,
+                                            cp_url,
+                                            committed_delta,
+                                        );
+                                    }
                                     debug!(
                                         "Incremental config delta from CP was valid but unchanged"
                                     );
@@ -1354,62 +2098,99 @@ async fn connect_and_subscribe_with_startup_ready_inner(
                                 // Empty delta — preserve original behavior of not
                                 // touching `last_config_received_at` so cluster
                                 // observability still reflects only deltas that
-                                // carried real changes.
-                                if was_empty {
-                                    tracing::debug!(
-                                        "Ignoring empty delta from CP (no resource changes)"
-                                    );
-                                }
+                                // carried real changes. Do not advance authority.
+                                tracing::debug!(
+                                    "Ignoring empty delta from CP (no resource changes)"
+                                );
                             }
                             ConfigApplyOutcome::Rejected { errors } => {
-                                if apply_gateway_trust_bundle_update(
-                                    proxy_state,
-                                    gateway_trust_bundle_update,
-                                ) {
-                                    update_state_config_received(connection_state);
-                                    info!(
-                                        "Gateway trust bundle update applied from CP despite rejected resource delta"
-                                    );
-                                }
+                                // Rejected resource deltas must not advance
+                                // freshness authority or last_config_received_at.
+                                // Do not apply trust from a rejected resource batch.
+                                let _ = gateway_trust_bundle_update;
                                 if was_empty {
                                     tracing::debug!(
                                         "Ignoring rejected empty delta from CP (no resource changes)"
                                     );
                                 } else {
-                                    // apply_incremental rejected a non-empty delta
-                                    // — surface the divergence to operators so the
-                                    // DP does not silently keep serving its cached
-                                    // config until the next full snapshot.
+                                    // Non-empty rejection: stop consuming this stream
+                                    // so a later partial delta cannot apply against
+                                    // the wrong base (issue #2394).
+                                    let _ = delta_rejection_stream_disposition(
+                                        DeltaRejectionKind::NonEmptyApplyRejected,
+                                    );
                                     error!(
                                         cp_version = %cp_version,
                                         update_version = update_version,
-                                        added_proxies = ?added_proxy_ids,
-                                        removed_proxies = ?removed_proxy_ids,
-                                        added_upstreams = ?added_upstream_ids,
-                                        removed_upstreams = ?removed_upstream_ids,
-                                        added_consumers = ?added_consumer_ids,
-                                        removed_consumers = ?removed_consumer_ids,
-                                        added_plugin_configs = ?added_plugin_config_ids,
-                                        removed_plugin_configs = ?removed_plugin_config_ids,
+                                        added_proxies = added_proxy_count,
+                                        removed_proxies = removed_proxy_count,
+                                        added_upstreams = added_upstream_count,
+                                        removed_upstreams = removed_upstream_count,
+                                        added_consumers = added_consumer_count,
+                                        removed_consumers = removed_consumer_count,
+                                        added_plugin_configs = added_plugin_config_count,
+                                        removed_plugin_configs = removed_plugin_config_count,
                                         validation_errors = ?errors,
-                                        "DP rejected CP-pushed delta — divergence possible until next full snapshot"
+                                        "DP rejected CP-pushed delta — terminating stream for \
+                                         authoritative FULL_SNAPSHOT resync; last-known-good \
+                                         config kept serving"
                                     );
+                                    update_state_config_diverged(
+                                        connection_state,
+                                        divergence_metrics,
+                                    );
+                                    return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
                                 }
                             }
                         }
                     }
                     Err(e) => {
+                        // Parse failure is unclassifiable — fail closed (issue #2394).
                         error!("Failed to parse delta update: {}", e);
+                        let _ =
+                            delta_rejection_stream_disposition(DeltaRejectionKind::ParseFailure);
+                        update_state_config_diverged(connection_state, divergence_metrics);
+                        return Ok(DpStreamEnd::ResyncAfterAcceptedConfig);
                     }
                 }
             }
             other => {
-                warn!("Unknown config update type {}, ignoring", other);
+                warn!(
+                    update_type = other,
+                    cp_url,
+                    base_applied = subscription.base_applied,
+                    "Refusing unknown ConfigSync update type; terminating stream so an \
+                     unrecognized authoritative message cannot be skipped before later deltas"
+                );
+                return Ok(react_to_unusable_snapshot(subscription.base_applied));
             }
         }
     }
+}
 
-    Ok(())
+/// An unusable FULL_SNAPSHOT always terminates the subscription so later
+/// deltas cannot apply against a base that missed the authoritative reload.
+/// When a prior base was already accepted, reconnect for a fresh snapshot
+/// while keeping last-known-good config; otherwise fail over as an invalid base.
+fn react_to_unusable_snapshot(subscription_base_applied: bool) -> DpStreamEnd {
+    let _ = snapshot_failure_stream_disposition(subscription_base_applied);
+    if subscription_base_applied {
+        DpStreamEnd::ResyncAfterAcceptedConfig
+    } else {
+        DpStreamEnd::InvalidSubscriptionBase
+    }
+}
+
+async fn wait_optional_shutdown(mut shutdown_rx: Option<watch::Receiver<bool>>) {
+    let Some(rx) = shutdown_rx.as_mut() else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    while !*rx.borrow() {
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Defense-in-depth: filter a full config snapshot to only the DP's
@@ -1486,18 +2267,26 @@ fn clear_frontend_tls_material(config: &mut GatewayConfig) -> bool {
     had_material
 }
 
-/// Defense-in-depth filter for incremental deltas. Applied to
-/// `added_or_modified_*` vectors only; removal IDs are namespace-agnostic
-/// and harmless on the DP side because they only delete resources the DP
-/// already has (which were themselves filtered through this same check).
+/// Defense-in-depth filter for incremental deltas. Filters both
+/// `added_or_modified_*` vectors and namespace-qualified removal keys so a
+/// misrouted or adversarial delta cannot delete a same-id object in another
+/// namespace.
 ///
 /// Returns the number of resources filtered out so the caller can warn.
-fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace: &str) -> usize {
+///
+/// Exposed so the namespace-qualified removal fail-closed behavior can be
+/// exercised directly by external unit tests instead of reimplementing the
+/// retain logic.
+pub fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace: &str) -> usize {
     let pre = (
         result.added_or_modified_proxies.len(),
         result.added_or_modified_consumers.len(),
         result.added_or_modified_plugin_configs.len(),
         result.added_or_modified_upstreams.len(),
+        result.removed_proxy_ids.len(),
+        result.removed_consumer_ids.len(),
+        result.removed_plugin_config_ids.len(),
+        result.removed_upstream_ids.len(),
     );
     result
         .added_or_modified_proxies
@@ -1511,37 +2300,37 @@ fn filter_incremental_to_namespace(result: &mut IncrementalResult, namespace: &s
     result
         .added_or_modified_upstreams
         .retain(|u| u.namespace == namespace);
+    result
+        .removed_proxy_ids
+        .retain(|key| key.namespace == namespace);
+    result
+        .removed_consumer_ids
+        .retain(|key| key.namespace == namespace);
+    result
+        .removed_plugin_config_ids
+        .retain(|key| key.namespace == namespace);
+    result
+        .removed_upstream_ids
+        .retain(|key| key.namespace == namespace);
     (pre.0 - result.added_or_modified_proxies.len())
         + (pre.1 - result.added_or_modified_consumers.len())
         + (pre.2 - result.added_or_modified_plugin_configs.len())
         + (pre.3 - result.added_or_modified_upstreams.len())
+        + (pre.4 - result.removed_proxy_ids.len())
+        + (pre.5 - result.removed_consumer_ids.len())
+        + (pre.6 - result.removed_plugin_config_ids.len())
+        + (pre.7 - result.removed_upstream_ids.len())
 }
 
 /// Check whether the CP's reported version is compatible with this DP.
 ///
-/// Major and minor versions must match. Patch-level differences are allowed.
-pub(crate) fn check_cp_version_compatibility(cp_version: &str) -> Result<(), String> {
-    let dp_parts: Vec<&str> = FERRUM_VERSION.split('.').collect();
-    let cp_parts: Vec<&str> = cp_version.split('.').collect();
-
-    if dp_parts.len() < 2 || cp_parts.len() < 2 {
-        warn!(
-            "Unable to parse version for compatibility check (DP={}, CP={}), allowing connection",
-            FERRUM_VERSION, cp_version
-        );
-        return Ok(());
-    }
-
-    if dp_parts[0] != cp_parts[0] || dp_parts[1] != cp_parts[1] {
-        return Err(format!(
-            "Version mismatch: DP is v{} but CP is v{}. \
-             Major and minor versions must match. \
-             Upgrade the CP first, then upgrade DPs to the same major.minor version.",
-            FERRUM_VERSION, cp_version
-        ));
-    }
-
-    Ok(())
+/// Uses SemVer parsing. Major and minor must match; patch and prerelease/build
+/// differences are allowed. Empty and malformed versions are rejected
+/// (issue #2395). See [`check_peer_version_compatibility`] for the prerelease
+/// policy.
+pub fn check_cp_version_compatibility(cp_version: &str) -> Result<(), String> {
+    check_peer_version_compatibility(FERRUM_VERSION, cp_version)
+        .map_err(|err| err.message("DP", "CP", FERRUM_VERSION))
 }
 
 #[cfg(test)]
@@ -1553,27 +2342,12 @@ mod tests {
     //! `test_dp_filters_cross_namespace_resources_from_snapshot`.
     use super::*;
     use crate::config::EnvConfig;
+    use crate::config::db_loader::NamespacedResourceId;
     use crate::dns::{DnsCache, DnsConfig};
     use crate::proxy::ProxyState;
     use crate::util::backoff::jittered_backoff_with_entropy;
     use chrono::Utc;
     use serde_json::json;
-
-    #[test]
-    fn next_backoff_does_not_increase_after_clean_stream_end() {
-        assert_eq!(
-            next_backoff_secs(BACKOFF_INITIAL_SECS, false),
-            BACKOFF_INITIAL_SECS
-        );
-        assert_eq!(next_backoff_secs(16, false), BACKOFF_INITIAL_SECS);
-    }
-
-    #[test]
-    fn next_backoff_increases_after_connection_error_until_cap() {
-        assert_eq!(next_backoff_secs(1, true), 2);
-        assert_eq!(next_backoff_secs(16, true), 30);
-        assert_eq!(next_backoff_secs(30, true), 30);
-    }
 
     #[test]
     fn jittered_backoff_with_entropy_stays_within_expected_range() {
@@ -1739,6 +2513,13 @@ mod tests {
             err.contains("has no authorities"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn parse_gateway_trust_bundle_update_rejects_unparseable_json_fail_closed() {
+        let err = parse_gateway_trust_bundle_update("{not-json")
+            .expect_err("malformed trust side-channel must fail closed");
+        assert!(err.contains("not valid JSON"), "unexpected error: {err}");
     }
 
     fn proxy_in_namespace(id: &str, ns: &str) -> crate::config::types::Proxy {
@@ -1932,7 +2713,7 @@ mod tests {
                 proxy_in_namespace("p-prod", "production"),
                 proxy_in_namespace("p-staging", "staging"),
             ],
-            removed_proxy_ids: vec!["doesnt-matter".to_string()],
+            removed_proxy_ids: vec![NamespacedResourceId::new("ferrum", "doesnt-matter")],
             added_or_modified_consumers: vec![consumer_in_namespace("c-staging", "staging")],
             removed_consumer_ids: vec![],
             added_or_modified_plugin_configs: vec![plugin_config_in_namespace(
@@ -1950,7 +2731,10 @@ mod tests {
         };
 
         let filtered = filter_incremental_to_namespace(&mut delta, "production");
-        assert_eq!(filtered, 3, "1 proxy + 1 consumer + 1 upstream filtered");
+        assert_eq!(
+            filtered, 4,
+            "1 proxy + 1 consumer + 1 upstream + 1 foreign removal filtered"
+        );
 
         assert_eq!(delta.added_or_modified_proxies.len(), 1);
         assert_eq!(delta.added_or_modified_proxies[0].namespace, "production");
@@ -1958,10 +2742,8 @@ mod tests {
         assert_eq!(delta.added_or_modified_plugin_configs.len(), 1);
         assert_eq!(delta.added_or_modified_upstreams.len(), 1);
 
-        // Removal IDs are intentionally NOT filtered — the DP only has
-        // resources in its own namespace anyway, so deleting an unknown ID
-        // is harmless.
-        assert_eq!(delta.removed_proxy_ids.len(), 1);
+        // Removal keys are namespace-qualified and filtered fail-closed.
+        assert!(delta.removed_proxy_ids.is_empty());
     }
 
     #[test]

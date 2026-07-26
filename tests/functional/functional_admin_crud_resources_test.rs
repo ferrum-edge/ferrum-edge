@@ -240,6 +240,114 @@ async fn test_admin_mongodb_runtime_resource_crud_matrix() {
 
 #[tokio::test]
 #[ignore]
+async fn test_admin_restore_persists_normalized_canonical_fields_mongodb() {
+    // Hosted-CI functional coverage for issue #2402 on the MongoDB path.
+    let mongo_url =
+        std::env::var("FERRUM_TEST_MONGO_URL").unwrap_or_else(|_| DEFAULT_MONGO_URL.to_string());
+    if !mongodb_is_available(&mongo_url).await {
+        eprintln!("MongoDB is not available at {mongo_url}; skipping restore normalization");
+        return;
+    }
+
+    let mongo_database = format!("ferrum_restore_norm_{}", Uuid::new_v4().simple());
+    let _mongo_cleanup = MongoDatabaseCleanup::new(mongo_url.clone(), mongo_database.clone());
+
+    let gateway = TestGateway::builder()
+        .mode_database(DbType::Mongo(mongo_url))
+        .env("FERRUM_MONGO_DATABASE", mongo_database)
+        .log_level("warn")
+        .db_poll_interval_seconds(1)
+        .spawn()
+        .await
+        .expect("spawn mongodb gateway");
+
+    let client = Client::new();
+    let auth = gateway.auth_header();
+    let noncanonical = json!({
+        "consumers": [{
+            "id": "mongo-norm-consumer",
+            "username": "mongo_norm_user",
+            "custom_id": "   ",
+            "credentials": {}
+        }],
+        "upstreams": [{
+            "id": "mongo-norm-upstream",
+            "name": "mongo_norm_upstream",
+            "targets": [{"host": "Reviews.Mesh.Internal", "port": 8080, "weight": 100}],
+            "backend_tls_sni": "Reviews.Mesh.Internal",
+            "backend_tls_san_allow_list": [
+                "Reviews.Mesh.Internal",
+                "spiffe://Cluster.Local/ns/Default/sa/Reviews"
+            ]
+        }],
+        "proxies": [{
+            "id": "mongo-norm-proxy",
+            "hosts": ["API.Example.COM"],
+            "listen_path": "/mongo-norm",
+            "backend_scheme": "http",
+            "backend_host": "Backend.Example.COM",
+            "backend_port": 8080,
+            "strip_listen_path": true,
+            "upstream_id": "mongo-norm-upstream"
+        }],
+        "plugin_configs": [{
+            "id": "mongo-norm-plugin",
+            "plugin_name": "rate_limiting",
+            "scope": "global",
+            "proxy_id": "",
+            "enabled": true,
+            "config": {
+                "limits": [{"scope": "default", "window_seconds": 60, "max_requests": 100}]
+            }
+        }]
+    });
+
+    let restore = admin_post_json(
+        &client,
+        &gateway,
+        "/restore?confirm=true",
+        &auth,
+        noncanonical,
+    )
+    .await;
+    assert!(
+        restore.get("restored").is_some(),
+        "mongodb restore must succeed: {restore}"
+    );
+
+    let proxy = admin_get_json(&client, &gateway, "/proxies/mongo-norm-proxy", &auth).await;
+    assert_eq!(proxy["hosts"][0], "api.example.com");
+    assert_eq!(proxy["backend_host"], "backend.example.com");
+
+    let consumer = admin_get_json(&client, &gateway, "/consumers/mongo-norm-consumer", &auth).await;
+    assert!(
+        consumer.get("custom_id").is_none() || consumer["custom_id"].is_null(),
+        "blank custom_id must normalize away: {consumer}"
+    );
+
+    let upstream = admin_get_json(&client, &gateway, "/upstreams/mongo-norm-upstream", &auth).await;
+    assert_eq!(upstream["targets"][0]["host"], "reviews.mesh.internal");
+    assert_eq!(upstream["backend_tls_sni"], "reviews.mesh.internal");
+    assert_eq!(
+        upstream["backend_tls_san_allow_list"][0],
+        "reviews.mesh.internal"
+    );
+
+    let plugin = admin_get_json(
+        &client,
+        &gateway,
+        "/plugins/config/mongo-norm-plugin",
+        &auth,
+    )
+    .await;
+    assert!(
+        plugin.get("proxy_id").is_none() || plugin["proxy_id"].is_null(),
+        "blank proxy_id must normalize away: {plugin}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
 async fn test_file_mode_reload_updates_and_deletes_runtime_resources() {
     let backend_a = spawn_http_identifying("file-crud-a")
         .await

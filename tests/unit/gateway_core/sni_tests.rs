@@ -1,6 +1,7 @@
 use ferrum_edge::proxy::sni::{
     DtlsSniResult, extract_sni_from_client_hello, extract_sni_from_dtls_client_hello,
-    extract_sni_from_tcp_stream, initial_peek_capacity, next_peek_capacity, resolve_proxy_by_sni,
+    extract_sni_from_tcp_stream, initial_peek_capacity, next_peek_capacity,
+    no_deadline_peek_capacity, resolve_proxy_by_sni,
 };
 
 fn build_tls_client_hello(hostname: &str) -> Vec<u8> {
@@ -886,6 +887,103 @@ async fn test_extract_sni_from_tcp_stream_no_timeout_succeeds_on_clienthello() {
 
     let result = accept_task.await.expect("accept_task");
     assert_eq!(result, Some("example.com".to_string()));
+}
+
+/// Regression for issue #2962 on the NO-DEADLINE path: an oversized (>4 KiB)
+/// ClientHello whose SNI is serialized after fat extensions must still yield
+/// SNI when `handshake_timeout` is `None`. Sizing the single peek at the 4 KiB
+/// lazy floor would truncate the parse and silently misroute the connection to
+/// the catch-all proxy whenever
+/// `FERRUM_FRONTEND_TLS_HANDSHAKE_TIMEOUT_SECONDS=0`.
+#[tokio::test]
+async fn test_extract_sni_from_tcp_stream_no_timeout_recovers_oversized_clienthello() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let hello = build_tls_client_hello_with_padding_before_sni(
+        "pq-notimeout.example.com",
+        OVERSIZED_HELLO_PADDING,
+    );
+    assert!(
+        hello.len() > initial_peek_capacity(),
+        "fixture must exceed the lazy peek floor (got {} bytes)",
+        hello.len()
+    );
+    assert!(
+        hello.len() < no_deadline_peek_capacity(),
+        "fixture must fit inside the hard peek cap (got {} bytes)",
+        hello.len()
+    );
+
+    let accept_task = tokio::spawn(async move {
+        let (server_stream, _) = listener.accept().await.expect("accept");
+        // Let the whole hello land in the receive buffer: the no-deadline path
+        // peeks the wire exactly once and never loops for more bytes.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        extract_sni_from_tcp_stream(&server_stream, None).await
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    use tokio::io::AsyncWriteExt;
+    client.write_all(&hello).await.expect("write");
+    client.flush().await.expect("flush");
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), accept_task)
+        .await
+        .expect("no-deadline peek must not hang once the socket is readable")
+        .expect("accept_task");
+    assert_eq!(
+        result,
+        Some("pq-notimeout.example.com".to_string()),
+        "no-deadline peek must inspect up to the hard cap, not stop at the \
+         4 KiB lazy floor (issue #2962)"
+    );
+}
+
+/// A silent peer on the no-deadline path must leave the peek suspended on
+/// socket readiness — holding no ClientHello buffer — rather than returning
+/// early, spinning, or blocking. The buffer only exists after the socket is
+/// readable, so an idle connection cannot pin a hard-cap allocation.
+#[tokio::test]
+async fn test_extract_sni_from_tcp_stream_no_timeout_waits_on_readiness_when_peer_silent() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+
+    // Held open and deliberately silent for the duration of the test.
+    let _client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+    let (server_stream, _) = listener.accept().await.expect("accept");
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        extract_sni_from_tcp_stream(&server_stream, None),
+    )
+    .await;
+
+    assert!(
+        outcome.is_err(),
+        "no-deadline peek must stay parked on readiness for a silent peer \
+         (callers that need a bound pass Some(timeout)); got {outcome:?}"
+    );
+}
+
+/// Sizing seam for the no-deadline path: its single peek uses the full hard
+/// cap, not the lazy-growth floor that the deadline-driven loop starts from.
+#[test]
+fn no_deadline_peek_uses_hard_cap_not_lazy_floor() {
+    assert_eq!(
+        no_deadline_peek_capacity(),
+        16 * 1024,
+        "the no-deadline single peek must be able to inspect a standards-valid \
+         oversized ClientHello up to the hard cap"
+    );
+    assert!(
+        no_deadline_peek_capacity() > initial_peek_capacity(),
+        "the no-deadline peek must not be capped at the lazy-growth floor"
+    );
 }
 
 /// A peer that writes a valid ClientHello within the timeout still gets

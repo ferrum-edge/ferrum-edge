@@ -41,7 +41,6 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tracing::warn;
 
 use super::utils::ai_pii::{KeyedBodyHasher, PiiRedactor};
 use super::utils::body_transform::is_json_content_type;
@@ -119,10 +118,14 @@ pub const AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS: &[&str] = &[
     "include_consumer_username",
     "include_client_ip",
     "include_raw_headers",
+    "path_mode",
 ];
 
 /// Accepted keys under `sink`. `custom_headers` remains an intentional free-form
-/// string map; every other sink property is fixed-shape.
+/// string map (arbitrary header names -> value templates); every other sink
+/// property is fixed-shape. Header value templates are literal text plus
+/// `${secret:NAME}` references, which resolve only the
+/// `FERRUM_TRANSCRIPT_SINK_SECRET_*` env namespace (see [`SINK_SECRET_ENV_PREFIX`]).
 pub const AI_TRANSCRIPT_AUDIT_SINK_KEYS: &[&str] = &[
     "type",
     "endpoint_url",
@@ -137,6 +140,37 @@ pub const AI_TRANSCRIPT_AUDIT_SINK_KEYS: &[&str] = &[
     "on_sink_error",
 ];
 
+/// Env-var namespace that transcript-sink custom headers may reference. A
+/// `${secret:NAME}` header-value reference resolves
+/// `FERRUM_TRANSCRIPT_SINK_SECRET_<NAME>` only, so a config writer can never
+/// expand unrelated Ferrum/database/cloud/system environment variables into an
+/// outbound header. There is no generic `${NAME}` process-environment
+/// interpolation; any other `${...}` form is rejected at config parse.
+const SINK_SECRET_ENV_PREFIX: &str = "FERRUM_TRANSCRIPT_SINK_SECRET_";
+
+/// Deployment-safe hard maximum for `limits.max_request_bytes` (1 MiB). Aligns
+/// with shared logger `HARD_MAX_ENTRY_BYTES` so a single excerpt cannot exceed
+/// what sink byte budgets can sanely retain.
+pub const HARD_MAX_REQUEST_BYTES: usize = 1_048_576;
+/// Deployment-safe hard maximum for `limits.max_response_bytes` (1 MiB).
+pub const HARD_MAX_RESPONSE_BYTES: usize = 1_048_576;
+/// Deployment-safe hard maximum for `limits.max_stream_capture_bytes` (1 MiB).
+pub const HARD_MAX_STREAM_CAPTURE_BYTES: usize = 1_048_576;
+/// Cross-field aggregate hard maximum for the sum of the three capture limits
+/// (2 MiB). Prevents an individually-valid triple from retaining an unsafe
+/// combined body budget on one record.
+pub const HARD_MAX_CAPTURE_BYTES_AGGREGATE: usize = 2_097_152;
+
+/// Hard bound for a retained request-derived `model` string (UTF-8 bytes).
+/// Independent of excerpt limits; matches ordinary provider model-id length.
+pub const MAX_MODEL_BYTES: usize = 256;
+/// Hard bound on how many distinct tool/function names one record retains.
+pub const MAX_TOOL_NAMES: usize = 64;
+/// Hard bound for each retained tool/function name (UTF-8 bytes).
+pub const MAX_TOOL_NAME_BYTES: usize = 128;
+/// Hard bound on the aggregate UTF-8 bytes of all retained tool/function names.
+pub const MAX_TOOL_NAMES_AGGREGATE_BYTES: usize = 4_096;
+
 /// Above this many staged entries, opportunistically drop expired orphans (a
 /// request that never reached the `log` hook). The common path removes staging
 /// at emit/log time, so this only guards pathological cases.
@@ -148,6 +182,23 @@ const MAX_STAGING_ENTRIES: usize = 4096;
 /// Amortize orphan cleanup so request admission never repeats a full shared-map
 /// scan for every request while the live set remains above the threshold.
 const STAGING_SWEEP_INTERVAL_SECS: u64 = 60;
+
+/// Per-record retained-memory contract (bodies + bounded request-derived
+/// metadata). Envelope/tokens/guardrail maps are separately cardinality-bounded
+/// by upstream publishers; this captures the operator-visible body+metadata
+/// budget one queued record may retain:
+/// `max_request_bytes + max(max_response_bytes, max_stream_capture_bytes)
+///  + MAX_MODEL_BYTES + MAX_TOOL_NAMES_AGGREGATE_BYTES`.
+pub fn max_retained_record_bytes(
+    max_request_bytes: usize,
+    max_response_bytes: usize,
+    max_stream_capture_bytes: usize,
+) -> usize {
+    max_request_bytes
+        .saturating_add(max_response_bytes.max(max_stream_capture_bytes))
+        .saturating_add(MAX_MODEL_BYTES)
+        .saturating_add(MAX_TOOL_NAMES_AGGREGATE_BYTES)
+}
 
 // Metadata keys written into `ctx.metadata` (small strings only — never bodies).
 // These flow into the transaction log via the summary metadata.
@@ -222,6 +273,39 @@ enum SinkErrorPolicy {
     Reject,
 }
 
+/// How the request path is exported. Applications routinely embed emails,
+/// account ids, document names, or tokens in path segments, so the literal
+/// path is never exported by default in a privacy mode — the safe default is
+/// the low-cardinality route identifier (`Template`) for every mode except the
+/// explicit `full_body` raw-capture opt-in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathMode {
+    /// Do not export the path at all.
+    Omit,
+    /// Export the matched route identifier (proxy `listen_path`, else proxy
+    /// name) instead of the user-controlled request path. Omitted when no
+    /// route identifier is available.
+    Template,
+    /// Export the literal path with the configured PII redactor applied.
+    Redact,
+    /// Export a keyed HMAC-SHA256 hex digest of the literal path (stable
+    /// correlation token, not brute-forceable offline; shares the redaction key).
+    Hash,
+    /// Export the literal path verbatim. Must be opted into explicitly.
+    Raw,
+}
+
+/// Default path privacy for a capture mode. `full_body` is the deliberate raw
+/// capture opt-in, so it defaults to the literal path; every privacy mode
+/// defaults to the route identifier so a literal path is never exported by
+/// accident under `metadata_only`, `redacted_body`, or `hash_only`.
+fn default_path_mode(mode: AuditMode) -> PathMode {
+    match mode {
+        AuditMode::FullBody => PathMode::Raw,
+        _ => PathMode::Template,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct CaptureConfig {
     request: bool,
@@ -246,15 +330,46 @@ struct LimitsConfig {
     max_stream_capture_bytes: usize,
 }
 
+impl LimitsConfig {
+    fn max_retained_record_bytes(self) -> usize {
+        max_retained_record_bytes(
+            self.max_request_bytes,
+            self.max_response_bytes,
+            self.max_stream_capture_bytes,
+        )
+    }
+}
+
+/// Authenticated `/health`/`/status` snapshot of admitted capture ceilings.
+/// Contains only numeric limits — never request/response content.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AiTranscriptAuditSnapshot {
+    pub instance_id: u64,
+    pub max_request_bytes: u64,
+    pub max_response_bytes: u64,
+    pub max_stream_capture_bytes: u64,
+    pub hard_max_request_bytes: u64,
+    pub hard_max_response_bytes: u64,
+    pub hard_max_stream_capture_bytes: u64,
+    pub hard_max_capture_bytes_aggregate: u64,
+    pub max_model_bytes: u64,
+    pub max_tool_names: u64,
+    pub max_tool_name_bytes: u64,
+    pub max_tool_names_aggregate_bytes: u64,
+    pub max_retained_record_bytes: u64,
+}
+
 #[derive(Clone, Copy)]
 struct PrivacyConfig {
     include_consumer_username: bool,
     include_client_ip: bool,
     include_raw_headers: bool,
+    path_mode: PathMode,
 }
 
 /// Per-request request-side capture, keyed by `record_id`. Never holds a full
-/// body — only the redacted/capped excerpt (bounded by `max_request_bytes`).
+/// body — only the redacted/capped excerpt (bounded by `max_request_bytes`)
+/// plus independently bounded model/tool metadata.
 struct AuditStaging {
     /// Holds one slot in the hard in-flight staging bound.
     _staging_permit: OwnedSemaphorePermit,
@@ -264,7 +379,15 @@ struct AuditStaging {
     request_truncated: bool,
     request_hash: Option<String>,
     request_model: Option<String>,
+    request_model_truncated: bool,
+    /// Keyed hash of the original model string when truncated; never raw excess.
+    request_model_hash: Option<String>,
     tool_names: Vec<String>,
+    tool_names_truncated: bool,
+    tool_names_omitted: u32,
+    /// Keyed hash over every observed tool name (including omitted) when
+    /// truncation/omission occurred; never raw excess bytes.
+    tool_names_hash: Option<String>,
     commit_permit: Option<BatchingLoggerPermit<AuditRecord>>,
     /// True only after the response path confirms that this transaction is
     /// actively streaming. A pre-commit reservation alone is not sufficient:
@@ -315,7 +438,11 @@ struct AuditRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     client_ip: Option<String>,
     method: String,
-    path: String,
+    /// Request path, transformed per `privacy.path_mode` (omitted, route
+    /// identifier, redacted, keyed hash, or raw). Absent when omitted or when
+    /// `template` mode has no route identifier available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -342,8 +469,37 @@ struct AuditRecord {
     guardrails: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tool_names: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    model_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_hash: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    tool_names_truncated: bool,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    tool_names_omitted: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_names_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     headers: Option<BTreeMap<String, String>>,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+#[derive(Default)]
+struct BoundedModel {
+    value: Option<String>,
+    truncated: bool,
+    hash: Option<String>,
+}
+
+#[derive(Default)]
+struct BoundedToolNames {
+    names: Vec<String>,
+    truncated: bool,
+    omitted: u32,
+    hash: Option<String>,
 }
 
 /// Owned request/response envelope fields, sourced from either a live
@@ -355,13 +511,20 @@ struct EnvelopeOwned {
     consumer_username: Option<String>,
     client_ip: Option<String>,
     method: String,
+    /// Literal request path (never exported directly; transformed by
+    /// `privacy.path_mode` in `build_record`).
     path: String,
+    /// Low-cardinality route identifier for `path_mode = template`: the matched
+    /// proxy `listen_path` (else proxy name). `None` when unavailable.
+    route_template: Option<String>,
     status_code: u16,
 }
 
 #[derive(Default)]
 struct Harvest {
     model: Option<String>,
+    model_truncated: bool,
+    model_hash: Option<String>,
     provider: Option<String>,
     tokens: BTreeMap<String, String>,
     cache: BTreeMap<String, String>,
@@ -412,11 +575,34 @@ impl RecordsPerMinute {
 #[derive(Clone)]
 struct HttpFlushConfig {
     endpoint_url: String,
-    /// Header name + `${VAR}`-expandable value template. The template (not the
-    /// resolved secret) is stored, so a config dump never leaks the token.
-    custom_headers: Vec<(HeaderName, String)>,
+    /// Fully materialized outbound headers, resolved once at background-task
+    /// activation from [`CustomHeaderSpec`]s (secrets marked sensitive so they
+    /// are never logged). Empty until `start_background_tasks` publishes the
+    /// materialized set; the hot send path never re-parses templates or reads
+    /// the environment per batch, and there is no fallible per-field
+    /// construction that could skip a header and send anyway.
+    custom_headers: Arc<Vec<(HeaderName, HeaderValue)>>,
     http_client: PluginHttpClient,
     sink_healthy: Arc<AtomicBool>,
+}
+
+/// One segment of a custom-header value template.
+enum HeaderSegment {
+    /// Literal text validated as header-value-safe at config parse.
+    Literal(String),
+    /// A `${secret:NAME}` reference; holds the fully-qualified env var name
+    /// (`FERRUM_TRANSCRIPT_SINK_SECRET_<NAME>`), resolved at activation only.
+    Secret(String),
+}
+
+/// A parsed, statically-validated custom outbound header. The value is a
+/// template of literal and secret segments; the secret is materialized once at
+/// activation (never stored resolved in config, never logged).
+struct CustomHeaderSpec {
+    name: HeaderName,
+    /// Original header-name text for diagnostics (never the secret value).
+    display_name: String,
+    segments: Vec<HeaderSegment>,
 }
 
 pub struct AiTranscriptAudit {
@@ -430,6 +616,11 @@ pub struct AiTranscriptAudit {
     redactor: Arc<PiiRedactor>,
     batch_config: BatchConfig,
     flush_config: HttpFlushConfig,
+    /// Statically-validated custom header templates. Materialized into
+    /// `flush_config.custom_headers` at `start_background_tasks`, so a missing/
+    /// empty/invalid secret or header value fails activation (the generation is
+    /// never published) rather than being silently skipped at send time.
+    custom_header_specs: Vec<CustomHeaderSpec>,
     logger: DeferredBatchingLogger<AuditRecord>,
     endpoint_hostname: String,
     namespace: String,
@@ -443,6 +634,8 @@ pub struct AiTranscriptAudit {
     staging_ttl: Duration,
     /// Monotonic process-relative second at which another staging sweep may run.
     next_staging_sweep_at: AtomicU64,
+    /// Process-local id published into authenticated `/health` after commit.
+    status_id: OnceLock<u64>,
 }
 
 impl AiTranscriptAudit {
@@ -590,26 +783,7 @@ impl AiTranscriptAudit {
             AI_TRANSCRIPT_AUDIT_LIMITS_KEYS,
         )?;
         let limits_obj = cfg_object(config, "limits", "limits")?.unwrap_or(&empty);
-        let limits = LimitsConfig {
-            max_request_bytes: cfg_positive_usize(
-                limits_obj,
-                "max_request_bytes",
-                65536,
-                "limits",
-            )?,
-            max_response_bytes: cfg_positive_usize(
-                limits_obj,
-                "max_response_bytes",
-                65536,
-                "limits",
-            )?,
-            max_stream_capture_bytes: cfg_positive_usize(
-                limits_obj,
-                "max_stream_capture_bytes",
-                65536,
-                "limits",
-            )?,
-        };
+        let limits = admit_limits_config(limits_obj)?;
 
         // ---- privacy ----
         reject_nested_unknown_keys(
@@ -619,6 +793,32 @@ impl AiTranscriptAudit {
             AI_TRANSCRIPT_AUDIT_PRIVACY_KEYS,
         )?;
         let privacy_obj = cfg_object(config, "privacy", "privacy")?.unwrap_or(&empty);
+        let path_mode = match cfg_str(privacy_obj, "path_mode", "privacy")? {
+            Some("omit") => PathMode::Omit,
+            Some("template") => PathMode::Template,
+            Some("redact") => PathMode::Redact,
+            Some("hash") => PathMode::Hash,
+            Some("raw") => PathMode::Raw,
+            Some(other) => {
+                return Err(format!(
+                    "ai_transcript_audit: 'privacy.path_mode' must be one of omit, template, \
+                     redact, hash, raw (got {other:?})"
+                ));
+            }
+            None => default_path_mode(mode),
+        };
+        // `redact` path mode with an empty pattern set would export the literal
+        // path unchanged while claiming redaction — the same silent
+        // pass-through the body-redaction guard rejects. `hash_only`/`full_body`
+        // are exempt from that body guard, so re-check here for the path.
+        if path_mode == PathMode::Redact && builtins.is_empty() && custom.is_empty() {
+            return Err(
+                "ai_transcript_audit: 'privacy.path_mode: redact' requires at least one \
+                 'redaction.builtins' or 'redaction.custom_patterns' pattern; otherwise the \
+                 literal path would be exported unredacted — use 'omit', 'template', or 'hash'"
+                    .to_string(),
+            );
+        }
         let privacy = PrivacyConfig {
             include_consumer_username: cfg_bool(
                 privacy_obj,
@@ -628,6 +828,7 @@ impl AiTranscriptAudit {
             )?,
             include_client_ip: cfg_bool(privacy_obj, "include_client_ip", false, "privacy")?,
             include_raw_headers: cfg_bool(privacy_obj, "include_raw_headers", false, "privacy")?,
+            path_mode,
         };
 
         // ---- sink ----
@@ -669,7 +870,7 @@ impl AiTranscriptAudit {
                 );
             }
         }
-        let custom_headers = parse_sink_headers(sink_obj)?;
+        let custom_header_specs = parse_sink_headers(sink_obj)?;
         let batch_defaults = BatchConfigDefaults {
             batch_size_key: "batch_size",
             batch_size: 50,
@@ -707,7 +908,8 @@ impl AiTranscriptAudit {
         let sink_healthy = Arc::new(AtomicBool::new(true));
         let flush_config = HttpFlushConfig {
             endpoint_url,
-            custom_headers,
+            // Materialized from `custom_header_specs` at `start_background_tasks`.
+            custom_headers: Arc::new(Vec::new()),
             http_client,
             sink_healthy: Arc::clone(&sink_healthy),
         };
@@ -730,6 +932,7 @@ impl AiTranscriptAudit {
             redactor: Arc::new(redactor),
             batch_config,
             flush_config,
+            custom_header_specs,
             logger: DeferredBatchingLogger::new(),
             endpoint_hostname,
             namespace,
@@ -741,7 +944,32 @@ impl AiTranscriptAudit {
             active,
             staging_ttl: Duration::from_secs(60 * 60),
             next_staging_sweep_at: AtomicU64::new(0),
+            status_id: OnceLock::new(),
         })
+    }
+
+    /// Effective admitted capture ceilings for authenticated status / tests.
+    #[allow(dead_code)] // used only by external tests; dead in binary test target
+    pub fn status_snapshot(&self) -> AiTranscriptAuditSnapshot {
+        self.status_snapshot_for_id(self.status_id.get().copied().unwrap_or(0))
+    }
+
+    fn status_snapshot_for_id(&self, instance_id: u64) -> AiTranscriptAuditSnapshot {
+        AiTranscriptAuditSnapshot {
+            instance_id,
+            max_request_bytes: self.limits.max_request_bytes as u64,
+            max_response_bytes: self.limits.max_response_bytes as u64,
+            max_stream_capture_bytes: self.limits.max_stream_capture_bytes as u64,
+            hard_max_request_bytes: HARD_MAX_REQUEST_BYTES as u64,
+            hard_max_response_bytes: HARD_MAX_RESPONSE_BYTES as u64,
+            hard_max_stream_capture_bytes: HARD_MAX_STREAM_CAPTURE_BYTES as u64,
+            hard_max_capture_bytes_aggregate: HARD_MAX_CAPTURE_BYTES_AGGREGATE as u64,
+            max_model_bytes: MAX_MODEL_BYTES as u64,
+            max_tool_names: MAX_TOOL_NAMES as u64,
+            max_tool_name_bytes: MAX_TOOL_NAME_BYTES as u64,
+            max_tool_names_aggregate_bytes: MAX_TOOL_NAMES_AGGREGATE_BYTES as u64,
+            max_retained_record_bytes: self.limits.max_retained_record_bytes() as u64,
+        }
     }
 
     /// (emit?, reason) — guardrail/error overrides beat the sampling roll.
@@ -1008,11 +1236,18 @@ impl AiTranscriptAudit {
         // guardrails (2925–2978, which run after this plugin's staging at 2740)
         // have already published their metadata. Non-AI JSON POSTs are never
         // staged, so they stay on the native-H3 path.
-        let request_model = parsed.as_ref().and_then(extract_model);
-        let tool_names = if self.capture.tool_calls {
-            parsed.as_ref().map(extract_tool_names).unwrap_or_default()
+        let redact_before_bound = self.mode != AuditMode::FullBody;
+        let bounded_model = parsed
+            .as_ref()
+            .map(|json| extract_model_bounded(json, &self.redactor, redact_before_bound))
+            .unwrap_or_default();
+        let bounded_tools = if self.capture.tool_calls {
+            parsed
+                .as_ref()
+                .map(|json| extract_tool_names_bounded(json, &self.redactor, redact_before_bound))
+                .unwrap_or_default()
         } else {
-            Vec::new()
+            BoundedToolNames::default()
         };
         let (request_excerpt, request_truncated) = if self.capture.request {
             self.shape_body(body, self.limits.max_request_bytes)
@@ -1029,8 +1264,13 @@ impl AiTranscriptAudit {
                 request_excerpt,
                 request_truncated,
                 request_hash: Some(request_hash),
-                request_model,
-                tool_names,
+                request_model: bounded_model.value,
+                request_model_truncated: bounded_model.truncated,
+                request_model_hash: bounded_model.hash,
+                tool_names: bounded_tools.names,
+                tool_names_truncated: bounded_tools.truncated,
+                tool_names_omitted: bounded_tools.omitted,
+                tool_names_hash: bounded_tools.hash,
                 commit_permit: None,
                 stream_active: false,
             },
@@ -1069,9 +1309,25 @@ impl AiTranscriptAudit {
             staged.request_excerpt = request_excerpt;
             staged.request_truncated = request_truncated;
             staged.request_hash = Some(request_hash.clone());
-            staged.request_model = parsed.as_ref().and_then(extract_model);
+            let redact_before_bound = self.mode != AuditMode::FullBody;
+            let bounded_model = parsed
+                .as_ref()
+                .map(|json| extract_model_bounded(json, &self.redactor, redact_before_bound))
+                .unwrap_or_default();
+            staged.request_model = bounded_model.value;
+            staged.request_model_truncated = bounded_model.truncated;
+            staged.request_model_hash = bounded_model.hash;
             if self.capture.tool_calls {
-                staged.tool_names = parsed.as_ref().map(extract_tool_names).unwrap_or_default();
+                let bounded_tools = parsed
+                    .as_ref()
+                    .map(|json| {
+                        extract_tool_names_bounded(json, &self.redactor, redact_before_bound)
+                    })
+                    .unwrap_or_default();
+                staged.tool_names = bounded_tools.names;
+                staged.tool_names_truncated = bounded_tools.truncated;
+                staged.tool_names_omitted = bounded_tools.omitted;
+                staged.tool_names_hash = bounded_tools.hash;
             }
         }
         // Re-detect `stream` on the FINAL backend-visible body: a
@@ -1136,7 +1392,7 @@ impl AiTranscriptAudit {
     }
 
     fn envelope_from_ctx(&self, ctx: &RequestContext, status: u16) -> EnvelopeOwned {
-        let (proxy_id, proxy_name, namespace) = match ctx.matched_proxy.as_ref() {
+        let (proxy_id, proxy_name, namespace, route_template) = match ctx.matched_proxy.as_ref() {
             Some(proxy) => (
                 Some(proxy.id.clone()),
                 proxy.name.clone(),
@@ -1145,8 +1401,11 @@ impl AiTranscriptAudit {
                 } else {
                     proxy.namespace.clone()
                 },
+                // Prefer the operator-configured `listen_path` (a path-shaped,
+                // low-cardinality route identifier), else the proxy name.
+                proxy.listen_path.clone().or_else(|| proxy.name.clone()),
             ),
-            None => (None, None, self.namespace.clone()),
+            None => (None, None, self.namespace.clone(), None),
         };
         EnvelopeOwned {
             proxy_id,
@@ -1164,6 +1423,7 @@ impl AiTranscriptAudit {
             },
             method: ctx.method.clone(),
             path: ctx.path.clone(),
+            route_template,
             status_code: status,
         }
     }
@@ -1189,7 +1449,23 @@ impl AiTranscriptAudit {
             },
             method: summary.http_method.clone(),
             path: summary.request_path.clone(),
+            // The summary carries no `listen_path`; the proxy name is the
+            // available low-cardinality route identifier on this fallback path.
+            route_template: summary.proxy_name.clone(),
             status_code: summary.response_status_code,
+        }
+    }
+
+    /// Apply `privacy.path_mode` to the envelope's literal path. Returns the
+    /// value to export (or `None` to omit). Runs off the request hot path (only
+    /// during record assembly for a captured transaction).
+    fn resolve_export_path(&self, envelope: &EnvelopeOwned) -> Option<String> {
+        match self.privacy.path_mode {
+            PathMode::Omit => None,
+            PathMode::Raw => Some(envelope.path.clone()),
+            PathMode::Redact => Some(self.redactor.redact(&envelope.path)),
+            PathMode::Hash => Some(self.redactor.keyed_hash_hex(envelope.path.as_bytes())),
+            PathMode::Template => envelope.route_template.clone(),
         }
     }
 
@@ -1214,9 +1490,19 @@ impl AiTranscriptAudit {
                 }
             };
             match key.as_str() {
-                "ai_model" => harvest.model = Some(value.clone()),
-                "ai_provider" => harvest.provider = Some(value.clone()),
-                "ai_federation_provider" => federation_provider = Some(value.clone()),
+                "ai_model" => {
+                    // Bound before retaining: metadata values can be attacker-shaped.
+                    // Protected modes redact the full observed string first so a
+                    // PII span straddling the model ceiling cannot leak as a raw
+                    // prefix; `full_body` keeps the bounded raw prefix.
+                    let bounded =
+                        bound_model_str(value, &self.redactor, self.mode != AuditMode::FullBody);
+                    harvest.model = bounded.value;
+                    harvest.model_truncated = bounded.truncated;
+                    harvest.model_hash = bounded.hash;
+                }
+                "ai_provider" => harvest.provider = Some(bound_short_metadata(value)),
+                "ai_federation_provider" => federation_provider = Some(bound_short_metadata(value)),
                 "ai_total_tokens"
                 | "ai_prompt_tokens"
                 | "ai_completion_tokens"
@@ -1265,38 +1551,44 @@ impl AiTranscriptAudit {
         let request_excerpt = staging.and_then(|s| s.request_excerpt.clone());
         let request_truncated = staging.map(|s| s.request_truncated).unwrap_or(false);
         let request_hash = staging.and_then(|s| s.request_hash.clone());
-        let req_model = staging.and_then(|s| s.request_model.clone());
-        // `model` and `tool_names` are copied straight out of the user request
-        // body, so they bypass the body-excerpt redaction path. Run them through
-        // the same redactor before export in every mode except the explicit
-        // `full_body` raw-capture opt-in — a PII-bearing "model" string must not
-        // leak through the metadata side door in redacted/metadata/hash modes.
-        let redact_request_derived = self.mode != AuditMode::FullBody;
-        let tool_names = if harvests {
+        // Request-derived model/tool values were already redacted over their
+        // full observed strings and then bounded while staging (or while
+        // harvesting `ai_model`). Do not run the redactor again here: custom
+        // replacements may expand an already-bounded value and violate the
+        // queued-record memory contract. `full_body` deliberately staged the
+        // bounded raw value instead.
+        let (tool_names, tool_names_truncated, tool_names_omitted, tool_names_hash) = if harvests {
             let tool_names = staging.map(|s| s.tool_names.clone()).unwrap_or_default();
-            if redact_request_derived {
-                tool_names
-                    .iter()
-                    .map(|name| self.redactor.redact(name))
-                    .collect()
-            } else {
-                tool_names
-            }
+            let tool_names_truncated = staging.map(|s| s.tool_names_truncated).unwrap_or(false);
+            let tool_names_omitted = staging.map(|s| s.tool_names_omitted).unwrap_or(0);
+            let tool_names_hash = staging.and_then(|s| s.tool_names_hash.clone());
+            (
+                tool_names,
+                tool_names_truncated,
+                tool_names_omitted,
+                tool_names_hash,
+            )
         } else {
-            Vec::new()
+            (Vec::new(), false, 0, None)
         };
 
-        let model = if harvests {
-            let model = req_model.or(harvest.model);
-            if redact_request_derived {
-                model.map(|value| self.redactor.redact(&value))
-            } else {
-                model
-            }
+        let (model, model_truncated, model_hash) = if harvests {
+            let (model, model_truncated, model_hash) =
+                if let Some(value) = staging.and_then(|s| s.request_model.clone()) {
+                    (
+                        Some(value),
+                        staging.map(|s| s.request_model_truncated).unwrap_or(false),
+                        staging.and_then(|s| s.request_model_hash.clone()),
+                    )
+                } else {
+                    (harvest.model, harvest.model_truncated, harvest.model_hash)
+                };
+            (model, model_truncated, model_hash)
         } else {
-            None
+            (None, false, None)
         };
         let provider = if harvests { harvest.provider } else { None };
+        let path = self.resolve_export_path(&envelope);
         // Raw headers require BOTH the capture switch and the privacy opt-in
         // (defense in depth); values are still redacted by key.
         let headers = if harvests && self.capture.headers && self.privacy.include_raw_headers {
@@ -1317,7 +1609,7 @@ impl AiTranscriptAudit {
             consumer_username: envelope.consumer_username,
             client_ip: envelope.client_ip,
             method: envelope.method,
-            path: envelope.path,
+            path,
             model,
             provider,
             status_code: envelope.status_code,
@@ -1334,6 +1626,11 @@ impl AiTranscriptAudit {
             cache: harvest.cache,
             guardrails: harvest.guardrails,
             tool_names,
+            model_truncated,
+            model_hash,
+            tool_names_truncated,
+            tool_names_omitted,
+            tool_names_hash,
             headers,
         }
     }
@@ -1411,7 +1708,18 @@ impl Plugin for AiTranscriptAudit {
     }
 
     fn start_background_tasks(&self) -> Result<(), String> {
-        let flush_config = self.flush_config.clone();
+        // Materialize every custom header (resolving `${secret:NAME}` references
+        // against `FERRUM_TRANSCRIPT_SINK_SECRET_*`) BEFORE the batching worker
+        // starts. A missing, empty, or invalid secret/header value fails
+        // activation here, so the generation is never published and admission
+        // never begins healthy under a predictable invalid-auth/routing header
+        // config — instead of silently dropping the field and sending the first
+        // batch unauthenticated. Runs on serving nodes only (CP/admin config
+        // validation never starts background tasks), so secrets that live on the
+        // data plane are not required at CP admission time.
+        let materialized = materialize_sink_headers(&self.custom_header_specs)?;
+        let mut flush_config = self.flush_config.clone();
+        flush_config.custom_headers = Arc::new(materialized);
         let healthy = Arc::clone(&self.sink_healthy);
         let hooks = LoggerHooks {
             on_failed_batch: Some(Arc::new(move |_batch: Vec<AuditRecord>, _error: String| {
@@ -1432,6 +1740,12 @@ impl Plugin for AiTranscriptAudit {
 
     fn commit_background_tasks(&self) {
         self.logger.commit();
+        let id = *self.status_id.get_or_init(|| {
+            NEXT_STATUS_ID
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1)
+        });
+        register_status_snapshot(id, self.status_snapshot_for_id(id));
     }
 
     fn warmup_hostnames(&self) -> Vec<String> {
@@ -2135,15 +2449,12 @@ impl ResponseStreamInspector for AuditStreamInspector {
 async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<(), String> {
     let entry_count = batch.len();
     let mut request = cfg.http_client.get().post(&cfg.endpoint_url).json(&batch);
-    for (name, template) in &cfg.custom_headers {
-        let value = expand_env_vars(template);
-        match HeaderValue::from_str(&value) {
-            Ok(header_value) => request = request.header(name.clone(), header_value),
-            Err(_) => warn!(
-                header = %name,
-                "ai_transcript_audit: dropping custom header with an invalid value after env expansion"
-            ),
-        }
+    // Headers were fully validated and materialized at activation
+    // (`materialize_sink_headers`), so there is no per-batch env expansion,
+    // template parsing, or fallible construction here — a required header can
+    // never be silently skipped while the batch is still sent.
+    for (name, value) in cfg.custom_headers.iter() {
+        request = request.header(name.clone(), value.clone());
     }
     let response = cfg
         .http_client
@@ -2151,7 +2462,7 @@ async fn send_batch(cfg: &HttpFlushConfig, batch: Vec<AuditRecord>) -> Result<()
         .await;
     // Sink health is derived from the raw collector response, NOT from the
     // shared `handle_http_batch_response` result: that helper treats a
-    // non-retryable non-2xx (401/403/413, e.g. an expired ${AUDIT_TOKEN}) as a
+    // non-retryable non-2xx (401/403/413, e.g. an expired sink token) as a
     // discarded-but-Ok batch so the other logging sinks do not retry it, but
     // for this plugin every record in that batch was silently lost — under
     // `on_sink_error: reject` the sink must go unhealthy so audited traffic
@@ -2701,31 +3012,272 @@ fn is_guardrail_key(key: &str) -> bool {
     PREFIXES.iter().any(|prefix| key.starts_with(prefix))
 }
 
-fn extract_model(json: &Value) -> Option<String> {
-    json.get("model")
-        .and_then(|value| value.as_str())
-        .map(str::to_string)
+fn extract_model_bounded(
+    json: &Value,
+    redactor: &PiiRedactor,
+    redact_before_bound: bool,
+) -> BoundedModel {
+    let Some(raw) = json.get("model").and_then(Value::as_str) else {
+        return BoundedModel::default();
+    };
+    bound_model_str(raw, redactor, redact_before_bound)
 }
 
-fn extract_tool_names(json: &Value) -> Vec<String> {
+/// Bound a request-derived model string for staging/export.
+///
+/// Ordering matters for every mode except the explicit `full_body` raw-capture
+/// opt-in: redaction runs over the FULL observed string first and the retained
+/// UTF-8-safe prefix is selected afterwards, so a sensitive token straddling
+/// the `MAX_MODEL_BYTES` ceiling can never leak as an unmatched raw prefix.
+/// Truncation evidence always hashes the original unredacted value; staging
+/// never retains raw excess bytes. `full_body` deliberately keeps the bounded
+/// raw prefix.
+fn bound_model_str(raw: &str, redactor: &PiiRedactor, redact_before_bound: bool) -> BoundedModel {
+    if raw.is_empty() {
+        return BoundedModel::default();
+    }
+    if redact_before_bound {
+        // Temporary full-string redaction is request-scoped; the retained
+        // value below is hard-bounded for staging and queued records.
+        let redacted = redactor.redact(raw);
+        let mut truncated = raw.len() > MAX_MODEL_BYTES;
+        let retained = if redacted.len() > MAX_MODEL_BYTES {
+            truncated = true;
+            truncate_str_ref(&redacted, MAX_MODEL_BYTES).to_string()
+        } else {
+            redacted
+        };
+        let hash = if truncated {
+            Some(redactor.keyed_hash_hex(raw.as_bytes()))
+        } else {
+            None
+        };
+        return BoundedModel {
+            value: Some(retained),
+            truncated,
+            hash,
+        };
+    }
+    if raw.len() <= MAX_MODEL_BYTES {
+        return BoundedModel {
+            value: Some(raw.to_string()),
+            truncated: false,
+            hash: None,
+        };
+    }
+    // Hash the full original without retaining excess bytes in staging/records.
+    let hash = redactor.keyed_hash_hex(raw.as_bytes());
+    let prefix = truncate_str_ref(raw, MAX_MODEL_BYTES);
+    BoundedModel {
+        value: Some(prefix.to_string()),
+        truncated: true,
+        hash: Some(hash),
+    }
+}
+
+/// Cap non-model metadata strings that are still request-derived publisher
+/// values so a hostile `ai_provider` cannot bypass excerpt budgets.
+fn bound_short_metadata(raw: &str) -> String {
+    truncate_str_ref(raw, MAX_MODEL_BYTES).to_string()
+}
+
+/// Bound request-derived tool/function names for staging/export.
+///
+/// Same redact-then-bound ordering as [`bound_model_str`] for protected modes:
+/// each observed name is redacted in full before the per-name / aggregate
+/// UTF-8-safe admit decision, while truncation evidence hashes the original
+/// unredacted names. `full_body` retains bounded raw prefixes.
+fn extract_tool_names_bounded(
+    json: &Value,
+    redactor: &PiiRedactor,
+    redact_before_bound: bool,
+) -> BoundedToolNames {
+    let mut hasher = redactor.keyed_hasher();
     let mut names = Vec::new();
+    let mut aggregate_bytes = 0usize;
+    let mut omitted = 0u32;
+    let mut truncated = false;
+    let mut saw_any = false;
+
     for key in ["tools", "functions"] {
-        if let Some(entries) = json.get(key).and_then(|value| value.as_array()) {
-            for entry in entries {
-                let name = entry
-                    .get("function")
-                    .and_then(|function| function.get("name"))
-                    .and_then(|name| name.as_str())
-                    .or_else(|| entry.get("name").and_then(|name| name.as_str()));
-                if let Some(name) = name {
-                    names.push(name.to_string());
-                }
+        let Some(entries) = json.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            let Some(name) = entry
+                .get("function")
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .or_else(|| entry.get("name").and_then(Value::as_str))
+            else {
+                continue;
+            };
+            saw_any = true;
+            // Evidence hash covers every observed name before any admit/omit,
+            // without cloning the raw excess into the retained set.
+            hasher.update(name.as_bytes());
+            hasher.update(&[0]);
+
+            // Protected modes: redact the full name first (temporary), then
+            // select the retained UTF-8-safe prefix. full_body keeps raw.
+            // Truncation evidence is driven by the original unredacted length.
+            if name.len() > MAX_TOOL_NAME_BYTES {
+                truncated = true;
             }
+            let redacted;
+            let candidate = if redact_before_bound {
+                redacted = redactor.redact(name);
+                redacted.as_str()
+            } else {
+                name
+            };
+            let admitted = if candidate.len() > MAX_TOOL_NAME_BYTES {
+                truncated = true;
+                truncate_str_ref(candidate, MAX_TOOL_NAME_BYTES)
+            } else {
+                candidate
+            };
+
+            if names.len() >= MAX_TOOL_NAMES
+                || aggregate_bytes.saturating_add(admitted.len()) > MAX_TOOL_NAMES_AGGREGATE_BYTES
+            {
+                truncated = true;
+                omitted = omitted.saturating_add(1);
+                continue;
+            }
+            aggregate_bytes = aggregate_bytes.saturating_add(admitted.len());
+            names.push(admitted.to_string());
         }
     }
+
+    if !saw_any {
+        return BoundedToolNames::default();
+    }
+
     names.sort();
     names.dedup();
-    names
+    let hash = if truncated {
+        Some(hasher.finalize_hex())
+    } else {
+        // Drop the hasher without exporting a hash when nothing was truncated.
+        let _ = hasher.finalize_hex();
+        None
+    };
+    BoundedToolNames {
+        names,
+        truncated,
+        omitted,
+        hash,
+    }
+}
+
+/// Truncate `text` to at most `max_bytes` without splitting a UTF-8 code point,
+/// returning a borrowed prefix so hostile inputs are not fully owned first.
+fn truncate_str_ref(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn admit_limits_config(limits_obj: &Value) -> Result<LimitsConfig, String> {
+    let max_request_bytes = cfg_positive_usize_capped(
+        limits_obj,
+        "max_request_bytes",
+        65536,
+        "limits",
+        HARD_MAX_REQUEST_BYTES,
+    )?;
+    let max_response_bytes = cfg_positive_usize_capped(
+        limits_obj,
+        "max_response_bytes",
+        65536,
+        "limits",
+        HARD_MAX_RESPONSE_BYTES,
+    )?;
+    let max_stream_capture_bytes = cfg_positive_usize_capped(
+        limits_obj,
+        "max_stream_capture_bytes",
+        65536,
+        "limits",
+        HARD_MAX_STREAM_CAPTURE_BYTES,
+    )?;
+    let aggregate = max_request_bytes
+        .saturating_add(max_response_bytes)
+        .saturating_add(max_stream_capture_bytes);
+    if aggregate > HARD_MAX_CAPTURE_BYTES_AGGREGATE {
+        return Err(format!(
+            "ai_transcript_audit: sum of 'limits.max_request_bytes' + \
+             'limits.max_response_bytes' + 'limits.max_stream_capture_bytes' \
+             ({aggregate}) must be <= {HARD_MAX_CAPTURE_BYTES_AGGREGATE}"
+        ));
+    }
+    Ok(LimitsConfig {
+        max_request_bytes,
+        max_response_bytes,
+        max_stream_capture_bytes,
+    })
+}
+
+fn cfg_positive_usize_capped(
+    obj: &Value,
+    key: &str,
+    default: usize,
+    ctx: &str,
+    hard_max: usize,
+) -> Result<usize, String> {
+    let value = cfg_positive_usize(obj, key, default, ctx)?;
+    if value > hard_max {
+        return Err(format!(
+            "ai_transcript_audit: '{ctx}.{key}' must be <= {hard_max} (deployment hard maximum)"
+        ));
+    }
+    Ok(value)
+}
+
+static NEXT_STATUS_ID: AtomicU64 = AtomicU64::new(0);
+
+fn active_status_snapshots() -> &'static Mutex<BTreeMap<u64, AiTranscriptAuditSnapshot>> {
+    static SNAPSHOTS: OnceLock<Mutex<BTreeMap<u64, AiTranscriptAuditSnapshot>>> = OnceLock::new();
+    SNAPSHOTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn register_status_snapshot(id: u64, snapshot: AiTranscriptAuditSnapshot) {
+    let mut guard = match active_status_snapshots().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.insert(id, snapshot);
+}
+
+fn unregister_status_snapshot(id: u64) {
+    let mut guard = match active_status_snapshots().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.remove(&id);
+}
+
+/// Authenticated diagnostics snapshots for every committed transcript-audit
+/// instance. Values are numeric admitted ceilings only — never body content.
+pub fn snapshots() -> Vec<AiTranscriptAuditSnapshot> {
+    let guard = match active_status_snapshots().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.values().cloned().collect()
+}
+
+impl Drop for AiTranscriptAudit {
+    fn drop(&mut self) {
+        if let Some(id) = self.status_id.get() {
+            unregister_status_snapshot(*id);
+        }
+    }
 }
 
 fn is_event_stream(content_type: &str) -> bool {
@@ -2758,40 +3310,152 @@ fn bool_str(value: bool) -> String {
     if value { "true" } else { "false" }.to_string()
 }
 
-/// Expand `${NAME}` occurrences from the process environment (unset/unknown ->
-/// empty). Malformed `${...}` is left literal. Applied lazily at send time so
-/// the resolved secret is never stored in config.
-fn expand_env_vars(template: &str) -> String {
-    if !template.contains("${") {
-        return template.to_string();
-    }
-    let mut out = String::with_capacity(template.len());
-    let mut rest = template;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        if let Some(end) = after.find('}') {
-            let name = &after[..end];
-            if is_valid_env_name(name) {
-                if let Ok(value) = std::env::var(name) {
-                    out.push_str(&value);
-                }
-                rest = &after[end + 1..];
-                continue;
-            }
-        }
-        out.push_str("${");
-        rest = after;
-    }
-    out.push_str(rest);
-    out
+/// Whether every byte of `text` is legal inside an HTTP header value
+/// (visible ASCII, space, or HTAB, plus obs-text). Rejects the CR/LF/NUL and
+/// other control bytes that would make `HeaderValue::from_str` fail, so a
+/// literal template segment can be validated at config parse independently of
+/// the (unknown) secret bytes.
+fn is_header_value_safe(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| byte == b'\t' || (0x20..=0x7e).contains(&byte) || byte >= 0x80)
 }
 
-fn is_valid_env_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().enumerate().all(|(index, byte)| {
-            byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
-        })
+/// Push a validated literal segment (skipping empty runs). A literal that
+/// carries bytes illegal in a header value is a hard config error.
+fn push_literal_segment(
+    segments: &mut Vec<HeaderSegment>,
+    text: &str,
+    display_name: &str,
+) -> Result<(), String> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    if !is_header_value_safe(text) {
+        return Err(format!(
+            "ai_transcript_audit: sink.custom_headers['{display_name}'] value contains bytes \
+             that are invalid in an HTTP header value"
+        ));
+    }
+    segments.push(HeaderSegment::Literal(text.to_string()));
+    Ok(())
+}
+
+/// Parse a single custom-header value template into literal/secret segments.
+///
+/// The only secret syntax is `${secret:NAME}`, which resolves
+/// `FERRUM_TRANSCRIPT_SINK_SECRET_<NAME>` at activation. `NAME` is uppercase
+/// `[A-Z_][A-Z0-9_]*`. Any other `${...}` form — including a bare
+/// `${SOME_VAR}` process-environment reference — is a hard error, so unrelated
+/// environment secrets can never be interpolated and a malformed reference can
+/// never be silently emitted as literal text.
+fn parse_header_template(template: &str, display_name: &str) -> Result<Vec<HeaderSegment>, String> {
+    let mut segments: Vec<HeaderSegment> = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        push_literal_segment(&mut segments, &rest[..start], display_name)?;
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            return Err(format!(
+                "ai_transcript_audit: sink.custom_headers['{display_name}'] has an unterminated \
+                 '${{...}}' reference; only '${{secret:NAME}}' references are supported"
+            ));
+        };
+        let inner = &after[..end];
+        let Some(suffix) = inner.strip_prefix("secret:") else {
+            return Err(format!(
+                "ai_transcript_audit: sink.custom_headers['{display_name}'] uses an unsupported \
+                 reference '${{{inner}}}'; only '${{secret:NAME}}' is permitted (it resolves \
+                 the {SINK_SECRET_ENV_PREFIX}NAME environment variable and cannot read any other \
+                 process environment variable)"
+            ));
+        };
+        if !is_valid_secret_suffix(suffix) {
+            return Err(format!(
+                "ai_transcript_audit: sink.custom_headers['{display_name}'] secret reference name \
+                 '{suffix}' must be uppercase [A-Z_][A-Z0-9_]* (it resolves \
+                 {SINK_SECRET_ENV_PREFIX}{suffix})"
+            ));
+        }
+        segments.push(HeaderSegment::Secret(format!(
+            "{SINK_SECRET_ENV_PREFIX}{suffix}"
+        )));
+        rest = &after[end + 1..];
+    }
+    push_literal_segment(&mut segments, rest, display_name)?;
+    if segments.is_empty() {
+        return Err(format!(
+            "ai_transcript_audit: sink.custom_headers['{display_name}'] value must not be empty"
+        ));
+    }
+    Ok(segments)
+}
+
+/// Secret-reference name charset: uppercase letters/underscore, then also
+/// digits. Mirrors env-var naming and keeps the resolved name inside the
+/// `FERRUM_TRANSCRIPT_SINK_SECRET_` namespace with no way to escape it.
+fn is_valid_secret_suffix(suffix: &str) -> bool {
+    let mut bytes = suffix.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first == b'_' || first.is_ascii_uppercase()) {
+        return false;
+    }
+    bytes.all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+/// Resolve every [`CustomHeaderSpec`] against the environment into concrete
+/// headers. Called once at background-task activation. A secret that is unset
+/// or empty, or a value that is not a legal `HeaderValue`, is a hard error so
+/// activation fails closed. The resolved secret value is never logged or placed
+/// in any error message; produced values are marked sensitive.
+fn materialize_sink_headers(
+    specs: &[CustomHeaderSpec],
+) -> Result<Vec<(HeaderName, HeaderValue)>, String> {
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let mut value = String::new();
+        for segment in &spec.segments {
+            match segment {
+                HeaderSegment::Literal(text) => value.push_str(text),
+                HeaderSegment::Secret(env_name) => {
+                    let resolved = std::env::var(env_name).map_err(|_| {
+                        format!(
+                            "ai_transcript_audit: sink.custom_headers['{}'] requires environment \
+                             variable {env_name}, which is not set",
+                            spec.display_name
+                        )
+                    })?;
+                    if resolved.is_empty() {
+                        return Err(format!(
+                            "ai_transcript_audit: sink.custom_headers['{}'] environment variable \
+                             {env_name} is set but empty",
+                            spec.display_name
+                        ));
+                    }
+                    value.push_str(&resolved);
+                }
+            }
+        }
+        // A purely-literal empty value is rejected at parse; this guards the
+        // case where every segment resolved but combined to empty.
+        if value.is_empty() {
+            return Err(format!(
+                "ai_transcript_audit: sink.custom_headers['{}'] materialized to an empty value",
+                spec.display_name
+            ));
+        }
+        let mut header_value = HeaderValue::from_str(&value).map_err(|_| {
+            format!(
+                "ai_transcript_audit: sink.custom_headers['{}'] materialized to a value that is \
+                 not a valid HTTP header",
+                spec.display_name
+            )
+        })?;
+        header_value.set_sensitive(true);
+        out.push((spec.name.clone(), header_value));
+    }
+    Ok(out)
 }
 
 // ---- config parsing helpers ----
@@ -2855,8 +3519,12 @@ fn parse_custom_patterns(obj: &Value) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
-fn parse_sink_headers(obj: &Value) -> Result<Vec<(HeaderName, String)>, String> {
-    let mut out = Vec::new();
+/// Parse and statically validate `sink.custom_headers`. Header names and value
+/// templates (literal + `${secret:NAME}` segments) are validated here at config
+/// admission (CP/admin-safe: no environment is read). Secrets are resolved only
+/// later, at activation, by [`materialize_sink_headers`].
+fn parse_sink_headers(obj: &Value) -> Result<Vec<CustomHeaderSpec>, String> {
+    let mut out: Vec<CustomHeaderSpec> = Vec::new();
     let Some(value) = obj.get("custom_headers") else {
         return Ok(out);
     };
@@ -2870,8 +3538,13 @@ fn parse_sink_headers(obj: &Value) -> Result<Vec<(HeaderName, String)>, String> 
         let name = HeaderName::from_bytes(key.as_bytes()).map_err(|error| {
             format!("ai_transcript_audit: invalid sink.custom_headers name '{key}': {error}")
         })?;
-        out.retain(|(existing, _)| *existing != name);
-        out.push((name, value.to_string()));
+        let segments = parse_header_template(value, key)?;
+        out.retain(|spec| spec.name != name);
+        out.push(CustomHeaderSpec {
+            name,
+            display_name: key.clone(),
+            segments,
+        });
     }
     Ok(out)
 }
