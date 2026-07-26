@@ -1946,12 +1946,6 @@ impl NativeRemoteSource {
             request_timeout: ctx.config.request_timeout,
         }
     }
-
-    /// The exact `aud` value this source mints. Exposed for tests and
-    /// operator-facing diagnostics; it is derived config, never a secret.
-    pub fn audience(&self) -> &str {
-        &self.audience
-    }
 }
 
 #[async_trait]

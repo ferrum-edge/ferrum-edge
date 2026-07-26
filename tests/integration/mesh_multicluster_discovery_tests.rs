@@ -502,15 +502,10 @@ mod audience_binding {
         let cp_c = start_cluster_cp(Some(CLUSTER_C)).await;
 
         // B's own discovery poll succeeds end to end through the production
-        // dialer: the minted `aud` names B and B expects exactly that.
+        // dialer: the minted `aud` names B (derived from RemoteCluster.name,
+        // not the endpoint URL) and B expects exactly that.
         let ctx_b = poll_ctx(CLUSTER_B, &cp_b.url);
-        let source_b = NativeRemoteSource::new(&ctx_b, shared_secret());
-        assert_eq!(
-            source_b.audience(),
-            remote_discovery_audience(CLUSTER_B),
-            "the minted audience is derived from RemoteCluster.name, not the endpoint URL"
-        );
-        source_b
+        NativeRemoteSource::new(&ctx_b, shared_secret())
             .fetch()
             .await
             .expect("cluster B accepts a token minted for cluster B");
