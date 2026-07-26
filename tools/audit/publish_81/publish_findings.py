@@ -262,8 +262,12 @@ def main() -> int:
             )
     checkpoint["overlap_reference_warnings"] = overlap_reference_warnings
     if overlap_reference_warnings:
-        print("warning: some snapshot overlap references are no longer open:", flush=True)
+        print("error: some reviewed overlap references are no longer open:", flush=True)
         print(json.dumps(overlap_reference_warnings, indent=2), flush=True)
+        write_checkpoint(args.output, checkpoint)
+        raise RuntimeError(
+            "live overlap validation failed; refresh the cited issue/PR references before publishing"
+        )
 
     for position, item in enumerate(findings, 1):
         marker = item["marker"]
