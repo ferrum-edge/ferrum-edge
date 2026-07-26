@@ -666,6 +666,7 @@ jobs:
               integration::graceful_shutdown_tests
               integration::db_full_load_snapshot_tests
               integration::db_incremental_poll_tests
+              integration::db_mutation_decode_fail_closed_tests
               integration::consumer_identity_enforcement_tests
               integration::db_offline_bootstrap_tests
               integration::db_row_decode_rejection_tests
