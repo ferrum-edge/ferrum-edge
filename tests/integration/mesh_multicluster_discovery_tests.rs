@@ -547,12 +547,14 @@ mod audience_binding {
         let b_audience = remote_discovery_audience(CLUSTER_B);
         let c_audience = remote_discovery_audience(CLUSTER_C);
 
+        // Cases that are wrong for BOTH clusters, so every CP must refuse them.
+        // The wrong-cluster case is deliberately NOT here: each cluster ACCEPTS
+        // its own audience (that is what
+        // `cluster_b_accepts_its_own_token_and_cluster_c_rejects_it` asserts),
+        // so it has to be paired with the peer that did not mint it.
         let cases: Vec<(&str, String)> = vec![
             // Missing: an ordinary CP↔DP-shaped token carries no `aud` at all.
             ("missing", token_with_audience(None)),
-            // Wrong cluster, in both directions.
-            ("wrong (b at c)", token_with_audience(Some(&b_audience))),
-            ("wrong (c at b)", token_with_audience(Some(&c_audience))),
             // Unprefixed bare cluster name: not this surface's audience.
             ("unprefixed", token_with_audience(Some(CLUSTER_B))),
         ];
@@ -575,8 +577,16 @@ mod audience_binding {
             ),
         ];
 
-        for cp in [&cp_b, &cp_c] {
-            for (label, token) in cases.iter().chain(raw_cases.iter()) {
+        // Each cluster is additionally presented with the OTHER cluster's
+        // audience — the misrouted/replayed token, in both directions.
+        for (cp, wrong_label, wrong_audience) in [
+            (&cp_b, "wrong (c at b)", c_audience.as_str()),
+            (&cp_c, "wrong (b at c)", b_audience.as_str()),
+        ] {
+            let mut cp_cases = cases.clone();
+            cp_cases.extend_from_slice(&raw_cases);
+            cp_cases.push((wrong_label, token_with_audience(Some(wrong_audience))));
+            for (label, token) in &cp_cases {
                 let status = subscribe_with_token(&cp.url, token, true)
                     .await
                     .expect_err(&format!("{label} audience must be refused"));
