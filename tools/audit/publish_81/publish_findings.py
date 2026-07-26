@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Idempotently publish the reviewed Ferrum Edge launch-audit findings."""
+"""Idempotently publish the reviewed Ferrum Edge launch-audit findings.
+
+The script intentionally creates public issues only. It uses exact hidden markers and
+normalized titles for idempotency, refreshes the complete live open backlog before
+publication, and verifies every marker after publication. Semantic overlaps are not
+silently skipped: each reviewed finding contains an explicit overlap/unique-scope
+section naming the existing issue or PR when applicable.
+"""
 from __future__ import annotations
 
 import argparse
@@ -8,14 +15,29 @@ import os
 import pathlib
 import random
 import re
+import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Iterable
 
 API = "https://api.github.com"
 API_VERSION = "2022-11-28"
 USER_AGENT = "ferrum-launch-readiness-audit-publisher/1.0"
+
+MANIFEST_BODY_REWRITES: dict[str, tuple[str, str]] = {
+    "ferrum-launch-audit:dr-max-connections-pooled-04b523ef": (
+        "Related open issue #3227 covers retiring a connection after `maxRequestsPerConnection`. "
+        "This issue is distinct: it enforces concurrent physical connection-count admission from "
+        "`tcp.maxConnections` across pooled transports.",
+        "Umbrella overlap: open issue #2110 tracks the deferred DestinationRule pool-limit surface, "
+        "including close-after-N and other incomplete transport projections. This issue is distinct: "
+        "it implements concurrent physical connection-count admission from `tcp.maxConnections` "
+        "across pooled transports, with separate pool-key, permit-lifecycle, multiplexing, and reload "
+        "acceptance criteria.",
+    ),
+}
 
 
 def normalize_title(value: str) -> str:
@@ -36,8 +58,19 @@ def overlap_text(body: str) -> str:
 def load_findings(manifest_file: pathlib.Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     payload = json.loads(manifest_file.read_text(encoding="utf-8"))
     findings = payload["findings"]
-    if len(findings) != 81:
-        raise ValueError(f"manifest count mismatch: expected 81, loaded {len(findings)}")
+    for item in findings:
+        rewrite = MANIFEST_BODY_REWRITES.get(item.get("marker", ""))
+        if rewrite is None:
+            continue
+        old, new = rewrite
+        body = item["body"]
+        if new not in body:
+            if old not in body:
+                raise ValueError(f"expected manifest rewrite source missing: {item['marker']}")
+            item["body"] = body.replace(old, new, 1)
+    expected = 81
+    if len(findings) != expected:
+        raise ValueError(f"manifest count mismatch: expected {expected}, loaded {len(findings)}")
     titles = [normalize_title(item["title"]) for item in findings]
     markers = [item["marker"] for item in findings]
     if len(set(titles)) != len(titles):
@@ -57,6 +90,7 @@ def load_findings(manifest_file: pathlib.Path) -> tuple[dict[str, Any], list[dic
         "repository": payload["repository"],
         "audited_sha": payload["audited_sha"],
         "verified_main_sha": payload["verified_main_sha"],
+        "finding_count": len(findings),
     }
     return index, findings
 
@@ -149,7 +183,8 @@ def make_indexes(rows: Iterable[dict[str, Any]]) -> tuple[dict[str, dict[str, An
         title = normalize_title(row.get("title") or "")
         if title:
             by_title.setdefault(title, row)
-        for marker in marker_re.findall(row.get("body") or ""):
+        body = row.get("body") or ""
+        for marker in marker_re.findall(body):
             by_marker.setdefault(marker, row)
     return by_title, by_marker
 
@@ -174,6 +209,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest-file", type=pathlib.Path, required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
+    parser.add_argument("--resolved-manifest", type=pathlib.Path, required=True)
     parser.add_argument("--delay", type=float, default=1.35)
     args = parser.parse_args()
 
@@ -186,7 +222,15 @@ def main() -> int:
     if repository != index["repository"]:
         raise SystemExit(f"repository mismatch: manifest={index['repository']} env={repository}")
 
+    args.resolved_manifest.parent.mkdir(parents=True, exist_ok=True)
+    args.resolved_manifest.write_text(
+        json.dumps({**index, "findings": findings}, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+
     client = GitHub(token, repository)
+    # `issues?state=all` includes pull requests and protects reruns from duplicating a
+    # prior marker even if an issue was closed while this workflow was interrupted.
     all_issue_rows = client.get_all("issues", state="all")
     open_issue_api_rows = [row for row in all_issue_rows if row.get("state") == "open"]
     open_issues = [row for row in open_issue_api_rows if "pull_request" not in row]
@@ -204,6 +248,9 @@ def main() -> int:
         "results": {},
     }
 
+    # Validate that every manually cited overlap was open at publication time.
+    # References in source/permalink text are outside the overlap section and are
+    # intentionally ignored here.
     overlap_reference_warnings: list[dict[str, Any]] = []
     for item in findings:
         section = overlap_text(item["body"])
@@ -250,6 +297,8 @@ def main() -> int:
         )
         time.sleep(max(1.0, args.delay))
 
+    # Post-verify every marker against all issue states. This also makes a partially
+    # interrupted rerun self-healing and produces a hard completion condition.
     final_rows = client.get_all("issues", state="all")
     final_by_title, final_by_marker = make_indexes(final_rows)
     missing: list[str] = []
