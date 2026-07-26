@@ -1,48 +1,58 @@
-name: Audit source snapshot
+name: Audit launch-readiness candidates
 
 on:
-  pull_request:
-    branches: [main]
+  push:
+    branches:
+      - audit/launch-readiness-2026-07-26
     paths:
       - '.github/workflows/audit-source-snapshot.yml'
-      - 'tools/audit/**'
+      - 'tools/audit/scan_repo.py'
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: ferrum-launch-readiness-audit
+  cancel-in-progress: true
 
 jobs:
-  snapshot:
+  scan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
-      - name: Check out exact audited main revision
-        uses: actions/checkout@v4
+      - name: Check out isolated audit branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
-          ref: 30dfc4aee3c16f5ea5ddcb7078a2b9da6f89564c
+          ref: audit/launch-readiness-2026-07-26
           fetch-depth: 1
 
-      - name: Record audited revision
-        shell: bash
-        run: |
-          set -euo pipefail
-          git rev-parse HEAD > /tmp/AUDITED_SHA
-          git status --short
-
-      - name: Package source tree
-        shell: bash
-        run: |
-          set -euo pipefail
-          tar \
-            --exclude=.git \
-            --exclude=target \
-            -czf /tmp/ferrum-edge-audit-source.tar.gz .
-
-      - name: Upload source snapshot
-        uses: actions/upload-artifact@v4
+      - name: Check out exact audited main revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
         with:
-          name: ferrum-edge-audit-source
-          path: |
-            /tmp/ferrum-edge-audit-source.tar.gz
-            /tmp/AUDITED_SHA
-          if-no-files-found: error
-          retention-days: 1
+          ref: 30dfc4aee3c16f5ea5ddcb7078a2b9da6f89564c
+          path: audited-main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Generate structured candidate report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/audit/scan_repo.py \
+            --root audited-main \
+            --sha 30dfc4aee3c16f5ea5ddcb7078a2b9da6f89564c \
+            --out tools/audit/generated
+
+      - name: Commit report to the isolated audit branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tools/audit/generated
+          if git diff --cached --quiet; then
+            echo 'Candidate report is unchanged.'
+            exit 0
+          fi
+          git commit -m 'chore(audit): refresh generated candidate report [skip ci]'
+          git push origin HEAD:audit/launch-readiness-2026-07-26
