@@ -9,7 +9,7 @@ on:
       - 'tools/audit/publish_81/**'
 
 permissions:
-  contents: read
+  contents: write
   issues: write
 
 concurrency:
@@ -24,6 +24,19 @@ jobs:
     steps:
       - name: Check out audit publisher
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+
+      - name: Record workflow run ID without retriggering publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$GITHUB_RUN_ID" > AUDIT_PUBLISH_RUN_ID
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add AUDIT_PUBLISH_RUN_ID
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore(audit): record publisher run id [skip ci]'
+            git push origin HEAD:audit/publish-81-findings-2026-07-26
+          fi
 
       - name: Decode reviewed finding manifest
         shell: bash
