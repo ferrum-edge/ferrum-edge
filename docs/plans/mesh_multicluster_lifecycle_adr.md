@@ -101,17 +101,16 @@ each other's discovery tokens. Ferrum binds each token to its target cluster:
   with **no** `FERRUM_MESH_CLUSTER_AUDIENCE` refuses every cross-cluster
   subscription rather than accepting an unbound one.
 
-**Token-purpose separation.** Ordinary local CP↔DP `ConfigSync`, xDS ADS, and
-ordinary local mesh `MeshSubscribe` tokens are unchanged and carry **no**
-audience, so they can never satisfy the discovery policy. In the other
-direction, every one of those surfaces refuses a token carrying the reserved
-`ferrum-mesh-discovery:` prefix, so a discovery token cannot be laundered into
-a local subscription — including by clearing the `remote_discovery` flag, since
-the local branch is what rejects the reserved prefix. Both branches fail
-closed, which is why the client-supplied flag is a class selector and not a
-trust decision. Non-discovery surfaces accept **no** audience at all, preserving
-`jsonwebtoken`'s strict `validate_aud` posture, and report a reserved prefix
-(`reserved_audience`) distinctly from an unrelated one (`unexpected_audience`).
+**Token-purpose separation.** Ordinary local mesh `MeshSubscribe` tokens carry
+the stable fixed audience `ferrum-mesh-subscribe:local`; discovery tokens carry
+the target-specific `ferrum-mesh-discovery:<cluster>` audience. The server
+requires the exact audience selected by the request class, so clearing
+`remote_discovery` cannot downgrade a discovery token, setting it cannot
+upgrade a local token, and the false/default branch cannot admit a legacy
+no-audience token. Ordinary CP↔DP `ConfigSync` and xDS ADS remain unchanged:
+their tokens carry **no** audience and their verifiers refuse every
+audience-bearing token, preserving `jsonwebtoken`'s strict `validate_aud`
+posture.
 
 Every other check is unchanged and still applies first: HS256 signature against
 the per-remote or shared secret, required `exp`/`iat`/`sub`/`iss`, pinned
@@ -125,6 +124,19 @@ as `ferrum_mesh_subscribe_audience_rejections_total{subscription,reason}` with
 compile-time-constant labels and audited as
 `audit.event="mesh_subscribe_audience_rejected"`; no token, claim value, or
 expected audience is ever logged or exported.
+
+### Compatibility
+
+This decision intentionally breaks mixed-version native `MeshSubscribe`.
+Pre-change local clients and pre-#3202 remote pollers both present
+`remote_discovery=false` with no `aud`; a new receiver cannot distinguish those
+wire shapes and refuses both. New local clients present
+`ferrum-mesh-subscribe:local`, and new remote pollers present a
+`ferrum-mesh-discovery:<cluster>` audience; an old receiver refuses either
+audience-bearing token. Control planes and all native local/remote
+MeshSubscribe clients must therefore be upgraded as one compatibility unit.
+Ordinary ConfigSync and xDS remain audience-less and are not part of this
+breaking change.
 
 ### Residual
 

@@ -19,6 +19,7 @@ use tokio::time::timeout;
 use tonic::transport::Server;
 
 use ferrum_edge::config::types::{AuthMode, BackendScheme, DispatchKind, GatewayConfig, Proxy};
+use ferrum_edge::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
 use ferrum_edge::grpc::cp_server::{CpGrpcServer, CpScope, DpNodeRegistry};
 use ferrum_edge::grpc::mesh_registry::MeshNodeRegistry;
 use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
@@ -34,6 +35,18 @@ const TEST_ISSUER: &str = "ferrum-edge-cp-dp";
 /// `None`, the token carries no `ns` claim — exercises the back-compat
 /// fall-through path.
 fn mint_token_with_ns(node_id: &str, ns: Option<serde_json::Value>) -> String {
+    mint_token_with_ns_and_audience(node_id, ns, None)
+}
+
+fn mint_local_mesh_token_with_ns(node_id: &str, ns: Option<serde_json::Value>) -> String {
+    mint_token_with_ns_and_audience(node_id, ns, Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE))
+}
+
+fn mint_token_with_ns_and_audience(
+    node_id: &str,
+    ns: Option<serde_json::Value>,
+    audience: Option<&str>,
+) -> String {
     let now = Utc::now().timestamp();
     let mut claims = json!({
         "sub": node_id,
@@ -44,6 +57,9 @@ fn mint_token_with_ns(node_id: &str, ns: Option<serde_json::Value>) -> String {
     });
     if let Some(ns_value) = ns {
         claims["ns"] = ns_value;
+    }
+    if let Some(audience) = audience {
+        claims["aud"] = json!(audience);
     }
     encode(
         &Header::new(Algorithm::HS256),
@@ -621,7 +637,7 @@ async fn native_mesh_subscribe_filters_tenant_slice_and_trust_material() {
     let (addr, handle) =
         start_mesh_with_scope(multi_tenant_mesh_config(), CpScope::Set(set), false).await;
 
-    let token = mint_token_with_ns("mesh-tenant-a", Some(json!("tenant-a")));
+    let token = mint_local_mesh_token_with_ns("mesh-tenant-a", Some(json!("tenant-a")));
     let mut client = connect_mesh_with_token!(addr, token);
     let req = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
         node_id: "mesh-tenant-a".to_string(),
@@ -656,7 +672,7 @@ async fn native_mesh_subscribe_rejects_missing_claim_in_multi_scope() {
     let (addr, handle) =
         start_mesh_with_scope(multi_tenant_mesh_config(), CpScope::Set(set), false).await;
 
-    let token = mint_token_with_ns("mesh-no-claim", None);
+    let token = mint_local_mesh_token_with_ns("mesh-no-claim", None);
     let mut client = connect_mesh_with_token!(addr, token);
     let req = tonic::Request::new(ferrum_edge::grpc::proto::MeshSubscribeRequest {
         node_id: "mesh-no-claim".to_string(),

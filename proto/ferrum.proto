@@ -105,15 +105,15 @@ message MeshSubscribeRequest {
   bool ambient_udp_source_scoping = 7;
   // True when this subscription is a CROSS-CLUSTER remote-discovery poll
   // (`RemoteCluster.control_plane_url`), false for an ordinary local mesh
-  // data-plane subscription. It selects which JWT audience policy the control
-  // plane enforces (issue #2475), and both branches fail closed, so the flag
-  // is not a trust decision:
+  // data-plane subscription. It selects between two REQUIRED, mutually
+  // exclusive JWT audiences (issue #2475), so the flag is not a trust
+  // decision and the proto3 false/default cannot admit a no-audience token:
   //   true  -> the bearer token must carry exactly one `aud` equal to
   //            "ferrum-mesh-discovery:<FERRUM_MESH_CLUSTER_AUDIENCE>" of THIS
   //            control plane; an unconfigured control plane refuses outright.
-  //   false -> the bearer token must carry NO `aud` at all, so a discovery
-  //            token minted for another cluster cannot be downgraded into a
-  //            local subscription here.
+  //   false -> the bearer token must carry exactly one `aud` equal to
+  //            "ferrum-mesh-subscribe:local"; missing or discovery-purpose
+  //            audiences are refused.
   bool remote_discovery = 8;
 }
 

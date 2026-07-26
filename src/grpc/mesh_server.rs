@@ -16,8 +16,8 @@ use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
 use super::auth::{
-    AllowedNamespaces, AudienceRejectReason, GrpcAudiencePolicy, remote_discovery_audience,
-    verify_grpc_jwt_metadata_with_audience,
+    AllowedNamespaces, AudienceRejectReason, GrpcAudiencePolicy, MESH_LOCAL_SUBSCRIBE_AUDIENCE,
+    remote_discovery_audience, verify_grpc_jwt_metadata_with_audience,
 };
 use super::cp_server::{CpGrpcServer, CpScope, DEFAULT_CP_DP_JWT_ISSUER};
 use super::mesh_registry::{MeshNodeInfo, MeshNodeRegistry};
@@ -313,19 +313,19 @@ impl MeshGrpcServer {
 
     /// Audience policy for one `MeshSubscribe` request.
     ///
-    /// Both branches fail closed, which is why trusting the client-supplied
-    /// `remote_discovery` flag is safe:
+    /// Both branches require distinct audiences and fail closed, which is why
+    /// trusting the client-supplied `remote_discovery` flag is safe:
     ///
     /// - A cross-cluster poll (`remote_discovery = true`) must present exactly
     ///   one `aud` naming THIS cluster. A control plane with no
     ///   `FERRUM_MESH_CLUSTER_AUDIENCE` cannot state which cluster it is, so it
     ///   refuses outright ([`GrpcAudiencePolicy::Unconfigured`]).
-    /// - An ordinary local subscription (`remote_discovery = false`) must carry
-    ///   no audience at all, so a token minted for cluster B cannot be
-    ///   laundered into cluster C by clearing the flag.
+    /// - An ordinary local subscription (`remote_discovery = false`) must
+    ///   present the fixed local-mesh purpose audience. A legacy token with no
+    ///   audience and a discovery token minted for cluster B both fail.
     fn audience_policy_for(&self, remote_discovery: bool) -> GrpcAudiencePolicy<'_> {
         if !remote_discovery {
-            return GrpcAudiencePolicy::ReservedForbidden;
+            return GrpcAudiencePolicy::Required(MESH_LOCAL_SUBSCRIBE_AUDIENCE);
         }
         match self.expected_remote_discovery_audience.as_deref() {
             Some(expected) => GrpcAudiencePolicy::Required(expected),
@@ -506,7 +506,7 @@ impl MeshConfigSync for MeshGrpcServer {
                         surface = "MeshConfigSync.MeshSubscribe",
                         subscription_class,
                         reason = reason.as_metric_label(),
-                        "Refused MeshSubscribe: JWT audience is not bound to this cluster"
+                        "Refused MeshSubscribe: JWT audience does not match subscription purpose"
                     );
                 }
                 CpGrpcServer::audit_tenant_subscription(

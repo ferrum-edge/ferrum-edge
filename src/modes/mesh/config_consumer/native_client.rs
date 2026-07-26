@@ -14,8 +14,9 @@ use super::update_validation::{
     MeshUpdateConsumer, MeshUpdateExpectation, MeshUpdateRejection, validate_mesh_config_update,
     validate_update_ferrum_version,
 };
+use crate::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE;
 use crate::grpc::dp_client::{
-    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_with_issuer_and_namespace,
+    DpGrpcTlsConfig, DpGrpcTlsReload, GrpcJwtSecret, generate_dp_jwt_full,
 };
 use crate::grpc::proto::mesh_config_sync_client::MeshConfigSyncClient;
 use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
@@ -50,11 +51,9 @@ impl NativeMeshClientConfig {
             waypoint_name: self.waypoint_name.clone().unwrap_or_default(),
             ambient_udp_source_scoping: self.ambient_udp_source_scoping,
             // Ordinary LOCAL mesh subscription: this data plane talks to its
-            // own control plane. Its token deliberately carries no `aud` and
-            // the CP refuses any token bearing a reserved
-            // `ferrum-mesh-discovery:` audience on this class, so a
-            // cross-cluster discovery token can never be replayed here
-            // (issue #2475).
+            // own control plane and presents the distinct, fixed local-mesh
+            // JWT audience. The CP rejects both missing audiences (legacy
+            // clients) and remote-discovery audiences on this class.
             remote_discovery: false,
         }
     }
@@ -221,11 +220,12 @@ async fn connect_mesh_subscribe(
     }
 
     let channel = endpoint.connect().await?;
-    let auth_token = generate_dp_jwt_with_issuer_and_namespace(
+    let auth_token = generate_dp_jwt_full(
         jwt_secret.as_str(),
         &config.node_id,
         jwt_secret.issuer(),
         Some(&config.namespace),
+        Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
     )?;
     let token: MetadataValue<_> = format!("Bearer {auth_token}").parse()?;
 
@@ -481,17 +481,19 @@ mod tests {
     }
 
     #[test]
-    fn mesh_client_self_minted_token_carries_namespace_claim() {
-        let token = generate_dp_jwt_with_issuer_and_namespace(
+    fn mesh_client_self_minted_token_carries_namespace_and_local_audience() {
+        let token = generate_dp_jwt_full(
             "test-secret",
             "node-a",
             "ferrum-edge-cp-dp",
             Some("tenant-a"),
+            Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE),
         )
         .expect("token should mint");
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
         validation.validate_exp = true;
         validation.set_issuer(&["ferrum-edge-cp-dp"]);
+        validation.set_audience(&[MESH_LOCAL_SUBSCRIBE_AUDIENCE]);
         let decoded = jsonwebtoken::decode::<serde_json::Value>(
             &token,
             &jsonwebtoken::DecodingKey::from_secret(b"test-secret"),
@@ -502,6 +504,10 @@ mod tests {
         assert_eq!(
             decoded.claims.get("ns").and_then(|value| value.as_str()),
             Some("tenant-a")
+        );
+        assert_eq!(
+            decoded.claims.get("aud").and_then(|value| value.as_str()),
+            Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE)
         );
     }
 }

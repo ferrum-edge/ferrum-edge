@@ -366,10 +366,11 @@ pub fn generate_dp_jwt_with_issuer_and_namespace(
 /// The claim is always a plain string (never an array), because Ferrum's
 /// verifier treats a multi-valued audience as ambiguous and fails closed.
 ///
-/// `audience` of `None` reproduces the ordinary CP↔DP / local mesh token shape
-/// exactly — those classes carry no `aud`, and every non-discovery gRPC surface
-/// refuses a token that carries a reserved discovery audience, so the two
-/// purposes stay unambiguous in both directions.
+/// `audience` of `None` reproduces the ordinary CP↔DP ConfigSync / xDS token
+/// shape exactly. Native local mesh callers pass
+/// [`crate::grpc::auth::MESH_LOCAL_SUBSCRIBE_AUDIENCE`], while remote discovery
+/// passes its target-cluster audience, so the two MeshSubscribe purposes are
+/// cryptographically distinct.
 pub fn generate_dp_jwt_full(
     secret: &str,
     node_id: &str,

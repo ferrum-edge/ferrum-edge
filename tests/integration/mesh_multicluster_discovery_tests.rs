@@ -331,7 +331,9 @@ mod audience_binding {
 
     use arc_swap::ArcSwap;
     use ferrum_edge::config::types::GatewayConfig;
-    use ferrum_edge::grpc::auth::remote_discovery_audience;
+    use ferrum_edge::grpc::auth::{
+        MESH_LOCAL_SUBSCRIBE_AUDIENCE, remote_discovery_audience,
+    };
     use ferrum_edge::grpc::dp_client::{GrpcJwtSecret, generate_dp_jwt_full};
     use ferrum_edge::grpc::mesh_server::MeshGrpcServer;
     use ferrum_edge::grpc::proto::MeshSubscribeRequest;
@@ -576,6 +578,13 @@ mod audience_binding {
                 "ambiguous",
                 token_with_raw_audience(serde_json::json!([b_audience, c_audience])),
             ),
+            (
+                "multiple duplicate",
+                token_with_raw_audience(serde_json::json!([
+                    remote_discovery_audience(CLUSTER_B),
+                    remote_discovery_audience(CLUSTER_B),
+                ])),
+            ),
         ];
 
         // Each cluster is additionally presented with the OTHER cluster's
@@ -608,7 +617,7 @@ mod audience_binding {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn unconfigured_control_plane_refuses_remote_discovery_but_serves_local() {
+    async fn unconfigured_control_plane_refuses_remote_discovery_and_requires_local_purpose() {
         // No FERRUM_MESH_CLUSTER_AUDIENCE: the CP cannot state which cluster it
         // is, so it must refuse every cross-cluster subscription rather than
         // accept an unbound one.
@@ -629,17 +638,30 @@ mod audience_binding {
             .expect_err("an unconfigured CP refuses discovery regardless of the token");
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
-        // Ordinary local mesh subscriptions are unaffected: unchanged token
-        // shape, unchanged acceptance.
-        subscribe_with_token(&cp.url, &token_with_audience(None), false)
+        // The false/default class is no longer a legacy escape hatch. An old
+        // local client or pre-#3202 remote poller sends no audience and must
+        // fail authentication rather than being classified as an accepted
+        // local subscription.
+        let status = subscribe_with_token(&cp.url, &token_with_audience(None), false)
             .await
-            .expect("ordinary local mesh subscriptions keep working unchanged");
+            .expect_err("false/default plus a missing audience must fail closed");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+        // A new local native client mints the distinct fixed local-purpose
+        // audience and succeeds on the false/local branch.
+        subscribe_with_token(
+            &cp.url,
+            &token_with_audience(Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE)),
+            false,
+        )
+        .await
+        .expect("the new local mesh token succeeds on the local branch");
 
         cp.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn discovery_token_cannot_be_downgraded_into_a_local_subscription() {
+    async fn mesh_subscribe_purpose_tokens_cannot_cross_classes() {
         // The `remote_discovery` flag is caller-supplied. Clearing it must not
         // launder a discovery token minted for B into a local subscription at
         // C (or anywhere else): the local branch refuses the reserved prefix.
@@ -657,6 +679,15 @@ mod audience_binding {
         let status = subscribe_with_token(&cp_c.url, &c_token, false)
             .await
             .expect_err("even this cluster's discovery audience is not a local token");
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+        // The inverse substitution fails too: the fixed local-purpose token
+        // cannot be upgraded into target-cluster discovery by setting the
+        // caller-supplied flag.
+        let local_token = token_with_audience(Some(MESH_LOCAL_SUBSCRIBE_AUDIENCE));
+        let status = subscribe_with_token(&cp_c.url, &local_token, true)
+            .await
+            .expect_err("a local-purpose token is not a discovery credential");
         assert_eq!(status.code(), tonic::Code::Unauthenticated);
 
         cp_c.shutdown().await;

@@ -17,16 +17,14 @@
 //!   [`remote_discovery_audience`] of the *receiving* cluster's configured
 //!   `FERRUM_MESH_CLUSTER_AUDIENCE`. Missing, malformed, multiple/ambiguous,
 //!   or mismatched audiences are refused, and so is an unconfigured receiver.
-//! - Every other surface (ordinary local CP↔DP `ConfigSync`, xDS ADS, and
-//!   ordinary local mesh `MeshSubscribe`) runs
-//!   [`GrpcAudiencePolicy::ReservedForbidden`]: those token classes are
-//!   unchanged and carry no `aud`, so any audience at all is refused —
-//!   preserving `jsonwebtoken`'s strict `validate_aud` posture — with a
-//!   reserved [`MESH_REMOTE_DISCOVERY_AUDIENCE_PREFIX`] value reported
-//!   distinctly from an unrelated one. That keeps the two token purposes
-//!   unambiguous in both directions: a discovery token can never be replayed
-//!   as a local subscription token, and a local token can never satisfy the
-//!   discovery policy (it carries no `aud` at all).
+//! - Ordinary local mesh `MeshSubscribe` requires exactly one `aud`, equal to
+//!   [`MESH_LOCAL_SUBSCRIBE_AUDIENCE`]. Requiring a distinct local purpose
+//!   prevents a legacy no-audience token from selecting the local branch by
+//!   sending the proto3 default `remote_discovery = false`.
+//! - Ordinary CP↔DP `ConfigSync` and xDS ADS remain unchanged and run
+//!   [`GrpcAudiencePolicy::ReservedForbidden`]: those token classes carry no
+//!   `aud`, so any audience at all is refused, preserving `jsonwebtoken`'s
+//!   strict `validate_aud` posture.
 
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde_json::Value;
@@ -39,6 +37,13 @@ use tonic::Status;
 /// it, so the class cannot be silently substituted for an ordinary CP↔DP or
 /// local mesh subscription token.
 pub const MESH_REMOTE_DISCOVERY_AUDIENCE_PREFIX: &str = "ferrum-mesh-discovery:";
+
+/// Stable JWT `aud` for an ordinary local mesh `MeshSubscribe`.
+///
+/// This is a purpose identifier, not a target-cluster identifier. Local mesh
+/// subscriptions and cross-cluster discovery must remain cryptographically
+/// distinct even when they share the same HS256 secret and issuer.
+pub const MESH_LOCAL_SUBSCRIBE_AUDIENCE: &str = "ferrum-mesh-subscribe:local";
 
 /// Build the remote-discovery audience for a target cluster.
 ///
@@ -69,8 +74,8 @@ pub enum GrpcAudiencePolicy<'a> {
     /// these surfaces (RFC 7519 §4.1.3): a token stamped for *some* audience
     /// was minted for a purpose this surface cannot check, and honoring it
     /// whenever the HS256 secret is shared is exactly the substitution this
-    /// binding exists to prevent. A reserved mesh audience is reported
-    /// separately from an unrelated one so operators can tell a cross-cluster
+    /// binding exists to prevent. A MeshSubscribe-purpose audience is reported
+    /// separately from an unrelated one so operators can tell a cross-surface
     /// replay attempt apart from a misconfigured token minter.
     ReservedForbidden,
     /// The surface requires exactly one audience, equal to this value.
@@ -98,7 +103,7 @@ pub enum AudienceRejectReason {
     Mismatch,
     /// The receiver has no audience configured but the request requires one.
     Unconfigured,
-    /// A reserved mesh audience reached a surface that is not its purpose.
+    /// A reserved MeshSubscribe audience reached a non-MeshSubscribe surface.
     ReservedAudience,
     /// A surface that expects no audience received a token carrying one.
     UnexpectedAudience,
@@ -125,7 +130,9 @@ impl AudienceRejectReason {
             Self::Missing => "Invalid token: required audience claim is missing",
             Self::Malformed => "Invalid token: audience claim is malformed",
             Self::Ambiguous => "Invalid token: audience claim is ambiguous",
-            Self::Mismatch => "Invalid token: audience claim is not this cluster",
+            Self::Mismatch => {
+                "Invalid token: audience claim does not match this subscription purpose"
+            }
             Self::Unconfigured => {
                 "Remote-cluster discovery is not enabled here: this control plane has no \
                  FERRUM_MESH_CLUSTER_AUDIENCE configured"
@@ -176,8 +183,6 @@ fn parse_audience_claim(claims: &Value) -> Result<Option<String>, AudienceReject
             }
             normalized.push(trimmed.to_string());
         }
-        normalized.sort();
-        normalized.dedup();
         if normalized.len() > 1 {
             return Err(AudienceRejectReason::Ambiguous);
         }
@@ -207,7 +212,10 @@ fn enforce_audience(
         },
         GrpcAudiencePolicy::ReservedForbidden => match audience {
             None => Ok(()),
-            Some(found) if found.starts_with(MESH_REMOTE_DISCOVERY_AUDIENCE_PREFIX) => {
+            Some(found)
+                if found == MESH_LOCAL_SUBSCRIBE_AUDIENCE
+                    || found.starts_with(MESH_REMOTE_DISCOVERY_AUDIENCE_PREFIX) =>
+            {
                 Err(AudienceRejectReason::ReservedAudience)
             }
             Some(_) => Err(AudienceRejectReason::UnexpectedAudience),
@@ -487,11 +495,6 @@ mod tests {
             parse_audience_claim(&json!({ "aud": ["cluster-b"] })).expect("array aud"),
             Some("cluster-b".to_string())
         );
-        // Duplicates collapse to one unambiguous target.
-        assert_eq!(
-            parse_audience_claim(&json!({ "aud": ["cluster-b", "cluster-b"] })).expect("dup aud"),
-            Some("cluster-b".to_string())
-        );
         assert_eq!(
             parse_audience_claim(&json!({ "sub": "n" })).expect("absent"),
             None
@@ -517,6 +520,10 @@ mod tests {
         }
         assert_eq!(
             parse_audience_claim(&json!({ "aud": ["cluster-b", "cluster-c"] })),
+            Err(AudienceRejectReason::Ambiguous)
+        );
+        assert_eq!(
+            parse_audience_claim(&json!({ "aud": ["cluster-b", "cluster-b"] })),
             Err(AudienceRejectReason::Ambiguous)
         );
     }
@@ -551,6 +558,33 @@ mod tests {
     }
 
     #[test]
+    fn local_mesh_and_remote_discovery_purposes_are_distinct() {
+        let local_policy = GrpcAudiencePolicy::Required(MESH_LOCAL_SUBSCRIBE_AUDIENCE);
+        assert!(
+            enforce_audience(
+                &json!({ "aud": MESH_LOCAL_SUBSCRIBE_AUDIENCE }),
+                local_policy
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            enforce_audience(&json!({ "sub": "legacy-mesh-node" }), local_policy),
+            Err(AudienceRejectReason::Missing)
+        );
+        assert_eq!(
+            enforce_audience(&json!({ "aud": CLUSTER_B_AUD }), local_policy),
+            Err(AudienceRejectReason::Mismatch)
+        );
+        assert_eq!(
+            enforce_audience(
+                &json!({ "aud": MESH_LOCAL_SUBSCRIBE_AUDIENCE }),
+                GrpcAudiencePolicy::Required(CLUSTER_B_AUD)
+            ),
+            Err(AudienceRejectReason::Mismatch)
+        );
+    }
+
+    #[test]
     fn unconfigured_policy_always_fails_closed() {
         assert_eq!(
             enforce_audience(
@@ -568,7 +602,8 @@ mod tests {
     #[test]
     fn reserved_forbidden_policy_separates_the_token_purposes() {
         let policy = GrpcAudiencePolicy::ReservedForbidden;
-        // Ordinary CP↔DP / local mesh tokens carry no audience: unchanged.
+        // Ordinary CP↔DP ConfigSync and xDS tokens carry no audience:
+        // unchanged.
         assert!(enforce_audience(&json!({ "sub": "dp" }), policy).is_ok());
         // A token minted for ANY other audience is refused, preserving
         // jsonwebtoken's strict `validate_aud` posture for these surfaces.
@@ -579,6 +614,13 @@ mod tests {
         // A remote-discovery token can never be replayed as a local one.
         assert_eq!(
             enforce_audience(&json!({ "aud": CLUSTER_B_AUD }), policy),
+            Err(AudienceRejectReason::ReservedAudience)
+        );
+        assert_eq!(
+            enforce_audience(
+                &json!({ "aud": MESH_LOCAL_SUBSCRIBE_AUDIENCE }),
+                policy
+            ),
             Err(AudienceRejectReason::ReservedAudience)
         );
         // Malformed shapes still fail closed on this policy.

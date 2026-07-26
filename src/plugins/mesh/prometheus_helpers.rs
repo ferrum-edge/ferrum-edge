@@ -796,7 +796,7 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
 
     if !MESH_SUBSCRIBE_AUDIENCE_REJECTIONS.is_empty() {
         output.push_str(
-            "# HELP ferrum_mesh_subscribe_audience_rejections_total MeshSubscribe subscriptions refused by the control plane because the bearer JWT audience is not bound to this cluster, by subscription class and reason.\n",
+            "# HELP ferrum_mesh_subscribe_audience_rejections_total MeshSubscribe subscriptions refused by the control plane because the bearer JWT audience does not match the required subscription purpose, by subscription class and reason.\n",
         );
         output.push_str("# TYPE ferrum_mesh_subscribe_audience_rejections_total counter\n");
         for entry in MESH_SUBSCRIBE_AUDIENCE_REJECTIONS.iter() {

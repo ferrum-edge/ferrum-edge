@@ -4276,7 +4276,8 @@ mod tests {
     // verification step.
 
     use crate::grpc::auth::{
-        GrpcAudiencePolicy, remote_discovery_audience, verify_grpc_jwt_metadata_with_audience,
+        GrpcAudiencePolicy, MESH_LOCAL_SUBSCRIBE_AUDIENCE, remote_discovery_audience,
+        verify_grpc_jwt_metadata_with_audience,
     };
     use crate::grpc::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
     use crate::grpc::proto::{MeshConfigUpdate, MeshSubscribeRequest};
@@ -4340,7 +4341,7 @@ mod tests {
                 let policy = if request.get_ref().remote_discovery {
                     GrpcAudiencePolicy::Required(&expected)
                 } else {
-                    GrpcAudiencePolicy::ReservedForbidden
+                    GrpcAudiencePolicy::Required(MESH_LOCAL_SUBSCRIBE_AUDIENCE)
                 };
                 verify_grpc_jwt_metadata_with_audience(
                     request.metadata(),
