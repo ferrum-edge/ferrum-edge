@@ -4993,8 +4993,9 @@ async fn tool_call_only_sse_uses_reassembled_shape() {
     assert_eq!(excerpt["finish_reason"]["2"], "tool_calls");
 }
 
-#[tokio::test]
-async fn repeated_indexless_tool_call_frames_reassemble_before_redaction() {
+/// Drive one SSE body through a live streaming capture and return the exported
+/// `response_body` excerpt.
+async fn captured_sse_excerpt(stream: &str) -> String {
     let server = mock_sink().await;
     let endpoint = format!("{}/ingest", server.uri());
     let plugin = AiTranscriptAudit::new(
@@ -5014,24 +5015,195 @@ async fn repeated_indexless_tool_call_frames_reassemble_before_redaction() {
     let mut inspector = plugin
         .response_stream_inspector(&ctx, 200, Some("text/event-stream"))
         .expect("inspector");
-    let stream = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"token\\\":\\\"abc\"}}]}}]}\n\ndata: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"def\\\"}\"}}]}}]}\n\ndata: [DONE]\n\n";
-    let _ = inspector.on_chunk(stream).await;
+    let _ = inspector.on_chunk(stream.as_bytes()).await;
     let _ = inspector.on_end().await;
     plugin
         .on_response_stream_terminated(&mut ctx, 200, &BodyOutcome::success(stream.len() as u64))
         .await;
 
     let records = wait_for_records(&server).await;
-    let excerpt = records[0]["response_body"]
+    assert_eq!(records.len(), 1);
+    records[0]["response_body"]
         .as_str()
-        .expect("response excerpt");
+        .expect("response excerpt")
+        .to_string()
+}
+
+#[tokio::test]
+async fn repeated_indexless_tool_call_frames_withhold_ambiguous_arguments() {
+    // Two `index`-less deltas for one choice: position cannot prove the second
+    // continues the first, so the fragments are neither joined (which could
+    // fabricate attacker-chosen JSON) nor exported apart (which would leak the
+    // value half of a split `token`).
+    let stream = concat!(
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"token\":\"AAA"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"BBB\"}"}}]}}]}"#,
+        "\n\ndata: [DONE]\n\n",
+    );
+    let excerpt = captured_sse_excerpt(stream).await;
+    // The reassembled path is retained — the leaky per-frame fallback is not
+    // an acceptable answer to ambiguity.
     assert!(excerpt.contains("sse_reassembled"), "{excerpt}");
-    assert!(!excerpt.contains("abcdef"), "{excerpt}");
+    assert!(!excerpt.contains("AAA"), "{excerpt}");
+    assert!(!excerpt.contains("BBB"), "{excerpt}");
+    let parsed: Value = serde_json::from_str(&excerpt).expect("reassembled excerpt JSON");
+    let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 1, "{excerpt}");
+    assert_eq!(calls[0]["position"], 0);
+    assert!(calls[0].get("index").is_none(), "{excerpt}");
+    assert_eq!(calls[0]["arguments_withheld"], true);
+    assert_eq!(
+        calls[0]["function"]["arguments"],
+        "[REDACTED:ambiguous_tool_call]"
+    );
+    // Unidentified entries also drop their positionally merged scalars.
+    assert!(calls[0].get("id").is_none(), "{excerpt}");
+    assert!(calls[0]["function"].get("name").is_none(), "{excerpt}");
+}
+
+#[tokio::test]
+async fn indexless_tool_call_never_continues_an_indexed_call() {
+    // Mixed indexed/`index`-less: the two key spaces are disjoint, so the
+    // trailing fragment must not silently complete `index: 0`. Both fragments
+    // are withheld because either could be the other's split half.
+    let stream = concat!(
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"notify","arguments":"{\"token\":\"AAA"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"function":{"arguments":"BBB\"}"}}]}}]}"#,
+        "\n\ndata: [DONE]\n\n",
+    );
+    let excerpt = captured_sse_excerpt(stream).await;
+    assert!(!excerpt.contains("AAA"), "{excerpt}");
+    assert!(!excerpt.contains("BBB"), "{excerpt}");
+    let parsed: Value = serde_json::from_str(&excerpt).expect("reassembled excerpt JSON");
+    let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 2, "slots must stay disjoint: {excerpt}");
+    // Provider-declared identity survives; its arguments do not.
+    assert_eq!(calls[0]["index"], 0);
+    assert_eq!(calls[0]["id"], "call_a");
+    assert_eq!(calls[0]["function"]["name"], "notify");
+    assert_eq!(calls[0]["arguments_withheld"], true);
+    assert_eq!(calls[1]["position"], 0);
+    assert_eq!(calls[1]["arguments_withheld"], true);
+}
+
+#[tokio::test]
+async fn single_delta_indexless_tool_call_is_reassembled_and_redacted() {
+    // One contributing delta is unambiguous by construction: array positions
+    // are distinct calls and nothing is joined across frames.
+    let stream = concat!(
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"id":"call_x","type":"function","function":{"name":"lookup","arguments":"{\"token\":\"AAA\",\"note\":\"keep\"}"}},{"id":"call_y","function":{"name":"other","arguments":"{\"note\":\"second\"}"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "\n\ndata: [DONE]\n\n",
+    );
+    let excerpt = captured_sse_excerpt(stream).await;
+    assert!(!excerpt.contains("AAA"), "{excerpt}");
+    let parsed: Value = serde_json::from_str(&excerpt).expect("reassembled excerpt JSON");
+    let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 2, "{excerpt}");
+    assert_eq!(calls[0]["position"], 0);
+    assert!(calls[0].get("arguments_withheld").is_none(), "{excerpt}");
+    assert_eq!(calls[0]["id"], "call_x");
+    let first: Value = serde_json::from_str(
+        calls[0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments"),
+    )
+    .expect("first arguments JSON");
+    assert_eq!(first["token"], "[REDACTED]");
+    assert_eq!(first["note"], "keep");
+    assert_eq!(calls[1]["position"], 1);
+    assert_eq!(calls[1]["id"], "call_y");
+}
+
+#[tokio::test]
+async fn tool_call_ambiguity_is_scoped_to_one_choice() {
+    // Choice 0 is correlated by provider `index` and stays reassembled; the
+    // `index`-less repetition in choice 1 must not degrade it.
+    let stream = concat!(
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"n0","arguments":"{\"token\":\"AAA"}}]}},{"index":1,"delta":{"tool_calls":[{"id":"call_b","function":{"arguments":"{\"token\":\"CCC"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"BBB\"}"}}]}},{"index":1,"delta":{"tool_calls":[{"function":{"arguments":"DDD\"}"}}]}}]}"#,
+        "\n\ndata: [DONE]\n\n",
+    );
+    let excerpt = captured_sse_excerpt(stream).await;
+    for leaked in ["AAABBB", "AAA", "BBB", "CCC", "DDD"] {
+        assert!(!excerpt.contains(leaked), "{leaked} in {excerpt}");
+    }
+    let parsed: Value = serde_json::from_str(&excerpt).expect("reassembled excerpt JSON");
+    let unambiguous = parsed["tool_calls"]["0"].as_array().expect("choice 0");
+    assert_eq!(unambiguous.len(), 1, "{excerpt}");
     assert!(
-        !excerpt.contains("abc") && !excerpt.contains("def"),
+        unambiguous[0].get("arguments_withheld").is_none(),
         "{excerpt}"
     );
-    assert!(excerpt.contains(r#"\"token\":\"[REDACTED]\""#), "{excerpt}");
+    let joined: Value = serde_json::from_str(
+        unambiguous[0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments"),
+    )
+    .expect("choice 0 arguments JSON");
+    assert_eq!(joined["token"], "[REDACTED]");
+    let ambiguous = parsed["tool_calls"]["1"].as_array().expect("choice 1");
+    assert_eq!(ambiguous.len(), 1, "{excerpt}");
+    assert_eq!(ambiguous[0]["arguments_withheld"], true);
+}
+
+#[tokio::test]
+async fn malformed_tool_call_index_is_unidentified_not_a_capture_downgrade() {
+    // A `null` or non-integer `index` must not let a backend force the leaky
+    // raw-frame fallback; it is treated as unidentified instead.
+    let stream = concat!(
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":null,"id":"call_1","function":{"name":"lookup","arguments":"{\"token\":\"AAA"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":"0","delta":{"tool_calls":[{"index":"0","function":{"arguments":"BBB\"}"}}]}}]}"#,
+        "\n\ndata: [DONE]\n\n",
+    );
+    let excerpt = captured_sse_excerpt(stream).await;
+    assert!(excerpt.contains("sse_reassembled"), "{excerpt}");
+    assert!(!excerpt.contains("AAA"), "{excerpt}");
+    assert!(!excerpt.contains("BBB"), "{excerpt}");
+    let parsed: Value = serde_json::from_str(&excerpt).expect("reassembled excerpt JSON");
+    let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 1, "{excerpt}");
+    assert_eq!(calls[0]["position"], 0);
+    assert_eq!(calls[0]["arguments_withheld"], true);
+}
+
+#[tokio::test]
+async fn indexed_tool_calls_survive_reordered_and_missing_frames() {
+    // Provider-declared indices remain the trusted identity even when a call
+    // is absent from a delta and the array order changes between deltas.
+    let stream = concat!(
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"a","arguments":"{\"token\":\"XX"}},{"index":1,"id":"c1","function":{"name":"b","arguments":"{\"note\":\"pu"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"bl"}}]}}]}"#,
+        "\n\n",
+        r#"data: {"object":"chat.completion.chunk","choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"ic\"}"}},{"index":0,"function":{"arguments":"YY\"}"}}]}}]}"#,
+        "\n\ndata: [DONE]\n\n",
+    );
+    let excerpt = captured_sse_excerpt(stream).await;
+    assert!(!excerpt.contains("XXYY"), "{excerpt}");
+    let parsed: Value = serde_json::from_str(&excerpt).expect("reassembled excerpt JSON");
+    let calls = parsed["tool_calls"]["0"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 2, "{excerpt}");
+    assert!(calls[0].get("arguments_withheld").is_none(), "{excerpt}");
+    let first: Value = serde_json::from_str(
+        calls[0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments"),
+    )
+    .expect("call 0 arguments JSON");
+    assert_eq!(first["token"], "[REDACTED]");
+    let second: Value = serde_json::from_str(
+        calls[1]["function"]["arguments"]
+            .as_str()
+            .expect("arguments"),
+    )
+    .expect("call 1 arguments JSON");
+    assert_eq!(second["note"], "public");
 }
 
 #[tokio::test]

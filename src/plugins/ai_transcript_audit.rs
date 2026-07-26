@@ -2582,17 +2582,70 @@ struct ReassembledToolCall {
     arguments: String,
 }
 
+/// Identity used to correlate streamed tool-call fragments across deltas.
+///
+/// The two key spaces are deliberately disjoint. A provider-declared `index`
+/// is the only assertion of cross-frame identity we trust; array position is
+/// meaningful only *within* the delta that carried it, so a positional slot
+/// must never be able to collide with (and silently continue) a call the
+/// provider identified by index.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ToolCallSlot {
+    /// Provider-declared `index`.
+    Indexed(u64),
+    /// Array position of an `index`-less entry within a single delta.
+    Positional(u64),
+}
+
+/// Placeholder exported in place of tool-call arguments whose owning call
+/// could not be identified. Withholding is deliberate: the fragments cannot
+/// be safely joined (they may belong to different calls) and they cannot be
+/// safely exported apart either, because a sensitive key and its value can be
+/// split across them and would then escape JSON-key redaction.
+const AMBIGUOUS_TOOL_CALL_ARGUMENTS: &str = "[REDACTED:ambiguous_tool_call]";
+
 #[derive(Default)]
 struct ReassembledChoice {
     content: String,
-    tool_calls: BTreeMap<u64, ReassembledToolCall>,
+    tool_calls: BTreeMap<ToolCallSlot, ReassembledToolCall>,
+    /// Number of `delta.tool_calls` arrays applied to this choice. Counted per
+    /// applied array rather than per SSE frame so that several `choices`
+    /// entries collapsing onto the same choice index (all `index`-less, say)
+    /// are recognized as separate, uncorrelatable contributions.
+    tool_call_deltas: usize,
+    /// Whether any applied entry omitted a usable `index`.
+    saw_indexless_tool_call: bool,
     finish_reason: Option<String>,
+}
+
+impl ReassembledChoice {
+    /// True when this choice's tool-call arguments cannot be attributed to a
+    /// specific call with confidence.
+    ///
+    /// A single delta is always unambiguous: its array positions are distinct
+    /// calls by construction and nothing is joined across frames. Once a
+    /// second delta contributes to a choice that has any `index`-less entry,
+    /// no fragment in the choice is trustworthy — the `index`-less entry may
+    /// continue any earlier call (indexed or not), and conversely an earlier
+    /// fragment may be the prefix whose value half arrives in a differently
+    /// keyed slot. Both directions are handled by withholding every argument
+    /// fragment in the choice.
+    fn tool_call_identity_ambiguous(&self) -> bool {
+        self.saw_indexless_tool_call && self.tool_call_deltas > 1
+    }
 }
 
 /// Reassemble captured OpenAI `chat.completion.chunk` SSE frames by choice.
 /// Text and tool-call fragments are concatenated in frame order, including
 /// fragmented arguments, before the caller applies sensitive-field and pattern
 /// redaction. Uniformly parseable tool-call-only streams use this path too.
+///
+/// Tool-call fragments are correlated only by a provider-declared `index`.
+/// Array position identifies a call within one delta and is never used to
+/// continue a call across deltas; when a choice mixes `index`-less entries
+/// with more than one contributing delta, its argument fragments are withheld
+/// (`AMBIGUOUS_TOOL_CALL_ARGUMENTS`) rather than joined on a guess or exported
+/// piecemeal. See [`ReassembledChoice::tool_call_identity_ambiguous`].
 fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
     let text = std::str::from_utf8(raw).ok()?;
     let mut per_choice: BTreeMap<u64, ReassembledChoice> = BTreeMap::new();
@@ -2633,13 +2686,26 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
             }
             if let Some(tool_calls) = delta.get("tool_calls") {
                 let tool_calls = tool_calls.as_array()?;
+                accumulated.tool_call_deltas = accumulated.tool_call_deltas.saturating_add(1);
                 for (position, tool_call) in tool_calls.iter().enumerate() {
                     let tool_call = tool_call.as_object()?;
-                    let tool_index = match tool_call.get("index") {
-                        Some(index) => index.as_u64()?,
-                        None => position as u64,
+                    // A missing, null, or non-integer `index` is treated as
+                    // "unidentified" rather than aborting to the raw-frame
+                    // path: a backend must not be able to downgrade this
+                    // capture to per-frame redaction by malforming one
+                    // optional field.
+                    let declared_index = tool_call
+                        .get("index")
+                        .filter(|index| !index.is_null())
+                        .and_then(Value::as_u64);
+                    let slot = match declared_index {
+                        Some(index) => ToolCallSlot::Indexed(index),
+                        None => {
+                            accumulated.saw_indexless_tool_call = true;
+                            ToolCallSlot::Positional(position as u64)
+                        }
                     };
-                    let call = accumulated.tool_calls.entry(tool_index).or_default();
+                    let call = accumulated.tool_calls.entry(slot).or_default();
                     if let Some(id) = tool_call.get("id")
                         && !id.is_null()
                     {
@@ -2684,23 +2750,56 @@ fn reassemble_openai_sse_deltas(raw: &[u8]) -> Option<Value> {
             completion_text.insert(choice_key.clone(), Value::String(choice.content));
         }
         if !choice.tool_calls.is_empty() {
+            let ambiguous = choice.tool_call_identity_ambiguous();
             let mut calls = Vec::with_capacity(choice.tool_calls.len());
-            for (tool_index, call) in choice.tool_calls {
+            for (slot, call) in choice.tool_calls {
                 let mut call_json = serde_json::Map::new();
-                call_json.insert("index".to_string(), Value::from(tool_index));
-                if !call.id.is_empty() {
-                    call_json.insert("id".to_string(), Value::String(call.id));
-                }
-                if !call.call_type.is_empty() {
-                    call_json.insert("type".to_string(), Value::String(call.call_type));
-                }
-                if !call.name.is_empty() || !call.arguments.is_empty() {
-                    let mut function = serde_json::Map::new();
-                    if !call.name.is_empty() {
-                        function.insert("name".to_string(), Value::String(call.name));
+                // Only a provider-declared index is exported as `index`; a
+                // positional slot is reported as `position` so the record
+                // never implies an identity the provider did not assert.
+                let indexless = match slot {
+                    ToolCallSlot::Indexed(index) => {
+                        call_json.insert("index".to_string(), Value::from(index));
+                        false
                     }
-                    if !call.arguments.is_empty() {
-                        function.insert("arguments".to_string(), Value::String(call.arguments));
+                    ToolCallSlot::Positional(position) => {
+                        call_json.insert("position".to_string(), Value::from(position));
+                        true
+                    }
+                };
+                // Under ambiguous identity the scalar fragments of an
+                // unidentified call may have been co-located with an
+                // unrelated call, so only provider-indexed identity survives.
+                let withhold_identity = ambiguous && indexless;
+                if !withhold_identity {
+                    if !call.id.is_empty() {
+                        call_json.insert("id".to_string(), Value::String(call.id));
+                    }
+                    if !call.call_type.is_empty() {
+                        call_json.insert("type".to_string(), Value::String(call.call_type));
+                    }
+                }
+                let name = if withhold_identity {
+                    String::new()
+                } else {
+                    call.name
+                };
+                let withhold_arguments = ambiguous && !call.arguments.is_empty();
+                let arguments = if withhold_arguments {
+                    AMBIGUOUS_TOOL_CALL_ARGUMENTS.to_string()
+                } else {
+                    call.arguments
+                };
+                if withhold_arguments {
+                    call_json.insert("arguments_withheld".to_string(), Value::Bool(true));
+                }
+                if !name.is_empty() || !arguments.is_empty() {
+                    let mut function = serde_json::Map::new();
+                    if !name.is_empty() {
+                        function.insert("name".to_string(), Value::String(name));
+                    }
+                    if !arguments.is_empty() {
+                        function.insert("arguments".to_string(), Value::String(arguments));
                     }
                     call_json.insert("function".to_string(), Value::Object(function));
                 }
