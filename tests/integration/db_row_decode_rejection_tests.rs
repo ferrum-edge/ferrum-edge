@@ -323,6 +323,7 @@ async fn undecodable_consumer_row_keeps_admin_writable_for_in_band_repair() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_admin(state).await;
@@ -480,6 +481,7 @@ async fn undecodable_proxy_row_allows_delete_repair() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_admin(state).await;
@@ -573,6 +575,7 @@ async fn undecodable_consumer_row_allows_put_overwrite_repair() {
         admin_http_header_read_timeout_seconds: 10,
         mesh_runtime_state: None,
         admin_tls_handshake_timeout_seconds: 10,
+        admin_request_limits: Default::default(),
         backend_allow_ips: ferrum_edge::config::BackendEgressPolicy::unrestricted(),
     };
     let (base_url, _shutdown) = start_admin(state).await;

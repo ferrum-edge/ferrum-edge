@@ -421,6 +421,12 @@ pub enum StreamIoSide {
 ///
 /// Preserves per-direction byte counts even when one half errors — callers
 /// use these to record metrics accurately regardless of which side failed.
+/// The Linux io_uring and libc-fallback splice workers carry `bytes_so_far`
+/// on their error variants so timeout/I/O endings report delivered totals
+/// the same way the async splice and direction-tracking userspace paths do
+/// via shared counters. (The all-bounds-disabled userspace fast path is the
+/// intentional exception: tokio's `copy_bidirectional_with_sizes` does not
+/// expose partial totals on `Err`.)
 /// `first_failure` is `Some((direction, class, side, message))` when a half
 /// errored before both halves observed a clean EOF; `None` indicates graceful
 /// shutdown. `side` is `Some` when the error could be attributed to the read
@@ -5381,9 +5387,13 @@ fn poll_ready_watchdog_ticks(
 /// skipping the Phase 1/Phase 2 machinery. This restores the historical
 /// zero-overhead behaviour for deployments that explicitly disable all relay
 /// bounds. The trade-off: on error the fast path loses `first_failure`
-/// direction attribution (reports `Direction::Unknown`) — acceptable because
-/// the user opted out of those observability bounds. Clean completion preserves
-/// per-direction byte counts.
+/// direction attribution (reports `Direction::Unknown`) and reports zero
+/// per-direction byte counts — tokio's bidirectional copy does not expose
+/// partial totals on `Err`. That zero-on-error shape is intentional and
+/// reachable only when the operator sets idle timeout, half-close cap, and
+/// both backend inactivity timeouts to `0`; any non-zero bound opts into
+/// the direction-tracking path which preserves counters. Clean completion
+/// preserves per-direction byte counts.
 async fn bidirectional_copy<C, B>(
     mut client: C,
     mut backend: B,
@@ -5400,7 +5410,10 @@ where
     // Fast path: all per-direction bounds disabled → use tokio's optimised
     // bidirectional copy directly. No split (no BiLock overhead), no select
     // loop. On error we classify with `Direction::Unknown` because
-    // `copy_bidirectional_with_sizes` doesn't report which half failed first.
+    // `copy_bidirectional_with_sizes` doesn't report which half failed first,
+    // and we report zero byte counts because that API does not return partial
+    // totals on `Err` (intentional trade-off for the all-bounds-disabled
+    // path; see the function-level doc).
     // `backend_read_timeout` / `backend_write_timeout` inherently require the
     // direction-tracking path — they wrap individual `read`/`write` polls,
     // which tokio's bidirectional copy does not expose. Any non-zero timeout
@@ -6613,7 +6626,7 @@ async fn bidirectional_splice_io_uring(
             c2b_write_wm_worker.as_deref(),
             backend_write_timeout_ms,
         );
-        if let Err((side, ref e)) = res {
+        if let Err((_bytes, side, ref e)) = res {
             let msg = e.to_string();
             let entry = classify_splice_worker_failure(Direction::ClientToBackend, side, &msg, e);
             let _ = ff_c2b.set(entry);
@@ -6633,7 +6646,7 @@ async fn bidirectional_splice_io_uring(
             None,
             0,
         );
-        if let Err((side, ref e)) = res {
+        if let Err((_bytes, side, ref e)) = res {
             let msg = e.to_string();
             let entry = classify_splice_worker_failure(Direction::BackendToClient, side, &msg, e);
             let _ = ff_b2c.set(entry);
@@ -6709,9 +6722,14 @@ async fn bidirectional_splice_io_uring(
         }
     };
 
+    // Extract per-direction byte totals from Ok and Err alike. Workers return
+    // `Err((bytes_so_far, side, err))` so idle/read/write timeouts and I/O
+    // failures still surface successfully delivered bytes — matching the
+    // `StreamCopyResult` contract and the async libc-splice / userspace
+    // direction-tracking paths. JoinError (panic/cancel) has no total.
     let c2b_bytes = match c2b_result {
         Ok(Ok(n)) => n,
-        Ok(Err(_)) => 0, // already recorded from inside the worker
+        Ok(Err((n, _, _))) => n,
         Err(e) => {
             // JoinError (task panicked or was cancelled) — side is not
             // meaningful. Only records if the worker didn't already set it.
@@ -6728,7 +6746,7 @@ async fn bidirectional_splice_io_uring(
     };
     let b2c_bytes = match b2c_result {
         Ok(Ok(n)) => n,
-        Ok(Err(_)) => 0,
+        Ok(Err((n, _, _))) => n,
         Err(e) => {
             let anyhow_err = anyhow::anyhow!("io_uring splice spawn error: {}", e);
             let msg = anyhow_err.to_string();
@@ -6758,6 +6776,10 @@ async fn bidirectional_splice_io_uring(
 /// pressure, resource limits). The idle timeout is checked inline inside
 /// the io_uring loop to prevent indefinite blocking on idle connections.
 ///
+/// Returns `Ok(bytes)` on clean EOF, or `Err((bytes_so_far, side, err))` on
+/// timeout/I/O failure so the parent can preserve delivered bytes without
+/// shared atomics on the splice hot path.
+///
 /// `read_watermark` / `read_timeout_ms` and `write_watermark` /
 /// `write_timeout_ms` enforce `backend_read_timeout_ms` and
 /// `backend_write_timeout_ms` respectively. Pass `None` / `0` on the side
@@ -6776,7 +6798,7 @@ fn io_uring_splice_direction(
     read_timeout_ms: u64,
     write_watermark: Option<&AtomicU64>,
     write_timeout_ms: u64,
-) -> Result<u64, (StreamIoSide, anyhow::Error)> {
+) -> Result<u64, (u64, StreamIoSide, anyhow::Error)> {
     let result = match crate::socket_opts::io_uring_splice::io_uring_splice_loop(
         src_fd,
         pipe_w,
@@ -6793,7 +6815,8 @@ fn io_uring_splice_direction(
         Err(e) if e.source.kind() == std::io::ErrorKind::Unsupported => {
             // io_uring ring creation failed — fall back to libc::splice.
             // This can happen under memlock pressure even though startup
-            // probing succeeded.
+            // probing succeeded. Unsupported is only returned before any
+            // bytes are transferred (`bytes_so_far == 0`).
             tracing::debug!("io_uring ring creation failed, falling back to libc splice");
             libc_splice_loop(
                 src_fd,
@@ -6809,6 +6832,7 @@ fn io_uring_splice_direction(
             )
         }
         Err(e) => {
+            let bytes = e.bytes_so_far;
             let side = if e.is_write_side {
                 StreamIoSide::Write
             } else {
@@ -6824,6 +6848,7 @@ fn io_uring_splice_direction(
                 let body = e.source.to_string();
                 if body.starts_with(STREAM_SPLICE_BACKEND_READ_TIMEOUT_PREFIX) {
                     Err((
+                        bytes,
                         side,
                         anyhow::anyhow!(
                             "{} (io_uring splice)",
@@ -6832,6 +6857,7 @@ fn io_uring_splice_direction(
                     ))
                 } else if body.starts_with(STREAM_SPLICE_BACKEND_WRITE_TIMEOUT_PREFIX) {
                     Err((
+                        bytes,
                         side,
                         anyhow::anyhow!(
                             "{} (io_uring splice)",
@@ -6840,12 +6866,17 @@ fn io_uring_splice_direction(
                     ))
                 } else {
                     Err((
+                        bytes,
                         side,
                         anyhow::anyhow!("{} (io_uring splice)", STREAM_SPLICE_IDLE_TIMEOUT_PREFIX),
                     ))
                 }
             } else {
-                Err((side, anyhow::anyhow!("io_uring splice error: {}", e.source)))
+                Err((
+                    bytes,
+                    side,
+                    anyhow::anyhow!("io_uring splice error: {}", e.source),
+                ))
             }
         }
     };
@@ -6857,15 +6888,6 @@ fn io_uring_splice_direction(
     result
 }
 
-/// Fallback libc::splice loop for when io_uring ring creation fails.
-/// Same logic as `splice_one_direction_no_guard` but synchronous (runs
-/// on a blocking thread). Errors are tagged with the side (Read for the
-/// src_fd → pipe splice, Write for the pipe → dst_fd splice) so the
-/// caller can attribute the failure to the correct socket.
-///
-/// `read_watermark` / `read_timeout_ms` and `write_watermark` /
-/// `write_timeout_ms` mirror the io_uring path — see
-/// `io_uring_splice_direction` for which worker carries which watermark.
 #[cfg(target_os = "linux")]
 fn splice_once(in_fd: i32, out_fd: i32, len: usize, flags: u32) -> std::io::Result<isize> {
     let n = unsafe {
@@ -6993,6 +7015,18 @@ fn poll_splice_fd(fd: i32, events: libc::c_short, timeout_ms: i32) -> std::io::R
     }
 }
 
+/// Fallback libc::splice loop for when io_uring ring creation fails.
+/// Same logic as `splice_one_direction_no_guard` but synchronous (runs
+/// on a blocking thread). Errors are tagged with the side (Read for the
+/// src_fd → pipe splice, Write for the pipe → dst_fd splice) so the
+/// caller can attribute the failure to the correct socket.
+///
+/// On timeout/I/O failure returns `Err((bytes_so_far, side, err))` so the
+/// parent preserves successfully delivered bytes (issue #2957).
+///
+/// `read_watermark` / `read_timeout_ms` and `write_watermark` /
+/// `write_timeout_ms` mirror the io_uring path — see
+/// `io_uring_splice_direction` for which worker carries which watermark.
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn libc_splice_loop(
@@ -7006,7 +7040,7 @@ fn libc_splice_loop(
     read_timeout_ms: u64,
     write_watermark: Option<&AtomicU64>,
     write_timeout_ms: u64,
-) -> Result<u64, (StreamIoSide, anyhow::Error)> {
+) -> Result<u64, (u64, StreamIoSide, anyhow::Error)> {
     let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
     let mut total: u64 = 0;
     let read_wm_active = read_watermark.is_some() && read_timeout_ms > 0;
@@ -7017,6 +7051,7 @@ fn libc_splice_loop(
             let last = shared_activity.load(Ordering::Relaxed);
             if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                 return Err((
+                    total,
                     StreamIoSide::Read,
                     anyhow::anyhow!(
                         "{} (libc splice fallback)",
@@ -7029,6 +7064,7 @@ fn libc_splice_loop(
             let last = wm.load(Ordering::Relaxed);
             if coarse_now_ms().saturating_sub(last) >= read_timeout_ms {
                 return Err((
+                    total,
                     StreamIoSide::Read,
                     anyhow::anyhow!(
                         "{} (libc splice fallback)",
@@ -7047,6 +7083,7 @@ fn libc_splice_loop(
             let last = wm.load(Ordering::Relaxed);
             if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
                 return Err((
+                    total,
                     StreamIoSide::Write,
                     anyhow::anyhow!(
                         "{} (libc splice fallback)",
@@ -7089,7 +7126,7 @@ fn libc_splice_loop(
                 };
                 if written > 0 {
                     remaining -= written as usize;
-                    total += written as u64;
+                    total = total.saturating_add(written as u64);
                     // Refresh shared idle timeout — visible to both directions.
                     let post_write_now = coarse_now_ms();
                     if timeout_ms > 0 {
@@ -7118,6 +7155,7 @@ fn libc_splice_loop(
                             let last = shared_activity.load(Ordering::Relaxed);
                             if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                                 return Err((
+                                    total,
                                     StreamIoSide::Write,
                                     anyhow::anyhow!(
                                         "{} (libc splice fallback, write phase)",
@@ -7130,6 +7168,7 @@ fn libc_splice_loop(
                             let last = wm.load(Ordering::Relaxed);
                             if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
                                 return Err((
+                                    total,
                                     StreamIoSide::Write,
                                     anyhow::anyhow!(
                                         "{} (libc splice fallback)",
@@ -7147,6 +7186,7 @@ fn libc_splice_loop(
                             let last = wm.load(Ordering::Relaxed);
                             if coarse_now_ms().saturating_sub(last) >= read_timeout_ms {
                                 return Err((
+                                    total,
                                     StreamIoSide::Read,
                                     anyhow::anyhow!(
                                         "{} (libc splice fallback)",
@@ -7165,6 +7205,7 @@ fn libc_splice_loop(
                         );
                         if let Err(err) = poll_splice_fd(dst_fd, libc::POLLOUT, wait_ms) {
                             return Err((
+                                total,
                                 StreamIoSide::Write,
                                 anyhow::anyhow!("splice write readiness error: {}", err),
                             ));
@@ -7172,6 +7213,7 @@ fn libc_splice_loop(
                         continue;
                     }
                     return Err((
+                        total,
                         StreamIoSide::Write,
                         anyhow::anyhow!("splice write error: {}", err),
                     ));
@@ -7189,6 +7231,7 @@ fn libc_splice_loop(
                     let last = shared_activity.load(Ordering::Relaxed);
                     if coarse_now_ms().saturating_sub(last) >= timeout_ms {
                         return Err((
+                            total,
                             StreamIoSide::Read,
                             anyhow::anyhow!(
                                 "{} (libc splice fallback, read phase)",
@@ -7201,6 +7244,7 @@ fn libc_splice_loop(
                     let last = wm.load(Ordering::Relaxed);
                     if coarse_now_ms().saturating_sub(last) >= read_timeout_ms {
                         return Err((
+                            total,
                             StreamIoSide::Read,
                             anyhow::anyhow!(
                                 "{} (libc splice fallback)",
@@ -7216,6 +7260,7 @@ fn libc_splice_loop(
                     let last = wm.load(Ordering::Relaxed);
                     if coarse_now_ms().saturating_sub(last) >= write_timeout_ms {
                         return Err((
+                            total,
                             StreamIoSide::Write,
                             anyhow::anyhow!(
                                 "{} (libc splice fallback)",
@@ -7234,6 +7279,7 @@ fn libc_splice_loop(
                 );
                 if let Err(err) = poll_splice_fd(src_fd, libc::POLLIN, wait_ms) {
                     return Err((
+                        total,
                         StreamIoSide::Read,
                         anyhow::anyhow!("splice read readiness error: {}", err),
                     ));
@@ -7241,6 +7287,7 @@ fn libc_splice_loop(
                 continue;
             }
             return Err((
+                total,
                 StreamIoSide::Read,
                 anyhow::anyhow!("splice read error: {}", err),
             ));

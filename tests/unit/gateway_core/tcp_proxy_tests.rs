@@ -885,6 +885,9 @@ async fn test_bidirectional_splice_half_close_idle_timeout_fires_in_phase2() {
         .expect("idle timeout on stalled backend (splice path) must produce first_failure");
     assert_eq!(*dir, Direction::Unknown);
     assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    // Async libc splice uses shared counters — delivered request bytes must
+    // survive the idle-timeout ending (StreamCopyResult contract).
+    assert_eq!(result.bytes_client_to_backend, request.len() as u64);
 }
 
 // ── bidirectional_splice backend directional timeouts (Linux only) ───────────
@@ -1233,6 +1236,140 @@ async fn test_bidirectional_splice_io_uring_backend_write_timeout_fires() {
     assert_eq!(*dir, Direction::ClientToBackend);
     assert_eq!(*class, ErrorClass::ReadWriteTimeout);
     assert_eq!(*side, Some(StreamIoSide::Write));
+    // Issue #2957: partial c2b volume must survive the write-timeout ending.
+    assert!(
+        result.bytes_client_to_backend > 0,
+        "io_uring/libc-fallback splice must report delivered c2b bytes on write timeout, got 0"
+    );
+}
+
+/// Regression for issue #2957: io_uring (or libc-fallback) splice must preserve
+/// successfully delivered bytes when a direction ends via idle timeout. Before
+/// the fix, workers returned `Err` without the running total and the parent
+/// mapped `Ok(Err(_)) => 0`, under-reporting metrics for routine idle endings.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_bidirectional_splice_io_uring_idle_timeout_preserves_bytes() {
+    use ferrum_edge::_test_support::bidirectional_splice_io_uring_for_test_with_timeouts;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (proxy_client_side, mut external_client) = connected_tcp_pair().await;
+    let (proxy_backend_side, mut external_backend) = connected_tcp_pair().await;
+
+    let payload = vec![0xABu8; 4096];
+    let expected = payload.len() as u64;
+
+    // Client sends a known payload then goes silent (holds the socket open).
+    tokio::spawn(async move {
+        let _ = external_client.write_all(&payload).await;
+        let mut sink = Vec::new();
+        let _ = external_client.read_to_end(&mut sink).await;
+    });
+    // Backend drains the request then holds open without responding — idle.
+    tokio::spawn(async move {
+        let mut received = 0usize;
+        let mut buf = [0u8; 1024];
+        while received < expected as usize {
+            match external_backend.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => received += n,
+                Err(_) => break,
+            }
+        }
+        std::future::pending::<()>().await;
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        bidirectional_splice_io_uring_for_test_with_timeouts(
+            proxy_client_side,
+            proxy_backend_side,
+            Some(Duration::from_millis(400)),
+            Some(Duration::from_secs(2)),
+            None,
+            None,
+            64 * 1024,
+        ),
+    )
+    .await
+    .expect("io_uring/libc-fallback idle timeout must fire");
+
+    let (dir, class, _side, _msg) = result
+        .first_failure
+        .as_ref()
+        .expect("idle timeout must produce first_failure");
+    assert_eq!(*dir, Direction::Unknown);
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    assert!(
+        result.bytes_client_to_backend + result.bytes_backend_to_client >= expected,
+        "idle timeout must preserve delivered bytes; c2b={}, b2c={}, expected>={}",
+        result.bytes_client_to_backend,
+        result.bytes_backend_to_client,
+        expected
+    );
+    assert_eq!(result.bytes_client_to_backend, expected);
+}
+
+/// Companion of the idle-timeout byte-preservation test: after transferring a
+/// known request, a silent backend must fire `backend_read_timeout` while
+/// still reporting the delivered c2b bytes.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_bidirectional_splice_io_uring_backend_read_timeout_preserves_bytes() {
+    use ferrum_edge::_test_support::bidirectional_splice_io_uring_for_test_with_timeouts;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (proxy_client_side, mut external_client) = connected_tcp_pair().await;
+    let (proxy_backend_side, mut external_backend) = connected_tcp_pair().await;
+
+    let payload = vec![0xCDu8; 2048];
+    let expected = payload.len() as u64;
+
+    tokio::spawn(async move {
+        let _ = external_client.write_all(&payload).await;
+        let mut sink = Vec::new();
+        let _ = external_client.read_to_end(&mut sink).await;
+    });
+    tokio::spawn(async move {
+        let mut received = 0usize;
+        let mut buf = [0u8; 1024];
+        while received < expected as usize {
+            match external_backend.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => received += n,
+                Err(_) => break,
+            }
+        }
+        // Stay silent so b2c backend_read_timeout fires.
+        std::future::pending::<()>().await;
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        bidirectional_splice_io_uring_for_test_with_timeouts(
+            proxy_client_side,
+            proxy_backend_side,
+            Some(Duration::from_secs(10)),
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_millis(300)),
+            None,
+            64 * 1024,
+        ),
+    )
+    .await
+    .expect("io_uring/libc-fallback backend_read_timeout must fire");
+
+    let (dir, class, side, _msg) = result
+        .first_failure
+        .as_ref()
+        .expect("backend_read_timeout must produce first_failure");
+    assert_eq!(*dir, Direction::BackendToClient);
+    assert_eq!(*class, ErrorClass::ReadWriteTimeout);
+    assert_eq!(*side, Some(StreamIoSide::Read));
+    assert_eq!(
+        result.bytes_client_to_backend, expected,
+        "backend_read_timeout must preserve delivered c2b bytes"
+    );
 }
 
 /// Pin the "first-worker-error force-shutdown" fast path in

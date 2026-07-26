@@ -252,6 +252,7 @@ mod non_linux_stubs {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(!err.is_write_side);
+        assert_eq!(err.bytes_so_far, 0);
         assert_eq!(err.source.kind(), std::io::ErrorKind::Unsupported);
     }
 }

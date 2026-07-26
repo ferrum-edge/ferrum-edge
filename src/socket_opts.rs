@@ -2093,22 +2093,30 @@ pub mod io_uring_splice {
     /// `is_write_side = false` is also used for out-of-band failures (ring
     /// creation, idle timeout, submission-queue full) where the side isn't
     /// meaningful; callers that care should inspect `source.kind()`.
+    ///
+    /// `bytes_so_far` is the count of bytes successfully spliced pipe→dst
+    /// before this failure. Callers must surface it in `StreamCopyResult`
+    /// even when the direction ends in timeout/error — discarding it under-
+    /// reports metrics and contradicts the stream-copy contract.
     #[derive(Debug)]
     pub struct SpliceError {
         pub is_write_side: bool,
+        pub bytes_so_far: u64,
         pub source: std::io::Error,
     }
 
     impl SpliceError {
-        fn read(source: std::io::Error) -> Self {
+        fn read(bytes_so_far: u64, source: std::io::Error) -> Self {
             Self {
                 is_write_side: false,
+                bytes_so_far,
                 source,
             }
         }
-        fn write(source: std::io::Error) -> Self {
+        fn write(bytes_so_far: u64, source: std::io::Error) -> Self {
             Self {
                 is_write_side: true,
+                bytes_so_far,
                 source,
             }
         }
@@ -2128,6 +2136,11 @@ pub mod io_uring_splice {
     /// Runs on a blocking thread (called via `tokio::task::spawn_blocking`).
     /// Creates a small io_uring ring (8 entries) and submits IORING_OP_SPLICE
     /// operations for each chunk. Returns total bytes transferred.
+    ///
+    /// On error (including idle / per-direction timeouts), the returned
+    /// `SpliceError.bytes_so_far` carries bytes already delivered pipe→dst so
+    /// the parent can preserve them in `StreamCopyResult` without contested
+    /// atomics on the hot path.
     ///
     /// Returns `Err` with `source.kind() == ErrorKind::Unsupported` if the ring
     /// cannot be created, signaling the caller to fall back to `libc::splice`.
@@ -2165,10 +2178,13 @@ pub mod io_uring_splice {
                 // Ring creation failed (memlock pressure, resource limits).
                 // Signal caller to fall back to libc::splice. Side is N/A but
                 // the caller checks ErrorKind::Unsupported before side.
-                return Err(SpliceError::read(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "io_uring ring creation failed, falling back to libc splice",
-                )));
+                return Err(SpliceError::read(
+                    0,
+                    std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "io_uring ring creation failed, falling back to libc splice",
+                    ),
+                ));
             }
         };
         let splice_flags = libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK;
@@ -2192,19 +2208,20 @@ pub mod io_uring_splice {
                 let now = super::monotonic_now_ms();
                 let last = shared_last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
                 if now.saturating_sub(last) >= timeout_ms {
-                    return Err(SpliceError::read(std::io::Error::from(
-                        std::io::ErrorKind::TimedOut,
-                    )));
+                    return Err(SpliceError::read(
+                        total,
+                        std::io::Error::from(std::io::ErrorKind::TimedOut),
+                    ));
                 }
             }
             if read_wm_active && let Some(wm) = read_watermark {
                 let now = super::monotonic_now_ms();
                 let last = wm.load(std::sync::atomic::Ordering::Relaxed);
                 if now.saturating_sub(last) >= read_timeout_ms {
-                    return Err(SpliceError::read(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        BACKEND_READ_TIMEOUT_MSG,
-                    )));
+                    return Err(SpliceError::read(
+                        total,
+                        std::io::Error::new(std::io::ErrorKind::TimedOut, BACKEND_READ_TIMEOUT_MSG),
+                    ));
                 }
             }
             // The write watermark is also checked in the outer loop / Phase 1
@@ -2224,10 +2241,13 @@ pub mod io_uring_splice {
                 let now = super::monotonic_now_ms();
                 let last = wm.load(std::sync::atomic::Ordering::Relaxed);
                 if now.saturating_sub(last) >= write_timeout_ms {
-                    return Err(SpliceError::write(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        BACKEND_WRITE_TIMEOUT_MSG,
-                    )));
+                    return Err(SpliceError::write(
+                        total,
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            BACKEND_WRITE_TIMEOUT_MSG,
+                        ),
+                    ));
                 }
             }
 
@@ -2243,16 +2263,16 @@ pub mod io_uring_splice {
             .build();
 
             unsafe {
-                ring.submission()
-                    .push(&sqe)
-                    .map_err(|_| SpliceError::read(std::io::Error::other("io_uring SQ full")))?;
+                ring.submission().push(&sqe).map_err(|_| {
+                    SpliceError::read(total, std::io::Error::other("io_uring SQ full"))
+                })?;
             }
-            ring.submit_and_wait(1).map_err(SpliceError::read)?;
+            ring.submit_and_wait(1)
+                .map_err(|e| SpliceError::read(total, e))?;
 
-            let cqe = ring
-                .completion()
-                .next()
-                .ok_or_else(|| SpliceError::read(std::io::Error::other("io_uring no CQE")))?;
+            let cqe = ring.completion().next().ok_or_else(|| {
+                SpliceError::read(total, std::io::Error::other("io_uring no CQE"))
+            })?;
             let n = cqe.result();
 
             if n == 0 {
@@ -2270,19 +2290,23 @@ pub mod io_uring_splice {
                         let last =
                             shared_last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
                         if now.saturating_sub(last) >= timeout_ms {
-                            return Err(SpliceError::read(std::io::Error::from(
-                                std::io::ErrorKind::TimedOut,
-                            )));
+                            return Err(SpliceError::read(
+                                total,
+                                std::io::Error::from(std::io::ErrorKind::TimedOut),
+                            ));
                         }
                     }
                     if read_wm_active && let Some(wm) = read_watermark {
                         let now = super::monotonic_now_ms();
                         let last = wm.load(std::sync::atomic::Ordering::Relaxed);
                         if now.saturating_sub(last) >= read_timeout_ms {
-                            return Err(SpliceError::read(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                BACKEND_READ_TIMEOUT_MSG,
-                            )));
+                            return Err(SpliceError::read(
+                                total,
+                                std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    BACKEND_READ_TIMEOUT_MSG,
+                                ),
+                            ));
                         }
                     }
                     // Mirror the outer-loop check: a Phase 1 WouldBlock means
@@ -2294,17 +2318,20 @@ pub mod io_uring_splice {
                         let now = super::monotonic_now_ms();
                         let last = wm.load(std::sync::atomic::Ordering::Relaxed);
                         if now.saturating_sub(last) >= write_timeout_ms {
-                            return Err(SpliceError::write(std::io::Error::new(
-                                std::io::ErrorKind::TimedOut,
-                                BACKEND_WRITE_TIMEOUT_MSG,
-                            )));
+                            return Err(SpliceError::write(
+                                total,
+                                std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    BACKEND_WRITE_TIMEOUT_MSG,
+                                ),
+                            ));
                         }
                     }
                     // Back off to avoid tight spin — sleep 1ms then retry.
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
-                return Err(SpliceError::read(err));
+                return Err(SpliceError::read(total, err));
             }
 
             // Successful src→pipe: refresh the read watermark and prime the
@@ -2332,15 +2359,15 @@ pub mod io_uring_splice {
 
                 unsafe {
                     ring.submission().push(&sqe).map_err(|_| {
-                        SpliceError::write(std::io::Error::other("io_uring SQ full"))
+                        SpliceError::write(total, std::io::Error::other("io_uring SQ full"))
                     })?;
                 }
-                ring.submit_and_wait(1).map_err(SpliceError::write)?;
+                ring.submit_and_wait(1)
+                    .map_err(|e| SpliceError::write(total, e))?;
 
-                let cqe = ring
-                    .completion()
-                    .next()
-                    .ok_or_else(|| SpliceError::write(std::io::Error::other("io_uring no CQE")))?;
+                let cqe = ring.completion().next().ok_or_else(|| {
+                    SpliceError::write(total, std::io::Error::other("io_uring no CQE"))
+                })?;
                 let w = cqe.result();
 
                 if w == 0 {
@@ -2360,19 +2387,23 @@ pub mod io_uring_splice {
                             let last =
                                 shared_last_activity_ms.load(std::sync::atomic::Ordering::Relaxed);
                             if now.saturating_sub(last) >= timeout_ms {
-                                return Err(SpliceError::write(std::io::Error::from(
-                                    std::io::ErrorKind::TimedOut,
-                                )));
+                                return Err(SpliceError::write(
+                                    total,
+                                    std::io::Error::from(std::io::ErrorKind::TimedOut),
+                                ));
                             }
                         }
                         if write_wm_active && let Some(wm) = write_watermark {
                             let now = super::monotonic_now_ms();
                             let last = wm.load(std::sync::atomic::Ordering::Relaxed);
                             if now.saturating_sub(last) >= write_timeout_ms {
-                                return Err(SpliceError::write(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    BACKEND_WRITE_TIMEOUT_MSG,
-                                )));
+                                return Err(SpliceError::write(
+                                    total,
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        BACKEND_WRITE_TIMEOUT_MSG,
+                                    ),
+                                ));
                             }
                         }
                         // The b2c worker can be stalled in Phase 2 (client
@@ -2384,19 +2415,22 @@ pub mod io_uring_splice {
                             let now = super::monotonic_now_ms();
                             let last = wm.load(std::sync::atomic::Ordering::Relaxed);
                             if now.saturating_sub(last) >= read_timeout_ms {
-                                return Err(SpliceError::read(std::io::Error::new(
-                                    std::io::ErrorKind::TimedOut,
-                                    BACKEND_READ_TIMEOUT_MSG,
-                                )));
+                                return Err(SpliceError::read(
+                                    total,
+                                    std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        BACKEND_READ_TIMEOUT_MSG,
+                                    ),
+                                ));
                             }
                         }
                         std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
-                    return Err(SpliceError::write(err));
+                    return Err(SpliceError::write(total, err));
                 }
                 remaining -= w as u32;
-                total += w as u64;
+                total = total.saturating_add(w as u64);
                 // Refresh shared idle timeout — activity in either direction
                 // prevents the connection from timing out. Must use the same
                 // monotonic clock as the reader loop above (and the libc
@@ -2423,10 +2457,12 @@ pub mod io_uring_splice {
 
     /// Errors from an io_uring splice call tagged with the side of the relay
     /// that produced them. `is_write_side = false` for all non-Linux stubs.
+    /// `bytes_so_far` is always 0 on the stub (no transfer occurs).
     #[derive(Debug)]
     #[allow(dead_code)] // Fields are consumed only by the Linux splice path.
     pub struct SpliceError {
         pub is_write_side: bool,
+        pub bytes_so_far: u64,
         pub source: std::io::Error,
     }
 
@@ -2450,6 +2486,7 @@ pub mod io_uring_splice {
     ) -> Result<u64, SpliceError> {
         Err(SpliceError {
             is_write_side: false,
+            bytes_so_far: 0,
             source: std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "io_uring not available on this platform",
