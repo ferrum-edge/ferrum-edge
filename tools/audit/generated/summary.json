@@ -1,0 +1,2120 @@
+{
+  "audited_sha": "30dfc4aee3c16f5ea5ddcb7078a2b9da6f89564c",
+  "files_scanned": 1524,
+  "lines_scanned": 1381059,
+  "bytes_scanned": 55039635,
+  "candidate_count": 35768,
+  "production_candidate_count": 34481,
+  "high_severity_hint_count": 6334,
+  "high_confidence_hint_count": 833,
+  "by_category": {
+    "performance": 16561,
+    "correctness": 5321,
+    "resource-exhaustion": 3807,
+    "error-handling": 2094,
+    "concurrency": 2074,
+    "test-gap": 2066,
+    "implementation-gap": 1595,
+    "security": 517,
+    "ci-integrity": 413,
+    "lifecycle": 315,
+    "memory-safety": 234,
+    "durability": 204,
+    "observability": 156,
+    "supply-chain": 124,
+    "filesystem-security": 123,
+    "availability": 71,
+    "configuration-security": 37,
+    "operations": 23,
+    "data-exposure": 15,
+    "injection": 13,
+    "container-security": 4,
+    "database-performance": 1
+  },
+  "top_paths": [
+    [
+      "src/proxy/mod.rs",
+      754
+    ],
+    [
+      "src/modes/node_agent.rs",
+      699
+    ],
+    [
+      "src/modes/mesh/mod.rs",
+      602
+    ],
+    [
+      "src/config_sources/k8s/istio.rs",
+      513
+    ],
+    [
+      "src/config/mongo_store.rs",
+      468
+    ],
+    [
+      "src/router_cache.rs",
+      436
+    ],
+    [
+      "src/proxy/tcp_proxy.rs",
+      374
+    ],
+    [
+      "src/config/db_loader.rs",
+      366
+    ],
+    [
+      "src/config_sources/k8s/gateway_api.rs",
+      364
+    ],
+    [
+      "src/config/types.rs",
+      363
+    ],
+    [
+      "src/plugins/mesh_route_dispatch.rs",
+      360
+    ],
+    [
+      "src/admin/api_specs/extractor.rs",
+      357
+    ],
+    [
+      "src/k8s_controller/istio_status.rs",
+      337
+    ],
+    [
+      "src/plugins/api_chargeback_sink.rs",
+      336
+    ],
+    [
+      "src/plugins/ai_semantic_firewall.rs",
+      329
+    ],
+    [
+      "src/plugins/openapi_validator.rs",
+      325
+    ],
+    [
+      "src/capture/mod.rs",
+      320
+    ],
+    [
+      "src/admin/mod.rs",
+      318
+    ],
+    [
+      "src/plugins/ai_federation.rs",
+      315
+    ],
+    [
+      "src/plugins/mcp_gateway.rs",
+      313
+    ],
+    [
+      "src/plugins/prometheus_metrics.rs",
+      300
+    ],
+    [
+      "src/proxy/udp_proxy.rs",
+      298
+    ],
+    [
+      "src/plugins/oidc_relying_party.rs",
+      288
+    ],
+    [
+      "src/plugin_cache.rs",
+      278
+    ],
+    [
+      "src/modes/injector.rs",
+      276
+    ],
+    [
+      "src/k8s_controller/status.rs",
+      276
+    ],
+    [
+      "src/plugins/mesh/workload_metrics.rs",
+      275
+    ],
+    [
+      "src/load_balancer.rs",
+      273
+    ],
+    [
+      "src/plugins/soap_ws_security.rs",
+      272
+    ],
+    [
+      "src/modes/mesh/config_consumer/xds_client.rs",
+      272
+    ],
+    [
+      "src/modes/mesh/slice.rs",
+      265
+    ],
+    [
+      "src/plugins/ai_tool_governor.rs",
+      260
+    ],
+    [
+      "src/proxy/netns_udp_capture.rs",
+      260
+    ],
+    [
+      "src/modes/mesh/multicluster.rs",
+      260
+    ],
+    [
+      "src/http3/server.rs",
+      258
+    ],
+    [
+      "src/plugins/ai_semantic_cache.rs",
+      250
+    ],
+    [
+      "src/socket_opts.rs",
+      246
+    ],
+    [
+      "src/tls/acme.rs",
+      243
+    ],
+    [
+      "src/xds/server.rs",
+      242
+    ],
+    [
+      "src/grpc/cp_server.rs",
+      234
+    ],
+    [
+      "src/modes/mesh/dns_proxy.rs",
+      230
+    ],
+    [
+      "src/config_sources/k8s/mod.rs",
+      230
+    ],
+    [
+      "src/plugins/otel_tracing.rs",
+      227
+    ],
+    [
+      "src/plugins/ai_stream_router.rs",
+      227
+    ],
+    [
+      "src/proxy/hbone_pool.rs",
+      226
+    ],
+    [
+      "src/plugins/ai_transcript_audit.rs",
+      223
+    ],
+    [
+      "src/proxy/body.rs",
+      222
+    ],
+    [
+      "src/config/env_config.rs",
+      219
+    ],
+    [
+      "src/plugins/mod.rs",
+      210
+    ],
+    [
+      "src/modes/mesh/federation.rs",
+      209
+    ],
+    [
+      "src/plugins/mesh/authz.rs",
+      208
+    ],
+    [
+      "src/proxy/grpc_proxy.rs",
+      206
+    ],
+    [
+      "src/config_sources/k8s/core.rs",
+      203
+    ],
+    [
+      "src/modes/mesh/config.rs",
+      202
+    ],
+    [
+      "src/admin/api_specs/handlers.rs",
+      201
+    ],
+    [
+      "src/http3/cross_protocol.rs",
+      196
+    ],
+    [
+      "src/plugins/response_caching.rs",
+      194
+    ],
+    [
+      "src/proxy/netns_capture.rs",
+      178
+    ],
+    [
+      "src/plugins/mesh/prometheus_helpers.rs",
+      170
+    ],
+    [
+      "src/modes/control_plane.rs",
+      169
+    ],
+    [
+      "src/admin/crud.rs",
+      167
+    ],
+    [
+      "src/admin/tls_management.rs",
+      166
+    ],
+    [
+      "src/k8s_controller/reconciler.rs",
+      165
+    ],
+    [
+      "src/modes/mesh/policy.rs",
+      164
+    ],
+    [
+      "src/plugins/oauth2_introspection.rs",
+      163
+    ],
+    [
+      "src/proxy/stream_listener.rs",
+      163
+    ],
+    [
+      "src/modes/database.rs",
+      162
+    ],
+    [
+      "src/health_check.rs",
+      159
+    ],
+    [
+      "src/plugins/grpc_web.rs",
+      157
+    ],
+    [
+      "src/modes/mesh/node_waypoint.rs",
+      154
+    ],
+    [
+      "src/plugins/api_chargeback.rs",
+      154
+    ],
+    [
+      "src/plugins/ai_response_guard.rs",
+      152
+    ],
+    [
+      "src/plugins/request_deduplication.rs",
+      149
+    ],
+    [
+      "src/plugins/ldap_auth.rs",
+      148
+    ],
+    [
+      "src/plugins/a2a_gateway.rs",
+      146
+    ],
+    [
+      "vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/client.rs",
+      145
+    ],
+    [
+      "src/plugins/body_validator.rs",
+      143
+    ],
+    [
+      "src/plugins/utils/rate_limit.rs",
+      141
+    ],
+    [
+      "src/plugins/kafka_logging.rs",
+      140
+    ],
+    [
+      "src/modes/mesh/hbone.rs",
+      138
+    ],
+    [
+      "src/runtime_metrics.rs",
+      137
+    ],
+    [
+      "src/plugins/loki_logging.rs",
+      137
+    ],
+    [
+      "src/ebpf/loader.rs",
+      134
+    ],
+    [
+      "src/plugins/ai_rate_limiter.rs",
+      134
+    ],
+    [
+      "src/secrets/registry.rs",
+      134
+    ],
+    [
+      "src/tls/managed.rs",
+      133
+    ],
+    [
+      "src/tls/backend.rs",
+      133
+    ],
+    [
+      "src/dtls/mod.rs",
+      129
+    ],
+    [
+      "src/plugins/jwks_auth.rs",
+      129
+    ],
+    [
+      "vendor/h3-0.0.8-ferrum-patched/src/qpack/dynamic.rs",
+      129
+    ],
+    [
+      "src/plugins/ai_request_guard.rs",
+      126
+    ],
+    [
+      "vendor/reqwest-0.13.3-ferrum-patched/src/connect.rs",
+      126
+    ],
+    [
+      "src/plugins/opa.rs",
+      123
+    ],
+    [
+      "src/proxy/mesh_udp_capture.rs",
+      122
+    ],
+    [
+      "src/plugins/compression.rs",
+      121
+    ],
+    [
+      "src/proxy/headers.rs",
+      120
+    ],
+    [
+      "src/plugins/serverless_function.rs",
+      120
+    ],
+    [
+      "src/plugins/utils/log_schema/mod.rs",
+      119
+    ],
+    [
+      "vendor/reqwest-0.13.3-ferrum-patched/src/async_impl/request.rs",
+      119
+    ],
+    [
+      "src/proxy/mesh_mtls_pool.rs",
+      117
+    ]
+  ],
+  "context_manifest": [
+    {
+      "file": "contexts/part-0001.jsonl",
+      "rank_start": 1,
+      "rank_end": 250
+    },
+    {
+      "file": "contexts/part-0002.jsonl",
+      "rank_start": 251,
+      "rank_end": 500
+    },
+    {
+      "file": "contexts/part-0003.jsonl",
+      "rank_start": 501,
+      "rank_end": 750
+    },
+    {
+      "file": "contexts/part-0004.jsonl",
+      "rank_start": 751,
+      "rank_end": 1000
+    },
+    {
+      "file": "contexts/part-0005.jsonl",
+      "rank_start": 1001,
+      "rank_end": 1250
+    },
+    {
+      "file": "contexts/part-0006.jsonl",
+      "rank_start": 1251,
+      "rank_end": 1500
+    },
+    {
+      "file": "contexts/part-0007.jsonl",
+      "rank_start": 1501,
+      "rank_end": 1750
+    },
+    {
+      "file": "contexts/part-0008.jsonl",
+      "rank_start": 1751,
+      "rank_end": 2000
+    },
+    {
+      "file": "contexts/part-0009.jsonl",
+      "rank_start": 2001,
+      "rank_end": 2250
+    },
+    {
+      "file": "contexts/part-0010.jsonl",
+      "rank_start": 2251,
+      "rank_end": 2500
+    },
+    {
+      "file": "contexts/part-0011.jsonl",
+      "rank_start": 2501,
+      "rank_end": 2750
+    },
+    {
+      "file": "contexts/part-0012.jsonl",
+      "rank_start": 2751,
+      "rank_end": 3000
+    },
+    {
+      "file": "contexts/part-0013.jsonl",
+      "rank_start": 3001,
+      "rank_end": 3250
+    },
+    {
+      "file": "contexts/part-0014.jsonl",
+      "rank_start": 3251,
+      "rank_end": 3500
+    },
+    {
+      "file": "contexts/part-0015.jsonl",
+      "rank_start": 3501,
+      "rank_end": 3750
+    },
+    {
+      "file": "contexts/part-0016.jsonl",
+      "rank_start": 3751,
+      "rank_end": 4000
+    },
+    {
+      "file": "contexts/part-0017.jsonl",
+      "rank_start": 4001,
+      "rank_end": 4250
+    },
+    {
+      "file": "contexts/part-0018.jsonl",
+      "rank_start": 4251,
+      "rank_end": 4500
+    },
+    {
+      "file": "contexts/part-0019.jsonl",
+      "rank_start": 4501,
+      "rank_end": 4750
+    },
+    {
+      "file": "contexts/part-0020.jsonl",
+      "rank_start": 4751,
+      "rank_end": 5000
+    },
+    {
+      "file": "contexts/part-0021.jsonl",
+      "rank_start": 5001,
+      "rank_end": 5250
+    },
+    {
+      "file": "contexts/part-0022.jsonl",
+      "rank_start": 5251,
+      "rank_end": 5500
+    },
+    {
+      "file": "contexts/part-0023.jsonl",
+      "rank_start": 5501,
+      "rank_end": 5750
+    },
+    {
+      "file": "contexts/part-0024.jsonl",
+      "rank_start": 5751,
+      "rank_end": 6000
+    },
+    {
+      "file": "contexts/part-0025.jsonl",
+      "rank_start": 6001,
+      "rank_end": 6250
+    },
+    {
+      "file": "contexts/part-0026.jsonl",
+      "rank_start": 6251,
+      "rank_end": 6500
+    },
+    {
+      "file": "contexts/part-0027.jsonl",
+      "rank_start": 6501,
+      "rank_end": 6750
+    },
+    {
+      "file": "contexts/part-0028.jsonl",
+      "rank_start": 6751,
+      "rank_end": 7000
+    },
+    {
+      "file": "contexts/part-0029.jsonl",
+      "rank_start": 7001,
+      "rank_end": 7250
+    },
+    {
+      "file": "contexts/part-0030.jsonl",
+      "rank_start": 7251,
+      "rank_end": 7500
+    },
+    {
+      "file": "contexts/part-0031.jsonl",
+      "rank_start": 7501,
+      "rank_end": 7750
+    },
+    {
+      "file": "contexts/part-0032.jsonl",
+      "rank_start": 7751,
+      "rank_end": 8000
+    },
+    {
+      "file": "contexts/part-0033.jsonl",
+      "rank_start": 8001,
+      "rank_end": 8250
+    },
+    {
+      "file": "contexts/part-0034.jsonl",
+      "rank_start": 8251,
+      "rank_end": 8500
+    },
+    {
+      "file": "contexts/part-0035.jsonl",
+      "rank_start": 8501,
+      "rank_end": 8750
+    },
+    {
+      "file": "contexts/part-0036.jsonl",
+      "rank_start": 8751,
+      "rank_end": 9000
+    },
+    {
+      "file": "contexts/part-0037.jsonl",
+      "rank_start": 9001,
+      "rank_end": 9250
+    },
+    {
+      "file": "contexts/part-0038.jsonl",
+      "rank_start": 9251,
+      "rank_end": 9500
+    },
+    {
+      "file": "contexts/part-0039.jsonl",
+      "rank_start": 9501,
+      "rank_end": 9750
+    },
+    {
+      "file": "contexts/part-0040.jsonl",
+      "rank_start": 9751,
+      "rank_end": 10000
+    },
+    {
+      "file": "contexts/part-0041.jsonl",
+      "rank_start": 10001,
+      "rank_end": 10250
+    },
+    {
+      "file": "contexts/part-0042.jsonl",
+      "rank_start": 10251,
+      "rank_end": 10500
+    },
+    {
+      "file": "contexts/part-0043.jsonl",
+      "rank_start": 10501,
+      "rank_end": 10750
+    },
+    {
+      "file": "contexts/part-0044.jsonl",
+      "rank_start": 10751,
+      "rank_end": 11000
+    },
+    {
+      "file": "contexts/part-0045.jsonl",
+      "rank_start": 11001,
+      "rank_end": 11250
+    },
+    {
+      "file": "contexts/part-0046.jsonl",
+      "rank_start": 11251,
+      "rank_end": 11500
+    },
+    {
+      "file": "contexts/part-0047.jsonl",
+      "rank_start": 11501,
+      "rank_end": 11750
+    },
+    {
+      "file": "contexts/part-0048.jsonl",
+      "rank_start": 11751,
+      "rank_end": 12000
+    },
+    {
+      "file": "contexts/part-0049.jsonl",
+      "rank_start": 12001,
+      "rank_end": 12250
+    },
+    {
+      "file": "contexts/part-0050.jsonl",
+      "rank_start": 12251,
+      "rank_end": 12500
+    },
+    {
+      "file": "contexts/part-0051.jsonl",
+      "rank_start": 12501,
+      "rank_end": 12750
+    },
+    {
+      "file": "contexts/part-0052.jsonl",
+      "rank_start": 12751,
+      "rank_end": 13000
+    },
+    {
+      "file": "contexts/part-0053.jsonl",
+      "rank_start": 13001,
+      "rank_end": 13250
+    },
+    {
+      "file": "contexts/part-0054.jsonl",
+      "rank_start": 13251,
+      "rank_end": 13500
+    },
+    {
+      "file": "contexts/part-0055.jsonl",
+      "rank_start": 13501,
+      "rank_end": 13750
+    },
+    {
+      "file": "contexts/part-0056.jsonl",
+      "rank_start": 13751,
+      "rank_end": 14000
+    },
+    {
+      "file": "contexts/part-0057.jsonl",
+      "rank_start": 14001,
+      "rank_end": 14250
+    },
+    {
+      "file": "contexts/part-0058.jsonl",
+      "rank_start": 14251,
+      "rank_end": 14500
+    },
+    {
+      "file": "contexts/part-0059.jsonl",
+      "rank_start": 14501,
+      "rank_end": 14750
+    },
+    {
+      "file": "contexts/part-0060.jsonl",
+      "rank_start": 14751,
+      "rank_end": 15000
+    },
+    {
+      "file": "contexts/part-0061.jsonl",
+      "rank_start": 15001,
+      "rank_end": 15250
+    },
+    {
+      "file": "contexts/part-0062.jsonl",
+      "rank_start": 15251,
+      "rank_end": 15500
+    },
+    {
+      "file": "contexts/part-0063.jsonl",
+      "rank_start": 15501,
+      "rank_end": 15750
+    },
+    {
+      "file": "contexts/part-0064.jsonl",
+      "rank_start": 15751,
+      "rank_end": 16000
+    },
+    {
+      "file": "contexts/part-0065.jsonl",
+      "rank_start": 16001,
+      "rank_end": 16250
+    },
+    {
+      "file": "contexts/part-0066.jsonl",
+      "rank_start": 16251,
+      "rank_end": 16500
+    },
+    {
+      "file": "contexts/part-0067.jsonl",
+      "rank_start": 16501,
+      "rank_end": 16750
+    },
+    {
+      "file": "contexts/part-0068.jsonl",
+      "rank_start": 16751,
+      "rank_end": 17000
+    },
+    {
+      "file": "contexts/part-0069.jsonl",
+      "rank_start": 17001,
+      "rank_end": 17250
+    },
+    {
+      "file": "contexts/part-0070.jsonl",
+      "rank_start": 17251,
+      "rank_end": 17500
+    },
+    {
+      "file": "contexts/part-0071.jsonl",
+      "rank_start": 17501,
+      "rank_end": 17750
+    },
+    {
+      "file": "contexts/part-0072.jsonl",
+      "rank_start": 17751,
+      "rank_end": 18000
+    },
+    {
+      "file": "contexts/part-0073.jsonl",
+      "rank_start": 18001,
+      "rank_end": 18250
+    },
+    {
+      "file": "contexts/part-0074.jsonl",
+      "rank_start": 18251,
+      "rank_end": 18500
+    },
+    {
+      "file": "contexts/part-0075.jsonl",
+      "rank_start": 18501,
+      "rank_end": 18750
+    },
+    {
+      "file": "contexts/part-0076.jsonl",
+      "rank_start": 18751,
+      "rank_end": 19000
+    },
+    {
+      "file": "contexts/part-0077.jsonl",
+      "rank_start": 19001,
+      "rank_end": 19250
+    },
+    {
+      "file": "contexts/part-0078.jsonl",
+      "rank_start": 19251,
+      "rank_end": 19500
+    },
+    {
+      "file": "contexts/part-0079.jsonl",
+      "rank_start": 19501,
+      "rank_end": 19750
+    },
+    {
+      "file": "contexts/part-0080.jsonl",
+      "rank_start": 19751,
+      "rank_end": 20000
+    },
+    {
+      "file": "contexts/part-0081.jsonl",
+      "rank_start": 20001,
+      "rank_end": 20250
+    },
+    {
+      "file": "contexts/part-0082.jsonl",
+      "rank_start": 20251,
+      "rank_end": 20500
+    },
+    {
+      "file": "contexts/part-0083.jsonl",
+      "rank_start": 20501,
+      "rank_end": 20750
+    },
+    {
+      "file": "contexts/part-0084.jsonl",
+      "rank_start": 20751,
+      "rank_end": 21000
+    },
+    {
+      "file": "contexts/part-0085.jsonl",
+      "rank_start": 21001,
+      "rank_end": 21250
+    },
+    {
+      "file": "contexts/part-0086.jsonl",
+      "rank_start": 21251,
+      "rank_end": 21500
+    },
+    {
+      "file": "contexts/part-0087.jsonl",
+      "rank_start": 21501,
+      "rank_end": 21750
+    },
+    {
+      "file": "contexts/part-0088.jsonl",
+      "rank_start": 21751,
+      "rank_end": 22000
+    },
+    {
+      "file": "contexts/part-0089.jsonl",
+      "rank_start": 22001,
+      "rank_end": 22250
+    },
+    {
+      "file": "contexts/part-0090.jsonl",
+      "rank_start": 22251,
+      "rank_end": 22500
+    },
+    {
+      "file": "contexts/part-0091.jsonl",
+      "rank_start": 22501,
+      "rank_end": 22750
+    },
+    {
+      "file": "contexts/part-0092.jsonl",
+      "rank_start": 22751,
+      "rank_end": 23000
+    },
+    {
+      "file": "contexts/part-0093.jsonl",
+      "rank_start": 23001,
+      "rank_end": 23250
+    },
+    {
+      "file": "contexts/part-0094.jsonl",
+      "rank_start": 23251,
+      "rank_end": 23500
+    },
+    {
+      "file": "contexts/part-0095.jsonl",
+      "rank_start": 23501,
+      "rank_end": 23750
+    },
+    {
+      "file": "contexts/part-0096.jsonl",
+      "rank_start": 23751,
+      "rank_end": 24000
+    },
+    {
+      "file": "contexts/part-0097.jsonl",
+      "rank_start": 24001,
+      "rank_end": 24250
+    },
+    {
+      "file": "contexts/part-0098.jsonl",
+      "rank_start": 24251,
+      "rank_end": 24500
+    },
+    {
+      "file": "contexts/part-0099.jsonl",
+      "rank_start": 24501,
+      "rank_end": 24750
+    },
+    {
+      "file": "contexts/part-0100.jsonl",
+      "rank_start": 24751,
+      "rank_end": 25000
+    },
+    {
+      "file": "contexts/part-0101.jsonl",
+      "rank_start": 25001,
+      "rank_end": 25250
+    },
+    {
+      "file": "contexts/part-0102.jsonl",
+      "rank_start": 25251,
+      "rank_end": 25500
+    },
+    {
+      "file": "contexts/part-0103.jsonl",
+      "rank_start": 25501,
+      "rank_end": 25750
+    },
+    {
+      "file": "contexts/part-0104.jsonl",
+      "rank_start": 25751,
+      "rank_end": 26000
+    },
+    {
+      "file": "contexts/part-0105.jsonl",
+      "rank_start": 26001,
+      "rank_end": 26250
+    },
+    {
+      "file": "contexts/part-0106.jsonl",
+      "rank_start": 26251,
+      "rank_end": 26500
+    },
+    {
+      "file": "contexts/part-0107.jsonl",
+      "rank_start": 26501,
+      "rank_end": 26750
+    },
+    {
+      "file": "contexts/part-0108.jsonl",
+      "rank_start": 26751,
+      "rank_end": 27000
+    },
+    {
+      "file": "contexts/part-0109.jsonl",
+      "rank_start": 27001,
+      "rank_end": 27250
+    },
+    {
+      "file": "contexts/part-0110.jsonl",
+      "rank_start": 27251,
+      "rank_end": 27500
+    },
+    {
+      "file": "contexts/part-0111.jsonl",
+      "rank_start": 27501,
+      "rank_end": 27750
+    },
+    {
+      "file": "contexts/part-0112.jsonl",
+      "rank_start": 27751,
+      "rank_end": 28000
+    },
+    {
+      "file": "contexts/part-0113.jsonl",
+      "rank_start": 28001,
+      "rank_end": 28250
+    },
+    {
+      "file": "contexts/part-0114.jsonl",
+      "rank_start": 28251,
+      "rank_end": 28500
+    },
+    {
+      "file": "contexts/part-0115.jsonl",
+      "rank_start": 28501,
+      "rank_end": 28750
+    },
+    {
+      "file": "contexts/part-0116.jsonl",
+      "rank_start": 28751,
+      "rank_end": 29000
+    },
+    {
+      "file": "contexts/part-0117.jsonl",
+      "rank_start": 29001,
+      "rank_end": 29250
+    },
+    {
+      "file": "contexts/part-0118.jsonl",
+      "rank_start": 29251,
+      "rank_end": 29500
+    },
+    {
+      "file": "contexts/part-0119.jsonl",
+      "rank_start": 29501,
+      "rank_end": 29750
+    },
+    {
+      "file": "contexts/part-0120.jsonl",
+      "rank_start": 29751,
+      "rank_end": 30000
+    },
+    {
+      "file": "contexts/part-0121.jsonl",
+      "rank_start": 30001,
+      "rank_end": 30250
+    },
+    {
+      "file": "contexts/part-0122.jsonl",
+      "rank_start": 30251,
+      "rank_end": 30500
+    },
+    {
+      "file": "contexts/part-0123.jsonl",
+      "rank_start": 30501,
+      "rank_end": 30750
+    },
+    {
+      "file": "contexts/part-0124.jsonl",
+      "rank_start": 30751,
+      "rank_end": 31000
+    },
+    {
+      "file": "contexts/part-0125.jsonl",
+      "rank_start": 31001,
+      "rank_end": 31250
+    },
+    {
+      "file": "contexts/part-0126.jsonl",
+      "rank_start": 31251,
+      "rank_end": 31500
+    },
+    {
+      "file": "contexts/part-0127.jsonl",
+      "rank_start": 31501,
+      "rank_end": 31750
+    },
+    {
+      "file": "contexts/part-0128.jsonl",
+      "rank_start": 31751,
+      "rank_end": 32000
+    },
+    {
+      "file": "contexts/part-0129.jsonl",
+      "rank_start": 32001,
+      "rank_end": 32250
+    },
+    {
+      "file": "contexts/part-0130.jsonl",
+      "rank_start": 32251,
+      "rank_end": 32500
+    },
+    {
+      "file": "contexts/part-0131.jsonl",
+      "rank_start": 32501,
+      "rank_end": 32750
+    },
+    {
+      "file": "contexts/part-0132.jsonl",
+      "rank_start": 32751,
+      "rank_end": 33000
+    },
+    {
+      "file": "contexts/part-0133.jsonl",
+      "rank_start": 33001,
+      "rank_end": 33250
+    },
+    {
+      "file": "contexts/part-0134.jsonl",
+      "rank_start": 33251,
+      "rank_end": 33500
+    },
+    {
+      "file": "contexts/part-0135.jsonl",
+      "rank_start": 33501,
+      "rank_end": 33750
+    },
+    {
+      "file": "contexts/part-0136.jsonl",
+      "rank_start": 33751,
+      "rank_end": 34000
+    },
+    {
+      "file": "contexts/part-0137.jsonl",
+      "rank_start": 34001,
+      "rank_end": 34250
+    },
+    {
+      "file": "contexts/part-0138.jsonl",
+      "rank_start": 34251,
+      "rank_end": 34500
+    },
+    {
+      "file": "contexts/part-0139.jsonl",
+      "rank_start": 34501,
+      "rank_end": 34750
+    },
+    {
+      "file": "contexts/part-0140.jsonl",
+      "rank_start": 34751,
+      "rank_end": 35000
+    },
+    {
+      "file": "contexts/part-0141.jsonl",
+      "rank_start": 35001,
+      "rank_end": 35250
+    },
+    {
+      "file": "contexts/part-0142.jsonl",
+      "rank_start": 35251,
+      "rank_end": 35500
+    },
+    {
+      "file": "contexts/part-0143.jsonl",
+      "rank_start": 35501,
+      "rank_end": 35750
+    },
+    {
+      "file": "contexts/part-0144.jsonl",
+      "rank_start": 35751,
+      "rank_end": 35768
+    }
+  ],
+  "rules": [
+    {
+      "id": "rust-prod-unwrap",
+      "category": "correctness",
+      "pattern": "\\.(?:unwrap|expect)\\s*\\(",
+      "message": "Reachable unwrap/expect can terminate the process instead of returning a controlled error.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-panic-macro",
+      "category": "correctness",
+      "pattern": "\\b(?:panic|todo|unimplemented)\\s*!\\s*\\(",
+      "message": "Production panic/todo/unimplemented path can crash or make an advertised branch unusable.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-unreachable-macro",
+      "category": "correctness",
+      "pattern": "\\bunreachable\\s*!\\s*\\(",
+      "message": "An assumed-impossible branch may be reachable after configuration or protocol evolution.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-unsafe-block",
+      "category": "memory-safety",
+      "pattern": "\\bunsafe\\s*\\{",
+      "message": "Unsafe code needs explicit invariant, bounds, lifetime, and concurrency review.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-unchecked-operation",
+      "category": "memory-safety",
+      "pattern": "\\b(?:get_unchecked|from_utf8_unchecked|transmute|assume_init|set_len)\\b",
+      "message": "Unchecked memory/string operation can violate Rust safety invariants if inputs drift.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-unbounded-channel",
+      "category": "resource-exhaustion",
+      "pattern": "\\bunbounded_channel\\s*\\(",
+      "message": "Unbounded channel permits producer traffic to retain memory without backpressure.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-std-mutex",
+      "category": "concurrency",
+      "pattern": "\\bstd::sync::(?:Mutex|RwLock)\\b",
+      "message": "Blocking mutex/RwLock may stall an async executor or request hot path.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-blocking-sleep",
+      "category": "concurrency",
+      "pattern": "\\b(?:std::thread::sleep|thread::sleep)\\s*\\(",
+      "message": "Blocking sleep can monopolize an executor worker when called from async code.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-blocking-fs",
+      "category": "concurrency",
+      "pattern": "\\bstd::fs::(?:read|read_to_string|write|copy|rename|remove_file|remove_dir_all|metadata|canonicalize|create_dir_all|read_dir)\\s*\\(",
+      "message": "Synchronous filesystem operation may block an async/runtime worker.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-blocking-command",
+      "category": "concurrency",
+      "pattern": "\\bstd::process::Command\\b|\\bCommand::new\\s*\\(",
+      "message": "Child-process launch is blocking and needs timeout, output cap, and argument provenance review.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-detached-spawn",
+      "category": "lifecycle",
+      "pattern": "(?<![=\\w])tokio::spawn\\s*\\(",
+      "message": "Detached task may outlive reload/shutdown ownership and hide failures.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-spawn-blocking",
+      "category": "resource-exhaustion",
+      "pattern": "\\bspawn_blocking\\s*\\(",
+      "message": "spawn_blocking work needs explicit admission control and shutdown ownership.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-read-to-end",
+      "category": "resource-exhaustion",
+      "pattern": "\\bread_to_end\\s*\\(",
+      "message": "Read-to-end can allocate until EOF unless a hard byte limit is enforced upstream.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-read-to-string",
+      "category": "resource-exhaustion",
+      "pattern": "\\bread_to_string\\s*\\(",
+      "message": "Read-to-string can allocate until EOF unless a hard byte limit is enforced upstream.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-body-collect",
+      "category": "resource-exhaustion",
+      "pattern": "\\b(?:to_bytes|collect_body|body\\.collect|collect::<\\s*Bytes|collect::<\\s*Vec)\\b",
+      "message": "Whole-body/materializing collection needs an independently enforced byte cap.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-variable-capacity",
+      "category": "resource-exhaustion",
+      "pattern": "(?:Vec|String|BytesMut)::with_capacity\\s*\\((?!\\s*\\d+\\s*\\))",
+      "message": "Variable-derived preallocation can amplify attacker-controlled lengths.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-accept-loop",
+      "category": "availability",
+      "pattern": "\\.accept\\s*\\(\\s*\\)\\.await",
+      "message": "Listener accept error path needs bounded backoff and shutdown handling to avoid a hot failure loop.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-network-connect",
+      "category": "availability",
+      "pattern": "\\b(?:TcpStream::connect|UdpSocket::connect|lookup_host|connect_async|Endpoint::from_shared)\\b",
+      "message": "Network establishment needs connect timeout, cancellation, DNS policy, and address-rotation review.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-client-builder",
+      "category": "performance",
+      "pattern": "\\b(?:reqwest::Client::new|Client::builder|HttpConnector::new)\\s*\\(",
+      "message": "Client construction inside a request/plugin method can defeat pooling and repeat TLS/DNS setup.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-regex-compile",
+      "category": "performance",
+      "pattern": "\\bRegex(?:Set)?::new\\s*\\(",
+      "message": "Regex compilation should normally occur at config load, not per request/message.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-json-materialize",
+      "category": "performance",
+      "pattern": "serde_json::(?:to_vec|to_string|from_slice|from_str)\\s*\\(",
+      "message": "JSON materialization on a hot/body path can add full-size copies and CPU work.",
+      "severity": "medium",
+      "confidence": "low",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-string-lossy",
+      "category": "correctness",
+      "pattern": "String::from_utf8_lossy\\s*\\(",
+      "message": "Lossy UTF-8 conversion can alter signed, routed, filtered, or audited bytes.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-to-vec",
+      "category": "performance",
+      "pattern": "\\.(?:to_vec|to_string)\\s*\\(\\s*\\)",
+      "message": "Owned copy in a hot/body path may duplicate payloads or configuration snapshots.",
+      "severity": "medium",
+      "confidence": "low",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-full-sort",
+      "category": "performance",
+      "pattern": "\\.(?:sort|sort_by|sort_by_key|sort_unstable|sort_unstable_by)\\s*\\(",
+      "message": "Full sorting in request/status/eviction paths can turn bounded work into O(n log n).",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-map-full-scan",
+      "category": "performance",
+      "pattern": "\\.(?:iter|values|keys)\\s*\\(\\s*\\)",
+      "message": "Full collection scan may be on a request, metric-render, reload, or eviction path.",
+      "severity": "medium",
+      "confidence": "low",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-map-insert",
+      "category": "resource-exhaustion",
+      "pattern": "\\.(?:insert|entry)\\s*\\(",
+      "message": "State insertion needs cardinality, byte, TTL, and lifecycle bounds when keys can be traffic-derived.",
+      "severity": "medium",
+      "confidence": "low",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-let-underscore",
+      "category": "error-handling",
+      "pattern": "\\blet\\s+_\\s*=",
+      "message": "Discarded return value may hide persistence, cleanup, delivery, or task failures.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-result-ok",
+      "category": "error-handling",
+      "pattern": "\\.ok\\s*\\(\\s*\\)",
+      "message": "Converting Result to Option erases the cause and can silently skip invalid or failed work.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-filter-map-ok",
+      "category": "error-handling",
+      "pattern": "filter_map\\s*\\([^\\n]*\\.ok\\s*\\(\\s*\\)",
+      "message": "filter_map(Result::ok) silently drops malformed or failed entries.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-unwrap-or-default",
+      "category": "error-handling",
+      "pattern": "\\.unwrap_or_default\\s*\\(",
+      "message": "Default-on-error may turn invalid input or failed state retrieval into permissive behavior.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-unwrap-or-true",
+      "category": "security",
+      "pattern": "\\.unwrap_or\\s*\\(\\s*true\\s*\\)",
+      "message": "Defaulting a failed/missing decision to true can fail open.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-if-let-ok",
+      "category": "error-handling",
+      "pattern": "\\bif\\s+let\\s+Ok\\s*\\(",
+      "message": "if-let-Ok without an else can silently ignore an operational or validation failure.",
+      "severity": "medium",
+      "confidence": "low",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-log-secret",
+      "category": "data-exposure",
+      "pattern": "(?:trace|debug|info|warn|error)!\\s*\\([^\\n]*(?:token|secret|password|authorization|cookie|api[_-]?key|private[_-]?key)",
+      "message": "Logging credential-bearing values can expose secrets through normal diagnostics.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 2,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-dangerous-tls",
+      "category": "security",
+      "pattern": "danger_accept_invalid_(?:certs|hostnames)|NoCertificateVerification|tls_no_verify|insecure_skip_verify",
+      "message": "TLS verification bypass must be tightly gated and must not leak into production defaults.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 2,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-weak-hash",
+      "category": "security",
+      "pattern": "\\b(?:md5|sha1|Sha1)\\b",
+      "message": "Weak hash use needs review for signatures, integrity, cache keys, and credential storage.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 2,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-secret-equality",
+      "category": "security",
+      "pattern": "(?:token|secret|signature|password|api_key|hmac)[^\\n]{0,80}(?:==|!=)|(?:==|!=)[^\\n]{0,80}(?:token|secret|signature|password|api_key|hmac)",
+      "message": "Direct equality on secret material may be timing-sensitive or compare transformed representations.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 2,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-jwt-decode",
+      "category": "security",
+      "pattern": "\\bjsonwebtoken::decode\\b|\\bdecode::<",
+      "message": "JWT validation needs explicit algorithm, issuer, audience, time, key-selection, and replay policy review.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-wildcard-cors",
+      "category": "security",
+      "pattern": "Access-Control-Allow-Origin|allow_any_origin|HeaderValue::from_static\\(\\s*\\\"\\*\\\"",
+      "message": "Wildcard cross-origin access can expose management or credentialed endpoints.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 2,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-shell-command",
+      "category": "injection",
+      "pattern": "Command::new\\s*\\(\\s*\\\"(?:sh|bash)\\\"|\\.arg\\s*\\(\\s*\\\"-c\\\"",
+      "message": "Shell execution needs strict non-user-controlled command construction and timeout/output caps.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-dynamic-path-join",
+      "category": "filesystem-security",
+      "pattern": "\\.join\\s*\\([^\\n]*(?:tenant|namespace|node|proxy|plugin|consumer|id|name|key)",
+      "message": "Dynamic identifier used in a path needs canonical containment, separator, symlink, and collision checks.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 2,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-file-write",
+      "category": "durability",
+      "pattern": "\\b(?:tokio::fs|std::fs)::(?:write|rename|copy|remove_file|remove_dir_all|create_dir_all)\\b",
+      "message": "Filesystem mutation needs atomicity, fsync, ownership, symlink, quota, and crash-recovery review.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-relaxed-atomic",
+      "category": "concurrency",
+      "pattern": "Ordering::Relaxed",
+      "message": "Relaxed atomic ordering is unsafe for lifecycle/state publication unless independently synchronized.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-arc-swap-store",
+      "category": "concurrency",
+      "pattern": "\\.store\\s*\\(\\s*Arc::new|ArcSwap[^\\n]*\\.store",
+      "message": "Blind ArcSwap store can lose concurrent updates when derived from a stale snapshot.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-narrowing-cast",
+      "category": "correctness",
+      "pattern": "\\bas\\s+(?:u8|u16|u32|i8|i16|i32|usize)\\b",
+      "message": "Narrowing/platform-dependent cast needs overflow/truncation validation.",
+      "severity": "medium",
+      "confidence": "low",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-system-time-unwrap",
+      "category": "correctness",
+      "pattern": "SystemTime::now\\s*\\(\\s*\\)[^\\n]{0,120}duration_since[^\\n]{0,120}\\.(?:unwrap|expect)",
+      "message": "Wall-clock rollback can panic duration_since-based logic.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-user-metric-label",
+      "category": "observability",
+      "pattern": "(?:label|labels|with_label_values)[^\\n]*(?:path|host|url|user|consumer|tenant|namespace|proxy_id|request_id)",
+      "message": "Traffic-derived metric labels can create unbounded Prometheus cardinality.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 2,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-format-hot",
+      "category": "performance",
+      "pattern": "\\bformat!\\s*\\(",
+      "message": "format! allocates; verify it is not in a per-request/per-message hot loop.",
+      "severity": "medium",
+      "confidence": "low",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-serde-default-sensitive",
+      "category": "configuration-security",
+      "pattern": "#\\[serde\\([^\\]]*default[^\\]]*\\)\\][\\s\\n]*(?:pub\\s+)?(?:allow|enabled|verify|auth|tls|secure|fail_open|enforce)",
+      "message": "Security-sensitive serde default can silently change enforcement when a field is omitted.",
+      "severity": "high",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 2,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-todo-comment",
+      "category": "implementation-gap",
+      "pattern": "\\b(?:TODO|FIXME|HACK|XXX)\\b",
+      "message": "Explicit unfinished or workaround marker needs launch-readiness disposition.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs",
+        ".py",
+        ".sh",
+        ".yml",
+        ".yaml",
+        ".toml",
+        ".proto",
+        ".sql"
+      ],
+      "flags": 2,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-gap-language",
+      "category": "implementation-gap",
+      "pattern": "\\b(?:not implemented|unsupported|best[- ]effort|fail[-_ ]open|intentionally ignored|silently ignore|deferred|no-op)\\b",
+      "message": "Documented unsupported/best-effort/fail-open branch may be a pre-launch gap.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs",
+        ".py",
+        ".sh",
+        ".yml",
+        ".yaml",
+        ".toml",
+        ".proto",
+        ".sql"
+      ],
+      "flags": 2,
+      "prod_only": true,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "rust-ignore-test",
+      "category": "test-gap",
+      "pattern": "#\\[(?:ignore|cfg\\([^\\]]*(?:test|feature)[^\\]]*\\))\\]",
+      "message": "Ignored or narrowly gated test may leave a production branch outside required CI.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs"
+      ],
+      "flags": 0,
+      "prod_only": false,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "yaml-continue-on-error",
+      "category": "ci-integrity",
+      "pattern": "continue-on-error\\s*:\\s*true",
+      "message": "Required CI step can fail without failing the workflow.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".yml",
+        ".yaml"
+      ],
+      "flags": 0,
+      "prod_only": false,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "yaml-unpinned-action",
+      "category": "supply-chain",
+      "pattern": "uses\\s*:\\s*[^\\s#]+@(?:main|master|v\\d+)\\s*$",
+      "message": "Action is not pinned to an immutable commit SHA.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".yml",
+        ".yaml"
+      ],
+      "flags": 8,
+      "prod_only": false,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "yaml-privileged",
+      "category": "container-security",
+      "pattern": "privileged\\s*:\\s*true|hostNetwork\\s*:\\s*true|hostPID\\s*:\\s*true",
+      "message": "Privileged/host namespace workload materially expands compromise impact.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".yml",
+        ".yaml"
+      ],
+      "flags": 2,
+      "prod_only": false,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "yaml-latest-image",
+      "category": "supply-chain",
+      "pattern": "image\\s*:\\s*[^\\s]+:(?:latest|main)\\b",
+      "message": "Mutable container tag prevents reproducible deployment and rollback.",
+      "severity": "medium",
+      "confidence": "high",
+      "extensions": [
+        ".yml",
+        ".yaml"
+      ],
+      "flags": 2,
+      "prod_only": false,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "yaml-missing-probe-marker",
+      "category": "operations",
+      "pattern": "kind\\s*:\\s*(?:Deployment|DaemonSet|StatefulSet)",
+      "message": "Workload should be reviewed for startup/readiness/liveness probes, resource limits, and disruption behavior.",
+      "severity": "medium",
+      "confidence": "low",
+      "extensions": [
+        ".yml",
+        ".yaml"
+      ],
+      "flags": 2,
+      "prod_only": false,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "shell-error-suppression",
+      "category": "ci-integrity",
+      "pattern": "\\|\\|\\s*true\\b|set\\s+\\+e\\b|2>/dev/null",
+      "message": "Shell failure suppression may hide a required validation, cleanup, or deployment failure.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".sh",
+        ".bash",
+        ".yml",
+        ".yaml"
+      ],
+      "flags": 0,
+      "prod_only": false,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "shell-eval",
+      "category": "injection",
+      "pattern": "\\beval\\b|(?:bash|sh)\\s+-c\\s+[^\\\"']*\\$",
+      "message": "Dynamic shell evaluation can become command injection.",
+      "severity": "high",
+      "confidence": "high",
+      "extensions": [
+        ".sh",
+        ".bash",
+        ".yml",
+        ".yaml"
+      ],
+      "flags": 0,
+      "prod_only": false,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "shell-unverified-download",
+      "category": "supply-chain",
+      "pattern": "\\bcurl\\b|\\bwget\\b",
+      "message": "Downloaded executable/archive needs immutable version, digest/signature verification, timeout, and retry review.",
+      "severity": "medium",
+      "confidence": "low",
+      "extensions": [
+        ".sh",
+        ".bash",
+        ".yml",
+        ".yaml",
+        ".dockerfile"
+      ],
+      "flags": 0,
+      "prod_only": false,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "sql-select-star",
+      "category": "database-performance",
+      "pattern": "\\bSELECT\\s+\\*\\b",
+      "message": "SELECT * couples queries to schema growth and may retrieve unnecessary large columns.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".rs",
+        ".sql"
+      ],
+      "flags": 2,
+      "prod_only": false,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "proto-unbounded-repeated",
+      "category": "resource-exhaustion",
+      "pattern": "\\brepeated\\s+(?:bytes|string|[A-Za-z_][\\w.]*)\\s+\\w+\\s*=",
+      "message": "Repeated protobuf field needs message-size and element-count limits at ingress.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".proto"
+      ],
+      "flags": 0,
+      "prod_only": false,
+      "context_before": 5,
+      "context_after": 8
+    },
+    {
+      "id": "proto-bytes-field",
+      "category": "resource-exhaustion",
+      "pattern": "\\bbytes\\s+\\w+\\s*=",
+      "message": "Bytes protobuf field needs explicit decoded-size limits before allocation/use.",
+      "severity": "medium",
+      "confidence": "medium",
+      "extensions": [
+        ".proto"
+      ],
+      "flags": 0,
+      "prod_only": false,
+      "context_before": 5,
+      "context_after": 8
+    }
+  ]
+}
