@@ -5603,9 +5603,19 @@ impl ProxyState {
             Arc::new(env_config.mesh_egress_strip_baggage_keys.clone());
         let pool_shard_amount =
             crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount);
-        let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
-            &env_config.trusted_proxies,
-        ));
+        // Strict: a malformed entry must never yield a partially parsed
+        // forwarding trust boundary (advisory GHSA-pvj7-hhqj-rpv5).
+        // `EnvConfig::validate()` already rejects this at parse time, so a
+        // failure here means a hand-built config; either way construction fails
+        // before any listener binds, and a live `ProxyState` keeps its existing
+        // (last-known-good) trust set because `update_config` never rebuilds it.
+        let trusted_proxies = Arc::new(
+            client_ip::TrustedProxies::parse_strict(
+                &env_config.trusted_proxies,
+                "FERRUM_TRUSTED_PROXIES",
+            )
+            .map_err(|e| anyhow::anyhow!("FERRUM_TRUSTED_PROXIES: {e}"))?,
+        );
         let websocket_conn_limit = if env_config.websocket_max_connections > 0 {
             Some(Arc::new(tokio::sync::Semaphore::new(
                 env_config.websocket_max_connections,
@@ -18747,8 +18757,11 @@ async fn handle_proxy_request_inner(
     // parsing across the real-IP-header check and the XFF walk.
     // When no resolution changes the IP, we skip the allocation entirely —
     // ctx.client_ip was already set to socket_ip by RequestContext::new().
-    // Uses raw_header_get() to read specific headers without materializing the
-    // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
+    // Uses the raw header accessors to read specific headers without
+    // materializing the full HashMap — only 2-3 targeted lookups on the raw
+    // HeaderMap. The configured real-IP header is read as ALL of its field
+    // lines, never a single `get()`, so duplicate lines cannot hide a competing
+    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         if let Some(ref addr) = socket_addr {
@@ -18757,15 +18770,6 @@ async fn handle_proxy_request_inner(
             {
                 request_scheme = forwarded_scheme;
             }
-            let real_ip_header_val =
-                state
-                    .env_config
-                    .real_ip_header
-                    .as_ref()
-                    .and_then(|real_ip_header| {
-                        // real_ip_header is pre-lowercased at config load time — no allocation needed
-                        ctx.raw_header_get(real_ip_header.as_str())
-                    });
             let xff_chain = {
                 let mut values = ctx.raw_header_values("x-forwarded-for");
                 values.next().map(|first| {
@@ -18777,13 +18781,24 @@ async fn handle_proxy_request_inner(
                     combined
                 })
             };
-            if let Some(resolved) = client_ip::resolve_forwarded_client_ip(
+            // Bound the immutable borrow of `ctx` (held by the field-line
+            // iterator) to this statement so the assignment below can take a
+            // mutable borrow.
+            let resolved = client_ip::resolve_forwarded_client_ip(
                 &socket_ip,
                 addr,
-                real_ip_header_val,
+                state
+                    .env_config
+                    .real_ip_header
+                    .as_deref()
+                    // real_ip_header is pre-lowercased at config load time — no allocation needed
+                    .map(|name| ctx.header_field_lines(name))
+                    .into_iter()
+                    .flatten(),
                 xff_chain.as_deref(),
                 &state.trusted_proxies,
-            ) {
+            );
+            if let Some(resolved) = resolved {
                 ctx.client_ip = resolved;
             }
         }
@@ -40654,8 +40669,10 @@ mod tests {
     /// | untrusted peer                     | none        | equal          | peer               |
     #[test]
     fn build_xff_value_appends_peer_and_seeds_resolved_client() {
-        let no_policy = client_ip::TrustedProxies::parse("");
-        let lb_trusted = client_ip::TrustedProxies::parse("10.0.0.7");
+        let no_policy =
+            client_ip::TrustedProxies::parse_strict("", "test").expect("empty trust list is valid");
+        let lb_trusted = client_ip::TrustedProxies::parse_strict("10.0.0.7", "test")
+            .expect("valid trusted proxy list");
 
         // No proxy in front: client == peer, no inbound chain.
         assert_eq!(

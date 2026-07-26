@@ -179,6 +179,85 @@ fn cache_key_query_part(raw_query: &str) -> String {
 /// sensitivity rules.
 const SENSITIVE_VARY_HEADERS: [&str; 3] = ["authorization", "proxy-authorization", "cookie"];
 
+/// Response fields that describe *this* hop rather than the representation and
+/// must never survive into a shared-cache entry (RFC 9110 §7.6.1 connection
+/// options, §11.7 proxy authentication). Retaining `Proxy-Authenticate` would
+/// persist an intermediary's challenge and replay it to unrelated clients;
+/// retaining `Transfer-Encoding` / `Connection` would replay framing the
+/// buffered replay path does not use.
+const NEVER_CACHED_RESPONSE_HEADERS: [&str; 9] = [
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Status codes a caller can steer a backend into emitting whose caching
+/// semantics this plugin does not implement.
+///
+/// * `206 Partial Content` would need `Range` / `Content-Range` tracking,
+///   strong-validator matching, completeness state, and per-request range
+///   applicability (RFC 9111 §3.3, §3.4) before a stored partial could be
+///   reused; without that, an attacker-selected byte range becomes the stored
+///   representation for later unconditional full requests.
+/// * `304 Not Modified` is validator metadata used to freshen an existing
+///   stored representation (RFC 9111 §4.3.4), never a representation of its
+///   own; storing one hands later callers an empty body under a `304` status.
+/// * `1xx` are interim responses and never final.
+///
+/// These are rejected at configuration admission *and* refused again at store
+/// time, so neither an operator config nor a backend can turn a validator-only
+/// or partial payload into a reusable entry.
+const UNSUPPORTED_CACHEABLE_STATUS_CODES: [u16; 2] = [206, 304];
+
+fn is_supported_cacheable_status(status: u16) -> bool {
+    status >= 200 && !UNSUPPORTED_CACHEABLE_STATUS_CODES.contains(&status)
+}
+
+/// Strip everything that must not be retained from the representation about to
+/// be stored: connection-scoped and proxy-authentication fields, every field
+/// nominated by this response's own `Connection` header, and every field the
+/// origin qualified with `private="…"` / `no-cache="…"`.
+///
+/// The client-visible response for the miss that produced these bytes is
+/// untouched — only the retained copy is narrowed, which is exactly the
+/// RFC 9111 §5.2.2.4 / §5.2.2.7 requirement.
+fn sanitize_cached_response_headers(
+    headers: &mut HashMap<String, String>,
+    directives: &CacheControlDirectives,
+) {
+    let mut connection_nominated: Vec<String> = Vec::new();
+    if let Some(connection) = header_value(headers, "connection") {
+        for token in connection.split(',') {
+            let token = token.trim();
+            if token.is_empty()
+                || token.eq_ignore_ascii_case("close")
+                || token.eq_ignore_ascii_case("keep-alive")
+            {
+                continue;
+            }
+            connection_nominated.push(token.to_ascii_lowercase());
+        }
+    }
+
+    headers.retain(|name, _| {
+        !NEVER_CACHED_RESPONSE_HEADERS
+            .iter()
+            .any(|hop_by_hop| name.eq_ignore_ascii_case(hop_by_hop))
+            && !connection_nominated
+                .iter()
+                .any(|nominated| name.eq_ignore_ascii_case(nominated))
+            && !directives
+                .qualified_protected_fields()
+                .any(|protected| name.eq_ignore_ascii_case(protected))
+    });
+}
+
 fn is_auto_sensitive_vary_header(header: &str) -> bool {
     SENSITIVE_VARY_HEADERS
         .iter()
@@ -325,7 +404,14 @@ impl CacheEntry {
 }
 
 /// Parsed Cache-Control directives relevant to proxy caching.
-#[derive(Debug, Default, Clone, Copy)]
+///
+/// `private` and `no-cache` each have two RFC 9111 forms: the bare directive,
+/// which covers the whole response, and the *qualified* form whose argument is
+/// a quoted, comma-separated list of field names (`private="x-account"`).
+/// Both forms are represented here — the bare flags refuse the response
+/// outright, and the field lists name individual fields that must not survive
+/// into a shared-cache entry (§5.2.2.4 / §5.2.2.7).
+#[derive(Debug, Default, Clone)]
 struct CacheControlDirectives {
     no_store: bool,
     no_cache: bool,
@@ -334,37 +420,271 @@ struct CacheControlDirectives {
     must_revalidate: bool,
     max_age: Option<u64>,
     s_maxage: Option<u64>,
+    /// Lowercased field names carried by a qualified `private="…"` argument.
+    private_fields: Vec<String>,
+    /// Lowercased field names carried by a qualified `no-cache="…"` argument.
+    no_cache_fields: Vec<String>,
 }
 
+impl CacheControlDirectives {
+    /// Field names the origin refused to let a shared cache retain (qualified
+    /// `private`) or reuse without successful revalidation (qualified
+    /// `no-cache`). Ferrum revalidates only against its own stored validators,
+    /// never the origin, so both are handled the same conservative way: the
+    /// named fields are dropped before the representation is retained.
+    fn qualified_protected_fields(&self) -> impl Iterator<Item = &str> {
+        self.private_fields
+            .iter()
+            .chain(self.no_cache_fields.iter())
+            .map(String::as_str)
+    }
+
+    /// A client `Cache-Control` request header asks to bypass the cache under
+    /// either the bare or (non-standard, but observed) qualified `no-cache`
+    /// spelling. Requests have no field-scoped semantics, so any occurrence
+    /// bypasses.
+    fn request_bypasses_cache(&self) -> bool {
+        self.no_store || self.no_cache || !self.no_cache_fields.is_empty()
+    }
+}
+
+/// Largest `delta-seconds` a recipient is required to represent (RFC 9111
+/// §1.2.2). Values above it — including ones that overflow `u64` — are clamped
+/// rather than discarded, so an absurd `max-age` cannot silently fall back to
+/// the configured heuristic TTL.
+const MAX_DELTA_SECONDS: u64 = 2_147_483_648;
+
+/// The argument of one `Cache-Control` member, preserved with its grammar
+/// shape so a qualified directive can be told apart from a malformed one.
+enum CacheControlArgument<'a> {
+    /// Bare token argument (`max-age=60`, or the malformed `private=x-a`).
+    Token(&'a str),
+    /// Quoted-string argument with quoted-pairs resolved.
+    Quoted(Cow<'a, str>),
+    /// Unterminated quoted string or non-OWS trailing junk — unusable and
+    /// handled conservatively.
+    Malformed,
+}
+
+/// Parse an RFC 9110 §5.6.4 quoted-string whose opening `"` sits at
+/// `*position`, resolving quoted-pairs and leaving `*position` just past the
+/// closing quote. Returns `None` for an unterminated string.
+///
+/// Scanning is byte-wise but only ever stops on the ASCII delimiters `"` and
+/// `\`, so every slice boundary it takes is a UTF-8 character boundary; the
+/// fallible slicing below keeps that an invariant rather than a panic.
+fn parse_quoted_string<'a>(value: &'a str, position: &mut usize) -> Option<Cow<'a, str>> {
+    let bytes = value.as_bytes();
+    let mut index = position.checked_add(1)?;
+    let mut segment_start = index;
+    let mut unescaped: Option<String> = None;
+
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'"' => {
+                let segment = value.get(segment_start..index)?;
+                let parsed = match unescaped {
+                    Some(mut owned) => {
+                        owned.push_str(segment);
+                        Cow::Owned(owned)
+                    }
+                    None => Cow::Borrowed(segment),
+                };
+                *position = index + 1;
+                return Some(parsed);
+            }
+            b'\\' => {
+                let escaped_start = index + 1;
+                let escaped = value.get(escaped_start..)?.chars().next()?;
+                let buffer = unescaped.get_or_insert_with(String::new);
+                buffer.push_str(value.get(segment_start..index)?);
+                buffer.push(escaped);
+                index = escaped_start + escaped.len_utf8();
+                segment_start = index;
+            }
+            _ => index += 1,
+        }
+    }
+
+    None
+}
+
+/// Grammar-aware `Cache-Control` parser.
+///
+/// A naive `split(',')` cannot see qualified directives: it splits
+/// `private="x-a, x-b"` in half and matches neither half against `private`,
+/// so the origin's field protection is silently dropped. This walks members
+/// with quoted-string awareness instead, so a comma inside a quoted argument
+/// stays inside its member.
 fn parse_cache_control(header_value: &str) -> CacheControlDirectives {
     let mut directives = CacheControlDirectives::default();
+    let bytes = header_value.as_bytes();
+    let mut index = 0usize;
 
-    for part in header_value.split(',') {
-        let part = part.trim();
-        if part.eq_ignore_ascii_case("no-store") {
-            directives.no_store = true;
-        } else if part.eq_ignore_ascii_case("no-cache") {
-            directives.no_cache = true;
-        } else if part.eq_ignore_ascii_case("private") {
-            directives.private = true;
-        } else if part.eq_ignore_ascii_case("public") {
-            directives.public = true;
-        } else if part.eq_ignore_ascii_case("must-revalidate") {
-            directives.must_revalidate = true;
-        } else if let Some(val) = strip_prefix_ascii_case(part, "s-maxage=") {
-            directives.s_maxage = val.trim().parse().ok();
-        } else if let Some(val) = strip_prefix_ascii_case(part, "max-age=") {
-            directives.max_age = val.trim().parse().ok();
+    while index < bytes.len() {
+        while matches!(bytes.get(index), Some(b',' | b' ' | b'\t')) {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            break;
+        }
+
+        let name_start = index;
+        while !matches!(bytes.get(index), None | Some(b'=' | b',')) {
+            index += 1;
+        }
+        let Some(name) = value_slice_trimmed(header_value, name_start, index) else {
+            break;
+        };
+
+        let mut argument = None;
+        if bytes.get(index) == Some(&b'=') {
+            index += 1;
+            while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+                index += 1;
+            }
+            if bytes.get(index) == Some(&b'"') {
+                match parse_quoted_string(header_value, &mut index) {
+                    Some(parsed) => {
+                        // Only optional whitespace may follow a quoted-string
+                        // before the member delimiter. Treat trailing junk as
+                        // malformed instead of accepting a valid prefix such
+                        // as `private="x-account"junk`.
+                        while matches!(bytes.get(index), Some(b' ' | b'\t')) {
+                            index += 1;
+                        }
+                        if matches!(bytes.get(index), None | Some(b',')) {
+                            argument = Some(CacheControlArgument::Quoted(parsed));
+                        } else {
+                            argument = Some(CacheControlArgument::Malformed);
+                        }
+                    }
+                    None => {
+                        // Unterminated quote: the remainder of the header is
+                        // uninterpretable, so stop after handling this member
+                        // conservatively.
+                        argument = Some(CacheControlArgument::Malformed);
+                        index = bytes.len();
+                    }
+                }
+            } else {
+                let token_start = index;
+                while !matches!(bytes.get(index), None | Some(b',')) {
+                    index += 1;
+                }
+                argument = value_slice_trimmed(header_value, token_start, index)
+                    .map(CacheControlArgument::Token);
+            }
+        }
+
+        apply_cache_control_directive(&mut directives, name, argument.as_ref());
+
+        // Discard any trailing junk between this member and the next comma.
+        while !matches!(bytes.get(index), None | Some(b',')) {
+            index += 1;
         }
     }
 
     directives
 }
 
-fn strip_prefix_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    let head = value.get(..prefix.len())?;
-    head.eq_ignore_ascii_case(prefix)
-        .then_some(&value[prefix.len()..])
+fn value_slice_trimmed(value: &str, start: usize, end: usize) -> Option<&str> {
+    value.get(start..end).map(str::trim)
+}
+
+fn apply_cache_control_directive(
+    directives: &mut CacheControlDirectives,
+    name: &str,
+    argument: Option<&CacheControlArgument<'_>>,
+) {
+    if name.eq_ignore_ascii_case("no-store") {
+        directives.no_store = true;
+    } else if name.eq_ignore_ascii_case("no-cache") {
+        apply_qualified_directive(
+            argument,
+            &mut directives.no_cache,
+            &mut directives.no_cache_fields,
+        );
+    } else if name.eq_ignore_ascii_case("private") {
+        apply_qualified_directive(
+            argument,
+            &mut directives.private,
+            &mut directives.private_fields,
+        );
+    } else if name.eq_ignore_ascii_case("public") {
+        directives.public = true;
+    } else if name.eq_ignore_ascii_case("must-revalidate") {
+        directives.must_revalidate = true;
+    } else if name.eq_ignore_ascii_case("s-maxage") {
+        merge_delta_seconds(&mut directives.s_maxage, argument);
+    } else if name.eq_ignore_ascii_case("max-age") {
+        merge_delta_seconds(&mut directives.max_age, argument);
+    }
+}
+
+/// Apply `private` / `no-cache` in either their bare or qualified form.
+///
+/// Fail closed: anything a shared cache cannot read as a well-formed quoted
+/// field-name list — an unquoted argument, an unterminated quoted string, an
+/// empty list, or a member that is not a valid field name — degrades to the
+/// bare directive, which refuses the whole response. A duplicate bare
+/// spelling alongside a qualified one therefore also wins regardless of order,
+/// because the bare flag is checked before the field list is consulted.
+fn apply_qualified_directive(
+    argument: Option<&CacheControlArgument<'_>>,
+    bare: &mut bool,
+    fields: &mut Vec<String>,
+) {
+    match argument {
+        None => *bare = true,
+        Some(CacheControlArgument::Quoted(list)) => match parse_field_name_list(list) {
+            Some(parsed) => fields.extend(parsed),
+            None => *bare = true,
+        },
+        Some(CacheControlArgument::Token(_) | CacheControlArgument::Malformed) => *bare = true,
+    }
+}
+
+/// Parse the quoted argument of a qualified directive into lowercased field
+/// names. Returns `None` when the list is empty or holds a member that is not
+/// a valid RFC 9110 field name, so the caller can fall back to the bare form.
+fn parse_field_name_list(list: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    for member in list.split(',') {
+        let member = member.trim();
+        if member.is_empty() {
+            continue;
+        }
+        HeaderName::from_bytes(member.as_bytes()).ok()?;
+        fields.push(member.to_ascii_lowercase());
+    }
+    (!fields.is_empty()).then_some(fields)
+}
+
+fn merge_delta_seconds(slot: &mut Option<u64>, argument: Option<&CacheControlArgument<'_>>) {
+    let raw = match argument {
+        Some(CacheControlArgument::Token(token)) => *token,
+        Some(CacheControlArgument::Quoted(value)) => &**value,
+        Some(CacheControlArgument::Malformed) | None => return,
+    };
+    let Some(seconds) = parse_delta_seconds(raw) else {
+        return;
+    };
+    // Conflicting duplicates are ambiguous; keep the most restrictive lifetime.
+    *slot = Some(slot.map_or(seconds, |existing| existing.min(seconds)));
+}
+
+fn parse_delta_seconds(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() || !value.as_bytes().iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    Some(
+        value
+            .parse::<u64>()
+            .unwrap_or(MAX_DELTA_SECONDS)
+            .min(MAX_DELTA_SECONDS),
+    )
 }
 
 fn duration_saturating_add(lhs: Duration, rhs: Duration) -> Duration {
@@ -562,7 +882,16 @@ fn parse_status_code_list(config: &Value, field: &'static str) -> Result<Option<
                 "response_caching: '{field}[{index}]' must be an HTTP status code"
             ));
         }
-        status_codes.push(code as u16);
+        let code = code as u16;
+        if !is_supported_cacheable_status(code) {
+            return Err(format!(
+                "response_caching: '{field}[{index}]' ({code}) has caching semantics this plugin \
+                 does not implement and cannot be marked cacheable — 1xx responses are interim, \
+                 206 requires range/validator/completeness tracking, and 304 is validator \
+                 metadata for an existing stored representation rather than a representation"
+            ));
+        }
+        status_codes.push(code);
     }
     Ok(Some(status_codes))
 }
@@ -1376,7 +1705,7 @@ impl ResponseCaching {
             .unwrap_or_default()
     }
 
-    fn freshness_lifetime(&self, directives: CacheControlDirectives) -> Duration {
+    fn freshness_lifetime(&self, directives: &CacheControlDirectives) -> Duration {
         if let Some(s_maxage) = directives.s_maxage {
             Duration::from_secs(s_maxage)
         } else if let Some(max_age) = directives.max_age {
@@ -1406,16 +1735,41 @@ impl ResponseCaching {
         apparent_age.max(corrected_age_value)
     }
 
+    /// RFC 9111 §3.5: a shared cache MUST NOT store a response to a request
+    /// bearing `Authorization` unless the response explicitly permits it with
+    /// `public`, `must-revalidate`, or `s-maxage`.
+    ///
+    /// The predicate is the *request credential*, not whether Ferrum minted an
+    /// identity for it. A gateway that forwards `Authorization` to a backend
+    /// which authenticates it itself creates no `effective_identity` at all, so
+    /// keying on identity alone treats those requests as anonymous and stores a
+    /// protected response the origin never authorized a shared cache to keep.
+    /// Hashing the token into a Vary dimension isolates *credentials* from one
+    /// another but does not satisfy the protocol rule: the entry keeps serving
+    /// the protected representation for the rest of its TTL even after the
+    /// backend would revoke, expire, or narrow that token.
+    ///
+    /// `request_headers` must be the same live/restored view the cache key was
+    /// derived from (`before_proxy`'s `headers` parameter as replayed by
+    /// [`Self::restore_request_headers_view`]), never the untransformed
+    /// `ctx.headers` alone — a request-side transformer can add or remove the
+    /// credential. The restored view is the union of both, so a credential
+    /// visible in either direction still refuses.
+    ///
+    /// `Proxy-Authorization` is deliberately not part of this predicate: it is
+    /// an intermediary credential consumed at this hop and says nothing about
+    /// origin authorization. It is still an auto-Vary dimension (so sessions
+    /// never share an entry) and never survives into a stored entry — see
+    /// [`NEVER_CACHED_RESPONSE_HEADERS`] and
+    /// [`Self::stash_request_headers_snapshot`], which stores it only hashed.
     fn shared_cache_allows_authorized_response(
-        &self,
         ctx: &RequestContext,
-        directives: CacheControlDirectives,
+        request_headers: &HashMap<String, String>,
+        directives: &CacheControlDirectives,
     ) -> bool {
-        if self.config.cache_key_include_consumer {
-            return true;
-        }
-
-        if ctx.effective_identity().is_none() {
+        let authorized_request =
+            ctx.effective_identity().is_some() || request_headers.contains_key("authorization");
+        if !authorized_request {
             return true;
         }
 
@@ -1770,7 +2124,7 @@ impl Plugin for ResponseCaching {
             && let Some(cc) = headers.get("cache-control")
         {
             let directives = parse_cache_control(cc);
-            if directives.no_cache || directives.no_store {
+            if directives.request_bypasses_cache() {
                 // Keep this instance's staged base/snapshot/predict so a
                 // no-cache refresh can still store the replacement response
                 // under the same instance-owned key inputs.
@@ -1802,7 +2156,11 @@ impl Plugin for ResponseCaching {
             // representation is either provably current or refetched, never
             // stacked with a second pass of non-idempotent rules.
             let stale_policy = entry.response_policy_stamp != policy_stamp;
-            if stale_policy || !entry.is_fresh_at(now) {
+            // Belt-and-braces companion to the store-side refusal: an entry
+            // whose status has semantics this plugin does not implement is
+            // never replayed, whatever produced it.
+            let unsupported_status = !is_supported_cacheable_status(entry.status_code);
+            if stale_policy || unsupported_status || !entry.is_fresh_at(now) {
                 drop(entry);
                 self.invalidate_cache_key(&base_key, &cache_key);
                 if stale_policy {
@@ -1949,6 +2307,27 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
+        // Second, independent gate on the statuses whose caching semantics this
+        // plugin does not implement. Configuration admission already rejects
+        // them, but the runtime refusal is what makes the guarantee
+        // status-driven rather than config-driven, and it also covers a partial
+        // representation that arrives under an allowed status: a caller-chosen
+        // `Range` answered with `Content-Range` describes bytes, not the
+        // resource, and must never become the reusable entry for later
+        // unconditional requests. Neither is an uncacheable *resource* signal —
+        // the very next unconditional request may store the full
+        // representation — so the predictor is deliberately left alone.
+        if !is_supported_cacheable_status(response_status)
+            || response_headers.contains_key("content-range")
+        {
+            debug!(
+                response_status = response_status,
+                "response_caching: refusing to store a partial or validator-only response as a \
+                 reusable representation"
+            );
+            return PluginResult::Continue;
+        }
+
         let directives = if self.config.respect_cache_control {
             response_headers
                 .get("cache-control")
@@ -1969,7 +2348,7 @@ impl Plugin for ResponseCaching {
         // both see the transformed values, not the untransformed
         // `ctx.headers`. See `restore_request_headers_view` for why.
         let lookup_headers = self.restore_request_headers_view(ctx);
-        let freshness_lifetime = self.freshness_lifetime(directives);
+        let freshness_lifetime = self.freshness_lifetime(&directives);
 
         if freshness_lifetime.is_zero() {
             self.invalidate_zero_freshness_response(
@@ -1992,7 +2371,12 @@ impl Plugin for ResponseCaching {
             return PluginResult::Continue;
         }
 
-        if !self.shared_cache_allows_authorized_response(ctx, directives) {
+        let request_view = &lookup_headers.headers;
+        if !Self::shared_cache_allows_authorized_response(ctx, request_view, &directives) {
+            debug!(
+                "response_caching: refusing to store a response to an authorized request without \
+                 an explicit shared-cache opt-in"
+            );
             self.mark_uncacheable_if_no_cached_entry(predict_key.as_deref());
             return PluginResult::Continue;
         }
@@ -2074,6 +2458,12 @@ impl Plugin for ResponseCaching {
         // built yet: another concurrent store may widen `vary_index` before
         // this store acquires `accounting_lock`.
         let mut cached_response_headers = response_headers.clone();
+        // Narrow the retained copy only: hop-by-hop / proxy-authentication
+        // fields and every field the origin qualified as `private` or
+        // `no-cache` are dropped before the entry exists, so no later replay
+        // path can emit them. The client that produced this miss still receives
+        // the untouched `response_headers`.
+        sanitize_cached_response_headers(&mut cached_response_headers, &directives);
         let cached_body = Bytes::copy_from_slice(body);
 
         let (cache_key, entry_size) = {

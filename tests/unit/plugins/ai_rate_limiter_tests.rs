@@ -970,7 +970,8 @@ async fn test_tracked_keys_count_uses_canonical_ingress_identity() {
     plugin.before_proxy(&mut native, &mut native_headers).await;
 
     let mut mapped = create_test_context();
-    mapped.client_ip = resolve_client_ip("::ffff:192.0.2.10", None, &TrustedProxies::parse(""));
+    let no_trust = TrustedProxies::parse_strict("", "test").expect("empty trust list is valid");
+    mapped.client_ip = resolve_client_ip("::ffff:192.0.2.10", None, &no_trust);
     let mut mapped_headers = HashMap::new();
     plugin.before_proxy(&mut mapped, &mut mapped_headers).await;
 

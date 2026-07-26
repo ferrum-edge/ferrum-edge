@@ -23,6 +23,21 @@
 //! 5. If all entries are trusted (or XFF is absent/empty), fall back to the
 //!    TCP socket address.
 //!
+//! # Configured single-hop real-IP header
+//!
+//! When `FERRUM_REAL_IP_HEADER` names an authoritative header (`X-Real-IP`,
+//! `CF-Connecting-IP`, …), that header is the trusted proxy's **overwrite-only**
+//! assertion of one client address. It is therefore accepted only when the
+//! request carries **exactly one** field-line holding **exactly one** valid IP
+//! (or `ip:port`) value. Zero, duplicate (identical or differing), non-UTF-8,
+//! comma-list, or otherwise malformed field-lines are rejected and the direct
+//! socket identity is kept — without then falling through to `X-Forwarded-For`,
+//! whose contents are less authoritative than the header the operator named.
+//!
+//! This multiplicity check exists because a trusted proxy that *preserves* a
+//! client-supplied copy of the header and *appends* its own would otherwise
+//! leave the selected value dependent on field order.
+//!
 //! # Configuration
 //!
 //! Set `FERRUM_TRUSTED_PROXIES` to a comma-separated list of CIDRs and/or IPs:
@@ -30,6 +45,13 @@
 //! ```text
 //! FERRUM_TRUSTED_PROXIES=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1
 //! ```
+//!
+//! The list is parsed **strictly**: every entry must be a valid IP or CIDR and
+//! empty comma segments are rejected. A typo must not silently shrink the trust
+//! boundary — that would collapse every downstream client onto the proxy's own
+//! socket address for IP policy, geo/bot attribution, and per-IP limits. Invalid
+//! configuration fails `ferrum-edge validate` and fails startup before any
+//! listener binds; nothing installs a partially parsed trust set.
 //!
 //! When unset (empty), XFF headers are **ignored** and the socket IP is always
 //! used — which is the secure default for edge deployments.
@@ -49,36 +71,24 @@ pub struct TrustedProxies {
 }
 
 impl TrustedProxies {
-    /// Parse a comma-separated list of CIDRs/IPs into a `TrustedProxies` set.
+    /// Parse a comma-separated list of CIDRs/IPs, failing if **any** entry is
+    /// invalid or empty.
     ///
-    /// Accepts formats like: `10.0.0.0/8`, `192.168.1.1`, `::1`, `fd00::/8`
-    /// Whitespace around entries is trimmed. Invalid entries are logged and skipped.
-    pub fn parse(raw: &str) -> Self {
-        let (cidrs, invalid) = CidrSet::parse_lenient(raw);
-        for entry in &invalid {
-            tracing::warn!(
-                "Ignoring invalid trusted proxy entry: {:?}. Expected IP or CIDR notation.",
-                entry
-            );
-        }
-        if !cidrs.is_empty() {
-            tracing::info!(
-                "Configured {} trusted proxy CIDR(s) for forwarded client metadata",
-                cidrs.len()
-            );
-        }
-        Self { cidrs }
-    }
-
-    /// Parse a comma-separated list of CIDRs/IPs, failing if any entry is invalid.
+    /// Accepts formats like `10.0.0.0/8`, `192.168.1.1`, `::1`, `fd00::/8`, and
+    /// `::ffff:10.0.0.0/104`; whitespace around entries is trimmed. A wholly
+    /// empty (or whitespace-only) input is the valid "no entries" configuration.
+    /// Malformed prefixes, junk entries, and empty/trailing/doubled comma
+    /// segments are errors — a partially parsed set is never returned, because
+    /// silently dropping one entry moves a security boundary.
     ///
-    /// Unlike `parse()` which skips invalid entries, this method returns an error
-    /// if the input is non-empty but produces zero valid CIDRs. Used for security-
-    /// critical allowlists (e.g., admin API) where a typo must not silently fail open.
-    pub fn parse_strict(raw: &str) -> Result<Self, String> {
+    /// This is the only parser for **every** IP trust boundary in the gateway
+    /// (forwarding trust, admin allowlist, metrics allowlist), so `boundary`
+    /// names the configuration variable in the startup log line instead of the
+    /// wording being specific to any one caller.
+    pub fn parse_strict(raw: &str, boundary: &str) -> Result<Self, String> {
         let cidrs = CidrSet::parse_strict(raw)?;
         if !cidrs.is_empty() {
-            tracing::info!("Configured {} admin allowed CIDR(s)", cidrs.len());
+            tracing::info!("Configured {} CIDR/IP entries for {boundary}", cidrs.len());
         }
         Ok(Self { cidrs })
     }
@@ -307,65 +317,115 @@ pub fn resolve_client_ip_parsed(
     socket_addr.to_canonical().to_string()
 }
 
+/// Outcome of evaluating every field-line of the configured real-IP header.
+///
+/// The three states are deliberately distinct: only [`Self::Absent`] may fall
+/// through to the `X-Forwarded-For` walk. [`Self::Rejected`] means the operator
+/// named an authoritative header and the request's copy of it could not be
+/// trusted, so the direct socket identity stands and no weaker forwarded source
+/// is consulted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RealIpHeaderOutcome {
+    /// The header carried no field-line at all (or no header is configured).
+    Absent,
+    /// Exactly one field-line held exactly one valid, canonicalized address.
+    Accepted(String),
+    /// Field-lines were present but not a single unambiguous trusted value.
+    Rejected,
+}
+
 /// Resolve a configured single-hop real-IP header from a trusted direct proxy.
 ///
 /// Unlike `X-Forwarded-For`, configured headers such as `CF-Connecting-IP` or
-/// `X-Real-IP` are expected to contain exactly one IP address. The AWS
-/// `CloudFront-Viewer-Address` form (`ip:source-port`) is also accepted.
-/// Comma-separated chains or malformed values are ignored so client-controlled
-/// header text cannot feed ACLs, rate limits, or logs.
-pub fn resolve_real_ip_header(
+/// `X-Real-IP` are the direct proxy's overwrite-only assertion of exactly one
+/// client address, so `field_lines` must yield exactly one value holding
+/// exactly one IP. The AWS `CloudFront-Viewer-Address` form (`ip:source-port`)
+/// is also accepted, with the source port discarded.
+///
+/// Every other shape is [`RealIpHeaderOutcome::Rejected`]:
+///
+/// * **Duplicate field-lines**, identical or differing, in either order — a
+///   proxy that preserves a client-supplied copy and appends its own leaves the
+///   authoritative value ambiguous, so neither line is used.
+/// * **Non-UTF-8 bytes**, which must be counted rather than silently skipped.
+/// * **Comma-separated chains**, empty values, and unparseable text.
+/// * **Any value at all from an untrusted direct peer**, where the header is
+///   entirely client-controlled.
+///
+/// Rejection is logged at `debug` (not `warn`) because a remote client can
+/// trigger it on every request through a preserve-and-append proxy; an
+/// unconditional per-request warning would be a log-flood surface.
+pub fn resolve_real_ip_header_field_lines<'a>(
     socket_ip: &str,
     socket_addr: &IpAddr,
-    header_value: &str,
+    field_lines: impl IntoIterator<Item = &'a [u8]>,
     trusted_proxies: &TrustedProxies,
-) -> Option<String> {
+) -> RealIpHeaderOutcome {
+    let mut field_lines = field_lines.into_iter();
+    let Some(first) = field_lines.next() else {
+        return RealIpHeaderOutcome::Absent;
+    };
+
+    // Trust is checked before the value is parsed or logged: from an untrusted
+    // peer the bytes are attacker text, not a proxy assertion.
     if !trusted_proxies.contains(socket_addr) {
         debug!(
             socket_ip = socket_ip,
             "Direct connection not from trusted proxy; ignoring configured real-IP header"
         );
-        return None;
+        return RealIpHeaderOutcome::Rejected;
     }
 
-    let value = header_value.trim();
-    if value.is_empty() || value.contains(',') {
+    if field_lines.next().is_some() {
         debug!(
-            value = value,
-            "Configured real-IP header must contain a single IP address or IP:port value"
+            socket_ip = socket_ip,
+            "Configured real-IP header arrived as multiple field-lines; \
+             the authoritative client address is ambiguous, keeping the socket address"
         );
-        return None;
+        return RealIpHeaderOutcome::Rejected;
     }
 
-    match parse_single_real_ip_value(value) {
-        Ok(ip) => Some(ip.to_canonical().to_string()),
-        Err(_) => {
+    match parse_single_real_ip_field_line(first) {
+        Some(ip) => RealIpHeaderOutcome::Accepted(ip.to_canonical().to_string()),
+        None => {
             debug!(
-                value = value,
-                "Configured real-IP header was not a parseable IP address or IP:port value"
+                socket_ip = socket_ip,
+                "Configured real-IP header was not a single parseable IP address or IP:port value"
             );
-            None
+            RealIpHeaderOutcome::Rejected
         }
     }
 }
 
-fn parse_single_real_ip_value(value: &str) -> Result<IpAddr, std::net::AddrParseError> {
-    value
-        .parse::<IpAddr>()
-        .or_else(|_| value.parse::<std::net::SocketAddr>().map(|addr| addr.ip()))
+/// Parse one real-IP field-line. `None` for non-UTF-8 bytes, an empty value, a
+/// comma-separated chain, or text that is neither an IP nor an `ip:port`.
+fn parse_single_real_ip_field_line(field_line: &[u8]) -> Option<IpAddr> {
+    let value = std::str::from_utf8(field_line).ok()?.trim();
+    if value.is_empty() || value.contains(',') {
+        return None;
+    }
+    parse_single_real_ip_value(value)
 }
 
-/// Resolve client IP when a caller has already performed targeted header
-/// lookups from the request.
+fn parse_single_real_ip_value(value: &str) -> Option<IpAddr> {
+    value
+        .parse::<IpAddr>()
+        .ok()
+        .or_else(|| value.parse::<std::net::SocketAddr>().ok().map(|a| a.ip()))
+}
+
+/// Resolve client IP from the request's forwarded metadata.
 ///
-/// If a configured real-IP header is present, that single-hop header is the
-/// only forwarded source considered. Rejected real-IP values return `None` so
-/// callers keep the socket IP rather than falling through to XFF. When the
-/// configured real-IP header is absent, this falls back to the XFF walk.
-pub fn resolve_forwarded_client_ip(
+/// `real_ip_field_lines` yields every field-line of the configured real-IP
+/// header (an empty iterator when no header is configured). When it yields at
+/// least one line, that single-hop header is the only forwarded source
+/// considered: an accepted value wins, and a rejected one returns `None` so
+/// callers keep the socket IP rather than falling through to XFF. Only a wholly
+/// absent header falls back to the XFF walk.
+pub fn resolve_forwarded_client_ip<'a>(
     socket_ip: &str,
     socket_addr: &IpAddr,
-    real_ip_header_value: Option<&str>,
+    real_ip_field_lines: impl IntoIterator<Item = &'a [u8]>,
     xff_header: Option<&str>,
     trusted_proxies: &TrustedProxies,
 ) -> Option<String> {
@@ -373,8 +433,15 @@ pub fn resolve_forwarded_client_ip(
         return None;
     }
 
-    if let Some(value) = real_ip_header_value {
-        return resolve_real_ip_header(socket_ip, socket_addr, value, trusted_proxies);
+    match resolve_real_ip_header_field_lines(
+        socket_ip,
+        socket_addr,
+        real_ip_field_lines,
+        trusted_proxies,
+    ) {
+        RealIpHeaderOutcome::Accepted(ip) => return Some(ip),
+        RealIpHeaderOutcome::Rejected => return None,
+        RealIpHeaderOutcome::Absent => {}
     }
 
     let resolved = resolve_client_ip_parsed(socket_ip, socket_addr, xff_header, trusted_proxies);

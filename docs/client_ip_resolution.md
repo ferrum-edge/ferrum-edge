@@ -16,11 +16,24 @@ When Ferrum Edge sits behind load balancers, CDNs, or reverse proxies, the TCP s
 
 The gateway uses a three-step process to resolve the real client IP:
 
-1. **Check authoritative header** (optional): If `FERRUM_REAL_IP_HEADER` is set (e.g., `CF-Connecting-IP`), the gateway checks that header first. This is only trusted when the direct connection comes from a trusted proxy. Accepted values are parsed as a single `IpAddr`, or as an `ip:source-port` socket address for headers such as CloudFront's `CloudFront-Viewer-Address`, and normalized before use.
+1. **Check authoritative header** (optional): If `FERRUM_REAL_IP_HEADER` is set (e.g., `CF-Connecting-IP`), the gateway checks that header first. This is only trusted when the direct connection comes from a trusted proxy. The header is read as **all of its field-lines**, and exactly one field-line holding exactly one value is accepted. Accepted values are parsed as a single `IpAddr`, or as an `ip:source-port` socket address for headers such as CloudFront's `CloudFront-Viewer-Address`, and normalized before use.
 
 2. **Walk `X-Forwarded-For` right-to-left**: If the configured real-IP header is absent, parse the XFF header into a list of IPs. Starting from the rightmost entry, skip any IP that matches a trusted proxy CIDR. The first non-trusted IP is the real client.
 
-3. **Fall back to socket IP**: If the configured real-IP header is present but empty, malformed, comma-separated, or sent by an untrusted peer, the TCP socket address is used. The socket address is also used when no XFF header is present, all XFF entries are trusted proxies, or no trusted proxies are configured.
+3. **Fall back to socket IP**: If the configured real-IP header is present but empty, duplicated across field-lines, not valid UTF-8, malformed, comma-separated, or sent by an untrusted peer, the TCP socket address is used — and `X-Forwarded-For` is **not** consulted as a fallback, because it is the weaker source the operator chose to override. The socket address is also used when no XFF header is present, all XFF entries are trusted proxies, or no trusted proxies are configured.
+
+### The authoritative header must be overwritten, not appended
+
+`FERRUM_REAL_IP_HEADER` names an **overwrite-only** contract. A proxy that preserves the client's copy of the header and appends its own leaves two field-lines on the wire:
+
+```
+X-Real-IP: 203.0.113.50      <- attacker-supplied, preserved by the proxy
+X-Real-IP: 198.51.100.23     <- appended by your proxy
+```
+
+Ferrum refuses to guess which line is authoritative: any count other than exactly one is rejected in either field order, identical duplicates included, and the request is accounted to the direct socket address. This is a fail-closed guard, not a substitute for correct upstream configuration — configure the hop in front of Ferrum to **overwrite** (nginx `proxy_set_header X-Real-IP $remote_addr;`, or the CDN's own authoritative header, which CDNs overwrite by contract). If you cannot guarantee overwrite behavior, leave `FERRUM_REAL_IP_HEADER` unset and rely on the `X-Forwarded-For` walk, which is append-aware by design.
+
+The same verdict holds on HTTP/1.1, HTTP/2, and HTTP/3, and whether or not request headers have been materialized for plugins.
 
 ### Why right-to-left?
 
@@ -54,7 +67,17 @@ For example, `X-Forwarded-For: 203.0.113.50, 172.16.1.1` and `X-Forwarded-Proto:
 
 ### `FERRUM_TRUSTED_PROXIES`
 
-A comma-separated list of IP addresses and CIDR ranges that represent your trusted proxy infrastructure. Supports IPv4 and IPv6.
+A comma-separated list of IP addresses and CIDR ranges that represent your trusted proxy infrastructure. Supports IPv4, IPv6, and IPv4-mapped IPv6 forms (`::ffff:10.0.0.0/104`, which matches the equivalent IPv4 rule).
+
+**The list is parsed strictly.** Every entry must be a valid IP or CIDR, and empty, trailing, or doubled comma segments are rejected:
+
+```bash
+FERRUM_TRUSTED_PROXIES="10.0.0.0/8,192.168.0.0/33"   # rejected: /33 is not a valid IPv4 prefix
+FERRUM_TRUSTED_PROXIES="10.0.0.0/8,"                 # rejected: trailing comma
+FERRUM_TRUSTED_PROXIES=""                            # valid: the secure default
+```
+
+A malformed entry fails `ferrum-edge validate` and fails startup **before any listener binds**; a partially parsed trust set is never installed, and a running gateway keeps its last-known-good boundary. Skipping the bad entry would be a silent security change, not a lenient one: the mistyped hop stops being trusted, so every client behind it collapses onto that hop's socket address for `ip_restriction`, GeoIP, bot/client attribution, per-IP rate and concurrency keys, and logs. A deny-only IP policy then stops seeing the abusive client addresses entirely.
 
 ```bash
 # Private network ranges (common for internal load balancers)
@@ -103,9 +126,11 @@ The client IP resolution follows these security principles:
 
 3. **Right-to-left walk prevents injection**: Even when XFF is trusted, the algorithm walks from right to left, skipping only known proxy IPs. An attacker who prepends fake IPs cannot influence the resolved client IP.
 
-4. **Authoritative header gated on trust**: The `FERRUM_REAL_IP_HEADER` is only honored when the connection comes from a trusted proxy. If the configured header is present but rejected, the socket IP remains the source of truth.
+4. **Authoritative header gated on trust and singular**: The `FERRUM_REAL_IP_HEADER` is only honored when the connection comes from a trusted proxy **and** the request carries exactly one field-line with exactly one value. If the configured header is present but rejected, the socket IP remains the source of truth and `X-Forwarded-For` is not consulted.
 
 5. **Forwarded scheme is correlated or overwritten**: A trusted proxy may overwrite `X-Forwarded-Proto` with one original value. If proxies append values, the scheme list must align with the validated XFF chain; Ferrum rejects malformed or misaligned chains instead of guessing from the nearest hop.
+
+6. **The trust list itself is strict**: `FERRUM_TRUSTED_PROXIES` must parse in full. Invalid configuration fails validation and startup rather than installing a partial trust boundary.
 
 ### Attack Scenarios Handled
 
@@ -115,7 +140,9 @@ The client IP resolution follows these security principles:
 | Client behind proxy prepends fake IP to XFF | Right-to-left walk returns the real client IP (added by your proxy) |
 | Client behind proxy sends fake `CF-Connecting-IP` | Header ignored because the direct connection isn't from a trusted proxy; socket IP used |
 | CloudFront sends `CloudFront-Viewer-Address: 198.51.100.10:46532` | Source port is discarded; client IP is `198.51.100.10` |
-| Trusted proxy sends empty, malformed, or comma-separated real-IP header | Socket IP used |
+| Trusted proxy sends empty, malformed, non-UTF-8, or comma-separated real-IP header | Socket IP used; XFF not consulted |
+| Proxy preserves the client's real-IP header and appends its own (two field-lines) | Both lines rejected in either order; socket IP used; XFF not consulted |
+| Typo in `FERRUM_TRUSTED_PROXIES` (e.g. `/33`, junk, stray comma) | Configuration rejected; `validate` and startup fail before listeners bind |
 | All XFF entries are trusted proxy IPs | Falls back to socket IP |
 | XFF contains unparseable garbage entries | Stops at the first unparseable entry (conservative) |
 | Trusted proxy overwrites XFP with one `http` or `https` value | Value becomes the original request scheme |

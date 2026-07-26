@@ -248,9 +248,11 @@ impl MetricsAuthPolicy {
     /// Build the policy from environment config, validating any configured CIDR
     /// list (invalid entries are a hard error, mirroring `admin_allowed_cidrs`).
     pub fn from_env(env: &crate::config::EnvConfig) -> Result<Self, String> {
-        let allowed_cidrs =
-            crate::proxy::client_ip::TrustedProxies::parse_strict(&env.metrics_allowed_cidrs)
-                .map_err(|e| format!("FERRUM_METRICS_ALLOWED_CIDRS: {e}"))?;
+        let allowed_cidrs = crate::proxy::client_ip::TrustedProxies::parse_strict(
+            &env.metrics_allowed_cidrs,
+            "FERRUM_METRICS_ALLOWED_CIDRS",
+        )
+        .map_err(|e| format!("FERRUM_METRICS_ALLOWED_CIDRS: {e}"))?;
         let bearer_token = env
             .metrics_bearer_token
             .as_ref()

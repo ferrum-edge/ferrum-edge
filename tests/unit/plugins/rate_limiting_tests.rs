@@ -150,7 +150,8 @@ async fn test_rate_limiting_uses_canonical_ingress_identity() {
     assert_continue(plugin.on_request_received(&mut native).await);
 
     let mut mapped = create_test_context();
-    mapped.client_ip = resolve_client_ip("::ffff:192.0.2.10", None, &TrustedProxies::parse(""));
+    let no_trust = TrustedProxies::parse_strict("", "test").expect("empty trust list is valid");
+    mapped.client_ip = resolve_client_ip("::ffff:192.0.2.10", None, &no_trust);
     assert_reject(plugin.on_request_received(&mut mapped).await, Some(429));
     assert_eq!(plugin.tracked_keys_count(), Some(1));
 }

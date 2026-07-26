@@ -2689,7 +2689,8 @@ async fn test_auth_rejection_cookie_storage_key_allows_trusted_tls_termination()
     });
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
-    let trusted = TrustedProxies::parse("10.0.0.0/8");
+    let trusted =
+        TrustedProxies::parse_strict("10.0.0.0/8", "test").expect("valid trusted proxy list");
     let socket_peer: std::net::IpAddr = "10.0.0.8".parse().expect("valid trusted proxy IP");
     let mut ctx = RequestContext::new(
         socket_peer.to_string(),
@@ -2742,7 +2743,8 @@ async fn test_trusted_forwarded_http_overrides_tls_cookie_and_authority_scope() 
     });
     let auth_plugins = [staged, selected];
     let consumer_index = ConsumerIndex::new(&[]);
-    let trusted = TrustedProxies::parse("10.0.0.0/8");
+    let trusted =
+        TrustedProxies::parse_strict("10.0.0.0/8", "test").expect("valid trusted proxy list");
     let socket_peer: std::net::IpAddr = "10.0.0.8".parse().expect("valid trusted proxy IP");
     let mut ctx = RequestContext::new(
         socket_peer.to_string(),
@@ -2805,7 +2807,8 @@ async fn test_trusted_forwarded_http_overrides_tls_cookie_and_authority_scope() 
 
 #[test]
 fn test_trusted_tls_termination_fails_closed_on_invalid_final_proto_field() {
-    let trusted = TrustedProxies::parse("10.0.0.0/8");
+    let trusted =
+        TrustedProxies::parse_strict("10.0.0.0/8", "test").expect("valid trusted proxy list");
     let socket_peer: std::net::IpAddr = "10.0.0.8".parse().expect("valid trusted proxy IP");
     let mut ctx = RequestContext::new(
         socket_peer.to_string(),

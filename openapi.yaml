@@ -18415,7 +18415,7 @@ components:
 
     ResponseCachingConfig:
       type: object
-      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
+      description: "Plugin: response_caching — In-memory HTTP response caching keyed by matched proxy, method, path, exact raw query-string hash when enabled, authenticated identity when present, optional anonymous marker, and Vary/credential-selected request headers. Honors Cache-Control freshness, upstream Age/Date, current Age generation on hits, ETag/Last-Modified revalidation (304), Vary, and never caches responses with Set-Cookie. Retained entries are sanitized: connection-scoped and proxy-authentication fields (Connection and everything it nominates, Keep-Alive, Proxy-Authenticate, Proxy-Authorization, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade) plus every field the origin qualified with private=\"…\" or no-cache=\"…\" are dropped before storage, so no replay can emit them. Responses to Authorization-bearing requests are stored only with an explicit origin shared-cache opt-in (public, must-revalidate, or s-maxage); cache_key_include_consumer changes key partitioning only and cannot override that requirement. Partial (206) and validator-only (304) responses, and any response carrying Content-Range, are never stored as reusable representations. Includes an LRU cacheability predictor that suppresses repeat cache lookups for variants known to be uncacheable. Multiple instances on one proxy namespace request staging metadata under response_caching.<instance_id>.* so differing query/consumer/Vary/method/SSE/status policies remain independent across priority order and reload generations. Unknown top-level keys are rejected with path-qualified diagnostics and spelling suggestions so misspelled Vary, consumer, query, Cache-Control, status/method, capacity, or invalidation fields cannot silently weaken isolation or retention. HTTP only."
       additionalProperties: false
       properties:
         ttl_seconds:
@@ -18455,14 +18455,16 @@ components:
           items:
             type: integer
             format: uint16
-            minimum: 100
+            minimum: 200
             maximum: 599
+            not:
+              enum: [206, 304]
           default: [200, 301, 404]
-          description: Response status codes eligible for caching. Must contain at least one entry, and every entry must be within 100-599.
+          description: "Response status codes eligible for caching. Must contain at least one entry, and every entry must be a final status between 200 and 599 whose caching semantics the plugin implements. 1xx (interim), 206 (partial content — requires Range/Content-Range, strong-validator, completeness, and request-applicability tracking), and 304 (validator metadata that freshens an existing stored representation rather than a representation of its own) are rejected at admission and refused again at store time, so a caller cannot poison the shared cache with a truncated or validator-only entry. A 2xx response carrying Content-Range is likewise never stored."
         respect_cache_control:
           type: [boolean, "null"]
           default: true
-          description: "Honor backend Cache-Control directives (no-store, private, no-cache, max-age, s-maxage, must-revalidate, public)"
+          description: "Honor backend Cache-Control directives (no-store, private, no-cache, max-age, s-maxage, must-revalidate, public). Parsing is grammar-aware: the qualified field-name forms private=\"x-account\" and no-cache=\"x-secret\" are understood, and the named fields are removed from the retained entry so they are never replayed from the shared cache. A qualified argument that is not a well-formed quoted field-name list (unquoted, unterminated, empty, or not a valid field name) fails closed to the bare directive and the whole response is refused. Duplicate max-age/s-maxage keep the most restrictive value."
         respect_no_cache:
           type: [boolean, "null"]
           default: true
@@ -18481,7 +18483,7 @@ components:
         cache_key_include_consumer:
           type: [boolean, "null"]
           default: false
-          description: Allow caching authenticated responses under their isolated identity key even when the backend does not send Cache-Control public/s-maxage/must-revalidate; also add an _anon cache-key partition for unauthenticated requests. Authenticated requests are always partitioned by hashed effective identity regardless of this flag.
+          description: "Add an _anon cache-key partition for unauthenticated requests. Authenticated requests are always partitioned by hashed effective identity regardless of this flag. This key-partition option does not authorize shared storage of a response to an Authorization-bearing request: the origin must still send Cache-Control public, must-revalidate, or s-maxage, so backend-side revocation, expiry, and scope changes remain authoritative."
         add_cache_status_header:
           type: [boolean, "null"]
           default: true

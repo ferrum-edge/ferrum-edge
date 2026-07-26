@@ -2794,3 +2794,69 @@ async fn functional_cli_run_withholds_externally_resolved_mode() {
         "the operating-mode record must carry the placeholder: {record}"
     );
 }
+
+// ── FERRUM_TRUSTED_PROXIES strict validation (GHSA-pvj7-hhqj-rpv5) ──────────
+
+/// A mistyped entry in the forwarding trust list must fail `validate` (and, by
+/// the same `EnvConfig::validate()` call, startup before any listener binds)
+/// rather than being warned about and skipped. Skipping it silently narrows the
+/// trust boundary: the mistyped hop stops being trusted, so every client behind
+/// it collapses onto that hop's socket address for IP policy and per-IP limits.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_rejects_malformed_trusted_proxies() {
+    let temp_dir = TempDir::new().unwrap();
+    let jwt_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&jwt_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env("FERRUM_ADMIN_JWT_SECRET_FILE", jwt_path.to_str().unwrap())
+        .env("FERRUM_TRUSTED_PROXIES", "10.0.0.0/8,192.168.0.0/33")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a partial trusted-proxy list must fail: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("FERRUM_TRUSTED_PROXIES"),
+        "expected the trusted-proxy diagnostic, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("192.168.0.0/33"),
+        "expected the offending entry to be named, got: {stderr}"
+    );
+}
+
+/// Non-vacuity control: a fully valid list still passes, so the check above is
+/// not simply rejecting the variable's presence.
+#[ignore]
+#[tokio::test]
+async fn functional_cli_validate_accepts_valid_trusted_proxies() {
+    let temp_dir = TempDir::new().unwrap();
+    let jwt_path = temp_dir.path().join("jwt-secret");
+    std::fs::write(&jwt_path, "validate-file-secret-with-well-over-32-bytes").unwrap();
+
+    let output = validate_database_mode_command(&temp_dir)
+        .env("FERRUM_ADMIN_JWT_SECRET_FILE", jwt_path.to_str().unwrap())
+        .env(
+            "FERRUM_TRUSTED_PROXIES",
+            "10.0.0.0/8,::1,::ffff:192.0.2.0/120",
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run ferrum-edge validate");
+
+    assert!(
+        output.status.success(),
+        "a fully valid trusted-proxy list must pass: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

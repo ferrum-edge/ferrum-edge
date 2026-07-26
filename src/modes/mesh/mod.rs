@@ -10440,8 +10440,11 @@ fn start_mesh_admin_listeners(
         listener_failures: serving_listener_failures,
     } = serving_signals;
     let admin_allowed_cidrs = Arc::new(
-        crate::proxy::client_ip::TrustedProxies::parse_strict(&env_config.admin_allowed_cidrs)
-            .map_err(|err| anyhow::anyhow!("Invalid FERRUM_ADMIN_ALLOWED_CIDRS: {err}"))?,
+        crate::proxy::client_ip::TrustedProxies::parse_strict(
+            &env_config.admin_allowed_cidrs,
+            "FERRUM_ADMIN_ALLOWED_CIDRS",
+        )
+        .map_err(|err| anyhow::anyhow!("Invalid FERRUM_ADMIN_ALLOWED_CIDRS: {err}"))?,
     );
     let metrics_auth = Arc::new(
         crate::admin::MetricsAuthPolicy::from_env(env_config)

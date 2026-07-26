@@ -3881,6 +3881,32 @@ impl RequestContext {
             .map(|value| value.as_bytes())
     }
 
+    /// Iterate every field-line of `name` for a trust-boundary decision,
+    /// regardless of whether headers have been materialized.
+    ///
+    /// While the pristine wire map is held this is exactly
+    /// [`Self::raw_header_value_bytes`]: every field-line, including non-UTF-8
+    /// ones, so multiplicity is observable. If a caller ever reaches this
+    /// without raw headers, it degrades to the single folded value from the
+    /// materialized map — which joins repeated field-lines with `, ` and is
+    /// therefore rejected as a comma list by the single-value contract in
+    /// `client_ip::resolve_real_ip_header_field_lines`. Both states fail closed;
+    /// neither can silently surface one of several competing values.
+    ///
+    /// Allocation-free: the returned iterator borrows in place.
+    #[inline]
+    pub fn header_field_lines<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a [u8]> + 'a {
+        let raw = self.raw_headers.as_ref();
+        let folded = match raw {
+            Some(_) => None,
+            None => self.headers.get(name).map(|value| value.as_bytes()),
+        };
+        raw.into_iter()
+            .flat_map(move |headers| headers.get_all(name).iter())
+            .map(|value| value.as_bytes())
+            .chain(folded)
+    }
+
     /// Whether a header name is reserved for gateway-asserted metadata and
     /// must not be trusted from client-supplied wire headers.
     #[inline]

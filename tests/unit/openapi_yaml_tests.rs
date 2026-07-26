@@ -8065,11 +8065,18 @@ fn response_caching_schema_matches_strict_runtime_contract() {
     );
     assert_eq!(
         schema["properties"]["cacheable_status_codes"]["items"]["minimum"],
-        json!(100)
+        json!(200)
     );
     assert_eq!(
         schema["properties"]["cacheable_status_codes"]["items"]["maximum"],
         json!(599)
+    );
+    // GHSA-v7fj-73gm-h625: 206 and 304 have caching semantics the plugin does
+    // not implement, so the schema must refuse them the same way the runtime
+    // constructor does.
+    assert_eq!(
+        schema["properties"]["cacheable_status_codes"]["items"]["not"]["enum"],
+        json!([206, 304])
     );
     assert_eq!(
         schema["properties"]["vary_by_headers"]["items"]["pattern"],
@@ -8110,8 +8117,8 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"max_entries": 1, "max_entry_size_bytes": 1, "max_total_size_bytes": 1}),
         // Extension-method casing is accepted and uppercased by the runtime.
         json!({"cacheable_methods": ["get"]}),
-        // Status-code boundary values.
-        json!({"cacheable_status_codes": [100, 599]}),
+        // Status-code boundary values (1xx / 206 / 304 are excluded below).
+        json!({"cacheable_status_codes": [200, 599]}),
         // An explicitly empty Vary list is accepted (no extra key dimensions).
         json!({"vary_by_headers": []}),
         json!({
@@ -8168,6 +8175,13 @@ fn response_caching_schema_matches_strict_runtime_contract() {
         json!({"cacheable_status_codes": []}),
         json!({"cacheable_status_codes": [99]}),
         json!({"cacheable_status_codes": [600]}),
+        // GHSA-v7fj-73gm-h625: interim, partial, and validator-only statuses
+        // must fail admission in both the schema and the runtime constructor.
+        json!({"cacheable_status_codes": [100]}),
+        json!({"cacheable_status_codes": [199]}),
+        json!({"cacheable_status_codes": [206]}),
+        json!({"cacheable_status_codes": [304]}),
+        json!({"cacheable_status_codes": [200, 206]}),
         json!({"vary_by_headers": [""]}),
         json!({"vary_by_headers": ["bad header"]}),
     ] {

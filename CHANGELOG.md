@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- `response_caching` now applies RFC 9111 §3.5 shared-cache admission to the
+  live request credential rather than only to a gateway-minted identity, so a
+  gateway that forwards `Authorization` to a backend that validates it no longer
+  retains the protected response without an explicit `public` /
+  `must-revalidate` / `s-maxage` opt-in. `cache_key_include_consumer` remains a
+  key-partition option but no longer overrides the origin's storage policy.
+  Backend-side revocation, expiry, and scope changes are no longer masked for
+  the entry's lifetime (GHSA-7f28-wh4x-5375).
+- `Cache-Control` is parsed with quoted-string awareness, so the qualified
+  `private="…"` and `no-cache="…"` field-name forms are understood. Named fields
+  are removed from the retained entry instead of being replayed from the shared
+  cache, and a malformed qualified argument fails closed to the bare directive.
+  Connection-scoped and proxy-authentication response fields are also stripped
+  before storage (GHSA-fpx2-5v4j-wqxq).
+- `1xx`, `206`, and `304` can no longer be configured in
+  `cacheable_status_codes`, are refused again at store time, and are never
+  replayed; a response carrying `Content-Range` is likewise never stored. A
+  caller can no longer poison a shared cache with a partial or validator-only
+  representation (GHSA-v7fj-73gm-h625). **Breaking:** existing plugin rows
+  containing those statuses must be repaired before upgrade — see the
+  [Safe Upgrade Guide](docs/upgrade_guide.md#response-cache-shared-storage-hardening).
+
 ### Changed
 
 - Authenticated `/metrics` now renders TLS certificate gauges from a cached,
