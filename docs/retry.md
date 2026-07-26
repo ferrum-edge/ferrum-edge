@@ -224,7 +224,7 @@ The retry system handles request bodies as follows:
 
 - **Connection failures**: The request body was never sent to the backend, so it is safely replayed on retry.
 - **HTTP status failures**: The request body is retained (buffered) and replayed on each retry attempt.
-- **Final attempt**: On the last retry attempt, the response streams directly to the client if the proxy is configured for streaming (no additional buffering).
+- **Response streaming**: The retry decision is made from response headers alone (status code, connection-error flag, error class, method), so a proxy configured for streaming streams on *every* attempt, not just the last one. An attempt selected for retry drops its undrained response before any byte reaches the client. See [Interaction with Retry Logic](response_body_streaming.md#interaction-with-retry-logic).
 
 ## Examples
 

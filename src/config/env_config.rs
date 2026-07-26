@@ -5170,6 +5170,41 @@ impl EnvConfig {
         // Bounded pre-authentication admission on the CP gRPC listener.
         self.validate_cp_grpc_connection_limits()?;
 
+        // The forwarding trust boundary is parsed strictly here so a typo fails
+        // `ferrum-edge validate` and fails startup before any listener binds,
+        // rather than quietly shrinking the trust set at runtime.
+        self.validate_trusted_proxies()?;
+
+        Ok(())
+    }
+
+    /// Reject a `FERRUM_TRUSTED_PROXIES` list that is not entirely valid.
+    ///
+    /// This list decides whose `X-Forwarded-For`, `X-Forwarded-Proto`,
+    /// configured real-IP header, and inbound PROXY-protocol header Ferrum
+    /// believes. Retaining only the parseable entries after a typo is not a
+    /// smaller trust set in any useful sense — it silently moves an
+    /// authorization and abuse-control identity boundary: the mistyped hop stops
+    /// being trusted, so every client behind it collapses onto that hop's socket
+    /// address for `ip_restriction`, GeoIP, bot/client attribution, per-IP rate
+    /// and concurrency keys, and logs. Every entry must therefore parse, and
+    /// empty/trailing/doubled comma segments are typos, not empty configuration.
+    /// A wholly empty value stays valid: it is the secure default in which
+    /// forwarded metadata is ignored altogether.
+    ///
+    /// Parses through the shared `CidrSet` so validation and the runtime filter
+    /// agree on canonical IPv4/IPv6/mapped forms; the set is discarded here
+    /// because `ProxyState` builds the enforcing one (strictly, again) at
+    /// construction.
+    fn validate_trusted_proxies(&self) -> Result<(), String> {
+        crate::util::cidr::CidrSet::parse_strict(&self.trusted_proxies).map_err(|e| {
+            format!(
+                "Invalid FERRUM_TRUSTED_PROXIES {}: {e}. Every entry must be a valid IP or CIDR \
+                 and empty comma segments are rejected — a partially parsed forwarding trust \
+                 boundary would silently change which peers may assert a client identity.",
+                crate::secrets::quoted_env_value("FERRUM_TRUSTED_PROXIES", &self.trusted_proxies)
+            )
+        })?;
         Ok(())
     }
 

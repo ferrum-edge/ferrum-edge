@@ -1290,6 +1290,46 @@ async fn handle_h3_request(
         return Ok(());
     }
 
+    // Canonical policy path (advisory GHSA-69xf-42xm-4w4f). Placed at exactly
+    // the same point in the ordering as the HTTP/1.1 + HTTP/2 handler — after
+    // the transport-level checks, before routing, plugins, and backend
+    // dispatch — so all three frontend protocols accept and reject the same
+    // set of request targets. Both the local `path` and `ctx.path` are
+    // rebound: the H3 backend URL builders read the local value while plugins
+    // read the context.
+    // `None` means the target was already canonical, so nothing is rebound and
+    // nothing is allocated — the case for the overwhelming majority of traffic.
+    let canonicalized_path = match crate::policy_path::canonicalize_policy_path(&path) {
+        Ok(std::borrow::Cow::Borrowed(_)) => None,
+        Ok(std::borrow::Cow::Owned(canonical)) => Some(canonical),
+        Err(rejection) => {
+            warn!(
+                reason = rejection.reason(),
+                "Rejected HTTP/3 request: ambiguous percent-encoded request path"
+            );
+            record_h3_flavor_aware_reject(&state, http_flavor, 400);
+            send_h3_error_flavor_aware(
+                &mut stream,
+                http_flavor,
+                grpc_web_response_content_type,
+                StatusCode::BAD_REQUEST,
+                rejection.client_error_body(),
+                crate::proxy::grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                rejection.grpc_message(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let path = match canonicalized_path {
+        Some(canonical) => {
+            let raw_path = std::mem::replace(&mut ctx.path, canonical.clone());
+            ctx.set_raw_path_for_hmac(raw_path);
+            canonical
+        }
+        None => path,
+    };
+
     // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
     if method == "TRACE" {
         warn!("Rejected HTTP/3 TRACE request");
@@ -1356,8 +1396,11 @@ async fn handle_h3_request(
 
     // Resolve real client IP using trusted proxy configuration.
     // Parse socket IP once upfront to avoid redundant parsing in each branch.
-    // Uses raw_header_get() to read specific headers without materializing the
-    // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
+    // Uses the raw header accessors to read specific headers without
+    // materializing the full HashMap — only 2-3 targeted lookups on the raw
+    // HeaderMap. Parity with the H1/H2 path: the configured real-IP header is
+    // read as ALL of its field lines so duplicate lines cannot hide a competing
+    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
     if !state.trusted_proxies.is_empty() {
         let socket_addr: std::net::IpAddr = remote_addr.ip();
         if let Some(forwarded_scheme) = crate::proxy::apply_trusted_forwarded_request_scheme(
@@ -1367,15 +1410,6 @@ async fn handle_h3_request(
         ) {
             request_scheme = forwarded_scheme;
         }
-        let real_ip_header_val =
-            state
-                .env_config
-                .real_ip_header
-                .as_ref()
-                .and_then(|real_ip_header| {
-                    // real_ip_header is already lowercase from env config parsing
-                    ctx.raw_header_get(real_ip_header.as_str())
-                });
         let xff_chain = {
             let mut values = ctx.raw_header_values("x-forwarded-for");
             values.next().map(|first| {
@@ -1387,10 +1421,19 @@ async fn handle_h3_request(
                 combined
             })
         };
+        // Bound the immutable borrow of `ctx` (held by the field-line iterator)
+        // to this statement so the assignment below can take a mutable borrow.
         let resolved = crate::proxy::client_ip::resolve_forwarded_client_ip(
             socket_ip,
             &socket_addr,
-            real_ip_header_val,
+            state
+                .env_config
+                .real_ip_header
+                .as_deref()
+                // real_ip_header is already lowercase from env config parsing
+                .map(|name| ctx.header_field_lines(name))
+                .into_iter()
+                .flatten(),
             xff_chain.as_deref(),
             &state.trusted_proxies,
         )

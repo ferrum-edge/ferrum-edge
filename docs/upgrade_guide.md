@@ -142,6 +142,34 @@ restart validation. For file mode, edit the YAML/JSON copy and run the staged
 validation step again. Do not bypass the check by adding placeholder HTTP/UDP
 targets; disable or remove a policy that has no TCP listener to protect.
 
+### Response Cache Shared-Storage Hardening
+
+`response_caching` now applies RFC 9111 shared-cache rules that earlier
+versions only applied partially. Three behaviors change:
+
+- **Authorized requests need an explicit opt-in.** A request carrying an
+  `Authorization` header is treated as authorized even when Ferrum itself
+  performs no authentication (the common "forward the bearer token to a backend
+  that validates it" topology). Such responses are stored only when the origin
+  sends `Cache-Control: public`, `must-revalidate`, or `s-maxage`.
+  `cache_key_include_consumer` no longer overrides this origin policy; it only
+  changes cache-key partitioning. Deployments that relied on caching
+  backend-authenticated responses under a plain `max-age` will see those routes
+  go to the origin every time. Restore caching by adding an appropriate origin
+  directive so backend revocation and scope changes remain authoritative.
+- **Qualified `private` / `no-cache` field lists are enforced.** Fields named by
+  `private="x-account"` / `no-cache="x-secret"` are dropped from the stored
+  entry, and a malformed qualified argument (unquoted, unterminated, empty, or
+  not a valid field name) refuses the whole response. Origins that emit such
+  headers will see those routes become uncacheable until the header is
+  well-formed.
+- **`cacheable_status_codes` no longer accepts `1xx`, `206`, or `304`.** Config
+  load fails closed on those values in database, control-plane, data-plane, and
+  file modes. Before cutover, inspect every enabled `response_caching` plugin
+  row and remove them; a `206` or `304` entry could previously be replayed to
+  later unconditional requests as a truncated or empty representation. A `2xx`
+  response carrying `Content-Range` is now refused at store time as well.
+
 ### Chargeback Scrape Authentication
 
 `GET /charges` now requires an admin JWT. Update Prometheus or external billing

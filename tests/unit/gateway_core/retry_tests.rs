@@ -1329,3 +1329,47 @@ fn test_substring_fallback_anchored_tls_handshake() {
         "outbound request failed: tls handshake aborted by peer".into();
     assert_eq!(classify_boxed_error(&*err), ErrorClass::TlsError);
 }
+
+/// Issue #2949 — the retry loop's response-streaming decision must not be
+/// attempt-positional.
+///
+/// `should_retry` (above) consults only `status_code`, `connection_error`,
+/// `error_class`, and the method — every one of which is known from the
+/// response headers, before a single body byte is read. So a retry attempt can
+/// safely be dispatched with the caller's streaming intent: an attempt that
+/// turns out retryable just drops its undrained response, exactly as the
+/// initial attempt (always dispatched with `should_stream`) already does.
+///
+/// Gating on `attempt >= max_retries` instead forced a healthy
+/// `text/event-stream` that succeeded on an earlier attempt through the
+/// buffered arm, which has no streaming-content-type exemption (unbounded when
+/// `max_response_body_size_bytes` is `0`). Hosted acceptance coverage is
+/// `functional_retry_test::retry_streams_sse_that_succeeds_before_the_final_attempt`;
+/// this guard only pins the wiring at both dispatch arms.
+#[test]
+fn retry_dispatch_arms_pass_the_streaming_decision_on_every_attempt() {
+    let proxy_src = include_str!("../../../src/proxy/mod.rs");
+    let dispatch = proxy_src
+        .split("// Replay the original request body on retry.")
+        .nth(1)
+        .expect("retry-loop attempt dispatch block")
+        .split("final_upstream_target = current_target.clone();")
+        .next()
+        .expect("bounded attempt dispatch block");
+
+    assert!(
+        dispatch.contains("proxy_to_backend_http3_retry(")
+            && dispatch.contains("proxy_to_backend_retry("),
+        "the bounded block must cover both retry dispatch arms"
+    );
+    assert!(
+        !dispatch.contains("is_last_attempt")
+            && !dispatch.contains("attempt >= retry_config.max_retries"),
+        "neither retry dispatch arm may gate the response-streaming decision on the attempt index"
+    );
+    assert_eq!(
+        dispatch.matches("should_stream,").count(),
+        2,
+        "both the native-H3 and reqwest retry arms must forward `should_stream` unchanged"
+    );
+}

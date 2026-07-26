@@ -274,15 +274,17 @@ fn test_proxy_http_listen_path_must_start_with_slash_or_regex_prefix() {
 }
 
 #[test]
-fn test_proxy_listen_path_rejects_encoded_slashes() {
-    // Prefix form, uppercase / lowercase single-encoded.
+fn test_proxy_listen_path_rejects_non_canonical_policy_paths() {
+    const MARKER: &str = "canonical policy path";
+
+    // Prefix form, uppercase / lowercase single-encoded separator.
     let mut proxy = make_proxy("test", "/api");
     for path in ["/api%2Fadmin", "/api%2fadmin"] {
         proxy.listen_path = Some(path.into());
         let errs = proxy.validate_fields().unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("encoded slashes")),
-            "expected encoded slash rejection for {path:?}, got {errs:?}"
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected encoded-separator rejection for {path:?}, got {errs:?}"
         );
     }
 
@@ -291,8 +293,29 @@ fn test_proxy_listen_path_rejects_encoded_slashes() {
         proxy.listen_path = Some(path.into());
         let errs = proxy.validate_fields().unwrap_err();
         assert!(
-            errs.iter().any(|e| e.contains("encoded slashes")),
-            "expected double-encoded slash rejection for {path:?}, got {errs:?}"
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected double-encoding rejection for {path:?}, got {errs:?}"
+        );
+    }
+
+    // Escapes of characters that are legal literally in a path decode during
+    // canonicalization, so `/%61dmin` is a different (unreachable) spelling of
+    // `/admin` rather than a stricter one. Admission must refuse it.
+    proxy.listen_path = Some("/%61dmin".into());
+    let errs = proxy.validate_fields().unwrap_err();
+    assert!(
+        errs.iter().any(|e| e.contains(MARKER)),
+        "expected ordinary-single-encoding rejection, got {errs:?}"
+    );
+
+    // Encoded backslash, encoded dot segment, encoded NUL, and a truncated
+    // escape are all refused for the same reason.
+    for path in ["/api%5Cadmin", "/api/%2e%2e/admin", "/api%00", "/api%2"] {
+        proxy.listen_path = Some(path.into());
+        let errs = proxy.validate_fields().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected non-canonical rejection for {path:?}, got {errs:?}"
         );
     }
 
@@ -300,26 +323,72 @@ fn test_proxy_listen_path_rejects_encoded_slashes() {
     proxy.listen_path = Some("=/api%2Fadmin".into());
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
-        errs.iter().any(|e| e.contains("encoded slashes")),
+        errs.iter().any(|e| e.contains(MARKER)),
         "expected exact-form rejection, got {errs:?}"
     );
 
-    // Regex (`~…`) form is also rejected — request paths are normalized
+    // Regex (`~…`) form is also rejected — request paths are canonicalized
     // before regex evaluation, so a pattern with `%2F` could never match.
     proxy.listen_path = Some("~/api%2F.*".into());
     let errs = proxy.validate_fields().unwrap_err();
     assert!(
-        errs.iter().any(|e| e.contains("encoded slashes")),
+        errs.iter().any(|e| e.contains(MARKER)),
         "expected regex-form rejection, got {errs:?}"
     );
 
-    // Negative: non-slash percent escapes (e.g. `%20` for space) are allowed.
-    proxy.listen_path = Some("/api%20name".into());
-    let result = proxy.validate_fields();
-    if let Err(errs) = &result {
+    // An escape of a byte outside the `pchar` decode set (`%20` for space,
+    // `%7B` for a brace, `%C3%A9` for `é`) can neither be retained nor decoded
+    // into the forwarded target, so the runtime refuses those request paths
+    // outright and such a listen_path is dead config.
+    for path in ["/api%20name", "/api/%7Bid%7D", "/caf%C3%A9"] {
+        proxy.listen_path = Some(path.into());
+        let errs = proxy.validate_fields().unwrap_err();
         assert!(
-            !errs.iter().any(|e| e.contains("encoded slashes")),
-            "did not expect encoded-slash rejection for `%20`, got {errs:?}"
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected unrepresentable-escape rejection for {path:?}, got {errs:?}"
+        );
+    }
+
+    // A literal dot segment or backslash is refused too: every RFC 3986 /
+    // WHATWG normalizer removes dot segments and the `url` parser treats `\`
+    // as a separator, so neither can appear in a canonical request path and
+    // neither is reachable as a literal listen_path.
+    for path in [
+        "/api/../admin",
+        "/api/./admin",
+        "/api/..",
+        "/api\\admin",
+        "=/api/../admin",
+    ] {
+        proxy.listen_path = Some(path.into());
+        let errs = proxy.validate_fields().unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains(MARKER)),
+            "expected literal-structure rejection for {path:?}, got {errs:?}"
+        );
+    }
+
+    // Negative: a `~regex` listen_path is a pattern, not a literal path. `\`
+    // and `.` are regex syntax there, and the canonical path it is matched
+    // against already cannot contain a dot segment or a backslash, so holding
+    // the pattern to the literal rules would kill a working route without
+    // closing anything.
+    for path in [r"~^/v1\.0/.*", "~^/api/v[0-9]+", "~(?i:/Api.*)"] {
+        proxy.listen_path = Some(path.into());
+        if let Err(errs) = proxy.validate_fields() {
+            assert!(
+                !errs.iter().any(|e| e.contains(MARKER)),
+                "did not expect a canonical-path rejection for pattern {path:?}, got {errs:?}"
+            );
+        }
+    }
+
+    // A `.` inside a segment is an ordinary path character and stays valid.
+    proxy.listen_path = Some("/v1.0/reports".into());
+    if let Err(errs) = proxy.validate_fields() {
+        assert!(
+            !errs.iter().any(|e| e.contains(MARKER)),
+            "did not expect a canonical-path rejection for `/v1.0/reports`, got {errs:?}"
         );
     }
 }

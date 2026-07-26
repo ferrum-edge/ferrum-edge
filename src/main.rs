@@ -50,6 +50,7 @@ mod observability_delivery;
 mod overload;
 mod plugin_cache;
 mod plugins;
+mod policy_path;
 mod pool;
 mod proxy;
 pub mod request_epoch;

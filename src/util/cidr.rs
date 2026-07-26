@@ -64,8 +64,15 @@ impl CidrSet {
     /// Parse like [`Self::parse_strict`] but skip invalid entries (including
     /// empty comma segments) instead of failing, returning the parsed set plus
     /// the list of rejected non-empty entry strings so the caller can decide
-    /// how to surface them (e.g. log a warning per entry). Used by lenient
-    /// callers like the trusted-proxy list.
+    /// how to surface them (e.g. log a warning per entry).
+    ///
+    /// **No IP trust boundary may be built from this.** Every enforcing
+    /// allow/deny/trust list — forwarding trust, admin, metrics, backend egress
+    /// — uses [`Self::parse_strict`], because retaining a partially parsed set
+    /// silently moves the boundary a typo was meant to describe. This variant
+    /// exists only for side-effect-free *classification* of a raw list (see
+    /// `client_ip::TrustedProxies::cidr_list_permits_all`, which answers "would
+    /// this list restrict anything?" for a startup exposure warning).
     pub fn parse_lenient(raw: &str) -> (Self, Vec<String>) {
         let (entries, invalid) = Self::parse_entries(raw, false);
         (Self { entries }, invalid)

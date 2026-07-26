@@ -564,11 +564,14 @@ fn non_runtime_full_loads_skip_node_local_plugin_files() {
     assert!(!FullConfigLoadPurpose::BackupExport.loads_node_local_plugin_files());
 
     let control_plane = include_str!("../../../src/modes/control_plane.rs");
+    // Two call sites: the single-namespace fast path and the per-namespace
+    // isolation loop that also covers the multi-namespace seed (#2983 folded
+    // the former "first namespace" seed into that loop).
     assert_eq!(
         control_plane
             .matches("FullConfigLoadPurpose::ControlPlane")
             .count(),
-        3,
+        2,
         "single- and multi-namespace CP full loads must use the non-serving purpose"
     );
     assert!(!control_plane.contains("CountryMmdbLoadSession"));

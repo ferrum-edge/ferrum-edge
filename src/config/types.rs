@@ -2725,38 +2725,38 @@ fn has_unescaped_trailing_dollar(pattern: &str) -> bool {
     escaping_backslashes % 2 == 0
 }
 
-/// Detects single-encoded (`%2F`/`%2f`) or double-encoded (`%252F`/`%252f`)
-/// slash escapes anywhere in a `listen_path` value.
+/// Why a configured `listen_path` is not already a canonical policy path, or
+/// `None` when it is usable as written.
 ///
-/// Must stay in lockstep with `normalize_encoded_slashes` in
-/// `src/router_cache.rs`: the runtime normalizes the same set of encodings
-/// on every inbound request path before route lookup, so admission has to
-/// reject the matching set to keep routing/auth lookups symmetric. If the
-/// runtime normalizer is ever taught to recognise additional encodings
-/// (triple-encoded slashes, encoded backslashes, etc.) this helper must be
-/// extended in the same change.
-fn contains_encoded_slash(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 < bytes.len() && bytes[i + 1] == b'2' && matches!(bytes[i + 2], b'F' | b'f') {
-                return true;
-            }
-            if i + 4 < bytes.len()
-                && bytes[i + 1] == b'2'
-                && bytes[i + 2] == b'5'
-                && bytes[i + 3] == b'2'
-                && matches!(bytes[i + 4], b'F' | b'f')
-            {
-                return true;
-            }
-        }
-        i += 1;
+/// Route lookup runs on the canonical request path
+/// (`crate::policy_path::canonicalize_policy_path`), so a `listen_path` that
+/// is not itself canonical can never match: either the runtime would reject
+/// every request that spelled it that way (`/api%2Fadmin`, an encoded
+/// separator) or the runtime path would canonicalize to different bytes
+/// (`/%61dmin` -> `/admin`). Both are silently unreachable routes, which is
+/// exactly the routing/auth asymmetry the canonical representation exists to
+/// remove — so admission rejects them instead. Delegating to the runtime
+/// canonicalizer keeps admission and request handling on one model rather
+/// than two hand-maintained encoding tables.
+///
+/// The value is checked exactly as written, markers included, matching the
+/// previous encoded-slash admission. `~` and `=` are ordinary path characters
+/// to the canonicalizer, and a regex or exact literal carrying an escape the
+/// runtime would refuse is unreachable for the same reason.
+///
+/// A `~regex` value is a *pattern*, not a literal path, so only the escape
+/// half of the contract applies to it: `\` and `.` are regex syntax there
+/// (`~^/v1\.0/.*` matches the reachable canonical path `/v1.0/x`), while the
+/// canonical request path the pattern is evaluated against already cannot
+/// contain a backslash or a dot segment. Exact (`=/…`) and prefix values are
+/// compared byte-for-byte against that canonical path, so they are held to the
+/// full contract.
+fn non_canonical_listen_path_reason(path: &str) -> Option<&'static str> {
+    if path.starts_with('~') {
+        crate::policy_path::non_canonical_policy_path_pattern_reason(path)
+    } else {
+        crate::policy_path::non_canonical_policy_path_reason(path)
     }
-
-    false
 }
 
 /// Whether a proxy's retry policy can actually trigger for at least one request
@@ -3573,8 +3573,8 @@ impl GatewayConfig {
         }
     }
 
-    /// Reject any proxy whose `listen_path` contains a percent-encoded slash
-    /// (`%2F`/`%2f` or `%252F`/`%252f`).
+    /// Reject any proxy whose `listen_path` is not already a canonical policy
+    /// path (`crate::policy_path`).
     ///
     /// Runs as a dedicated rejecting validator on every load/reload path
     /// because the catch-all `validate_all_fields_with_ip_policy()` is wired
@@ -3584,8 +3584,8 @@ impl GatewayConfig {
     /// returned by a Mongo backend would still be served and silently
     /// unreachable — the routing/auth bypass the admission rejection in
     /// `Proxy::validate_fields()` is meant to eliminate. Paired with
-    /// `contains_encoded_slash()` in this module and
-    /// `normalize_encoded_slashes()` in `src/router_cache.rs`.
+    /// `non_canonical_listen_path_reason()` in this module and
+    /// `canonicalize_policy_path()` in `src/policy_path.rs`.
     pub fn validate_listen_path_encodings(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         for proxy in &self.proxies {
@@ -3595,10 +3595,10 @@ impl GatewayConfig {
             let Some(path) = proxy.listen_path.as_deref() else {
                 continue;
             };
-            if contains_encoded_slash(path) {
+            if let Some(reason) = non_canonical_listen_path_reason(path) {
                 errors.push(format!(
-                    "Proxy '{}': listen_path '{}' contains encoded slashes (%2F or %252F); request paths are normalized before route lookup, so an encoded-slash listen_path is unreachable and creates a routing/auth bypass",
-                    proxy.id, path
+                    "Proxy '{}': listen_path '{}' is not a canonical policy path ({}); request paths are canonicalized before route lookup, so a non-canonical listen_path is unreachable and creates a routing/auth bypass",
+                    proxy.id, path, reason
                 ));
             }
         }
@@ -6702,11 +6702,12 @@ impl Proxy {
                                 .to_string(),
                         );
                     }
-                    if contains_encoded_slash(path) {
-                        errors.push(
-                            "listen_path must not contain encoded slashes (%2F or %252F)"
-                                .to_string(),
-                        );
+                    if let Some(reason) = non_canonical_listen_path_reason(path) {
+                        errors.push(format!(
+                            "listen_path must already be a canonical policy path ({reason}); \
+                             request paths are canonicalized before route lookup, so a \
+                             non-canonical listen_path is unreachable and creates a routing/auth bypass"
+                        ));
                     }
                 }
             }

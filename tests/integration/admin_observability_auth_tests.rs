@@ -376,7 +376,8 @@ async fn metrics_allows_allowlisted_cidr_unauthenticated() {
     // Loopback is allowlisted, so an unauthenticated scrape from 127.0.0.1
     // (the test client) is permitted.
     let policy = MetricsAuthPolicy {
-        allowed_cidrs: TrustedProxies::parse("127.0.0.1/32,::1"),
+        allowed_cidrs: TrustedProxies::parse_strict("127.0.0.1/32,::1", "test")
+            .expect("valid metrics CIDR list"),
         bearer_token: None,
     };
     let (base, _sd) = start_admin(admin_state(policy)).await;

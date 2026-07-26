@@ -5774,3 +5774,62 @@ fn test_k8s_controller_explicit_false_overrides_in_cluster_default() {
         },
     );
 }
+
+// ── FERRUM_TRUSTED_PROXIES strict validation (GHSA-pvj7-hhqj-rpv5) ──────────
+
+/// Parse `FERRUM_TRUSTED_PROXIES` through the full env pipeline so the assertion
+/// covers `EnvConfig::validate()`, which is what `ferrum-edge validate` and every
+/// serving mode run before a listener binds.
+fn trusted_proxies_from_env(raw: &str) -> Result<EnvConfig, String> {
+    let mut result = None;
+    with_env_vars(
+        &[
+            ("FERRUM_MODE", "file"),
+            ("FERRUM_FILE_CONFIG_PATH", "/path/config.yaml"),
+            ("FERRUM_TRUSTED_PROXIES", raw),
+        ],
+        || result = Some(EnvConfig::from_env()),
+    );
+    result.expect("closure ran")
+}
+
+#[test]
+fn test_trusted_proxies_accepts_valid_mixed_list() {
+    let raw = "10.0.0.0/8, 172.16.0.0/12, ::1, ::ffff:192.0.2.0/120";
+    let config = trusted_proxies_from_env(raw).expect("a fully valid list must be accepted");
+    assert_eq!(config.trusted_proxies, raw);
+}
+
+#[test]
+fn test_trusted_proxies_empty_stays_valid_secure_default() {
+    let config = trusted_proxies_from_env("").expect("empty is the secure default");
+    assert!(config.trusted_proxies.is_empty());
+}
+
+/// A mistyped prefix in an otherwise valid list must fail configuration rather
+/// than silently retain the valid entries — the dropped hop is exactly the one
+/// whose forwarded client identity would stop being believed.
+#[test]
+fn test_trusted_proxies_rejects_invalid_prefix_in_mixed_list() {
+    let err = trusted_proxies_from_env("10.0.0.0/8,192.168.0.0/33")
+        .expect_err("a malformed prefix must fail configuration");
+    assert!(err.contains("FERRUM_TRUSTED_PROXIES"), "got: {err}");
+    assert!(err.contains("192.168.0.0/33"), "got: {err}");
+}
+
+#[test]
+fn test_trusted_proxies_rejects_junk_and_empty_segments() {
+    for raw in [
+        "not-an-ip",
+        "10.0.0.0/8,junk",
+        "10.0.0.0/8,",
+        ",10.0.0.0/8",
+        "10.0.0.0/8,,172.16.0.0/12",
+        ",",
+    ] {
+        assert!(
+            trusted_proxies_from_env(raw).is_err(),
+            "FERRUM_TRUSTED_PROXIES={raw:?} must fail configuration"
+        );
+    }
+}

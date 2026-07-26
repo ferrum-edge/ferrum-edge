@@ -414,7 +414,10 @@ async fn test_http3_proxy_state_creation() {
         websocket_tunnel_mode: false,
         env_config: Arc::new(ferrum_edge::config::EnvConfig::default()),
         reserved_gateway_ports: Arc::new(std::collections::HashSet::new()),
-        trusted_proxies: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::parse("")),
+        trusted_proxies: Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::parse_strict("", "test")
+                .expect("empty trust list is valid"),
+        ),
         websocket_conn_limit: None,
         h3_websocket_reachable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         per_ip_request_counts: None,
@@ -703,7 +706,10 @@ async fn test_http3_full_integration() {
         websocket_tunnel_mode: false,
         env_config: Arc::new(ferrum_edge::config::EnvConfig::default()),
         reserved_gateway_ports: Arc::new(std::collections::HashSet::new()),
-        trusted_proxies: Arc::new(ferrum_edge::proxy::client_ip::TrustedProxies::parse("")),
+        trusted_proxies: Arc::new(
+            ferrum_edge::proxy::client_ip::TrustedProxies::parse_strict("", "test")
+                .expect("empty trust list is valid"),
+        ),
         websocket_conn_limit: None,
         h3_websocket_reachable: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         per_ip_request_counts: None,

@@ -312,16 +312,20 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
     assert_eq!(alias.text().await.expect("alias body"), "ordinary backend");
     assert_eq!(backend.hits(), 1);
 
-    // Encoded separators do not become the plugin-owned resource.
+    // Encoded separators do not become the plugin-owned resource. Since the
+    // canonical-policy-path fix (advisory GHSA-69xf-42xm-4w4f) they are
+    // refused at the frontend boundary rather than folded into `/`, so the
+    // request reaches neither the plugin nor a backend.
     let encoded = h1
         .get(gateway.proxy_url("/api%2Fspecz"))
         .send()
         .await
         .expect("H1 encoded separator");
+    assert_eq!(encoded.status(), reqwest::StatusCode::BAD_REQUEST);
     let encoded_body = encoded.text().await.expect("encoded body");
     assert!(!encoded_body.contains("\"openapi\""));
     assert_eq!(origin.hits(), 1);
-    assert_eq!(backend.hits(), 2);
+    assert_eq!(backend.hits(), 1);
 
     // Route method admission runs before the plugin and can exclude HEAD.
     let blocked = h1
@@ -331,7 +335,7 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
         .expect("H1 blocked HEAD");
     assert_eq!(blocked.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(origin.hits(), 1);
-    assert_eq!(backend.hits(), 2);
+    assert_eq!(backend.hits(), 1);
 
     let h2 = reqwest::Client::builder()
         .http2_prior_knowledge()
@@ -374,7 +378,7 @@ async fn functional_spec_expose_get_head_path_and_method_contract_across_http_ve
     let h3_blocked = h3_request_until_ready(&h3, &h3_blocked_url, Method::HEAD).await;
     assert_eq!(h3_blocked.status, StatusCode::METHOD_NOT_ALLOWED);
     assert_eq!(origin.hits(), 1);
-    assert_eq!(backend.hits(), 2);
+    assert_eq!(backend.hits(), 1);
     assert_eq!(backend.h2c_probes(), startup_h2c_probes);
 
     gateway.shutdown();

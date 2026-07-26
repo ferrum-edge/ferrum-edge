@@ -1049,14 +1049,14 @@ impl AiTranscriptAudit {
         _response_status: u16,
         _content_type: Option<&str>,
     ) -> bool {
-        if self.capture.streaming == StreamingCapture::Off
-            || !flag(&ctx.metadata, MD_CANDIDATE)
-            || !self.has_staged_candidate(&ctx.metadata)
-        {
+        if self.capture.streaming == StreamingCapture::Off || !flag(&ctx.metadata, MD_CANDIDATE) {
             return false;
         }
-
-        let sample_hit = self.staged_sample_hit(&ctx.metadata);
+        // Ownership is proven by a local staging entry only — never by the
+        // shared peer-writable `MD_SAMPLE_HIT` key (see `owned_sample_hit`).
+        let Some(sample_hit) = self.owned_sample_hit(&ctx.metadata) else {
+            return false;
+        };
         sample_hit
             // A response-side streaming inspector can fire the guardrail only
             // after headers commit. Reserve now for that possible terminal
@@ -1358,36 +1358,41 @@ impl AiTranscriptAudit {
             .is_some_and(|record_id| self.staging.contains_key(record_id))
     }
 
-    /// THIS instance's staged sampling roll, not the shared
-    /// `ai_transcript_audit.sample_hit` metadata key: a second instance of the
-    /// plugin can overwrite that key with its own roll, and each instance keys
-    /// its own `staging` map by the shared record id.
-    fn staged_sample_hit(&self, metadata: &HashMap<String, String>) -> bool {
-        let staged = metadata
+    /// THIS instance's staged sampling roll, or `None` when this instance holds
+    /// no staging entry for the record — i.e. the shared `MD_CANDIDATE` marker on
+    /// the context belongs to a co-located peer instance. There is deliberately
+    /// no `MD_SAMPLE_HIT` fallback: that key is shared and peer-writable, so
+    /// falling back to it would let a peer's roll drive this instance's stream
+    /// selection, commit admission, and client-visible fail-closed 503.
+    fn owned_sample_hit(&self, metadata: &HashMap<String, String>) -> Option<bool> {
+        metadata
             .get(MD_RECORD_ID)
             .and_then(|record_id| self.staging.get(record_id))
-            .map(|staging| staging.sample_hit);
-        staged.unwrap_or_else(|| flag(metadata, MD_SAMPLE_HIT))
+            .map(|staging| staging.sample_hit)
     }
 
     /// Whether a marked AI candidate's stream should actually be teed. `On`
-    /// tees every marked candidate; `Sampled` tees only sampling-roll winners
-    /// plus requests a request-side guardrail flagged (evaluated here — at
-    /// dispatch/response time — because the guardrail plugins at 2925–2978 run
-    /// AFTER staging at 2740 but BEFORE the proxy's dispatch decision, so
-    /// `always_capture_on_guardrail` can still capture response evidence on an
-    /// un-sampled stream). Error statuses and response-side guardrail hits are
-    /// only known later still: on un-sampled streams those overrides emit via
-    /// the `log` fallback without a response body/hash (teeing every stream
-    /// "just in case" would defeat sampled capture entirely).
+    /// tees every candidate THIS instance staged; `Sampled` tees only
+    /// sampling-roll winners plus requests a request-side guardrail flagged
+    /// (evaluated here — at dispatch/response time — because the guardrail
+    /// plugins at 2925–2978 run AFTER staging at 2740 but BEFORE the proxy's
+    /// dispatch decision, so `always_capture_on_guardrail` can still capture
+    /// response evidence on an un-sampled stream). A peer-only marker yields
+    /// no tee. Error statuses and response-side guardrail hits are only known
+    /// later still: on un-sampled streams those overrides emit via the `log`
+    /// fallback without a response body/hash (teeing every stream "just in
+    /// case" would defeat sampled capture entirely).
     fn stream_tee_wanted(&self, metadata: &HashMap<String, String>) -> bool {
         match self.capture.streaming {
             StreamingCapture::Off => false,
-            StreamingCapture::On => true,
-            StreamingCapture::Sampled => {
-                self.staged_sample_hit(metadata)
-                    || (self.sampling.always_on_guardrail && guardrail_fired(metadata))
-            }
+            StreamingCapture::On => self.has_staged_candidate(metadata),
+            StreamingCapture::Sampled => match self.owned_sample_hit(metadata) {
+                Some(true) => true,
+                Some(false) => self.sampling.always_on_guardrail && guardrail_fired(metadata),
+                // Shared peer marker / no local staging: never tee from a
+                // borrowed `MD_SAMPLE_HIT` roll.
+                None => false,
+            },
         }
     }
 
@@ -1681,7 +1686,9 @@ impl AiTranscriptAudit {
     /// re-evaluation (`refine_stream_response_for_content_type`) can never
     /// disagree about whether this request's response is worth buffering.
     fn buffered_response_capture_wanted(&self, ctx: &RequestContext) -> bool {
-        if !self.capture.response {
+        if !self.capture.response
+            || (flag(&ctx.metadata, MD_CANDIDATE) && !self.has_staged_candidate(&ctx.metadata))
+        {
             return false;
         }
         // A `stream: true` request expects an SSE response; do not buffer it —
@@ -1931,7 +1938,10 @@ impl Plugin for AiTranscriptAudit {
         response_status: u16,
         response_headers: &mut HashMap<String, String>,
     ) -> PluginResult {
-        if !self.active || !flag(&ctx.metadata, MD_CANDIDATE) {
+        if !self.active
+            || !flag(&ctx.metadata, MD_CANDIDATE)
+            || !self.has_staged_candidate(&ctx.metadata)
+        {
             return PluginResult::Continue;
         }
         if !flag(&ctx.metadata, MD_FINAL_REQ_SEEN)
@@ -2037,7 +2047,7 @@ impl Plugin for AiTranscriptAudit {
         let Some(record_id) = ctx.metadata.get(MD_RECORD_ID).cloned() else {
             return PluginResult::Continue;
         };
-        if !flag(&ctx.metadata, MD_CANDIDATE) {
+        if !flag(&ctx.metadata, MD_CANDIDATE) || !self.has_staged_candidate(&ctx.metadata) {
             self.staging.remove(&record_id);
             return PluginResult::Continue;
         }
@@ -2058,11 +2068,11 @@ impl Plugin for AiTranscriptAudit {
 
         // Peek (do not consume) the staging entry for the fail-closed gate. The
         // observe-only committed hook consumes it after every validator has run.
-        let sample_hit = self
-            .staging
-            .get(&record_id)
-            .map(|staging| staging.sample_hit)
-            .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
+        // The roll is read from THIS instance's staging entry only, never from
+        // the shared peer-writable `MD_SAMPLE_HIT` key (see `owned_sample_hit`).
+        let Some(sample_hit) = self.owned_sample_hit(&ctx.metadata) else {
+            return PluginResult::Continue;
+        };
         // The transaction-log `sampled` flag carries the sampling ROLL (matching
         // the exported record's `sampled` field), not the emit decision —
         // `sink_status` already conveys whether a record was emitted.
@@ -2111,11 +2121,17 @@ impl Plugin for AiTranscriptAudit {
             .get(MD_SINK_STATUS)
             .is_some_and(|status| status == "rejected");
 
-        let sample_hit = self
-            .staging
-            .get(&record_id)
-            .map(|staging| staging.sample_hit)
-            .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
+        // The single atomic `remove` IS the instance-scoped commit capability: it
+        // both proves this instance staged the request (a peer instance's shared
+        // `MD_CANDIDATE` marker yields nothing here) and consumes the staging
+        // permit exactly once, so a duplicated or retried commit hook cannot emit
+        // a second, staging-less record. Do not reintroduce a
+        // `has_staged_candidate` pre-check: that would only re-open a
+        // check-then-act window without changing the outcome.
+        let Some((_, mut staging)) = self.staging.remove(&record_id) else {
+            return;
+        };
+        let sample_hit = staging.sample_hit;
         let (emit, reason) = self.emit_decision(
             sample_hit,
             guardrail_fired(&ctx.metadata),
@@ -2124,7 +2140,6 @@ impl Plugin for AiTranscriptAudit {
         ctx.metadata
             .insert(MD_SAMPLED.to_string(), bool_str(sample_hit));
 
-        let mut staging = self.staging.remove(&record_id).map(|(_, value)| value);
         if !emit {
             // A fail-closed rejection (`on_sink_error`/`on_buffer_full: reject`)
             // stamps `MD_SINK_STATUS = "rejected"` and returns a 503 in the
@@ -2158,7 +2173,7 @@ impl Plugin for AiTranscriptAudit {
             &record_id,
             envelope,
             &ctx.metadata,
-            staging.as_ref(),
+            Some(&staging),
             response_excerpt,
             response_truncated,
             response_hash,
@@ -2166,7 +2181,7 @@ impl Plugin for AiTranscriptAudit {
             reason,
             Some(response_headers),
         );
-        let status = match self.enqueue(record, staging.as_mut()) {
+        let status = match self.enqueue(record, Some(&mut staging)) {
             SinkOutcome::Queued => "queued",
             SinkOutcome::Dropped => "dropped",
             SinkOutcome::Rejected => "rejected",
@@ -2231,18 +2246,17 @@ impl Plugin for AiTranscriptAudit {
             return None;
         }
         let record_id = ctx.metadata.get(MD_RECORD_ID)?.clone();
-        if self.capture.streaming == StreamingCapture::Off
-            || !self.has_staged_candidate(&ctx.metadata)
-        {
+        if self.capture.streaming == StreamingCapture::Off {
             return None;
         }
         // In `sampled` mode the marker alone is not enough: only tee streams
         // that won the sampling roll or that a request-side guardrail flagged
-        // (see `stream_tee_wanted`).
+        // (see `stream_tee_wanted`). Ownership is required either way —
+        // `stream_tee_wanted` reads only the local staging entry.
         if !self.stream_tee_wanted(&ctx.metadata) {
             return None;
         }
-        let sample_hit = self.staged_sample_hit(&ctx.metadata);
+        let sample_hit = self.owned_sample_hit(&ctx.metadata)?;
         // 2xx SSE is the normal capture path. A non-2xx SSE is teed too when the
         // record will emit anyway — either `always_capture_on_error` is set, or
         // this request won the sampling roll (`emit_decision` emits on `sampled`
@@ -2297,11 +2311,12 @@ impl Plugin for AiTranscriptAudit {
         }
         let downstream_terminated = slot.downstream_terminated.load(Ordering::Relaxed);
         let captured = slot.captured.lock().ok().and_then(|mut guard| guard.take());
-        let sample_hit = self
-            .staging
-            .get(&record_id)
-            .map(|staging| staging.sample_hit)
-            .unwrap_or_else(|| flag(&ctx.metadata, MD_SAMPLE_HIT));
+        // Sampling and emission require THIS instance's staging entry. Do not
+        // fall back to the shared peer-writable `MD_SAMPLE_HIT` key, and do not
+        // enqueue a staging-less record if the entry was swept or never owned.
+        let Some(sample_hit) = self.owned_sample_hit(&ctx.metadata) else {
+            return;
+        };
         let errored = response_status >= 400 || !outcome.body_completed;
         let guardrail = guardrail_fired(&ctx.metadata) || downstream_terminated;
         let (excerpt, truncated, hash) = if downstream_terminated {
@@ -2331,14 +2346,18 @@ impl Plugin for AiTranscriptAudit {
         }
 
         // A response already being streamed cannot run a new rejecting
-        // admission, so stream-terminal enqueue is best-effort.
-        let mut staging = self.staging.remove(&record_id).map(|(_, value)| value);
+        // admission, so stream-terminal enqueue is best-effort. The atomic
+        // `remove` is the instance-scoped commit capability (same contract as
+        // `on_response_committed`): no local entry means no record.
+        let Some((_, mut staging)) = self.staging.remove(&record_id) else {
+            return;
+        };
         let envelope = self.envelope_from_ctx(ctx, response_status);
         let record = self.build_record(
             &record_id,
             envelope,
             &ctx.metadata,
-            staging.as_ref(),
+            Some(&staging),
             excerpt,
             truncated,
             hash,
@@ -2346,7 +2365,7 @@ impl Plugin for AiTranscriptAudit {
             reason,
             None,
         );
-        let status = match self.enqueue(record, staging.as_mut()) {
+        let status = match self.enqueue(record, Some(&mut staging)) {
             SinkOutcome::Queued => "queued",
             SinkOutcome::Dropped => "dropped",
             SinkOutcome::Rejected => "rejected",

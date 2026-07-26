@@ -12,6 +12,7 @@
 // warnings there; the `acme`-feature build keeps full dead-code linting.
 #![cfg_attr(not(feature = "acme"), allow(dead_code))]
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -37,6 +38,18 @@ const ORDER_STORE_FILE_NAME: &str = "acme-orders.json";
 const ACCOUNT_STORE_FILE_NAME: &str = "acme-accounts.json";
 const DEFAULT_STORE_DIR: &str = "./ferrum-managed-tls";
 const HTTP01_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
+/// Longest HTTP-01 token [`validate_http01_token`] accepts.
+const MAX_HTTP01_TOKEN_LEN: usize = 256;
+/// Longest raw request target that could still name a valid HTTP-01 challenge.
+///
+/// The canonical form of such a target is [`HTTP01_CHALLENGE_PREFIX`] plus a
+/// token of at most [`MAX_HTTP01_TOKEN_LEN`] bytes, and canonicalization only
+/// ever shrinks a target (every accepted escape collapses three raw bytes to
+/// one), so the longest raw spelling is the all-escapes spelling. Anything
+/// longer cannot resolve to a challenge, so it is discarded before the
+/// canonicalizer runs. This matters because HTTP-01 is served ahead of the
+/// operator's URL-length limit: the pre-admission lookup must stay bounded.
+const MAX_HTTP01_TARGET_LEN: usize = 3 * (HTTP01_CHALLENGE_PREFIX.len() + MAX_HTTP01_TOKEN_LEN);
 pub const TLS_ALPN01_PROTOCOL: &[u8] = b"acme-tls/1";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -1490,10 +1503,10 @@ fn validate_http01_token(token: &str) -> Result<(), AcmeError> {
             "token must not be empty".to_string(),
         ));
     }
-    if token.len() > 256 {
-        return Err(AcmeError::InvalidChallengeToken(
-            "token exceeds 256 bytes".to_string(),
-        ));
+    if token.len() > MAX_HTTP01_TOKEN_LEN {
+        return Err(AcmeError::InvalidChallengeToken(format!(
+            "token exceeds {MAX_HTTP01_TOKEN_LEN} bytes"
+        )));
     }
     if !token
         .bytes()
@@ -1506,12 +1519,60 @@ fn validate_http01_token(token: &str) -> Result<(), AcmeError> {
     Ok(())
 }
 
-pub fn http01_key_authorization_for_path(path: &str) -> Option<String> {
-    let token = path.strip_prefix(HTTP01_CHALLENGE_PREFIX)?;
+/// The HTTP-01 challenge token a request target names, in the canonical policy
+/// coordinate, or `None` when the target does not name exactly one challenge.
+///
+/// HTTP-01 is served at the frontend boundary ahead of overload admission, so
+/// this is where the ACME handler establishes its request coordinate — and it
+/// must be the *same* coordinate every later stage uses (private advisory
+/// `GHSA-69xf-42xm-4w4f`). Resolving the raw target instead would let an
+/// encoded-but-legal spelling of a live challenge — an escaped prefix byte
+/// (`/%2Ewell-known/…`) or an escaped base64url token byte
+/// (`…/tok%5FABC`) — miss the ACME handler, canonicalize a moment later, and
+/// fall through to ordinary routing and backend handling.
+///
+/// ACME is deliberately *not* a second place that decides what a path means: an
+/// ambiguous or refused target resolves to `None` here and falls through to the
+/// single request boundary in `handle_proxy_request_inner`, which answers it
+/// with the fixed, non-echoing 400. Nothing is normalized or accepted here that
+/// the canonicalizer would refuse.
+pub fn http01_challenge_token_for_path(path: &str) -> Option<Cow<'_, str>> {
+    if path.len() > MAX_HTTP01_TARGET_LEN {
+        return None;
+    }
+    // Canonicalization only ever decodes escapes, so a target with no `%` is
+    // already its own canonical form (or is refused outright). Such a target
+    // can therefore only name a challenge if it already spells the prefix
+    // literally. That keeps the normal GET hot path to a length compare, a
+    // prefix compare, and one `memchr` — no allocation and no decode.
+    if !path.starts_with(HTTP01_CHALLENGE_PREFIX) && !path.contains('%') {
+        return None;
+    }
+    match crate::policy_path::canonicalize_policy_path(path).ok()? {
+        Cow::Borrowed(canonical) => single_http01_token(canonical).map(Cow::Borrowed),
+        Cow::Owned(canonical) => {
+            single_http01_token(&canonical).map(|token| Cow::Owned(token.to_string()))
+        }
+    }
+}
+
+/// Split a canonical policy path into the single challenge token it addresses.
+fn single_http01_token(canonical_path: &str) -> Option<&str> {
+    let token = canonical_path.strip_prefix(HTTP01_CHALLENGE_PREFIX)?;
     if token.contains('/') || token.contains('?') {
         return None;
     }
-    global_order_store().ok()?.http01_key_authorization(token)
+    Some(token)
+}
+
+/// Resolve a pending HTTP-01 key authorization for a request target.
+///
+/// Consumes the canonical policy path — see
+/// [`http01_challenge_token_for_path`] for why, and for what a `None` result
+/// leaves to the central boundary rejection.
+pub fn http01_key_authorization_for_path(path: &str) -> Option<String> {
+    let token = http01_challenge_token_for_path(path)?;
+    global_order_store().ok()?.http01_key_authorization(&token)
 }
 
 fn acme_store_dir_from_env() -> PathBuf {

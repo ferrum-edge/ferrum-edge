@@ -5603,9 +5603,19 @@ impl ProxyState {
             Arc::new(env_config.mesh_egress_strip_baggage_keys.clone());
         let pool_shard_amount =
             crate::util::sharding::pool_shard_amount(env_config.pool_shard_amount);
-        let trusted_proxies = Arc::new(client_ip::TrustedProxies::parse(
-            &env_config.trusted_proxies,
-        ));
+        // Strict: a malformed entry must never yield a partially parsed
+        // forwarding trust boundary (advisory GHSA-pvj7-hhqj-rpv5).
+        // `EnvConfig::validate()` already rejects this at parse time, so a
+        // failure here means a hand-built config; either way construction fails
+        // before any listener binds, and a live `ProxyState` keeps its existing
+        // (last-known-good) trust set because `update_config` never rebuilds it.
+        let trusted_proxies = Arc::new(
+            client_ip::TrustedProxies::parse_strict(
+                &env_config.trusted_proxies,
+                "FERRUM_TRUSTED_PROXIES",
+            )
+            .map_err(|e| anyhow::anyhow!("FERRUM_TRUSTED_PROXIES: {e}"))?,
+        );
         let websocket_conn_limit = if env_config.websocket_max_connections > 0 {
             Some(Arc::new(tokio::sync::Semaphore::new(
                 env_config.websocket_max_connections,
@@ -18409,6 +18419,14 @@ async fn handle_proxy_request_on_frontend_port(
     mtls_auth_connection_cache: Option<Arc<crate::plugins::mtls_auth::MtlsAuthConnectionCache>>,
     connection_metadata: RequestConnectionMetadata,
 ) -> Result<Response<ProxyBody>, hyper::Error> {
+    // ACME HTTP-01 is answered ahead of overload admission on purpose: losing a
+    // domain validation to load shedding costs a certificate. The lookup
+    // resolves the *canonical* policy path (advisory GHSA-69xf-42xm-4w4f), so an
+    // escaped-but-legal spelling of a live challenge cannot slip past the ACME
+    // handler here and then fall through to routing under a different reading.
+    // A refused or ambiguous target resolves to `None` and reaches the single
+    // canonicalization boundary in `handle_proxy_request_inner`, which is the
+    // only place a path is rejected.
     if req.method() == hyper::Method::GET
         && let Some(key_authorization) =
             crate::tls::acme::http01_key_authorization_for_path(req.uri().path())
@@ -18672,6 +18690,106 @@ async fn handle_proxy_request_inner(
         return Ok(build_response(StatusCode::BAD_REQUEST, error_body));
     }
 
+    // Classify before the canonical-path boundary so a refusal uses the
+    // client's wire representation. WebSocket Upgrade / Extended CONNECT wins
+    // over any hostile Content-Type, matching backend dispatch and the H3
+    // frontend.
+    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
+    let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
+    let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket {
+        None
+    } else {
+        req.headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|content_type| {
+                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
+                    return None;
+                }
+                let negotiated =
+                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
+                        content_type,
+                        req.headers(),
+                        state.max_header_size_bytes,
+                    );
+                Some(negotiated.unwrap_or_else(|_| {
+                    crate::plugins::grpc_web::response_content_type(content_type)
+                }))
+            })
+    };
+    let grpc_web_request = grpc_web_response_content_type_owned.is_some();
+    let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
+    // Retain the representation just classified, exactly as the H3 frontend
+    // does right after it builds its context. Without this the marker existed
+    // only when the `grpc_web` plugin was configured, so an H1/H2 PASS-THROUGH
+    // deployment — the backend speaks gRPC-Web itself and the translator is
+    // deliberately absent — left `client_grpc_framing_representation` with
+    // nothing to read. A backend that omits `Content-Type` (or a response hook
+    // that strips it) then reached the buffered representation gate as untyped
+    // JSON, and valid gRPC-Web frames were replaced with a `502` whenever a
+    // response body rule was configured. The classification is taken from the
+    // immutable inbound content-type before any hook runs, so it records the
+    // client's own representation and never a rewritten one.
+    if let Some(content_type) = grpc_web_response_content_type {
+        crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);
+    }
+
+    // Canonical policy path (advisory GHSA-69xf-42xm-4w4f). Runs after the
+    // transport-level checks above — which bound the work by the operator's
+    // URL-length limit and settle smuggling/authority questions first — and
+    // before routing, every plugin phase, and backend dispatch, so no
+    // protected surface ever observes a non-canonical target. An ambiguous
+    // target is refused here rather than resolved to one of its readings.
+    //
+    // `path` and `ctx.path` are the only path coordinates the rest of this
+    // handler uses (backend URL building reads the local `path`; plugins read
+    // `ctx.path`), so rebinding both here is what makes policy and the wire
+    // agree. Nothing between `RequestContext::new` and this point inspects the
+    // path.
+    // `None` means the target was already canonical, so nothing is rebound and
+    // nothing is allocated — the case for the overwhelming majority of traffic.
+    let canonicalized_path = match crate::policy_path::canonicalize_policy_path(&path) {
+        Ok(std::borrow::Cow::Borrowed(_)) => None,
+        Ok(std::borrow::Cow::Owned(canonical)) => Some(canonical),
+        Err(rejection) => {
+            // The raw target is attacker-controlled: log only the fixed reason
+            // token, never the bytes.
+            warn!(
+                reason = rejection.reason(),
+                "Rejected request: ambiguous percent-encoded request path"
+            );
+            record_request(&state, 400);
+            if let Some(content_type) = grpc_web_response_content_type {
+                return Ok(build_grpc_web_error_response(
+                    content_type,
+                    grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    rejection.grpc_message(),
+                    &[],
+                ));
+            }
+            if request_uses_grpc_content_type {
+                return Ok(grpc_proxy::build_grpc_error_response(
+                    grpc_proxy::grpc_status::INVALID_ARGUMENT,
+                    rejection.grpc_message(),
+                ));
+            }
+            return Ok(build_response(
+                StatusCode::BAD_REQUEST,
+                rejection.client_error_body(),
+            ));
+        }
+    };
+    let path = match canonicalized_path {
+        Some(canonical) => {
+            // Move the original target into the context for `hmac_auth`; the
+            // canonical form replaces it everywhere else.
+            let raw_path = std::mem::replace(&mut ctx.path, canonical.clone());
+            ctx.set_raw_path_for_hmac(raw_path);
+            canonical
+        }
+        None => path,
+    };
+
     // Block TRACE method to prevent Cross-Site Tracing (XST) attacks.
     // TRACE echoes request headers (including cookies and auth tokens) in the
     // response body, which can be exploited to steal credentials.
@@ -18747,8 +18865,11 @@ async fn handle_proxy_request_inner(
     // parsing across the real-IP-header check and the XFF walk.
     // When no resolution changes the IP, we skip the allocation entirely —
     // ctx.client_ip was already set to socket_ip by RequestContext::new().
-    // Uses raw_header_get() to read specific headers without materializing the
-    // full HashMap — only 2-3 targeted lookups on the raw HeaderMap.
+    // Uses the raw header accessors to read specific headers without
+    // materializing the full HashMap — only 2-3 targeted lookups on the raw
+    // HeaderMap. The configured real-IP header is read as ALL of its field
+    // lines, never a single `get()`, so duplicate lines cannot hide a competing
+    // attacker-supplied value (advisory GHSA-fx4w-68hx-mj7r).
     if !state.trusted_proxies.is_empty() {
         let socket_addr: Option<std::net::IpAddr> = socket_ip.parse().ok();
         if let Some(ref addr) = socket_addr {
@@ -18757,15 +18878,6 @@ async fn handle_proxy_request_inner(
             {
                 request_scheme = forwarded_scheme;
             }
-            let real_ip_header_val =
-                state
-                    .env_config
-                    .real_ip_header
-                    .as_ref()
-                    .and_then(|real_ip_header| {
-                        // real_ip_header is pre-lowercased at config load time — no allocation needed
-                        ctx.raw_header_get(real_ip_header.as_str())
-                    });
             let xff_chain = {
                 let mut values = ctx.raw_header_values("x-forwarded-for");
                 values.next().map(|first| {
@@ -18777,13 +18889,24 @@ async fn handle_proxy_request_inner(
                     combined
                 })
             };
-            if let Some(resolved) = client_ip::resolve_forwarded_client_ip(
+            // Bound the immutable borrow of `ctx` (held by the field-line
+            // iterator) to this statement so the assignment below can take a
+            // mutable borrow.
+            let resolved = client_ip::resolve_forwarded_client_ip(
                 &socket_ip,
                 addr,
-                real_ip_header_val,
+                state
+                    .env_config
+                    .real_ip_header
+                    .as_deref()
+                    // real_ip_header is pre-lowercased at config load time — no allocation needed
+                    .map(|name| ctx.header_field_lines(name))
+                    .into_iter()
+                    .flatten(),
                 xff_chain.as_deref(),
                 &state.trusted_proxies,
-            ) {
+            );
+            if let Some(resolved) = resolved {
                 ctx.client_ip = resolved;
             }
         }
@@ -18868,48 +18991,6 @@ async fn handle_proxy_request_inner(
     });
     ctx.request_authority = request_authority;
 
-    // Classify before routing so route/method rejects can use the client's wire
-    // representation. WebSocket Upgrade / Extended CONNECT wins over any
-    // hostile Content-Type, matching backend dispatch and the H3 frontend.
-    let flavor = crate::proxy::backend_dispatch::detect_http_flavor(&req);
-    let request_uses_grpc_content_type = flavor == HttpFlavor::Grpc;
-    let grpc_web_response_content_type_owned = if flavor == HttpFlavor::WebSocket {
-        None
-    } else {
-        req.headers()
-            .get(hyper::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|content_type| {
-                if !crate::plugins::grpc_web::is_grpc_web_content_type(content_type) {
-                    return None;
-                }
-                let negotiated =
-                    crate::plugins::grpc_web::negotiate_response_media_type_from_headers(
-                        content_type,
-                        req.headers(),
-                        state.max_header_size_bytes,
-                    );
-                Some(negotiated.unwrap_or_else(|_| {
-                    crate::plugins::grpc_web::response_content_type(content_type)
-                }))
-            })
-    };
-    let grpc_web_request = grpc_web_response_content_type_owned.is_some();
-    let grpc_web_response_content_type = grpc_web_response_content_type_owned.as_deref();
-    // Retain the representation just classified, exactly as the H3 frontend does
-    // right after it builds its context. Without this the marker existed only
-    // when the `grpc_web` plugin was configured, so an H1/H2 PASS-THROUGH
-    // deployment — the backend speaks gRPC-Web itself and the translator is
-    // deliberately absent — left `client_grpc_framing_representation` with
-    // nothing to read. A backend that omits `Content-Type` (or a response hook
-    // that strips it) then reached the buffered representation gate as untyped
-    // JSON, and valid gRPC-Web frames were replaced with a `502` whenever a
-    // response body rule was configured. The classification is taken from the
-    // immutable inbound content-type before any hook runs, so it records the
-    // client's own representation and never a rewritten one.
-    if let Some(content_type) = grpc_web_response_content_type {
-        crate::plugins::grpc_web::retain_negotiated_response_content_type(&mut ctx, content_type);
-    }
     let epoch = state.request_epoch.load();
     ctx.lb_generation = epoch.lb_generation;
 
@@ -24789,10 +24870,19 @@ async fn handle_proxy_request_inner(
 
             // Replay the original request body on retry. On connection failures
             // the body was never sent, so replaying is correct and safe.
-            // The final retry attempt uses streaming if configured.
-            let is_last_attempt = attempt >= retry_config.max_retries;
-            let h3_retry_stream_response =
-                should_stream_h3_retry_response(should_stream, attempt, retry_config.max_retries);
+            //
+            // The caller's response-streaming decision (`should_stream`) is
+            // preserved on EVERY attempt, not only the last one (issue #2949).
+            // `retry::should_retry` consults status/`error_class`/method only —
+            // all known once the response headers arrive and before any body
+            // byte is read — so an attempt that turns out retryable simply drops
+            // its `reqwest::Response` / `H3StreamingResponse` undrained, exactly
+            // as the initial attempt (dispatched with `should_stream`) already
+            // does. Making streaming attempt-positional instead forced a healthy
+            // `text/event-stream` that succeeded before the last attempt through
+            // full-body collection: unbounded when
+            // `max_response_body_size_bytes` is `0`, and otherwise a stalled
+            // stream that 502s at the cap or the read timeout.
             // `current_dispatch_h3` was either kept from the prior attempt
             // (same target → same protocol) or recomputed above for the
             // new target (rotation → match the new target's capability).
@@ -24805,7 +24895,7 @@ async fn handle_proxy_request_inner(
                     owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     current_target.as_deref(),
                     retained_body.as_deref(),
-                    h3_retry_stream_response,
+                    should_stream,
                     &plugins,
                     &ctx,
                     &ctx.client_ip,
@@ -24823,7 +24913,7 @@ async fn handle_proxy_request_inner(
                     owned_proxy_headers_ref.unwrap_or(&ctx.headers),
                     current_target.as_deref(),
                     retained_body.as_deref(),
-                    should_stream && is_last_attempt,
+                    should_stream,
                     &plugins,
                     &ctx,
                     &ctx.client_ip,
@@ -33827,10 +33917,6 @@ fn classify_h3_pool_error(
     classify_h3_error(e.as_ref())
 }
 
-fn should_stream_h3_retry_response(stream_response: bool, attempt: u32, max_retries: u32) -> bool {
-    stream_response && attempt >= max_retries
-}
-
 /// Build the 502 returned when an H3 backend response body exceeds
 /// `max_response_body_size_bytes`. `connection_error` stays `false` (the
 /// request demonstrably reached the backend) and the
@@ -34024,7 +34110,7 @@ async fn proxy_to_backend_http3_retry(
                 // Fast path: reject before streaming when the declared
                 // Content-Length exceeds the configured response size limit —
                 // mirrors the reqwest retry path's pre-stream reject. Without
-                // this the final streaming retry attempt would forward an
+                // this a streaming retry attempt would forward an
                 // oversized declared body unguarded (the downstream H3 body
                 // builder only size-limits when Content-Length is absent).
                 if let Some(len) = declared_response_length_exceeds_limit(
@@ -40587,23 +40673,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn h3_retry_streams_only_the_final_attempt_when_requested() {
-        assert!(
-            !super::should_stream_h3_retry_response(true, 0, 2),
-            "non-final H3 retries must stay buffered so another retry can replay"
-        );
-        assert!(
-            !super::should_stream_h3_retry_response(false, 2, 2),
-            "a buffered-response request must stay buffered even on the final retry"
-        );
-        assert!(
-            super::should_stream_h3_retry_response(true, 2, 2),
-            "the final H3 retry must preserve the original streaming response decision"
-        );
-    }
-
-    /// Guards the declared-Content-Length fast-path reject used by the final
+    /// Guards the declared-Content-Length fast-path reject used by every
     /// streaming H3 retry attempt: only a nonzero limit with a parseable
     /// over-limit Content-Length triggers the pre-stream 502.
     #[test]
@@ -40654,8 +40724,10 @@ mod tests {
     /// | untrusted peer                     | none        | equal          | peer               |
     #[test]
     fn build_xff_value_appends_peer_and_seeds_resolved_client() {
-        let no_policy = client_ip::TrustedProxies::parse("");
-        let lb_trusted = client_ip::TrustedProxies::parse("10.0.0.7");
+        let no_policy =
+            client_ip::TrustedProxies::parse_strict("", "test").expect("empty trust list is valid");
+        let lb_trusted = client_ip::TrustedProxies::parse_strict("10.0.0.7", "test")
+            .expect("valid trusted proxy list");
 
         // No proxy in front: client == peer, no inbound chain.
         assert_eq!(

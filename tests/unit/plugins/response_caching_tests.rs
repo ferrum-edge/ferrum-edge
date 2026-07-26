@@ -1892,7 +1892,10 @@ async fn test_authorization_response_not_shared_cached_without_public() {
     let mut ctx = make_ctx("GET", "/api/private");
     ctx.headers
         .insert("authorization".to_string(), "Bearer token-a".to_string());
-    let mut headers = HashMap::new();
+    // GHSA-7f28-wh4x-5375: the credential must be in the live `before_proxy`
+    // view too — that map, not `ctx.headers`, is what production passes — so
+    // this exercises the storage refusal rather than a Vary-key mismatch.
+    let mut headers = ctx.headers.clone();
     plugin.before_proxy(&mut ctx, &mut headers).await;
 
     let mut response_headers = HashMap::new();
@@ -1904,11 +1907,16 @@ async fn test_authorization_response_not_shared_cached_without_public() {
         .on_final_response_body(&mut ctx, 200, &response_headers, b"user-a")
         .await;
 
+    assert!(
+        response_caching_cache_keys_for_test(&plugin).is_empty(),
+        "the response must not be retained at all, not merely keyed apart"
+    );
+
     let mut second_ctx = make_ctx("GET", "/api/private");
     second_ctx
         .headers
         .insert("authorization".to_string(), "Bearer token-a".to_string());
-    let mut second_headers = HashMap::new();
+    let mut second_headers = second_ctx.headers.clone();
     let result = plugin
         .before_proxy(&mut second_ctx, &mut second_headers)
         .await;
@@ -2388,12 +2396,21 @@ async fn test_consumer_keyed_caching() {
         "cache_key_include_consumer": true
     }));
 
+    // Authenticated principals require RFC 9111 §3.5 shared-cache opt-in.
+    // `cache_key_include_consumer` only partitions keys; it cannot authorize
+    // storage (see `test_consumer_key_partition_does_not_override_shared_cache_admission`).
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
     // Cache response for user A
     let mut ctx_a = make_ctx("GET", "/api/data");
     ctx_a.identified_consumer = Some(Arc::new(make_consumer("a", "alice")));
     let mut h = HashMap::new();
     plugin.before_proxy(&mut ctx_a, &mut h).await;
-    let mut rh = HashMap::new();
+    let mut rh = public_response.clone();
     plugin.after_proxy(&mut ctx_a, 200, &mut rh).await;
     plugin
         .on_final_response_body(&mut ctx_a, 200, &rh, b"alice-data")
@@ -2420,11 +2437,17 @@ async fn test_consumer_keyed_caching_uses_authenticated_identity_fallback() {
         "cache_key_include_consumer": true
     }));
 
+    let mut public_response = HashMap::new();
+    public_response.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
+
     let mut ctx_external = make_ctx("GET", "/api/data");
     ctx_external.authenticated_identity = Some("oidc-alice".to_string());
     let mut headers = HashMap::new();
     plugin.before_proxy(&mut ctx_external, &mut headers).await;
-    let mut response_headers = HashMap::new();
+    let mut response_headers = public_response.clone();
     plugin
         .after_proxy(&mut ctx_external, 200, &mut response_headers)
         .await;
@@ -4176,5 +4199,420 @@ fn test_default_constructor_auto_derives_shard_amount() {
         response_caching_shard_amount_for_test(&plugin),
         ferrum_edge::util::sharding::pool_shard_amount(0),
         "the default constructor must auto-derive the host shard amount"
+    );
+}
+
+// === Advisory coverage: shared-cache admission, qualified Cache-Control
+// field lists, and partial/validator-only representations ===
+//
+// GHSA-7f28-wh4x-5375 — authenticated responses cached without shared-cache opt-in
+// GHSA-fpx2-5v4j-wqxq — qualified private/no-cache fields replayed unsafely
+// GHSA-v7fj-73gm-h625 — standalone 304 / partial 206 stored as reusable representations
+
+fn advisory_headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+/// Drive one production-shaped MISS: `before_proxy` sees the live (possibly
+/// transformed) header view, `after_proxy` stamps the status header, and
+/// `on_final_response_body` decides whether the representation is retained.
+async fn advisory_miss_cycle(
+    plugin: &ResponseCaching,
+    path: &str,
+    request_headers: &HashMap<String, String>,
+    status: u16,
+    response_headers: &HashMap<String, String>,
+    body: &[u8],
+) {
+    let mut ctx = make_ctx("GET", path);
+    ctx.headers = request_headers.clone();
+    let mut live_headers = request_headers.clone();
+    plugin.before_proxy(&mut ctx, &mut live_headers).await;
+
+    let mut resp_headers = response_headers.clone();
+    plugin
+        .after_proxy(&mut ctx, status, &mut resp_headers)
+        .await;
+    plugin
+        .on_final_response_body(&mut ctx, status, &resp_headers, body)
+        .await;
+}
+
+async fn advisory_lookup(
+    plugin: &ResponseCaching,
+    path: &str,
+    request_headers: &HashMap<String, String>,
+) -> PluginResult {
+    let mut ctx = make_ctx("GET", path);
+    ctx.headers = request_headers.clone();
+    let mut live_headers = request_headers.clone();
+    plugin.before_proxy(&mut ctx, &mut live_headers).await
+}
+
+/// GHSA-7f28-wh4x-5375: a gateway that forwards `Authorization` to a backend
+/// which validates it itself mints no Ferrum identity, so an identity-only
+/// gate treated the request as anonymous and stored the protected response.
+/// RFC 9111 §3.5 requires an explicit shared-cache opt-in.
+#[tokio::test]
+async fn test_backend_authenticated_bearer_not_stored_without_shared_cache_optin() {
+    let plugin = default_plugin();
+    let request = advisory_headers(&[("authorization", "Bearer backend-validated")]);
+    let response = advisory_headers(&[("cache-control", "max-age=300")]);
+
+    advisory_miss_cycle(
+        &plugin,
+        "/api/backend-auth",
+        &request,
+        200,
+        &response,
+        b"protected",
+    )
+    .await;
+
+    assert!(
+        response_caching_cache_keys_for_test(&plugin).is_empty(),
+        "a response to an Authorization-bearing request must not be retained without \
+         `public`, `must-revalidate`, or `s-maxage`"
+    );
+
+    // Backend-side revocation, expiry, and scope changes must not be masked:
+    // the same token has to reach the origin again.
+    assert!(matches!(
+        advisory_lookup(&plugin, "/api/backend-auth", &request).await,
+        PluginResult::Continue
+    ));
+}
+
+/// The three RFC 9111 §3.5 opt-in directives each permit shared storage of a
+/// backend-authenticated response.
+#[tokio::test]
+async fn test_backend_authenticated_bearer_stored_with_explicit_optin() {
+    for directive in [
+        "public, max-age=300",
+        "must-revalidate, max-age=300",
+        "s-maxage=300",
+    ] {
+        let plugin = default_plugin();
+        let request = advisory_headers(&[("authorization", "Bearer backend-validated")]);
+        let response = advisory_headers(&[("cache-control", directive)]);
+
+        advisory_miss_cycle(&plugin, "/api/opt-in", &request, 200, &response, b"shared").await;
+
+        let (_, body, _) = expect_reject(advisory_lookup(&plugin, "/api/opt-in", &request).await);
+        assert_eq!(
+            body, b"shared",
+            "`{directive}` must permit shared storage of an authorized response"
+        );
+    }
+}
+
+/// A local key-partition option cannot replace the origin's explicit
+/// shared-cache permission. Otherwise backend-side revocation remains masked
+/// for the entry lifetime even though credentials do not cross cache keys.
+#[tokio::test]
+async fn test_consumer_key_partition_does_not_override_shared_cache_admission() {
+    let plugin = plugin_with_config(json!({ "cache_key_include_consumer": true }));
+    let request = advisory_headers(&[("authorization", "Bearer backend-validated")]);
+    let response = advisory_headers(&[("cache-control", "max-age=300")]);
+
+    advisory_miss_cycle(
+        &plugin,
+        "/api/consumer-key-partition",
+        &request,
+        200,
+        &response,
+        b"isolated",
+    )
+    .await;
+
+    assert!(
+        response_caching_cache_keys_for_test(&plugin).is_empty(),
+        "cache_key_include_consumer only changes key partitioning and must not authorize storage"
+    );
+    assert!(matches!(
+        advisory_lookup(&plugin, "/api/consumer-key-partition", &request).await,
+        PluginResult::Continue
+    ));
+}
+
+/// The gate reads the same live/restored header view the cache key comes from,
+/// so a request-side transformer cannot move a credentialed request across the
+/// boundary in either direction.
+#[tokio::test]
+async fn test_transformed_authorization_view_still_requires_optin() {
+    for (in_live_view, in_ctx_headers) in [(true, false), (false, true)] {
+        let plugin = default_plugin();
+        let mut ctx = make_ctx("GET", "/api/transformed-auth");
+        if in_ctx_headers {
+            ctx.headers
+                .insert("authorization".to_string(), "Bearer t".to_string());
+        }
+        let mut live_headers = HashMap::new();
+        if in_live_view {
+            live_headers.insert("authorization".to_string(), "Bearer t".to_string());
+        }
+        plugin.before_proxy(&mut ctx, &mut live_headers).await;
+
+        let response = advisory_headers(&[("cache-control", "max-age=300")]);
+        plugin
+            .on_final_response_body(&mut ctx, 200, &response, b"protected")
+            .await;
+
+        assert!(
+            response_caching_cache_keys_for_test(&plugin).is_empty(),
+            "a credential visible in either header view must refuse storage \
+             (live={in_live_view}, ctx={in_ctx_headers})"
+        );
+    }
+}
+
+/// GHSA-fpx2-5v4j-wqxq: `private="x-account"` names a field a shared cache may
+/// not retain. The response for the requesting client keeps it; the entry must
+/// not.
+#[tokio::test]
+async fn test_qualified_private_field_is_not_retained() {
+    let plugin = default_plugin();
+    let request = HashMap::new();
+    let response = advisory_headers(&[
+        (
+            "cache-control",
+            "public, max-age=300, private=\"x-account\"",
+        ),
+        ("x-account", "tenant-a"),
+        ("content-type", "application/json"),
+    ]);
+
+    advisory_miss_cycle(
+        &plugin,
+        "/api/qualified-private",
+        &request,
+        200,
+        &response,
+        b"{}",
+    )
+    .await;
+
+    let hit = advisory_lookup(&plugin, "/api/qualified-private", &request).await;
+    let (_, body, replayed) = expect_reject(hit);
+    assert_eq!(body, b"{}");
+    assert!(
+        !replayed.contains_key("x-account"),
+        "a qualified `private` field must never be replayed: {replayed:?}"
+    );
+    assert_eq!(
+        replayed.get("content-type").map(String::as_str),
+        Some("application/json"),
+        "unqualified fields must survive"
+    );
+    assert_eq!(
+        response.get("x-account").map(String::as_str),
+        Some("tenant-a"),
+        "only the retained copy is narrowed; the origin response is untouched"
+    );
+}
+
+/// A quoted field-name list holds its own commas, is matched case-insensitively,
+/// and may name several fields. A `split(',')` parser sees neither half of
+/// `no-cache="a, b"` as a directive and retains both fields.
+#[tokio::test]
+async fn test_qualified_no_cache_quoted_list_survives_commas_and_case() {
+    let plugin = default_plugin();
+    let request = HashMap::new();
+    let cache_control = "public, MAX-AGE=300, No-Cache=\"X-Secret, x-policy\"";
+    let response = advisory_headers(&[
+        ("cache-control", cache_control),
+        ("x-secret", "s3cret"),
+        ("x-policy", "tenant-a"),
+        ("x-public", "ok"),
+    ]);
+
+    advisory_miss_cycle(
+        &plugin,
+        "/api/qualified-no-cache",
+        &request,
+        200,
+        &response,
+        b"body",
+    )
+    .await;
+
+    let hit = advisory_lookup(&plugin, "/api/qualified-no-cache", &request).await;
+    let (_, body, replayed) = expect_reject(hit);
+    assert_eq!(body, b"body");
+    for protected in ["x-secret", "x-policy"] {
+        assert!(
+            !replayed.contains_key(protected),
+            "`{protected}` was named by a qualified `no-cache` and must not be replayed: \
+             {replayed:?}"
+        );
+    }
+    assert_eq!(replayed.get("x-public").map(String::as_str), Some("ok"));
+}
+
+/// Anything that is not a well-formed quoted field-name list fails closed to
+/// the bare directive, which refuses the whole response. Duplicate spellings
+/// resolve to the bare form in either order.
+#[tokio::test]
+async fn test_malformed_qualified_directives_refuse_the_whole_response() {
+    for directive in [
+        // Unterminated quoted string.
+        "public, max-age=300, private=\"x-account",
+        // Unquoted argument.
+        "public, max-age=300, private=x-account",
+        // Empty list.
+        "public, max-age=300, private=\"\"",
+        // Member that is not a valid field name.
+        "public, max-age=300, no-cache=\"bad header\"",
+        // A valid quoted prefix followed by non-OWS junk is malformed.
+        "public, max-age=300, private=\"x-account\"junk",
+        // Bare spelling alongside a qualified one, either order.
+        "public, max-age=300, private=\"x-account\", private",
+        "public, max-age=300, private, private=\"x-account\"",
+    ] {
+        let plugin = default_plugin();
+        let request = HashMap::new();
+        let response = advisory_headers(&[("cache-control", directive), ("x-account", "t-a")]);
+
+        advisory_miss_cycle(&plugin, "/api/malformed", &request, 200, &response, b"body").await;
+
+        assert!(
+            response_caching_cache_keys_for_test(&plugin).is_empty(),
+            "`{directive}` must fail closed to the bare directive and refuse the response"
+        );
+    }
+}
+
+/// Connection- and intermediary-scoped response fields describe this hop, not
+/// the representation, and must never be replayed from a shared entry.
+#[tokio::test]
+async fn test_connection_scoped_and_proxy_auth_fields_are_not_retained() {
+    let plugin = default_plugin();
+    let request = HashMap::new();
+    let response = advisory_headers(&[
+        ("cache-control", "public, max-age=300"),
+        ("connection", "keep-alive, x-internal-token"),
+        ("x-internal-token", "internal"),
+        ("keep-alive", "timeout=5"),
+        ("proxy-authenticate", "Basic realm=\"edge\""),
+        ("transfer-encoding", "chunked"),
+        ("upgrade", "websocket"),
+        ("content-type", "text/plain"),
+    ]);
+
+    advisory_miss_cycle(&plugin, "/api/hop-by-hop", &request, 200, &response, b"ok").await;
+
+    let hit = advisory_lookup(&plugin, "/api/hop-by-hop", &request).await;
+    let (_, _, replayed) = expect_reject(hit);
+    for stripped in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "transfer-encoding",
+        "upgrade",
+        "x-internal-token",
+    ] {
+        assert!(
+            !replayed.contains_key(stripped),
+            "`{stripped}` must not be replayed from cache: {replayed:?}"
+        );
+    }
+    assert_eq!(
+        replayed.get("content-type").map(String::as_str),
+        Some("text/plain")
+    );
+}
+
+/// GHSA-v7fj-73gm-h625: statuses whose caching semantics the plugin does not
+/// implement cannot be configured as cacheable.
+#[test]
+fn test_unsupported_cacheable_status_codes_rejected() {
+    for status in [100, 101, 199, 206, 304] {
+        let err = ResponseCaching::new(&json!({ "cacheable_status_codes": [200, status] }))
+            .err()
+            .unwrap_or_else(|| panic!("status {status} must not be configurable as cacheable"));
+        assert!(err.contains("cacheable_status_codes[1]"), "got: {err}");
+    }
+
+    for status in [200, 203, 204, 300, 301, 308, 404, 410, 500] {
+        ResponseCaching::new(&json!({ "cacheable_status_codes": [status] }))
+            .unwrap_or_else(|error| panic!("status {status} must stay configurable: {error}"));
+    }
+}
+
+/// A caller-selected byte range describes bytes, not the resource, so it must
+/// never become the entry a later unconditional request receives — even when
+/// the partial arrives under an allowed status.
+#[tokio::test]
+async fn test_partial_representation_is_never_stored() {
+    let plugin = default_plugin();
+    let ranged_request = advisory_headers(&[("range", "bytes=0-3")]);
+    let response = advisory_headers(&[
+        ("cache-control", "public, max-age=300"),
+        ("content-range", "bytes 0-3/1024"),
+    ]);
+
+    advisory_miss_cycle(
+        &plugin,
+        "/api/ranged",
+        &ranged_request,
+        200,
+        &response,
+        b"part",
+    )
+    .await;
+
+    assert!(
+        response_caching_cache_keys_for_test(&plugin).is_empty(),
+        "a `Content-Range` response must not become a reusable representation"
+    );
+    assert!(matches!(
+        advisory_lookup(&plugin, "/api/ranged", &HashMap::new()).await,
+        PluginResult::Continue
+    ));
+}
+
+/// A `304` is validator metadata for an existing stored representation, never
+/// a representation of its own.
+#[tokio::test]
+async fn test_validator_only_not_modified_is_never_stored() {
+    let plugin = plugin_with_config(json!({ "cacheable_status_codes": [200] }));
+    let request = HashMap::new();
+    let response =
+        advisory_headers(&[("cache-control", "public, max-age=300"), ("etag", "\"v1\"")]);
+
+    advisory_miss_cycle(&plugin, "/api/validator", &request, 304, &response, b"").await;
+
+    assert!(
+        response_caching_cache_keys_for_test(&plugin).is_empty(),
+        "a standalone 304 must not be stored as a reusable representation"
+    );
+    assert!(matches!(
+        advisory_lookup(&plugin, "/api/validator", &request).await,
+        PluginResult::Continue
+    ));
+}
+
+/// Conflicting duplicate `delta-seconds` values are ambiguous; the most
+/// restrictive lifetime wins instead of whichever member happened to be last.
+#[tokio::test]
+async fn test_duplicate_max_age_keeps_the_most_restrictive_lifetime() {
+    let plugin = default_plugin();
+    let request = HashMap::new();
+    let response = advisory_headers(&[("cache-control", "public, max-age=600, max-age=1")]);
+
+    advisory_miss_cycle(&plugin, "/api/dup-max-age", &request, 200, &response, b"ok").await;
+    let fresh_hit = advisory_lookup(&plugin, "/api/dup-max-age", &request).await;
+    assert!(is_reject(&fresh_hit));
+
+    advance_response_caching_clock_for_test(&plugin, std::time::Duration::from_secs(2));
+    assert!(
+        matches!(
+            advisory_lookup(&plugin, "/api/dup-max-age", &request).await,
+            PluginResult::Continue
+        ),
+        "the shorter duplicate `max-age` must bound freshness"
     );
 }

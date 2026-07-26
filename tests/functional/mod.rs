@@ -68,6 +68,7 @@ mod functional_passthrough_test;
 mod functional_plugin_extended_test;
 mod functional_plugin_test;
 mod functional_plugins_network_test;
+mod functional_policy_path_canonicalization_test;
 mod functional_prometheus_test;
 mod functional_protocol_body_limit_config_test;
 mod functional_protocol_h2_body_limit_config_test;

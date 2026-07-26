@@ -574,14 +574,10 @@ async fn test_plugin_complex_configurations() {
 #[tokio::test]
 async fn test_response_caching_stores_transformed_body() {
     let _policy_guard = response_cache_replay_policy_guard();
-    // `create_test_context` populates an authenticated consumer. After the
-    // PR d34d3508 fix (shared cache leak across authenticated users), the
-    // plugin refuses to store cache entries for authenticated requests
-    // unless the cache key includes the consumer identity OR the response
-    // explicitly opts in via `Cache-Control: public/must-revalidate/
-    // s-maxage`. Enable `cache_key_include_consumer` so the test exercises
-    // the storage+lookup symmetry while staying compatible with the
-    // post-fix shared-cache policy.
+    // `create_test_context` authenticates a consumer and sends Authorization.
+    // RFC 9111 §3.5 / GHSA-7f28 require an explicit shared-cache opt-in
+    // (`public` / `must-revalidate` / `s-maxage`) before storage; consumer
+    // key partitioning alone cannot authorize retention.
     let plugins = sort_plugins(vec![
         create_plugin(
             "response_caching",
@@ -613,6 +609,10 @@ async fn test_response_caching_stores_transformed_body() {
     let mut ctx = create_response_context("/cache-transform");
     let mut response_headers = HashMap::new();
     response_headers.insert("content-type".to_string(), "application/json".to_string());
+    response_headers.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
 
     let (status, _, body) = run_buffered_response_lifecycle(
         &plugins,
@@ -698,9 +698,9 @@ mod runtime_overlay_cache_provenance {
                 &json!({
                     "ttl_seconds": 60,
                     "add_cache_status_header": true,
-                    // `create_test_context` authenticates a consumer; keying by
-                    // consumer keeps storage eligible under the shared-cache
-                    // policy (same reason as the sibling cache tests).
+                    // Partitioning only: authenticated fixtures still need
+                    // `Cache-Control: public` (see `origin_headers`) under
+                    // RFC 9111 §3.5 / GHSA-7f28.
                     "cache_key_include_consumer": true,
                 }),
             )
@@ -818,7 +818,11 @@ mod runtime_overlay_cache_provenance {
     pub(super) fn origin_headers(extra: &[(&str, &str)]) -> HashMap<String, String> {
         let mut headers = HashMap::new();
         headers.insert("content-type".to_string(), "application/json".to_string());
-        headers.insert("cache-control".to_string(), "max-age=60".to_string());
+        // Authenticated test contexts require an explicit shared-cache opt-in.
+        headers.insert(
+            "cache-control".to_string(),
+            "public, max-age=60".to_string(),
+        );
         for (key, value) in extra {
             headers.insert(key.to_string(), value.to_string());
         }
@@ -1320,7 +1324,10 @@ async fn test_response_cache_hit_lifecycle_skips_non_idempotent_transforms() {
     let mut miss_headers = HashMap::new();
     miss_headers.insert("content-type".to_string(), "application/json".to_string());
     miss_headers.insert("x-a".to_string(), "origin".to_string());
-    miss_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    miss_headers.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
 
     let (status, headers, body) = run_buffered_response_lifecycle(
         &plugins,
@@ -1467,7 +1474,10 @@ async fn test_response_cache_revalidated_lifecycle_skips_header_transforms() {
     miss_headers.insert("content-type".to_string(), "application/json".to_string());
     miss_headers.insert("etag".to_string(), "\"v1\"".to_string());
     miss_headers.insert("x-a".to_string(), "origin".to_string());
-    miss_headers.insert("cache-control".to_string(), "max-age=60".to_string());
+    miss_headers.insert(
+        "cache-control".to_string(),
+        "public, max-age=60".to_string(),
+    );
 
     let (status, headers, _) = run_buffered_response_lifecycle(
         &plugins,

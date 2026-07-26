@@ -315,3 +315,84 @@ async fn functional_client_ip_real_ip_header_takes_precedence_over_xff_for_limit
         "only admitted requests should reach backend"
     );
 }
+
+/// Advisory GHSA-fx4w-68hx-mj7r: a trusted proxy that preserves the client's
+/// copy of the configured real-IP header and appends its own leaves two
+/// field-lines. Neither may be selected, in either order — the request must be
+/// accounted to the direct socket identity, and the weaker `X-Forwarded-For`
+/// must not be consulted as a fallback.
+///
+/// The discriminator is the per-IP admission limit: the holding request sends
+/// duplicate `X-Real-IP` lines plus an `X-Forwarded-For`, and a following plain
+/// request (no forwarded headers at all, so it keys on `127.0.0.1`) must be
+/// rejected. Before the fix the holding request keyed on one of the header
+/// values instead, leaving the socket identity's budget free.
+#[ignore]
+#[tokio::test]
+async fn functional_client_ip_duplicate_real_ip_headers_key_on_socket_identity() {
+    let orders: [&[(&str, &str)]; 2] = [
+        &[
+            ("x-real-ip", "203.0.113.50"),
+            ("x-real-ip", "198.51.100.30"),
+            ("x-forwarded-for", "198.51.100.77"),
+        ],
+        &[
+            ("x-real-ip", "198.51.100.30"),
+            ("x-real-ip", "203.0.113.50"),
+            ("x-forwarded-for", "198.51.100.77"),
+        ],
+    ];
+
+    for headers in orders {
+        let harness = ClientIpHarness::new(&[
+            ("FERRUM_TRUSTED_PROXIES", "127.0.0.1"),
+            ("FERRUM_REAL_IP_HEADER", "X-Real-IP"),
+        ])
+        .await;
+
+        let _first_conn = open_holding_get(&harness, headers).await;
+        wait_until_backend_get_count(&harness, 1).await;
+
+        let socket_identity = client()
+            .get(harness.proxy_url())
+            .send()
+            .await
+            .expect("socket-identity response");
+        assert_eq!(
+            socket_identity.status(),
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "duplicate real-IP field-lines must be accounted to the socket identity \
+             (header order: {headers:?})"
+        );
+
+        assert_eq!(
+            harness.backend_get_count().await,
+            1,
+            "rejected request must not reach backend"
+        );
+    }
+}
+
+/// Companion to the test above: one field-line still resolves normally, so the
+/// duplicate rejection is not a blanket disabling of the configured header.
+#[ignore]
+#[tokio::test]
+async fn functional_client_ip_single_real_ip_header_still_resolves() {
+    let harness = ClientIpHarness::new(&[
+        ("FERRUM_TRUSTED_PROXIES", "127.0.0.1"),
+        ("FERRUM_REAL_IP_HEADER", "X-Real-IP"),
+    ])
+    .await;
+
+    let _first_conn = open_holding_get(&harness, &[("x-real-ip", "198.51.100.30")]).await;
+    wait_until_backend_get_count(&harness, 1).await;
+
+    // The holding request consumed 198.51.100.30's budget, not 127.0.0.1's.
+    let socket_identity = client()
+        .get(harness.proxy_url())
+        .send()
+        .await
+        .expect("socket-identity response");
+    assert_eq!(socket_identity.status(), reqwest::StatusCode::OK);
+    assert_eq!(socket_identity.text().await.expect("body"), "ok");
+}

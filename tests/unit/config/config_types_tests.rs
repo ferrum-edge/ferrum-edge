@@ -4237,9 +4237,55 @@ fn test_listen_path_encodings_accepts_clean_paths() {
         make_proxy("p1", "/api"),
         make_proxy("p2", "=/exact/path"),
         make_proxy("p3", "~/regex/.*"),
-        make_proxy("p4", "/with-space%20here"),
+        // A regex listen_path is a pattern, so `\` and `.` are regex syntax
+        // there rather than path bytes: `~^/v1\.0/.*` matches the entirely
+        // reachable canonical path `/v1.0/x`.
+        make_proxy("p4", r"~^/v1\.0/.*"),
+        make_proxy("p5", "/v1.0/legacy"),
     ];
     assert!(config.validate_listen_path_encodings().is_ok());
+}
+
+#[test]
+fn test_listen_path_encodings_rejects_literal_dot_segments_and_backslashes() {
+    // No canonical request path can contain a dot segment or a backslash —
+    // both are rejected at the frontend boundary — so a literal listen_path
+    // carrying one is unreachable config.
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("good", "/api"),
+        make_proxy("bad-dotdot", "/api/../legacy"),
+        make_proxy("bad-dot", "/api/./legacy"),
+        make_proxy("bad-backslash", "/api\\legacy"),
+        make_proxy("bad-exact-dotdot", "=/api/../legacy"),
+    ];
+    let errs = config.validate_listen_path_encodings().unwrap_err();
+    assert_eq!(errs.len(), 4);
+    assert!(errs.iter().any(|e| e.contains("bad-dotdot")));
+    assert!(errs.iter().any(|e| e.contains("bad-dot")));
+    assert!(errs.iter().any(|e| e.contains("bad-backslash")));
+    assert!(errs.iter().any(|e| e.contains("bad-exact-dotdot")));
+    assert!(errs.iter().all(|e| e.contains("canonical policy path")));
+}
+
+#[test]
+fn test_listen_path_encodings_rejects_escapes_that_cannot_be_forwarded_literally() {
+    // An escaped space, brace, or non-ASCII byte is outside the `pchar` decode
+    // set, so the runtime refuses any request that spells one — a `listen_path`
+    // carrying such an escape can only ever be dead config.
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("good", "/api"),
+        make_proxy("bad-space", "/with-space%20here"),
+        make_proxy("bad-brace", "/api/%7Bid%7D"),
+        make_proxy("bad-utf8", "/caf%C3%A9"),
+    ];
+    let errs = config.validate_listen_path_encodings().unwrap_err();
+    assert_eq!(errs.len(), 3);
+    assert!(errs.iter().any(|e| e.contains("bad-space")));
+    assert!(errs.iter().any(|e| e.contains("bad-brace")));
+    assert!(errs.iter().any(|e| e.contains("bad-utf8")));
+    assert!(errs.iter().all(|e| e.contains("canonical policy path")));
 }
 
 #[test]
@@ -4254,7 +4300,28 @@ fn test_listen_path_encodings_rejects_single_encoded_slash() {
     assert_eq!(errs.len(), 2);
     assert!(errs.iter().any(|e| e.contains("bad-upper")));
     assert!(errs.iter().any(|e| e.contains("bad-lower")));
-    assert!(errs.iter().all(|e| e.contains("encoded slashes")));
+    assert!(errs.iter().all(|e| e.contains("canonical policy path")));
+}
+
+#[test]
+fn test_listen_path_encodings_rejects_ordinary_single_encoding() {
+    // The advisory's headline case: `/%61dmin` is not a stricter spelling of
+    // `/admin`, it is an unreachable one, because request paths canonicalize
+    // before route lookup.
+    let mut config = empty_config();
+    config.proxies = vec![
+        make_proxy("good", "/admin"),
+        make_proxy("bad", "/%61dmin"),
+        make_proxy("bad-dot-segment", "/api/%2e%2e/admin"),
+        make_proxy("bad-backslash", "/api%5Cadmin"),
+        make_proxy("bad-truncated-escape", "/api%2"),
+    ];
+    let errs = config.validate_listen_path_encodings().unwrap_err();
+    assert_eq!(errs.len(), 4);
+    assert!(errs.iter().any(|e| e.contains("bad-dot-segment")));
+    assert!(errs.iter().any(|e| e.contains("bad-backslash")));
+    assert!(errs.iter().any(|e| e.contains("bad-truncated-escape")));
+    assert!(errs.iter().all(|e| e.contains("canonical policy path")));
 }
 
 #[test]
