@@ -103,6 +103,18 @@ message MeshSubscribeRequest {
   // Ambient UDP consumers need the namespace-visible policy candidate
   // superset so trusted per-pod baggage can be scoped at the destination.
   bool ambient_udp_source_scoping = 7;
+  // True when this subscription is a CROSS-CLUSTER remote-discovery poll
+  // (`RemoteCluster.control_plane_url`), false for an ordinary local mesh
+  // data-plane subscription. It selects which JWT audience policy the control
+  // plane enforces (issue #2475), and both branches fail closed, so the flag
+  // is not a trust decision:
+  //   true  -> the bearer token must carry exactly one `aud` equal to
+  //            "ferrum-mesh-discovery:<FERRUM_MESH_CLUSTER_AUDIENCE>" of THIS
+  //            control plane; an unconfigured control plane refuses outright.
+  //   false -> the bearer token must carry NO `aud` at all, so a discovery
+  //            token minted for another cluster cannot be downgraded into a
+  //            local subscription here.
+  bool remote_discovery = 8;
 }
 
 // A MeshSubscribe response frame.

@@ -994,7 +994,21 @@ pub async fn run(
             .sidecar_enforced_dry_run(env_config.mesh_sidecar_enforced_dry_run)
             .sidecar_identity_narrowing(env_config.mesh_sidecar_identity_narrowing)
             .cluster_domain(env_config.k8s_cluster_domain.clone())
+            .cluster_audience(env_config.mesh_cluster_audience.clone())
             .build();
+    match env_config.mesh_cluster_audience.as_deref() {
+        Some(audience) => info!(
+            cluster_audience = %audience,
+            "Cross-cluster mesh remote discovery enabled: MeshSubscribe remote-discovery \
+             subscriptions must present a JWT bound to this cluster's audience"
+        ),
+        None => info!(
+            "FERRUM_MESH_CLUSTER_AUDIENCE is unset: this control plane refuses cross-cluster \
+             mesh remote-discovery MeshSubscribe subscriptions (ordinary local mesh \
+             subscriptions are unaffected). Set it to the identifier peer clusters use in \
+             RemoteCluster.name to serve them."
+        ),
+    }
     let xds_server = if env_config.xds_enabled {
         info!("FERRUM_XDS_ENABLED=true — mounting xDS ADS on the CP gRPC listener");
         Some(

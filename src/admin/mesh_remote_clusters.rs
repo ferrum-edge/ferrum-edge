@@ -108,6 +108,15 @@ pub struct ConfiguredRemoteCluster {
     /// Whether a `federation_endpoint` is configured for SPIFFE trust-bundle
     /// exchange with this cluster.
     pub federation_endpoint_configured: bool,
+    /// The JWT `aud` value this data plane mints into remote-discovery tokens
+    /// for this cluster, derived from `cluster_name` (issue #2475). Present
+    /// only when `control_plane_configured` is `true` — a federation-only
+    /// cluster is never polled and mints no discovery token. This is derived
+    /// configuration, not a credential: it names the target cluster and
+    /// reveals nothing about the JWT secret. Operators use it to confirm the
+    /// peer control plane's `FERRUM_MESH_CLUSTER_AUDIENCE` matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_audience: Option<String>,
     /// `true` when a cluster of this name is present in the live `discovered`
     /// map — a quick "is configured discovery actually returning anything?"
     /// flag so operators don't have to cross-reference the two lists by hand.
@@ -376,15 +385,19 @@ pub fn build_response(inputs: MeshRemoteClustersInputs<'_>) -> MeshRemoteCluster
                         federation_endpoint_configured,
                         effective_trust_bundles.as_ref(),
                     );
+                    let control_plane_configured = remote
+                        .control_plane_url
+                        .as_deref()
+                        .is_some_and(|url| !url.trim().is_empty());
                     ConfiguredRemoteCluster {
                         cluster_name: remote.name.clone(),
                         trust_domain: remote.trust_domain.as_str().to_string(),
                         network: remote.network.clone(),
-                        control_plane_configured: remote
-                            .control_plane_url
-                            .as_deref()
-                            .is_some_and(|url| !url.trim().is_empty()),
+                        control_plane_configured,
                         federation_endpoint_configured,
+                        discovery_audience: control_plane_configured.then(|| {
+                            crate::grpc::auth::remote_discovery_audience(&remote.name)
+                        }),
                         discovered: discovered_names.contains(remote.name.as_str()),
                         outbound_trust_active: trust_status.outbound_trust_active,
                         inbound_trust_active: trust_status.inbound_trust_active,

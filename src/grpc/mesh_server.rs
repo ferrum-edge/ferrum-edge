@@ -15,7 +15,10 @@ use tokio_stream::wrappers::{BroadcastStream, IntervalStream};
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
-use super::auth::{AllowedNamespaces, verify_grpc_jwt_metadata_with_claims};
+use super::auth::{
+    AllowedNamespaces, AudienceRejectReason, GrpcAudiencePolicy, remote_discovery_audience,
+    verify_grpc_jwt_metadata_with_audience,
+};
 use super::cp_server::{CpGrpcServer, CpScope, DEFAULT_CP_DP_JWT_ISSUER};
 use super::mesh_registry::{MeshNodeInfo, MeshNodeRegistry};
 use super::proto::mesh_config_sync_server::{MeshConfigSync, MeshConfigSyncServer};
@@ -90,6 +93,18 @@ pub struct MeshGrpcServer {
     /// Cluster DNS suffix used when synthesizing MeshService FQDN aliases for
     /// Sidecar egress matching.
     cluster_domain: String,
+    /// Mirror of `FERRUM_MESH_CLUSTER_AUDIENCE`: the stable, operator-visible
+    /// identifier THIS cluster is known by to its multi-cluster peers (the
+    /// value peers put in `RemoteCluster.name`). Cross-cluster remote-discovery
+    /// subscriptions must present a JWT whose single `aud` is
+    /// `remote_discovery_audience(this value)`. `None` means the operator has
+    /// not enabled cross-cluster discovery serving here, and every
+    /// `remote_discovery` subscription is refused (fail closed) — it is never
+    /// a permissive posture. Issue #2475.
+    ///
+    /// Precomputed at build time into the full expected `aud` string so the
+    /// per-subscription check is a borrow + compare, never a `format!`.
+    expected_remote_discovery_audience: Option<String>,
 }
 
 pub struct MeshGrpcServerBuilder {
@@ -105,6 +120,7 @@ pub struct MeshGrpcServerBuilder {
     sidecar_enforced_dry_run: bool,
     sidecar_identity_narrowing: bool,
     cluster_domain: String,
+    cluster_audience: Option<String>,
 }
 
 impl MeshGrpcServerBuilder {
@@ -122,6 +138,7 @@ impl MeshGrpcServerBuilder {
             sidecar_enforced_dry_run: false,
             sidecar_identity_narrowing: false,
             cluster_domain: crate::modes::mesh::dns_proxy::DEFAULT_CLUSTER_DOMAIN.to_string(),
+            cluster_audience: None,
         }
     }
 
@@ -176,6 +193,17 @@ impl MeshGrpcServerBuilder {
         self
     }
 
+    /// Set this cluster's remote-discovery audience identity
+    /// (`FERRUM_MESH_CLUSTER_AUDIENCE`). An empty/blank value is treated as
+    /// unset, which keeps cross-cluster discovery refused rather than
+    /// accepting an empty audience.
+    pub fn cluster_audience(mut self, cluster_audience: Option<String>) -> Self {
+        self.cluster_audience = cluster_audience
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        self
+    }
+
     pub fn build(self) -> (MeshGrpcServer, broadcast::Sender<MeshConfigBroadcast>) {
         let (tx, _) = broadcast::channel(self.channel_capacity.max(1));
         let tx_clone = tx.clone();
@@ -193,6 +221,10 @@ impl MeshGrpcServerBuilder {
                 sidecar_enforced_dry_run: self.sidecar_enforced_dry_run,
                 sidecar_identity_narrowing: self.sidecar_identity_narrowing,
                 cluster_domain: self.cluster_domain,
+                expected_remote_discovery_audience: self
+                    .cluster_audience
+                    .as_deref()
+                    .map(remote_discovery_audience),
             },
             tx_clone,
         )
@@ -279,12 +311,40 @@ impl MeshGrpcServer {
         })
     }
 
-    #[allow(clippy::result_large_err)]
+    /// Audience policy for one `MeshSubscribe` request.
+    ///
+    /// Both branches fail closed, which is why trusting the client-supplied
+    /// `remote_discovery` flag is safe:
+    ///
+    /// - A cross-cluster poll (`remote_discovery = true`) must present exactly
+    ///   one `aud` naming THIS cluster. A control plane with no
+    ///   `FERRUM_MESH_CLUSTER_AUDIENCE` cannot state which cluster it is, so it
+    ///   refuses outright ([`GrpcAudiencePolicy::Unconfigured`]).
+    /// - An ordinary local subscription (`remote_discovery = false`) must carry
+    ///   no audience at all, so a token minted for cluster B cannot be
+    ///   laundered into cluster C by clearing the flag.
+    fn audience_policy_for(&self, remote_discovery: bool) -> GrpcAudiencePolicy<'_> {
+        if !remote_discovery {
+            return GrpcAudiencePolicy::ReservedForbidden;
+        }
+        match self.expected_remote_discovery_audience.as_deref() {
+            Some(expected) => GrpcAudiencePolicy::Required(expected),
+            None => GrpcAudiencePolicy::Unconfigured,
+        }
+    }
+
+    #[allow(clippy::result_large_err, clippy::type_complexity)]
     fn verify_jwt_metadata(
         &self,
         metadata: &tonic::metadata::MetadataMap,
-    ) -> Result<AllowedNamespaces, Status> {
-        verify_grpc_jwt_metadata_with_claims(metadata, &self.jwt_secret, &self.expected_issuer)
+        remote_discovery: bool,
+    ) -> Result<AllowedNamespaces, (Status, Option<AudienceRejectReason>)> {
+        verify_grpc_jwt_metadata_with_audience(
+            metadata,
+            &self.jwt_secret,
+            &self.expected_issuer,
+            self.audience_policy_for(remote_discovery),
+        )
     }
 
     fn filter_config_for_request(
@@ -422,10 +482,33 @@ impl MeshConfigSync for MeshGrpcServer {
         &self,
         request: Request<MeshSubscribeRequest>,
     ) -> Result<Response<Self::MeshSubscribeStream>, Status> {
-        let allowed = match self.verify_jwt_metadata(request.metadata()) {
+        let remote_discovery = request.get_ref().remote_discovery;
+        let allowed = match self.verify_jwt_metadata(request.metadata(), remote_discovery) {
             Ok(allowed) => allowed,
-            Err(status) => {
+            Err((status, audience_reason)) => {
                 let req = request.get_ref();
+                if let Some(reason) = audience_reason {
+                    // Fixed-cardinality diagnostics only: the subscription
+                    // class and a closed-set reason label. The token, its
+                    // claims, the expected audience, and the JWT secret are
+                    // never rendered.
+                    let subscription_class = if remote_discovery {
+                        "remote_discovery"
+                    } else {
+                        "local"
+                    };
+                    crate::plugins::mesh::prometheus_helpers::increment_mesh_subscribe_audience_rejection(
+                        subscription_class,
+                        reason.as_metric_label(),
+                    );
+                    warn!(
+                        audit.event = "mesh_subscribe_audience_rejected",
+                        surface = "MeshConfigSync.MeshSubscribe",
+                        subscription_class,
+                        reason = reason.as_metric_label(),
+                        "Refused MeshSubscribe: JWT audience is not bound to this cluster"
+                    );
+                }
                 CpGrpcServer::audit_tenant_subscription(
                     "MeshConfigSync.MeshSubscribe",
                     &req.node_id,

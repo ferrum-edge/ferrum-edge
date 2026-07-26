@@ -2481,7 +2481,9 @@ paths:
         - `configured`: remote clusters declared in the **accepted** slice's
           multicluster config — name, trust domain, network, and whether a
           control plane (`control_plane_configured`) / federation endpoint
-          (`federation_endpoint_configured`) is set. Each carries a
+          (`federation_endpoint_configured`) is set, plus the derived
+          `discovery_audience` this data plane binds that cluster's discovery
+          token to. Each carries a
           `discovered` flag cross-referencing the scoped `discovered` view so a
           configured-but-unreachable cluster is visible.
 
@@ -2595,6 +2597,20 @@ paths:
                         federation_endpoint_configured:
                           type: boolean
                           description: Whether a `federation_endpoint` is set for SPIFFE trust-bundle exchange.
+                        discovery_audience:
+                          type: [string, "null"]
+                          description: |
+                            The JWT `aud` value this data plane mints into
+                            cross-cluster remote-discovery tokens for this
+                            cluster, derived from `cluster_name` as
+                            `ferrum-mesh-discovery:<cluster_name>`. Present only
+                            when `control_plane_configured` is `true` — a
+                            federation-only cluster is never polled and mints no
+                            discovery token. Derived configuration, not a
+                            credential: it names the target cluster and reveals
+                            nothing about the JWT secret. The peer control
+                            plane's `FERRUM_MESH_CLUSTER_AUDIENCE` must produce
+                            this same value or the poll is refused.
                         discovered:
                           type: boolean
                           description: |
@@ -2640,6 +2656,7 @@ paths:
                         network: net2
                         control_plane_configured: true
                         federation_endpoint_configured: true
+                        discovery_audience: "ferrum-mesh-discovery:remote-east"
                         discovered: true
                         outbound_trust_active: true
                         inbound_trust_active: true

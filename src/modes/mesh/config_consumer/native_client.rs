@@ -49,6 +49,13 @@ impl NativeMeshClientConfig {
             labels: self.labels.clone(),
             waypoint_name: self.waypoint_name.clone().unwrap_or_default(),
             ambient_udp_source_scoping: self.ambient_udp_source_scoping,
+            // Ordinary LOCAL mesh subscription: this data plane talks to its
+            // own control plane. Its token deliberately carries no `aud` and
+            // the CP refuses any token bearing a reserved
+            // `ferrum-mesh-discovery:` audience on this class, so a
+            // cross-cluster discovery token can never be replayed here
+            // (issue #2475).
+            remote_discovery: false,
         }
     }
 }

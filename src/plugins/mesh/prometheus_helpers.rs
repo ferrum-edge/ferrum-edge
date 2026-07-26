@@ -46,6 +46,9 @@ static MESH_REMOTE_DISCOVERY_LAST_SUCCESS: LazyLock<
 > = LazyLock::new(DashMap::new);
 static MESH_CONFIG_UPDATE_REJECTIONS: LazyLock<DashMap<MeshConfigUpdateRejectKey, AtomicU64>> =
     LazyLock::new(DashMap::new);
+static MESH_SUBSCRIBE_AUDIENCE_REJECTIONS: LazyLock<
+    DashMap<MeshSubscribeAudienceRejectKey, AtomicU64>,
+> = LazyLock::new(DashMap::new);
 static XDS_STREAMS_REJECTED: AtomicU64 = AtomicU64::new(0);
 static MESH_INBOUND_PLAINTEXT_ALLOWED: AtomicU64 = AtomicU64::new(0);
 static XDS_WARMING_PARTIAL_APPLIES: LazyLock<DashMap<Arc<str>, AtomicU64>> =
@@ -245,6 +248,17 @@ struct MeshRemoteDiscoveryPollSuccessKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct MeshConfigUpdateRejectKey {
     consumer: &'static str,
+    reason: &'static str,
+}
+
+/// Control-plane-side `MeshSubscribe` JWT audience rejections (issue #2475).
+/// Both labels are `&'static str` from closed enums — the subscription class
+/// (`remote_discovery` / `local`) and an `AudienceRejectReason` label — so the
+/// series cardinality is fixed at compile time. No token, claim value, cluster
+/// audience, or peer-supplied string ever becomes a label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct MeshSubscribeAudienceRejectKey {
+    subscription: &'static str,
     reason: &'static str,
 }
 
@@ -554,6 +568,24 @@ pub fn increment_mesh_config_update_rejection(consumer: &'static str, reason: &'
         .fetch_add(1, Ordering::Relaxed);
 }
 
+/// Count a control-plane-side `MeshSubscribe` JWT audience rejection
+/// (issue #2475). `subscription` is `"remote_discovery"` or `"local"`;
+/// `reason` is an `AudienceRejectReason` metric label. Both are compile-time
+/// constants, so the series cannot grow at runtime and no credential metadata
+/// reaches `/metrics` — the detail stays in the structured audit `warn!`.
+pub fn increment_mesh_subscribe_audience_rejection(
+    subscription: &'static str,
+    reason: &'static str,
+) {
+    MESH_SUBSCRIBE_AUDIENCE_REJECTIONS
+        .entry(MeshSubscribeAudienceRejectKey {
+            subscription,
+            reason,
+        })
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn increment_mesh_mtls_handshake_failure(reason: impl AsRef<str>) {
     let key = MeshMtlsHandshakeFailureKey {
         reason: Arc::from(reason.as_ref()),
@@ -755,6 +787,22 @@ pub fn render_mesh_observability_metrics_with_gateway_namespace(
             output.push_str(&format!(
                 "ferrum_mesh_config_update_rejections_total{{consumer=\"{}\",reason=\"{}\"{}}} {}\n",
                 escape_label_value(entry.key().consumer),
+                escape_label_value(entry.key().reason),
+                gateway_ns_label,
+                entry.value().load(Ordering::Relaxed)
+            ));
+        }
+    }
+
+    if !MESH_SUBSCRIBE_AUDIENCE_REJECTIONS.is_empty() {
+        output.push_str(
+            "# HELP ferrum_mesh_subscribe_audience_rejections_total MeshSubscribe subscriptions refused by the control plane because the bearer JWT audience is not bound to this cluster, by subscription class and reason.\n",
+        );
+        output.push_str("# TYPE ferrum_mesh_subscribe_audience_rejections_total counter\n");
+        for entry in MESH_SUBSCRIBE_AUDIENCE_REJECTIONS.iter() {
+            output.push_str(&format!(
+                "ferrum_mesh_subscribe_audience_rejections_total{{subscription=\"{}\",reason=\"{}\"{}}} {}\n",
+                escape_label_value(entry.key().subscription),
                 escape_label_value(entry.key().reason),
                 gateway_ns_label,
                 entry.value().load(Ordering::Relaxed)

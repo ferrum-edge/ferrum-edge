@@ -352,24 +352,50 @@ pub fn generate_dp_jwt_with_issuer_and_namespace(
     issuer: &str,
     namespace: Option<&str>,
 ) -> Result<String, anyhow::Error> {
+    generate_dp_jwt_full(secret, node_id, issuer, namespace, None)
+}
+
+/// Generate a short-lived HS256 JWT with an optional `ns` claim and an optional
+/// **single-valued** `aud` claim naming the token's intended target.
+///
+/// Audience binding (issue #2475) is what makes a credential non-transferable
+/// between destinations that share a secret and issuer: the cross-cluster mesh
+/// remote-discovery poller mints
+/// `aud = "ferrum-mesh-discovery:<target RemoteCluster.name>"`, and the
+/// receiving control plane refuses any token whose single `aud` is not its own.
+/// The claim is always a plain string (never an array), because Ferrum's
+/// verifier treats a multi-valued audience as ambiguous and fails closed.
+///
+/// `audience` of `None` reproduces the ordinary CP↔DP / local mesh token shape
+/// exactly — those classes carry no `aud`, and every non-discovery gRPC surface
+/// refuses a token that carries a reserved discovery audience, so the two
+/// purposes stay unambiguous in both directions.
+pub fn generate_dp_jwt_full(
+    secret: &str,
+    node_id: &str,
+    issuer: &str,
+    namespace: Option<&str>,
+    audience: Option<&str>,
+) -> Result<String, anyhow::Error> {
     let now = chrono::Utc::now().timestamp();
-    let claims = match namespace {
-        Some(ns) if !ns.is_empty() => json!({
-            "sub": node_id,
-            "iat": now,
-            "exp": now + DP_JWT_TTL_SECONDS,
-            "iss": issuer,
-            "role": "data_plane",
-            "ns": ns,
-        }),
-        _ => json!({
-            "sub": node_id,
-            "iat": now,
-            "exp": now + DP_JWT_TTL_SECONDS,
-            "iss": issuer,
-            "role": "data_plane",
-        }),
+    let mut claims = json!({
+        "sub": node_id,
+        "iat": now,
+        "exp": now + DP_JWT_TTL_SECONDS,
+        "iss": issuer,
+        "role": "data_plane",
+    });
+    // `claims` is constructed as a JSON object literal directly above, so the
+    // `as_object_mut` invariant cannot fail.
+    let Some(object) = claims.as_object_mut() else {
+        anyhow::bail!("internal error: DP JWT claims are not a JSON object");
     };
+    if let Some(ns) = namespace.filter(|ns| !ns.is_empty()) {
+        object.insert("ns".to_string(), json!(ns));
+    }
+    if let Some(aud) = audience.map(str::trim).filter(|aud| !aud.is_empty()) {
+        object.insert("aud".to_string(), json!(aud));
+    }
     let token = encode(
         &Header::new(Algorithm::HS256),
         &claims,

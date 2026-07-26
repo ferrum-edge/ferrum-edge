@@ -1428,6 +1428,19 @@ pub struct EnvConfig {
     /// per-remote credential cannot authenticate to the wrong cluster. Never
     /// logged. Unset falls back to the shared CP-DP JWT secret.
     pub mesh_remote_discovery_credentials: Option<String>,
+    /// Stable, operator-visible identifier this cluster is known by to its
+    /// multi-cluster peers — the value a peer puts in `RemoteCluster.name` when
+    /// it declares this cluster. Deliberately independent of any endpoint URL,
+    /// which is mutable and must never be what a credential is bound to.
+    ///
+    /// Control-plane side: `MeshConfigSync.MeshSubscribe` requests marked as
+    /// cross-cluster remote discovery must present a JWT whose single `aud` is
+    /// `ferrum-mesh-discovery:<this value>`. Unset means this control plane
+    /// does not serve cross-cluster discovery and refuses every such
+    /// subscription (fail closed); ordinary local mesh subscriptions are
+    /// unaffected either way. Not a secret — it is an identifier, never a
+    /// credential. Issue #2475.
+    pub mesh_cluster_audience: Option<String>,
     /// Strict local-first locality load balancing. Default `false` (fail-open):
     /// when a mesh upstream's source locality is absent/unresolved the
     /// locality-aware LB returns local **and** remote endpoints together so
@@ -2491,6 +2504,7 @@ impl Default for EnvConfig {
             mesh_remote_discovery_poll_timeout_seconds: 30,
             mesh_remote_discovery_max_stale_seconds: 300,
             mesh_remote_discovery_credentials: None,
+            mesh_cluster_audience: None,
             mesh_locality_lb_strict: false,
             mesh_node_waypoint_cgroup_sweep_interval_secs: 30,
             mesh_node_waypoint_idle_gc_interval_secs: 30,
@@ -2913,6 +2927,7 @@ impl EnvConfig {
             mesh_remote_discovery_poll_timeout_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_POLL_TIMEOUT_SECONDS" => 30u64;
             mesh_remote_discovery_max_stale_seconds: u64 = "FERRUM_MESH_REMOTE_DISCOVERY_MAX_STALE_SECONDS" => 300u64;
             mesh_remote_discovery_credentials: Option<String> = "FERRUM_MESH_REMOTE_DISCOVERY_CREDENTIALS";
+            mesh_cluster_audience: Option<String> = "FERRUM_MESH_CLUSTER_AUDIENCE";
             mesh_locality_lb_strict: bool = "FERRUM_MESH_LOCALITY_LB_STRICT" => false;
             mesh_node_waypoint_cgroup_sweep_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_CGROUP_SWEEP_INTERVAL_SECS" => 30u64;
             mesh_node_waypoint_idle_gc_interval_secs: u64 = "FERRUM_MESH_NODE_WAYPOINT_IDLE_GC_INTERVAL_SECS" => 30u64;
@@ -3424,6 +3439,12 @@ impl EnvConfig {
         // secret fallback) rather than an empty-string JSON parse attempt.
         let mesh_remote_discovery_credentials =
             mesh_remote_discovery_credentials.filter(|s| !s.trim().is_empty());
+        // Blank-means-unset: an empty audience identifier must never become
+        // an accepted `aud` value. Unset keeps cross-cluster discovery
+        // serving refused (fail closed).
+        let mesh_cluster_audience = mesh_cluster_audience
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let dtls_cert_path = resolve_tls_source_override(
             conf,
             "FERRUM_DTLS_CERT_SOURCE",
@@ -3571,6 +3592,7 @@ impl EnvConfig {
             mesh_remote_discovery_poll_timeout_seconds,
             mesh_remote_discovery_max_stale_seconds,
             mesh_remote_discovery_credentials,
+            mesh_cluster_audience,
             mesh_locality_lb_strict,
             mesh_node_waypoint_cgroup_sweep_interval_secs,
             mesh_node_waypoint_idle_gc_interval_secs,

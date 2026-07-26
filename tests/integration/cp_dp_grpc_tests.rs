@@ -882,6 +882,7 @@ async fn test_mesh_subscribe_receives_initial_mesh_slice() {
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
+        remote_discovery: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -970,6 +971,7 @@ async fn test_mesh_subscribe_waypoint_name_narrows_initial_slice() {
         labels: HashMap::new(),
         waypoint_name: "api-waypoint".to_string(),
         ambient_udp_source_scoping: false,
+        remote_discovery: false,
     });
     let mut stream = client.mesh_subscribe(request).await.unwrap().into_inner();
     let update = stream.message().await.unwrap().unwrap();
@@ -1644,6 +1646,7 @@ async fn test_mesh_subscribe_rejects_token_with_wrong_issuer() {
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
+        remote_discovery: false,
     });
 
     let result = client.mesh_subscribe(request).await;
@@ -4004,6 +4007,7 @@ async fn test_cp_rejects_mesh_subscribe_with_mismatched_namespace() {
         labels: HashMap::from([("app".to_string(), "api".to_string())]),
         waypoint_name: String::new(),
         ambient_udp_source_scoping: false,
+        remote_discovery: false,
     });
 
     let result = client.mesh_subscribe(request).await;
