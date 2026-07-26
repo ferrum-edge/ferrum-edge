@@ -25,6 +25,13 @@ jobs:
       - name: Check out audit publisher
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
 
+      - name: Decode reviewed finding manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 --decode tools/audit/publish_81/findings.json.gz.b64 \
+            | gzip --decompress > /tmp/ferrum-reviewed-findings.json
+
       - name: Validate and publish reviewed findings
         shell: bash
         env:
@@ -33,7 +40,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 tools/audit/publish_81/publish_findings.py \
-            --manifest-dir tools/audit/publish_81/manifest \
+            --manifest-file /tmp/ferrum-reviewed-findings.json \
             --output tools/audit/publish_81/results.json
 
       - name: Upload publication manifest and verification results
@@ -42,7 +49,7 @@ jobs:
         with:
           name: ferrum-published-81-findings-${{ github.run_id }}
           path: |
-            tools/audit/publish_81/manifest
+            tools/audit/publish_81/findings.json.gz.b64
             tools/audit/publish_81/results.json
           if-no-files-found: warn
           retention-days: 7
