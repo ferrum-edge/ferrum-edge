@@ -99,13 +99,11 @@ async fn proxy_updated_at(store: &DatabaseStore, id: &str) -> String {
 }
 
 async fn count_plugins(store: &DatabaseStore, id: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM plugin_configs WHERE id = ? AND namespace = 'ferrum'",
-    )
-    .bind(id)
-    .fetch_one(&store.pool())
-    .await
-    .expect("plugin count must succeed")
+    sqlx::query_scalar("SELECT COUNT(*) FROM plugin_configs WHERE id = ? AND namespace = 'ferrum'")
+        .bind(id)
+        .fetch_one(&store.pool())
+        .await
+        .expect("plugin count must succeed")
 }
 
 async fn count_associations(store: &DatabaseStore, plugin_config_id: &str) -> i64 {
