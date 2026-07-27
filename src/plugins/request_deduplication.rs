@@ -378,12 +378,13 @@ pub fn validate_composition(
             })
             .collect();
         let effective: Vec<&PluginConfig> = if local.is_empty() {
+            // Runtime globals are process-wide rather than namespace-scoped,
+            // so admission must consider every enabled global here too.
             config
                 .plugin_configs
                 .iter()
                 .filter(|plugin| {
                     plugin.enabled
-                        && plugin.namespace == proxy.namespace
                         && plugin.scope == PluginScope::Global
                         && plugin.plugin_name == name
                 })

@@ -5746,10 +5746,9 @@ fn a_proxy_local_mcp_gateway_shadowing_a_global_one_is_still_rejected() {
 }
 
 #[test]
-fn a_global_mcp_gateway_in_another_namespace_does_not_block_dedup() {
-    // Globals are namespace-partitioned by the runtime merge (each proxy takes
-    // only the globals of its own namespace), so a global `mcp_gateway` in one
-    // tenant must not refuse deduplication in another.
+fn a_global_mcp_gateway_in_another_namespace_blocks_dedup() {
+    // Runtime globals are process-wide, so admission must account for a global
+    // `mcp_gateway` even when its configured namespace differs from the proxy.
     let mut config = empty_config();
     let mut dedup = dedup_plugin_config("dedup1", PluginScope::Proxy, Some("p1"));
     dedup.namespace = "tenant-a".to_string();
@@ -5761,9 +5760,14 @@ fn a_global_mcp_gateway_in_another_namespace_does_not_block_dedup() {
     associate(&mut proxy, &["dedup1"]);
     config.proxies = vec![proxy];
 
+    let errors = config
+        .validate_plugin_references()
+        .expect_err("the process-wide global mcp_gateway must block deduplication");
     assert!(
-        config.validate_plugin_references().is_ok(),
-        "a global mcp_gateway is never merged into a proxy in a different namespace"
+        errors
+            .iter()
+            .any(|error| error.contains("request_deduplication") && error.contains("mcp_gateway")),
+        "the unsafe runtime composition must be reported: {errors:?}"
     );
 }
 
