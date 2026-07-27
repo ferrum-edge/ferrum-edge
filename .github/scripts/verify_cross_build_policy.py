@@ -666,6 +666,358 @@ RELEASE_CREATE_RELEASE_STEPS = r"""    steps:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 """
 
+RELEASE_ATTEST_RELEASE_IMAGES_STEPS = r"""    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@af1e73f918a031802d376d3c8bbc3fe56130a9b0 # v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Resolve and compare immutable manifest digests
+        id: images
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid release tag format: $TAG_NAME" >&2
+            exit 1
+          fi
+
+          work="$RUNNER_TEMP/image-attestations"
+          mkdir -p "$work"
+
+          cat > "$work/require_manifest.jq" <<'JQ'
+          (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")) and
+          (.manifests | type == "array" and length == 2) and
+          ([.manifests[].platform | "\(.os)/\(.architecture)"] | sort == ["linux/amd64", "linux/arm64"]) and
+          all(.manifests[]; (.digest | type == "string" and test("^sha256:[0-9a-f]{64}$")))
+          JQ
+
+          cat > "$work/platform_descriptors.jq" <<'JQ'
+          .manifests
+          | sort_by(.platform.os, .platform.architecture)
+          | map({mediaType, digest, size, platform})
+          JQ
+
+          resolve_manifest() {
+            local key="$1"
+            local tag_ref="$2"
+            local manifest_file="$work/${key}.manifest.json"
+            local digest
+
+            docker buildx imagetools inspect \
+              "$tag_ref" \
+              --format '{{json .Manifest}}' > "$manifest_file"
+
+            jq -e -f "$work/require_manifest.jq" "$manifest_file" >/dev/null
+
+            digest="$(jq -er '.digest' "$manifest_file")"
+            echo "${key}_ref=${tag_ref}@${digest}" >> "$GITHUB_OUTPUT"
+          }
+
+          resolve_manifest standard_docker "ferrumedge/ferrum-edge:${TAG_NAME}"
+          resolve_manifest standard_ghcr "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}"
+          resolve_manifest ebpf_docker "ferrumedge/ferrum-edge:${TAG_NAME}-ebpf"
+          resolve_manifest ebpf_ghcr "ghcr.io/${GITHUB_REPOSITORY}:${TAG_NAME}-ebpf"
+
+          compare_registry_manifests() {
+            local family="$1"
+            jq -S -f "$work/platform_descriptors.jq" \
+              "$work/${family}_docker.manifest.json" > "$work/${family}_docker.descriptors.json"
+            jq -S -f "$work/platform_descriptors.jq" \
+              "$work/${family}_ghcr.manifest.json" > "$work/${family}_ghcr.descriptors.json"
+            if ! diff -u \
+              "$work/${family}_docker.descriptors.json" \
+              "$work/${family}_ghcr.descriptors.json"; then
+              echo "::error::${family} platform manifests differ between Docker Hub and GHCR" >&2
+              exit 1
+            fi
+          }
+
+          compare_registry_manifests standard
+          compare_registry_manifests ebpf
+
+      - name: Generate SPDX SBOMs and manifest provenance
+        env:
+          DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USERNAME: ${{ github.actor }}
+          STANDARD_DOCKER_REF: ${{ steps.images.outputs.standard_docker_ref }}
+          STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
+          EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
+          EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/image-attestations"
+
+          cat > "$work/require_sbom.jq" <<'JQ'
+          (.spdxVersion | type == "string" and startswith("SPDX-")) and
+          (.documentNamespace | type == "string" and length > 0) and
+          (.packages | type == "array" and length > 0) and
+          (.documentDescribes | type == "array" and length > 0)
+          JQ
+
+          generate_sboms() {
+            local family="$1"
+            local registry="$2"
+            local image_ref="$3"
+            local registry_username="$4"
+            local registry_password="$5"
+            local platform arch output
+
+            for platform in linux/amd64 linux/arm64; do
+              arch="${platform#linux/}"
+              output="$work/${family}_${registry}-${arch}.spdx.json"
+              # anchore/syft:v1.49.0, pinned to its linux/amd64 image manifest.
+              docker run --rm \
+                -e SYFT_CHECK_FOR_APP_UPDATE=false \
+                -e SYFT_REGISTRY_AUTH_USERNAME="$registry_username" \
+                -e SYFT_REGISTRY_AUTH_PASSWORD="$registry_password" \
+                -v "$work:/out" \
+                anchore/syft@sha256:9a9f85314017f1ea798fb012edfa7fe9259923910f82c8d4bc983ab5c765e60b \
+                scan "registry:${image_ref}" \
+                --platform "$platform" \
+                -o "spdx-json=/out/${family}_${registry}-${arch}.spdx.json"
+
+              jq -e -f "$work/require_sbom.jq" "$output" >/dev/null
+            done
+          }
+
+          generate_sboms \
+            standard docker "$STANDARD_DOCKER_REF" \
+            "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"
+          generate_sboms \
+            standard ghcr "$STANDARD_GHCR_REF" \
+            "$GHCR_USERNAME" "$GHCR_TOKEN"
+          generate_sboms \
+            ebpf docker "$EBPF_DOCKER_REF" \
+            "$DOCKERHUB_USERNAME" "$DOCKERHUB_PASSWORD"
+          generate_sboms \
+            ebpf ghcr "$EBPF_GHCR_REF" \
+            "$GHCR_USERNAME" "$GHCR_TOKEN"
+
+          cat > "$work/create_provenance.jq" <<'JQ'
+          {
+            buildDefinition: {
+              buildType: $build_type,
+              externalParameters: {
+                repository: $repository,
+                ref: $ref,
+                tag: $tag,
+                variant: $variant,
+                platforms: ["linux/amd64", "linux/arm64"]
+              },
+              internalParameters: {},
+              resolvedDependencies: (
+                [{
+                  uri: $source_uri,
+                  digest: {gitCommit: $source_sha}
+                }] +
+                ($manifest[0].manifests | map({
+                  uri: ($repository + "@" + .digest),
+                  digest: {sha256: (.digest | sub("^sha256:"; ""))},
+                  annotations: {platform: (.platform.os + "/" + .platform.architecture)}
+                }))
+              )
+            },
+            runDetails: {
+              builder: {id: $builder_id},
+              metadata: {invocationId: $invocation_id},
+              byproducts: []
+            }
+          }
+          JQ
+
+          create_provenance() {
+            local family="$1"
+            local repository="$2"
+            local manifest_file="$3"
+            local output="$4"
+            local variant="$family"
+
+            jq -n \
+              --arg build_type "https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/ci_cd.md#image-signatures-sboms-and-provenance" \
+              --arg builder_id "https://github.com/${GITHUB_WORKFLOW_REF}" \
+              --arg invocation_id "https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}" \
+              --arg ref "$GITHUB_REF" \
+              --arg repository "$repository" \
+              --arg source_uri "git+https://github.com/${GITHUB_REPOSITORY}@${GITHUB_REF}" \
+              --arg source_sha "$GITHUB_SHA" \
+              --arg tag "$TAG_NAME" \
+              --arg variant "$variant" \
+              --slurpfile manifest "$manifest_file" \
+              -f "$work/create_provenance.jq" > "$output"
+          }
+
+          create_provenance \
+            standard \
+            ferrumedge/ferrum-edge \
+            "$work/standard_docker.manifest.json" \
+            "$work/standard_docker.provenance.json"
+          create_provenance \
+            standard \
+            "ghcr.io/${GITHUB_REPOSITORY}" \
+            "$work/standard_ghcr.manifest.json" \
+            "$work/standard_ghcr.provenance.json"
+          create_provenance \
+            ebpf \
+            ferrumedge/ferrum-edge \
+            "$work/ebpf_docker.manifest.json" \
+            "$work/ebpf_docker.provenance.json"
+          create_provenance \
+            ebpf \
+            "ghcr.io/${GITHUB_REPOSITORY}" \
+            "$work/ebpf_ghcr.manifest.json" \
+            "$work/ebpf_ghcr.provenance.json"
+
+      - name: Sign and attest immutable image digests
+        env:
+          STANDARD_DOCKER_REF: ${{ steps.images.outputs.standard_docker_ref }}
+          STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
+          EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
+          EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/image-attestations"
+
+          sign_and_attest() {
+            local family="$1"
+            local registry="$2"
+            local image_ref="$3"
+            local provenance="$work/${family}_${registry}.provenance.json"
+
+            cosign sign --yes "$image_ref"
+            cosign attest --yes \
+              --type slsaprovenance1 \
+              --predicate "$provenance" \
+              "$image_ref"
+            for sbom in \
+              "$work/${family}_${registry}-amd64.spdx.json" \
+              "$work/${family}_${registry}-arm64.spdx.json"; do
+              cosign attest --yes \
+                --type spdxjson \
+                --predicate "$sbom" \
+                "$image_ref"
+            done
+          }
+
+          sign_and_attest standard docker "$STANDARD_DOCKER_REF"
+          sign_and_attest standard ghcr "$STANDARD_GHCR_REF"
+          sign_and_attest ebpf docker "$EBPF_DOCKER_REF"
+          sign_and_attest ebpf ghcr "$EBPF_GHCR_REF"
+
+      - name: Verify signatures, provenance, subjects, and SBOMs
+        env:
+          STANDARD_DOCKER_REF: ${{ steps.images.outputs.standard_docker_ref }}
+          STANDARD_GHCR_REF: ${{ steps.images.outputs.standard_ghcr_ref }}
+          EBPF_DOCKER_REF: ${{ steps.images.outputs.ebpf_docker_ref }}
+          EBPF_GHCR_REF: ${{ steps.images.outputs.ebpf_ghcr_ref }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/image-attestations"
+          certificate_identity="https://github.com/${GITHUB_WORKFLOW_REF}"
+          oidc_issuer="https://token.actions.githubusercontent.com"
+
+          cat > "$work/require_signature.jq" <<'JQ'
+          length > 0 and
+          all(.[]; .critical.image["docker-manifest-digest"] == $digest)
+          JQ
+
+          cat > "$work/require_provenance.jq" <<'JQ'
+          [
+            .[].payload
+            | @base64d
+            | fromjson
+            | select(.predicateType == "https://slsa.dev/provenance/v1")
+            | select(any(.subject[]?; .digest.sha256 == $digest))
+            | select(
+                any(
+                  .predicate.buildDefinition.resolvedDependencies[]?;
+                  .digest.gitCommit == $source_sha
+                )
+              )
+          ] | length > 0
+          JQ
+
+          cat > "$work/require_sbom_attest.jq" <<'JQ'
+          [
+            .[].payload
+            | @base64d
+            | fromjson
+            | select(any(.subject[]?; .digest.sha256 == $digest))
+            | select(.predicate.spdxVersion | startswith("SPDX-"))
+            | select(.predicate.packages | type == "array" and length > 0)
+          ] | length >= 2
+          JQ
+
+          verify_common_args=(
+            --certificate-identity "$certificate_identity"
+            --certificate-oidc-issuer "$oidc_issuer"
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY"
+            --certificate-github-workflow-sha "$GITHUB_SHA"
+            --certificate-github-workflow-ref "$GITHUB_REF"
+            --certificate-github-workflow-trigger push
+          )
+
+          verify_image() {
+            local family="$1"
+            local registry="$2"
+            local image_ref="$3"
+            local expected_digest="${image_ref##*@sha256:}"
+            local prefix="$work/verified-${family}-${registry}"
+
+            if [[ ! "$expected_digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid immutable image reference ${image_ref}" >&2
+              exit 1
+            fi
+
+            cosign verify \
+              "${verify_common_args[@]}" \
+              "$image_ref" > "${prefix}-signature.json"
+            jq -e --arg digest "sha256:${expected_digest}" \
+              -f "$work/require_signature.jq" \
+              "${prefix}-signature.json" >/dev/null
+
+            cosign verify-attestation \
+              "${verify_common_args[@]}" \
+              --type slsaprovenance1 \
+              "$image_ref" > "${prefix}-provenance.json"
+            jq -e --arg digest "$expected_digest" --arg source_sha "$GITHUB_SHA" \
+              -f "$work/require_provenance.jq" \
+              "${prefix}-provenance.json" >/dev/null
+
+            cosign verify-attestation \
+              "${verify_common_args[@]}" \
+              --type spdxjson \
+              "$image_ref" > "${prefix}-sbom.json"
+            jq -e --arg digest "$expected_digest" \
+              -f "$work/require_sbom_attest.jq" \
+              "${prefix}-sbom.json" >/dev/null
+          }
+
+          verify_image standard docker "$STANDARD_DOCKER_REF"
+          verify_image standard ghcr "$STANDARD_GHCR_REF"
+          verify_image ebpf docker "$EBPF_DOCKER_REF"
+          verify_image ebpf ghcr "$EBPF_GHCR_REF"
+"""
+
 RELEASE_DOCKER_MANIFEST_STEPS = r"""    steps:
       - name: Extract version tag
         id: version
@@ -1018,6 +1370,15 @@ PUBLISH_CONTROL_CONTRACTS = {
                 "docker-manifest, docker-ebpf-manifest]\n"
             ),
             "steps": RELEASE_CREATE_RELEASE_STEPS,
+        },
+        "attest-release-images": {
+            "needs": "    needs: [docker-manifest, docker-ebpf-manifest]\n",
+            "permissions": (
+                "    permissions:\n"
+                "      id-token: write\n"
+                "      packages: write\n"
+            ),
+            "steps": RELEASE_ATTEST_RELEASE_IMAGES_STEPS,
         },
         "docker": {
             "needs": (
@@ -20630,6 +20991,7 @@ pre_build = []
         ("CI workflow", "latest-release"),
         ("CI workflow", "docker-manifest"),
         ("release workflow", "create-release"),
+        ("release workflow", "attest-release-images"),
         ("release workflow", "docker-manifest"),
         ("release workflow", "docker-ebpf-manifest"),
     ):
